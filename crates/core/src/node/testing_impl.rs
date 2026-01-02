@@ -1,3 +1,67 @@
+//! Simulation network implementation for testing Freenet nodes.
+//!
+//! This module provides `SimNetwork`, a fully in-memory simulation framework for testing
+//! Freenet's peer-to-peer network behavior. It enables deterministic testing of complex
+//! distributed scenarios without real network I/O.
+//!
+//! # Key Components
+//!
+//! - [`SimNetwork`]: The main simulation controller that manages virtual nodes
+//! - [`NodeLabel`]: Identifies nodes in the simulation (gateways and regular nodes)
+//! - [`FaultConfig`]: Configures fault injection (message loss, partitions, latency)
+//! - [`VirtualTime`]: Controls deterministic time progression
+//!
+//! # Features
+//!
+//! - **Deterministic execution**: All randomness is seeded for reproducible tests
+//! - **Fault injection**: Simulate message loss, network partitions, and node crashes
+//! - **Virtual time**: Control time progression for testing time-dependent behavior
+//! - **Node lifecycle**: Crash and restart nodes while preserving identity
+//! - **Network-scoped state**: Each simulation is isolated from others
+//!
+//! # Example
+//!
+//! ```ignore
+//! use freenet::dev_tool::SimNetwork;
+//! use freenet::simulation::FaultConfig;
+//!
+//! // Create a 3-node network with 1 gateway
+//! let mut sim = SimNetwork::new(
+//!     "my-test",
+//!     1,  // gateways
+//!     2,  // regular nodes
+//!     7,  // ring_max_htl
+//!     3,  // rnd_if_htl_above
+//!     10, // max_connections
+//!     2,  // min_connections
+//!     42, // seed for determinism
+//! ).await;
+//!
+//! // Start the network
+//! let handles = sim.start_with_rand_gen::<rand::rngs::SmallRng>(42, 1, 1).await;
+//!
+//! // Inject 10% message loss
+//! sim.with_fault_injection(FaultConfig::builder()
+//!     .message_loss_rate(0.1)
+//!     .build());
+//!
+//! // Advance virtual time to trigger pending message deliveries
+//! sim.advance_time(Duration::from_millis(100));
+//! ```
+//!
+//! # Network Isolation
+//!
+//! Each `SimNetwork` instance is identified by its name and maintains isolated state.
+//! This allows running multiple independent simulations in parallel tests without
+//! interference. The fault injection state is automatically cleaned up when the
+//! simulation is dropped.
+//!
+//! # Thread Safety
+//!
+//! The simulation is thread-safe and can be used with `#[tokio::test]` multi-threaded
+//! test configurations. Internal state is protected by appropriate synchronization
+//! primitives.
+
 use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
@@ -133,12 +197,34 @@ pub struct EventSummary {
     pub event_detail: String,
 }
 
+/// A stream of events for simulation testing.
+///
+/// `EventChain` provides a `Stream` of events that drive user interactions in
+/// the simulated network.
+///
+/// # Ownership and Cleanup
+///
+/// There are two ways to obtain an `EventChain`:
+///
+/// 1. **`event_chain(&mut sim)`** - Borrows from `SimNetwork`. The `SimNetwork`
+///    retains ownership of labels and handles cleanup on drop. The `EventChain`
+///    is created with `clean_up_tmp_dirs = false`.
+///
+/// 2. **`into_event_chain(sim)`** - Consumes `SimNetwork`. The `EventChain` takes
+///    ownership of labels and handles cleanup on drop. The `EventChain` is created
+///    with `clean_up_tmp_dirs` set to whatever `SimNetwork` had.
+///
+/// This design allows tests to either retain access to `SimNetwork` for verification
+/// methods, or to release it for simpler cleanup.
 pub struct EventChain<S = watch::Sender<(EventId, TransportPublicKey)>> {
     labels: Vec<(NodeLabel, TransportPublicKey)>,
     user_ev_controller: S,
     total_events: u32,
     count: u32,
     rng: rand::rngs::SmallRng,
+    /// Whether this EventChain is responsible for cleaning up temp directories.
+    /// Set to `true` when created via `into_event_chain()` (consuming SimNetwork),
+    /// `false` when created via `event_chain()` (borrowing from SimNetwork).
     clean_up_tmp_dirs: bool,
     choice: Option<TransportPublicKey>,
 }
@@ -291,16 +377,19 @@ pub(super) struct Builder<ER> {
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     /// Seed for deterministic RNG in this node's transport layer
     pub rng_seed: u64,
+    /// Network name for scoped fault injection
+    pub network_name: String,
 }
 
 impl<ER: NetEventRegister> Builder<ER> {
-    /// Buils an in-memory node. Does nothing upon construction,
+    /// Builds an in-memory node. Does nothing upon construction.
     pub fn build(
         builder: NodeConfig,
         event_register: ER,
         contract_handler_name: String,
         add_noise: bool,
         rng_seed: u64,
+        network_name: String,
     ) -> Builder<ER> {
         Builder {
             config: builder.clone(),
@@ -310,6 +399,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
             rng_seed,
+            network_name,
         }
     }
 }
@@ -448,7 +538,10 @@ impl SimNetwork {
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(FaultConfig::default(), fault_seed)
             .with_virtual_time(self.virtual_time.clone());
-        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+        set_fault_injector(
+            &self.name,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
+        );
     }
 
     /// Derives a deterministic per-peer seed from the master seed and peer index.
@@ -470,7 +563,15 @@ impl SimNetwork {
         self.start_backoff = value;
     }
 
-    /// Simulates network random behaviour, like messages arriving delayed or out of order, throttling etc.
+    /// Simulates network random behavior, like messages arriving delayed or out of order, throttling, etc.
+    ///
+    /// **Warning: Non-deterministic mode.** Enabling noise introduces timing-dependent
+    /// behavior that makes test results harder to reproduce, even with the same seed.
+    /// The noise affects message shuffling and timing in ways that depend on thread
+    /// scheduling and system load.
+    ///
+    /// For deterministic testing, prefer using `with_fault_injection` with `FaultConfig`
+    /// instead, which provides controllable, seeded randomness for message loss and latency.
     #[allow(unused)]
     pub fn with_noise(&mut self) {
         self.add_noise = true;
@@ -528,7 +629,10 @@ impl SimNetwork {
         // Always use VirtualTime for deterministic behavior
         let state = FaultInjectorState::new(config, fault_seed)
             .with_virtual_time(self.virtual_time.clone());
-        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+        set_fault_injector(
+            &self.name,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
+        );
     }
 
     /// Clears any configured fault injection and resets to default (VirtualTime only).
@@ -555,7 +659,10 @@ impl SimNetwork {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
-        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+        set_fault_injector(
+            &self.name,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
+        );
     }
 
     /// Advances virtual time and delivers pending messages.
@@ -566,7 +673,7 @@ impl SimNetwork {
     /// Returns the number of messages delivered.
     pub fn advance_virtual_time(&mut self) -> usize {
         use crate::node::network_bridge::get_fault_injector;
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let mut state = injector.lock().unwrap();
             state.advance_time()
         } else {
@@ -593,7 +700,7 @@ impl SimNetwork {
     /// - Latency injection metrics
     pub fn get_network_stats(&self) -> Option<crate::node::network_bridge::NetworkStats> {
         use crate::node::network_bridge::get_fault_injector;
-        get_fault_injector().map(|injector| {
+        get_fault_injector(&self.name).map(|injector| {
             let state = injector.lock().unwrap();
             state.stats().clone()
         })
@@ -602,7 +709,7 @@ impl SimNetwork {
     /// Resets the network statistics.
     pub fn reset_network_stats(&mut self) {
         use crate::node::network_bridge::get_fault_injector;
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let mut state = injector.lock().unwrap();
             state.reset_stats();
         }
@@ -642,7 +749,7 @@ impl SimNetwork {
         };
 
         // Mark as crashed in fault injector
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let mut state = injector.lock().unwrap();
             state.config.crash_node(addr);
             tracing::info!(?label, ?addr, "Node marked as crashed in fault injector");
@@ -680,7 +787,7 @@ impl SimNetwork {
             }
         };
 
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let mut state = injector.lock().unwrap();
             state.config.recover_node(addr);
             tracing::info!(
@@ -703,7 +810,7 @@ impl SimNetwork {
             None => return false,
         };
 
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let state = injector.lock().unwrap();
             state.config.is_crashed(addr)
         } else {
@@ -804,7 +911,7 @@ impl SimNetwork {
         unregister_peer(&node_addr);
 
         // Clear crash status in fault injector
-        if let Some(injector) = get_fault_injector() {
+        if let Some(injector) = get_fault_injector(&self.name) {
             let mut state = injector.lock().unwrap();
             state.config.recover_node(&node_addr);
         }
@@ -831,6 +938,7 @@ impl SimNetwork {
             format!("{}-{}", self.name, label),
             self.add_noise,
             restart_config.rng_seed,
+            self.name.clone(),
         );
 
         // Calculate total peers for event generation params
@@ -967,6 +1075,7 @@ impl SimNetwork {
                 format!("{}-{label}", self.name, label = this_config.label),
                 self.add_noise,
                 peer_seed,
+                self.name.clone(),
             );
             self.gateways.push((gateway, this_config));
         }
@@ -1038,6 +1147,7 @@ impl SimNetwork {
                 format!("{}-{label}", self.name),
                 self.add_noise,
                 peer_seed,
+                self.name.clone(),
             );
             self.nodes.push((node, label));
         }
@@ -1339,7 +1449,8 @@ impl SimNetwork {
         while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
         {
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
-                if !connected.contains(&node) && self.connected(&NodeLabel::node(&self.name, node))
+                if !connected.contains(&node)
+                    && self.is_connected(&NodeLabel::node(&self.name, node))
                 {
                     connected.insert(node);
                 }
@@ -1377,7 +1488,7 @@ impl SimNetwork {
         Ok(())
     }
 
-    pub fn connected(&self, peer: &NodeLabel) -> bool {
+    pub fn is_connected(&self, peer: &NodeLabel) -> bool {
         let pos = self
             .labels
             .binary_search_by(|(label, _)| label.cmp(peer))
@@ -1447,6 +1558,12 @@ impl SimNetwork {
     pub fn network_connectivity_quality(&self) -> anyhow::Result<()> {
         const HIGHER_THAN_MIN_THRESHOLD: f64 = 0.5;
         let num_nodes = self.number_of_nodes;
+
+        // Guard against division by zero
+        if num_nodes == 0 {
+            anyhow::bail!("cannot check connectivity quality with zero nodes");
+        }
+
         let min_connections_threshold = (num_nodes as f64 * HIGHER_THAN_MIN_THRESHOLD) as usize;
         let node_connectivity = self.node_connectivity();
 
@@ -1457,9 +1574,19 @@ impl SimNetwork {
             .map(|(_, v)| v)
             .collect();
 
+        // Guard against empty connections list
+        if connections_per_peer.is_empty() {
+            anyhow::bail!("no non-gateway nodes found for connectivity check");
+        }
+
         // ensure at least "most" normal nodes have more than one connection
         connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
-        if connections_per_peer[min_connections_threshold] < self.min_connections {
+        if connections_per_peer
+            .get(min_connections_threshold)
+            .copied()
+            .unwrap_or(0)
+            < self.min_connections
+        {
             tracing::error!(
                 "Low connectivity; more than {:.0}% of the nodes don't have more than minimum connections",
                 HIGHER_THAN_MIN_THRESHOLD * 100.0
@@ -2113,6 +2240,10 @@ impl std::fmt::Debug for SimNetwork {
 
 impl Drop for SimNetwork {
     fn drop(&mut self) {
+        // Clean up the fault injector for this network
+        use crate::node::network_bridge::set_fault_injector;
+        set_fault_injector(&self.name, None);
+
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
         }

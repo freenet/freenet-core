@@ -92,6 +92,7 @@ impl<ER> Builder<ER> {
             op_manager.clone(),
             self.add_noise,
             self.rng_seed,
+            &self.network_name,
         );
 
         GlobalExecutor::spawn(
@@ -199,6 +200,7 @@ impl<ER> Builder<ER> {
             op_manager.clone(),
             self.add_noise,
             self.rng_seed,
+            &self.network_name,
         );
 
         GlobalExecutor::spawn(

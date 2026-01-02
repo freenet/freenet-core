@@ -178,21 +178,22 @@ impl FaultInjectorState {
     }
 }
 
-/// Shared fault injector for controlling message delivery in tests.
+/// Network-scoped fault injectors for controlling message delivery in tests.
 ///
-/// When set, messages are checked against the fault configuration before delivery.
-/// This enables deterministic fault injection without replacing the transport layer.
-static FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<FaultInjectorState>>>>> =
-    LazyLock::new(|| RwLock::new(None));
+/// Each network (identified by name) can have its own fault injector configuration.
+/// This prevents test interference when multiple tests run concurrently.
+static FAULT_INJECTORS: LazyLock<
+    RwLock<HashMap<String, Arc<std::sync::Mutex<FaultInjectorState>>>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Sets the global fault injector for in-memory transport.
+/// Sets the fault injector for a specific network.
 ///
-/// When set, all `MemoryConnManager` instances will check messages against
-/// this configuration before delivery, allowing tests to inject:
-/// - Message drops (loss rate) - deterministic with seeded RNG
-/// - Network partitions
-/// - Node crashes
-/// - Latency injection
+/// Each network (identified by name) can have its own fault injector, preventing
+/// test interference when multiple tests run concurrently.
+///
+/// # Arguments
+/// * `network_name` - The unique name of the network (from SimNetwork)
+/// * `state` - The fault injector state, or None to clear
 ///
 /// # Example
 /// ```ignore
@@ -203,16 +204,33 @@ static FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<FaultInjector
 ///     .message_loss_rate(0.1)
 ///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
 ///     .build();
-/// let state = FaultInjectorState::new(config, 12345); // seeded for determinism
-/// set_fault_injector(Some(Arc::new(std::sync::Mutex::new(state))));
+/// let state = FaultInjectorState::new(config, 12345);
+/// set_fault_injector("my-test-network", Some(Arc::new(std::sync::Mutex::new(state))));
 /// ```
-pub fn set_fault_injector(state: Option<Arc<std::sync::Mutex<FaultInjectorState>>>) {
-    *FAULT_INJECTOR.write().unwrap() = state;
+pub fn set_fault_injector(
+    network_name: &str,
+    state: Option<Arc<std::sync::Mutex<FaultInjectorState>>>,
+) {
+    let mut injectors = FAULT_INJECTORS.write().unwrap();
+    match state {
+        Some(s) => {
+            injectors.insert(network_name.to_string(), s);
+        }
+        None => {
+            injectors.remove(network_name);
+        }
+    }
 }
 
-/// Returns the current fault injector, if set.
-pub fn get_fault_injector() -> Option<Arc<std::sync::Mutex<FaultInjectorState>>> {
-    FAULT_INJECTOR.read().unwrap().clone()
+/// Returns the fault injector for a specific network, if set.
+pub fn get_fault_injector(network_name: &str) -> Option<Arc<std::sync::Mutex<FaultInjectorState>>> {
+    FAULT_INJECTORS.read().unwrap().get(network_name).cloned()
+}
+
+/// Clears all fault injectors. Useful for test cleanup.
+#[allow(dead_code)]
+pub fn clear_all_fault_injectors() {
+    FAULT_INJECTORS.write().unwrap().clear();
 }
 
 /// Reason for dropping a message.
@@ -249,9 +267,14 @@ pub enum DeliveryDecision {
 ///
 /// Returns a DeliveryDecision indicating whether to deliver, delay, or drop.
 /// Also updates network stats.
-fn check_delivery(from: SocketAddr, to: SocketAddr) -> DeliveryDecision {
-    let Some(injector) = get_fault_injector() else {
-        return DeliveryDecision::Deliver; // No fault injection configured
+///
+/// # Arguments
+/// * `network_name` - The network this message belongs to (for scoped fault injection)
+/// * `from` - Source address
+/// * `to` - Destination address
+fn check_delivery(network_name: &str, from: SocketAddr, to: SocketAddr) -> DeliveryDecision {
+    let Some(injector) = get_fault_injector(network_name) else {
+        return DeliveryDecision::Deliver; // No fault injection configured for this network
     };
 
     let mut state = injector.lock().unwrap();
@@ -389,8 +412,9 @@ impl MemoryConnManager {
         op_manager: Arc<OpManager>,
         add_noise: bool,
         rng_seed: u64,
+        network_name: &str,
     ) -> Self {
-        let transport = InMemoryTransport::new(peer, add_noise, rng_seed);
+        let transport = InMemoryTransport::new(peer, add_noise, rng_seed, network_name);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
         let msg_queue_cp = msg_queue.clone();
@@ -403,9 +427,18 @@ impl MemoryConnManager {
                     continue;
                 };
                 let source_addr = msg.origin.addr;
-                let msg_data: NetMessage =
-                    bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
-                msg_queue_cp.lock().await.push((msg_data, source_addr));
+                match bincode::deserialize_from(Cursor::new(msg.data)) {
+                    Ok(msg_data) => {
+                        msg_queue_cp.lock().await.push((msg_data, source_addr));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            ?source_addr,
+                            error = %e,
+                            "Failed to deserialize message, skipping"
+                        );
+                    }
+                }
             }
         });
 
@@ -485,10 +518,12 @@ struct InMemoryTransport {
     interface_peer: PeerId,
     /// received messages per each peer awaiting processing
     msg_stack_queue: Arc<Mutex<Vec<MessageOnTransit>>>,
+    /// Network name for scoped fault injection
+    network_name: Arc<str>,
 }
 
 impl InMemoryTransport {
-    fn new(interface_peer: PeerId, add_noise: bool, rng_seed: u64) -> Self {
+    fn new(interface_peer: PeerId, add_noise: bool, rng_seed: u64, network_name: &str) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
 
         // Create a dedicated channel for this peer
@@ -546,6 +581,7 @@ impl InMemoryTransport {
         Self {
             interface_peer,
             msg_stack_queue,
+            network_name: network_name.into(),
         }
     }
 
@@ -564,8 +600,8 @@ impl InMemoryTransport {
     }
 
     fn send(&self, target: PeerId, message: Vec<u8>) -> Result<(), ConnectionError> {
-        // Check fault injector before sending
-        match check_delivery(self.interface_peer.addr, target.addr) {
+        // Check fault injector before sending (scoped to this network)
+        match check_delivery(&self.network_name, self.interface_peer.addr, target.addr) {
             DeliveryDecision::Drop(_reason) => {
                 // Message dropped by fault injection - return success to caller
                 // (from sender's perspective, the message was sent)
@@ -603,7 +639,7 @@ impl InMemoryTransport {
                 let target_addr = target.addr;
 
                 // Add to pending deliveries queue
-                if let Some(injector) = get_fault_injector() {
+                if let Some(injector) = get_fault_injector(&self.network_name) {
                     let mut state = injector.lock().unwrap();
                     state.pending_deliveries.push(PendingDelivery {
                         deadline,
