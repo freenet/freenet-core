@@ -634,6 +634,8 @@ pub struct LedbatController {
     min_cwnd_events: AtomicUsize,
     slow_start_exits: AtomicUsize,
     periodic_slowdowns: AtomicUsize,
+    /// Slowdowns skipped because cwnd was too small to meaningfully reduce
+    skipped_slowdowns: AtomicUsize,
     /// Peak congestion window reached during this controller's lifetime
     peak_cwnd: AtomicUsize,
 }
@@ -747,6 +749,7 @@ impl LedbatController {
             min_cwnd_events: AtomicUsize::new(0),
             slow_start_exits: AtomicUsize::new(0),
             periodic_slowdowns: AtomicUsize::new(0),
+            skipped_slowdowns: AtomicUsize::new(0),
             peak_cwnd: AtomicUsize::new(config.initial_cwnd),
         }
     }
@@ -1080,6 +1083,11 @@ impl LedbatController {
                 // Check if it's time for the next scheduled slowdown
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown && next_slowdown != u64::MAX {
+                    // Skip slowdown if cwnd is too small to meaningfully reduce
+                    if self.is_cwnd_too_small_for_slowdown() {
+                        self.skip_slowdown_and_reschedule(now_nanos, base_delay);
+                        return false; // Let congestion avoidance continue to grow cwnd
+                    }
                     self.start_slowdown(now_nanos, base_delay);
                     return true;
                 }
@@ -1089,6 +1097,12 @@ impl LedbatController {
                 // Check if wait period is over
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown {
+                    // Skip slowdown if cwnd is too small to meaningfully reduce
+                    if self.is_cwnd_too_small_for_slowdown() {
+                        self.skip_slowdown_and_reschedule(now_nanos, base_delay);
+                        self.congestion_state.enter_congestion_avoidance();
+                        return false;
+                    }
                     self.start_slowdown(now_nanos, base_delay);
                     return true;
                 }
@@ -1163,6 +1177,48 @@ impl LedbatController {
             }
             CongestionState::SlowStart => false, // SlowStart handled elsewhere
         }
+    }
+
+    /// Check if cwnd is too small for a slowdown to be effective.
+    ///
+    /// A slowdown reduces cwnd by SLOWDOWN_REDUCTION_FACTOR (4x). If cwnd is already
+    /// at or below `min_cwnd * SLOWDOWN_REDUCTION_FACTOR`, the reduction would clamp
+    /// to min_cwnd anyway, making the slowdown ineffective.
+    ///
+    /// This prevents futile slowdown cycles that keep cwnd stuck at minimum:
+    /// - After a timeout, cwnd = min_cwnd
+    /// - Slowdown triggers, but cwnd/4 clamps to min_cwnd
+    /// - Ramp-up target is min_cwnd, so ramp-up completes instantly
+    /// - Next slowdown scheduled in 18 RTTs
+    /// - Cwnd barely recovers before next slowdown
+    /// - Repeat, keeping cwnd perpetually at minimum
+    fn is_cwnd_too_small_for_slowdown(&self) -> bool {
+        let current_cwnd = self.cwnd.load(Ordering::Acquire);
+        // If current cwnd would clamp to min_cwnd after reduction, skip the slowdown
+        current_cwnd <= self.min_cwnd * SLOWDOWN_REDUCTION_FACTOR
+    }
+
+    /// Reschedule the next slowdown without actually performing one.
+    ///
+    /// Used when cwnd is too small for a slowdown to be effective.
+    /// Uses an extended interval (2x normal) to give cwnd time to recover.
+    fn skip_slowdown_and_reschedule(&self, now_nanos: u64, base_delay: Duration) {
+        // Use 2x the normal min_interval to give more recovery time
+        let min_slowdown_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
+        let extended_interval = min_slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64 * 2;
+
+        self.next_slowdown_time_nanos
+            .store(now_nanos + extended_interval, Ordering::Release);
+
+        // Track skipped slowdowns for diagnostics
+        self.skipped_slowdowns.fetch_add(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            cwnd_kb = self.cwnd.load(Ordering::Relaxed) / 1024,
+            min_cwnd_kb = self.min_cwnd / 1024,
+            next_interval_ms = extended_interval / 1_000_000,
+            "LEDBAT++ skipping slowdown: cwnd too small, rescheduling with extended interval"
+        );
     }
 
     /// Start a periodic slowdown cycle.
@@ -1271,6 +1327,7 @@ impl LedbatController {
     /// - Reset cwnd to min_cwnd
     /// - Set ssthresh to max(old_cwnd/2, 2*min_cwnd)
     /// - Enter SlowStart state for exponential recovery
+    /// - Clear any scheduled slowdown (will be rescheduled after slow start exits)
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
@@ -1285,6 +1342,14 @@ impl LedbatController {
         // Floor at 2*min_cwnd to ensure reasonable recovery target
         let new_ssthresh = (old_cwnd / 2).max(self.min_cwnd * 2);
         self.ssthresh.store(new_ssthresh, Ordering::Release);
+
+        // Clear any scheduled slowdown. After timeout, we're resetting state, so
+        // a stale slowdown shouldn't trigger. The slowdown will be rescheduled
+        // after slow start exits (using initial_slow_start_completed flag check).
+        // If initial_slow_start_completed is already true, the skip_slowdown logic
+        // will handle rescheduling when cwnd is too small.
+        self.next_slowdown_time_nanos
+            .store(u64::MAX, Ordering::Release);
 
         // Transition to SlowStart for fast (exponential) recovery.
         // This cleanly overrides any slowdown state without conflicts.
@@ -3832,21 +3897,27 @@ mod tests {
 
     /// Test ramp-up with small pre_slowdown_cwnd near min_cwnd.
     ///
-    /// Edge case: When pre_slowdown_cwnd is close to min_cwnd:
-    /// - pre_slowdown_cwnd = 5000 bytes (close to min_cwnd = 2848)
-    /// - Frozen at 5000/4 = 1250, but clamped to min_cwnd = 2848
-    /// - 85% threshold = 4250 bytes
+    /// Edge case: When pre_slowdown_cwnd results in frozen cwnd at min_cwnd:
+    /// - pre_slowdown_cwnd = 15000 bytes (just above skip threshold of 4*min_cwnd = 11392)
+    /// - Frozen at 15000/4 = 3750, above min_cwnd = 2848
+    /// - 85% threshold = 12750 bytes
     ///
     /// This tests that the 85% recovery threshold works correctly even when
-    /// the frozen cwnd is clamped to min_cwnd (making the growth ratio smaller).
+    /// the frozen cwnd is close to min_cwnd (making the growth ratio smaller).
+    ///
+    /// Note: Slowdowns with cwnd <= min_cwnd * 4 are now skipped (they would be
+    /// ineffective since cwnd/4 clamps to min_cwnd). This test uses a cwnd just
+    /// above that threshold to still exercise the ramp-up behavior.
     #[tokio::test]
     async fn test_rampup_with_small_pre_slowdown_cwnd() {
         let min_cwnd = 2848;
         let config = LedbatConfig {
-            initial_cwnd: 5_000, // Small, close to min_cwnd
+            // Use cwnd well above skip threshold (min_cwnd * 4 = 11392)
+            // Use high initial_cwnd to ensure we stay above threshold after slow start
+            initial_cwnd: 60_000,
             min_cwnd,
             max_cwnd: 10_000_000,
-            ssthresh: 4_000, // Exit slow start quickly
+            ssthresh: 40_000, // Exit slow start when we reach this
             enable_slow_start: true,
             enable_periodic_slowdown: true,
             randomize_ssthresh: false,
@@ -3854,15 +3925,17 @@ mod tests {
         };
         let controller = LedbatController::new_with_config(config);
 
-        controller.on_send(100_000);
+        controller.on_send(200_000);
 
         // Phase 1: Establish base_delay and exit slow start
+        // Use larger bytes_acked to ensure cwnd grows during slow start
         let rtt = Duration::from_millis(50);
-        for _ in 0..5 {
-            controller.on_ack(rtt, 1000);
+        for _ in 0..6 {
+            controller.on_ack(rtt, 10_000);
             tokio::time::sleep(Duration::from_millis(55)).await;
         }
 
+        // Should have exited slow start
         assert!(
             controller.congestion_state.load() != CongestionState::SlowStart,
             "Should have exited slow start"
@@ -3871,12 +3944,17 @@ mod tests {
         let pre_slowdown_cwnd = controller.current_cwnd();
         println!("Pre-slowdown cwnd: {} bytes", pre_slowdown_cwnd);
         println!("min_cwnd: {} bytes", min_cwnd);
+        println!(
+            "Skip threshold: {} bytes",
+            min_cwnd * SLOWDOWN_REDUCTION_FACTOR
+        );
 
-        // Verify we're in a small cwnd scenario
+        // Verify we're above the skip threshold so slowdown will actually happen
         assert!(
-            pre_slowdown_cwnd < 10_000,
-            "Test expects small cwnd, got {}",
-            pre_slowdown_cwnd
+            pre_slowdown_cwnd > min_cwnd * SLOWDOWN_REDUCTION_FACTOR,
+            "Test expects cwnd above skip threshold ({} > {})",
+            pre_slowdown_cwnd,
+            min_cwnd * SLOWDOWN_REDUCTION_FACTOR
         );
 
         // Phase 2: Trigger slowdown
@@ -5605,5 +5683,229 @@ mod tests {
             "Base delay should return to near baseline: {:?}",
             final_base_delay
         );
+    }
+
+    /// Regression test: cwnd stuck at minimum due to ineffective slowdowns
+    ///
+    /// This tests the scenario reported in the field:
+    /// - After timeout, cwnd is at min_cwnd
+    /// - Slowdowns keep triggering every 18 RTTs
+    /// - Each slowdown is ineffective (cwnd/4 clamps to min_cwnd)
+    /// - cwnd never has time to recover before next slowdown
+    ///
+    /// The fix: Skip slowdowns when cwnd is too small to meaningfully reduce.
+    /// This allows cwnd to grow back to a healthy level before slowdowns resume.
+    #[tokio::test]
+    async fn test_cwnd_recovery_after_timeout_with_slowdowns() {
+        let rtt = Duration::from_millis(30); // ~30ms RTT as in the field report
+
+        let config = LedbatConfig {
+            initial_cwnd: 100_000, // Start healthy
+            min_cwnd: 2848,        // 2 * MSS
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Warm up: exit slow start and have a scheduled slowdown
+        controller.on_send(500_000);
+        for i in 0..10 {
+            controller.on_ack(rtt, 5000);
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            if i % 3 == 0 {
+                println!(
+                    "Warmup {}: cwnd={}, state={:?}",
+                    i,
+                    controller.current_cwnd() / 1024,
+                    controller.congestion_state.load()
+                );
+            }
+        }
+
+        println!(
+            "After warmup: cwnd={}KB, slowdowns={}, state={:?}",
+            controller.current_cwnd() / 1024,
+            controller.periodic_slowdowns.load(Ordering::Relaxed),
+            controller.congestion_state.load()
+        );
+
+        // Simulate timeout - this is the scenario from the field
+        controller.on_timeout();
+
+        let post_timeout_cwnd = controller.current_cwnd();
+        assert_eq!(
+            post_timeout_cwnd, controller.min_cwnd,
+            "Timeout should reset cwnd to min_cwnd"
+        );
+        println!(
+            "After timeout: cwnd={}KB, next_slowdown cleared={}",
+            post_timeout_cwnd / 1024,
+            controller.next_slowdown_time_nanos.load(Ordering::Relaxed) == u64::MAX
+        );
+
+        // Verify scheduled slowdown was cleared
+        assert_eq!(
+            controller.next_slowdown_time_nanos.load(Ordering::Relaxed),
+            u64::MAX,
+            "Timeout should clear scheduled slowdown"
+        );
+
+        // Now simulate recovery - slow start then congestion avoidance
+        // With the old bug: slowdowns would trigger and keep cwnd at minimum
+        // With the fix: slowdowns are skipped, allowing cwnd to grow
+
+        let recovery_start = std::time::Instant::now();
+        let recovery_duration = Duration::from_secs(2); // Simulate 2 seconds of recovery
+
+        let mut max_cwnd_during_recovery = post_timeout_cwnd;
+
+        let initial_slowdowns = controller.periodic_slowdowns.load(Ordering::Relaxed);
+        let initial_skipped = controller.skipped_slowdowns.load(Ordering::Relaxed);
+
+        while recovery_start.elapsed() < recovery_duration {
+            // Simulate ACKs with good RTT (no congestion)
+            controller.on_ack(rtt, 2000);
+
+            max_cwnd_during_recovery = max_cwnd_during_recovery.max(controller.current_cwnd());
+
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+
+        let slowdowns_during_recovery =
+            controller.periodic_slowdowns.load(Ordering::Relaxed) - initial_slowdowns;
+        let skipped_during_recovery =
+            controller.skipped_slowdowns.load(Ordering::Relaxed) - initial_skipped;
+
+        let final_cwnd = controller.current_cwnd();
+
+        println!(
+            "After 2s recovery: cwnd={}KB (max={}KB), slowdowns={}, skipped={}",
+            final_cwnd / 1024,
+            max_cwnd_during_recovery / 1024,
+            slowdowns_during_recovery,
+            skipped_during_recovery
+        );
+
+        // With the fix:
+        // - Slowdowns should be skipped while cwnd is small (counted in skipped_slowdowns)
+        // - cwnd should grow significantly above min_cwnd
+        // - Eventually slowdowns resume when cwnd is healthy
+
+        // cwnd should recover to at least 4x min_cwnd (the threshold for skipping)
+        let min_expected_cwnd = controller.min_cwnd * SLOWDOWN_REDUCTION_FACTOR;
+        assert!(
+            max_cwnd_during_recovery >= min_expected_cwnd,
+            "cwnd should recover to at least {}KB (4x min_cwnd). \
+             Max during recovery: {}KB. \
+             This suggests slowdowns prevented recovery.",
+            min_expected_cwnd / 1024,
+            max_cwnd_during_recovery / 1024
+        );
+
+        // If slowdowns happened, they should have been skipped (not actually reducing cwnd)
+        // when cwnd was small
+        if skipped_during_recovery > 0 {
+            println!(
+                "✓ {} slowdowns were skipped because cwnd was too small",
+                skipped_during_recovery
+            );
+        }
+
+        println!("✓ cwnd recovery after timeout test passed");
+    }
+
+    /// Test that multiple LEDBAT controllers don't interfere with each other
+    ///
+    /// This validates that the fix works correctly when multiple connections
+    /// are active simultaneously (as mentioned in the field report).
+    #[tokio::test]
+    async fn test_multiple_connections_independent_slowdowns() {
+        let rtt1 = Duration::from_millis(30);
+        let rtt2 = Duration::from_millis(100);
+
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 30_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let controller1 = LedbatController::new_with_config(config.clone());
+        let controller2 = LedbatController::new_with_config(config);
+
+        // Warm up both controllers
+        controller1.on_send(100_000);
+        controller2.on_send(100_000);
+
+        for _ in 0..5 {
+            controller1.on_ack(rtt1, 3000);
+            controller2.on_ack(rtt2, 3000);
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+
+        println!(
+            "Initial: c1_cwnd={}KB, c2_cwnd={}KB",
+            controller1.current_cwnd() / 1024,
+            controller2.current_cwnd() / 1024
+        );
+
+        // Timeout on controller1 only
+        controller1.on_timeout();
+
+        assert_eq!(
+            controller1.current_cwnd(),
+            controller1.min_cwnd,
+            "Controller 1 should be at min_cwnd after timeout"
+        );
+        assert!(
+            controller2.current_cwnd() > controller2.min_cwnd * 2,
+            "Controller 2 should still have healthy cwnd"
+        );
+
+        // Run both for a while
+        let test_duration = Duration::from_secs(1);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < test_duration {
+            controller1.on_ack(rtt1, 2000);
+            controller2.on_ack(rtt2, 2000);
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+
+        let c1_final = controller1.current_cwnd();
+        let c2_final = controller2.current_cwnd();
+        let c1_skipped = controller1.skipped_slowdowns.load(Ordering::Relaxed);
+        let c2_slowdowns = controller2.periodic_slowdowns.load(Ordering::Relaxed);
+
+        println!(
+            "After 1s: c1_cwnd={}KB (skipped={}), c2_cwnd={}KB (slowdowns={})",
+            c1_final / 1024,
+            c1_skipped,
+            c2_final / 1024,
+            c2_slowdowns
+        );
+
+        // Controller1 should have recovered from min_cwnd
+        assert!(
+            c1_final > controller1.min_cwnd,
+            "Controller 1 should recover from min_cwnd"
+        );
+
+        // Controllers should operate independently
+        // (this mainly checks there's no global state corruption)
+        assert!(
+            c2_final > controller2.min_cwnd * 2,
+            "Controller 2 should maintain healthy cwnd independently"
+        );
+
+        println!("✓ Multiple connections test passed");
     }
 }
