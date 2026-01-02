@@ -525,34 +525,6 @@ pub(crate) async fn run_op_request_mediator(
     tracing::info!("Op request mediator stopped");
 }
 
-#[allow(dead_code)] // These methods are part of the public API for future event loop patterns
-impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
-    pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
-        tracing::trace!("Waiting to receive transaction from executor channel");
-        let tx = self.end.waiting_for_op_rx.recv().await.ok_or_else(|| {
-            tracing::error!(
-                phase = "channel_closed",
-                "Executor channel closed - all senders dropped. Possible causes: 1) executor task panic, 2) network timeout cascade, 3) resource constraints"
-            );
-            anyhow::anyhow!("channel closed")
-        })?;
-        tracing::trace!(
-            tx = %tx,
-            "Successfully received transaction from executor channel"
-        );
-        Ok(tx)
-    }
-
-    pub(crate) fn callback(&self) -> ExecutorToEventLoopChannel<Callback> {
-        ExecutorToEventLoopChannel {
-            op_manager: self.op_manager.clone(),
-            end: Callback {
-                response_for_tx: self.end.response_for_tx.clone(),
-            },
-        }
-    }
-}
-
 impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     type Item = Transaction;
 
