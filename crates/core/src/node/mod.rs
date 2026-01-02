@@ -686,6 +686,7 @@ macro_rules! handle_op_not_available {
 
 /// Legacy process_message - only kept for testing_impl
 /// Production code uses process_message_decoupled instead
+#[allow(dead_code)] // May be used for alternative event loop patterns
 pub(super) async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
@@ -802,6 +803,7 @@ where
     }
 }
 
+#[allow(dead_code)] // Called by process_message
 async fn process_message_v1<CB>(
     tx: Option<Transaction>,
     msg: NetMessageV1,

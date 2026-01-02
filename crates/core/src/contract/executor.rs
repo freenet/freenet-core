@@ -258,6 +258,7 @@ impl Display for OperationMode {
 }
 
 pub struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
+    #[allow(dead_code)] // Used for reference in callback pattern
     op_manager: Arc<OpManager>,
     end: End,
 }
@@ -524,6 +525,7 @@ pub(crate) async fn run_op_request_mediator(
     tracing::info!("Op request mediator stopped");
 }
 
+#[allow(dead_code)] // These methods are part of the public API for future event loop patterns
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         tracing::trace!("Waiting to receive transaction from executor channel");
@@ -576,6 +578,7 @@ pub(crate) struct Callback {
     response_for_tx: mpsc::Sender<OpEnum>,
 }
 
+#[allow(dead_code)] // Used via callback pattern
 pub(crate) struct NetworkEventListenerHalve {
     /// this is the receiver end of the Executor halve, which will be sent from the executor
     /// when a callback is expected for a given transaction

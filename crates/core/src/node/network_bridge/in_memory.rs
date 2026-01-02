@@ -86,6 +86,7 @@ pub struct FaultInjectorState {
     /// The fault configuration (message loss, partitions, crashes, latency)
     pub config: FaultConfig,
     /// Seeded RNG for deterministic fault decisions
+    #[allow(dead_code)] // Public API for external fault injection use
     pub rng: SimulationRng,
     /// Optional VirtualTime for deterministic latency
     pub virtual_time: Option<VirtualTime>,

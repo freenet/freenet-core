@@ -261,6 +261,7 @@ pub(crate) fn contract_handler_channel() -> (
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)] // Public API for alternative event loop patterns
 impl ContractHandlerChannel<WaitingResolution> {
     pub async fn relay_transaction_result_to_client(
         &mut self,
