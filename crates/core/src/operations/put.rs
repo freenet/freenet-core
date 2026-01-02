@@ -341,7 +341,7 @@ impl Operation for PutOp {
                             phase = "update_trigger",
                             "PUT on subscribed contract resulted in state change, triggering Update"
                         );
-                        start_update_after_put(op_manager, id, key, merged_value.clone()).await;
+                        start_update_after_put(op_manager, key, merged_value.clone()).await;
                     }
 
                     // Step 2: Determine if we should forward or respond
@@ -621,24 +621,23 @@ async fn start_subscription_after_put(
 }
 
 /// Helper to start an Update operation when a PUT on a subscribed contract results in state change.
-/// This propagates the merged state to other subscribers.
-async fn start_update_after_put(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-    new_state: WrappedState,
-) {
+/// This propagates the merged state to other subscribers asynchronously (fire-and-forget).
+///
+/// Updates spread through the subscription tree like a virus - there is no meaningful "completion"
+/// signal since we can't know when all subscribers have received the update. The PUT response
+/// should not wait for update propagation.
+async fn start_update_after_put(op_manager: &OpManager, key: ContractKey, new_state: WrappedState) {
     use super::update;
 
-    let child_tx = Transaction::new_child_of::<update::UpdateMsg>(&parent_tx);
-    op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
+    // Create a standalone transaction - NOT a child of the PUT.
+    // Updates are fire-and-forget; the PUT response should return immediately.
+    let update_tx = Transaction::new::<update::UpdateMsg>();
 
     tracing::debug!(
-        tx = %parent_tx,
-        child_tx = %child_tx,
+        tx = %update_tx,
         contract = %key,
         phase = "update",
-        "Starting Update as child operation after PUT changed subscribed contract state"
+        "Starting async Update after PUT changed subscribed contract state"
     );
 
     let op_manager_cloned = op_manager.clone();
@@ -651,16 +650,15 @@ async fn start_update_after_put(
             freenet_stdlib::prelude::State::from(new_state),
         );
         let update_op =
-            update::start_op_with_id(key, update_data, RelatedContracts::default(), child_tx);
+            update::start_op_with_id(key, update_data, RelatedContracts::default(), update_tx);
 
         match update::request_update(&op_manager_cloned, update_op).await {
             Ok(_) => {
-                tracing::debug!(tx = %child_tx, parent_tx = %parent_tx, contract = %key, phase = "complete", "child Update completed");
+                tracing::debug!(tx = %update_tx, contract = %key, phase = "propagating", "Update initiated successfully");
             }
             Err(error) => {
-                tracing::error!(tx = %parent_tx, child_tx = %child_tx, contract = %key, error = %error, phase = "error", "child Update failed");
-                // Note: We don't propagate this failure to the parent PUT since the PUT itself
-                // succeeded - the Update is best-effort propagation to subscribers
+                // Updates are best-effort - log but don't fail
+                tracing::warn!(tx = %update_tx, contract = %key, error = %error, phase = "error", "Update initiation failed");
             }
         }
     });
