@@ -2,6 +2,10 @@
 //!
 //! This module provides a `Builder` that uses the production event loop (`P2pConnManager`)
 //! with `InMemorySocket` for testing without real network I/O.
+//!
+//! Each node must have the network context set before binding sockets. This is done
+//! automatically by the `run_node` and `run_node_with_shared_storage` methods using
+//! the `network_name` from the `Builder`.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -22,7 +26,7 @@ use crate::{
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
-    transport::in_memory_socket::InMemorySocket,
+    transport::in_memory_socket::{register_address_network, InMemorySocket},
     wasm_runtime::MockStateStorage,
 };
 
@@ -124,6 +128,14 @@ impl<ER> Builder<ER> {
             )
             .instrument(tracing::info_span!(parent: parent_span.clone(), "client_event_handling"))
         });
+
+        // Register this node's address with its network for InMemorySocket binding
+        // This is thread-safe and must be done before the event loop binds the socket
+        let local_addr = std::net::SocketAddr::new(
+            self.config.network_listener_ip,
+            self.config.network_listener_port,
+        );
+        register_address_network(local_addr, &self.network_name);
 
         // Run the production event loop with InMemorySocket
         let result = conn_manager
@@ -257,6 +269,14 @@ impl<ER> Builder<ER> {
             )
             .instrument(tracing::info_span!(parent: parent_span.clone(), "client_event_handling"))
         });
+
+        // Register this node's address with its network for InMemorySocket binding
+        // This is thread-safe and must be done before the event loop binds the socket
+        let local_addr = std::net::SocketAddr::new(
+            self.config.network_listener_ip,
+            self.config.network_listener_port,
+        );
+        register_address_network(local_addr, &self.network_name);
 
         // Run the production event loop with InMemorySocket
         let result = conn_manager

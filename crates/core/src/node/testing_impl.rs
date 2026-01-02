@@ -82,8 +82,7 @@ use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::{ConfigArgs, GlobalExecutor},
     dev_tool::TransportKeypair,
-    message::NodeEvent,
-    node::{InitPeerNode, NetEventRegister, NodeConfig, PeerId},
+    node::{InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
     simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
@@ -358,7 +357,6 @@ type DefaultRegistry = TestEventListener;
 pub(super) struct Builder<ER> {
     pub config: NodeConfig,
     contract_handler_name: String,
-    add_noise: bool,
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
@@ -374,14 +372,12 @@ impl<ER: NetEventRegister> Builder<ER> {
         builder: NodeConfig,
         event_register: ER,
         contract_handler_name: String,
-        add_noise: bool,
         rng_seed: u64,
         network_name: String,
     ) -> Builder<ER> {
         Builder {
             config: builder.clone(),
             contract_handler_name,
-            add_noise,
             event_register,
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
@@ -441,7 +437,6 @@ pub struct SimNetwork {
     max_connections: usize,
     min_connections: usize,
     start_backoff: Duration,
-    add_noise: bool,
     /// Master seed for deterministic RNG - used to derive per-peer seeds
     seed: u64,
     /// VirtualTime for deterministic simulation - always enabled
@@ -495,7 +490,6 @@ impl SimNetwork {
             max_connections,
             min_connections,
             start_backoff: Duration::from_millis(1),
-            add_noise: false,
             seed,
             virtual_time,
             running_nodes: HashMap::new(),
@@ -548,20 +542,6 @@ impl SimNetwork {
 impl SimNetwork {
     pub fn with_start_backoff(&mut self, value: Duration) {
         self.start_backoff = value;
-    }
-
-    /// Simulates network random behavior, like messages arriving delayed or out of order, throttling, etc.
-    ///
-    /// **Warning: Non-deterministic mode.** Enabling noise introduces timing-dependent
-    /// behavior that makes test results harder to reproduce, even with the same seed.
-    /// The noise affects message shuffling and timing in ways that depend on thread
-    /// scheduling and system load.
-    ///
-    /// For deterministic testing, prefer using `with_fault_injection` with `FaultConfig`
-    /// instead, which provides controllable, seeded randomness for message loss and latency.
-    #[allow(unused)]
-    pub fn with_noise(&mut self) {
-        self.add_noise = true;
     }
 
     /// Returns the VirtualTime instance for this simulation.
@@ -872,7 +852,7 @@ impl SimNetwork {
         R: crate::client_events::test::RandomEventGenerator + Send + 'static,
     {
         use crate::node::network_bridge::get_fault_injector;
-        use crate::node::network_bridge::in_memory::unregister_peer;
+        use crate::transport::in_memory_socket::unregister_socket;
 
         // Get the saved restartable config
         let restart_config = match self.restartable_configs.get(label) {
@@ -894,8 +874,8 @@ impl SimNetwork {
 
         tracing::info!(?label, ?node_addr, "Restarting node with persisted state");
 
-        // Unregister the old peer from transport (the new node will re-register)
-        unregister_peer(&node_addr);
+        // Unregister the old socket from transport (the new node will re-register)
+        unregister_socket(&self.name, &node_addr);
 
         // Clear crash status in fault injector
         if let Some(injector) = get_fault_injector(&self.name) {
@@ -923,7 +903,6 @@ impl SimNetwork {
             restart_config.config.clone(),
             event_listener,
             format!("{}-{}", self.name, label),
-            self.add_noise,
             restart_config.rng_seed,
             self.name.clone(),
         );
@@ -1060,7 +1039,6 @@ impl SimNetwork {
                 this_node,
                 event_listener,
                 format!("{}-{label}", self.name, label = this_config.label),
-                self.add_noise,
                 peer_seed,
                 self.name.clone(),
             );
@@ -1132,7 +1110,6 @@ impl SimNetwork {
                 config,
                 event_listener,
                 format!("{}-{label}", self.name),
-                self.add_noise,
                 peer_seed,
                 self.name.clone(),
             );
@@ -1149,7 +1126,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
-        use crate::node::network_bridge::in_memory::is_peer_registered;
+        use crate::transport::in_memory_socket::is_socket_registered;
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
         let mut peers = vec![];
@@ -1229,7 +1206,7 @@ impl SimNetwork {
         'wait_loop: loop {
             let mut all_registered = true;
             for addr in &gateway_addrs {
-                if !is_peer_registered(addr) {
+                if !is_socket_registered(&self.name, addr) {
                     all_registered = false;
                     break;
                 }
@@ -1250,7 +1227,7 @@ impl SimNetwork {
                      Registered: {}/{}",
                     gateway_addrs
                         .iter()
-                        .filter(|a| is_peer_registered(a))
+                        .filter(|a| is_socket_registered(&self.name, a))
                         .count(),
                     gateway_addrs.len()
                 );
@@ -2220,7 +2197,6 @@ impl std::fmt::Debug for SimNetwork {
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
             .field("init_backoff", &self.start_backoff)
-            .field("add_noise", &self.add_noise)
             .finish()
     }
 }

@@ -4,9 +4,20 @@
 //! that allows the production event loop (`P2pConnManager`) to be used in
 //! tests without real UDP sockets.
 //!
-//! The implementation uses a global registry to route packets between sockets,
-//! and integrates with the existing fault injection infrastructure for
-//! deterministic testing.
+//! The implementation uses network-scoped registries to route packets between
+//! sockets, enabling test isolation when multiple SimNetwork instances run
+//! concurrently. Each network (identified by name) has its own socket registry.
+//!
+//! # Usage
+//!
+//! Before binding an `InMemorySocket`, register the address with its network:
+//!
+//! ```ignore
+//! use freenet::transport::in_memory_socket::{register_address_network, InMemorySocket};
+//!
+//! register_address_network(addr, "my-test-network");
+//! let socket = InMemorySocket::bind(addr).await?;
+//! ```
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -19,159 +30,52 @@ use std::{
 use tokio::sync::Mutex;
 
 use super::Socket;
-use crate::simulation::{FaultConfig, SimulationRng, TimeSource, VirtualTime};
 
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;
 
-/// A packet pending delivery at a virtual time deadline.
-#[derive(Debug, Clone)]
-pub struct PendingPacket {
-    /// Virtual time deadline (nanoseconds) when packet should be delivered
-    pub deadline: u64,
-    /// The packet data
-    pub data: Vec<u8>,
-    /// Source address
-    pub from: SocketAddr,
-    /// Target address
-    pub target: SocketAddr,
+/// Global registry mapping socket addresses to their network names.
+/// This is used during `InMemorySocket::bind()` to determine which network
+/// a socket belongs to. The mapping is thread-safe and works across async tasks.
+static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Registers a socket address with a network name.
+///
+/// This must be called before `InMemorySocket::bind()` to specify which
+/// network the socket belongs to. Sockets in different networks are isolated
+/// and cannot communicate with each other.
+///
+/// This function is thread-safe and can be called from any thread.
+///
+/// # Example
+/// ```ignore
+/// register_address_network(addr, "test-network-1");
+/// let socket = InMemorySocket::bind(addr).await?;
+/// ```
+pub fn register_address_network(addr: SocketAddr, network_name: &str) {
+    ADDRESS_NETWORKS
+        .write()
+        .unwrap()
+        .insert(addr, network_name.to_string());
 }
 
-/// Statistics for socket-level fault injection.
-#[derive(Debug, Clone, Default)]
-pub struct SocketNetworkStats {
-    /// Total packets sent
-    pub packets_sent: u64,
-    /// Packets delivered immediately
-    pub packets_delivered: u64,
-    /// Packets dropped due to message loss rate
-    pub packets_dropped_loss: u64,
-    /// Packets dropped due to network partitions
-    pub packets_dropped_partition: u64,
-    /// Packets dropped due to crashed nodes
-    pub packets_dropped_crash: u64,
-    /// Packets queued for delayed delivery (VirtualTime mode)
-    pub packets_queued: u64,
-    /// Packets delivered after delay
-    pub packets_delayed_delivered: u64,
-    /// Total latency added (in nanoseconds)
-    pub total_latency_nanos: u64,
+/// Unregisters a socket address from the network mapping.
+fn unregister_address_network(addr: &SocketAddr) {
+    ADDRESS_NETWORKS.write().unwrap().remove(addr);
 }
 
-impl SocketNetworkStats {
-    /// Returns total dropped packets.
-    pub fn total_dropped(&self) -> u64 {
-        self.packets_dropped_loss + self.packets_dropped_partition + self.packets_dropped_crash
-    }
-
-    /// Returns the packet loss ratio (0.0 to 1.0).
-    pub fn loss_ratio(&self) -> f64 {
-        if self.packets_sent == 0 {
-            0.0
-        } else {
-            self.total_dropped() as f64 / self.packets_sent as f64
-        }
-    }
-
-    /// Returns average latency per delayed packet.
-    pub fn average_latency(&self) -> Duration {
-        if self.packets_delayed_delivered == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.total_latency_nanos / self.packets_delayed_delivered)
-        }
-    }
+/// Gets the network name for an address, if registered.
+fn get_address_network(addr: &SocketAddr) -> Option<String> {
+    ADDRESS_NETWORKS.read().unwrap().get(addr).cloned()
 }
 
-/// State for socket-level fault injection.
-pub struct SocketFaultInjector {
-    /// Fault configuration
-    pub config: FaultConfig,
-    /// Seeded RNG for deterministic decisions
-    pub rng: SimulationRng,
-    /// Optional VirtualTime for deterministic latency
-    pub virtual_time: Option<VirtualTime>,
-    /// Packets pending delivery in VirtualTime mode
-    pub pending_packets: Vec<PendingPacket>,
-    /// Network statistics
-    pub stats: SocketNetworkStats,
+/// Clears all address-network mappings. Useful for test cleanup.
+pub fn clear_all_address_networks() {
+    ADDRESS_NETWORKS.write().unwrap().clear();
 }
 
-impl SocketFaultInjector {
-    /// Creates a new fault injector with the given config and seed.
-    pub fn new(config: FaultConfig, seed: u64) -> Self {
-        Self {
-            config,
-            rng: SimulationRng::new(seed),
-            virtual_time: None,
-            pending_packets: Vec::new(),
-            stats: SocketNetworkStats::default(),
-        }
-    }
-
-    /// Enables VirtualTime mode.
-    pub fn with_virtual_time(mut self, vt: VirtualTime) -> Self {
-        self.virtual_time = Some(vt);
-        self
-    }
-
-    /// Returns reference to VirtualTime if enabled.
-    pub fn virtual_time(&self) -> Option<&VirtualTime> {
-        self.virtual_time.as_ref()
-    }
-
-    /// Advances virtual time and delivers pending packets.
-    /// Returns number of packets delivered.
-    pub fn advance_time(&mut self) -> usize {
-        let Some(ref vt) = self.virtual_time else {
-            return 0;
-        };
-
-        let now = vt.now_nanos();
-        let mut delivered = 0;
-
-        // Find packets ready for delivery
-        let ready: Vec<usize> = self
-            .pending_packets
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.deadline <= now)
-            .map(|(i, _)| i)
-            .collect();
-
-        // Deliver in reverse order to maintain indices
-        for idx in ready.into_iter().rev() {
-            let packet = self.pending_packets.remove(idx);
-            let registry = SOCKET_REGISTRY.read().unwrap();
-            if registry.deliver_packet(packet.target, packet.data, packet.from) {
-                delivered += 1;
-                self.stats.packets_delayed_delivered += 1;
-            }
-        }
-
-        delivered
-    }
-
-    /// Returns reference to stats.
-    pub fn stats(&self) -> &SocketNetworkStats {
-        &self.stats
-    }
-
-    /// Resets statistics.
-    pub fn reset_stats(&mut self) {
-        self.stats = SocketNetworkStats::default();
-    }
-}
-
-/// Reason for dropping a packet.
-#[derive(Debug, Clone, Copy)]
-pub enum PacketDropReason {
-    RandomLoss,
-    Partition,
-    NodeCrashed,
-}
-
-/// Result of checking packet delivery.
+/// Result of checking packet delivery through fault injection.
 #[derive(Debug)]
 pub enum PacketDeliveryDecision {
     /// Deliver immediately
@@ -179,74 +83,69 @@ pub enum PacketDeliveryDecision {
     /// Delay delivery (real-time mode)
     DelayedDelivery(Duration),
     /// Queue for virtual time delivery
-    QueuedDelivery { deadline: u64, latency: Duration },
+    QueuedDelivery {
+        /// Virtual time deadline in nanoseconds
+        deadline: u64,
+    },
     /// Drop the packet
-    Drop(PacketDropReason),
+    Drop,
 }
 
-/// Global fault injector for socket-level testing.
-static SOCKET_FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<SocketFaultInjector>>>>> =
+/// Callback type for packet delivery decisions.
+///
+/// This allows the fault injection logic to be injected from outside
+/// without creating circular dependencies.
+pub type PacketDeliveryCallback =
+    Arc<dyn Fn(&str, SocketAddr, SocketAddr) -> PacketDeliveryDecision + Send + Sync>;
+
+/// Callback for queuing a packet for delayed delivery.
+pub type QueuePacketCallback =
+    Arc<dyn Fn(&str, u64, Vec<u8>, SocketAddr, SocketAddr) + Send + Sync>;
+
+/// Global callbacks for fault injection integration.
+static DELIVERY_CALLBACK: LazyLock<RwLock<Option<PacketDeliveryCallback>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Sets the global socket fault injector.
-pub fn set_socket_fault_injector(injector: Option<Arc<std::sync::Mutex<SocketFaultInjector>>>) {
-    *SOCKET_FAULT_INJECTOR.write().unwrap() = injector;
+static QUEUE_PACKET_CALLBACK: LazyLock<RwLock<Option<QueuePacketCallback>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Registers the packet delivery callback for fault injection.
+///
+/// This is called by the testing infrastructure to wire up fault injection.
+pub fn set_packet_delivery_callback(callback: Option<PacketDeliveryCallback>) {
+    *DELIVERY_CALLBACK.write().unwrap() = callback;
 }
 
-/// Gets the global socket fault injector.
-pub fn get_socket_fault_injector() -> Option<Arc<std::sync::Mutex<SocketFaultInjector>>> {
-    SOCKET_FAULT_INJECTOR.read().unwrap().clone()
+/// Registers the queue packet callback for virtual time delivery.
+pub fn set_queue_packet_callback(callback: Option<QueuePacketCallback>) {
+    *QUEUE_PACKET_CALLBACK.write().unwrap() = callback;
 }
 
-/// Checks if a packet should be delivered.
-fn check_packet_delivery(from: SocketAddr, to: SocketAddr) -> PacketDeliveryDecision {
-    let Some(injector) = get_socket_fault_injector() else {
-        return PacketDeliveryDecision::Deliver;
-    };
-
-    let mut state = injector.lock().unwrap();
-    state.stats.packets_sent += 1;
-
-    // Check if sender or receiver is crashed
-    if state.config.is_crashed(&from) || state.config.is_crashed(&to) {
-        state.stats.packets_dropped_crash += 1;
-        return PacketDeliveryDecision::Drop(PacketDropReason::NodeCrashed);
+/// Checks if a packet should be delivered based on fault injection config.
+fn check_packet_delivery(
+    network_name: &str,
+    from: SocketAddr,
+    to: SocketAddr,
+) -> PacketDeliveryDecision {
+    let callback = DELIVERY_CALLBACK.read().unwrap();
+    match callback.as_ref() {
+        Some(cb) => cb(network_name, from, to),
+        None => PacketDeliveryDecision::Deliver,
     }
+}
 
-    // Get current virtual time
-    let current_time = state
-        .virtual_time
-        .as_ref()
-        .map(|vt| vt.now_nanos())
-        .unwrap_or(0);
-
-    // Check for partition
-    if state.config.is_partitioned(&from, &to, current_time) {
-        state.stats.packets_dropped_partition += 1;
-        return PacketDeliveryDecision::Drop(PacketDropReason::Partition);
+/// Queues a packet for delayed delivery in virtual time mode.
+fn queue_packet_for_delivery(
+    network_name: &str,
+    deadline: u64,
+    data: Vec<u8>,
+    from: SocketAddr,
+    target: SocketAddr,
+) {
+    let callback = QUEUE_PACKET_CALLBACK.read().unwrap();
+    if let Some(cb) = callback.as_ref() {
+        cb(network_name, deadline, data, from, target);
     }
-
-    // Check message loss
-    if state.config.should_drop_message(&state.rng) {
-        state.stats.packets_dropped_loss += 1;
-        return PacketDeliveryDecision::Drop(PacketDropReason::RandomLoss);
-    }
-
-    // Check latency injection
-    if let Some(latency) = state.config.generate_latency(&state.rng) {
-        if let Some(ref vt) = state.virtual_time {
-            let deadline = vt.now_nanos() + latency.as_nanos() as u64;
-            state.stats.packets_queued += 1;
-            state.stats.total_latency_nanos += latency.as_nanos() as u64;
-            return PacketDeliveryDecision::QueuedDelivery { deadline, latency };
-        } else {
-            state.stats.total_latency_nanos += latency.as_nanos() as u64;
-            return PacketDeliveryDecision::DelayedDelivery(latency);
-        }
-    }
-
-    state.stats.packets_delivered += 1;
-    PacketDeliveryDecision::Deliver
 }
 
 /// A received packet with source address.
@@ -286,7 +185,7 @@ impl SocketInbox {
     }
 }
 
-/// Global registry for in-memory sockets.
+/// Registry for sockets within a single network.
 #[derive(Default)]
 struct SocketRegistry {
     /// Maps socket address to inbox
@@ -329,30 +228,89 @@ impl SocketRegistry {
     }
 }
 
-/// Global socket registry.
-static SOCKET_REGISTRY: LazyLock<RwLock<SocketRegistry>> =
-    LazyLock::new(|| RwLock::new(SocketRegistry::default()));
+/// Global map of network name -> socket registry.
+///
+/// Each SimNetwork gets its own registry, providing test isolation.
+static SOCKET_REGISTRIES: LazyLock<RwLock<HashMap<String, Arc<RwLock<SocketRegistry>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Checks if a socket is registered at the given address.
-pub fn is_socket_registered(addr: &SocketAddr) -> bool {
-    SOCKET_REGISTRY.read().unwrap().is_registered(addr)
+/// Gets or creates the socket registry for a network.
+fn get_or_create_registry(network_name: &str) -> Arc<RwLock<SocketRegistry>> {
+    let registries = SOCKET_REGISTRIES.read().unwrap();
+    if let Some(registry) = registries.get(network_name) {
+        return registry.clone();
+    }
+    drop(registries);
+
+    let mut registries = SOCKET_REGISTRIES.write().unwrap();
+    registries
+        .entry(network_name.to_string())
+        .or_insert_with(|| Arc::new(RwLock::new(SocketRegistry::default())))
+        .clone()
 }
 
-/// Unregisters a socket from the global registry.
-pub fn unregister_socket(addr: &SocketAddr) {
-    SOCKET_REGISTRY.write().unwrap().unregister(addr);
+/// Gets the socket registry for a network, if it exists.
+fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
+    SOCKET_REGISTRIES.read().unwrap().get(network_name).cloned()
 }
 
-/// Clears all registered sockets (useful between tests).
-pub fn clear_socket_registry() {
-    SOCKET_REGISTRY.write().unwrap().sockets.clear();
+/// Delivers a packet to a target socket within a network.
+///
+/// This is called by `FaultInjectorState::advance_time()` to deliver
+/// delayed packets when their deadline is reached.
+pub fn deliver_packet_to_network(
+    network_name: &str,
+    target: SocketAddr,
+    data: Vec<u8>,
+    from: SocketAddr,
+) -> bool {
+    if let Some(registry) = get_registry(network_name) {
+        registry.read().unwrap().deliver_packet(target, data, from)
+    } else {
+        tracing::warn!(
+            network = %network_name,
+            "Attempted to deliver packet to non-existent network"
+        );
+        false
+    }
+}
+
+/// Checks if a socket is registered at the given address in a network.
+pub fn is_socket_registered(network_name: &str, addr: &SocketAddr) -> bool {
+    get_registry(network_name)
+        .map(|r| r.read().unwrap().is_registered(addr))
+        .unwrap_or(false)
+}
+
+/// Unregisters a socket from a network's registry.
+pub fn unregister_socket(network_name: &str, addr: &SocketAddr) {
+    if let Some(registry) = get_registry(network_name) {
+        registry.write().unwrap().unregister(addr);
+    }
+}
+
+/// Clears all registered sockets for a network (useful for test cleanup).
+pub fn clear_network_sockets(network_name: &str) {
+    if let Some(registry) = get_registry(network_name) {
+        registry.write().unwrap().sockets.clear();
+    }
+}
+
+/// Clears all socket registries (useful between test runs).
+pub fn clear_all_socket_registries() {
+    SOCKET_REGISTRIES.write().unwrap().clear();
 }
 
 /// An in-memory socket implementing the `Socket` trait.
 ///
 /// This allows the production `P2pConnManager` and event loop to be used
 /// in tests with simulated network conditions.
+///
+/// Sockets are scoped to a network (identified by name). Sockets in different
+/// networks cannot communicate with each other, providing test isolation.
 pub struct InMemorySocket {
+    /// Network this socket belongs to
+    network_name: String,
     /// This socket's bound address
     addr: SocketAddr,
     /// Inbox for received packets
@@ -363,12 +321,21 @@ pub struct InMemorySocket {
 
 impl Socket for InMemorySocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let inbox = SOCKET_REGISTRY.write().unwrap().register(addr);
+        let network_name = get_address_network(&addr).ok_or_else(|| {
+            io::Error::other(format!(
+                "No network registered for address {}. Call register_address_network() before binding InMemorySocket.",
+                addr
+            ))
+        })?;
+
+        let registry = get_or_create_registry(&network_name);
+        let inbox = registry.write().unwrap().register(addr);
         let notify = inbox.lock().await.notifier();
 
-        tracing::debug!(addr = %addr, "InMemorySocket bound");
+        tracing::debug!(network = %network_name, addr = %addr, "InMemorySocket bound");
 
         Ok(Self {
+            network_name,
             addr,
             inbox,
             notify,
@@ -402,38 +369,29 @@ impl Socket for InMemorySocket {
 
         let data = buf.to_vec();
 
-        match check_packet_delivery(self.addr, target) {
-            PacketDeliveryDecision::Drop(_) => {
+        match check_packet_delivery(&self.network_name, self.addr, target) {
+            PacketDeliveryDecision::Drop => {
                 // Silently drop - from sender's perspective, packet was sent
                 Ok(buf.len())
             }
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // Spawn task to deliver after delay
+                let network_name = self.network_name.clone();
                 let from = self.addr;
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let registry = SOCKET_REGISTRY.read().unwrap();
-                    registry.deliver_packet(target, data, from);
+                    deliver_packet_to_network(&network_name, target, data, from);
                 });
                 Ok(buf.len())
             }
-            PacketDeliveryDecision::QueuedDelivery { deadline, .. } => {
+            PacketDeliveryDecision::QueuedDelivery { deadline } => {
                 // Queue for virtual time delivery
-                if let Some(injector) = get_socket_fault_injector() {
-                    let mut state = injector.lock().unwrap();
-                    state.pending_packets.push(PendingPacket {
-                        deadline,
-                        data,
-                        from: self.addr,
-                        target,
-                    });
-                }
+                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
                 Ok(buf.len())
             }
             PacketDeliveryDecision::Deliver => {
                 // Immediate delivery
-                let registry = SOCKET_REGISTRY.read().unwrap();
-                registry.deliver_packet(target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
                 Ok(buf.len())
             }
         }
@@ -449,31 +407,21 @@ impl Socket for InMemorySocket {
 
         let data = buf.to_vec();
 
-        match check_packet_delivery(self.addr, target) {
-            PacketDeliveryDecision::Drop(_) => Ok(buf.len()),
+        match check_packet_delivery(&self.network_name, self.addr, target) {
+            PacketDeliveryDecision::Drop => Ok(buf.len()),
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // For blocking context, just sleep and deliver
                 std::thread::sleep(delay);
-                let registry = SOCKET_REGISTRY.read().unwrap();
-                registry.deliver_packet(target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
                 Ok(buf.len())
             }
-            PacketDeliveryDecision::QueuedDelivery { deadline, .. } => {
+            PacketDeliveryDecision::QueuedDelivery { deadline } => {
                 // Queue for virtual time
-                if let Some(injector) = get_socket_fault_injector() {
-                    let mut state = injector.lock().unwrap();
-                    state.pending_packets.push(PendingPacket {
-                        deadline,
-                        data,
-                        from: self.addr,
-                        target,
-                    });
-                }
+                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
                 Ok(buf.len())
             }
             PacketDeliveryDecision::Deliver => {
-                let registry = SOCKET_REGISTRY.read().unwrap();
-                registry.deliver_packet(target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
                 Ok(buf.len())
             }
         }
@@ -482,22 +430,31 @@ impl Socket for InMemorySocket {
 
 impl Drop for InMemorySocket {
     fn drop(&mut self) {
-        SOCKET_REGISTRY.write().unwrap().unregister(&self.addr);
-        tracing::debug!(addr = %self.addr, "InMemorySocket dropped");
+        unregister_socket(&self.network_name, &self.addr);
+        unregister_address_network(&self.addr);
+        tracing::debug!(
+            network = %self.network_name,
+            addr = %self.addr,
+            "InMemorySocket dropped"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::FaultConfigBuilder;
 
     #[tokio::test]
     async fn test_socket_bind_and_send() {
-        clear_socket_registry();
+        let network = "test-bind-send";
+        clear_network_sockets(network);
 
         let addr1: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+
+        // Register addresses with network before binding
+        register_address_network(addr1, network);
+        register_address_network(addr2, network);
 
         let socket1 = InMemorySocket::bind(addr1).await.unwrap();
         let socket2 = InMemorySocket::bind(addr2).await.unwrap();
@@ -515,51 +472,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_socket_with_fault_injection() {
-        clear_socket_registry();
-        set_socket_fault_injector(None);
+    async fn test_network_isolation() {
+        let network1 = "test-isolation-1";
+        let network2 = "test-isolation-2";
+        clear_network_sockets(network1);
+        clear_network_sockets(network2);
 
-        let addr1: SocketAddr = "127.0.0.1:10003".parse().unwrap();
-        let addr2: SocketAddr = "127.0.0.1:10004".parse().unwrap();
+        let addr1: SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:20002".parse().unwrap();
 
-        // Configure 100% message loss
-        let config = FaultConfigBuilder::default().message_loss_rate(1.0).build();
-        let injector = Arc::new(std::sync::Mutex::new(SocketFaultInjector::new(config, 42)));
-        set_socket_fault_injector(Some(injector.clone()));
-
+        // Create socket in network1
+        register_address_network(addr1, network1);
         let socket1 = InMemorySocket::bind(addr1).await.unwrap();
-        let _socket2 = InMemorySocket::bind(addr2).await.unwrap();
 
-        // Send should succeed (from sender's perspective)
-        let msg = b"hello";
-        let result = socket1.send_to(msg, addr2).await;
-        assert!(result.is_ok());
+        // Create socket in network2 with a different address
+        // (same address would fail since addr1 is already registered)
+        register_address_network(addr2, network2);
+        let socket2 = InMemorySocket::bind(addr2).await.unwrap();
 
-        // Check stats
-        let stats = injector.lock().unwrap().stats.clone();
-        assert_eq!(stats.packets_sent, 1);
-        assert_eq!(stats.packets_dropped_loss, 1);
-        assert_eq!(stats.packets_delivered, 0);
+        // Verify they're in different registries
+        assert!(is_socket_registered(network1, &addr1));
+        assert!(is_socket_registered(network2, &addr2));
+        assert!(!is_socket_registered(network1, &addr2));
+        assert!(!is_socket_registered(network2, &addr1));
 
-        // Cleanup
-        set_socket_fault_injector(None);
+        // Clean up
+        drop(socket1);
+        drop(socket2);
     }
 
     #[tokio::test]
-    async fn test_socket_stats() {
-        let stats = SocketNetworkStats {
-            packets_sent: 100,
-            packets_delivered: 70,
-            packets_dropped_loss: 15,
-            packets_dropped_partition: 10,
-            packets_dropped_crash: 5,
-            packets_queued: 0,
-            packets_delayed_delivered: 20,
-            total_latency_nanos: 100_000_000,
-        };
+    async fn test_bind_without_registration_fails() {
+        // Use a fresh address that's not registered
+        let addr: SocketAddr = "127.0.0.1:30001".parse().unwrap();
+        unregister_address_network(&addr); // Ensure it's not registered
 
-        assert_eq!(stats.total_dropped(), 30);
-        assert!((stats.loss_ratio() - 0.3).abs() < 0.001);
-        assert_eq!(stats.average_latency(), Duration::from_millis(5));
+        let result = InMemorySocket::bind(addr).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("No network registered"));
     }
 }
