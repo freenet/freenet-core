@@ -223,7 +223,6 @@ impl CongestionState {
             _ => None,
         }
     }
-
 }
 
 /// Lock-free atomic wrapper for [`CongestionState`].
@@ -299,6 +298,31 @@ impl AtomicCongestionState {
     /// Transition to RampingUp state.
     fn enter_ramping_up(&self) {
         self.store(CongestionState::RampingUp);
+    }
+
+    /// Atomically compare and exchange state.
+    ///
+    /// If current state equals `expected`, sets it to `new` and returns `Ok(expected)`.
+    /// Otherwise, returns `Err(current_state)`.
+    ///
+    /// Uses AcqRel ordering for success and Acquire for failure.
+    #[allow(dead_code)] // Available for future use in atomic state transitions
+    fn compare_exchange(
+        &self,
+        expected: CongestionState,
+        new: CongestionState,
+    ) -> Result<CongestionState, CongestionState> {
+        self.0
+            .compare_exchange(
+                expected as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|v| CongestionState::from_u8(v).unwrap_or(CongestionState::CongestionAvoidance))
+            .map_err(|v| {
+                CongestionState::from_u8(v).unwrap_or(CongestionState::CongestionAvoidance)
+            })
     }
 }
 
@@ -1904,6 +1928,88 @@ mod tests {
         assert_eq!(stats.total_losses, num_threads * 10);
     }
 
+    /// Stress test: concurrent state transitions (timeout vs ACK during slowdown).
+    ///
+    /// This test verifies that racing `on_timeout` and `on_ack` calls during
+    /// slowdown states don't cause panics or invalid states. Due to the
+    /// non-atomic nature of compound state transitions, the final state
+    /// may vary, but the state machine should always remain valid.
+    #[test]
+    fn test_concurrent_state_transition_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: false, // Start in CongestionAvoidance
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = Arc::new(LedbatController::new_with_config(config));
+
+        // Set up initial state for slowdown cycle
+        controller.on_send(500_000);
+        controller
+            .base_delay_history
+            .update(Duration::from_millis(50));
+
+        let num_threads = 4;
+        let iterations = 50;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let controller = Arc::clone(&controller);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        // Alternate between timeout and ACK to stress state transitions
+                        if (i + j) % 3 == 0 {
+                            controller.on_timeout();
+                        } else {
+                            controller.on_ack(Duration::from_millis(50 + (j % 20) as u64), 1000);
+                        }
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Thread panicked during state transition stress test");
+        }
+
+        // Verify state machine is still valid (load should succeed without panic)
+        let final_state = controller.congestion_state.load();
+
+        // State should be one of the valid states
+        assert!(
+            matches!(
+                final_state,
+                CongestionState::SlowStart
+                    | CongestionState::CongestionAvoidance
+                    | CongestionState::WaitingForSlowdown
+                    | CongestionState::InSlowdown
+                    | CongestionState::Frozen
+                    | CongestionState::RampingUp
+            ),
+            "Final state should be valid: {:?}",
+            final_state
+        );
+
+        // cwnd should be within bounds
+        let final_cwnd = controller.current_cwnd();
+        assert!(
+            final_cwnd >= controller.min_cwnd && final_cwnd <= controller.max_cwnd,
+            "cwnd should be within bounds: {}",
+            final_cwnd
+        );
+    }
+
     /// Test atomic delay filter under concurrent access.
     #[test]
     fn test_atomic_delay_filter_concurrent() {
@@ -2559,11 +2665,7 @@ mod tests {
             frozen_cwnd, state
         );
 
-        assert_eq!(
-            state,
-            CongestionState::Frozen,
-            "Should be in Frozen state"
-        );
+        assert_eq!(state, CongestionState::Frozen, "Should be in Frozen state");
 
         // Verify proportional reduction
         let expected_frozen = (controller.pre_slowdown_cwnd.load(Ordering::Relaxed)
@@ -3458,7 +3560,11 @@ mod tests {
             controller.on_ack(rtt, 20_000);
 
             let state = controller.congestion_state.load();
-            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name(state)));
+            timeline.push((
+                elapsed_ms,
+                controller.current_cwnd() / 1024,
+                state_name(state),
+            ));
 
             if state != CongestionState::SlowStart {
                 println!(
@@ -3478,9 +3584,16 @@ mod tests {
             controller.on_ack(rtt, 10_000);
 
             let state = controller.congestion_state.load();
-            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name(state)));
+            timeline.push((
+                elapsed_ms,
+                controller.current_cwnd() / 1024,
+                state_name(state),
+            ));
 
-            if matches!(state, CongestionState::InSlowdown | CongestionState::Frozen | CongestionState::RampingUp) {
+            if matches!(
+                state,
+                CongestionState::InSlowdown | CongestionState::Frozen | CongestionState::RampingUp
+            ) {
                 println!(
                     "  Slowdown triggered at {}ms, cwnd={}KB",
                     elapsed_ms,
@@ -3499,7 +3612,11 @@ mod tests {
             controller.on_ack(rtt, 5_000);
 
             let state = controller.congestion_state.load();
-            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name(state)));
+            timeline.push((
+                elapsed_ms,
+                controller.current_cwnd() / 1024,
+                state_name(state),
+            ));
 
             if state == CongestionState::RampingUp {
                 println!(
@@ -3519,7 +3636,11 @@ mod tests {
             controller.on_ack(rtt, 30_000);
 
             let state = controller.congestion_state.load();
-            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name(state)));
+            timeline.push((
+                elapsed_ms,
+                controller.current_cwnd() / 1024,
+                state_name(state),
+            ));
 
             if state == CongestionState::CongestionAvoidance {
                 println!(
@@ -3942,8 +4063,6 @@ mod tests {
              This suggests cwnd was stuck low due to excessive slowdowns.",
             avg_cwnd
         );
-
-        println!("✓ High-latency slowdown rate test passed");
     }
 
     // =========================================================================
@@ -3996,8 +4115,6 @@ mod tests {
                 gain
             );
         }
-
-        println!("✓ Dynamic GAIN extreme latencies test passed");
     }
 
     /// Test min_interval calculation at extreme RTTs
@@ -4051,8 +4168,6 @@ mod tests {
                 rtt_ms, next_interval_ms, expected_min_ms
             );
         }
-
-        println!("✓ Min interval extreme latencies test passed");
     }
 
     /// Test rate conversion at extreme RTTs
@@ -4099,8 +4214,6 @@ mod tests {
             rate_100ms,
             rate_200ms
         );
-
-        println!("✓ Rate conversion extreme latencies test passed");
     }
 
     // =========================================================================
@@ -4160,8 +4273,6 @@ mod tests {
             1,
             "Loss counter should increment"
         );
-
-        println!("✓ Loss during Frozen state test passed");
     }
 
     /// Test that timeout during RampingUp state resets appropriately
@@ -4190,7 +4301,8 @@ mod tests {
 
         // Manually set state to RampingUp
         controller.congestion_state.enter_ramping_up();
-        controller.cwnd.store(80_000, Ordering::Release); // Mid-rampup
+        let pre_timeout_cwnd = 80_000;
+        controller.cwnd.store(pre_timeout_cwnd, Ordering::Release); // Mid-rampup
 
         // Trigger timeout
         controller.on_timeout();
@@ -4215,12 +4327,12 @@ mod tests {
         );
 
         // ssthresh should be set to half the pre-timeout cwnd
+        let expected_ssthresh = pre_timeout_cwnd / 2;
         assert_eq!(
-            ssthresh_after, 40_000,
-            "ssthresh should be half the pre-timeout cwnd (80000/2)"
+            ssthresh_after, expected_ssthresh,
+            "ssthresh should be half the pre-timeout cwnd ({}/2 = {})",
+            pre_timeout_cwnd, expected_ssthresh
         );
-
-        println!("✓ Timeout during RampingUp state test passed");
     }
 
     /// Test that timeout during Frozen state resets appropriately
@@ -4248,7 +4360,8 @@ mod tests {
 
         // Manually set state to Frozen (simulating mid-slowdown)
         controller.congestion_state.enter_frozen();
-        controller.cwnd.store(60_000, Ordering::Release); // Mid-freeze cwnd
+        let pre_timeout_cwnd = 60_000;
+        controller.cwnd.store(pre_timeout_cwnd, Ordering::Release); // Mid-freeze cwnd
 
         // Trigger timeout
         controller.on_timeout();
@@ -4273,12 +4386,12 @@ mod tests {
         );
 
         // ssthresh should be set to half the pre-timeout cwnd
+        let expected_ssthresh = pre_timeout_cwnd / 2;
         assert_eq!(
-            ssthresh_after, 30_000,
-            "ssthresh should be half the pre-timeout cwnd (60000/2)"
+            ssthresh_after, expected_ssthresh,
+            "ssthresh should be half the pre-timeout cwnd ({}/2 = {})",
+            pre_timeout_cwnd, expected_ssthresh
         );
-
-        println!("✓ Timeout during Frozen state test passed");
     }
 
     /// Test that timeout during WaitingForSlowdown state resets appropriately
@@ -4325,8 +4438,6 @@ mod tests {
             CongestionState::SlowStart,
             "Should transition to SlowStart on timeout"
         );
-
-        println!("✓ Timeout during WaitingForSlowdown state test passed");
     }
 
     /// Test state machine integrity: all states are reachable and valid
@@ -4396,8 +4507,6 @@ mod tests {
             CongestionState::CongestionAvoidance,
             "Controller should start in CongestionAvoidance state when enable_slow_start=false"
         );
-
-        println!("✓ Congestion state machine integrity test passed");
     }
 
     /// Test that multiple rapid losses don't cause cwnd underflow
@@ -4460,8 +4569,6 @@ mod tests {
             20,
             "Should have recorded 20 losses"
         );
-
-        println!("✓ Rapid losses no underflow test passed");
     }
 
     /// Test base delay tracking with jittery RTT samples
@@ -4500,8 +4607,6 @@ mod tests {
             "Base delay should track minimum: expected {:?}, got {:?}",
             expected_min, measured_base
         );
-
-        println!("✓ Base delay with jitter test passed");
     }
 
     /// Test that slowdown doesn't occur when disabled
@@ -4554,8 +4659,6 @@ mod tests {
             CongestionState::CongestionAvoidance,
             "State should remain CongestionAvoidance when slowdowns disabled"
         );
-
-        println!("✓ Slowdown disabled test passed");
     }
 
     /// Test ramp-up completes correctly with RTT jitter
@@ -4681,7 +4784,10 @@ mod tests {
             final_cwnd / 1024,
             target_cwnd / 1024
         );
-        println!("  state: {:?} (SlowStart, CongestionAvoidance, RampingUp, etc.)", final_state);
+        println!(
+            "  state: {:?} (SlowStart, CongestionAvoidance, RampingUp, etc.)",
+            final_state
+        );
         println!("  base_delay: {:?}", final_base_delay);
         println!("  ramp_iterations: {}", ramp_iterations);
 
@@ -4704,8 +4810,6 @@ mod tests {
             min_expected,
             max_expected
         );
-
-        println!("✓ Slowdown ramp-up with RTT jitter test passed");
     }
 
     /// Regression test for slow start re-entry after timeout.
@@ -4953,8 +5057,6 @@ mod tests {
             "Cwnd should be reasonably stable under jitter (CoV={:.2} < 0.5)",
             coefficient_of_variation
         );
-
-        println!("✓ Continuous jitter test passed");
     }
 
     /// Test base delay shift detection (network path change).
@@ -5056,8 +5158,6 @@ mod tests {
             "Cwnd should remain usable after path change: {}",
             final_cwnd
         );
-
-        println!("✓ Base delay shift test passed");
     }
 
     /// Test behavior under extreme RTT variation (stress test).
@@ -5147,8 +5247,6 @@ mod tests {
             final_base_delay,
             min_rtt
         );
-
-        println!("✓ Extreme variation stress test passed");
     }
 
     /// Parametrized test: variable RTT with different base latencies.
@@ -5507,7 +5605,5 @@ mod tests {
             "Base delay should return to near baseline: {:?}",
             final_base_delay
         );
-
-        println!("✓ Timeout with degrading conditions test passed");
     }
 }
