@@ -58,6 +58,10 @@ pub(crate) const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAIN
 /// Note: X25519 decryption is ~100x faster than RSA-2048, so this is very conservative.
 const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 
+/// Interval for cleaning up expired rate limit entries.
+/// This prevents unbounded growth of the last_asym_attempt HashMap.
+const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S> = BoxFuture<
@@ -391,6 +395,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
+        let mut rate_limit_cleanup = tokio::time::interval(RATE_LIMIT_CLEANUP_INTERVAL);
+        rate_limit_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         'outer: loop {
             tokio::select! {
@@ -559,8 +565,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 peer_addr = %remote_addr,
                                                 "Connection closed, removing from active connections"
                                             );
-                                            // Clean up rate-limit tracking
-                                            self.last_asym_attempt.remove(&remote_addr);
+                                            // Issue #2554: Don't clear rate-limit tracking here.
+                                            // Let the rate limit expire naturally (1 second) to prevent
+                                            // packets still in flight from being routed to asymmetric
+                                            // decryption. A 72-byte symmetric packet arriving during the
+                                            // transition window would otherwise trigger decryption errors.
                                             // Don't reinsert - connection is truly dead
                                             continue;
                                         }
@@ -922,6 +931,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
+                // Periodic cleanup of expired rate limit entries (issue #2554)
+                _ = rate_limit_cleanup.tick() => {
+                    let now = Instant::now();
+                    self.last_asym_attempt.retain(|_, last_attempt| {
+                        now.duration_since(*last_attempt) < ASYM_DECRYPTION_RATE_LIMIT
+                    });
+                }
             }
         }
     }
