@@ -56,7 +56,7 @@ const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
 
 /// Get current timestamp in milliseconds since Unix epoch.
 /// Logs a warning if system time is unavailable (e.g., clock went backwards).
-fn current_timestamp_ms() -> u64 {
+pub fn current_timestamp_ms() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
         Err(e) => {
@@ -120,8 +120,16 @@ impl TelemetryReporter {
         // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
 
+        // Initialize the transfer event channel for per-transfer telemetry
+        let transfer_event_receiver = crate::transport::metrics::init_transfer_event_channel();
+
         // Spawn the background worker
-        let worker = TelemetryWorker::new(endpoint, receiver, transport_snapshot_interval_secs);
+        let worker = TelemetryWorker::new(
+            endpoint,
+            receiver,
+            transport_snapshot_interval_secs,
+            transfer_event_receiver,
+        );
         tokio::spawn(worker.run());
 
         Some(Self { sender })
@@ -190,6 +198,8 @@ struct TelemetryWorker {
     rate_limit_window_start: Instant,
     /// Interval for transport snapshots (0 = disabled)
     transport_snapshot_interval_secs: u64,
+    /// Receiver for per-transfer telemetry events from transport layer
+    transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
 }
 
 impl TelemetryWorker {
@@ -197,6 +207,7 @@ impl TelemetryWorker {
         endpoint: String,
         receiver: mpsc::Receiver<TelemetryCommand>,
         transport_snapshot_interval_secs: u64,
+        transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
     ) -> Self {
         Self {
             endpoint,
@@ -211,6 +222,7 @@ impl TelemetryWorker {
             events_this_second: 0,
             rate_limit_window_start: Instant::now(),
             transport_snapshot_interval_secs,
+            transfer_event_receiver,
         }
     }
 
@@ -247,6 +259,24 @@ impl TelemetryWorker {
                             self.flush().await;
                             break;
                         }
+                    }
+                }
+                transfer_event = self.transfer_event_receiver.recv() => {
+                    // Handle per-transfer telemetry events from transport layer
+                    if let Some(transfer_event) = transfer_event {
+                        let event_type = match &transfer_event {
+                            super::TransferEvent::Started { .. } => "transfer_started",
+                            super::TransferEvent::Completed { .. } => "transfer_completed",
+                            super::TransferEvent::Failed { .. } => "transfer_failed",
+                        };
+                        let event = TelemetryEvent {
+                            timestamp: current_timestamp_ms(),
+                            peer_id: String::new(), // Transport layer doesn't have peer identity
+                            transaction_id: String::new(), // Not available at transport layer
+                            event_type: event_type.to_string(),
+                            event_data: event_kind_to_json(&super::EventKind::Transfer(transfer_event)),
+                        };
+                        self.handle_event(event).await;
                     }
                 }
                 _ = batch_interval.tick() => {
@@ -1092,8 +1122,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             match transfer_event {
                 TransferEvent::Started {
                     stream_id,
-                    peer,
-                    contract_instance,
+                    peer_addr,
                     expected_bytes,
                     direction,
                     tx_id,
@@ -1102,8 +1131,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!({
                         "type": "started",
                         "stream_id": stream_id,
-                        "peer": peer.to_string(),
-                        "contract_instance": contract_instance.as_ref().map(|c| c.to_string()),
+                        "peer_addr": peer_addr.to_string(),
                         "expected_bytes": expected_bytes,
                         "direction": format!("{:?}", direction),
                         "tx_id": tx_id.as_ref().map(|t| t.to_string()),
@@ -1112,7 +1140,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
                 TransferEvent::Completed {
                     stream_id,
-                    peer,
+                    peer_addr,
                     bytes_transferred,
                     elapsed_ms,
                     avg_throughput_bps,
@@ -1126,7 +1154,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!({
                         "type": "completed",
                         "stream_id": stream_id,
-                        "peer": peer.to_string(),
+                        "peer_addr": peer_addr.to_string(),
                         "bytes_transferred": bytes_transferred,
                         "elapsed_ms": elapsed_ms,
                         "avg_throughput_bps": avg_throughput_bps,
@@ -1140,7 +1168,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
                 TransferEvent::Failed {
                     stream_id,
-                    peer,
+                    peer_addr,
                     bytes_transferred,
                     reason,
                     elapsed_ms,
@@ -1150,7 +1178,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!({
                         "type": "failed",
                         "stream_id": stream_id,
-                        "peer": peer.to_string(),
+                        "peer_addr": peer_addr.to_string(),
                         "bytes_transferred": bytes_transferred,
                         "reason": reason,
                         "elapsed_ms": elapsed_ms,

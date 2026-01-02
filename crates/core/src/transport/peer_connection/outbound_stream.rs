@@ -7,7 +7,9 @@ use aes_gcm::Aes128Gcm;
 use bytes::Bytes;
 
 use crate::{
+    tracing::TransferDirection,
     transport::{
+        metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
@@ -47,6 +49,14 @@ pub(super) async fn send_stream<S: super::super::Socket>(
 ) -> Result<TransferStats, TransportError> {
     let start_time = Instant::now();
     let bytes_to_send = stream_to_send.len() as u64;
+
+    // Emit transfer started telemetry event
+    emit_transfer_started(
+        stream_id.0 as u64,
+        destination_addr,
+        bytes_to_send,
+        TransferDirection::Send,
+    );
 
     tracing::debug!(
         stream_id = %stream_id.0,
@@ -145,7 +155,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             }
         };
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-        super::packet_sending(
+        if let Err(e) = super::packet_sending(
             destination_addr,
             &socket,
             packet_id,
@@ -159,7 +169,20 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             },
             &sent_packet_tracker,
         )
-        .await?;
+        .await
+        {
+            // Emit transfer failed telemetry event
+            let bytes_sent = (sent_so_far * MAX_DATA_SIZE) as u64;
+            emit_transfer_failed(
+                stream_id.0 as u64,
+                destination_addr,
+                bytes_sent.min(bytes_to_send),
+                e.to_string(),
+                start_time.elapsed().as_millis() as u64,
+                TransferDirection::Send,
+            );
+            return Err(e);
+        }
 
         // Track packet send for LEDBAT congestion control
         ledbat.on_send(packet_size);
@@ -181,6 +204,24 @@ pub(super) async fn send_stream<S: super::super::Socket>(
         final_cwnd_kb = ledbat_stats.cwnd / 1024,
         slowdowns = ledbat_stats.periodic_slowdowns,
         "Stream sent"
+    );
+
+    // Emit transfer completed telemetry event
+    emit_transfer_completed(
+        stream_id.0 as u64,
+        destination_addr,
+        bytes_to_send,
+        elapsed.as_millis() as u64,
+        if elapsed.as_secs() > 0 {
+            bytes_to_send / elapsed.as_secs()
+        } else {
+            bytes_to_send * 1000 / elapsed.as_millis().max(1) as u64
+        },
+        Some(ledbat_stats.peak_cwnd as u32),
+        Some(ledbat_stats.cwnd as u32),
+        Some(ledbat_stats.periodic_slowdowns as u32),
+        Some(ledbat_stats.base_delay.as_millis() as u32),
+        TransferDirection::Send,
     );
 
     Ok(TransferStats {
