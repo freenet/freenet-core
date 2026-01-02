@@ -222,49 +222,6 @@ jobs:
           export FREENET_TEST_DOCKER_NAT=1
           cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
 
-  ubertest:
-    name: Ubertest
-    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
-    # TODO: Re-enable when ubertest is stable - currently failing
-    # When re-enabling, add: && github.event_name != 'merge_group'
-    if: false
-    runs-on: self-hosted
-    timeout-minutes: 30
-
-    env:
-      # RUST_LOG controls tracing output level
-      RUST_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
-      # Increase rustc stack size to prevent SIGSEGV during compilation
-      RUST_MIN_STACK: 16777216
-      # Use mold linker to avoid rust-lld crashes (see issue #2519)
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
-        with:
-          save-if: false
-
-      - name: Install riverctl
-        run: cargo install riverctl
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run Ubertest
-        run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
-        working-directory: crates/core
-
   claude-ci-analysis:
     name: Claude CI Analysis
     runs-on: self-hosted
