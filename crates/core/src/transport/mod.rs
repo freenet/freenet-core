@@ -45,6 +45,7 @@ pub fn clear_version_mismatch() {
 
 pub mod connection_handler;
 mod crypto;
+pub mod in_memory_socket;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
@@ -139,6 +140,7 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::connection_handler::create_connection_handler;
+pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},

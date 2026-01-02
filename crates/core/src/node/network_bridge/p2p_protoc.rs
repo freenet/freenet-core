@@ -29,8 +29,8 @@ use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
 use crate::ring::{Location, SubscriptionRecoveryGuard};
 use crate::transport::{
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, OutboundConnectionHandler,
-    PeerConnectionApi, TransportError, TransportKeypair, TransportPublicKey,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, ExpectedInboundTracker,
+    PeerConnectionApi, Socket, TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -402,9 +402,40 @@ impl P2pConnManager {
         })
     }
 
+    /// Runs the event listener with `UdpSocket` (production mode).
+    ///
+    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
+        self,
+        op_manager: Arc<OpManager>,
+        client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        notification_channel: EventLoopNotificationsReceiver,
+        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        node_controller: Receiver<NodeEvent>,
+    ) -> anyhow::Result<Infallible> {
+        self.run_event_listener_with_socket::<UdpSocket>(
+            op_manager,
+            client_wait_for_transaction,
+            notification_channel,
+            executor_listener,
+            node_controller,
+        )
+        .await
+    }
+
+    /// Runs the event listener with a configurable socket type.
+    ///
+    /// This is the generic version that allows using different socket implementations:
+    /// - `UdpSocket` for production
+    /// - `InMemorySocket` for testing
+    ///
+    /// The socket type only affects connection establishment. Once connections are
+    /// established, they are type-erased via `PeerConnectionApi` trait objects.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
+    pub async fn run_event_listener_with_socket<S: Socket>(
         self,
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
@@ -433,7 +464,7 @@ impl P2pConnManager {
             message_processor,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
+        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<S>(
             key_pair.clone(),
             listening_ip,
             listening_port,
@@ -452,7 +483,8 @@ impl P2pConnManager {
             "Network listener opened - ready to receive connections"
         );
 
-        let mut state = EventListenerState::new(outbound_conn_handler.clone());
+        let expected_inbound = outbound_conn_handler.expected_inbound_tracker();
+        let mut state = EventListenerState::new(expected_inbound);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
 
@@ -1054,7 +1086,7 @@ impl P2pConnManager {
                                     phase = "connect",
                                     "Expecting peer connection - registering with handshake handler"
                                 );
-                                state.outbound_handler.expect_incoming(addr);
+                                state.expected_inbound.expect_incoming(addr);
                                 // We don't know the peer's public key yet for expected inbound connections,
                                 // so use our own pub_key as a placeholder. The handshake will update it.
                                 let peer_placeholder = PeerKeyLocation::new(
@@ -2015,7 +2047,7 @@ impl P2pConnManager {
                     transient,
                     "connect_peer: registered new pending connection"
                 );
-                state.outbound_handler.expect_incoming(peer_addr);
+                state.expected_inbound.expect_incoming(peer_addr);
             }
         }
 
@@ -2960,7 +2992,7 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
 }
 
 struct EventListenerState {
-    outbound_handler: OutboundConnectionHandler,
+    expected_inbound: ExpectedInboundTracker,
     pending_from_executor: HashSet<Transaction>,
     // FIXME: we are potentially leaving trash here when transacrions are completed
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
@@ -2976,9 +3008,9 @@ struct EventListenerState {
 }
 
 impl EventListenerState {
-    fn new(outbound_handler: OutboundConnectionHandler) -> Self {
+    fn new(expected_inbound: ExpectedInboundTracker) -> Self {
         Self {
-            outbound_handler,
+            expected_inbound,
             pending_from_executor: HashSet::new(),
             tx_to_client: HashMap::new(),
             client_waiting_transaction: Vec::new(),
