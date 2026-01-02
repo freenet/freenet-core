@@ -1071,26 +1071,45 @@ impl LedbatController {
     /// Called on retransmission timeout (severe congestion).
     ///
     /// RFC 6817: Reset to 1 * MSS on timeout.
-    /// Also exits slow start and resets to min_cwnd.
+    ///
+    /// After resetting cwnd, we re-enter slow start to enable fast recovery.
+    /// Without this, the connection would be stuck in congestion avoidance
+    /// mode with minimum cwnd. On high-RTT paths with zero queuing delay,
+    /// congestion avoidance growth is extremely slow (~150 bytes per RTT),
+    /// causing transfers to stall for tens of seconds.
+    ///
+    /// This follows standard TCP RTO recovery behavior (RFC 5681):
+    /// - Reset cwnd to min_cwnd
+    /// - Set ssthresh to max(old_cwnd/2, 2*min_cwnd)
+    /// - Re-enter slow start for exponential recovery
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
-        // Exit slow start on timeout
-        if self.in_slow_start.swap(false, Ordering::AcqRel) {
-            self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
-        }
+        // Save old cwnd for ssthresh calculation before resetting
+        let old_cwnd = self.cwnd.load(Ordering::Acquire);
 
+        // Reset cwnd to minimum (RFC 6817: 1 * MSS)
         let new_cwnd = MSS.max(self.min_cwnd);
-
-        let current_cwnd = self.cwnd.load(Ordering::Acquire);
         self.cwnd.store(new_cwnd, Ordering::Release);
 
+        // Set ssthresh to half the pre-timeout cwnd (standard TCP RTO recovery)
+        // Floor at 2*min_cwnd to ensure reasonable recovery target
+        let new_ssthresh = (old_cwnd / 2).max(self.min_cwnd * 2);
+        self.ssthresh.store(new_ssthresh, Ordering::Release);
+
+        // Re-enter slow start for fast (exponential) recovery
+        // Without this, we'd be stuck in congestion avoidance with very slow
+        // linear growth, especially on high-RTT paths with zero queuing delay
+        // where off_target ≈ 0 means almost no congestion avoidance growth.
+        self.in_slow_start.store(true, Ordering::Release);
+
         // Only log when cwnd actually changes to avoid spam when already at minimum
-        if current_cwnd != new_cwnd {
+        if old_cwnd != new_cwnd {
             tracing::warn!(
-                old_cwnd_kb = current_cwnd / 1024,
+                old_cwnd_kb = old_cwnd / 1024,
                 new_cwnd_kb = new_cwnd / 1024,
-                "LEDBAT retransmission timeout - reset to 1*MSS"
+                new_ssthresh_kb = new_ssthresh / 1024,
+                "LEDBAT retransmission timeout - reset to min_cwnd, re-entering slow start"
             );
         }
     }
@@ -3996,7 +4015,11 @@ mod tests {
     /// When timeout occurs during RampingUp:
     /// - cwnd should reset to min_cwnd (severe congestion response)
     /// - State remains RampingUp (timeout doesn't change slowdown state)
-    /// - Slow start flag should be cleared
+    /// - Slow start flag should remain true (for fast recovery after timeout)
+    ///
+    /// Note: Prior to the slow-start-reentry fix, timeout would exit slow start,
+    /// leaving the connection stuck in slow linear growth. Now timeout re-enters
+    /// slow start for fast exponential recovery.
     #[test]
     fn test_timeout_during_rampup_state() {
         let config = LedbatConfig {
@@ -4026,6 +4049,7 @@ mod tests {
         let cwnd_after = controller.current_cwnd();
         let state_after = controller.slowdown_state.load(Ordering::Acquire);
         let in_slow_start_after = controller.in_slow_start.load(Ordering::Acquire);
+        let ssthresh_after = controller.ssthresh.load(Ordering::Acquire);
 
         // cwnd should reset to min_cwnd (or MSS, whichever is larger)
         assert!(
@@ -4040,10 +4064,17 @@ mod tests {
             "Slowdown state should not change on timeout"
         );
 
-        // Slow start should be exited
+        // Slow start should be re-enabled for fast recovery
+        // (This changed: previously timeout exited slow start, now it re-enters)
         assert!(
-            !in_slow_start_after,
-            "Slow start should be exited on timeout"
+            in_slow_start_after,
+            "Slow start should be enabled after timeout for fast recovery"
+        );
+
+        // ssthresh should be set to half the pre-timeout cwnd
+        assert_eq!(
+            ssthresh_after, 40_000,
+            "ssthresh should be half the pre-timeout cwnd (80000/2)"
         );
 
         println!("✓ Timeout during RampingUp state test passed");
@@ -4390,5 +4421,115 @@ mod tests {
         );
 
         println!("✓ Slowdown ramp-up with RTT jitter test passed");
+    }
+
+    /// Regression test for slow start re-entry after timeout.
+    ///
+    /// Issue: After a retransmission timeout, on_timeout() resets cwnd to min_cwnd
+    /// and sets in_slow_start = false. This puts the connection in congestion
+    /// avoidance mode with minimum cwnd. On high-RTT paths with zero queuing,
+    /// congestion avoidance growth is extremely slow (~188 bytes per 264ms RTT),
+    /// causing transfers to stall for tens of seconds.
+    ///
+    /// The fix: Re-enter slow start after timeout to enable exponential recovery.
+    ///
+    /// This test verifies that after a timeout, cwnd can recover quickly (via
+    /// slow start exponential growth) rather than being stuck in slow linear
+    /// congestion avoidance growth.
+    #[tokio::test]
+    async fn test_timeout_reenters_slow_start_for_fast_recovery() {
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd: 2_848,
+            max_cwnd: 10_000_000,
+            ssthresh: 100_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false, // Disable to isolate timeout behavior
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Establish base delay with some samples
+        controller.on_ack(Duration::from_millis(100), 1000);
+        controller.on_ack(Duration::from_millis(100), 1000);
+
+        // Simulate initial working state with good cwnd
+        let pre_timeout_cwnd = controller.current_cwnd();
+        assert!(
+            pre_timeout_cwnd >= 50_000,
+            "pre-timeout cwnd should be at initial value: {}",
+            pre_timeout_cwnd
+        );
+
+        // Trigger a timeout - this should reset cwnd but allow fast recovery
+        controller.on_timeout();
+
+        let post_timeout_cwnd = controller.current_cwnd();
+        assert!(
+            post_timeout_cwnd <= 3000,
+            "post-timeout cwnd should be at minimum: {}",
+            post_timeout_cwnd
+        );
+
+        // Now try to recover via ACKs
+        // With slow start (exponential growth), we should recover quickly
+        // With congestion avoidance (linear growth), recovery would be very slow
+        //
+        // At 100ms RTT with zero queuing delay, slow start should roughly double
+        // cwnd every RTT. Starting from ~2.8KB:
+        // - After 1 RTT: ~5.6KB
+        // - After 2 RTTs: ~11KB
+        // - After 3 RTTs: ~22KB
+        // - After 4 RTTs: ~44KB
+        //
+        // In congestion avoidance, growth would be ~150-200 bytes per RTT, so
+        // after 4 RTTs we'd only be at ~3.4KB (barely any growth).
+
+        // Simulate 4 RTTs worth of ACKs with zero queuing delay
+        let bytes_per_ack = 5_000;
+        for i in 0..4 {
+            // Keep flightsize high enough to not trigger application-limited cap
+            controller.on_send(50_000);
+
+            // Wait for rate-limiting interval (base_delay = 100ms)
+            tokio::time::sleep(Duration::from_millis(110)).await;
+
+            // Zero queuing delay (RTT = base delay) - this is the problematic case
+            // because off_target = 0 means no congestion avoidance growth
+            controller.on_ack(Duration::from_millis(100), bytes_per_ack);
+
+            let current_cwnd = controller.current_cwnd();
+            println!(
+                "After ACK {}: cwnd = {} bytes ({} KB)",
+                i + 1,
+                current_cwnd,
+                current_cwnd / 1024
+            );
+        }
+
+        let recovered_cwnd = controller.current_cwnd();
+
+        // After 4 RTTs in slow start, cwnd should have grown significantly
+        // We're lenient here: just checking it grew more than 10KB (proving
+        // exponential growth, not the ~1KB we'd see from linear growth)
+        assert!(
+            recovered_cwnd >= 10_000,
+            "After 4 RTTs, cwnd should have recovered via slow start to at least 10KB. \
+             Got {} bytes. This suggests slow start was NOT re-enabled after timeout, \
+             leaving cwnd stuck in slow linear congestion avoidance growth.",
+            recovered_cwnd
+        );
+
+        // Also verify we're in slow start mode (in_slow_start should be true)
+        assert!(
+            controller.in_slow_start.load(Ordering::Relaxed),
+            "Should be in slow start after timeout for fast recovery"
+        );
+
+        println!(
+            "✓ Timeout recovery test passed: cwnd recovered from {} to {} bytes",
+            post_timeout_cwnd, recovered_cwnd
+        );
     }
 }
