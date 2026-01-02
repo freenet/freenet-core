@@ -99,6 +99,10 @@ jobs:
         env:
           # Support macOS 11 (Big Sur) and later for broader compatibility
           MACOSX_DEPLOYMENT_TARGET: "11.0"
+          # Force static linking of liblzma to avoid dependency on Homebrew's xz
+          # Without this, the binary links to /opt/homebrew/opt/xz/lib/liblzma.5.dylib
+          # which doesn't exist on fresh macOS installations
+          LZMA_API_STATIC: "1"
         run: cargo build --release
 
       - name: Ad-hoc sign binaries
