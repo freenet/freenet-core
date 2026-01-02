@@ -32,7 +32,7 @@ use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
     ContractExecError, ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface,
-    DelegateStore, Runtime, SecretsStore, StateStore, StateStoreError,
+    DelegateStore, Runtime, SecretsStore, StateStorage, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -711,10 +711,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
 
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
-pub struct Executor<R = Runtime> {
+///
+/// The type parameters are:
+/// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
+/// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
+pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     mode: OperationMode,
     runtime: R,
-    pub state_store: StateStore<Storage>,
+    pub state_store: StateStore<S>,
     /// Notification channels for any clients subscribed to updates for a given contract.
     update_notifications:
         HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
@@ -732,11 +736,15 @@ pub struct Executor<R = Runtime> {
     op_manager: Option<Arc<OpManager>>,
 }
 
-impl<R> Executor<R> {
+impl<R, S> Executor<R, S>
+where
+    S: StateStorage + Send + 'static,
+    <S as StateStorage>::Error: Into<anyhow::Error>,
+{
     /// Create a new Executor with optional network operation support.
     /// This is `pub(crate)` because the parameters involve crate-internal types.
     pub(crate) async fn new(
-        state_store: StateStore<Storage>,
+        state_store: StateStore<S>,
         ctrl_handler: impl FnOnce() -> anyhow::Result<()>,
         mode: OperationMode,
         runtime: R,

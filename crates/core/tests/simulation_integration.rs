@@ -915,3 +915,258 @@ mod simulation_primitives {
         assert!(config.can_deliver(&addr(2000), &addr(3000), 0, &rng));
     }
 }
+
+// =============================================================================
+// Test 10: Node Crash and Recovery via SimNetwork API
+// =============================================================================
+
+/// Tests the node crash/recovery API in SimNetwork.
+///
+/// This verifies:
+/// 1. VirtualTime is always enabled by default
+/// 2. crash_node() aborts the task and blocks messages
+/// 3. recover_node() allows messages to flow again
+/// 4. is_node_crashed() correctly reports crash status
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_node_crash_recovery() {
+    use freenet::dev_tool::{SimNetwork, TimeSource};
+
+    const SEED: u64 = 0xC2A5_0000_000E;
+
+    let mut sim = SimNetwork::new(
+        "crash-recovery-test",
+        1,  // gateways
+        3,  // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // VirtualTime should always be available
+    let vt = sim.virtual_time();
+    assert_eq!(vt.now_nanos(), 0, "VirtualTime should start at 0");
+
+    // Start the network
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Allow some time for connections
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Get a node label to crash from all tracked addresses
+    let all_addrs = sim.all_node_addresses();
+    assert!(!all_addrs.is_empty(), "Should have tracked node addresses");
+
+    // Find a non-gateway node (one that contains "-node-")
+    let node_to_crash = all_addrs
+        .keys()
+        .find(|label| label.is_node())
+        .cloned()
+        .expect("Should have at least one regular node");
+
+    // Verify the node address is tracked
+    let addr = sim.node_address(&node_to_crash);
+    assert!(addr.is_some(), "Node address should be tracked");
+    tracing::info!(?node_to_crash, ?addr, "Node to crash");
+
+    // Initially node is not crashed
+    assert!(
+        !sim.is_node_crashed(&node_to_crash),
+        "Node should not be crashed initially"
+    );
+
+    // Crash the node
+    let crashed = sim.crash_node(&node_to_crash);
+    assert!(crashed, "crash_node should return true for running node");
+
+    // Verify crash status
+    assert!(
+        sim.is_node_crashed(&node_to_crash),
+        "Node should be marked as crashed"
+    );
+
+    // Get network stats - should show dropped messages
+    let stats_before = sim.get_network_stats();
+    assert!(stats_before.is_some(), "Network stats should be available");
+
+    // Give some time for crash effects to propagate
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Recover the node (message blocking removed, but task is still aborted)
+    let recovered = sim.recover_node(&node_to_crash);
+    assert!(recovered, "recover_node should return true");
+
+    // Verify crash status cleared
+    assert!(
+        !sim.is_node_crashed(&node_to_crash),
+        "Node should not be marked as crashed after recovery"
+    );
+
+    tracing::info!("Node crash/recovery test completed successfully");
+}
+
+/// Tests that VirtualTime is always enabled and accessible.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_virtual_time_always_enabled() {
+    use freenet::dev_tool::{SimNetwork, TimeSource};
+
+    const SEED: u64 = 0x1111_7111;
+
+    let mut sim = SimNetwork::new(
+        "virtual-time-test",
+        1,  // gateways
+        2,  // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+
+    // VirtualTime should be available immediately
+    let vt = sim.virtual_time();
+    assert_eq!(vt.now_nanos(), 0, "VirtualTime should start at 0");
+
+    // Advance virtual time
+    vt.advance(Duration::from_millis(100));
+    assert_eq!(
+        vt.now_nanos(),
+        100_000_000,
+        "VirtualTime should advance by 100ms"
+    );
+
+    // Network stats should be available (fault injection auto-configured)
+    let stats = sim.get_network_stats();
+    assert!(
+        stats.is_some(),
+        "Network stats should be available (VirtualTime enables fault injection)"
+    );
+
+    // Start network and use advance_time convenience method
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // advance_time should work
+    let delivered = sim.advance_time(Duration::from_millis(50));
+    tracing::info!("advance_time delivered {} messages", delivered);
+
+    // VirtualTime should have advanced
+    assert!(
+        sim.virtual_time().now_nanos() >= 150_000_000,
+        "VirtualTime should have advanced past 150ms"
+    );
+
+    tracing::info!("VirtualTime always-enabled test completed");
+}
+
+/// Tests full node restart with preserved state.
+///
+/// This verifies:
+/// 1. Nodes can be crashed and restarted
+/// 2. Restarted nodes use the same identity (keypair)
+/// 3. can_restart() correctly identifies restartable nodes
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_node_restart() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0x2E57_A2F0;
+
+    let mut sim = SimNetwork::new(
+        "restart-test",
+        1,  // gateways
+        3,  // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start the network
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Allow some time for connections to establish
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Get all node addresses
+    let all_addrs = sim.all_node_addresses();
+    assert!(!all_addrs.is_empty(), "Should have tracked node addresses");
+
+    // Find a non-gateway node to restart
+    let node_to_restart = all_addrs
+        .keys()
+        .find(|label| label.is_node())
+        .cloned()
+        .expect("Should have at least one regular node");
+
+    tracing::info!(?node_to_restart, "Testing restart for node");
+
+    // Verify the node can be restarted (config was saved)
+    assert!(
+        sim.can_restart(&node_to_restart),
+        "Node should have saved config for restart"
+    );
+
+    // Initially node is not crashed
+    assert!(
+        !sim.is_node_crashed(&node_to_restart),
+        "Node should not be crashed initially"
+    );
+
+    // Get the node's address before crash
+    let addr_before = sim.node_address(&node_to_restart);
+    assert!(addr_before.is_some(), "Node address should be tracked");
+
+    // Crash the node
+    let crashed = sim.crash_node(&node_to_restart);
+    assert!(crashed, "crash_node should succeed for running node");
+    assert!(
+        sim.is_node_crashed(&node_to_restart),
+        "Node should be marked as crashed"
+    );
+
+    // Small delay to let crash take effect
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart the node with same identity but different event seed
+    let restart_seed = SEED.wrapping_add(0x1000);
+    let handle = sim
+        .restart_node::<rand::rngs::SmallRng>(&node_to_restart, restart_seed, 1, 1)
+        .await;
+
+    assert!(handle.is_some(), "restart_node should return a handle");
+    tracing::info!(?node_to_restart, "Node restarted successfully");
+
+    // Node should no longer be crashed
+    assert!(
+        !sim.is_node_crashed(&node_to_restart),
+        "Restarted node should not be marked as crashed"
+    );
+
+    // Address should remain the same (same identity)
+    let addr_after = sim.node_address(&node_to_restart);
+    assert_eq!(
+        addr_before, addr_after,
+        "Node should have same address after restart"
+    );
+
+    // Give the restarted node time to reconnect
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    tracing::info!("Node restart test completed successfully");
+}

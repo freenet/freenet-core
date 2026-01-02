@@ -30,6 +30,7 @@ use crate::{
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
+    simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
     transport::TransportPublicKey,
 };
@@ -108,7 +109,8 @@ impl<'a> From<&'a str> for NodeLabel {
 }
 
 #[derive(Clone)]
-struct GatewayConfig {
+pub(crate) struct GatewayConfig {
+    #[allow(dead_code)]
     label: NodeLabel,
     peer_key_location: PeerKeyLocation,
     location: Location,
@@ -312,6 +314,39 @@ impl<ER: NetEventRegister> Builder<ER> {
     }
 }
 
+/// Information about a running node, used for crash/restart operations.
+#[derive(Debug)]
+pub struct RunningNode {
+    /// The label identifying this node
+    pub label: NodeLabel,
+    /// Socket address for fault injection
+    pub addr: SocketAddr,
+    /// Handle to abort the running task (AbortHandle can be cloned and used independently)
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+/// Configuration saved for node restart.
+///
+/// When a node is started, its configuration is saved here so it can be
+/// restarted with the same identity (keypair), location, and data directory.
+#[derive(Clone)]
+pub struct RestartableNodeConfig {
+    /// The node's configuration (contains keypair, location, data dir, etc.)
+    pub config: NodeConfig,
+    /// The node label (reserved for future use in restart scenarios)
+    #[allow(dead_code)]
+    pub label: NodeLabel,
+    /// Whether this is a gateway node
+    pub is_gateway: bool,
+    /// Gateway addresses to connect to (for non-gateway nodes)
+    #[allow(dead_code)]
+    pub gateway_configs: Vec<GatewayConfig>,
+    /// Seed for deterministic RNG in this node's transport layer
+    pub rng_seed: u64,
+    /// Shared in-memory storage for contract state (persists across restarts)
+    pub shared_storage: crate::wasm_runtime::MockStateStorage,
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -332,6 +367,16 @@ pub struct SimNetwork {
     add_noise: bool,
     /// Master seed for deterministic RNG - used to derive per-peer seeds
     seed: u64,
+    /// VirtualTime for deterministic simulation - always enabled
+    virtual_time: VirtualTime,
+    /// Running nodes indexed by label for crash/restart operations
+    running_nodes: HashMap<NodeLabel, RunningNode>,
+    /// Map from label to socket address for quick lookup
+    node_addresses: HashMap<NodeLabel, SocketAddr>,
+    /// Saved configurations for node restart (preserved after crash)
+    restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
+    /// All gateway configs (needed for restarting non-gateway nodes)
+    all_gateway_configs: Vec<GatewayConfig>,
 }
 
 impl SimNetwork {
@@ -353,6 +398,10 @@ impl SimNetwork {
         let (user_ev_controller, mut receiver_ch) =
             watch::channel((0, TransportKeypair::new().public().clone()));
         receiver_ch.borrow_and_update();
+
+        // VirtualTime is always enabled for deterministic simulation
+        let virtual_time = VirtualTime::new();
+
         let mut net = Self {
             name: name.into(),
             clean_up_tmp_dirs: true,
@@ -371,6 +420,11 @@ impl SimNetwork {
             start_backoff: Duration::from_millis(1),
             add_noise: false,
             seed,
+            virtual_time,
+            running_nodes: HashMap::new(),
+            node_addresses: HashMap::new(),
+            restartable_configs: HashMap::new(),
+            all_gateway_configs: Vec::new(),
         };
         net.config_gateways(
             gateways
@@ -379,7 +433,22 @@ impl SimNetwork {
         )
         .await;
         net.config_nodes(nodes).await;
+
+        // Auto-configure fault injection with VirtualTime enabled
+        // Users can call with_fault_injection() to customize
+        net.init_default_fault_injection();
+
         net
+    }
+
+    /// Initializes the default fault injection with VirtualTime but no faults.
+    /// Users can call with_fault_injection() to add message loss, latency, etc.
+    fn init_default_fault_injection(&mut self) {
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state = FaultInjectorState::new(FaultConfig::default(), fault_seed)
+            .with_virtual_time(self.virtual_time.clone());
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
     /// Derives a deterministic per-peer seed from the master seed and peer index.
@@ -407,6 +476,25 @@ impl SimNetwork {
         self.add_noise = true;
     }
 
+    /// Returns the VirtualTime instance for this simulation.
+    ///
+    /// VirtualTime is always enabled. Use this to advance time and control
+    /// message delivery timing.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut sim = SimNetwork::new(...).await;
+    ///
+    /// // Advance virtual time by 100ms
+    /// sim.virtual_time().advance(Duration::from_millis(100));
+    ///
+    /// // Deliver pending messages
+    /// let delivered = sim.advance_virtual_time();
+    /// ```
+    pub fn virtual_time(&self) -> &VirtualTime {
+        &self.virtual_time
+    }
+
     /// Configures fault injection for the network simulation.
     ///
     /// This enables deterministic fault injection using the simulation framework's
@@ -416,7 +504,7 @@ impl SimNetwork {
     /// - Node crashes
     /// - Latency injection (via `latency_range`)
     ///
-    /// The fault injector uses the network's seed for deterministic behavior.
+    /// VirtualTime is automatically used for deterministic latency injection.
     ///
     /// # Example
     /// ```ignore
@@ -428,19 +516,367 @@ impl SimNetwork {
     ///     .message_loss_rate(0.1)
     ///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
     ///     .build());
+    ///
+    /// // Advance time and deliver pending messages
+    /// sim.virtual_time().advance(Duration::from_millis(100));
+    /// sim.advance_virtual_time();
     /// ```
-    pub fn with_fault_injection(&mut self, config: crate::simulation::FaultConfig) {
+    pub fn with_fault_injection(&mut self, config: FaultConfig) {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         // Use a derived seed for fault injection to maintain determinism
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
-        let state = FaultInjectorState::new(config, fault_seed);
+        // Always use VirtualTime for deterministic behavior
+        let state = FaultInjectorState::new(config, fault_seed)
+            .with_virtual_time(self.virtual_time.clone());
         set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
-    /// Clears any configured fault injection.
+    /// Clears any configured fault injection and resets to default (VirtualTime only).
     pub fn clear_fault_injection(&mut self) {
-        use crate::node::network_bridge::set_fault_injector;
-        set_fault_injector(None);
+        self.init_default_fault_injection();
+    }
+
+    /// Configures fault injection with a custom VirtualTime instance.
+    ///
+    /// This is useful if you want to use a shared VirtualTime across multiple
+    /// simulations or have more control over time advancement.
+    ///
+    /// For most cases, use [`with_fault_injection`](Self::with_fault_injection) instead,
+    /// which uses the built-in VirtualTime.
+    #[deprecated(
+        since = "0.1.0",
+        note = "VirtualTime is now always enabled. Use with_fault_injection() and virtual_time() instead."
+    )]
+    pub fn with_fault_injection_virtual_time(
+        &mut self,
+        config: FaultConfig,
+        virtual_time: VirtualTime,
+    ) {
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+    }
+
+    /// Advances virtual time and delivers pending messages.
+    ///
+    /// This should be called after advancing the VirtualTime instance to deliver
+    /// messages whose deadlines have passed.
+    ///
+    /// Returns the number of messages delivered.
+    pub fn advance_virtual_time(&mut self) -> usize {
+        use crate::node::network_bridge::get_fault_injector;
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.advance_time()
+        } else {
+            0
+        }
+    }
+
+    /// Advances virtual time by the given duration and delivers pending messages.
+    ///
+    /// This is a convenience method combining `virtual_time().advance()` and
+    /// `advance_virtual_time()`.
+    ///
+    /// Returns the number of messages delivered.
+    pub fn advance_time(&mut self, duration: Duration) -> usize {
+        self.virtual_time.advance(duration);
+        self.advance_virtual_time()
+    }
+
+    /// Returns the current network statistics from fault injection.
+    ///
+    /// These statistics track:
+    /// - Messages sent, delivered, dropped
+    /// - Drop reasons (loss rate, partition, crash)
+    /// - Latency injection metrics
+    pub fn get_network_stats(&self) -> Option<crate::node::network_bridge::NetworkStats> {
+        use crate::node::network_bridge::get_fault_injector;
+        get_fault_injector().map(|injector| {
+            let state = injector.lock().unwrap();
+            state.stats().clone()
+        })
+    }
+
+    /// Resets the network statistics.
+    pub fn reset_network_stats(&mut self) {
+        use crate::node::network_bridge::get_fault_injector;
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.reset_stats();
+        }
+    }
+
+    // =========================================================================
+    // Node Lifecycle Management (Crash/Restart)
+    // =========================================================================
+
+    /// Crashes a node, stopping its execution and blocking all messages to/from it.
+    ///
+    /// The node's task is aborted and all messages to/from its address are dropped.
+    /// In-flight operations will fail. Use [`restart_node`](Self::restart_node) to
+    /// bring the node back (note: restart is not yet implemented).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut sim = SimNetwork::new(...).await;
+    /// let handles = sim.start_with_rand_gen::<SmallRng>(seed, 10, 5).await;
+    ///
+    /// // Crash node "node-0"
+    /// sim.crash_node(&NodeLabel::node(0));
+    ///
+    /// // Messages to/from this node will be dropped
+    /// // Other nodes should handle the failure gracefully
+    /// ```
+    pub fn crash_node(&mut self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        // Get the node's address
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => *addr,
+            None => {
+                tracing::warn!(?label, "Cannot crash node: address not found");
+                return false;
+            }
+        };
+
+        // Mark as crashed in fault injector
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.crash_node(addr);
+            tracing::info!(?label, ?addr, "Node marked as crashed in fault injector");
+        }
+
+        // Abort the running task if we have a handle
+        if let Some(running) = self.running_nodes.remove(label) {
+            running.abort_handle.abort();
+            tracing::info!(?label, "Node task aborted");
+            true
+        } else {
+            tracing::warn!(
+                ?label,
+                "Node not found in running_nodes (may not be started yet)"
+            );
+            false
+        }
+    }
+
+    /// Recovers a crashed node, allowing messages to flow again.
+    ///
+    /// This removes the node from the crashed set, but does NOT restart the node's
+    /// execution. The node will not process messages, but other nodes can attempt
+    /// to reach it (messages won't be dropped due to crash status).
+    ///
+    /// For full restart, see the roadmap in `docs/architecture/simulation-testing-design.md`.
+    pub fn recover_node(&mut self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!(?label, "Cannot recover node: address not found");
+                return false;
+            }
+        };
+
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.recover_node(addr);
+            tracing::info!(
+                ?label,
+                ?addr,
+                "Node recovered (no longer marked as crashed)"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Checks if a node is currently marked as crashed.
+    pub fn is_node_crashed(&self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        if let Some(injector) = get_fault_injector() {
+            let state = injector.lock().unwrap();
+            state.config.is_crashed(addr)
+        } else {
+            false
+        }
+    }
+
+    /// Returns the socket address for a node label, if known.
+    pub fn node_address(&self, label: &NodeLabel) -> Option<SocketAddr> {
+        self.node_addresses.get(label).copied()
+    }
+
+    /// Returns all node labels and their addresses.
+    pub fn all_node_addresses(&self) -> &HashMap<NodeLabel, SocketAddr> {
+        &self.node_addresses
+    }
+
+    /// Restarts a crashed node, preserving its identity.
+    ///
+    /// This method:
+    /// 1. Retrieves the saved configuration (keypair, data directory, location)
+    /// 2. Unregisters the old peer from the transport layer
+    /// 3. Creates a new node with the same identity
+    /// 4. Starts the node task
+    ///
+    /// # What's Preserved
+    /// - **Keypair/identity**: Same public key and address
+    /// - **Data directory path**: Same location for any disk-based storage
+    /// - **Network location**: Same ring location
+    /// - **Gateway configs**: Same gateway connections
+    ///
+    /// # What's NOT Preserved (Current Limitation)
+    /// - **In-memory state**: Memory caches are lost on crash
+    /// - **In-flight transactions**: Any pending operations are lost
+    /// - **Contract state**: Currently stored on disk (SQLite), which may or may not
+    ///   survive the abrupt task abort depending on flush timing
+    ///
+    /// # Future Work
+    /// For truly deterministic state persistence, we need to implement shared
+    /// in-memory storage using `MockStateStorage` instead of SQLite. This would
+    /// require making `Executor` generic over the storage type.
+    ///
+    /// # Arguments
+    /// * `label` - The label of the node to restart
+    /// * `seed` - Seed for random event generation
+    /// * `max_contract_num` - Maximum number of contracts for event generation
+    /// * `iterations` - Number of iterations for event generation
+    ///
+    /// # Returns
+    /// * `Some(JoinHandle)` if restart was successful
+    /// * `None` if the node config was not found or restart failed
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Crash a node
+    /// sim.crash_node(&label);
+    /// assert!(sim.is_node_crashed(&label));
+    ///
+    /// // Restart it with same identity
+    /// let handle = sim.restart_node::<SmallRng>(&label, 0x5678, 10, 5).await;
+    /// assert!(handle.is_some());
+    /// assert!(!sim.is_node_crashed(&label));
+    /// ```
+    pub async fn restart_node<R>(
+        &mut self,
+        label: &NodeLabel,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+    ) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>>
+    where
+        R: crate::client_events::test::RandomEventGenerator + Send + 'static,
+    {
+        use crate::node::network_bridge::get_fault_injector;
+        use crate::node::network_bridge::in_memory::unregister_peer;
+
+        // Get the saved restartable config
+        let restart_config = match self.restartable_configs.get(label) {
+            Some(config) => config.clone(),
+            None => {
+                tracing::warn!(?label, "Cannot restart node: config not found");
+                return None;
+            }
+        };
+
+        // Get the node address
+        let node_addr = match self.node_addresses.get(label) {
+            Some(addr) => *addr,
+            None => {
+                tracing::warn!(?label, "Cannot restart node: address not found");
+                return None;
+            }
+        };
+
+        tracing::info!(?label, ?node_addr, "Restarting node with persisted state");
+
+        // Unregister the old peer from transport (the new node will re-register)
+        unregister_peer(&node_addr);
+
+        // Clear crash status in fault injector
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.recover_node(&node_addr);
+        }
+
+        // Create a new Builder with the saved configuration
+        let event_listener = {
+            #[cfg(feature = "trace-ot")]
+            {
+                use crate::tracing::OTEventRegister;
+                CombinedRegister::new([
+                    self.event_listener.trait_clone(),
+                    Box::new(OTEventRegister::new()),
+                ])
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                self.event_listener.clone()
+            }
+        };
+
+        let builder = Builder::build(
+            restart_config.config.clone(),
+            event_listener,
+            format!("{}-{}", self.name, label),
+            self.add_noise,
+            restart_config.rng_seed,
+        );
+
+        // Calculate total peers for event generation params
+        let total_peer_num = self.labels.len();
+
+        // Create user events for the restarted node
+        let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+            self.receiver_ch.clone(),
+            restart_config.config.key_pair.public().clone(),
+            seed,
+        );
+        user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+        // Create the appropriate span
+        let span = if restart_config.is_gateway {
+            tracing::info_span!("in_mem_gateway_restart", %label)
+        } else {
+            tracing::info_span!("in_mem_node_restart", %label)
+        };
+
+        // Start the node task with shared storage for state persistence
+        let shared_storage = restart_config.shared_storage.clone();
+        let node_task = async move {
+            builder
+                .run_node_with_shared_storage(user_events, span, shared_storage)
+                .await
+        };
+        let handle = GlobalExecutor::spawn(node_task);
+
+        // Track the new running node
+        self.running_nodes.insert(
+            label.clone(),
+            RunningNode {
+                label: label.clone(),
+                addr: node_addr,
+                abort_handle: handle.abort_handle(),
+            },
+        );
+
+        tracing::info!(?label, "Node restarted successfully with persisted state");
+        Some(handle)
+    }
+
+    /// Checks if a node has a saved configuration for restart.
+    pub fn can_restart(&self, label: &NodeLabel) -> bool {
+        self.restartable_configs.contains_key(label)
     }
 
     #[allow(unused)]
@@ -455,9 +891,12 @@ impl SimNetwork {
             let label = NodeLabel::gateway(&self.name, node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
-            let addr = (Ipv6Addr::LOCALHOST, port).into();
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
             let location = Location::random();
+
+            // Track address for crash/restart operations
+            self.node_addresses.insert(label.clone(), addr);
 
             let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
@@ -493,6 +932,9 @@ impl SimNetwork {
         configs[0].0.should_connect = false;
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
+        // Store all gateway configs for use when restarting non-gateway nodes
+        self.all_gateway_configs = gateways.clone();
+
         for (mut this_node, this_config) in configs {
             for GatewayConfig {
                 peer_key_location,
@@ -559,7 +1001,7 @@ impl SimNetwork {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
             let port = crate::util::get_free_port().unwrap();
-            let addr = (Ipv6Addr::LOCALHOST, port).into();
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.key_pair = crate::transport::TransportKeypair::new();
@@ -568,6 +1010,9 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);
+
+            // Track address for crash/restart operations
+            self.node_addresses.insert(label.clone(), addr);
 
             self.event_listener
                 .add_node(label.clone(), config.key_pair.public().clone());
@@ -607,31 +1052,177 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
+        use crate::node::network_bridge::in_memory::is_peer_registered;
+
         let total_peer_num = self.gateways.len() + self.nodes.len();
-        let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         let mut peers = vec![];
-        for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
-            tracing::debug!(peer = %label, "initializing");
+
+        // Phase 1: Start all gateways first and collect their addresses
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        let mut gateway_addrs = Vec::with_capacity(gateways.len());
+
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            // Use the peer_key_location address from GatewayConfig - this is the address
+            // that will be registered in the peer registry
+            let gateway_addr = *config
+                .peer_key_location
+                .peer_addr
+                .as_known()
+                .expect("Gateway should have known address");
+            gateway_addrs.push(gateway_addr);
+
+            tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway");
+
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: true,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
+
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
                 seed,
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
-            let span = if label.is_gateway() {
-                tracing::info_span!("in_mem_gateway", %label)
-            } else {
-                tracing::info_span!("in_mem_node", %label)
-            };
+            let span = tracing::info_span!("in_mem_gateway", %label);
             self.labels
-                .push((label, node.config.key_pair.public().clone()));
+                .push((label.clone(), node.config.key_pair.public().clone()));
 
-            let node_task = async move { node.run_node(user_events, span).await };
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
+            };
             let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: gateway_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
+
             peers.push(handle);
 
             tokio::time::sleep(self.start_backoff).await;
         }
+
+        // Phase 2: Wait for all gateways to be registered in the peer registry
+        // This prevents the race condition where regular nodes try to connect
+        // before gateways are ready to receive connections
+        let registration_timeout = Duration::from_secs(10);
+        let poll_interval = Duration::from_millis(10);
+        let start = std::time::Instant::now();
+
+        'wait_loop: loop {
+            let mut all_registered = true;
+            for addr in &gateway_addrs {
+                if !is_peer_registered(addr) {
+                    all_registered = false;
+                    break;
+                }
+            }
+
+            if all_registered {
+                tracing::debug!("All {} gateways registered", gateway_addrs.len());
+                // Give gateways additional time to fully initialize their event loops
+                // before regular nodes start connecting
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                tracing::debug!("Starting regular nodes");
+                break 'wait_loop;
+            }
+
+            if start.elapsed() > registration_timeout {
+                tracing::warn!(
+                    "Timeout waiting for gateway registration, some may not be ready. \
+                     Registered: {}/{}",
+                    gateway_addrs
+                        .iter()
+                        .filter(|a| is_peer_registered(a))
+                        .count(),
+                    gateway_addrs.len()
+                );
+                break 'wait_loop;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Phase 3: Start all regular nodes
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            // Get node address from tracked addresses
+            let node_addr = self
+                .node_addresses
+                .get(&label)
+                .copied()
+                .expect("Node address should be tracked");
+
+            tracing::debug!(peer = %label, addr = %node_addr, "starting regular node");
+
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: false,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
+
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                self.receiver_ch.clone(),
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+            let span = tracing::info_span!("in_mem_node", %label);
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
+            };
+            let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: node_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
+
+            peers.push(handle);
+
+            tokio::time::sleep(self.start_backoff).await;
+        }
+
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers
     }
@@ -670,9 +1261,46 @@ impl SimNetwork {
 
     /// Start an event chain for this simulation. Allows passing a different controller for the peers.
     ///
+    /// This method borrows the SimNetwork, allowing you to call verification methods
+    /// (like `check_convergence()`, `get_operation_summary()`) after events complete.
+    ///
     /// If done make sure you set the proper receiving side for the controller. For example in the
     /// nodes built through the [`build_peers`](`Self::build_peers`) method.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut stream = sim.event_chain(100, None);
+    /// while stream.next().await.is_some() {
+    ///     tokio::time::sleep(Duration::from_millis(100)).await;
+    /// }
+    /// drop(stream); // Drop the stream before verification
+    /// let result = sim.check_convergence().await; // sim is still usable!
+    /// ```
     pub fn event_chain(
+        &mut self,
+        total_events: u32,
+        controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
+    ) -> EventChain {
+        let user_ev_controller = controller.unwrap_or_else(|| {
+            self.user_ev_controller
+                .take()
+                .expect("controller should be set")
+        });
+        // Clone labels - SimNetwork retains ownership for verification methods
+        let labels = self.labels.clone();
+        // EventChain no longer handles cleanup - SimNetwork's Drop does
+        EventChain::new(labels, user_ev_controller, total_events, false)
+    }
+
+    /// Consumes the SimNetwork and returns an event chain.
+    ///
+    /// Use this when you don't need to access SimNetwork after events complete.
+    /// For post-event verification, use [`event_chain`](Self::event_chain) instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use event_chain(&mut self) instead to retain access to SimNetwork for verification"
+    )]
+    pub fn into_event_chain(
         mut self,
         total_events: u32,
         controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
@@ -680,11 +1308,11 @@ impl SimNetwork {
         let user_ev_controller = controller.unwrap_or_else(|| {
             self.user_ev_controller
                 .take()
-                .expect("controller should be ser")
+                .expect("controller should be set")
         });
         let labels = std::mem::take(&mut self.labels);
         let debug_val = self.clean_up_tmp_dirs;
-        self.clean_up_tmp_dirs = false; // set to false to avoid cleaning up the tmp dirs
+        self.clean_up_tmp_dirs = false; // EventChain handles cleanup
         EventChain::new(labels, user_ev_controller, total_events, debug_val)
     }
 
@@ -855,6 +1483,613 @@ impl SimNetwork {
             tracing::warn!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
         }
         Ok(())
+    }
+
+    /// Checks convergence of contract states across all peers.
+    ///
+    /// Returns a `ConvergenceResult` containing:
+    /// - Which contracts have converged (all replicas have the same state hash)
+    /// - Which contracts have not converged (different state hashes across replicas)
+    /// - Per-contract details of state hashes per peer
+    ///
+    /// This is useful for testing eventual consistency properties.
+    pub async fn check_convergence(&self) -> ConvergenceResult {
+        let summary = self.get_deterministic_event_summary().await;
+
+        // Group (contract_key -> peer_addr -> latest_state_hash)
+        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+
+        for event in &summary {
+            if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
+            {
+                // Keep the latest state for each peer/contract pair
+                contract_states
+                    .entry(contract_key.clone())
+                    .or_default()
+                    .insert(event.peer_addr, state_hash.clone());
+            }
+        }
+
+        let mut converged = Vec::new();
+        let mut diverged = Vec::new();
+
+        for (contract_key, peer_states) in contract_states {
+            if peer_states.len() < 2 {
+                // Need at least 2 peers to check convergence
+                continue;
+            }
+
+            let unique_states: HashSet<&String> = peer_states.values().collect();
+
+            if unique_states.len() == 1 {
+                let state = unique_states.into_iter().next().unwrap().clone();
+                converged.push(ConvergedContract {
+                    contract_key,
+                    state_hash: state,
+                    replica_count: peer_states.len(),
+                });
+            } else {
+                diverged.push(DivergedContract {
+                    contract_key,
+                    peer_states: peer_states.into_iter().collect(),
+                });
+            }
+        }
+
+        ConvergenceResult {
+            converged,
+            diverged,
+        }
+    }
+
+    /// Waits for convergence of contract states, polling at regular intervals.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time to wait for convergence
+    /// * `poll_interval` - How often to check convergence
+    /// * `min_contracts` - Minimum number of contracts that must be replicated (default: 1)
+    ///
+    /// # Returns
+    /// * `Ok(ConvergenceResult)` - If convergence achieved (no diverged contracts)
+    /// * `Err(ConvergenceResult)` - If timeout reached with diverged contracts
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = sim.await_convergence(
+    ///     Duration::from_secs(30),
+    ///     Duration::from_millis(500),
+    ///     1,
+    /// ).await;
+    ///
+    /// match result {
+    ///     Ok(r) => println!("{} contracts converged", r.converged.len()),
+    ///     Err(r) => panic!("{} contracts still diverged", r.diverged.len()),
+    /// }
+    /// ```
+    pub async fn await_convergence(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+        min_contracts: usize,
+    ) -> Result<ConvergenceResult, ConvergenceResult> {
+        let start = Instant::now();
+
+        loop {
+            let result = self.check_convergence().await;
+
+            // Check if we have enough contracts and all have converged
+            let total_replicated = result.converged.len() + result.diverged.len();
+            if total_replicated >= min_contracts && result.diverged.is_empty() {
+                tracing::info!(
+                    "Convergence achieved: {} contracts converged in {:?}",
+                    result.converged.len(),
+                    start.elapsed()
+                );
+                return Ok(result);
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Convergence timeout after {:?}: {} converged, {} diverged",
+                    timeout,
+                    result.converged.len(),
+                    result.diverged.len()
+                );
+                return Err(result);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Asserts that all replicated contracts have converged.
+    ///
+    /// This is a convenience method that combines `await_convergence` with
+    /// an assertion. It panics if convergence is not achieved.
+    ///
+    /// # Panics
+    /// Panics if convergence is not achieved within the timeout.
+    pub async fn assert_convergence(&self, timeout: Duration, poll_interval: Duration) {
+        match self.await_convergence(timeout, poll_interval, 1).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Convergence assertion passed: {} contracts",
+                    result.converged.len()
+                );
+            }
+            Err(result) => {
+                let diverged_details: Vec<String> = result
+                    .diverged
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "Contract {}: {} different states across {} peers",
+                            d.contract_key,
+                            d.unique_state_count(),
+                            d.peer_states.len()
+                        )
+                    })
+                    .collect();
+
+                panic!(
+                    "Convergence assertion failed after {:?}: {} contracts diverged\n{}",
+                    timeout,
+                    result.diverged.len(),
+                    diverged_details.join("\n")
+                );
+            }
+        }
+    }
+
+    /// Returns the convergence rate as a ratio (0.0 to 1.0).
+    ///
+    /// Convergence rate = converged_contracts / total_replicated_contracts
+    pub async fn convergence_rate(&self) -> f64 {
+        let result = self.check_convergence().await;
+        let total = result.converged.len() + result.diverged.len();
+        if total == 0 {
+            return 1.0; // No contracts replicated yet
+        }
+        result.converged.len() as f64 / total as f64
+    }
+
+    // =========================================================================
+    // Gap 4: Direct State Query API (event-based)
+    // =========================================================================
+
+    /// Returns the latest known state hash for each contract on each peer.
+    ///
+    /// This provides a view of contract state distribution across the network
+    /// by examining event logs. Returns a map of contract_key -> (peer_addr -> state_hash).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let states = sim.get_contract_state_hashes().await;
+    /// for (contract, peer_states) in states {
+    ///     println!("Contract {}: {} replicas", contract, peer_states.len());
+    ///     for (peer, hash) in peer_states {
+    ///         println!("  {}: {}", peer, hash);
+    ///     }
+    /// }
+    /// ```
+    pub async fn get_contract_state_hashes(&self) -> HashMap<String, HashMap<SocketAddr, String>> {
+        let summary = self.get_deterministic_event_summary().await;
+
+        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+
+        for event in &summary {
+            if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
+            {
+                // Keep the latest state for each peer/contract pair
+                contract_states
+                    .entry(contract_key.clone())
+                    .or_default()
+                    .insert(event.peer_addr, state_hash.clone());
+            }
+        }
+
+        contract_states
+    }
+
+    /// Returns a list of contracts and the peers that have them.
+    ///
+    /// This is useful for checking contract distribution across the network.
+    pub async fn get_contract_distribution(&self) -> Vec<ContractDistribution> {
+        let states = self.get_contract_state_hashes().await;
+        states
+            .into_iter()
+            .map(|(contract_key, peer_states)| ContractDistribution {
+                contract_key,
+                replica_count: peer_states.len(),
+                peers: peer_states.keys().cloned().collect(),
+            })
+            .collect()
+    }
+
+    // =========================================================================
+    // Gap T4: Operation Completion Tracking
+    // =========================================================================
+
+    /// Returns a summary of operation completion status.
+    ///
+    /// This tracks Put, Get, Subscribe, and Update operations from request to
+    /// completion (success or failure).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let summary = sim.get_operation_summary().await;
+    /// println!("Put: {}/{} completed ({:.1}% success)",
+    ///     summary.put.completed(),
+    ///     summary.put.requested,
+    ///     summary.put.success_rate() * 100.0);
+    /// ```
+    pub async fn get_operation_summary(&self) -> OperationSummary {
+        let logs = self.event_listener.logs.lock().await;
+
+        let mut summary = OperationSummary::default();
+
+        for log in logs.iter() {
+            match &log.kind {
+                // Put operations
+                crate::tracing::EventKind::Put(put_event) => {
+                    use crate::tracing::PutEvent;
+                    match put_event {
+                        PutEvent::Request { .. } => summary.put.requested += 1,
+                        PutEvent::PutSuccess { .. } => summary.put.succeeded += 1,
+                        PutEvent::PutFailure { .. } => summary.put.failed += 1,
+                        PutEvent::BroadcastEmitted { .. } => summary.put.broadcasts_emitted += 1,
+                        PutEvent::BroadcastReceived { .. } => summary.put.broadcasts_received += 1,
+                    }
+                }
+                // Get operations
+                crate::tracing::EventKind::Get(get_event) => {
+                    use crate::tracing::GetEvent;
+                    match get_event {
+                        GetEvent::Request { .. } => summary.get.requested += 1,
+                        GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
+                        GetEvent::GetFailure { .. } => summary.get.failed += 1,
+                        _ => {}
+                    }
+                }
+                // Subscribe operations
+                crate::tracing::EventKind::Subscribe(sub_event) => {
+                    use crate::tracing::SubscribeEvent;
+                    match sub_event {
+                        SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
+                        SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
+                        SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
+                        _ => {}
+                    }
+                }
+                // Update operations (no UpdateFailure variant exists)
+                crate::tracing::EventKind::Update(update_event) => {
+                    use crate::tracing::UpdateEvent;
+                    match update_event {
+                        UpdateEvent::Request { .. } => summary.update.requested += 1,
+                        UpdateEvent::UpdateSuccess { .. } => summary.update.succeeded += 1,
+                        UpdateEvent::BroadcastReceived { .. } => {
+                            summary.update.broadcasts_received += 1
+                        }
+                        _ => {}
+                    }
+                }
+                // Timeouts
+                crate::tracing::EventKind::Timeout { .. } => {
+                    summary.timeouts += 1;
+                }
+                _ => {}
+            }
+        }
+
+        summary
+    }
+
+    /// Checks if all requested operations have completed (either succeeded or failed).
+    ///
+    /// Returns (completed, pending) counts.
+    pub async fn operation_completion_status(&self) -> (usize, usize) {
+        let summary = self.get_operation_summary().await;
+        let completed = summary.total_completed();
+        let requested = summary.total_requested();
+        let pending = requested.saturating_sub(completed);
+        (completed, pending)
+    }
+
+    /// Returns the overall operation success rate (0.0 to 1.0).
+    pub async fn operation_success_rate(&self) -> f64 {
+        let summary = self.get_operation_summary().await;
+        summary.overall_success_rate()
+    }
+
+    /// Waits for all operations to complete, up to a timeout.
+    ///
+    /// # Returns
+    /// * `Ok(OperationSummary)` - If all operations completed
+    /// * `Err(OperationSummary)` - If timeout reached with pending operations
+    pub async fn await_operation_completion(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<OperationSummary, OperationSummary> {
+        let start = Instant::now();
+
+        loop {
+            let summary = self.get_operation_summary().await;
+            let (completed, pending) = (summary.total_completed(), summary.total_requested());
+
+            // All operations completed (or none requested)
+            if pending == 0 || completed >= pending {
+                return Ok(summary);
+            }
+
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Operation completion timeout: {} completed, {} pending",
+                    completed,
+                    pending.saturating_sub(completed)
+                );
+                return Err(summary);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Asserts that operation success rate meets the threshold.
+    ///
+    /// # Panics
+    /// Panics if success rate is below the threshold.
+    pub async fn assert_operation_success_rate(&self, min_rate: f64) {
+        let summary = self.get_operation_summary().await;
+        let rate = summary.overall_success_rate();
+
+        if rate < min_rate {
+            panic!(
+                "Operation success rate {:.1}% is below threshold {:.1}%\n\
+                 Put: {}/{} ({:.1}%), Get: {}/{} ({:.1}%), \
+                 Subscribe: {}/{} ({:.1}%), Update: {}/{} ({:.1}%)",
+                rate * 100.0,
+                min_rate * 100.0,
+                summary.put.succeeded,
+                summary.put.completed(),
+                summary.put.success_rate() * 100.0,
+                summary.get.succeeded,
+                summary.get.completed(),
+                summary.get.success_rate() * 100.0,
+                summary.subscribe.succeeded,
+                summary.subscribe.completed(),
+                summary.subscribe.success_rate() * 100.0,
+                summary.update.succeeded,
+                summary.update.completed(),
+                summary.update.success_rate() * 100.0,
+            );
+        }
+    }
+}
+
+/// Result of a convergence check.
+#[derive(Debug, Clone)]
+pub struct ConvergenceResult {
+    /// Contracts where all replicas have the same state hash.
+    pub converged: Vec<ConvergedContract>,
+    /// Contracts where replicas have different state hashes.
+    pub diverged: Vec<DivergedContract>,
+}
+
+impl ConvergenceResult {
+    /// Returns the total number of contracts checked.
+    pub fn total_contracts(&self) -> usize {
+        self.converged.len() + self.diverged.len()
+    }
+
+    /// Returns the convergence rate as a ratio (0.0 to 1.0).
+    pub fn rate(&self) -> f64 {
+        if self.total_contracts() == 0 {
+            return 1.0;
+        }
+        self.converged.len() as f64 / self.total_contracts() as f64
+    }
+
+    /// Returns true if all replicated contracts have converged.
+    pub fn is_converged(&self) -> bool {
+        self.diverged.is_empty()
+    }
+}
+
+/// A contract that has converged (all replicas have the same state).
+#[derive(Debug, Clone)]
+pub struct ConvergedContract {
+    /// The contract key
+    pub contract_key: String,
+    /// The state hash that all replicas have
+    pub state_hash: String,
+    /// Number of replicas that have this state
+    pub replica_count: usize,
+}
+
+/// A contract that has diverged (replicas have different states).
+#[derive(Debug, Clone)]
+pub struct DivergedContract {
+    /// The contract key
+    pub contract_key: String,
+    /// Map of peer address to their state hash
+    pub peer_states: Vec<(SocketAddr, String)>,
+}
+
+impl DivergedContract {
+    /// Returns the number of unique states across replicas.
+    pub fn unique_state_count(&self) -> usize {
+        let unique: HashSet<&String> = self.peer_states.iter().map(|(_, h)| h).collect();
+        unique.len()
+    }
+}
+
+// =============================================================================
+// Gap 4: Contract Distribution Types
+// =============================================================================
+
+/// Information about how a contract is distributed across the network.
+#[derive(Debug, Clone)]
+pub struct ContractDistribution {
+    /// The contract key
+    pub contract_key: String,
+    /// Number of replicas
+    pub replica_count: usize,
+    /// Peers that have this contract
+    pub peers: Vec<SocketAddr>,
+}
+
+// =============================================================================
+// Gap T4: Operation Tracking Types
+// =============================================================================
+
+/// Summary of operation completion status across the network.
+#[derive(Debug, Clone, Default)]
+pub struct OperationSummary {
+    /// Put operation statistics
+    pub put: PutOperationStats,
+    /// Get operation statistics
+    pub get: OperationStats,
+    /// Subscribe operation statistics
+    pub subscribe: OperationStats,
+    /// Update operation statistics
+    pub update: UpdateOperationStats,
+    /// Total number of timed-out operations
+    pub timeouts: usize,
+}
+
+impl OperationSummary {
+    /// Returns total number of operations requested.
+    pub fn total_requested(&self) -> usize {
+        self.put.requested + self.get.requested + self.subscribe.requested + self.update.requested
+    }
+
+    /// Returns total number of operations completed (succeeded + failed).
+    pub fn total_completed(&self) -> usize {
+        self.put.completed()
+            + self.get.completed()
+            + self.subscribe.completed()
+            + self.update.completed()
+    }
+
+    /// Returns total number of successful operations.
+    pub fn total_succeeded(&self) -> usize {
+        self.put.succeeded + self.get.succeeded + self.subscribe.succeeded + self.update.succeeded
+    }
+
+    /// Returns total number of failed operations.
+    pub fn total_failed(&self) -> usize {
+        self.put.failed + self.get.failed + self.subscribe.failed + self.update.failed
+    }
+
+    /// Returns overall success rate (0.0 to 1.0).
+    pub fn overall_success_rate(&self) -> f64 {
+        let completed = self.total_completed();
+        if completed == 0 {
+            return 1.0; // No operations completed yet
+        }
+        self.total_succeeded() as f64 / completed as f64
+    }
+
+    /// Returns true if all requested operations have completed.
+    pub fn all_completed(&self) -> bool {
+        self.total_completed() >= self.total_requested()
+    }
+}
+
+/// Statistics for a basic operation type (Get, Subscribe).
+#[derive(Debug, Clone, Default)]
+pub struct OperationStats {
+    /// Number of operations requested
+    pub requested: usize,
+    /// Number of operations that succeeded
+    pub succeeded: usize,
+    /// Number of operations that failed
+    pub failed: usize,
+}
+
+impl OperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
+    }
+}
+
+/// Statistics for Put operations (includes broadcast tracking).
+#[derive(Debug, Clone, Default)]
+pub struct PutOperationStats {
+    /// Number of Put operations requested
+    pub requested: usize,
+    /// Number of Put operations that succeeded
+    pub succeeded: usize,
+    /// Number of Put operations that failed
+    pub failed: usize,
+    /// Number of broadcasts emitted
+    pub broadcasts_emitted: usize,
+    /// Number of broadcasts received by peers
+    pub broadcasts_received: usize,
+}
+
+impl PutOperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
+    }
+
+    /// Returns broadcast propagation rate (received / emitted).
+    pub fn broadcast_propagation_rate(&self) -> f64 {
+        if self.broadcasts_emitted == 0 {
+            return 1.0;
+        }
+        self.broadcasts_received as f64 / self.broadcasts_emitted as f64
+    }
+}
+
+/// Statistics for Update operations (includes broadcast tracking).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOperationStats {
+    /// Number of Update operations requested
+    pub requested: usize,
+    /// Number of Update operations that succeeded
+    pub succeeded: usize,
+    /// Number of Update operations that failed
+    pub failed: usize,
+    /// Number of update broadcasts received by subscribers
+    pub broadcasts_received: usize,
+}
+
+impl UpdateOperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
     }
 }
 

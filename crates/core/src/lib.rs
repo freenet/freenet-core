@@ -73,13 +73,22 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{
-            EventChain, EventSummary, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
+            ContractDistribution, ConvergedContract, ConvergenceResult, DivergedContract,
+            EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
+            PeerMessage, PeerStatus, PutOperationStats, RunningNode, SimNetwork,
+            UpdateOperationStats,
         },
-        InitPeerNode, NodeConfig, PeerId,
+        InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
+
+    // Re-export simulation types for test infrastructure
+    pub use crate::simulation::{
+        FaultConfig, FaultConfigBuilder, Partition, SimulationRng, TimeSource, VirtualTime,
+        WakeupId,
+    };
 }
 
 pub mod test_utils;

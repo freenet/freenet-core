@@ -2627,7 +2627,7 @@ impl std::fmt::Display for OperationFailure {
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum PutEvent {
+pub(crate) enum PutEvent {
     Request {
         id: Transaction,
         requester: PeerKeyLocation,
@@ -2720,7 +2720,7 @@ impl PutEvent {
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum UpdateEvent {
+pub(crate) enum UpdateEvent {
     Request {
         id: Transaction,
         requester: PeerKeyLocation,
@@ -2824,7 +2824,7 @@ impl UpdateEvent {
 /// - Failure when operation fails due to network/system errors
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum GetEvent {
+pub(crate) enum GetEvent {
     /// A Get request was initiated or received.
     Request {
         id: Transaction,
@@ -2904,7 +2904,7 @@ impl GetEvent {
 /// - Subscription tree structure changes (upstream/downstream relationships)
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum SubscribeEvent {
+pub(crate) enum SubscribeEvent {
     /// A Subscribe request was initiated or received.
     Request {
         id: Transaction,
