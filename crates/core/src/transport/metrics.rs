@@ -21,8 +21,12 @@
 //! }
 //! ```
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use tokio::sync::mpsc;
+
+use crate::tracing::{TransferDirection, TransferEvent};
 
 /// Global transport metrics instance.
 ///
@@ -346,6 +350,108 @@ pub struct TransportSnapshot {
     pub min_rtt_us: u64,
     /// Maximum RTT in microseconds.
     pub max_rtt_us: u64,
+}
+
+/// Channel capacity for transfer events.
+/// Using a bounded channel to prevent memory issues if telemetry is slow.
+const TRANSFER_EVENT_CHANNEL_CAPACITY: usize = 1000;
+
+/// Global sender for transfer events.
+/// This is set once during telemetry initialization.
+static TRANSFER_EVENT_SENDER: LazyLock<parking_lot::RwLock<Option<mpsc::Sender<TransferEvent>>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Initialize the transfer event channel.
+/// Returns a receiver that the TelemetryWorker should poll.
+/// Should be called once during telemetry initialization.
+pub fn init_transfer_event_channel() -> mpsc::Receiver<TransferEvent> {
+    let (tx, rx) = mpsc::channel(TRANSFER_EVENT_CHANNEL_CAPACITY);
+    *TRANSFER_EVENT_SENDER.write() = Some(tx);
+    rx
+}
+
+/// Emit a transfer started event.
+/// Returns immediately if telemetry is not enabled (sender not initialized).
+pub fn emit_transfer_started(
+    stream_id: u64,
+    peer_addr: SocketAddr,
+    expected_bytes: u64,
+    direction: TransferDirection,
+) {
+    let sender_guard = TRANSFER_EVENT_SENDER.read();
+    if let Some(sender) = sender_guard.as_ref() {
+        let event = TransferEvent::Started {
+            stream_id,
+            peer_addr,
+            expected_bytes,
+            direction,
+            tx_id: None, // Transaction ID not available at transport layer
+            timestamp: crate::tracing::telemetry::current_timestamp_ms(),
+        };
+        // Use try_send to avoid blocking the transport layer
+        let _ = sender.try_send(event);
+    }
+}
+
+/// Emit a transfer completed event.
+/// Returns immediately if telemetry is not enabled (sender not initialized).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_transfer_completed(
+    stream_id: u64,
+    peer_addr: SocketAddr,
+    bytes_transferred: u64,
+    elapsed_ms: u64,
+    avg_throughput_bps: u64,
+    peak_cwnd_bytes: Option<u32>,
+    final_cwnd_bytes: Option<u32>,
+    slowdowns_triggered: Option<u32>,
+    final_srtt_ms: Option<u32>,
+    direction: TransferDirection,
+) {
+    let sender_guard = TRANSFER_EVENT_SENDER.read();
+    if let Some(sender) = sender_guard.as_ref() {
+        let event = TransferEvent::Completed {
+            stream_id,
+            peer_addr,
+            bytes_transferred,
+            elapsed_ms,
+            avg_throughput_bps,
+            peak_cwnd_bytes,
+            final_cwnd_bytes,
+            slowdowns_triggered,
+            final_srtt_ms,
+            direction,
+            timestamp: crate::tracing::telemetry::current_timestamp_ms(),
+        };
+        // Use try_send to avoid blocking the transport layer
+        let _ = sender.try_send(event);
+    }
+}
+
+/// Emit a transfer failed event.
+/// Returns immediately if telemetry is not enabled (sender not initialized).
+pub fn emit_transfer_failed(
+    stream_id: u64,
+    peer_addr: SocketAddr,
+    bytes_transferred: u64,
+    reason: String,
+    elapsed_ms: u64,
+    direction: TransferDirection,
+) {
+    let sender_guard = TRANSFER_EVENT_SENDER.read();
+    if let Some(sender) = sender_guard.as_ref() {
+        let event = TransferEvent::Failed {
+            stream_id,
+            peer_addr,
+            bytes_transferred,
+            reason,
+            elapsed_ms,
+            direction,
+            timestamp: crate::tracing::telemetry::current_timestamp_ms(),
+        };
+        // Use try_send to avoid blocking the transport layer
+        let _ = sender.try_send(event);
+    }
 }
 
 #[cfg(test)]

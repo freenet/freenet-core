@@ -3105,20 +3105,22 @@ pub enum TransferDirection {
 /// Only transfer-level events (start/complete/failed) are emitted.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum TransferEvent {
+pub enum TransferEvent {
     /// A data stream transfer has started.
     Started {
         /// Unique identifier for this stream.
         stream_id: u64,
-        /// The remote peer we're transferring with.
-        peer: PeerKeyLocation,
-        /// Contract instance this transfer is for (if applicable).
-        contract_instance: Option<ContractInstanceId>,
+        /// The remote peer's socket address.
+        /// Note: Uses SocketAddr rather than PeerKeyLocation because the transport
+        /// layer doesn't always have access to the peer's public key (especially
+        /// for inbound connections at gateways before identity is established).
+        peer_addr: std::net::SocketAddr,
         /// Total expected bytes to transfer.
         expected_bytes: u64,
         /// Whether we're sending or receiving.
         direction: TransferDirection,
-        /// Transaction ID associated with this transfer.
+        /// Transaction ID associated with this transfer (if available).
+        /// May be None when the transport layer doesn't have transaction context.
         tx_id: Option<Transaction>,
         timestamp: u64,
     },
@@ -3126,8 +3128,8 @@ enum TransferEvent {
     Completed {
         /// Unique identifier for this stream.
         stream_id: u64,
-        /// The remote peer we transferred with.
-        peer: PeerKeyLocation,
+        /// The remote peer's socket address.
+        peer_addr: std::net::SocketAddr,
         /// Actual bytes transferred.
         bytes_transferred: u64,
         /// Time elapsed from start to completion (milliseconds).
@@ -3151,8 +3153,8 @@ enum TransferEvent {
     Failed {
         /// Unique identifier for this stream.
         stream_id: u64,
-        /// The remote peer we were transferring with.
-        peer: PeerKeyLocation,
+        /// The remote peer's socket address.
+        peer_addr: std::net::SocketAddr,
         /// Bytes transferred before failure.
         bytes_transferred: u64,
         /// Reason for failure.
