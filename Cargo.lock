@@ -2070,9 +2070,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-test-network"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa0d545cca2fab9717c55882f7922498942d171548ce79319cac80c95ba2480"
+checksum = "779b2980d239732f4079e342c4262183e9d0f720afd3757b0ff2a1290b1e40e3"
 dependencies = [
  "anyhow",
  "bollard",
