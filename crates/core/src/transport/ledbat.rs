@@ -7452,7 +7452,7 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-// Regression test (issue #2559): min_interval must be at least 18 RTTs.
+        // Regression test (issue #2559): min_interval must be at least 18 RTTs.
         //
         // The bug: min_interval was 1 RTT instead of 18 RTTs, causing
         // 224 slowdowns in 30s on a 137ms RTT path.
@@ -7502,7 +7502,7 @@ mod tests {
             }
         }
 
-// Dynamic GAIN must be in range [1/MAX_GAIN_DIVISOR, 1].
+        // Dynamic GAIN must be in range [1/MAX_GAIN_DIVISOR, 1].
         //
         // GAIN = 1 / min(MAX_GAIN_DIVISOR, ceil(2 * TARGET / base_delay))
         //
@@ -7529,7 +7529,7 @@ mod tests {
             }
         }
 
-// Rate = cwnd / RTT, with 1ms minimum RTT floor.
+        // Rate = cwnd / RTT, with 1ms minimum RTT floor.
         //
         // Properties:
         // - rate(cwnd, rtt) = cwnd / max(rtt, 1ms)
@@ -7564,7 +7564,7 @@ mod tests {
             }
         }
 
-// Rate doubles when cwnd doubles (at same RTT).
+        // Rate doubles when cwnd doubles (at same RTT).
         proptest! {
             #[test]
             fn rate_proportional_to_cwnd(
@@ -7597,7 +7597,7 @@ mod tests {
             }
         }
 
-// Rate halves when RTT doubles (above 1ms floor).
+        // Rate halves when RTT doubles (above 1ms floor).
         proptest! {
             #[test]
             fn rate_inversely_proportional_to_rtt(
@@ -7628,7 +7628,7 @@ mod tests {
             }
         }
 
-// Cwnd decrease is capped at -cwnd/2 (LEDBAT++ multiplicative decrease limit).
+        // Cwnd decrease is capped at -cwnd/2 (LEDBAT++ multiplicative decrease limit).
         //
         // This prevents severe cwnd collapse on transient delay spikes.
         proptest! {
@@ -7660,7 +7660,7 @@ mod tests {
             }
         }
 
-// Queuing delay is non-negative (saturating subtraction).
+        // Queuing delay is non-negative (saturating subtraction).
         proptest! {
             #[test]
             fn queuing_delay_non_negative(
@@ -7685,7 +7685,7 @@ mod tests {
             }
         }
 
-// GAIN divisor formula: ceil(2 * TARGET / base_delay), clamped to [1, 16].
+        // GAIN divisor formula: ceil(2 * TARGET / base_delay), clamped to [1, 16].
         proptest! {
             #[test]
             fn gain_divisor_formula_correct(base_delay_ms in 1u64..1000) {
@@ -7709,7 +7709,7 @@ mod tests {
             }
         }
 
-// Next slowdown interval = max(9 * slowdown_duration, 18 * RTT).
+        // Next slowdown interval = max(9 * slowdown_duration, 18 * RTT).
         //
         // The 18 RTT floor prevents excessive slowdowns on high-latency paths.
         proptest! {
@@ -7747,7 +7747,7 @@ mod tests {
             }
         }
 
-// Slow start exit threshold: cwnd >= ssthresh OR queuing_delay > 0.75 * TARGET.
+        // Slow start exit threshold: cwnd >= ssthresh OR queuing_delay > 0.75 * TARGET.
         //
         // With TARGET = 60ms and delay_exit_threshold = 0.75, exit at 45ms queuing delay.
         proptest! {
