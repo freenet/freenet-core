@@ -30,7 +30,7 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::{Location, SubscriptionRecoveryGuard};
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, OutboundConnectionHandler,
-    PeerConnection, TransportError, TransportKeypair, TransportPublicKey,
+    PeerConnectionApi, TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -2309,7 +2309,7 @@ impl P2pConnManager {
     async fn handle_successful_connection(
         &mut self,
         peer_id: Option<PeerKeyLocation>,
-        connection: PeerConnection,
+        connection: Box<dyn PeerConnectionApi>,
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
         is_transient: bool,
@@ -3060,13 +3060,13 @@ enum ProtocolStatus {
 }
 
 async fn handle_peer_channel_message(
-    conn: &mut PeerConnection,
+    conn: &mut Box<dyn PeerConnectionApi>,
     msg: Either<NetMessage, ConnEvent>,
 ) -> Result<(), TransportError> {
     match msg {
         Left(msg) => {
             tracing::debug!(to=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
-            if let Err(error) = conn.send(msg).await {
+            if let Err(error) = conn.send_message(msg).await {
                 tracing::error!(
                     to = %conn.remote_addr(),
                     ?error,
@@ -3135,7 +3135,7 @@ async fn notify_transport_closed(
 /// Without this drain, those messages would be silently lost.
 async fn drain_pending_before_shutdown(
     rx: &mut PeerConnChannelRecv,
-    conn: &mut PeerConnection,
+    conn: &mut Box<dyn PeerConnectionApi>,
     remote_addr: SocketAddr,
 ) -> usize {
     let mut drained = 0;
@@ -3174,7 +3174,7 @@ async fn drain_pending_before_shutdown(
 /// loss of messages that arrived during the select! wait.
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
-    mut conn: PeerConnection,
+    mut conn: Box<dyn PeerConnectionApi>,
     peer_addr: SocketAddr,
     conn_events: Sender<ConnEvent>,
 ) {

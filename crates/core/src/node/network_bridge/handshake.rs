@@ -21,23 +21,28 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{InboundConnectionHandler, OutboundConnectionHandler, PeerConnection};
+use crate::transport::{
+    InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, PeerConnectionApi,
+};
 
 /// Events emitted by the handshake driver.
-#[derive(Debug)]
+///
+/// The connection field uses `Box<dyn PeerConnectionApi>` to type-erase the socket type,
+/// allowing the same event loop code to work with both production (UdpSocket) and
+/// testing (InMemorySocket) transports.
 pub(crate) enum Event {
     /// A remote peer initiated or completed a connection to us.
     InboundConnection {
         transaction: Option<Transaction>,
         peer: Option<PeerKeyLocation>,
-        connection: PeerConnection,
+        connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
     /// An outbound connection attempt succeeded.
     OutboundEstablished {
         transaction: Transaction,
         peer: PeerKeyLocation,
-        connection: PeerConnection,
+        connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
     /// An outbound connection attempt failed.
@@ -47,6 +52,49 @@ pub(crate) enum Event {
         error: ConnectionError,
         transient: bool,
     },
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::InboundConnection {
+                transaction,
+                peer,
+                connection,
+                transient,
+            } => f
+                .debug_struct("InboundConnection")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("remote_addr", &connection.remote_addr())
+                .field("transient", transient)
+                .finish(),
+            Event::OutboundEstablished {
+                transaction,
+                peer,
+                connection,
+                transient,
+            } => f
+                .debug_struct("OutboundEstablished")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("remote_addr", &connection.remote_addr())
+                .field("transient", transient)
+                .finish(),
+            Event::OutboundFailed {
+                transaction,
+                peer,
+                error,
+                transient,
+            } => f
+                .debug_struct("OutboundFailed")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("error", error)
+                .field("transient", transient)
+                .finish(),
+        }
+    }
 }
 
 /// Commands delivered from the event loop into the handshake driver.
@@ -235,7 +283,7 @@ async fn run_driver(
                         if events_tx.send(Event::InboundConnection {
                             transaction,
                             peer,
-                            connection: conn,
+                            connection: Box::new(conn),
                             transient,
                         }).await.is_err() {
                             break;
@@ -282,7 +330,7 @@ fn spawn_outbound(
             Ok(connection) => Event::OutboundEstablished {
                 transaction,
                 peer: peer.clone(),
-                connection,
+                connection: Box::new(connection),
                 transient,
             },
             Err(error) => Event::OutboundFailed {
