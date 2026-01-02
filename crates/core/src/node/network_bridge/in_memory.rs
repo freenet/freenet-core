@@ -1,7 +1,11 @@
-//! A in-memory connection manager and transport implementation. Used for testing purposes.
+//! A in-memory transport implementation for simulation testing.
+//!
+//! This module provides the messaging infrastructure for in-memory simulation testing.
+//! The actual event loop is now handled by the production `P2pConnManager` with
+//! `InMemorySocket` - this module provides the peer registry and fault injection
+//! infrastructure that the transport layer uses.
 use std::{
     collections::HashMap,
-    io::Cursor,
     net::SocketAddr,
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
@@ -16,14 +20,11 @@ use crossbeam::channel::{self, Sender};
 use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
 use tokio::sync::Mutex;
 
-use super::{ConnectionError, NetworkBridge};
+use super::ConnectionError;
 use crate::{
     config::GlobalExecutor,
-    message::NetMessage,
-    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
-    ring::PeerKeyLocation,
+    node::PeerId,
     simulation::{FaultConfig, SimulationRng, TimeSource, VirtualTime},
-    tracing::NetEventLog,
     transport::TransportPublicKey,
 };
 
@@ -396,110 +397,6 @@ pub fn unregister_peer(addr: &SocketAddr) {
 static PEER_REGISTRY: LazyLock<RwLock<PeerRegistry>> =
     LazyLock::new(|| RwLock::new(PeerRegistry::default()));
 
-#[derive(Clone)]
-pub(in crate::node) struct MemoryConnManager {
-    transport: InMemoryTransport,
-    log_register: Arc<dyn NetEventRegister>,
-    op_manager: Arc<OpManager>,
-    /// Queue of received messages with their source addresses
-    msg_queue: Arc<Mutex<Vec<(NetMessage, SocketAddr)>>>,
-}
-
-impl MemoryConnManager {
-    pub fn new(
-        peer: PeerId,
-        log_register: impl NetEventRegister,
-        op_manager: Arc<OpManager>,
-        add_noise: bool,
-        rng_seed: u64,
-        network_name: &str,
-    ) -> Self {
-        let transport = InMemoryTransport::new(peer, add_noise, rng_seed, network_name);
-        let msg_queue = Arc::new(Mutex::new(Vec::new()));
-
-        let msg_queue_cp = msg_queue.clone();
-        let transport_cp = transport.clone();
-        GlobalExecutor::spawn(async move {
-            // evaluate the messages as they arrive
-            loop {
-                let Some(msg) = transport_cp.msg_stack_queue.lock().await.pop() else {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                };
-                let source_addr = msg.origin.addr;
-                match bincode::deserialize_from(Cursor::new(msg.data)) {
-                    Ok(msg_data) => {
-                        msg_queue_cp.lock().await.push((msg_data, source_addr));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            ?source_addr,
-                            error = %e,
-                            "Failed to deserialize message, skipping"
-                        );
-                    }
-                }
-            }
-        });
-
-        Self {
-            transport,
-            log_register: Arc::new(log_register),
-            op_manager,
-            msg_queue,
-        }
-    }
-}
-
-impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
-        self.log_register
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
-            .await;
-
-        // Look up the target peer's public key from the registry
-        let target_pub_key = {
-            let registry = PEER_REGISTRY.read().unwrap();
-            registry.get_public_key(&target_addr)
-        };
-
-        let target_pub_key = target_pub_key.ok_or_else(|| {
-            tracing::warn!("No peer registered at target address {}", target_addr);
-            ConnectionError::SendNotCompleted(target_addr)
-        })?;
-
-        // Create correct PeerId with target's public key
-        let target_peer_id = PeerId::new(target_addr, target_pub_key.clone());
-
-        // Create PeerKeyLocation for op_manager tracking
-        let target_peer = PeerKeyLocation::new(target_pub_key, target_addr);
-        self.op_manager.sending_transaction(&target_peer, &msg);
-
-        let msg = bincode::serialize(&msg)?;
-        self.transport.send(target_peer_id, msg)?;
-        Ok(())
-    }
-
-    async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
-        tracing::debug!("Dropping in-memory connection to {}", peer_addr);
-        PEER_REGISTRY.write().unwrap().unregister(&peer_addr);
-        Ok(())
-    }
-}
-
-impl NetworkBridgeExt for MemoryConnManager {
-    async fn recv(&mut self) -> Result<(NetMessage, Option<SocketAddr>), ConnectionError> {
-        loop {
-            let mut queue = self.msg_queue.lock().await;
-            let Some((msg, source_addr)) = queue.pop() else {
-                std::mem::drop(queue);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            };
-            return Ok((msg, Some(source_addr)));
-        }
-    }
-}
 
 /// A message in transit between peers in the in-memory transport.
 #[derive(Clone, Debug)]

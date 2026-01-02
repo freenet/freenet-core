@@ -2975,7 +2975,7 @@ impl P2pConnManager {
     }
 }
 
-trait ConnectResultSender {
+trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
         result: Result<(SocketAddr, Option<usize>), ()>,
