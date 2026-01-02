@@ -1455,13 +1455,33 @@ mod messages {
     }
 }
 
+/// State machine for UPDATE operations.
+///
+/// # Important: Updates are Fire-and-Forget
+///
+/// Updates spread through the subscription tree like a virus - there is no acknowledgment
+/// or completion signal that propagates back. When a node receives an UPDATE:
+/// 1. It applies the update locally
+/// 2. It broadcasts to its downstream subscribers (if any)
+/// 3. It does NOT wait for or expect any response from downstream
+///
+/// The `Finished` state only indicates that the LOCAL update was applied successfully.
+/// It does NOT mean all subscribers have received the update - that's unknowable.
+/// This is by design: waiting for tree-wide propagation would be impractical and
+/// would create deadlocks in cyclic subscription topologies.
 #[derive(Debug)]
 pub enum UpdateState {
+    /// Initial state when receiving an update request from another peer.
     ReceivedRequest,
+
+    /// The update was applied locally. Used to signal completion to the client
+    /// for client-initiated updates. Does NOT indicate network-wide propagation.
     Finished {
         key: ContractKey,
         summary: StateSummary<'static>,
     },
+
+    /// Preparing to send an update request (client-initiated updates).
     PrepareRequest {
         key: ContractKey,
         related_contracts: RelatedContracts<'static>,
@@ -1469,5 +1489,8 @@ pub enum UpdateState {
         /// This is passed to update_contract which calls UpdateQuery to merge and persist.
         update_data: UpdateData<'static>,
     },
+
+    /// Broadcasting the update to downstream subscribers. This is fire-and-forget;
+    /// we don't wait for acknowledgments from downstream peers.
     BroadcastOngoing,
 }

@@ -98,7 +98,17 @@ impl P2pBridge {
         let futures: Vec<_> = notifications
             .into_iter()
             .filter_map(|(contract_key, upstream)| {
-                let upstream_addr = upstream.socket_addr()?;
+                let Some(upstream_addr) = upstream.socket_addr() else {
+                    // This indicates a bug: we stored an upstream PeerKeyLocation without
+                    // a known address. The Unsubscribed notification cannot be sent.
+                    tracing::error!(
+                        %contract_key,
+                        upstream_key = %upstream.pub_key,
+                        "Cannot send Unsubscribed: upstream address unknown - subscription tree may have stale entries"
+                    );
+                    return None;
+                };
+
                 let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
                     transaction: Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
                     key: contract_key,
