@@ -53,13 +53,29 @@ async fn wait_for_contract_with_timeout(
         return Ok(Some(key));
     }
 
+    // Contract not immediately available - will wait up to timeout_ms
+    tracing::debug!(
+        contract = %instance_id,
+        timeout_ms = timeout_ms,
+        phase = "contract_wait_start",
+        "Contract not available, waiting up to {}ms for propagation (issue #2494 investigation)",
+        timeout_ms
+    );
+
     // Register waiter BEFORE second check to avoid race condition
     let notifier = op_manager.wait_for_contract(instance_id);
 
     // Check again - contract may have arrived between first check and registration
     if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        tracing::debug!(
+            contract = %instance_id,
+            phase = "contract_wait_fast",
+            "Contract arrived during registration"
+        );
         return Ok(Some(key));
     }
+
+    let wait_start = std::time::Instant::now();
 
     // Wait for notification or timeout (we don't care which triggers first)
     tokio::select! {
@@ -67,8 +83,43 @@ async fn wait_for_contract_with_timeout(
         _ = sleep(Duration::from_millis(timeout_ms)) => {}
     };
 
+    let wait_duration = wait_start.elapsed();
+
     // Always verify actual state - don't trust notification alone
-    super::has_contract(op_manager, instance_id).await
+    let result = super::has_contract(op_manager, instance_id).await;
+
+    match &result {
+        Ok(Some(key)) => {
+            tracing::debug!(
+                contract = %instance_id,
+                contract_key = %key,
+                wait_ms = wait_duration.as_millis(),
+                phase = "contract_wait_success",
+                "Contract became available after {}ms",
+                wait_duration.as_millis()
+            );
+        }
+        Ok(None) => {
+            tracing::warn!(
+                contract = %instance_id,
+                wait_ms = wait_duration.as_millis(),
+                timeout_ms = timeout_ms,
+                phase = "contract_wait_timeout",
+                "Contract still not available after {}ms timeout - PUT/SUBSCRIBE race? (issue #2494)",
+                wait_duration.as_millis()
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                contract = %instance_id,
+                error = ?e,
+                phase = "contract_wait_error",
+                "Error while waiting for contract"
+            );
+        }
+    }
+
+    result
 }
 
 async fn fetch_contract_if_missing(
@@ -257,11 +308,28 @@ pub(crate) async fn request_subscribe(
         .ring
         .k_closest_potentially_caching(instance_id, &visited, 3);
 
+    // Log routing decision for investigation of issue #2494
+    tracing::debug!(
+        tx = %id,
+        contract = %instance_id,
+        candidates_found = candidates.len(),
+        phase = "routing_decision",
+        "k_closest_potentially_caching returned {} candidates",
+        candidates.len()
+    );
+
     // First try the best candidates from k_closest_potentially_caching.
     // If that returns empty, fall back to any available connection.
     // This ensures we join the subscription tree even when the routing algorithm
     // can't find ideal candidates (e.g., due to timing or location filtering).
     let target = if let Some(t) = candidates.first() {
+        tracing::debug!(
+            tx = %id,
+            contract = %instance_id,
+            target = ?t.socket_addr(),
+            phase = "optimal_routing",
+            "Using optimal candidate from k_closest"
+        );
         t.clone()
     } else {
         // k_closest_potentially_caching returned empty - try any connected peer as fallback.
@@ -283,12 +351,12 @@ pub(crate) async fn request_subscribe(
 
         match fallback_target {
             Some(target) => {
-                tracing::debug!(
+                tracing::warn!(
                     tx = %id,
                     contract = %instance_id,
                     target = ?target.socket_addr(),
                     phase = "fallback_routing",
-                    "Using fallback connection for subscription (k_closest returned empty)"
+                    "Using fallback connection for subscription (k_closest returned empty) - may cause delays (issue #2494)"
                 );
                 target
             }
