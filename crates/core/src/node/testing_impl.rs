@@ -62,7 +62,6 @@
 //! test configurations. Internal state is protected by appropriate synchronization
 //! primitives.
 
-use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
 use rand::prelude::IndexedRandom;
@@ -75,24 +74,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{info, Instrument};
+use tracing::info;
 
 #[cfg(feature = "trace-ot")]
 use crate::tracing::CombinedRegister;
 use crate::{
-    client_events::{
-        client_event_handling,
-        test::{MemoryEventsGen, RandomEventGenerator},
-    },
+    client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::{ConfigArgs, GlobalExecutor},
-    contract::{
-        self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-        WaitingResolution,
-    },
     dev_tool::TransportKeypair,
-    message::{MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
-    operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
@@ -103,10 +93,6 @@ mod in_memory;
 mod network;
 
 pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
-
-use super::{
-    network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
-};
 
 pub(crate) type EventId = u32;
 
@@ -371,7 +357,6 @@ type DefaultRegistry = TestEventListener;
 pub(super) struct Builder<ER> {
     pub config: NodeConfig,
     contract_handler_name: String,
-    add_noise: bool,
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
@@ -387,14 +372,12 @@ impl<ER: NetEventRegister> Builder<ER> {
         builder: NodeConfig,
         event_register: ER,
         contract_handler_name: String,
-        add_noise: bool,
         rng_seed: u64,
         network_name: String,
     ) -> Builder<ER> {
         Builder {
             config: builder.clone(),
             contract_handler_name,
-            add_noise,
             event_register,
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
@@ -454,7 +437,6 @@ pub struct SimNetwork {
     max_connections: usize,
     min_connections: usize,
     start_backoff: Duration,
-    add_noise: bool,
     /// Master seed for deterministic RNG - used to derive per-peer seeds
     seed: u64,
     /// VirtualTime for deterministic simulation - always enabled
@@ -508,7 +490,6 @@ impl SimNetwork {
             max_connections,
             min_connections,
             start_backoff: Duration::from_millis(1),
-            add_noise: false,
             seed,
             virtual_time,
             running_nodes: HashMap::new(),
@@ -561,20 +542,6 @@ impl SimNetwork {
 impl SimNetwork {
     pub fn with_start_backoff(&mut self, value: Duration) {
         self.start_backoff = value;
-    }
-
-    /// Simulates network random behavior, like messages arriving delayed or out of order, throttling, etc.
-    ///
-    /// **Warning: Non-deterministic mode.** Enabling noise introduces timing-dependent
-    /// behavior that makes test results harder to reproduce, even with the same seed.
-    /// The noise affects message shuffling and timing in ways that depend on thread
-    /// scheduling and system load.
-    ///
-    /// For deterministic testing, prefer using `with_fault_injection` with `FaultConfig`
-    /// instead, which provides controllable, seeded randomness for message loss and latency.
-    #[allow(unused)]
-    pub fn with_noise(&mut self) {
-        self.add_noise = true;
     }
 
     /// Returns the VirtualTime instance for this simulation.
@@ -885,7 +852,7 @@ impl SimNetwork {
         R: crate::client_events::test::RandomEventGenerator + Send + 'static,
     {
         use crate::node::network_bridge::get_fault_injector;
-        use crate::node::network_bridge::in_memory::unregister_peer;
+        use crate::transport::in_memory_socket::unregister_socket;
 
         // Get the saved restartable config
         let restart_config = match self.restartable_configs.get(label) {
@@ -907,8 +874,8 @@ impl SimNetwork {
 
         tracing::info!(?label, ?node_addr, "Restarting node with persisted state");
 
-        // Unregister the old peer from transport (the new node will re-register)
-        unregister_peer(&node_addr);
+        // Unregister the old socket from transport (the new node will re-register)
+        unregister_socket(&self.name, &node_addr);
 
         // Clear crash status in fault injector
         if let Some(injector) = get_fault_injector(&self.name) {
@@ -936,7 +903,6 @@ impl SimNetwork {
             restart_config.config.clone(),
             event_listener,
             format!("{}-{}", self.name, label),
-            self.add_noise,
             restart_config.rng_seed,
             self.name.clone(),
         );
@@ -1073,7 +1039,6 @@ impl SimNetwork {
                 this_node,
                 event_listener,
                 format!("{}-{label}", self.name, label = this_config.label),
-                self.add_noise,
                 peer_seed,
                 self.name.clone(),
             );
@@ -1145,7 +1110,6 @@ impl SimNetwork {
                 config,
                 event_listener,
                 format!("{}-{label}", self.name),
-                self.add_noise,
                 peer_seed,
                 self.name.clone(),
             );
@@ -1162,7 +1126,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
-        use crate::node::network_bridge::in_memory::is_peer_registered;
+        use crate::transport::in_memory_socket::is_socket_registered;
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
         let mut peers = vec![];
@@ -1242,7 +1206,7 @@ impl SimNetwork {
         'wait_loop: loop {
             let mut all_registered = true;
             for addr in &gateway_addrs {
-                if !is_peer_registered(addr) {
+                if !is_socket_registered(&self.name, addr) {
                     all_registered = false;
                     break;
                 }
@@ -1263,7 +1227,7 @@ impl SimNetwork {
                      Registered: {}/{}",
                     gateway_addrs
                         .iter()
-                        .filter(|a| is_peer_registered(a))
+                        .filter(|a| is_socket_registered(&self.name, a))
                         .count(),
                     gateway_addrs.len()
                 );
@@ -2233,7 +2197,6 @@ impl std::fmt::Debug for SimNetwork {
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
             .field("init_backoff", &self.start_backoff)
-            .field("add_noise", &self.add_noise)
             .finish()
     }
 }
@@ -2261,401 +2224,4 @@ fn clean_up_tmp_dirs<'a>(labels: impl Iterator<Item = &'a NodeLabel>) {
     }
 }
 
-use super::op_state_manager::OpManager;
-use crate::client_events::ClientEventsProxy;
 use crate::contract::OperationMode;
-
-pub(super) trait NetworkBridgeExt: Clone + 'static {
-    /// Receive a message and the source address of the sender
-    fn recv(
-        &mut self,
-    ) -> impl Future<Output = Result<(NetMessage, Option<SocketAddr>), ConnectionError>> + Send;
-}
-
-struct RunnerConfig<NB, UsrEv>
-where
-    NB: NetworkBridge,
-    UsrEv: ClientEventsProxy + Send + 'static,
-{
-    peer_key: PeerKeyLocation,
-    parent_span: Option<tracing::Span>,
-    op_manager: Arc<OpManager>,
-    conn_manager: NB,
-    /// Set on creation, taken on run
-    user_events: Option<UsrEv>,
-    notification_channel: EventLoopNotificationsReceiver,
-    event_register: Box<dyn NetEventRegister>,
-    gateways: Vec<PeerKeyLocation>,
-    executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
-}
-
-async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> anyhow::Result<()>
-where
-    NB: NetworkBridge + NetworkBridgeExt,
-    UsrEv: ClientEventsProxy + Send + 'static,
-{
-    let join_task =
-        connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
-    let (client_responses, _cli_response_sender) = contract::client_responses_channel();
-    let span = {
-        config
-            .parent_span
-            .clone()
-            .map(|parent_span| {
-                tracing::info_span!(
-                    parent: parent_span,
-                    "client_event_handling",
-                    peer = %config.peer_key.clone()
-                )
-            })
-            .unwrap_or_else(
-                || tracing::info_span!("client_event_handling", peer = %config.peer_key),
-            )
-    };
-    let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
-    GlobalExecutor::spawn(
-        client_event_handling(
-            config.op_manager.clone(),
-            config.user_events.take().expect("should be set"),
-            client_responses,
-            node_controller_tx,
-        )
-        .instrument(span),
-    );
-    let parent_span: tracing::Span = config
-        .parent_span
-        .clone()
-        .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
-    let result = run_event_listener(node_controller_rx, config)
-        .instrument(parent_span)
-        .await;
-
-    join_task.abort();
-    let _ = join_task.await;
-    result
-}
-
-/// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
-async fn run_event_listener<NB, UsrEv>(
-    mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
-    RunnerConfig {
-        peer_key,
-        gateways,
-        parent_span,
-        op_manager,
-        mut conn_manager,
-        mut notification_channel,
-        event_register,
-        mut executor_listener,
-        client_wait_for_transaction: mut wait_for_event,
-        ..
-    }: RunnerConfig<NB, UsrEv>,
-) -> anyhow::Result<()>
-where
-    NB: NetworkBridge + NetworkBridgeExt,
-    UsrEv: ClientEventsProxy + Send + 'static,
-{
-    // todo: this two containers need to be clean up on transaction time-out
-    let mut pending_from_executor = HashSet::new();
-    let mut tx_to_client: HashMap<Transaction, crate::client_events::ClientId> = HashMap::new();
-    loop {
-        let (msg, source_addr) = tokio::select! {
-            msg = conn_manager.recv() => {
-                match msg {
-                    Ok((m, addr)) => {
-                        tracing::debug!(source_addr = ?addr, msg_id = %m.id(), "Received message from network");
-                        (Ok(Either::Left(m)), addr)
-                    },
-                    Err(e) => (Err(anyhow::Error::from(e)), None),
-                }
-            }
-            msg = notification_channel.notifications_receiver.recv() => {
-                if let Some(msg) = msg {
-                    match &msg {
-                        Either::Left(net_msg) => {
-                            tracing::debug!(msg_id = %net_msg.id(), "Received NetMessage from notification channel (no source_addr)");
-                        }
-                        Either::Right(_) => {}
-                    }
-                    (Ok(msg), None)
-                } else {
-                    anyhow::bail!("notification channel shutdown, fatal error");
-                }
-            }
-            msg = node_controller_rx.recv() => {
-                if let Some(msg) = msg {
-                    (Ok(Either::Right(msg)), None)
-                } else {
-                    anyhow::bail!("node controller channel shutdown, fatal error");
-                }
-            }
-            event_id = wait_for_event.relay_transaction_result_to_client() => {
-                if let Ok((client_id, transaction)) = event_id {
-                    match transaction {
-                        contract::WaitingTransaction::Transaction(transaction) => {
-                            tx_to_client.insert(transaction, client_id);
-                        }
-                        contract::WaitingTransaction::Subscription { contract_key } => {
-                            // For subscriptions, we track the client waiting for responses
-                            // related to this contract key. The actual subscription response
-                            // will be handled through the contract notification system.
-                            tracing::debug!(
-                                "Client {} waiting for subscription to contract {}",
-                                client_id,
-                                contract_key
-                            );
-                            // Note: Unlike regular transactions, subscriptions don't have a
-                            // transaction ID to track. The subscription system handles routing
-                            // updates to subscribed clients through the contract key.
-                        }
-                    }
-                }
-                continue;
-            }
-            id = executor_listener.transaction_from_executor() => {
-                if let Ok(res) = id {
-                    pending_from_executor.insert(res);
-                }
-                continue;
-            }
-        };
-
-        if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
-            super::handle_aborted_op(tx, &op_manager, &gateways).await?;
-        }
-
-        // Handle locally-initiated outbound connect requests:
-        // If we received a ConnectMsg::Request from the notification channel (source_addr = None)
-        // and we have a stored ConnectOp with first_hop, this is OUR outbound request
-        // that needs to be sent to the gateway, not processed locally.
-        if source_addr.is_none() {
-            // Check if this is a Connect Request message
-            let connect_tx = match &msg {
-                Ok(Either::Left(NetMessage::V1(NetMessageV1::Connect(connect_msg)))) => {
-                    connect::extract_connect_request_tx(connect_msg)
-                }
-                _ => None,
-            };
-
-            if let Some(tx_id) = connect_tx {
-                // Check if we have this operation stored (meaning we initiated it)
-                if let Ok(Some(crate::operations::OpEnum::Connect(connect_op))) =
-                    op_manager.pop(&tx_id)
-                {
-                    if let Some(ref first_hop) = connect_op.first_hop {
-                        if let Some(target_addr) = first_hop.socket_addr() {
-                            tracing::debug!(
-                                tx = %tx_id,
-                                target = %target_addr,
-                                "Routing locally-initiated connect request to gateway"
-                            );
-                            // Push the operation back - we still need to track it
-                            if let Err(e) = op_manager
-                                .push(tx_id, crate::operations::OpEnum::Connect(connect_op))
-                                .await
-                            {
-                                tracing::error!(tx = %tx_id, error = %e, "Failed to push connect op back");
-                            }
-                            // Send to the gateway
-                            if let Ok(Either::Left(net_msg)) = msg {
-                                if let Err(e) = conn_manager.send(target_addr, net_msg).await {
-                                    tracing::error!(tx = %tx_id, error = %e, "Failed to send connect request to gateway");
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    // Push back if we couldn't route it
-                    if let Err(e) = op_manager
-                        .push(tx_id, crate::operations::OpEnum::Connect(connect_op))
-                        .await
-                    {
-                        tracing::error!(tx = %tx_id, error = %e, "Failed to push connect op back");
-                    }
-                }
-            }
-        }
-
-        let msg = match msg {
-            Ok(Either::Left(msg)) => msg,
-            Ok(Either::Right(action)) => match action {
-                NodeEvent::DropConnection(peer_addr) => {
-                    tracing::info!("Dropping connection to {peer_addr}");
-                    // Look up the peer by address in the ring
-                    if let Some(peer_loc) = op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_by_addr(peer_addr)
-                    {
-                        // Convert PeerKeyLocation to PeerId for the disconnect/prune operations
-                        let peer_id = PeerId::new(
-                            peer_loc
-                                .socket_addr()
-                                .expect("peer should have socket address"),
-                            peer_loc.pub_key().clone(),
-                        );
-                        // Capture connection duration before pruning
-                        let connection_duration_ms = op_manager
-                            .ring
-                            .connection_manager
-                            .get_connection_duration_ms(peer_addr);
-                        if let Some(event) = crate::tracing::NetEventLog::disconnected_with_context(
-                            &op_manager.ring,
-                            &peer_id,
-                            crate::tracing::DisconnectReason::Explicit(
-                                "connection dropped by node request".to_string(),
-                            ),
-                            connection_duration_ms,
-                            None,
-                            None,
-                        ) {
-                            event_register.register_events(Either::Left(event)).await;
-                        }
-                        let prune_result = op_manager.ring.prune_connection(peer_id).await;
-
-                        // Handle orphaned transactions immediately (retry via alternate routes)
-                        for tx in prune_result.orphaned_transactions {
-                            if let Err(err) =
-                                super::handle_aborted_op(tx, &op_manager, &gateways).await
-                            {
-                                tracing::warn!(
-                                    %tx,
-                                    error = %err,
-                                    "Failed to handle orphaned transaction"
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                }
-                NodeEvent::ConnectPeer { peer, .. } => {
-                    tracing::info!("Notifying connection to {peer}");
-                    continue;
-                }
-                NodeEvent::Disconnect { cause: Some(cause) } => {
-                    tracing::info!(peer = %peer_key, "Shutting down node, reason: {cause}");
-                    return Ok(());
-                }
-                NodeEvent::Disconnect { cause: None } => {
-                    tracing::info!(peer = %peer_key, "Shutting down node");
-                    return Ok(());
-                }
-                NodeEvent::QueryConnections { .. } => {
-                    unimplemented!()
-                }
-                NodeEvent::TransactionTimedOut(_) => {
-                    unimplemented!()
-                }
-                NodeEvent::TransactionCompleted(_) => {
-                    unimplemented!()
-                }
-                NodeEvent::LocalSubscribeComplete { .. } => {
-                    unimplemented!()
-                }
-                NodeEvent::QuerySubscriptions { .. } => {
-                    unimplemented!()
-                }
-                NodeEvent::QueryNodeDiagnostics { .. } => {
-                    unimplemented!()
-                }
-                NodeEvent::ExpectPeerConnection { addr } => {
-                    tracing::debug!(%addr, "ExpectPeerConnection ignored in testing impl");
-                    continue;
-                }
-                NodeEvent::BroadcastProximityCache { message } => {
-                    tracing::debug!(?message, "BroadcastProximityCache ignored in testing impl");
-                    continue;
-                }
-                NodeEvent::ClientDisconnected { client_id } => {
-                    tracing::debug!(%client_id, "Client disconnected");
-                    let notifications = op_manager
-                        .ring
-                        .remove_client_from_all_subscriptions(client_id);
-
-                    // Send Unsubscribed messages to upstream peers for subscription tree pruning
-                    if !notifications.is_empty() {
-                        let own_location = op_manager.ring.connection_manager.own_location();
-                        for (contract_key, upstream) in notifications {
-                            let Some(upstream_addr) = upstream.socket_addr() else {
-                                tracing::error!(
-                                    %contract_key,
-                                    upstream_key = %upstream.pub_key,
-                                    "Cannot send Unsubscribed: upstream address unknown"
-                                );
-                                continue;
-                            };
-
-                            let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
-                                transaction: Transaction::new::<
-                                    crate::operations::subscribe::SubscribeMsg,
-                                >(),
-                                key: contract_key,
-                                from: own_location.clone(),
-                            });
-
-                            if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await
-                            {
-                                tracing::warn!(
-                                    %contract_key,
-                                    %upstream_addr,
-                                    error = %e,
-                                    "Failed to send Unsubscribed to upstream after client disconnect"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    %contract_key,
-                                    %upstream_addr,
-                                    "Sent Unsubscribed to upstream after client disconnect"
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                }
-            },
-            Err(err) => {
-                tracing::error!("Error receiving message: {}", err);
-                continue;
-            }
-        };
-
-        let op_manager = op_manager.clone();
-        let event_listener = event_register.trait_clone();
-
-        let span = {
-            parent_span
-                .clone()
-                .map(|parent_span| {
-                    tracing::info_span!(
-                        parent: parent_span.clone(),
-                        "process_network_message",
-                        peer = %peer_key, transaction = %msg.id(),
-                        tx_type = %msg.id().transaction_type()
-                    )
-                })
-                .unwrap_or_else(|| {
-                    tracing::info_span!(
-                        "process_network_message",
-                        peer = %peer_key, transaction = %msg.id(),
-                        tx_type = %msg.id().transaction_type()
-                    )
-                })
-        };
-
-        let executor_callback = pending_from_executor
-            .remove(msg.id())
-            .then(|| executor_listener.callback());
-
-        let msg = super::process_message(
-            msg,
-            op_manager,
-            conn_manager.clone(),
-            event_listener,
-            executor_callback,
-            source_addr,
-        )
-        .instrument(span);
-        GlobalExecutor::spawn(msg);
-    }
-}

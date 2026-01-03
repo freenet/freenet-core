@@ -21,23 +21,28 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{InboundConnectionHandler, OutboundConnectionHandler, PeerConnection};
+use crate::transport::{
+    InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, PeerConnectionApi,
+};
 
 /// Events emitted by the handshake driver.
-#[derive(Debug)]
+///
+/// The connection field uses `Box<dyn PeerConnectionApi>` to type-erase the socket type,
+/// allowing the same event loop code to work with both production (UdpSocket) and
+/// testing (InMemorySocket) transports.
 pub(crate) enum Event {
     /// A remote peer initiated or completed a connection to us.
     InboundConnection {
         transaction: Option<Transaction>,
         peer: Option<PeerKeyLocation>,
-        connection: PeerConnection,
+        connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
     /// An outbound connection attempt succeeded.
     OutboundEstablished {
         transaction: Transaction,
         peer: PeerKeyLocation,
-        connection: PeerConnection,
+        connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
     /// An outbound connection attempt failed.
@@ -47,6 +52,49 @@ pub(crate) enum Event {
         error: ConnectionError,
         transient: bool,
     },
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::InboundConnection {
+                transaction,
+                peer,
+                connection,
+                transient,
+            } => f
+                .debug_struct("InboundConnection")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("remote_addr", &connection.remote_addr())
+                .field("transient", transient)
+                .finish(),
+            Event::OutboundEstablished {
+                transaction,
+                peer,
+                connection,
+                transient,
+            } => f
+                .debug_struct("OutboundEstablished")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("remote_addr", &connection.remote_addr())
+                .field("transient", transient)
+                .finish(),
+            Event::OutboundFailed {
+                transaction,
+                peer,
+                error,
+                transient,
+            } => f
+                .debug_struct("OutboundFailed")
+                .field("transaction", transaction)
+                .field("peer", peer)
+                .field("error", error)
+                .field("transient", transient)
+                .finish(),
+        }
+    }
 }
 
 /// Commands delivered from the event loop into the handshake driver.
@@ -85,9 +133,9 @@ pub(crate) struct HandshakeHandler {
 
 impl HandshakeHandler {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        inbound: InboundConnectionHandler,
-        outbound: OutboundConnectionHandler,
+    pub fn new<S: crate::transport::Socket>(
+        inbound: InboundConnectionHandler<S>,
+        outbound: OutboundConnectionHandler<S>,
         _connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
         _this_location: Option<Location>,
@@ -188,9 +236,9 @@ impl ExpectedInboundTracker {
     }
 }
 
-async fn run_driver(
-    mut inbound: InboundConnectionHandler,
-    outbound: OutboundConnectionHandler,
+async fn run_driver<S: crate::transport::Socket>(
+    mut inbound: InboundConnectionHandler<S>,
+    outbound: OutboundConnectionHandler<S>,
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -235,7 +283,7 @@ async fn run_driver(
                         if events_tx.send(Event::InboundConnection {
                             transaction,
                             peer,
-                            connection: conn,
+                            connection: Box::new(conn),
                             transient,
                         }).await.is_err() {
                             break;
@@ -248,8 +296,8 @@ async fn run_driver(
     }
 }
 
-fn spawn_outbound(
-    outbound: OutboundConnectionHandler,
+fn spawn_outbound<S: crate::transport::Socket>(
+    outbound: OutboundConnectionHandler<S>,
     events_tx: mpsc::Sender<Event>,
     peer: PeerKeyLocation,
     transaction: Transaction,
@@ -265,7 +313,7 @@ fn spawn_outbound(
         let connect_future = handler
             .connect(peer_for_connect.pub_key.clone(), addr)
             .await;
-        let result: Result<PeerConnection, ConnectionError> =
+        let result: Result<PeerConnection<S>, ConnectionError> =
             match tokio::time::timeout(Duration::from_secs(10), connect_future).await {
                 Ok(res) => res.map_err(|err| err.into()),
                 Err(_) => Err(ConnectionError::Timeout),
@@ -282,7 +330,7 @@ fn spawn_outbound(
             Ok(connection) => Event::OutboundEstablished {
                 transaction,
                 peer: peer.clone(),
-                connection,
+                connection: Box::new(connection),
                 transient,
             },
             Err(error) => Event::OutboundFailed {

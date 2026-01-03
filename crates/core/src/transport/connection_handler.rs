@@ -314,6 +314,35 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             );
         }
     }
+
+    /// Returns a clone of the expected inbound tracker.
+    ///
+    /// This is used by `EventListenerState` to register expected inbound connections
+    /// without holding a reference to the entire `OutboundConnectionHandler`.
+    pub fn expected_inbound_tracker(&self) -> ExpectedInboundTracker {
+        ExpectedInboundTracker(self.expected_non_gateway.clone())
+    }
+}
+
+/// A handle for registering expected inbound connections.
+///
+/// This is a type-erased wrapper around the expected inbound IP set, allowing
+/// `EventListenerState` to register expected connections without being generic
+/// over the socket type.
+#[derive(Clone)]
+pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
+
+impl ExpectedInboundTracker {
+    /// Register an expected inbound connection from the given address.
+    pub fn expect_incoming(&self, remote_addr: SocketAddr) {
+        if self.0.insert(remote_addr.ip()) {
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "inbound",
+                "Registered expected inbound handshake from remote IP"
+            );
+        }
+    }
 }
 
 /// Handles UDP transport internally.

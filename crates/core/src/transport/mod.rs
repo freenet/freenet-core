@@ -45,6 +45,7 @@ pub fn clear_version_mismatch() {
 
 pub mod connection_handler;
 mod crypto;
+pub mod in_memory_socket;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
@@ -139,6 +140,7 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::connection_handler::create_connection_handler;
+pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
@@ -227,6 +229,44 @@ impl Socket for UdpSocket {
             }
         }
     }
+}
+
+// =============================================================================
+// Type-erased peer connection trait
+// =============================================================================
+//
+// This trait abstracts over `PeerConnection<S>` to allow the event loop to work
+// with connections without being generic over the socket type. This enables
+// using the same event loop code for both production (UdpSocket) and testing
+// (InMemorySocket) without propagating generics through the entire codebase.
+
+use crate::message::NetMessage;
+
+/// Type-erased interface for peer connections.
+///
+/// This trait provides the minimal interface needed by `peer_connection_listener`
+/// and related event loop code to communicate with a peer. By boxing connections
+/// as `Box<dyn PeerConnectionApi>`, we avoid making the event loop generic over
+/// the socket type.
+pub(crate) trait PeerConnectionApi: Send {
+    /// Returns the remote peer's socket address.
+    fn remote_addr(&self) -> SocketAddr;
+
+    /// Sends a network message to the remote peer.
+    ///
+    /// The message is serialized and sent over the transport connection.
+    fn send_message(
+        &mut self,
+        msg: NetMessage,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Receives raw bytes from the remote peer.
+    ///
+    /// Returns the deserialized message bytes. The caller is responsible for
+    /// deserializing into the appropriate message type.
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
 }
 
 #[cfg(test)]

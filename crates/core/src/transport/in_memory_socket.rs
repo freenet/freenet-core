@@ -1,0 +1,526 @@
+//! In-memory socket implementation for testing.
+//!
+//! This module provides an in-memory implementation of the `Socket` trait
+//! that allows the production event loop (`P2pConnManager`) to be used in
+//! tests without real UDP sockets.
+//!
+//! The implementation uses network-scoped registries to route packets between
+//! sockets, enabling test isolation when multiple SimNetwork instances run
+//! concurrently. Each network (identified by name) has its own socket registry.
+//!
+//! # Usage
+//!
+//! Before binding an `InMemorySocket`, register the address with its network:
+//!
+//! ```ignore
+//! use freenet::transport::in_memory_socket::{register_address_network, InMemorySocket};
+//!
+//! register_address_network(addr, "my-test-network");
+//! let socket = InMemorySocket::bind(addr).await?;
+//! ```
+
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+    net::SocketAddr,
+    sync::{Arc, LazyLock, RwLock},
+    time::Duration,
+};
+
+use tokio::sync::Mutex;
+
+use super::Socket;
+
+/// Maximum packet size for in-memory transport (matches typical UDP MTU)
+const MAX_PACKET_SIZE: usize = 65535;
+
+/// Global registry mapping socket addresses to their network names.
+/// This is used during `InMemorySocket::bind()` to determine which network
+/// a socket belongs to. The mapping is thread-safe and works across async tasks.
+static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Registers a socket address with a network name.
+///
+/// This must be called before `InMemorySocket::bind()` to specify which
+/// network the socket belongs to. Sockets in different networks are isolated
+/// and cannot communicate with each other.
+///
+/// This function is thread-safe and can be called from any thread.
+///
+/// # Example
+/// ```ignore
+/// register_address_network(addr, "test-network-1");
+/// let socket = InMemorySocket::bind(addr).await?;
+/// ```
+pub fn register_address_network(addr: SocketAddr, network_name: &str) {
+    ADDRESS_NETWORKS
+        .write()
+        .unwrap()
+        .insert(addr, network_name.to_string());
+}
+
+/// Unregisters a socket address from the network mapping.
+fn unregister_address_network(addr: &SocketAddr) {
+    ADDRESS_NETWORKS.write().unwrap().remove(addr);
+}
+
+/// Gets the network name for an address, if registered.
+fn get_address_network(addr: &SocketAddr) -> Option<String> {
+    ADDRESS_NETWORKS.read().unwrap().get(addr).cloned()
+}
+
+/// Clears all address-network mappings. Useful for test cleanup.
+pub fn clear_all_address_networks() {
+    ADDRESS_NETWORKS.write().unwrap().clear();
+}
+
+/// Result of checking packet delivery through fault injection.
+#[derive(Debug)]
+pub enum PacketDeliveryDecision {
+    /// Deliver immediately
+    Deliver,
+    /// Delay delivery (real-time mode)
+    DelayedDelivery(Duration),
+    /// Queue for virtual time delivery
+    QueuedDelivery {
+        /// Virtual time deadline in nanoseconds
+        deadline: u64,
+    },
+    /// Drop the packet
+    Drop,
+}
+
+/// Callback type for packet delivery decisions.
+///
+/// This allows the fault injection logic to be injected from outside
+/// without creating circular dependencies.
+pub type PacketDeliveryCallback =
+    Arc<dyn Fn(&str, SocketAddr, SocketAddr) -> PacketDeliveryDecision + Send + Sync>;
+
+/// Callback for queuing a packet for delayed delivery.
+pub type QueuePacketCallback =
+    Arc<dyn Fn(&str, u64, Vec<u8>, SocketAddr, SocketAddr) + Send + Sync>;
+
+/// Global callbacks for fault injection integration.
+static DELIVERY_CALLBACK: LazyLock<RwLock<Option<PacketDeliveryCallback>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+static QUEUE_PACKET_CALLBACK: LazyLock<RwLock<Option<QueuePacketCallback>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Registers the packet delivery callback for fault injection.
+///
+/// This is called by the testing infrastructure to wire up fault injection.
+pub fn set_packet_delivery_callback(callback: Option<PacketDeliveryCallback>) {
+    *DELIVERY_CALLBACK.write().unwrap() = callback;
+}
+
+/// Registers the queue packet callback for virtual time delivery.
+pub fn set_queue_packet_callback(callback: Option<QueuePacketCallback>) {
+    *QUEUE_PACKET_CALLBACK.write().unwrap() = callback;
+}
+
+/// Checks if a packet should be delivered based on fault injection config.
+fn check_packet_delivery(
+    network_name: &str,
+    from: SocketAddr,
+    to: SocketAddr,
+) -> PacketDeliveryDecision {
+    let callback = DELIVERY_CALLBACK.read().unwrap();
+    match callback.as_ref() {
+        Some(cb) => cb(network_name, from, to),
+        None => PacketDeliveryDecision::Deliver,
+    }
+}
+
+/// Queues a packet for delayed delivery in virtual time mode.
+fn queue_packet_for_delivery(
+    network_name: &str,
+    deadline: u64,
+    data: Vec<u8>,
+    from: SocketAddr,
+    target: SocketAddr,
+) {
+    let callback = QUEUE_PACKET_CALLBACK.read().unwrap();
+    if let Some(cb) = callback.as_ref() {
+        cb(network_name, deadline, data, from, target);
+    }
+}
+
+/// A received packet with source address.
+#[derive(Debug, Clone)]
+struct ReceivedPacket {
+    data: Vec<u8>,
+    from: SocketAddr,
+}
+
+/// Per-socket inbox for received packets.
+struct SocketInbox {
+    /// Queue of received packets
+    packets: VecDeque<ReceivedPacket>,
+    /// Notifier for when packets arrive
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl SocketInbox {
+    fn new() -> Self {
+        Self {
+            packets: VecDeque::new(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn push(&mut self, data: Vec<u8>, from: SocketAddr) {
+        self.packets.push_back(ReceivedPacket { data, from });
+        self.notify.notify_one();
+    }
+
+    fn pop(&mut self) -> Option<ReceivedPacket> {
+        self.packets.pop_front()
+    }
+
+    fn notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.notify.clone()
+    }
+}
+
+/// Registry for sockets within a single network.
+#[derive(Default)]
+struct SocketRegistry {
+    /// Maps socket address to inbox
+    sockets: HashMap<SocketAddr, Arc<Mutex<SocketInbox>>>,
+}
+
+impl SocketRegistry {
+    fn register(&mut self, addr: SocketAddr) -> Arc<Mutex<SocketInbox>> {
+        let inbox = Arc::new(Mutex::new(SocketInbox::new()));
+        self.sockets.insert(addr, inbox.clone());
+        inbox
+    }
+
+    fn unregister(&mut self, addr: &SocketAddr) {
+        self.sockets.remove(addr);
+    }
+
+    fn deliver_packet(&self, target: SocketAddr, data: Vec<u8>, from: SocketAddr) -> bool {
+        if let Some(inbox) = self.sockets.get(&target) {
+            // Use try_lock to avoid blocking - if we can't get the lock, spawn a task
+            if let Ok(mut guard) = inbox.try_lock() {
+                guard.push(data, from);
+                true
+            } else {
+                // Inbox is locked, spawn delivery task
+                let inbox = inbox.clone();
+                tokio::spawn(async move {
+                    inbox.lock().await.push(data, from);
+                });
+                true
+            }
+        } else {
+            tracing::trace!(target = %target, "No socket registered at target address");
+            false
+        }
+    }
+
+    fn is_registered(&self, addr: &SocketAddr) -> bool {
+        self.sockets.contains_key(addr)
+    }
+}
+
+/// Global map of network name -> socket registry.
+///
+/// Each SimNetwork gets its own registry, providing test isolation.
+static SOCKET_REGISTRIES: LazyLock<RwLock<HashMap<String, Arc<RwLock<SocketRegistry>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Gets or creates the socket registry for a network.
+fn get_or_create_registry(network_name: &str) -> Arc<RwLock<SocketRegistry>> {
+    let registries = SOCKET_REGISTRIES.read().unwrap();
+    if let Some(registry) = registries.get(network_name) {
+        return registry.clone();
+    }
+    drop(registries);
+
+    let mut registries = SOCKET_REGISTRIES.write().unwrap();
+    registries
+        .entry(network_name.to_string())
+        .or_insert_with(|| Arc::new(RwLock::new(SocketRegistry::default())))
+        .clone()
+}
+
+/// Gets the socket registry for a network, if it exists.
+fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
+    SOCKET_REGISTRIES.read().unwrap().get(network_name).cloned()
+}
+
+/// Delivers a packet to a target socket within a network.
+///
+/// This is called by `FaultInjectorState::advance_time()` to deliver
+/// delayed packets when their deadline is reached.
+pub fn deliver_packet_to_network(
+    network_name: &str,
+    target: SocketAddr,
+    data: Vec<u8>,
+    from: SocketAddr,
+) -> bool {
+    if let Some(registry) = get_registry(network_name) {
+        registry.read().unwrap().deliver_packet(target, data, from)
+    } else {
+        tracing::warn!(
+            network = %network_name,
+            "Attempted to deliver packet to non-existent network"
+        );
+        false
+    }
+}
+
+/// Checks if a socket is registered at the given address in a network.
+pub fn is_socket_registered(network_name: &str, addr: &SocketAddr) -> bool {
+    get_registry(network_name)
+        .map(|r| r.read().unwrap().is_registered(addr))
+        .unwrap_or(false)
+}
+
+/// Unregisters a socket from a network's registry.
+pub fn unregister_socket(network_name: &str, addr: &SocketAddr) {
+    if let Some(registry) = get_registry(network_name) {
+        registry.write().unwrap().unregister(addr);
+    }
+}
+
+/// Clears all registered sockets for a network (useful for test cleanup).
+pub fn clear_network_sockets(network_name: &str) {
+    if let Some(registry) = get_registry(network_name) {
+        registry.write().unwrap().sockets.clear();
+    }
+}
+
+/// Clears all socket registries (useful between test runs).
+pub fn clear_all_socket_registries() {
+    SOCKET_REGISTRIES.write().unwrap().clear();
+}
+
+/// An in-memory socket implementing the `Socket` trait.
+///
+/// This allows the production `P2pConnManager` and event loop to be used
+/// in tests with simulated network conditions.
+///
+/// Sockets are scoped to a network (identified by name). Sockets in different
+/// networks cannot communicate with each other, providing test isolation.
+pub struct InMemorySocket {
+    /// Network this socket belongs to
+    network_name: String,
+    /// This socket's bound address
+    addr: SocketAddr,
+    /// Inbox for received packets
+    inbox: Arc<Mutex<SocketInbox>>,
+    /// Notifier for packet arrival
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for InMemorySocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemorySocket")
+            .field("network_name", &self.network_name)
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Socket for InMemorySocket {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let network_name = get_address_network(&addr).ok_or_else(|| {
+            io::Error::other(format!(
+                "No network registered for address {}. Call register_address_network() before binding InMemorySocket.",
+                addr
+            ))
+        })?;
+
+        let registry = get_or_create_registry(&network_name);
+        let inbox = registry.write().unwrap().register(addr);
+        let notify = inbox.lock().await.notifier();
+
+        tracing::debug!(network = %network_name, addr = %addr, "InMemorySocket bound");
+
+        Ok(Self {
+            network_name,
+            addr,
+            inbox,
+            notify,
+        })
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            // Try to get a packet from inbox
+            {
+                let mut inbox = self.inbox.lock().await;
+                if let Some(packet) = inbox.pop() {
+                    let len = packet.data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&packet.data[..len]);
+                    return Ok((len, packet.from));
+                }
+            }
+
+            // Wait for notification of new packet
+            self.notify.notified().await;
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if buf.len() > MAX_PACKET_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet too large",
+            ));
+        }
+
+        let data = buf.to_vec();
+
+        match check_packet_delivery(&self.network_name, self.addr, target) {
+            PacketDeliveryDecision::Drop => {
+                // Silently drop - from sender's perspective, packet was sent
+                Ok(buf.len())
+            }
+            PacketDeliveryDecision::DelayedDelivery(delay) => {
+                // Spawn task to deliver after delay
+                let network_name = self.network_name.clone();
+                let from = self.addr;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    deliver_packet_to_network(&network_name, target, data, from);
+                });
+                Ok(buf.len())
+            }
+            PacketDeliveryDecision::QueuedDelivery { deadline } => {
+                // Queue for virtual time delivery
+                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
+                Ok(buf.len())
+            }
+            PacketDeliveryDecision::Deliver => {
+                // Immediate delivery
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if buf.len() > MAX_PACKET_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet too large",
+            ));
+        }
+
+        let data = buf.to_vec();
+
+        match check_packet_delivery(&self.network_name, self.addr, target) {
+            PacketDeliveryDecision::Drop => Ok(buf.len()),
+            PacketDeliveryDecision::DelayedDelivery(delay) => {
+                // For blocking context, just sleep and deliver
+                std::thread::sleep(delay);
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                Ok(buf.len())
+            }
+            PacketDeliveryDecision::QueuedDelivery { deadline } => {
+                // Queue for virtual time
+                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
+                Ok(buf.len())
+            }
+            PacketDeliveryDecision::Deliver => {
+                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                Ok(buf.len())
+            }
+        }
+    }
+}
+
+impl Drop for InMemorySocket {
+    fn drop(&mut self) {
+        unregister_socket(&self.network_name, &self.addr);
+        unregister_address_network(&self.addr);
+        tracing::debug!(
+            network = %self.network_name,
+            addr = %self.addr,
+            "InMemorySocket dropped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_socket_bind_and_send() {
+        let network = "test-bind-send";
+        clear_network_sockets(network);
+
+        let addr1: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+
+        // Register addresses with network before binding
+        register_address_network(addr1, network);
+        register_address_network(addr2, network);
+
+        let socket1 = InMemorySocket::bind(addr1).await.unwrap();
+        let socket2 = InMemorySocket::bind(addr2).await.unwrap();
+
+        // Send from socket1 to socket2
+        let msg = b"hello";
+        socket1.send_to(msg, addr2).await.unwrap();
+
+        // Receive on socket2
+        let mut buf = [0u8; 100];
+        let (len, from) = socket2.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..len], msg);
+        assert_eq!(from, addr1);
+    }
+
+    #[tokio::test]
+    async fn test_network_isolation() {
+        let network1 = "test-isolation-1";
+        let network2 = "test-isolation-2";
+        clear_network_sockets(network1);
+        clear_network_sockets(network2);
+
+        let addr1: SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:20002".parse().unwrap();
+
+        // Create socket in network1
+        register_address_network(addr1, network1);
+        let socket1 = InMemorySocket::bind(addr1).await.unwrap();
+
+        // Create socket in network2 with a different address
+        // (same address would fail since addr1 is already registered)
+        register_address_network(addr2, network2);
+        let socket2 = InMemorySocket::bind(addr2).await.unwrap();
+
+        // Verify they're in different registries
+        assert!(is_socket_registered(network1, &addr1));
+        assert!(is_socket_registered(network2, &addr2));
+        assert!(!is_socket_registered(network1, &addr2));
+        assert!(!is_socket_registered(network2, &addr1));
+
+        // Clean up
+        drop(socket1);
+        drop(socket2);
+    }
+
+    #[tokio::test]
+    async fn test_bind_without_registration_fails() {
+        // Use a fresh address that's not registered
+        let addr: SocketAddr = "127.0.0.1:30001".parse().unwrap();
+        unregister_address_network(&addr); // Ensure it's not registered
+
+        let result = InMemorySocket::bind(addr).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("No network registered"));
+    }
+}
