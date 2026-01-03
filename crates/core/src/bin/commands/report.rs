@@ -396,20 +396,20 @@ fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
         files.push(legacy_path);
     }
 
-    // Look for rolling log files (freenet.YYYY-MM-DD.log pattern)
+    // Look for rolling log files (freenet.YYYY-MM-DD.log or freenet.YYYY-MM-DD-HH.log pattern)
     if let Ok(entries) = fs::read_dir(log_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match pattern: prefix.YYYY-MM-DD.log
+                // Match pattern: prefix.YYYY-MM-DD.log (daily) or prefix.YYYY-MM-DD-HH.log (hourly)
                 if name.starts_with(prefix)
                     && name.ends_with(".log")
                     && name.len() > prefix.len() + 5
                 {
-                    // Check if it has a date pattern
+                    // Check if it has a date pattern (daily: 11 chars, hourly: 14 chars)
                     let middle = &name[prefix.len()..name.len() - 4];
-                    if middle.starts_with('.') && middle.len() == 11 {
-                        // .YYYY-MM-DD
+                    if middle.starts_with('.') && (middle.len() == 11 || middle.len() == 14) {
+                        // .YYYY-MM-DD or .YYYY-MM-DD-HH
                         files.push(path);
                     }
                 }
