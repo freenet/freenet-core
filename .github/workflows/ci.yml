@@ -111,8 +111,8 @@ jobs:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # Increased from 16MB to 32MB after ICE in rustc 1.91.0 borrowck pass
-      RUST_MIN_STACK: 33554432
+      # 64MB required for LLVM inliner pass on large workspaces
+      RUST_MIN_STACK: 67108864
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       # rust-lld occasionally segfaults with "relocation R_X86_64_PLT32 out of range"
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
