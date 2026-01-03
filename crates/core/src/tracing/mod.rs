@@ -3221,8 +3221,9 @@ pub mod tracer {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{Layer, Registry};
 
-    /// Number of days to keep log files
-    const LOG_RETENTION_DAYS: usize = 7;
+    /// Number of hours to keep log files (using hourly rotation)
+    /// Keeps logs small to prevent disk fill-up from log spam
+    const LOG_RETENTION_HOURS: usize = 3;
 
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
@@ -3248,6 +3249,42 @@ pub mod tracer {
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             None
+        }
+    }
+
+    /// Clean up old log files on startup.
+    /// Removes any log files older than LOG_RETENTION_HOURS, including legacy daily log files.
+    fn cleanup_old_logs(log_dir: &std::path::Path) {
+        use std::time::{Duration, SystemTime};
+
+        let retention = Duration::from_secs(LOG_RETENTION_HOURS as u64 * 3600);
+        let cutoff = SystemTime::now() - retention;
+
+        let Ok(entries) = std::fs::read_dir(log_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Only process log files
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("freenet") || !name.ends_with(".log") {
+                continue;
+            }
+
+            // Check file modification time
+            if let Ok(metadata) = path.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if modified < cutoff {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            eprintln!("Failed to remove old log file {}: {}", path.display(), e);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3333,19 +3370,22 @@ pub mod tracer {
                     );
                 }
 
-                // Create rolling file appender for main log
+                // Clean up old log files (including legacy daily logs) on startup
+                cleanup_old_logs(&log_dir);
+
+                // Create rolling file appender for main log (hourly rotation, 3 hour retention)
                 let main_appender = RollingFileAppender::builder()
-                    .rotation(Rotation::DAILY)
-                    .max_log_files(LOG_RETENTION_DAYS)
+                    .rotation(Rotation::HOURLY)
+                    .max_log_files(LOG_RETENTION_HOURS)
                     .filename_prefix("freenet")
                     .filename_suffix("log")
                     .build(&log_dir)
                     .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
 
-                // Create rolling file appender for error log
+                // Create rolling file appender for error log (hourly rotation, 3 hour retention)
                 let error_appender = RollingFileAppender::builder()
-                    .rotation(Rotation::DAILY)
-                    .max_log_files(LOG_RETENTION_DAYS)
+                    .rotation(Rotation::HOURLY)
+                    .max_log_files(LOG_RETENTION_HOURS)
                     .filename_prefix("freenet.error")
                     .filename_suffix("log")
                     .build(&log_dir)

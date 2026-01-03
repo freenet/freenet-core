@@ -648,7 +648,7 @@ impl P2pConnManager {
                                         continue;
                                     };
 
-                                    tracing::info!(
+                                    tracing::debug!(
                                         tx = %tx,
                                         peer_addr = %target_addr,
                                         peer = %target_peer,
@@ -718,7 +718,7 @@ impl P2pConnManager {
                                                 }
                                             }
                                             Ok(Some(Err(e))) => {
-                                                tracing::error!(
+                                                tracing::debug!(
                                                     tx = %tx,
                                                     peer_addr = %target_addr,
                                                     error = ?e,
@@ -1684,7 +1684,7 @@ impl P2pConnManager {
         executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
     ) {
-        tracing::info!(
+        tracing::debug!(
             tx = %msg.id(),
             tx_type = ?msg.id().transaction_type(),
             msg_type = %msg,
@@ -2809,7 +2809,7 @@ impl P2pConnManager {
                 EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
             }
             Some(Right(action)) => {
-                tracing::info!(
+                tracing::debug!(
                     event = %action,
                     "handle_notification_msg: Received NodeEvent notification"
                 );
