@@ -3246,10 +3246,11 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
     let wrapped_state = WrappedState::from(initial_state);
 
     let peer_a = ctx.node("peer-a")?;
+    let ws_api_port = peer_a.ws_port;
 
     tracing::info!(
         "Regression test #2326: Testing PUT then immediate Subscribe on peer-a (ws_port: {})",
-        peer_a.ws_port
+        ws_api_port
     );
 
     // Give time for peer to connect to gateway (so remote peers exist)
