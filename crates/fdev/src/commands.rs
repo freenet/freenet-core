@@ -304,7 +304,8 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
     };
 
     let key = contract.key();
-    tracing::info!("{key}");
+    // Print to stdout for scripting use (not tracing, which may be filtered)
+    println!("{key}");
     Ok(())
 }
 
