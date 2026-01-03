@@ -56,8 +56,12 @@ const BASE_HISTORY_SIZE: usize = 10;
 /// Delay filter sample count (RFC 6817 recommendation)
 const DELAY_FILTER_SIZE: usize = 4;
 
-/// Default slow start threshold (100 KB)
-const DEFAULT_SSTHRESH: usize = 102_400;
+/// Default slow start threshold (1 MB)
+///
+/// Higher values allow slow start to reach useful throughput on high-BDP paths
+/// before transitioning to congestion avoidance. With 135ms RTT (e.g., US to EU),
+/// 100KB ssthresh limits throughput to ~6 Mbit/s. 1MB allows ~60 Mbit/s.
+const DEFAULT_SSTHRESH: usize = 1_048_576;
 
 /// Periodic slowdown interval multiplier (LEDBAT++ Section 4.4)
 /// Next slowdown is scheduled at 9x the previous slowdown duration,
@@ -6318,6 +6322,7 @@ mod tests {
             initial_cwnd: 38_000,
             min_cwnd: 2_848,
             max_cwnd: 1_000_000,
+            ssthresh: 102_400, // Use lower ssthresh for this test (not testing ssthresh behavior)
             enable_slow_start: true,
             enable_periodic_slowdown: true,
             randomize_ssthresh: false,
