@@ -6,6 +6,7 @@
 //! - Channel closure behavior
 //! - Capacity limits and backpressure
 
+use crate::config::GlobalExecutor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,7 +143,7 @@ async fn test_multiple_executors_drop_independently() {
             dropped.fetch_add(1, Ordering::SeqCst);
         } else {
             // Keep even ones alive briefly then drop
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(response_rx);
             });

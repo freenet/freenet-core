@@ -3405,6 +3405,7 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 
 #[cfg(test)]
 mod tests {
+    use crate::config::GlobalExecutor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -3433,7 +3434,7 @@ mod tests {
         let processed_clone = processed.clone();
 
         // Simulate peer_connection_listener pattern
-        let listener = tokio::spawn(async move {
+        let listener = GlobalExecutor::spawn(async move {
             // Drain-then-select loop (simplified)
             loop {
                 // Phase 1: Drain pending messages (like the loop at start of peer_connection_listener)
@@ -3480,7 +3481,7 @@ mod tests {
 
         // Send messages with timing that causes them to arrive DURING the select! wait
         // This is the race condition that causes message loss without the drain
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             // Wait for listener to enter select!
             sleep(Duration::from_millis(10)).await;
 
@@ -3521,7 +3522,7 @@ mod tests {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Buggy listener - NO drain before shutdown (demonstrates the bug)
-        let listener = tokio::spawn(async move {
+        let listener = GlobalExecutor::spawn(async move {
             // Drain at loop start (the original PR #2255 fix)
             loop {
                 match rx.try_recv() {

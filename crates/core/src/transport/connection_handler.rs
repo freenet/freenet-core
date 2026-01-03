@@ -2106,7 +2106,7 @@ pub mod mock_transport {
             let mut peer_keys_and_addr = peer_keys_and_addr.clone();
             peer_keys_and_addr.remove(i);
             let barrier_cp = barrier.clone();
-            let peer = tokio::spawn(async move {
+            let peer = GlobalExecutor::spawn(async move {
                 let mut conns = FuturesOrdered::new();
                 let mut establish_conns = Vec::new();
                 barrier_cp.wait().await;
@@ -2203,13 +2203,13 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2230,13 +2230,13 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2256,14 +2256,14 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
@@ -2287,7 +2287,7 @@ pub mod mock_transport {
         )
         .await?;
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn).await??;
             conn.send("some data").await.inspect_err(|error| {
@@ -2297,7 +2297,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn).await??;
             let b = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await??;
@@ -2335,7 +2335,7 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(PacketDropPolicy::Ranges(vec![0..1, 3..5]), channels).await?;
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_a_conn)
                 .await
@@ -2354,7 +2354,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(conn)
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_b_conn)
                 .await
@@ -2393,7 +2393,7 @@ pub mod mock_transport {
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             create_mock_gateway(Default::default(), channels).await?;
 
-        let gw = tokio::spawn(async move {
+        let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
@@ -2401,7 +2401,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2422,7 +2422,7 @@ pub mod mock_transport {
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             create_mock_gateway(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
 
-        let gw = tokio::spawn(async move {
+        let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
@@ -2430,7 +2430,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2451,7 +2451,7 @@ pub mod mock_transport {
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             create_mock_gateway(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
-        let gw = tokio::spawn(async move {
+        let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
@@ -2459,7 +2459,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2479,7 +2479,7 @@ pub mod mock_transport {
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             create_mock_gateway(Default::default(), channels).await?;
 
-        let gw = tokio::spawn(async move {
+        let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
@@ -2487,7 +2487,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
@@ -2549,7 +2549,7 @@ pub mod mock_transport {
         let test_data: Vec<u8> = (0..1400).map(|i| (i % 256) as u8).collect();
         let expected_len = test_data.len();
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
             let msg = tokio::time::timeout(Duration::from_secs(5), conn.recv()).await??;
@@ -2558,7 +2558,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
             // Small delay to ensure peer_a's recv() is ready before we send.
@@ -2584,14 +2584,14 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
-        let peer_a = tokio::spawn(async move {
+        let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
             Ok::<_, anyhow::Error>(())
         });
 
-        let peer_b = tokio::spawn(async move {
+        let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_a_conn).await??;
             let data = vec![0u8; MAX_DATA_SIZE + 1];
@@ -2683,7 +2683,7 @@ pub mod mock_transport {
                 );
 
                 let now = std::time::Instant::now();
-                tests.push_back(tokio::spawn(
+                tests.push_back(GlobalExecutor::spawn(
                     run_test(
                         TestConfig {
                             packet_drop_policy: PacketDropPolicy::Factor(factor),
@@ -2753,7 +2753,7 @@ pub mod mock_transport {
         );
 
         // Peer A connects to gateway
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!("gateway: no inbound connection"))?;
@@ -2805,7 +2805,7 @@ pub mod mock_transport {
         // Step 4: Peer B connects to gateway - this should work on first attempt
         tracing::info!("Step 4: Peer B connecting to gateway");
 
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(5), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!("gateway: no inbound connection for peer B"))?;
@@ -2888,7 +2888,7 @@ pub mod mock_transport {
         );
 
         // Step 1: Peer A connects to gateway
-        let gw_task_a = tokio::spawn(async move {
+        let gw_task_a = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!("gateway: no connection from peer A"))?;
@@ -2909,7 +2909,7 @@ pub mod mock_transport {
         let (mut gw_conn, gw_peer_a_conn) = gw_task_a.await??;
 
         // Step 2: Peer B connects to gateway (while peer A is still connected)
-        let gw_task_b = tokio::spawn(async move {
+        let gw_task_b = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!("gateway: no connection from peer B"))?;
@@ -3053,7 +3053,7 @@ pub mod mock_transport {
             create_mock_peer(Default::default(), channels.clone()).await?;
 
         // Peer connects to Gateway A
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(10), gw_a_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!(
@@ -3108,7 +3108,7 @@ pub mod mock_transport {
         // - With the fix: connect() clears stale entry and does fresh handshake
         tracing::info!("Step 4: Peer reconnecting to Gateway B (new identity) at same address");
 
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(5), gw_b_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!(
@@ -3183,7 +3183,7 @@ pub mod mock_transport {
         tracing::info!("Peer A public key: {:?}", peer_a_pub);
 
         // Peer A connects to gateway
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!(
@@ -3240,7 +3240,7 @@ pub mod mock_transport {
         // - Handshake silently fails
         tracing::info!("Step 4: Peer B (new identity) connecting to gateway from same address");
 
-        let gw_task = tokio::spawn(async move {
+        let gw_task = GlobalExecutor::spawn(async move {
             let conn = tokio::time::timeout(Duration::from_secs(5), gw_conn.recv())
                 .await?
                 .ok_or(anyhow::anyhow!(

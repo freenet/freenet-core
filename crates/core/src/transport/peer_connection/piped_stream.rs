@@ -527,6 +527,7 @@ impl std::fmt::Debug for PipedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
 
     fn make_stream_id() -> StreamId {
         StreamId::next()
@@ -813,7 +814,7 @@ mod tests {
         let mut handles = Vec::new();
         for frag_num in 1..=num_fragments {
             let stream = Arc::clone(&stream);
-            handles.push(tokio::spawn(async move {
+            handles.push(GlobalExecutor::spawn(async move {
                 let payload = Bytes::from(format!("fragment {}", frag_num));
                 stream.push_fragment(frag_num, payload)
             }));
@@ -852,7 +853,7 @@ mod tests {
 
         // Spawn a task that tries to acquire a permit (will block)
         let stream_clone = Arc::clone(&stream);
-        let waiter = tokio::spawn(async move { stream_clone.acquire_send_permit(0).await });
+        let waiter = GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
 
         // Give the waiter time to start waiting
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -883,7 +884,7 @@ mod tests {
 
         // Start pushing fragments
         let stream_clone = Arc::clone(&stream);
-        let pusher = tokio::spawn(async move {
+        let pusher = GlobalExecutor::spawn(async move {
             for i in 1..=10 {
                 if stream_clone.is_cancelled() {
                     break;
@@ -974,7 +975,7 @@ mod tests {
 
         // Spawn a waiter
         let stream_clone = Arc::clone(&stream);
-        let waiter = tokio::spawn(async move { stream_clone.acquire_send_permit(0).await });
+        let waiter = GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
 
         // Release one permit
         drop(permit1);

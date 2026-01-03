@@ -163,6 +163,7 @@ impl EventLoopNotificationsSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use either::Either;
     use freenet_stdlib::prelude::*;
     use tokio::time::{timeout, Duration};
@@ -181,7 +182,7 @@ mod tests {
 
         // Spawn a task to send notification after a delay
         let sender = notification_tx.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             tracing::info!("Sending notification");
             sender

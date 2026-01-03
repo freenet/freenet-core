@@ -437,6 +437,7 @@ impl RequestRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use freenet_stdlib::prelude::{
         CodeHash, ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion,
         Parameters, RelatedContracts, WrappedContract, WrappedState,
@@ -1105,7 +1106,7 @@ mod tests {
             .map(|i| {
                 let router = router.clone();
                 let barrier = barrier.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     let client_id = ClientId::next();
                     let request_id = RequestId::new();
 

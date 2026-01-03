@@ -523,6 +523,7 @@ impl<T: TimeSource> SessionActor<T> {
 mod tests {
     use super::*;
     use crate::client_events::{ClientId, RequestId};
+    use crate::config::GlobalExecutor;
     use crate::message::Transaction;
     use crate::operations::put::PutMsg;
     use freenet_stdlib::client_api::HostResponse;
@@ -542,7 +543,7 @@ mod tests {
         let actor = SessionActor::new(session_rx, client_responses_tx);
 
         // Start the actor
-        let actor_handle = tokio::spawn(async move {
+        let actor_handle = GlobalExecutor::spawn(async move {
             actor.run().await;
         });
 
@@ -657,7 +658,7 @@ mod tests {
         let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
         let actor = SessionActor::new(session_rx, client_responses_tx);
 
-        let actor_handle = tokio::spawn(async move {
+        let actor_handle = GlobalExecutor::spawn(async move {
             actor.run().await;
         });
 
@@ -763,7 +764,7 @@ mod tests {
         let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
         let actor = SessionActor::new(session_rx, client_responses_tx);
 
-        let actor_handle = tokio::spawn(async move {
+        let actor_handle = GlobalExecutor::spawn(async move {
             actor.run().await;
         });
 
@@ -860,7 +861,7 @@ mod tests {
         let actor = SessionActor::new(session_rx, client_responses_tx);
 
         // Start the actor
-        let actor_handle = tokio::spawn(async move {
+        let actor_handle = GlobalExecutor::spawn(async move {
             actor.run().await;
         });
 
@@ -914,7 +915,7 @@ mod tests {
         let actor = SessionActor::new(session_rx, client_responses_tx);
 
         // Start the actor
-        let actor_handle = tokio::spawn(async move {
+        let actor_handle = GlobalExecutor::spawn(async move {
             actor.run().await;
         });
 
@@ -1197,7 +1198,7 @@ mod tests {
             let (session_tx, actor) = create_test_actor_with_time(time_source.clone());
 
             // We need to run the actor to test lazy eviction
-            let actor_handle = tokio::spawn(async move {
+            let actor_handle = GlobalExecutor::spawn(async move {
                 actor.run().await;
             });
 

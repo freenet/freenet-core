@@ -242,6 +242,7 @@ impl std::error::Error for OrphanStreamError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
 
     /// Small delay to allow async waiter registration before asserting.
     const WAITER_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
@@ -286,7 +287,7 @@ mod tests {
 
         // Start waiting in background
         let registry_clone = registry.clone();
-        let waiter = tokio::spawn(async move {
+        let waiter = GlobalExecutor::spawn(async move {
             registry_clone
                 .claim_or_wait(stream_id, Duration::from_secs(5))
                 .await

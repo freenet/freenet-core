@@ -179,6 +179,7 @@ impl BucketState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use std::time::Duration;
 
     #[test]
@@ -301,7 +302,7 @@ mod tests {
         // Spawn 5 tasks, each sending 20KB
         for _ in 0..5 {
             let bucket_clone = bucket.clone();
-            let handle = tokio::spawn(async move {
+            let handle = GlobalExecutor::spawn(async move {
                 let mut sent = 0;
                 while sent < 20_000 {
                     let wait = bucket_clone.reserve(1000);
