@@ -261,7 +261,7 @@ download_release() {
     local arch
     arch=$(detect_arch)
 
-    local asset_name="freenet-${arch}-unknown-linux-gnu.tar.gz"
+    local asset_name="freenet-${arch}-unknown-linux-musl.tar.gz"
     local download_url="https://github.com/$GITHUB_REPO/releases/download/v${version}/${asset_name}"
 
     log INFO "Downloading $asset_name from release v$version..."
