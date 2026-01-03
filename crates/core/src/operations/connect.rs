@@ -1588,7 +1588,7 @@ pub(crate) async fn join_ring_request(
 
     op.first_hop = Some(Box::new(gateway.clone()));
 
-    tracing::info!(
+    tracing::debug!(
         gateway = %gateway.pub_key(),
         tx = %tx,
         target_connections,

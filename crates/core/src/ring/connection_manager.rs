@@ -261,7 +261,7 @@ impl ConnectionManager {
             );
             accepted
         };
-        tracing::info!(
+        tracing::debug!(
             addr = %addr,
             peer_location = %location,
             accepted,
