@@ -17,7 +17,7 @@ use tracing::info;
 
 const ITERATIONS: usize = 5;
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore = "manual-only: reproduces riverctl missing contract race"]
 async fn river_missing_contract_smoke() -> Result<()> {
     let riverctl = which::which("riverctl").context("riverctl not found in PATH")?;

@@ -119,7 +119,7 @@ impl TestConfig {
 /// - Most peers have connections (low isolation rate)
 /// - Connections are primarily to nearby peers on the ring
 /// - Average ring distance between connected peers is small
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore = "Manual test - requires Docker NAT (FREENET_TEST_DOCKER_NAT=1)"]
 async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();
@@ -259,7 +259,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
 /// - Room creation (put)
 /// - Room retrieval (get)
 /// - Subscription and message delivery (subscribe/update)
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore = "Manual test - requires riverctl in PATH"]
 async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();
@@ -391,7 +391,7 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
 /// 1. Starts a Docker NAT network
 /// 2. Validates small-world topology formation
 /// 3. Runs River operations to validate put/get/subscribe/update
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore = "Manual test - requires Docker NAT and riverctl"]
 async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();

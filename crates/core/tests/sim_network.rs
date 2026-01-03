@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Test that a small in-memory network can establish connectivity.
 ///
 /// This is a basic smoke test for the simulation infrastructure.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_sim_network_basic_connectivity() {
     // Create a network with 1 gateway and 5 peers
     let mut sim = SimNetwork::new(
@@ -50,7 +50,7 @@ async fn test_sim_network_basic_connectivity() {
 /// Test that the network can start peers and they register correctly.
 ///
 /// This test verifies the PeerRegistry mechanics work when nodes are started.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_sim_network_peer_registration() {
     // Create a minimal network for quick testing
     let mut sim = SimNetwork::new(
@@ -91,7 +91,7 @@ async fn test_sim_network_peer_registration() {
 /// Test that peers can check connectivity status.
 ///
 /// This test verifies that after starting, peers attempt to connect.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_sim_network_connection_check() {
     // Create a network with 1 gateway and 3 peers
     let mut sim = SimNetwork::new(
@@ -158,7 +158,7 @@ async fn test_sim_network_connection_check() {
 /// **On failure:** Prints seed for local reproduction
 ///
 /// Run with: `cargo test -p freenet --test sim_network ci_quick_simulation -- --ignored --test-threads=1`
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore] // TODO: Enable when peer registration race condition is fixed
 async fn ci_quick_simulation() {
     // Use a fixed seed for reproducibility - if this test fails, the seed
@@ -385,7 +385,7 @@ async fn run_ci_simulation(
 /// - Timeout: 60 seconds
 ///
 /// Marked as `#[ignore]` to avoid running in quick CI - run with `--ignored`.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore] // Run with: cargo test --test sim_network extended_simulation -- --ignored
 async fn extended_simulation() {
     const SEED: u64 = 0xE17E_ED5E_ED01;
