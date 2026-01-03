@@ -1,6 +1,7 @@
 //! Integration verification tests for client connection refactor infrastructure
 
 use crate::client_events::{ClientId, OpenRequest, RequestId};
+use crate::config::GlobalExecutor;
 use crate::contract::{contract_handler_channel, SessionMessage};
 use freenet_stdlib::client_api::ClientRequest;
 use tokio::sync::mpsc;
@@ -71,7 +72,7 @@ async fn test_result_router_receives_host_responses() {
     let router = ResultRouter::new(network_rx, session_tx);
 
     // Spawn router task
-    let router_handle = tokio::spawn(async move {
+    let router_handle = GlobalExecutor::spawn(async move {
         router.run().await;
     });
 

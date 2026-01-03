@@ -1494,7 +1494,18 @@ pub enum Address {
     HostAddress(SocketAddr),
 }
 
-pub(crate) struct GlobalExecutor;
+/// Global async executor abstraction for spawning tasks.
+///
+/// This abstraction allows swapping the underlying executor for deterministic
+/// simulation testing. In production, it delegates to tokio. With MadSim enabled
+/// (`RUSTFLAGS="--cfg madsim"`), tokio is replaced with a deterministic runtime.
+///
+/// # Usage
+/// ```ignore
+/// use freenet::config::GlobalExecutor;
+/// GlobalExecutor::spawn(async { /* task */ });
+/// ```
+pub struct GlobalExecutor;
 
 impl GlobalExecutor {
     /// Returns the runtime handle if it was initialized or none if it was already

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::GlobalExecutor;
 use futures::stream::StreamExt;
 use std::future::Future;
 use tokio::sync::mpsc;
@@ -81,7 +82,7 @@ async fn test_priority_select_future_wakeup() {
 
     // Spawn task that sends notification after delay
     let notif_tx_clone = notif_tx.clone();
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         sleep(Duration::from_millis(50)).await;
         let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
             crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
@@ -330,7 +331,7 @@ async fn test_priority_select_event_loop_simulation() {
     let op_tx_clone = op_tx.clone();
     let bridge_tx_clone = bridge_tx.clone();
     let node_tx_clone = node_tx.clone();
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         sleep(Duration::from_millis(10)).await;
 
         // Send 3 notifications
@@ -582,7 +583,7 @@ async fn test_with_seed(seed: u64) {
     );
 
     // Spawn separate task for each channel with pre-generated delays
-    let notif_handle = tokio::spawn(async move {
+    let notif_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in notif_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
@@ -599,7 +600,7 @@ async fn test_with_seed(seed: u64) {
         NOTIF_COUNT
     });
 
-    let op_handle = tokio::spawn(async move {
+    let op_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in op_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
@@ -617,7 +618,7 @@ async fn test_with_seed(seed: u64) {
         OP_COUNT
     });
 
-    let bridge_handle = tokio::spawn(async move {
+    let bridge_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in bridge_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             tracing::debug!(
@@ -634,7 +635,7 @@ async fn test_with_seed(seed: u64) {
         BRIDGE_COUNT
     });
 
-    let node_handle = tokio::spawn(async move {
+    let node_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in node_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             tracing::debug!(
@@ -651,7 +652,7 @@ async fn test_with_seed(seed: u64) {
         NODE_COUNT
     });
 
-    let client_handle = tokio::spawn(async move {
+    let client_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in client_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             let client_id = crate::client_events::ClientId::next();
@@ -669,7 +670,7 @@ async fn test_with_seed(seed: u64) {
         CLIENT_COUNT
     });
 
-    let executor_handle = tokio::spawn(async move {
+    let executor_handle = GlobalExecutor::spawn(async move {
         for (i, &delay_us) in executor_delays.iter().enumerate() {
             sleep(Duration::from_micros(delay_us)).await;
             tracing::debug!(
@@ -955,7 +956,7 @@ async fn test_priority_select_all_pending_waker_registration() {
 
     // Spawn a task that will send messages after a delay
     // This gives the stream time to poll all channels and register wakers
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         sleep(Duration::from_millis(10)).await;
         tracing::info!("All wakers should now be registered, sending messages");
 
@@ -1065,7 +1066,7 @@ async fn test_sparse_messages_reproduce_race() {
     let (_, node_rx) = mpsc::channel(1);
 
     // Spawn sender that sends 5 messages with 200ms gaps
-    let sender = tokio::spawn(async move {
+    let sender = GlobalExecutor::spawn(async move {
         for i in 0..5 {
             sleep(Duration::from_millis(200)).await;
             tracing::info!(
@@ -1176,7 +1177,7 @@ async fn test_stream_no_lost_messages_sparse_arrivals() {
     let mut message_stream = MessageStream { inner: stream };
 
     // Spawn sender that sends 5 messages with 200ms gaps (sparse arrivals)
-    let sender = tokio::spawn(async move {
+    let sender = GlobalExecutor::spawn(async move {
         for i in 0..5 {
             sleep(Duration::from_millis(200)).await;
             tracing::info!(
@@ -1292,7 +1293,7 @@ async fn test_recreating_futures_maintains_waker() {
     };
 
     // Spawn sender with sparse arrivals (200ms gaps)
-    let sender = tokio::spawn(async move {
+    let sender = GlobalExecutor::spawn(async move {
         for i in 0..5 {
             sleep(Duration::from_millis(200)).await;
             tracing::info!("Sender: Sending message {}", i);
@@ -1612,7 +1613,7 @@ async fn test_nested_select_concurrent_arrivals() {
     // STRESS TEST: 1000 messages (100x more than original)
     // Spawn a sender that rapidly sends messages alternating between channels
     const MESSAGE_COUNT: usize = 1000;
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         for i in 0..MESSAGE_COUNT {
             // Send to alternating channels with minimal delay
             if i % 2 == 0 {
@@ -1732,7 +1733,7 @@ async fn test_waker_registration_after_pending_poll() {
     // Spawn a task that sends a message after a delay
     // This delay ensures the stream has already been polled once and returned Pending
     let tx_clone = tx.clone();
-    let sender = tokio::spawn(async move {
+    let sender = GlobalExecutor::spawn(async move {
         // Wait long enough for the stream to be polled and return Pending
         sleep(Duration::from_millis(50)).await;
         let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(

@@ -552,6 +552,7 @@ impl Default for StreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use futures::StreamExt;
 
     fn make_stream_id() -> StreamId {
@@ -650,7 +651,7 @@ mod tests {
 
         // Spawn a task to push fragments with delays
         let handle_clone = handle.clone();
-        let producer = tokio::spawn(async move {
+        let producer = GlobalExecutor::spawn(async move {
             for i in 1..=3 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 handle_clone
@@ -754,7 +755,7 @@ mod tests {
 
         // Spawn producer
         let handle_clone = handle.clone();
-        let producer = tokio::spawn(async move {
+        let producer = GlobalExecutor::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             handle_clone
                 .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
@@ -848,7 +849,7 @@ mod tests {
         let handle_clone = handle.clone();
 
         // Start assemble in background
-        let assemble_task = tokio::spawn(async move { handle_clone.assemble().await });
+        let assemble_task = GlobalExecutor::spawn(async move { handle_clone.assemble().await });
 
         // Give it time to start waiting
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -899,7 +900,7 @@ mod tests {
 
         // Create a task that tries to read - should block waiting for fragment 1
         let handle_clone = handle.clone();
-        let read_task = tokio::spawn(async move {
+        let read_task = GlobalExecutor::spawn(async move {
             let mut s = handle_clone.stream();
             s.next().await
         });
@@ -949,7 +950,7 @@ mod tests {
 
         // Cancel while waiting for second fragment
         let handle_clone = handle.clone();
-        let cancel_task = tokio::spawn(async move {
+        let cancel_task = GlobalExecutor::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             handle_clone.cancel();
         });
@@ -1083,7 +1084,7 @@ mod tests {
 
         // Spawn producer
         let handle_producer = handle.clone();
-        let producer = tokio::spawn(async move {
+        let producer = GlobalExecutor::spawn(async move {
             for i in 1..=10 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 handle_producer
@@ -1097,7 +1098,7 @@ mod tests {
         for _ in 0..3 {
             let h = handle.clone();
             let counter = Arc::clone(&fragments_received);
-            consumers.push(tokio::spawn(async move {
+            consumers.push(GlobalExecutor::spawn(async move {
                 let mut stream = h.stream();
                 let mut local_count = 0;
                 while let Some(result) = stream.next().await {

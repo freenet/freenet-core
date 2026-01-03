@@ -315,6 +315,7 @@ pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
 
     #[tokio::test]
     async fn test_send_recv() {
@@ -392,13 +393,13 @@ mod tests {
         let (tx, rx) = bounded::<i32>(100);
         let count = 1000;
 
-        let sender = tokio::spawn(async move {
+        let sender = GlobalExecutor::spawn(async move {
             for i in 0..count {
                 tx.send_async(i).await.unwrap();
             }
         });
 
-        let receiver = tokio::spawn(async move {
+        let receiver = GlobalExecutor::spawn(async move {
             let mut received = 0;
             while rx.recv_async().await.is_ok() {
                 received += 1;
@@ -422,7 +423,7 @@ mod tests {
         let (tx, rx) = bounded::<i32>(10);
 
         // Spawn sender that waits 1 second before sending
-        let sender = tokio::spawn(async move {
+        let sender = GlobalExecutor::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             tx.send_async(42).await.unwrap();
         });

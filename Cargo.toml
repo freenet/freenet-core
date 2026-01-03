@@ -46,3 +46,17 @@ opt-level = 3
 # lto = true
 # codegen-units = 1
 # panic = "abort"
+
+# ==============================================================================
+# MadSim Patches for Deterministic Simulation Testing
+# ==============================================================================
+# These patches are always present but only affect builds with --cfg madsim.
+# Enable deterministic testing with: RUSTFLAGS="--cfg madsim" cargo test
+#
+# See docs/architecture/testing/deterministic-simulation-roadmap.md for details.
+# ==============================================================================
+[patch.crates-io]
+# Patch getrandom to use seeded RNG for reproducibility
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git", rev = "e79a7ae" }
+# Patch quanta for deterministic time measurements
+quanta = { git = "https://github.com/madsim-rs/quanta.git", branch = "madsim" }

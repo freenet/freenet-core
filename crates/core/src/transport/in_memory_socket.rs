@@ -19,6 +19,8 @@
 //! let socket = InMemorySocket::bind(addr).await?;
 //! ```
 
+use crate::config::GlobalExecutor;
+
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -213,7 +215,7 @@ impl SocketRegistry {
             } else {
                 // Inbox is locked, spawn delivery task
                 let inbox = inbox.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     inbox.lock().await.push(data, from);
                 });
                 true
@@ -399,7 +401,7 @@ impl<T: TimeSource> InMemorySocket<T> {
                 let network_name = self.network_name.clone();
                 let from = self.addr;
                 let time_source = self.time_source.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     time_source.sleep(delay).await;
                     deliver_packet_to_network(&network_name, target, data, from);
                 });

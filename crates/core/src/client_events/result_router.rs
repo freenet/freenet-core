@@ -71,6 +71,7 @@ impl ResultRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use crate::operations::get::GetMsg;
     use freenet_stdlib::client_api::HostResponse;
 
@@ -102,7 +103,7 @@ mod tests {
         let router = ResultRouter::new(network_rx, session_tx);
 
         // Spawn the router
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             router.run().await;
         });
 
@@ -124,7 +125,7 @@ mod tests {
         let router = ResultRouter::new(network_rx, session_tx);
 
         // Spawn the router
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             router.run().await;
         });
 
@@ -163,7 +164,7 @@ mod tests {
 
         let router = ResultRouter::new(network_rx, session_tx);
 
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             router.run().await;
         });
 
@@ -206,7 +207,7 @@ mod tests {
 
         let router = ResultRouter::new(network_rx, session_tx);
 
-        let router_handle = tokio::spawn(async move {
+        let router_handle = GlobalExecutor::spawn(async move {
             router.run().await;
         });
 
@@ -232,7 +233,7 @@ mod tests {
 
         let router = ResultRouter::new(network_rx, session_tx);
 
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             router.run().await;
         });
 
@@ -240,7 +241,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let tx_clone = network_tx.clone();
-            let handle = tokio::spawn(async move {
+            let handle = GlobalExecutor::spawn(async move {
                 let tx = create_test_transaction();
                 let result = create_test_host_result();
                 tx_clone.send((tx, result)).await.unwrap();
@@ -282,7 +283,7 @@ mod tests {
 
         let router = ResultRouter::new(network_rx, session_tx);
 
-        let router_handle = tokio::spawn(async move {
+        let router_handle = GlobalExecutor::spawn(async move {
             router.run().await;
         });
 

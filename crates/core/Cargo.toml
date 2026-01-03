@@ -183,9 +183,4 @@ bench_full = []  # Enables full benchmark suite (slow, ~78 min)
 [target.'cfg(madsim)'.dependencies]
 madsim = "0.2"
 madsim-tokio = "0.2"
-
-[target.'cfg(madsim)'.patch.crates-io]
-# Patch getrandom to use seeded RNG for reproducibility
-getrandom = { git = "https://github.com/madsim-rs/getrandom.git", rev = "e79a7ae" }
-# Patch quanta for deterministic time measurements
-quanta = { git = "https://github.com/madsim-rs/quanta.git", branch = "madsim" }
+# Note: Patches for getrandom/quanta are defined in workspace Cargo.toml
