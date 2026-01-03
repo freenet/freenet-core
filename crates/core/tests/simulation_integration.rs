@@ -19,7 +19,7 @@ use std::time::Duration;
 /// NOTE: Full determinism requires a single-threaded async runtime to control
 /// scheduling. With multi-threaded tokio, message ordering can vary slightly.
 /// This test verifies that the same types of events are captured across runs.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_deterministic_replay_events() {
     const SEED: u64 = 0xDEAD_BEEF_1234;
 
@@ -112,7 +112,7 @@ async fn test_deterministic_replay_events() {
 }
 
 /// Verifies that different seeds produce different event sequences.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_different_seeds_produce_different_events() {
     const SEED_A: u64 = 0x1111_2222_3333;
     const SEED_B: u64 = 0x4444_5555_6666;
@@ -155,7 +155,7 @@ async fn test_different_seeds_produce_different_events() {
 /// Tests that simulation produces deterministic results with the same seed.
 ///
 /// VirtualTime is always enabled, making simulation fully deterministic.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_fault_injection_deterministic() {
     const SEED: u64 = 0xFA01_7777_1234;
 
@@ -198,7 +198,7 @@ async fn test_fault_injection_deterministic() {
 // =============================================================================
 
 /// Tests that the event summary is correctly ordered and consistent.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_event_summary_ordering() {
     const SEED: u64 = 0xC0DE_CAFE_BABE;
 
@@ -245,7 +245,7 @@ async fn test_event_summary_ordering() {
 // =============================================================================
 
 /// Minimal network test: 1 gateway + 2 nodes.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_small_network_connectivity() {
     const SEED: u64 = 0x5A11_1111;
 
@@ -288,7 +288,7 @@ async fn test_small_network_connectivity() {
 }
 
 /// Tests that peer labels are assigned correctly and deterministically.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_peer_label_assignment() {
     const SEED: u64 = 0x1ABE_1234;
 
@@ -332,7 +332,7 @@ async fn test_peer_label_assignment() {
 /// 3. Comparing state hashes across nodes for the same contract
 ///
 /// This test validates the infrastructure is in place for such verification.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_event_state_hash_capture() {
     const SEED: u64 = 0xC0DE_1234;
 
@@ -429,7 +429,7 @@ async fn test_event_state_hash_capture() {
 /// This test verifies that when multiple peers receive broadcast updates
 /// (via BroadcastReceived or UpdateSuccess events), they end up with the
 /// same state_hash for a given contract key.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_eventual_consistency_state_hashes() {
     const SEED: u64 = 0xC0DE_5678;
 
@@ -561,7 +561,7 @@ async fn test_eventual_consistency_state_hashes() {
 ///
 /// This verifies Gap 2 fix: SimulatedNetwork's FaultConfig can now be applied
 /// to SimNetwork's InMemoryTransport to inject message loss, partitions, etc.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_fault_injection_bridge() {
     use freenet::simulation::FaultConfig;
 
@@ -649,7 +649,7 @@ async fn test_fault_injection_bridge() {
 ///
 /// Creates a network and then partitions it, verifying that the
 /// partition blocks messages between specified peer groups.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_partition_injection_bridge() {
     use freenet::simulation::{FaultConfig, Partition};
     use std::collections::HashSet;
@@ -734,7 +734,7 @@ async fn test_partition_injection_bridge() {
 ///
 /// This verifies that the fault injection bridge uses seeded RNG for reproducible
 /// message loss decisions across multiple runs.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_deterministic_fault_injection() {
     use freenet::simulation::FaultConfig;
 
@@ -791,7 +791,7 @@ async fn test_deterministic_fault_injection() {
 ///
 /// This verifies that configured latency is applied to message delivery,
 /// resulting in delayed propagation of events.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_latency_injection() {
     use freenet::simulation::FaultConfig;
     use std::time::Instant;
@@ -934,7 +934,7 @@ mod simulation_primitives {
 /// 2. crash_node() aborts the task and blocks messages
 /// 3. recover_node() allows messages to flow again
 /// 4. is_node_crashed() correctly reports crash status
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_node_crash_recovery() {
     use freenet::dev_tool::{SimNetwork, TimeSource};
 
@@ -1019,7 +1019,7 @@ async fn test_node_crash_recovery() {
 }
 
 /// Tests that VirtualTime is always enabled and accessible.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_virtual_time_always_enabled() {
     use freenet::dev_tool::{SimNetwork, TimeSource};
 
@@ -1082,7 +1082,7 @@ async fn test_virtual_time_always_enabled() {
 /// 1. Nodes can be crashed and restarted
 /// 2. Restarted nodes use the same identity (keypair)
 /// 3. can_restart() correctly identifies restartable nodes
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_node_restart() {
     use freenet::dev_tool::SimNetwork;
 
@@ -1185,7 +1185,7 @@ async fn test_node_restart() {
 /// 2. Recovering a non-existent node returns false
 /// 3. is_node_crashed returns false for unknown nodes
 /// 4. can_restart returns false for unknown nodes
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_crash_restart_edge_cases() {
     use freenet::dev_tool::{NodeLabel, SimNetwork};
 
@@ -1289,7 +1289,7 @@ async fn test_zero_gateways_panics() {
 }
 
 /// Tests that a minimal network with 1 gateway and 1 node works.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_minimal_network() {
     use freenet::dev_tool::SimNetwork;
 

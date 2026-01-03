@@ -2,20 +2,32 @@
 
 This document analyzes what it would take to make Freenet's simulation tests fully deterministic.
 
-## Current State
+## Current State (January 2025)
 
-SimNetwork achieves **partial determinism** through:
+SimNetwork achieves **~95% determinism** through:
 - ✅ Seeded RNG for all random decisions
-- ✅ VirtualTime abstraction for time control
+- ✅ VirtualTime abstraction for time control (with MadSim delegation)
 - ✅ In-memory transport (no real network I/O)
 - ✅ MockStateStorage (no disk I/O)
 - ✅ Fault injection with deterministic drop decisions
+- ✅ **GlobalExecutor::spawn** - All tokio::spawn calls migrated
+- ✅ **Single-threaded tests** - All SimNetwork tests use `current_thread, start_paused = true`
+- ✅ **MadSim configuration** - Ready for deterministic runtime when enabled
 
-But **full determinism is blocked by**:
-- ❌ Multi-threaded tokio scheduler (task ordering varies)
-- ❌ Real wall-clock time in 257+ locations
-- ❌ Channel message ordering non-deterministic
-- ❌ `select!` macro branch selection
+### Recent Progress
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 1: Single-threaded tokio | ✅ Complete | Tests use `current_thread, start_paused = true` |
+| Phase 3: GlobalExecutor migration | ✅ Complete | All tokio::spawn → GlobalExecutor::spawn |
+| Phase 3: MadSim configuration | ✅ Complete | Cargo.toml configured for MadSim |
+| Phase 3: VirtualTime MadSim delegation | ✅ Complete | VirtualTime delegates to MadSim when enabled |
+
+### Remaining Gaps
+
+**Full determinism still blocked by** (when not using MadSim):
+- ⚠️ Channel message ordering (partially mitigated by single-threaded)
+- ⚠️ `select!` macro branch selection (use `biased` where possible)
 
 ## Sources of Non-Determinism
 
@@ -475,6 +487,170 @@ Only if Phase 3 insufficient:
 2. Battle-tested in RisingWave (distributed streaming database)
 3. Patches getrandom/quanta for true reproducibility
 4. Existing `GlobalExecutor::spawn` abstraction makes migration straightforward
+
+---
+
+## MadSim Usage Guide
+
+This section documents how to use MadSim for deterministic simulation testing.
+
+### Quick Start
+
+Run tests with MadSim's deterministic runtime:
+
+```bash
+# Run all simulation tests with MadSim
+RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network
+
+# Run specific test
+RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network test_sim_network_basic_connectivity
+
+# Run with a specific seed for reproducibility
+RUSTFLAGS="--cfg madsim" MADSIM_SEED=12345 cargo test -p freenet --test sim_network
+```
+
+### How MadSim Works
+
+When you compile with `--cfg madsim`, Cargo:
+
+1. **Replaces tokio** with `madsim-tokio` (package substitution)
+2. **Patches dependencies** like `getrandom` and `quanta` for determinism
+3. **Enables VirtualTime delegation** - our VirtualTime delegates to MadSim's time
+
+MadSim provides:
+- **Deterministic scheduling** - Same seed → same task order
+- **Virtual time** - Time only advances when runtime is idle or explicitly advanced
+- **Reproducible randomness** - All random sources are seeded
+
+### CI Configuration
+
+For deterministic CI runs, configure your CI workflow to use MadSim:
+
+```yaml
+# .github/workflows/simulation-tests.yml
+name: Simulation Tests
+
+on: [push, pull_request]
+
+jobs:
+  simulation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run simulation tests (deterministic)
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network -- --test-threads=1
+        env:
+          MADSIM_SEED: 0xDEADBEEF  # Fixed seed for reproducibility
+```
+
+### fdev Test Command
+
+For local development with `fdev`:
+
+```bash
+# Run contract tests with MadSim (deterministic)
+RUSTFLAGS="--cfg madsim" fdev test --simulate
+
+# Run with specific seed (reproduce failures)
+RUSTFLAGS="--cfg madsim" MADSIM_SEED=12345 fdev test --simulate
+
+# Run with verbose logging
+RUSTFLAGS="--cfg madsim" RUST_LOG=info fdev test --simulate
+```
+
+### VirtualTime Integration
+
+When MadSim is enabled, `VirtualTime` automatically delegates to MadSim's time infrastructure:
+
+```rust
+use freenet::simulation::VirtualTime;
+
+// VirtualTime works the same way regardless of MadSim
+let vt = VirtualTime::new();
+
+// Get current time (delegates to MadSim when enabled)
+let now = vt.now_nanos();
+
+// Sleep (uses MadSim's deterministic time)
+vt.sleep(Duration::from_secs(1)).await;
+
+// With MadSim, advance() is a no-op (MadSim auto-advances time)
+// Without MadSim, advance() manually steps time
+vt.advance(Duration::from_secs(1));
+```
+
+### Test Annotations
+
+All simulation tests use single-threaded tokio for better determinism:
+
+```rust
+// This is the standard test annotation for simulation tests
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+async fn my_simulation_test() {
+    // Test code here
+}
+```
+
+When compiled with MadSim:
+- `tokio::test` is intercepted by MadSim
+- Time starts paused and only advances when idle
+- Task scheduling is deterministic
+
+### Reproducing Failures
+
+When a test fails in CI, reproduce locally with the same seed:
+
+```bash
+# 1. Get the seed from CI logs (look for "MADSIM_SEED=...")
+# 2. Run locally with that seed
+RUSTFLAGS="--cfg madsim" MADSIM_SEED=<seed-from-ci> cargo test -p freenet --test sim_network <test_name> -- --nocapture
+```
+
+### Debugging Tips
+
+1. **Enable logging** to see what's happening:
+   ```bash
+   RUSTFLAGS="--cfg madsim" RUST_LOG=debug cargo test ...
+   ```
+
+2. **Set a known seed** for reproducibility:
+   ```bash
+   RUSTFLAGS="--cfg madsim" MADSIM_SEED=42 cargo test ...
+   ```
+
+3. **Check time progression** in logs for timing-related issues
+
+4. **Compare with non-MadSim** to isolate MadSim-specific behavior:
+   ```bash
+   # Without MadSim
+   cargo test -p freenet --test sim_network
+
+   # With MadSim
+   RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network
+   ```
+
+### Cargo Configuration
+
+The following configuration is already set up in `Cargo.toml`:
+
+```toml
+# Workspace Cargo.toml - patches for MadSim
+[patch.crates-io]
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git", rev = "e79a7ae" }
+quanta = { git = "https://github.com/madsim-rs/quanta.git", branch = "madsim" }
+
+# crates/core/Cargo.toml - MadSim dependencies
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+madsim-tokio = "0.2"
+
+# Lint configuration to allow madsim cfg
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+```
 
 ---
 

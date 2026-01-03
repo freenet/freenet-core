@@ -242,7 +242,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
 ///
 /// Scenario: Connect 2 peers (gateway + peer1), establish connection, then forcibly
 /// drop the peer to trigger connection errors.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
     use std::net::TcpListener;
     // Create network sockets for gateway and peer
