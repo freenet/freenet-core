@@ -32,7 +32,6 @@ use tokio_tungstenite::connect_async;
 )]
 async fn test_minimal_state_put_get(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract and create minimal state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -42,11 +41,7 @@ async fn test_minimal_state_put_get(ctx: &mut TestContext) -> TestResult {
     let wrapped_state = WrappedState::from(minimal_state);
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // PUT minimal state
@@ -92,7 +87,6 @@ async fn test_minimal_state_put_get(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_large_state_put_get(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract and create large state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -104,11 +98,7 @@ async fn test_large_state_put_get(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Testing with large state size: {} bytes", large_state.len());
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // PUT large state
@@ -159,7 +149,6 @@ async fn test_large_state_put_get(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_empty_state_put_get(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract and create empty state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -169,11 +158,7 @@ async fn test_empty_state_put_get(ctx: &mut TestContext) -> TestResult {
     let wrapped_state = WrappedState::from(empty_state);
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // PUT empty state
@@ -232,7 +217,6 @@ async fn test_empty_state_put_get(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_oversized_state_handling(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract and create oversized state (10MB+)
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -253,11 +237,7 @@ async fn test_oversized_state_handling(ctx: &mut TestContext) -> TestResult {
     );
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // Attempt PUT with oversized state
@@ -313,7 +293,6 @@ async fn test_oversized_state_handling(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_update_no_state_change(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract and create initial state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -329,11 +308,7 @@ async fn test_update_no_state_change(ctx: &mut TestContext) -> TestResult {
     let wrapped_state = WrappedState::from(initial_state);
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // First PUT the initial state
@@ -392,7 +367,6 @@ async fn test_update_no_state_change(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_state_at_boundary_size(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -429,11 +403,7 @@ async fn test_state_at_boundary_size(ctx: &mut TestContext) -> TestResult {
     );
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     // PUT boundary state
