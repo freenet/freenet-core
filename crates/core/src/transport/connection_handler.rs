@@ -784,7 +784,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // fall through to asymmetric decryption, causing spurious "decryption error"
                             // failures when symmetric packets are misrouted.
                             //
-                            // Issue #2576: Check if a connection already exists for this address.
+                            // PR #2575: Check if a connection already exists for this address.
                             // A race can occur where both inbound (gateway) and outbound (NAT traversal)
                             // connections complete for the same address. If we blindly insert, we replace
                             // the existing connection, orphaning its PeerConnection which eventually times
@@ -865,7 +865,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     direction = "outbound",
                                     "Connection established"
                                 );
-                                // Issue #2576: Check if a connection already exists for this address.
+                                // PR #2575: Check if a connection already exists for this address.
                                 // A race can occur where both inbound (gateway) and outbound (NAT traversal)
                                 // connections complete for the same address. Keep the existing one.
                                 let remote_addr = outbound_remote_conn.remote_addr;
