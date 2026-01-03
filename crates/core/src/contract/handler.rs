@@ -261,18 +261,6 @@ pub(crate) fn contract_handler_channel() -> (
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
-impl ContractHandlerChannel<WaitingResolution> {
-    pub async fn relay_transaction_result_to_client(
-        &mut self,
-    ) -> anyhow::Result<(ClientId, WaitingTransaction)> {
-        self.end
-            .wait_for_res_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("channel dropped"))
-    }
-}
-
 impl Stream for ContractHandlerChannel<WaitingResolution> {
     type Item = (ClientId, WaitingTransaction);
 

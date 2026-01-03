@@ -124,8 +124,10 @@ pub fn bench_concurrent_insert(c: &mut Criterion) {
                             };
 
                             handles.push(tokio::spawn(async move {
-                                for i in start..end {
-                                    buf.insert((i + 1) as u32, thread_frags[i].clone()).unwrap();
+                                for (idx, frag) in
+                                    thread_frags.iter().enumerate().take(end).skip(start)
+                                {
+                                    buf.insert((idx + 1) as u32, frag.clone()).unwrap();
                                 }
                             }));
                         }

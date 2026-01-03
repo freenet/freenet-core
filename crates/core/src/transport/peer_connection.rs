@@ -1423,6 +1423,33 @@ async fn packet_sending<S: super::Socket>(
     }
 }
 
+// =============================================================================
+// PeerConnectionApi implementation for type erasure
+// =============================================================================
+
+impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
+    fn remote_addr(&self) -> std::net::SocketAddr {
+        self.remote_conn.remote_addr
+    }
+
+    fn send_message(
+        &mut self,
+        msg: crate::message::NetMessage,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+    > {
+        Box::pin(async move { self.send(msg).await })
+    }
+
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<Vec<u8>, super::TransportError>> + Send + '_>,
+    > {
+        Box::pin(async move { PeerConnection::recv(self).await })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aes_gcm::KeyInit;
