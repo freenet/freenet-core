@@ -741,4 +741,71 @@ ws-api-port = 8080
         let config = "mode = \"network\"";
         assert_eq!(parse_ws_port_from_config(config), None);
     }
+
+    #[test]
+    fn test_find_log_files_patterns() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Create test files matching different log patterns
+        fs::write(log_dir.join("freenet.log"), "legacy").unwrap();
+        fs::write(log_dir.join("freenet.2025-12-26.log"), "daily").unwrap();
+        fs::write(log_dir.join("freenet.2025-12-26-14.log"), "hourly").unwrap();
+        fs::write(log_dir.join("freenet.error.log"), "error legacy").unwrap();
+        fs::write(
+            log_dir.join("freenet.error.2025-12-26-14.log"),
+            "error hourly",
+        )
+        .unwrap();
+        fs::write(log_dir.join("other.log"), "unrelated").unwrap();
+
+        // Test finding main log files
+        let main_files = find_log_files(&log_dir, "freenet");
+        let main_names: Vec<_> = main_files
+            .iter()
+            .filter_map(|p| p.file_name())
+            .filter_map(|n| n.to_str())
+            .collect();
+
+        assert!(
+            main_names.contains(&"freenet.log"),
+            "Should find legacy format"
+        );
+        assert!(
+            main_names.contains(&"freenet.2025-12-26.log"),
+            "Should find daily format"
+        );
+        assert!(
+            main_names.contains(&"freenet.2025-12-26-14.log"),
+            "Should find hourly format"
+        );
+        assert!(
+            !main_names.iter().any(|n| n.contains("error")),
+            "Should not match error logs with 'freenet' prefix"
+        );
+        assert!(
+            !main_names.contains(&"other.log"),
+            "Should not match unrelated files"
+        );
+
+        // Test finding error log files
+        let error_files = find_log_files(&log_dir, "freenet.error");
+        let error_names: Vec<_> = error_files
+            .iter()
+            .filter_map(|p| p.file_name())
+            .filter_map(|n| n.to_str())
+            .collect();
+
+        assert!(
+            error_names.contains(&"freenet.error.log"),
+            "Should find error legacy format"
+        );
+        assert!(
+            error_names.contains(&"freenet.error.2025-12-26-14.log"),
+            "Should find error hourly format"
+        );
+    }
 }
