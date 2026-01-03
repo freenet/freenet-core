@@ -6,6 +6,13 @@ use std::{
 
 use dashmap::DashMap;
 
+/// Interval for sending WebSocket ping frames to keep connection alive.
+/// Idle TCP connections may be closed by the OS, browser, or intermediate
+/// proxies after extended periods of inactivity. 30 seconds is a safe
+/// interval that prevents most idle timeouts while not creating excessive
+/// overhead.
+const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -385,6 +392,12 @@ async fn websocket_interface(
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+
+    // Create ping interval to keep connection alive and prevent idle timeout
+    let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
+    // Don't send ping immediately on connection, wait for first interval
+    ping_interval.tick().await;
+
     loop {
         let contract_updates_cp = contract_updates.clone();
         let listeners_task = async move {
@@ -497,6 +510,23 @@ async fn websocket_interface(
                 server_sink.send(Message::Binary(serialized_res.into())).await.inspect_err(|err| {
                     tracing::debug!(err = %err, "error sending message to client");
                 })?;
+            }
+            // Send periodic pings to keep connection alive and prevent idle timeout
+            _ = ping_interval.tick() => {
+                tracing::trace!(%client_id, "sending WebSocket ping to keep connection alive");
+                if let Err(err) = server_sink.send(Message::Ping(vec![].into())).await {
+                    tracing::debug!(%client_id, %err, "failed to send ping, connection may be dead");
+                    // Connection is likely dead, clean up and exit
+                    let _ = request_sender
+                        .send(ClientConnection::Request {
+                            client_id,
+                            req: Box::new(ClientRequest::Disconnect { cause: None }),
+                            auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+                            attested_contract: auth_token.as_ref().map(|t| t.1),
+                        })
+                        .await;
+                    return Err(err.into());
+                }
             }
         }
     }
