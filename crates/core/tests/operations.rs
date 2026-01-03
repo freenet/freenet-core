@@ -282,8 +282,7 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A's websocket API
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
@@ -329,9 +328,7 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
 
     {
         // Connect to node B's websocket API
-        let uri = format!(
-            "ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native"
-        );
+        let uri = gateway.ws_url();
         let (stream, _) = connect_async(&uri).await?;
         let mut client_api_b = WebApi::start(stream);
 
@@ -381,7 +378,6 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 
     let peer_a = ctx.node("peer-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port = peer_a.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Node A (peer-a) data dir: {:?}", peer_a.temp_dir_path);
@@ -391,7 +387,7 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A websocket API
-    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
@@ -576,8 +572,6 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 
     let peer_a = ctx.node("peer-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_peer_a = peer_a.ws_port;
-    let ws_api_port_peer_b = gateway.ws_port;
 
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
@@ -586,8 +580,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A's websocket API
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
@@ -642,8 +635,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     // The key test: GET from gateway to verify it persisted the merged state
     // This is the bug from issue #1995 - gateway receives PUT for already-cached
     // contract, merges state, but doesn't persist it
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native");
+    let uri = gateway.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_gateway = WebApi::start(stream);
 
@@ -735,8 +727,6 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     let node_a = ctx.node("node-a")?;
     let node_b = ctx.node("node-b")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_a = node_a.ws_port;
-    let ws_api_port_b = node_b.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
@@ -749,8 +739,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     // Connect first client to node A's websocket API
     tracing::info!("Starting WebSocket connections after 40s startup wait");
     let start_time = std::time::Instant::now();
-    let uri_a =
-        format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
+    let uri_a = node_a.ws_url();
     let (stream1, _) = connect_async(&uri_a).await?;
     let mut client_api1_node_a = WebApi::start(stream1);
 
@@ -758,10 +747,9 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     let (stream2, _) = connect_async(&uri_a).await?;
     let mut client_api2_node_a = WebApi::start(stream2);
 
-    // Connect third client to node C's websocket API (different node)
-    let uri_c =
-        format!("ws://127.0.0.1:{ws_api_port_b}/v1/contract/command?encodingProtocol=native");
-    let (stream3, _) = connect_async(&uri_c).await?;
+    // Connect third client to node B's websocket API (different node)
+    let uri_b = node_b.ws_url();
+    let (stream3, _) = connect_async(&uri_b).await?;
     let mut client_api_node_b = WebApi::start(stream3);
 
     // First client puts contract with initial state (without subscribing)
@@ -1320,7 +1308,6 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
     let node_a = ctx.node("node-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_a = node_a.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
@@ -1330,8 +1317,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect first client to node A's websocket API (for putting the contract)
-    let uri_a =
-        format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
+    let uri_a = node_a.ws_url();
     let (stream1, _) = connect_async(&uri_a).await?;
     let mut client_api1_node_a = WebApi::start(stream1);
 
@@ -1567,7 +1553,6 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
     let node_a = ctx.node("node-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_a = node_a.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
@@ -1577,8 +1562,7 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect first client to node A's websocket API (for putting with auto-subscribe)
-    let uri_a =
-        format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
+    let uri_a = node_a.ws_url();
     let (stream1, _) = connect_async(&uri_a).await?;
     let mut client_api1 = WebApi::start(stream1);
 
@@ -1998,7 +1982,6 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
 
     let client_node = ctx.node("client-node")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_client = client_node.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Client node data dir: {:?}", client_node.temp_dir_path);
@@ -2008,8 +1991,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to the client node's WebSocket API
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native");
+    let uri = client_node.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client = WebApi::start(stream);
 
@@ -2229,10 +2211,7 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     );
 
     // Connect to peer A's WebSocket API
-    let uri_a = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer_a.ws_port
-    );
+    let uri_a = peer_a.ws_url();
     let (stream_a, _) = connect_async(&uri_a).await?;
     let mut client_api_a = WebApi::start(stream_a);
 
@@ -2247,10 +2226,7 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     .await?;
 
     // Verify contract can be retrieved from peer C
-    let uri_c = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer_c.ws_port
-    );
+    let uri_c = peer_c.ws_url();
     let (stream_c, _) = connect_async(&uri_c).await?;
     let mut client_api_c = WebApi::start(stream_c);
     // Allow routing to settle and retry GET a few times to deflake under CI load.
@@ -2294,10 +2270,7 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     // sometimes doesn't reach the client. This appears to be a race condition
     // in the GET response routing. The retry logic here is a workaround until
     // the root cause is identified (see CI logs for transaction flow).
-    let uri_b = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri_b = gateway.ws_url();
     let (stream_b, _) = connect_async(&uri_b).await?;
     let mut client_api_b = WebApi::start(stream_b);
 
@@ -2824,8 +2797,6 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
 
     let gateway = ctx.node("gateway")?;
     let peer_node = ctx.node("peer-node")?;
-    let ws_api_port_gw = gateway.ws_port;
-    let ws_api_port_node = peer_node.ws_port;
 
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
     tracing::info!("Node data dir: {:?}", peer_node.temp_dir_path);
@@ -2834,14 +2805,12 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to gateway websocket API
-    let uri_gw =
-        format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
     // Connect to node websocket API
-    let uri_node =
-        format!("ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native");
+    let uri_node = peer_node.ws_url();
     let (stream_node, _) = connect_async(&uri_node).await?;
     let _client_node = WebApi::start(stream_node);
 
@@ -2910,7 +2879,6 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 
     let peer_a = ctx.node("peer-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port = peer_a.ws_port;
 
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
@@ -2920,7 +2888,7 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A websocket API
-    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
@@ -3021,8 +2989,6 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 
     let peer_a = ctx.node("peer-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_peer_a = peer_a.ws_port;
-    let ws_api_port_gateway = gateway.ws_port;
 
     tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
@@ -3032,14 +2998,12 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
-    let uri_peer_a =
-        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let uri_peer_a = peer_a.ws_url();
     let (stream_a, _) = connect_async(&uri_peer_a).await?;
     let mut client_peer_a = WebApi::start(stream_a);
 
     // Connect to gateway's websocket API
-    let uri_gateway =
-        format!("ws://127.0.0.1:{ws_api_port_gateway}/v1/contract/command?encodingProtocol=native");
+    let uri_gateway = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gateway).await?;
     let mut client_gateway = WebApi::start(stream_gw);
 
@@ -3293,7 +3257,7 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Connect to peer-a's websocket API
-    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api = WebApi::start(stream);
 
@@ -3416,17 +3380,11 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let uri_gw = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri_a = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer_a.ws_port
-    );
+    let uri_a = peer_a.ws_url();
     let (stream_a, _) = connect_async(&uri_a).await?;
     let mut client_a = WebApi::start(stream_a);
 
@@ -3702,10 +3660,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect gateway client
-    let uri_gw = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
@@ -3734,10 +3689,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
     }
 
     // Step 2: Connect two clients on peer-a and subscribe both
-    let uri_a = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer_a.ws_port
-    );
+    let uri_a = peer_a.ws_url();
     let (stream_a1, _) = connect_async(&uri_a).await?;
     let mut client_a1 = WebApi::start(stream_a1);
 
@@ -3997,17 +3949,11 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect clients
-    let uri_gw = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri_a = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer_a.ws_port
-    );
+    let uri_a = peer_a.ws_url();
     let (stream_a, _) = connect_async(&uri_a).await?;
     let mut client_a = WebApi::start(stream_a);
 
@@ -4263,10 +4209,7 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Connect to gateway's websocket API
-    let uri = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri = gateway.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api = WebApi::start(stream);
 
@@ -4386,8 +4329,6 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
 
     let peer_a = ctx.node("peer-a")?;
     let gateway = ctx.node("gateway")?;
-    let ws_api_port_peer_a = peer_a.ws_port;
-    let ws_api_port_gateway = gateway.ws_port;
 
     tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
@@ -4396,14 +4337,12 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
-    let uri_peer_a =
-        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let uri_peer_a = peer_a.ws_url();
     let (stream_a, _) = connect_async(&uri_peer_a).await?;
     let mut client_peer_a = WebApi::start(stream_a);
 
     // Connect to gateway's websocket API
-    let uri_gateway =
-        format!("ws://127.0.0.1:{ws_api_port_gateway}/v1/contract/command?encodingProtocol=native");
+    let uri_gateway = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gateway).await?;
     let mut client_gateway = WebApi::start(stream_gw);
 

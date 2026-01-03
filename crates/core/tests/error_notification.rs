@@ -49,14 +49,9 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 )]
 async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     info!("Testing GET operation for non-existent contract (should fail with error)");
@@ -116,14 +111,9 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     info!("Testing PUT operation with invalid contract (should fail with error)");
@@ -191,14 +181,9 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
 )]
 async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     info!("Testing UPDATE operation for non-existent contract (should fail with error)");

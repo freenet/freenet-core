@@ -7649,7 +7649,7 @@ mod tests {
 
                 // Simulate LEDBAT++ cwnd calculation with worst-case GAIN
                 let gain = 1.0;  // Maximum GAIN
-                let bytes_acked = current_cwnd as f64;  // Full window ACKed
+                let bytes_acked = current_cwnd;  // Full window ACKed
 
                 let cwnd_change = gain * (off_target / target_ms) * bytes_acked * (MSS as f64)
                     / current_cwnd;
