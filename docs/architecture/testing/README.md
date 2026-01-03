@@ -6,9 +6,32 @@ This directory contains documentation for Freenet Core's testing strategies and 
 
 | Document | Description |
 |----------|-------------|
-| [testing-matrix.md](testing-matrix.md) | Comprehensive matrix of all testing approaches, what they cover, and gaps |
+| [testing-matrix.md](testing-matrix.md) | Comprehensive matrix of all testing approaches, coverage gaps, and paradigm analysis |
 | [simulation-testing.md](simulation-testing.md) | SimNetwork architecture and deterministic simulation |
 | [simulation-testing-design.md](simulation-testing-design.md) | Design philosophy and roadmap for simulation testing |
+
+## Testing Paradigms
+
+We currently use these testing paradigms:
+
+| Paradigm | Status | Coverage |
+|----------|--------|----------|
+| Unit Testing | ✅ Mature | ~1,000 tests |
+| Integration Testing | ✅ Mature | ~80 tests |
+| Mock-based Testing | ✅ Mature | Extensive |
+| Simulation Testing | ✅ Mature | SimNetwork |
+| Property-based Testing | ⚠️ Limited | LEDBAT only |
+| Fuzz Testing | ⚠️ Underused | Infrastructure exists |
+
+Paradigms we should adopt (see [testing-matrix.md](testing-matrix.md#testing-paradigms-current-vs-potential) for details):
+
+| Paradigm | Priority | Effort |
+|----------|----------|--------|
+| Mutation Testing | High | Low |
+| Contract Fuzzing | High | Low |
+| Expanded Property Testing | High | Medium |
+| Snapshot Testing | Medium | Low |
+| Deterministic Simulation | Medium | High |
 
 ## Quick Reference: Which Testing Approach to Use
 
