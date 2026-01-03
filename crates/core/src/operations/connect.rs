@@ -103,6 +103,7 @@ use tokio::task::{self, JoinHandle};
 use either::Either;
 
 use crate::client_events::HostResult;
+use crate::config::GlobalExecutor;
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
@@ -1219,7 +1220,7 @@ impl Operation for ConnectOp {
                             // to log the outcome.
                             let tx_id = self.id;
                             let peer_clone = peer.clone();
-                            tokio::spawn(async move {
+                            GlobalExecutor::spawn(async move {
                                 if let Some(result) = rx.recv().await {
                                     match result {
                                         Ok((connected_peer, _)) => {

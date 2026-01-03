@@ -722,7 +722,7 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
-                                    tokio::spawn(async move {
+                                    GlobalExecutor::spawn(async move {
                                         match timeout(Duration::from_secs(20), result.recv()).await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
@@ -2421,7 +2421,7 @@ impl P2pConnManager {
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
             // Yield to allow the spawned peer_connection_listener task to start.
@@ -2573,7 +2573,7 @@ impl P2pConnManager {
                                 if ring.mark_subscription_pending(contract) {
                                     let op_manager = self.bridge.op_manager.clone();
                                     let contract_key = contract;
-                                    tokio::spawn(async move {
+                                    GlobalExecutor::spawn(async move {
                                         // Guard ensures complete_subscription_request is called
                                         // even if the task panics
                                         let guard = SubscriptionRecoveryGuard::new(
@@ -2624,7 +2624,7 @@ impl P2pConnManager {
                 let ttl = connection_manager.transient_ttl();
                 let drop_tx = self.bridge.ev_listener_tx.clone();
                 let cm = connection_manager.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     sleep(ttl).await;
                     if cm.drop_transient(peer_addr).is_some() {
                         tracing::info!(%peer_addr, "Transient connection expired; dropping");

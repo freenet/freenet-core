@@ -374,7 +374,7 @@ impl Ring {
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
 
-                    tokio::spawn(async move {
+                    GlobalExecutor::spawn(async move {
                         // Guard ensures complete_subscription_request is called even on panic
                         let guard =
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);

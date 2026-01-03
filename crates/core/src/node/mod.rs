@@ -36,7 +36,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, WebsocketApiConfig},
+    config::{Address, GlobalExecutor, GatewayConfig, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -538,7 +538,7 @@ async fn report_result(
 
                     // Spawn fire-and-forget task to avoid blocking report_result()
                     // while still guaranteeing message delivery
-                    tokio::spawn(async move {
+                    GlobalExecutor::spawn(async move {
                         if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
                             tracing::error!(
                                 "CRITICAL: Result router channel closed - dual-path delivery broken. \
@@ -1078,7 +1078,7 @@ where
                                         let contract_key = *contract;
                                         if op_manager.ring.mark_subscription_pending(contract_key) {
                                             let op_manager_clone = op_manager.clone();
-                                            tokio::spawn(async move {
+                                            GlobalExecutor::spawn(async move {
                                                 let instance_id = *contract_key.id();
                                                 let sub_op = crate::operations::subscribe::start_op(
                                                     instance_id,

@@ -162,7 +162,7 @@ impl NodeP2P {
         let aggressive_conn_task = if self.should_try_connect {
             let op_manager = self.op_manager.clone();
             let min_connections = op_manager.ring.connection_manager.min_connections;
-            Some(tokio::spawn(async move {
+            Some(GlobalExecutor::spawn(async move {
                 Self::aggressive_initial_connections_impl(&op_manager, min_connections).await;
             }))
         } else {

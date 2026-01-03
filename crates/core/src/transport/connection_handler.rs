@@ -6,7 +6,8 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::PCK_VERSION;
+use crate::config::{GlobalExecutor, PCK_VERSION};
+use crate::transport::crypto::intro_packet_size;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::symmetric_message::OutboundConnection;
@@ -738,7 +739,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
-                                let task = tokio::spawn(gw_ongoing_connection
+                                let task = GlobalExecutor::spawn(gw_ongoing_connection
                                     .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                     .map_err(move |error| {
                                         tracing::warn!(
@@ -991,7 +992,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         remote_public_key.clone(),
                     );
                     self.expected_non_gateway.insert(remote_addr.ip());
-                    let task = tokio::spawn(ongoing_connection
+                    let task = GlobalExecutor::spawn(ongoing_connection
                         .map_err(move |err| (err, remote_addr))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
                     );
