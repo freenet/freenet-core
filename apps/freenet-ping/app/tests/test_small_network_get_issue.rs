@@ -312,7 +312,7 @@ async fn test_small_network_get_failure() -> TestResult {
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: *contract_key.id(),
-                return_contract_code: true,  // Same as first GET for consistency
+                return_contract_code: true, // Same as first GET for consistency
                 subscribe: false,
             }))
             .await?;
