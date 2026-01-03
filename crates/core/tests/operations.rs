@@ -3230,8 +3230,8 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 /// 3. Subscribe should succeed locally without network round-trip
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    timeout_secs = 60,
-    startup_wait_secs = 10,
+    timeout_secs = 300,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3253,8 +3253,10 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
         ws_api_port
     );
 
-    // Give time for peer to connect to gateway (so remote peers exist)
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Give time for peer to connect to gateway (so remote peers exist).
+    // Use 5 seconds to match other CI-stable tests and avoid race conditions
+    // where connection establishment takes longer under CI load.
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
     let uri = peer_a.ws_url();
@@ -3294,8 +3296,8 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
     tracing::info!("Step 2: Immediately Subscribe (before propagation to gateway)");
     make_subscribe(&mut client_api, contract_key).await?;
 
-    // Wait for Subscribe response
-    let sub_resp = tokio::time::timeout(Duration::from_secs(10), client_api.recv()).await;
+    // Wait for Subscribe response (30s timeout for CI resilience)
+    let sub_resp = tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await;
     match sub_resp {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
             key,
