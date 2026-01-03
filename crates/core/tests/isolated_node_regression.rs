@@ -34,7 +34,6 @@ use tracing::info;
 )]
 async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load test contract and state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -44,11 +43,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
     let wrapped_state = WrappedState::from(initial_state);
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     info!("Step 1: Performing PUT operation to cache contract locally");
@@ -154,7 +149,6 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
 )]
 async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load a small test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -163,19 +157,14 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
     let initial_state = freenet::test_utils::create_empty_todo_list();
     let wrapped_state = WrappedState::from(initial_state);
 
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-
     // Connect multiple clients
-    let (ws_stream1, _) = connect_async(&url).await?;
+    let (ws_stream1, _) = connect_async(&gateway.ws_url()).await?;
     let mut client1 = WebApi::start(ws_stream1);
 
-    let (ws_stream2, _) = connect_async(&url).await?;
+    let (ws_stream2, _) = connect_async(&gateway.ws_url()).await?;
     let mut client2 = WebApi::start(ws_stream2);
 
-    let (ws_stream3, _) = connect_async(&url).await?;
+    let (ws_stream3, _) = connect_async(&gateway.ws_url()).await?;
     let mut client3 = WebApi::start(ws_stream3);
 
     info!("Step 1: PUT contract to cache it locally");
@@ -302,7 +291,6 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
 )]
 async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load test contract and state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -312,15 +300,11 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
     let wrapped_state = WrappedState::from(initial_state);
 
     // Connect first client to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream1, _) = connect_async(&url).await?;
+    let (ws_stream1, _) = connect_async(&gateway.ws_url()).await?;
     let mut client1 = WebApi::start(ws_stream1);
 
     // Connect second client to test that subscriptions work for multiple clients
-    let (ws_stream2, _) = connect_async(&url).await?;
+    let (ws_stream2, _) = connect_async(&gateway.ws_url()).await?;
     let mut client2 = WebApi::start(ws_stream2);
 
     info!("Step 1: Performing PUT operation to cache contract locally");
@@ -446,7 +430,6 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
 )]
 async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
-    let ws_port = gateway.ws_port;
 
     // Load test contract and state
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -456,11 +439,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
     let wrapped_initial_state = WrappedState::from(initial_state);
 
     // Connect to the node
-    let url = format!(
-        "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
     let mut client = WebApi::start(ws_stream);
 
     info!("Step 1: Performing PUT operation to cache contract locally");
