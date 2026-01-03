@@ -213,7 +213,98 @@ sim.run().unwrap();
 **Effort:** 2-3 weeks for prototype, ongoing maintenance
 **Determinism achieved:** ~95%
 
-### Option D: Custom Deterministic Executor (High Effort, Full Determinism)
+### Option D: GlobalExecutor Abstraction + MadSim (Recommended)
+
+**Current State:**
+```
+GlobalExecutor::spawn usage:  27 calls in 10 files (18%)
+Direct tokio::spawn usage:   119 calls in 31 files (82%)
+```
+
+**Key Insight:** `GlobalExecutor::spawn` already exists as an abstraction point. By:
+1. Making it the canonical spawn method
+2. Adding a feature flag to swap implementations
+3. Using MadSim's package substitution approach
+
+We can achieve high determinism with incremental effort.
+
+**MadSim Approach:**
+
+[MadSim](https://github.com/madsim-rs/madsim) provides drop-in tokio replacement via Cargo:
+
+```toml
+# Normal builds use real tokio
+[dependencies]
+tokio = "1.0"
+
+# Simulation builds swap to madsim-tokio
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "1.0", package = "madsim-tokio" }
+
+[target.'cfg(madsim)'.patch.crates-io]
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git" }
+```
+
+Run with: `RUSTFLAGS="--cfg madsim" cargo test`
+
+**Required Changes for Freenet:**
+
+1. **Canonicalize GlobalExecutor::spawn** (migrate 119 → 0 direct tokio::spawn):
+
+```rust
+// Current GlobalExecutor (just wraps tokio)
+pub struct GlobalExecutor;
+
+impl GlobalExecutor {
+    pub fn spawn<R: Send + 'static>(
+        f: impl Future<Output = R> + Send + 'static,
+    ) -> tokio::task::JoinHandle<R> {
+        tokio::runtime::Handle::current().spawn(f)
+    }
+}
+```
+
+No changes needed to GlobalExecutor itself—MadSim swaps tokio at the package level.
+
+2. **Migrate direct spawns** (119 calls across 31 files):
+
+| Category | Files | Calls | Effort |
+|----------|-------|-------|--------|
+| Transport | 10 files | 62 | 2-3 days |
+| Client Events | 4 files | 15 | 1 day |
+| Node/Bridge | 6 files | 24 | 1-2 days |
+| Operations | 4 files | 4 | 0.5 day |
+| Other | 7 files | 14 | 1 day |
+
+3. **Add madsim dependencies**:
+```toml
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+tokio = { version = "1.0", package = "madsim-tokio" }
+
+[target.'cfg(madsim)'.patch.crates-io]
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git" }
+quanta = { git = "https://github.com/madsim-rs/quanta.git" }
+```
+
+**Alternative: Diviner**
+
+[Diviner](https://github.com/xxuejie/diviner) is a FoundationDB-style executor requiring wrapper types:
+
+```rust
+// Diviner requires explicit wrapper types
+use diviner::time::sleep;  // Not tokio::time::sleep
+use diviner::net::TcpListener;  // Not tokio::net::TcpListener
+```
+
+More invasive than MadSim but provides finer control.
+
+**Effort:** 1-2 weeks (primarily mechanical migration)
+**Determinism achieved:** ~95%
+
+---
+
+### Option E: Custom Deterministic Executor (High Effort, Full Determinism)
 
 **Design (FoundationDB-style):**
 ```rust
@@ -303,28 +394,46 @@ async fn test_with_better_determinism() {
 | Replace executor timeouts | 2-3 days | 2 contract files |
 | Integration tests | 3-5 days | New test files |
 
-### Phase 3: Full Determinism (Optional, 4-6 weeks)
+### Phase 3: GlobalExecutor Canonicalization + MadSim (Recommended, 1-2 weeks)
 
-Only if Phase 1-2 insufficient:
+**This is the recommended approach** - achieves ~95% determinism with primarily mechanical changes.
 
 | Task | Effort | Notes |
 |------|--------|-------|
-| Evaluate turmoil vs custom | 1 week | Research spike |
-| Prototype chosen approach | 2 weeks | Core infrastructure |
-| Full integration | 2-3 weeks | Node + transport |
-| Testing & validation | 1 week | Verify determinism |
+| Migrate transport spawns to GlobalExecutor | 2-3 days | 62 calls in 10 files |
+| Migrate client_events spawns | 1 day | 15 calls in 4 files |
+| Migrate node/bridge spawns | 1-2 days | 24 calls in 6 files |
+| Migrate remaining spawns | 1.5 days | 18 calls in 11 files |
+| Add MadSim Cargo configuration | 0.5 day | Cargo.toml changes |
+| Validation with seeded tests | 1-2 days | Verify reproducibility |
+
+**Why MadSim over alternatives:**
+- Drop-in tokio replacement (no API changes needed)
+- Used in production by RisingWave
+- Package substitution via Cargo (no code changes after spawn migration)
+- Patches getrandom/quanta for full determinism
+
+### Phase 4: Full Determinism (Optional, 4-6 weeks)
+
+Only if Phase 3 insufficient:
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Custom deterministic executor | 4-6 weeks | FoundationDB-style |
+| Deterministic channel shims | 1-2 weeks | Replace tokio::sync |
+| Full replay infrastructure | 1 week | Recording + playback |
 
 ---
 
 ## Current vs Target Determinism
 
-| Aspect | Current | Phase 1 | Phase 2 | Phase 3 |
-|--------|---------|---------|---------|---------|
-| Task scheduling | ❌ Multi-thread | ✅ Single-thread | ✅ Single-thread | ✅ Custom executor |
-| Time control | ⚠️ Partial | ✅ Paused | ✅ VirtualTime | ✅ VirtualTime |
-| Message order | ❌ Random | ⚠️ Better | ✅ Scheduled | ✅ Deterministic |
-| RNG | ✅ Seeded | ✅ Seeded | ✅ Seeded | ✅ Seeded |
-| **Reproducibility** | ~40% | ~70% | ~90% | ~99% |
+| Aspect | Current | Phase 1 | Phase 2 | Phase 3 (MadSim) | Phase 4 |
+|--------|---------|---------|---------|------------------|---------|
+| Task scheduling | ❌ Multi-thread | ✅ Single-thread | ✅ Single-thread | ✅ MadSim executor | ✅ Custom executor |
+| Time control | ⚠️ Partial | ✅ Paused | ✅ VirtualTime | ✅ MadSim time | ✅ VirtualTime |
+| Message order | ❌ Random | ⚠️ Better | ✅ Scheduled | ✅ MadSim channels | ✅ Deterministic |
+| RNG | ✅ Seeded | ✅ Seeded | ✅ Seeded | ✅ Patched getrandom | ✅ Seeded |
+| **Reproducibility** | ~40% | ~70% | ~90% | ~95% | ~99% |
 
 ---
 
@@ -340,16 +449,45 @@ Only if Phase 1-2 insufficient:
 - Message delivery order matters for correctness
 - Transport layer bugs need deterministic reproduction
 
-**Proceed to Phase 3 if:**
-- Phase 2 insufficient for bug reproduction
+**Proceed to Phase 3 (MadSim - Recommended) if:**
+- Want ~95% determinism with minimal code changes
+- Need production-proven framework (used by RisingWave)
+- Team can invest 1-2 weeks for spawn migration
+
+**Proceed to Phase 4 if:**
+- Phase 3 insufficient for bug reproduction
 - Need Jepsen-style formal verification
-- Team has capacity for infrastructure investment
+- Need 99%+ reproducibility guarantee
+
+---
+
+## Framework Comparison (2025)
+
+| Framework | Approach | Effort | Production Use | Determinism |
+|-----------|----------|--------|----------------|-------------|
+| [MadSim](https://github.com/madsim-rs/madsim) | Tokio package swap | Low | RisingWave | ~95% |
+| [Turmoil](https://github.com/tokio-rs/turmoil) | Tokio host simulation | Medium | Experimental | ~95% |
+| [Diviner](https://github.com/xxuejie/diviner) | Custom executor + wrappers | High | CKB | ~99% |
+| Custom | FoundationDB-style | Very High | N/A | ~99%+ |
+
+**MadSim is recommended** because:
+1. Minimal code changes (package substitution, not API changes)
+2. Battle-tested in RisingWave (distributed streaming database)
+3. Patches getrandom/quanta for true reproducibility
+4. Existing `GlobalExecutor::spawn` abstraction makes migration straightforward
 
 ---
 
 ## References
 
+### Frameworks
+- [MadSim](https://github.com/madsim-rs/madsim) - Recommended: Drop-in tokio replacement with simulation mode
+- [Diviner](https://github.com/xxuejie/diviner) - FoundationDB-style deterministic testing for Rust
+- [Turmoil](https://github.com/tokio-rs/turmoil) - Tokio's experimental deterministic network simulation
+- [ODEM-rs](https://lib.rs/crates/odem-rs) - Object-based discrete-event modeling
+
+### Articles
 - [FoundationDB Testing](https://apple.github.io/foundationdb/testing.html) - Gold standard for deterministic simulation
-- [Turmoil](https://github.com/tokio-rs/turmoil) - Tokio's deterministic network simulation
-- [MadSim](https://github.com/madsim-rs/madsim) - Alternative with libc overrides
-- [Deterministic Simulation Testing](https://notes.eatonphil.com/2024-08-20-deterministic-simulation-testing.html) - Overview article
+- [S2: Deterministic Simulation Testing](https://s2.dev/blog/dst) - Practical DST implementation (2025)
+- [Polar Signals: DST in Rust](https://www.polarsignals.com/blog/posts/2025/07/08/dst-rust) - State machine approach (2025)
+- [Deterministic Simulation Testing Overview](https://notes.eatonphil.com/2024-08-20-deterministic-simulation-testing.html) - Phil Eaton's overview
