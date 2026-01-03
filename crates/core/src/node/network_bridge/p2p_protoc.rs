@@ -542,6 +542,10 @@ impl P2pConnManager {
             message_processor,
         };
 
+        // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)
+        // vs unexpected stream end
+        let mut graceful_shutdown = false;
+
         while let Some(result) = select_stream.as_mut().next().await {
             // Process the result using the existing handler
             let event = ctx
@@ -942,6 +946,7 @@ impl P2pConnManager {
                                         phase = "shutdown",
                                         "Cleanup complete - exiting event loop"
                                     );
+                                    graceful_shutdown = true;
                                     break;
                                 }
                             }
@@ -1579,6 +1584,7 @@ impl P2pConnManager {
                                     phase = "shutdown",
                                     "Disconnecting from network"
                                 );
+                                graceful_shutdown = true;
                                 break;
                             }
                             NodeEvent::ClientDisconnected { client_id } => {
@@ -1595,7 +1601,13 @@ impl P2pConnManager {
                 }
             }
         }
-        Err(anyhow::anyhow!("Network event stream ended unexpectedly"))
+        if graceful_shutdown {
+            // Return a specific error that callers can identify as graceful shutdown
+            // (The return type is Infallible, so we can't return Ok here)
+            Err(anyhow::anyhow!("Graceful shutdown"))
+        } else {
+            Err(anyhow::anyhow!("Network event stream ended unexpectedly"))
+        }
     }
 
     /// Process a SelectResult from the priority select stream

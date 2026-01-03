@@ -31,7 +31,8 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
-    let mut stream = simulated_network.event_chain(events, None);
+    // Use Option so we can drop the stream when events complete, signaling peers to disconnect
+    let mut stream = Some(simulated_network.event_chain(events, None));
 
     // Track whether events completed normally
     let mut events_completed = false;
@@ -57,7 +58,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
                 tracing::info!("Received Ctrl+C, shutting down...");
                 break;
             }
-            event = stream.next() => {
+            event = async {
+                match stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await, // Never resolves once stream is dropped
+                }
+            } => {
                 match event {
                     Some(_event_id) => {
                         tokio::time::sleep(next_event_wait_time).await;
@@ -65,7 +71,11 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
                     None => {
                         tracing::info!("All {} events generated successfully", events);
                         events_completed = true;
-                        // Continue to wait for peer tasks or ctrl+c
+                        // Drop the stream to release the watch::Sender, which signals
+                        // peers to disconnect. Without this, peers wait forever for
+                        // more events and never exit their event loops.
+                        stream = None;
+                        // Continue to wait for peer tasks to finalize
                     }
                 }
             }
@@ -85,7 +95,7 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         }
     }
 
-    // Drop the stream to release the borrow on simulated_network
+    // Drop the stream to release the borrow on simulated_network (if not already dropped)
     drop(stream);
 
     // Now we can perform verification since we still have access to simulated_network

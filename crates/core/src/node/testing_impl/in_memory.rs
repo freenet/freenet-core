@@ -155,8 +155,13 @@ impl<ER> Builder<ER> {
         }
 
         // Convert Infallible to () for test compatibility
+        // Graceful shutdown is treated as success in testing
         match result {
             Ok(_infallible) => Ok(()),
+            Err(e) if e.to_string() == "Graceful shutdown" => {
+                tracing::info!("Node exited via graceful shutdown");
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -296,8 +301,13 @@ impl<ER> Builder<ER> {
         }
 
         // Convert Infallible to () for test compatibility
+        // Graceful shutdown is treated as success in testing
         match result {
             Ok(_infallible) => Ok(()),
+            Err(e) if e.to_string() == "Graceful shutdown" => {
+                tracing::info!("Node exited via graceful shutdown");
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
