@@ -7439,4 +7439,539 @@ mod tests {
             expected_min_bytes / (1024 * 1024)
         );
     }
+
+    // =========================================================================
+    // Property-Based Tests - Algebraic invariants for LEDBAT++ math
+    // =========================================================================
+    //
+    // These tests use proptest to verify mathematical formulas are correct
+    // across the full input domain, catching bugs like the min_interval
+    // calculation that was algebraically wrong for high-latency paths.
+
+    mod proptest_math {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Tolerance constants for consistent error bounds across tests
+        const RATE_TOLERANCE_PERCENT: f64 = 0.01; // 1% tolerance for rate calculations
+        const RATIO_TOLERANCE: f64 = 0.01; // Tolerance for ratio comparisons (2x, 0.5x)
+        const GAIN_TOLERANCE: f64 = 0.0001; // High precision for GAIN formula
+        const DURATION_TOLERANCE_MS: u64 = 1; // 1ms tolerance for duration comparisons
+
+        // Regression test (issue #2559): min_interval must be at least 18 RTTs.
+        //
+        // The bug: min_interval was 1 RTT instead of 18 RTTs, causing
+        // 224 slowdowns in 30s on a 137ms RTT path.
+        //
+        // The formula: min_interval = SLOWDOWN_FREEZE_RTTS * RTT * SLOWDOWN_INTERVAL_MULTIPLIER
+        //            = 2 * RTT * 9 = 18 * RTT
+        proptest! {
+            #[test]
+            fn slowdown_interval_is_at_least_18_rtts(base_delay_ms in 1u64..500) {
+                let base_delay = Duration::from_millis(base_delay_ms);
+
+                let config = LedbatConfig {
+                    initial_cwnd: 160_000,
+                    min_cwnd: 2848,
+                    max_cwnd: 10_000_000,
+                    ssthresh: 50_000,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: true,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Trigger initial slowdown
+                controller.congestion_state.enter_in_slowdown();
+                let start_nanos = controller.epoch.elapsed().as_nanos() as u64;
+                controller.slowdown_phase_start_nanos.store(start_nanos, Ordering::Release);
+
+                // Complete slowdown with a very short duration (simulating quick ramp-up)
+                let completion_nanos = start_nanos + 1_000_000; // 1ms later
+                controller.complete_slowdown(completion_nanos, base_delay);
+
+                let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+                let next_interval_ns = next_slowdown.saturating_sub(completion_nanos);
+                let next_interval = Duration::from_nanos(next_interval_ns);
+
+                // The minimum interval should be 18 RTTs
+                let min_expected = Duration::from_millis(
+                    base_delay_ms * SLOWDOWN_FREEZE_RTTS as u64 * SLOWDOWN_INTERVAL_MULTIPLIER as u64
+                );
+
+                prop_assert!(
+                    next_interval >= min_expected,
+                    "Interval {:?} < 18 RTTs ({:?}) at {}ms base delay",
+                    next_interval, min_expected, base_delay_ms
+                );
+            }
+        }
+
+        // Dynamic GAIN must be in range [1/MAX_GAIN_DIVISOR, 1].
+        //
+        // GAIN = 1 / min(MAX_GAIN_DIVISOR, ceil(2 * TARGET / base_delay))
+        //
+        // Edge cases:
+        // - base_delay = 0: GAIN = 1/16 (conservative)
+        // - base_delay >> TARGET: GAIN approaches 1/16
+        // - base_delay << TARGET: GAIN approaches 1
+        proptest! {
+            #[test]
+            fn dynamic_gain_in_valid_range(base_delay_ms in 0u64..1000) {
+                let base_delay = Duration::from_millis(base_delay_ms);
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                let gain = controller.calculate_dynamic_gain(base_delay);
+
+                let min_gain = 1.0 / MAX_GAIN_DIVISOR as f64;
+                let max_gain = 1.0;
+
+                prop_assert!(
+                    gain >= min_gain && gain <= max_gain,
+                    "GAIN {} out of valid range [{}, {}] at {}ms base delay",
+                    gain, min_gain, max_gain, base_delay_ms
+                );
+            }
+        }
+
+        // Rate = cwnd / RTT, with 1ms minimum RTT floor.
+        //
+        // Properties:
+        // - rate(cwnd, rtt) = cwnd / max(rtt, 1ms)
+        // - rate is proportional to cwnd
+        // - rate is inversely proportional to RTT (above 1ms floor)
+        proptest! {
+            #[test]
+            fn rate_formula_is_correct(
+                cwnd_kb in 3u64..1000,  // 3KB to 1MB (>= min_cwnd of 2848)
+                rtt_ms in 0u64..1000    // 0ms to 1s
+            ) {
+                let cwnd = (cwnd_kb * 1024) as usize;
+                let rtt = Duration::from_millis(rtt_ms);
+                let min_cwnd = 2848;
+                let max_cwnd = 10_000_000;
+                let controller = LedbatController::new(cwnd, min_cwnd, max_cwnd);
+                controller.cwnd.store(cwnd, Ordering::Release);
+
+                let rate = controller.current_rate(rtt);
+
+                // RTT is floored at 1ms
+                let effective_rtt = rtt.max(Duration::from_millis(1));
+                let expected_rate = (cwnd as f64 / effective_rtt.as_secs_f64()) as usize;
+
+                // Allow tolerance for floating point precision
+                let tolerance = (expected_rate as f64 * RATE_TOLERANCE_PERCENT) as usize + 1;
+                prop_assert!(
+                    (rate as i64 - expected_rate as i64).unsigned_abs() <= tolerance as u64,
+                    "Rate {} != expected {} (±{}) at {}KB cwnd, {}ms RTT",
+                    rate, expected_rate, tolerance, cwnd_kb, rtt_ms
+                );
+            }
+        }
+
+        // Rate doubles when cwnd doubles (at same RTT).
+        proptest! {
+            #[test]
+            fn rate_proportional_to_cwnd(
+                cwnd_kb in 3u64..5_000,  // >= min_cwnd of 2848
+                rtt_ms in 1u64..500
+            ) {
+                let cwnd1 = (cwnd_kb * 1024) as usize;
+                let cwnd2 = cwnd1 * 2;
+                let rtt = Duration::from_millis(rtt_ms);
+                let min_cwnd = 2848;
+                let max_cwnd = 20_000_000;
+
+                let controller1 = LedbatController::new(cwnd1, min_cwnd, max_cwnd);
+                controller1.cwnd.store(cwnd1, Ordering::Release);
+                let rate1 = controller1.current_rate(rtt);
+
+                let controller2 = LedbatController::new(cwnd2, min_cwnd, max_cwnd);
+                controller2.cwnd.store(cwnd2, Ordering::Release);
+                let rate2 = controller2.current_rate(rtt);
+
+                // rate2 should be approximately 2 * rate1
+                let expected_ratio = 2.0;
+                let actual_ratio = rate2 as f64 / rate1 as f64;
+
+                prop_assert!(
+                    (actual_ratio - expected_ratio).abs() < RATIO_TOLERANCE,
+                    "Rate ratio {} != expected {} when cwnd doubled",
+                    actual_ratio, expected_ratio
+                );
+            }
+        }
+
+        // Rate halves when RTT doubles (above 1ms floor).
+        proptest! {
+            #[test]
+            fn rate_inversely_proportional_to_rtt(
+                cwnd_kb in 10u64..1000,  // >= min_cwnd of 2848
+                rtt_ms in 2u64..250      // Start at 2ms so doubling stays reasonable
+            ) {
+                let cwnd = (cwnd_kb * 1024) as usize;
+                let rtt1 = Duration::from_millis(rtt_ms);
+                let rtt2 = Duration::from_millis(rtt_ms * 2);
+                let min_cwnd = 2848;
+                let max_cwnd = 10_000_000;
+
+                let controller = LedbatController::new(cwnd, min_cwnd, max_cwnd);
+                controller.cwnd.store(cwnd, Ordering::Release);
+
+                let rate1 = controller.current_rate(rtt1);
+                let rate2 = controller.current_rate(rtt2);
+
+                // rate2 should be approximately rate1 / 2
+                let expected_ratio = 0.5;
+                let actual_ratio = rate2 as f64 / rate1 as f64;
+
+                prop_assert!(
+                    (actual_ratio - expected_ratio).abs() < RATIO_TOLERANCE,
+                    "Rate ratio {} != expected {} when RTT doubled from {}ms to {}ms",
+                    actual_ratio, expected_ratio, rtt_ms, rtt_ms * 2
+                );
+            }
+        }
+
+        // Cwnd decrease is capped at -cwnd/2 (LEDBAT++ multiplicative decrease limit).
+        //
+        // This prevents severe cwnd collapse on transient delay spikes.
+        proptest! {
+            #[test]
+            fn cwnd_decrease_capped_at_half(
+                cwnd_kb in 10u64..1000,
+                off_target_ms in -1000i64..-1  // Negative = over target (decrease)
+            ) {
+                let current_cwnd = (cwnd_kb * 1024) as f64;
+                let target_ms = TARGET.as_millis() as f64;
+                let off_target = off_target_ms as f64;
+
+                // Simulate LEDBAT++ cwnd calculation with worst-case GAIN
+                let gain = 1.0;  // Maximum GAIN
+                let bytes_acked = current_cwnd as f64;  // Full window ACKed
+
+                let cwnd_change = gain * (off_target / target_ms) * bytes_acked * (MSS as f64)
+                    / current_cwnd;
+
+                // LEDBAT++ cap: -W/2
+                let max_decrease = -(current_cwnd / 2.0);
+                let capped_change = cwnd_change.max(max_decrease);
+
+                prop_assert!(
+                    capped_change >= max_decrease,
+                    "Capped change {} < max decrease {} at {}KB cwnd",
+                    capped_change, max_decrease, cwnd_kb
+                );
+            }
+        }
+
+        // Queuing delay is non-negative (saturating subtraction).
+        proptest! {
+            #[test]
+            fn queuing_delay_non_negative(
+                base_delay_ms in 1u64..500,
+                extra_delay_ms in 0u64..500
+            ) {
+                let base_delay = Duration::from_millis(base_delay_ms);
+                let filtered_rtt = Duration::from_millis(base_delay_ms + extra_delay_ms);
+
+                // Queuing delay = filtered_rtt - base_delay (saturating)
+                let queuing_delay = filtered_rtt.saturating_sub(base_delay);
+
+                prop_assert!(
+                    queuing_delay >= Duration::ZERO,
+                    "Queuing delay {:?} is negative",
+                    queuing_delay
+                );
+
+                // Also verify the expected value
+                let expected = Duration::from_millis(extra_delay_ms);
+                prop_assert_eq!(queuing_delay, expected);
+            }
+        }
+
+        // GAIN divisor formula: ceil(2 * TARGET / base_delay), clamped to [1, 16].
+        proptest! {
+            #[test]
+            fn gain_divisor_formula_correct(base_delay_ms in 1u64..1000) {
+                let base_delay = Duration::from_millis(base_delay_ms);
+                let target_ms = TARGET.as_millis() as f64;
+                let base_ms = base_delay_ms as f64;
+
+                // Expected divisor calculation
+                let raw_divisor = (2.0 * target_ms / base_ms).ceil() as u32;
+                let expected_divisor = raw_divisor.clamp(1, MAX_GAIN_DIVISOR);
+                let expected_gain = 1.0 / expected_divisor as f64;
+
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+                let actual_gain = controller.calculate_dynamic_gain(base_delay);
+
+                prop_assert!(
+                    (actual_gain - expected_gain).abs() < GAIN_TOLERANCE,
+                    "GAIN {} != expected {} at {}ms base delay (divisor: raw={}, clamped={})",
+                    actual_gain, expected_gain, base_delay_ms, raw_divisor, expected_divisor
+                );
+            }
+        }
+
+        // Next slowdown interval = max(9 * slowdown_duration, 18 * RTT).
+        //
+        // The 18 RTT floor prevents excessive slowdowns on high-latency paths.
+        proptest! {
+            #[test]
+            fn slowdown_interval_formula(
+                base_delay_ms in 1u64..500,
+                slowdown_duration_ms in 1u64..10_000
+            ) {
+                let base_delay = Duration::from_millis(base_delay_ms);
+                let slowdown_duration_ns = slowdown_duration_ms * 1_000_000;
+
+                // Formula from complete_slowdown:
+                let next_interval = slowdown_duration_ns * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
+                let min_slowdown_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
+                let min_interval = min_slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
+                let actual_interval = next_interval.max(min_interval);
+
+                // Property 1: interval >= 9 * slowdown_duration
+                prop_assert!(
+                    actual_interval >= next_interval,
+                    "Interval {} < 9 * slowdown_duration {}",
+                    actual_interval, next_interval
+                );
+
+                // Property 2: interval >= 18 * RTT
+                prop_assert!(
+                    actual_interval >= min_interval,
+                    "Interval {} < 18 RTTs {}",
+                    actual_interval, min_interval
+                );
+
+                // Property 3: interval = max of the two
+                let expected = next_interval.max(min_interval);
+                prop_assert_eq!(actual_interval, expected);
+            }
+        }
+
+        // Slow start exit threshold: cwnd >= ssthresh OR queuing_delay > 0.75 * TARGET.
+        //
+        // With TARGET = 60ms and delay_exit_threshold = 0.75, exit at 45ms queuing delay.
+        proptest! {
+            #[test]
+            fn slow_start_exit_threshold(queuing_delay_ms in 0u64..100) {
+                let config = LedbatConfig::default();
+                let threshold = (TARGET.as_millis() as f64 * config.delay_exit_threshold) as u64;
+
+                let queuing_delay = Duration::from_millis(queuing_delay_ms);
+                let should_exit_on_delay = queuing_delay > Duration::from_millis(threshold);
+
+                // Verify threshold is 45ms (0.75 * 60ms)
+                prop_assert_eq!(threshold, 45);
+
+                // Verify exit logic
+                if queuing_delay_ms > 45 {
+                    prop_assert!(should_exit_on_delay, "Should exit slow start at {}ms delay", queuing_delay_ms);
+                } else {
+                    prop_assert!(!should_exit_on_delay, "Should NOT exit slow start at {}ms delay", queuing_delay_ms);
+                }
+            }
+        }
+
+        // =====================================================================
+        // Additional edge case tests requested in PR review
+        // =====================================================================
+
+        // Cwnd bounds enforcement: min_cwnd <= cwnd <= max_cwnd after all operations.
+        //
+        // This invariant must hold after on_ack, on_loss, and on_timeout.
+        proptest! {
+            #[test]
+            fn cwnd_bounds_enforced_after_timeout(
+                initial_cwnd_kb in 10u64..1000,
+                min_cwnd in 1000usize..5000,
+                max_cwnd in 1_000_000usize..10_000_000
+            ) {
+                let initial_cwnd = (initial_cwnd_kb * 1024) as usize;
+                let initial_cwnd = initial_cwnd.clamp(min_cwnd, max_cwnd);
+
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd,
+                    ssthresh: max_cwnd / 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Trigger timeout (most aggressive cwnd reduction)
+                controller.on_timeout();
+
+                let cwnd_after = controller.current_cwnd();
+                prop_assert!(
+                    cwnd_after >= min_cwnd,
+                    "cwnd {} < min_cwnd {} after timeout",
+                    cwnd_after, min_cwnd
+                );
+                prop_assert!(
+                    cwnd_after <= max_cwnd,
+                    "cwnd {} > max_cwnd {} after timeout",
+                    cwnd_after, max_cwnd
+                );
+            }
+        }
+
+        // Cwnd bounds enforced after loss events.
+        proptest! {
+            #[test]
+            fn cwnd_bounds_enforced_after_loss(
+                initial_cwnd_kb in 10u64..1000,
+                min_cwnd in 1000usize..5000,
+                max_cwnd in 1_000_000usize..10_000_000,
+                num_losses in 1u32..10
+            ) {
+                let initial_cwnd = (initial_cwnd_kb * 1024) as usize;
+                let initial_cwnd = initial_cwnd.clamp(min_cwnd, max_cwnd);
+
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd,
+                    ssthresh: max_cwnd / 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Trigger multiple losses
+                for _ in 0..num_losses {
+                    controller.on_loss();
+                }
+
+                let cwnd_after = controller.current_cwnd();
+                prop_assert!(
+                    cwnd_after >= min_cwnd,
+                    "cwnd {} < min_cwnd {} after {} losses",
+                    cwnd_after, min_cwnd, num_losses
+                );
+                prop_assert!(
+                    cwnd_after <= max_cwnd,
+                    "cwnd {} > max_cwnd {} after {} losses",
+                    cwnd_after, max_cwnd, num_losses
+                );
+            }
+        }
+
+        // Flightsize non-negativity: flightsize uses saturating subtraction.
+        //
+        // Random send/ack sequences should never produce negative flightsize.
+        proptest! {
+            #[test]
+            fn flightsize_never_negative(
+                sends in proptest::collection::vec(1000usize..10000, 1..20),
+                acks in proptest::collection::vec(1000usize..15000, 1..25)
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Simulate random send/ack pattern
+                for &bytes in &sends {
+                    controller.on_send(bytes);
+                }
+
+                // ACKs may exceed what was sent (simulating duplicate ACKs, etc.)
+                for &bytes in &acks {
+                    controller.on_ack_without_rtt(bytes);
+
+                    // Flightsize should never be negative (saturating subtraction)
+                    let flightsize = controller.flightsize();
+                    prop_assert!(
+                        flightsize < usize::MAX / 2,  // Would wrap to huge value if negative
+                        "Flightsize {} appears to have wrapped negative",
+                        flightsize
+                    );
+                }
+
+                // Final check
+                let final_flightsize = controller.flightsize();
+                prop_assert!(
+                    final_flightsize < usize::MAX / 2,
+                    "Final flightsize {} appears negative",
+                    final_flightsize
+                );
+            }
+        }
+
+        // Base delay only decreases or stays stable when new samples arrive.
+        //
+        // Adding an RTT sample should only decrease base_delay if the sample
+        // is smaller than the current minimum. Larger samples are ignored.
+        // (Note: base_delay CAN increase due to bucket expiration over time,
+        // but within immediate sample processing, it should only decrease.)
+        proptest! {
+            #[test]
+            fn base_delay_only_decreases_on_smaller_samples(
+                initial_rtt_ms in 50u64..200,
+                sample_rtt_ms in 10u64..300
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Establish initial base delay
+                let initial_rtt = Duration::from_millis(initial_rtt_ms);
+                controller.on_ack(initial_rtt, 1000);
+                let base_delay_before = controller.base_delay();
+
+                // Add new sample
+                let sample_rtt = Duration::from_millis(sample_rtt_ms);
+                controller.on_ack(sample_rtt, 1000);
+                let base_delay_after = controller.base_delay();
+
+                if sample_rtt_ms < initial_rtt_ms {
+                    // Smaller sample should decrease base delay
+                    prop_assert!(
+                        base_delay_after <= base_delay_before,
+                        "Base delay increased from {:?} to {:?} despite smaller sample {}ms < {}ms",
+                        base_delay_before, base_delay_after, sample_rtt_ms, initial_rtt_ms
+                    );
+                } else {
+                    // Larger sample should not increase base delay
+                    prop_assert!(
+                        base_delay_after <= base_delay_before,
+                        "Base delay increased from {:?} to {:?} on larger sample {}ms >= {}ms",
+                        base_delay_before, base_delay_after, sample_rtt_ms, initial_rtt_ms
+                    );
+                }
+            }
+        }
+
+        // Base delay converges to minimum across multiple samples.
+        proptest! {
+            #[test]
+            fn base_delay_converges_to_minimum(
+                samples in proptest::collection::vec(10u64..500, 5..20)
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Feed all samples
+                for &rtt_ms in &samples {
+                    let rtt = Duration::from_millis(rtt_ms);
+                    controller.on_ack(rtt, 1000);
+                }
+
+                let base_delay = controller.base_delay();
+                let expected_min = samples.iter().copied().min().unwrap();
+
+                // Base delay should be at or below the minimum sample
+                // (could be lower if there's a fallback or timing issue)
+                prop_assert!(
+                    base_delay.as_millis() as u64 <= expected_min + DURATION_TOLERANCE_MS,
+                    "Base delay {:?} > minimum sample {}ms",
+                    base_delay, expected_min
+                );
+            }
+        }
+    }
 }

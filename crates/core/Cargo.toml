@@ -109,6 +109,7 @@ zip = "7"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
+proptest = "1"
 chrono = { features = ["arbitrary"], workspace = true }
 criterion = { version = "0.8", features = ["async_tokio"] }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
