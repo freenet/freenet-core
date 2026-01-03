@@ -7,6 +7,7 @@ use std::{collections::HashMap, time::Instant};
 
 use parking_lot::RwLock;
 
+use crate::config::GlobalExecutor;
 use crate::transport::connection_handler::{NAT_TRAVERSAL_MAX_ATTEMPTS, X25519_INTRO_PACKET_SIZE};
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
@@ -233,7 +234,7 @@ impl<S: super::Socket> PeerConnection<S> {
             Arc::new(RwLock::new(BTreeMap::new()));
         let pending_pings_for_task = pending_pings.clone();
 
-        let keep_alive_handle = tokio::spawn(async move {
+        let keep_alive_handle = GlobalExecutor::spawn(async move {
             tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
@@ -1082,7 +1083,7 @@ impl<S: super::Socket> PeerConnection<S> {
                         return Ok(Some(msg));
                     }
                     self.inbound_stream_futures
-                        .push(tokio::spawn(inbound_stream::recv_stream(
+                        .push(GlobalExecutor::spawn(inbound_stream::recv_stream(
                             stream_id, receiver, stream,
                         )));
                 }
@@ -1164,7 +1165,7 @@ impl<S: super::Socket> PeerConnection<S> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        let task = tokio::spawn(
+        let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
                 stream_id,
                 self.remote_conn.last_packet_id.clone(),

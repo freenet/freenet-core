@@ -2,6 +2,8 @@ use core::future::Future;
 use freenet_stdlib::prelude::*;
 use stretto::AsyncCache;
 
+use crate::config::GlobalExecutor;
+
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
     #[error(transparent)]
@@ -70,7 +72,7 @@ where
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
         let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
         Ok(Self {
-            state_mem_cache: AsyncCache::new(counters, max_size as i64, tokio::spawn)
+            state_mem_cache: AsyncCache::new(counters, max_size as i64, GlobalExecutor::spawn)
                 .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
             // params_mem_cache: AsyncCache::new(counters, max_size as i64)
             //     .map_err(|err| StateStoreError::Any(Box::new(err)))?,

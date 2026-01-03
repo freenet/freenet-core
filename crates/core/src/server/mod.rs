@@ -27,7 +27,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     client_events::{websocket::WebSocketProxy, AuthToken, BoxedClient, ClientId, HostResult},
-    config::WebsocketApiConfig,
+    config::{GlobalExecutor, WebsocketApiConfig},
 };
 
 pub use app_packaging::WebApp;
@@ -83,7 +83,7 @@ async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> 
         }
     })?;
     tracing::info!("HTTP gateway listening on {}", socket);
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         axum::serve(listener, router).await.map_err(|e| {
             tracing::error!("Error while running HTTP gateway server: {e}");
         })
@@ -272,7 +272,7 @@ fn spawn_token_cleanup_task(
     let token_ttl = Duration::from_secs(token_ttl_seconds);
     let cleanup_interval = Duration::from_secs(cleanup_interval_seconds);
 
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         let mut interval = tokio::time::interval(cleanup_interval);
         interval.tick().await; // Skip the first immediate tick
 

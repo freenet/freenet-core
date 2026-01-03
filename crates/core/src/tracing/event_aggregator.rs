@@ -75,7 +75,7 @@
 //! ```
 
 use super::{EventKind, NetLogMessage};
-use crate::{message::Transaction, node::PeerId};
+use crate::{config::GlobalExecutor, message::Transaction, node::PeerId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -237,7 +237,7 @@ impl WebSocketEventCollector {
         };
 
         // Start WebSocket server in background
-        tokio::spawn(Self::run_server(port, events, peer_labels));
+        GlobalExecutor::spawn(Self::run_server(port, events, peer_labels));
 
         // Wait a bit for server to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -261,7 +261,7 @@ impl WebSocketEventCollector {
         while let Ok((stream, _)) = listener.accept().await {
             let events = events.clone();
 
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 if let Ok(ws_stream) = accept_async(stream).await {
                     let (_write, mut read) = ws_stream.split();
 

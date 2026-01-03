@@ -15,6 +15,7 @@ use futures::Stream;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
+use crate::config::GlobalExecutor;
 use crate::dev_tool::{Location, Transaction};
 use crate::node::network_bridge::ConnectionError;
 use crate::ring::{ConnectionManager, PeerKeyLocation};
@@ -145,7 +146,7 @@ impl HandshakeHandler {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
 
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready).await;
         });
 
@@ -304,7 +305,7 @@ fn spawn_outbound<S: crate::transport::Socket>(
     transient: bool,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         let peer_for_connect = peer.clone();
         let mut handler = outbound;
         let addr = peer_for_connect
