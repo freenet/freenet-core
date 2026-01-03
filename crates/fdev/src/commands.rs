@@ -187,6 +187,14 @@ async fn put_contract(
             tracing::info!(%response_key, "Contract published successfully");
             Ok(())
         }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key: response_key,
+            ..
+        }))) => {
+            // When updating an existing contract, server returns UpdateResponse
+            tracing::info!(%response_key, "Contract updated successfully");
+            Ok(())
+        }
         Ok(Ok(HostResponse::ContractResponse(other))) => {
             Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
         }
