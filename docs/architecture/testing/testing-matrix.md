@@ -76,6 +76,84 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 | **CI friendliness** | Unit + Macro + SimNetwork | Fast, deterministic |
 | **Debugging** | SimNetwork | Event capture, replay |
 
+### By Codebase Area
+
+This matrix shows which testing approaches cover each major codebase area:
+
+| Codebase Area | Path | Unit | Macro | SimNetwork | test-network |
+|---------------|------|:----:|:-----:|:----------:|:------------:|
+| **Transport Layer** |
+| LEDBAT++ congestion | `transport/ledbat.rs` | ✅ 183 | - | - | - |
+| Streaming/buffers | `transport/peer_connection/` | ✅ 120 | - | - | - |
+| Connection piping | `transport/connection_handler.rs` | ✅ 15 | - | - | - |
+| Bandwidth management | `transport/bw.rs` | ✅ 8 | - | - | - |
+| **Ring/DHT Layer** |
+| Location math | `ring/location.rs` | ✅ 47 | - | - | - |
+| Peer key location | `ring/peer_key_location.rs` | ✅ 68 | - | - | - |
+| Connection manager | `ring/connection_manager.rs` | ✅ 72 | ✅ | ✅ | ✅ |
+| Seeding cache | `ring/seeding.rs` | ✅ 78 | - | - | - |
+| **Operations** |
+| Connect operation | `operations/connect.rs` | ✅ 12 | ✅ | ✅ | ✅ |
+| Put operation | `operations/put.rs` | ✅ 28 | ✅ | ✅ | ✅ |
+| Get operation | `operations/get.rs` | ✅ 24 | ✅ | ✅ | ✅ |
+| Subscribe operation | `operations/subscribe.rs` | ✅ 18 | ✅ | ✅ | ✅ |
+| Update operation | `operations/update.rs` | ✅ 14 | ✅ | ✅ | ✅ |
+| **Contract Execution** |
+| Executor pool | `contract/executor/` | ✅ 57 | - | - | - |
+| WASM runtime | `wasm_runtime/` | ✅ 43 | - | - | - |
+| State storage | `wasm_runtime/state_store.rs` | ✅ 12 | ✅ | ✅ | - |
+| Mock storage | `wasm_runtime/mock_state_storage.rs` | ✅ 8 | - | ✅ | - |
+| **Client/Server** |
+| WebSocket API | `server/path_handlers/` | ✅ 1 | ✅ | - | ✅ |
+| Client events | `client_events/` | ✅ 12 | ✅ | - | ✅ |
+| **Network Bridge** |
+| P2P protocol | `network_bridge/p2p_protoc.rs` | ✅ 2 | - | - | - |
+| Handshake | `network_bridge/handshake.rs` | ✅ 4 | ✅ | - | ✅ |
+| In-memory transport | `transport/in_memory_socket.rs` | - | - | ✅ | - |
+| **Node/Config** |
+| Node startup | `local_node.rs` | - | ✅ | ✅ | ✅ |
+| Config parsing | `config.rs` | ✅ 3 | - | - | - |
+| **Simulation** |
+| VirtualTime | `simulation/time.rs` | ✅ 5 | - | ✅ | - |
+| Fault injection | `simulation/fault.rs` | ✅ 3 | - | ✅ | - |
+| SimulationRng | `simulation/rng.rs` | ✅ 4 | - | ✅ | - |
+| **Tracing/Telemetry** |
+| Event aggregator | `tracing/event_aggregator.rs` | ✅ 3 | - | - | - |
+| Test logger | `test_utils.rs` | ✅ 2 | ✅ | ✅ | ✅ |
+| **CLI/Binary** |
+| Service commands | `bin/service.rs` | ✅ 4 | - | - | - |
+| Auto-update | `bin/auto_update.rs` | ✅ 4 | - | - | - |
+| fdev testing | `fdev/src/testing.rs` | - | - | ✅ | - |
+
+**Legend:**
+- ✅ N = Tested with N unit tests
+- ✅ = Tested (integration/e2e)
+- `-` = Not tested by this approach
+
+### Coverage Heatmap by Layer
+
+```
+Layer              Unit Tests    Integration    Simulation    E2E
+─────────────────────────────────────────────────────────────────
+Transport          ████████████  ░░░░░░░░░░░░  ░░░░░░░░░░░░  ░░░░
+Ring/DHT           ████████████  ████░░░░░░░░  ████░░░░░░░░  ████
+Operations         ████████░░░░  ████████████  ████████████  ████
+Contract Exec      ████████░░░░  ░░░░░░░░░░░░  ░░░░░░░░░░░░  ░░░░
+Client/Server      ██░░░░░░░░░░  ████░░░░░░░░  ░░░░░░░░░░░░  ████
+Network Bridge     ██░░░░░░░░░░  ████░░░░░░░░  ░░░░░░░░░░░░  ████
+Simulation         ████░░░░░░░░  ░░░░░░░░░░░░  ████████████  ░░░░
+─────────────────────────────────────────────────────────────────
+█ = Good coverage   ░ = Limited/no coverage
+```
+
+**Key Observations:**
+1. **Transport layer** - Excellent unit test coverage, but no integration testing (relies on in-memory mocks)
+2. **Ring/DHT** - Well covered at unit level; integration tests via SimNetwork
+3. **Operations** - Best covered area; tested at all levels
+4. **Contract execution** - Good unit tests, but no integration tests for actual WASM execution
+5. **Client/Server** - Significant gap; needs more WebSocket API testing
+6. **Network bridge** - Light coverage; protocol-level bugs may slip through
+
 ---
 
 ## Test Count by Category
