@@ -166,10 +166,8 @@ jobs:
       LIBRARY_PATH: /usr/lib
       PKG_CONFIG_PATH: /usr/lib/pkgconfig
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # The river workspace builds many crates fresh (no cache), which can
-      # exhaust default stack space during parallel compilation
-      # Increased from 16MB to 32MB after ICE in rustc 1.91.0 borrowck pass
-      RUST_MIN_STACK: 33554432
+      # 64MB required for LLVM inliner pass on large workspaces
+      RUST_MIN_STACK: 67108864
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
