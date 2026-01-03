@@ -100,13 +100,12 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
 
     // Get nodes from context
     let peer = ctx.node("peer")?;
-    let peer_ws_port = peer.ws_port;
 
     // Give extra time for peer to connect to gateway
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer's websocket API
-    let uri = format!("ws://127.0.0.1:{peer_ws_port}/v1/contract/command?encodingProtocol=native");
+    let uri = peer.ws_url();
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api = WebApi::start(stream);
 
@@ -249,10 +248,9 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
 async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     // Get the gateway node from context
     let gateway = ctx.node("gateway")?;
-    let ws_port = gateway.ws_port;
 
     // Try to connect to the gateway's WebSocket API
-    let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
+    let uri = gateway.ws_url();
     let result = tokio::time::timeout(Duration::from_secs(10), connect_async(&uri)).await;
 
     match result {
@@ -358,26 +356,19 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         "Verified peer network ports for direct connectivity"
     );
 
-    let gateway_ws_port = gateway.ws_port;
-    let peer1_ws_port = peer1.ws_port;
-    let peer2_ws_port = peer2.ws_port;
-
     // Give extra time for peers to connect to gateway
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to websockets
-    let uri_gw =
-        format!("ws://127.0.0.1:{gateway_ws_port}/v1/contract/command?encodingProtocol=native");
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri1 =
-        format!("ws://127.0.0.1:{peer1_ws_port}/v1/contract/command?encodingProtocol=native");
+    let uri1 = peer1.ws_url();
     let (stream1, _) = connect_async(&uri1).await?;
     let mut client1 = WebApi::start(stream1);
 
-    let uri2 =
-        format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
+    let uri2 = peer2.ws_url();
     let (stream2, _) = connect_async(&uri2).await?;
     let mut client2 = WebApi::start(stream2);
 
@@ -759,17 +750,11 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     let peer = ctx.node("peer")?;
 
     // Connect to websockets
-    let uri_gw = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        gateway.ws_port
-    );
+    let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri_peer = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        peer.ws_port
-    );
+    let uri_peer = peer.ws_url();
     let (stream_peer, _) = connect_async(&uri_peer).await?;
     let mut client_peer = WebApi::start(stream_peer);
 

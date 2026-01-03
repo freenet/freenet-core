@@ -238,8 +238,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
                 // Reserve network port on the varied IP to match the socket binding address
                 let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
-                // WebSocket listener uses localhost
-                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
+                // WebSocket listener also uses varied IP for test isolation
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = &__keypairs[#idx_lit];
@@ -255,8 +255,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
-                            // Bind to localhost (127.0.0.1) for WebSocket API
-                            address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Bind to varied IP for test isolation (prevents port conflicts in parallel tests)
+                            address: Some(node_ip.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
@@ -375,8 +375,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
                 // Reserve network port on the varied IP to match the socket binding address
                 let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
-                // WebSocket listener uses localhost
-                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
+                // WebSocket listener also uses varied IP for test isolation
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = &__keypairs[#idx_lit];
@@ -392,8 +392,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
-                            // Bind to localhost (127.0.0.1) for WebSocket API
-                            address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Bind to varied IP for test isolation (prevents port conflicts in parallel tests)
+                            address: Some(node_ip.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
@@ -551,6 +551,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
         let ws_port_var = format_ident!("ws_port_{}", idx);
         let network_port_var = format_ident!("network_port_{}", idx);
         let location_var = format_ident!("location_{}", idx);
+        let node_ip_var = format_ident!("node_ip_{}", idx);
         let flush_handle_var = format_ident!("flush_handle_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
 
@@ -562,6 +563,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
                 network_port: Some(#network_port_var),
                 is_gateway: #is_gw,
                 location: #location_var,
+                ip: #node_ip_var,
             }
         });
 

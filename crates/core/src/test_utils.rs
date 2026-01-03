@@ -1142,6 +1142,18 @@ pub struct NodeInfo {
     pub is_gateway: bool,
     /// Node's location in the ring
     pub location: f64,
+    /// IP address the node binds to (varied loopback for test isolation)
+    pub ip: std::net::Ipv4Addr,
+}
+
+impl NodeInfo {
+    /// Returns the WebSocket URL for this node's API
+    pub fn ws_url(&self) -> String {
+        format!(
+            "ws://{}:{}/v1/contract/command?encodingProtocol=native",
+            self.ip, self.ws_port
+        )
+    }
 }
 
 /// Test result type for test functions
