@@ -783,25 +783,44 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // there's a gap where incoming packets aren't found in either map and
                             // fall through to asymmetric decryption, causing spurious "decryption error"
                             // failures when symmetric packets are misrouted.
-                            self.remote_connections.insert(remote_addr, inbound_remote_connection);
+                            //
+                            // Issue #2576: Check if a connection already exists for this address.
+                            // A race can occur where both inbound (gateway) and outbound (NAT traversal)
+                            // connections complete for the same address. If we blindly insert, we replace
+                            // the existing connection, orphaning its PeerConnection which eventually times
+                            // out and causes "decryption failed" errors when its channel closes.
                             ongoing_gw_connections.remove(&remote_addr);
 
-                            if self.new_connection_notifier
-                                .send(PeerConnection::new(outbound_remote_conn))
-                                .await
-                                .is_err() {
-                                tracing::error!(
+                            use std::collections::btree_map::Entry;
+                            if let Entry::Vacant(entry) = self.remote_connections.entry(remote_addr) {
+                                entry.insert(inbound_remote_connection);
+
+                                if self.new_connection_notifier
+                                    .send(PeerConnection::new(outbound_remote_conn))
+                                    .await
+                                    .is_err() {
+                                    tracing::error!(
+                                        peer_addr = %remote_addr,
+                                        direction = "inbound",
+                                        "Gateway connection established but failed to notify new connection"
+                                    );
+                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
+
+                                sent_tracker.lock().report_sent_packet(
+                                    SymmetricMessage::FIRST_PACKET_ID,
+                                    outbound_ack_packet.prepared_send(),
+                                );
+                            } else {
+                                tracing::debug!(
                                     peer_addr = %remote_addr,
                                     direction = "inbound",
-                                    "Gateway connection established but failed to notify new connection"
+                                    "Connection already exists, discarding duplicate gateway connection"
                                 );
-                                break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                // Don't insert or notify - keep the existing connection.
+                                // The new connection's resources (outbound_remote_conn, inbound_remote_connection)
+                                // will be dropped here, which is fine since we're keeping the existing one.
                             }
-
-                            sent_tracker.lock().report_sent_packet(
-                                SymmetricMessage::FIRST_PACKET_ID,
-                                outbound_ack_packet.prepared_send(),
-                            );
                         }
                         Err((error, remote_addr)) => {
                             tracing::error!(
@@ -846,12 +865,29 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     direction = "outbound",
                                     "Connection established"
                                 );
-                                self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
-                                let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
-                                    tracing::error!(
-                                        "Failed sending back peer connection"
+                                // Issue #2576: Check if a connection already exists for this address.
+                                // A race can occur where both inbound (gateway) and outbound (NAT traversal)
+                                // connections complete for the same address. Keep the existing one.
+                                let remote_addr = outbound_remote_conn.remote_addr;
+                                use std::collections::btree_map::Entry;
+                                if let Entry::Vacant(entry) = self.remote_connections.entry(remote_addr) {
+                                    entry.insert(inbound_remote_connection);
+                                    let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
+                                        tracing::error!(
+                                            "Failed sending back peer connection"
+                                        );
+                                    });
+                                } else {
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        "Connection already exists, discarding duplicate outbound connection"
                                     );
-                                });
+                                    // Send error back since we're not using this connection
+                                    let _ = result_sender.send(Err(TransportError::ConnectionEstablishmentFailure {
+                                        cause: "duplicate connection - keeping existing".into(),
+                                    }));
+                                }
                             } else {
                                 tracing::error!(
                                     peer_addr = %outbound_remote_conn.remote_addr,
