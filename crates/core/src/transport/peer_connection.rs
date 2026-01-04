@@ -209,13 +209,16 @@ impl<S> Drop for PeerConnection<S> {
 
 /// Maximum number of unanswered pings before considering the connection dead.
 ///
-/// With 5-second ping interval, 2 unanswered pings means 10 seconds of no response.
+/// With 5-second ping interval, 5 unanswered pings means 25 seconds of no response.
 /// This is intentionally shorter than KILL_CONNECTION_AFTER (120s) because:
 /// 1. We're actively probing, so we can detect failures faster
 /// 2. Operations have their own timeouts, but routing to a dead peer wastes time
-/// 3. 10 seconds is long enough to tolerate brief network hiccups
+/// 3. 25 seconds is long enough to tolerate network hiccups and CI load spikes
 /// 4. Bandwidth is negligible (~20 bytes/sec per connection)
-const MAX_UNANSWERED_PINGS: usize = 2;
+///
+/// Note: Was previously 2 (10 seconds) but caused flaky test failures due to
+/// pong responses being delayed under CI load (issue: premature connection closure).
+const MAX_UNANSWERED_PINGS: usize = 5;
 
 #[allow(private_bounds)]
 impl<S: super::Socket> PeerConnection<S> {
