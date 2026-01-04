@@ -77,7 +77,8 @@ const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
-    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<crate::simulation::RealTime>>>,
+    pub(super) sent_tracker:
+        Arc<parking_lot::Mutex<SentPacketTracker<crate::simulation::RealTime>>>,
     pub(super) last_packet_id: Arc<AtomicU32>,
     pub(super) inbound_packet_recv: FastReceiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,

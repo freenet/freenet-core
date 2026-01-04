@@ -7,6 +7,7 @@ use aes_gcm::Aes128Gcm;
 use bytes::Bytes;
 
 use crate::{
+    simulation::TimeSource,
     tracing::TransferDirection,
     transport::{
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
@@ -15,7 +16,6 @@ use crate::{
         symmetric_message::{self},
         TransferStats, TransportError,
     },
-    simulation::{RealTime, TimeSource},
 };
 
 use super::StreamId;
@@ -249,6 +249,7 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
+    use crate::simulation::RealTime;
     use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
     use crate::transport::packet_data::PacketData;
@@ -306,13 +307,17 @@ mod tests {
         // Use real time for integration testing
         let time_source = RealTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
-            SentPacketTracker::new_with_time_source(time_source.clone())
+            SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
         // Initialize LEDBAT and TokenBucket for test
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
-        let token_bucket = Arc::new(TokenBucket::new_with_time_source(1_000_000, 10_000_000, time_source.clone()));
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
 
         let background_task = tokio::spawn(send_stream(
             StreamId::next(),
@@ -365,7 +370,7 @@ mod tests {
         // Use real time for integration testing with bandwidth limiting
         let time_source = RealTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
-            SentPacketTracker::new_with_time_source(time_source.clone())
+            SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
         // Initialize LEDBAT and TokenBucket for test
@@ -469,7 +474,7 @@ mod tests {
         // Use real time for integration testing without bandwidth limiting
         let time_source = RealTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
-            SentPacketTracker::new_with_time_source(time_source.clone())
+            SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
         // Initialize LEDBAT and TokenBucket with very high rate (effectively unlimited)

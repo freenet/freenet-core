@@ -191,20 +191,27 @@ impl TimeSource for MockTimeSource {
 #[cfg(test)]
 #[derive(Clone)]
 pub struct SharedMockTimeSource {
-    current_instant: Arc<std::sync::Mutex<Instant>>,
+    /// The epoch when time started (used as baseline for elapsed calculations)
+    epoch: Instant,
+    /// Current elapsed time from the epoch
+    elapsed: Arc<std::sync::Mutex<Duration>>,
 }
 
 #[cfg(test)]
 impl SharedMockTimeSource {
-    /// Create a new shared mock time source starting at the current instant.
+    /// Create a new shared mock time source starting at zero elapsed time.
     pub fn new() -> Self {
-        Self::with_instant(Instant::now())
+        Self {
+            epoch: Instant::now(),
+            elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+        }
     }
 
-    /// Create a new shared mock time source starting at the given instant.
+    /// Create a new shared mock time source with a specific initial elapsed time.
     pub fn with_instant(start: Instant) -> Self {
-        SharedMockTimeSource {
-            current_instant: Arc::new(std::sync::Mutex::new(start)),
+        Self {
+            epoch: start,
+            elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
         }
     }
 
@@ -212,14 +219,14 @@ impl SharedMockTimeSource {
     ///
     /// All clones of this time source will see the advanced time.
     pub fn advance_time(&self, duration: Duration) {
-        let mut guard = self.current_instant.lock().unwrap();
+        let mut guard = self.elapsed.lock().unwrap();
         *guard += duration;
     }
 
     /// Get the current time value (for assertions).
     #[allow(dead_code)] // Utility for future test expansion
     pub fn current_time(&self) -> Instant {
-        *self.current_instant.lock().unwrap()
+        self.epoch + *self.elapsed.lock().unwrap()
     }
 }
 
@@ -233,7 +240,51 @@ impl Default for SharedMockTimeSource {
 #[cfg(test)]
 impl TimeSource for SharedMockTimeSource {
     fn now(&self) -> Instant {
-        *self.current_instant.lock().unwrap()
+        self.epoch + *self.elapsed.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+impl crate::simulation::TimeSource for SharedMockTimeSource {
+    fn now_nanos(&self) -> u64 {
+        let elapsed = *self.elapsed.lock().unwrap();
+        elapsed.as_nanos() as u64
+    }
+
+    fn sleep(
+        &self,
+        _duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        // For testing with SharedMockTimeSource, we need to manually advance time
+        // This is a simplified implementation that doesn't actually sleep
+        // Tests using SharedMockTimeSource should call advance_time() manually
+        Box::pin(async move {
+            // Sleeping is a no-op in SharedMockTimeSource - tests must advance time manually
+        })
+    }
+
+    fn sleep_until(
+        &self,
+        _deadline_nanos: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        // Similar to sleep - tests must advance time manually
+        Box::pin(async move {
+            // Tests must advance time manually to trigger this deadline
+        })
+    }
+
+    fn timeout<F, T>(
+        &self,
+        _duration: Duration,
+        future: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // For tests with SharedMockTimeSource, timeout is non-functional
+        // Tests should not rely on timeout behavior with this mock
+        Box::pin(async move { Some(future.await) })
     }
 }
 

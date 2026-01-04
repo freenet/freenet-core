@@ -1300,7 +1300,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
             // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
-            while time_source.now_nanos().saturating_sub(start_time_nanos) < overall_deadline.as_nanos() as u64 {
+            while time_source.now_nanos().saturating_sub(start_time_nanos)
+                < overall_deadline.as_nanos() as u64
+            {
                 // Send a packet if we haven't exceeded the max attempts
                 if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
                     match state {

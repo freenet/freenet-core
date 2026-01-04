@@ -195,8 +195,8 @@ impl<T: TimeSource> TokenBucket<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::simulation::VirtualTime;
+    use std::time::Duration;
 
     #[test]
     fn test_token_bucket_creation() {

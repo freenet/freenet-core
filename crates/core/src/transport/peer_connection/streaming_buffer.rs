@@ -25,8 +25,8 @@ use event_listener::Event;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use crate::transport::packet_data;
 use crate::simulation::{RealTime, TimeSource};
+use crate::transport::packet_data;
 
 /// Maximum payload size per fragment (excluding metadata overhead).
 /// This matches the constant from peer_connection.rs.
@@ -555,8 +555,8 @@ impl std::error::Error for InsertError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::simulation::VirtualTime;
+    use std::time::Duration;
 
     #[test]
     fn test_new_buffer_empty() {
@@ -908,7 +908,10 @@ mod tests {
         use tokio::sync::Barrier;
 
         let time_source = VirtualTime::new();
-        let buffer = Arc::new(LockFreeStreamBuffer::new_with_time_source(100, time_source.clone()));
+        let buffer = Arc::new(LockFreeStreamBuffer::new_with_time_source(
+            100,
+            time_source.clone(),
+        ));
         let buffer_clone = Arc::clone(&buffer);
         let barrier = Arc::new(Barrier::new(2));
         let barrier_clone = Arc::clone(&barrier);

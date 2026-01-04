@@ -319,7 +319,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 // that don't use TimeSource. We convert the nanosecond deadline back to an Instant by
                 // computing the delta from now. This works correctly in both production (RealTime) and
                 // tests (VirtualTime) because the difference is what matters, not the absolute value.
-                let wait_until = Instant::now() + Duration::from_nanos(wait_until_nanos.saturating_sub(now_nanos));
+                let wait_until = Instant::now()
+                    + Duration::from_nanos(wait_until_nanos.saturating_sub(now_nanos));
                 self.resend_queue.push_front(entry);
                 return ResendAction::WaitUntil(wait_until);
             } else if let Some((packet, _sent_time_nanos)) =
@@ -480,10 +481,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(wait_until) => {
                 // With virtual time, the deadline should be in the future
                 let now = std::time::Instant::now();
-                assert!(
-                    wait_until >= now,
-                    "Wait deadline should be in the future"
-                );
+                assert!(wait_until >= now, "Wait deadline should be in the future");
             }
             _ => panic!("Expected ResendAction::WaitUntil"),
         }
@@ -507,9 +505,7 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
 
         // Simulate delay
-        tracker
-            .time_source
-            .advance(Duration::from_millis(delay_ms));
+        tracker.time_source.advance(Duration::from_millis(delay_ms));
 
         // Receive ACK
         let (ack_info, _) = tracker.report_received_receipts(&[1]);
@@ -600,9 +596,7 @@ pub(in crate::transport) mod tests {
         for (i, &rtt_ms) in rtt_samples.iter().enumerate() {
             let packet_id = (i + 1) as PacketId;
             tracker.report_sent_packet(packet_id, vec![packet_id as u8].into());
-            tracker
-                .time_source
-                .advance(Duration::from_millis(rtt_ms));
+            tracker.time_source.advance(Duration::from_millis(rtt_ms));
             tracker.report_received_receipts(&[packet_id]);
         }
 
@@ -905,9 +899,7 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(1, payload);
 
         // Verify: if we wait less than 2s, we should NOT get a resend
-        tracker
-            .time_source
-            .advance(Duration::from_millis(1999));
+        tracker.time_source.advance(Duration::from_millis(1999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (2s)"),
@@ -928,9 +920,7 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(1, payload);
 
         // Verify: if we wait less than 4s, we should NOT get a resend
-        tracker
-            .time_source
-            .advance(Duration::from_millis(3999));
+        tracker.time_source.advance(Duration::from_millis(3999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (4s)"),

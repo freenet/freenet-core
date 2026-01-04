@@ -1826,6 +1826,7 @@ pub struct LedbatStats {
 mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
+    use crate::util::time_source::SharedMockTimeSource;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 

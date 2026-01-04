@@ -29,8 +29,8 @@ use std::{
 
 use tokio::sync::Mutex;
 
-use crate::simulation::{RealTime, TimeSource};
 use super::Socket;
+use crate::simulation::{RealTime, TimeSource};
 
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;

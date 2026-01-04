@@ -554,8 +554,8 @@ impl<T: TimeSource> std::fmt::Debug for PipedStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::simulation::VirtualTime;
+    use std::time::Duration;
 
     fn make_stream_id() -> StreamId {
         StreamId::next()
