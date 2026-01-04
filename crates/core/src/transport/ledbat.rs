@@ -56,8 +56,12 @@ const BASE_HISTORY_SIZE: usize = 10;
 /// Delay filter sample count (RFC 6817 recommendation)
 const DELAY_FILTER_SIZE: usize = 4;
 
-/// Default slow start threshold (100 KB)
-const DEFAULT_SSTHRESH: usize = 102_400;
+/// Default slow start threshold (1 MB)
+///
+/// Higher values allow slow start to reach useful throughput on high-BDP paths
+/// before transitioning to congestion avoidance. With 135ms RTT (e.g., US to EU),
+/// 100KB ssthresh limits throughput to ~6 Mbit/s. 1MB allows ~60 Mbit/s.
+const DEFAULT_SSTHRESH: usize = 1_048_576;
 
 /// Periodic slowdown interval multiplier (LEDBAT++ Section 4.4)
 /// Next slowdown is scheduled at 9x the previous slowdown duration,
@@ -111,7 +115,7 @@ impl Default for LedbatConfig {
             initial_cwnd: 38_000,           // 26 * MSS (IW26)
             min_cwnd: 2_848,                // 2 * MSS
             max_cwnd: 1_000_000_000,        // 1 GB
-            ssthresh: DEFAULT_SSTHRESH,     // 100 KB
+            ssthresh: DEFAULT_SSTHRESH,     // 1 MB
             enable_slow_start: true,        // Enable by default
             delay_exit_threshold: 0.75,     // LEDBAT++: exit at 3/4 * TARGET (45ms)
             randomize_ssthresh: true,       // Enable jitter by default
@@ -1149,8 +1153,13 @@ impl<T: TimeSource + Clone> LedbatController<T> {
                 // Check if it's time for the next scheduled slowdown
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown && next_slowdown != u64::MAX {
-                    self.start_slowdown(now_nanos, base_delay);
-                    return true;
+                    // Only return true if slowdown actually started.
+                    // If slowdown was skipped (cwnd too small), fall through to
+                    // congestion avoidance so cwnd can grow.
+                    if self.start_slowdown(now_nanos, base_delay) {
+                        return true;
+                    }
+                    // Slowdown was skipped - fall through to let congestion avoidance run
                 }
                 false
             }
@@ -1158,10 +1167,16 @@ impl<T: TimeSource + Clone> LedbatController<T> {
                 // Check if wait period is over
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown {
-                    self.start_slowdown(now_nanos, base_delay);
+                    if self.start_slowdown(now_nanos, base_delay) {
+                        // Slowdown started, stay in state machine
+                        return true;
+                    }
+                    // Slowdown skipped (cwnd too small) - transition to normal operation
+                    // so congestion avoidance can grow cwnd
+                    self.congestion_state.enter_congestion_avoidance();
+                    return false;
                 }
-                // Always return true to prevent fall-through to congestion avoidance.
-                // While waiting, cwnd should remain stable, not be subject to app-limited cap.
+                // Still waiting for slowdown timer - keep cwnd stable
                 true
             }
             CongestionState::InSlowdown => {
@@ -3388,6 +3403,109 @@ mod tests {
             "Next interval ({} ms) should be >> 1 RTT ({} ms)",
             next_interval_ms,
             one_rtt_ms
+        );
+    }
+
+    /// Regression test: when a scheduled slowdown is skipped because cwnd is too
+    /// small, congestion avoidance must still run to allow cwnd to grow.
+    ///
+    /// Previously, handle_congestion_state() ignored the return value of
+    /// start_slowdown(), always returning true even when the slowdown was skipped.
+    /// This prevented congestion avoidance from running, causing cwnd to remain
+    /// stuck at low values indefinitely.
+    ///
+    /// This bug caused 21-29 second transfer times on high-latency paths (e.g.,
+    /// nova → technic with 137ms RTT) instead of the expected ~7 seconds.
+    #[test]
+    fn test_skipped_slowdown_allows_congestion_avoidance_to_run() {
+        let rtt = Duration::from_millis(137); // High-latency WAN RTT
+
+        let config = LedbatConfig {
+            initial_cwnd: 10_000, // Start small, below skip threshold
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: false, // Skip slow start for this test
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Set up state: cwnd is below skip threshold, next slowdown is due NOW
+        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        controller
+            .next_slowdown_time_nanos
+            .store(now_nanos, Ordering::Release);
+
+        // Set base delay so off_target is positive (no queuing = cwnd should grow)
+        controller.base_delay_history.update(rtt);
+
+        // Track flight size for app-limited cap
+        controller.on_send(50_000);
+
+        let initial_cwnd = controller.current_cwnd();
+        println!("Initial cwnd: {} bytes", initial_cwnd);
+
+        // Verify we're in CongestionAvoidance state
+        assert_eq!(
+            controller.congestion_state.load(),
+            CongestionState::CongestionAvoidance
+        );
+
+        // Verify cwnd is below skip threshold (min_cwnd * 4 = 11,392)
+        let skip_threshold = controller.min_cwnd * SLOWDOWN_REDUCTION_FACTOR;
+        assert!(
+            initial_cwnd <= skip_threshold,
+            "Test setup: cwnd {} should be <= skip threshold {}",
+            initial_cwnd,
+            skip_threshold
+        );
+
+        // Simulate multiple RTTs worth of ACKs
+        // With the bug: cwnd would stay at initial value (congestion avoidance never runs)
+        // With the fix: cwnd should grow through congestion avoidance
+        //
+        // Note: LEDBAT rate-limits cwnd updates to once per RTT, so we need to
+        // sleep for at least one RTT between meaningful updates.
+        for i in 0..5 {
+            // Sleep for one RTT to allow update to proceed (rate-limiting check)
+            std::thread::sleep(rtt);
+
+            // Simulate sending more data to maintain flightsize (avoids app-limited cap)
+            controller.on_send(5000);
+
+            // ACK with zero queuing delay (below target) -> cwnd should increase
+            controller.on_ack(rtt, 5000); // Multiple MSS worth acked
+
+            println!(
+                "After {} RTTs: cwnd = {} bytes",
+                i + 1,
+                controller.current_cwnd()
+            );
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        println!(
+            "Final cwnd: {} bytes (started at {})",
+            final_cwnd, initial_cwnd
+        );
+
+        // Key assertion: cwnd must have grown (congestion avoidance ran)
+        // With the bug, cwnd would remain at initial_cwnd
+        assert!(
+            final_cwnd > initial_cwnd,
+            "cwnd should grow when slowdown is skipped and congestion avoidance runs. \
+             Initial: {}, Final: {}. If equal, the bug is present!",
+            initial_cwnd,
+            final_cwnd
+        );
+
+        // Verify the slowdown was actually skipped (not started)
+        assert_eq!(
+            controller.congestion_state.load(),
+            CongestionState::CongestionAvoidance,
+            "Should remain in CongestionAvoidance when slowdown is skipped"
         );
     }
 
@@ -6210,6 +6328,7 @@ mod tests {
             initial_cwnd: 38_000,
             min_cwnd: 2_848,
             max_cwnd: 1_000_000,
+            ssthresh: 102_400, // Use lower ssthresh for this test (not testing ssthresh behavior)
             enable_slow_start: true,
             enable_periodic_slowdown: true,
             randomize_ssthresh: false,
