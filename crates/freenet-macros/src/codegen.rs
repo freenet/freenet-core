@@ -190,7 +190,15 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     let node_count = args.nodes.len();
     let node_count_lit = LitInt::new(&node_count.to_string(), proc_macro2::Span::call_site());
 
-    // First, generate all keypairs upfront and verify uniqueness
+    // First, allocate a unique block of node indices for this test.
+    // This ensures parallel tests use non-overlapping IP address ranges.
+    setup_code.push(quote! {
+        // Allocate unique global node indices to prevent IP collisions in parallel tests
+        let __base_node_idx = freenet::test_utils::allocate_test_node_block(#node_count_lit);
+        tracing::debug!("Test allocated global node indices starting at {}", __base_node_idx);
+    });
+
+    // Generate all keypairs upfront and verify uniqueness
     // This prevents rare RNG collisions from causing confusing test failures
     setup_code.push(quote! {
         // Generate all transport keypairs upfront
@@ -235,7 +243,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
                 // Use varied loopback IPs (127.x.y.1) for both socket binding and location calculation
-                let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
+                let #node_ip_var = freenet::test_utils::test_ip_for_node(__base_node_idx + #idx_lit);
                 // Reserve network port on the varied IP to match the socket binding address
                 let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
                 // WebSocket listener also uses varied IP for test isolation
@@ -372,7 +380,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
                 // Use varied loopback IPs (127.x.y.1) for both socket binding and location calculation
-                let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
+                let #node_ip_var = freenet::test_utils::test_ip_for_node(__base_node_idx + #idx_lit);
                 // Reserve network port on the varied IP to match the socket binding address
                 let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
                 // WebSocket listener also uses varied IP for test isolation

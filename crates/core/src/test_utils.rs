@@ -1031,12 +1031,27 @@ static RESERVED_PORTS: Lazy<DashSet<u16>> = Lazy::new(DashSet::new);
 static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
     Lazy::new(DashMap::new);
 
+/// Global counter for allocating unique node indices across all parallel tests.
+/// Each test allocates a contiguous block of indices for its nodes.
+static GLOBAL_NODE_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Allocate a block of unique global node indices for a test.
+///
+/// This ensures that parallel tests get non-overlapping IP address ranges.
+/// Returns the starting global index for this test's nodes.
+pub fn allocate_test_node_block(node_count: usize) -> usize {
+    GLOBAL_NODE_INDEX.fetch_add(node_count, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Generate a unique loopback IP address for test node at given index.
 ///
 /// Location is computed from IP address (masking last byte), so we need different
 /// 2nd and 3rd octets to get different locations. Format: 127.{(idx/254)+1}.{(idx%254)+1}.1
 ///
 /// This supports up to 254*254 = 64,516 unique test nodes.
+///
+/// **Important**: Use [`allocate_test_node_block`] at test start to get a unique base index,
+/// then pass `base + local_node_idx` to this function for each node in the test.
 pub fn test_ip_for_node(node_idx: usize) -> std::net::Ipv4Addr {
     // Avoid 0 in octets (127.0.x.x might have special handling on some systems)
     // and avoid 255 (broadcast). Use range 1-254 for each octet.
