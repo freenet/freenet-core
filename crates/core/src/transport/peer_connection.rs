@@ -77,7 +77,7 @@ const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
-    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
+    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<crate::simulation::RealTime>>>,
     pub(super) last_packet_id: Arc<AtomicU32>,
     pub(super) inbound_packet_recv: FastReceiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
@@ -88,7 +88,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
     pub(super) ledbat: Arc<LedbatController>,
     /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
-    pub(super) token_bucket: Arc<TokenBucket>,
+    pub(super) token_bucket: Arc<TokenBucket<crate::simulation::RealTime>>,
     /// Socket for direct packet sending (bypasses centralized rate limiter)
     pub(super) socket: Arc<S>,
     /// Global bandwidth manager for fair sharing across connections.
@@ -1178,6 +1178,7 @@ impl<S: super::Socket> PeerConnection<S> {
                 self.remote_conn.sent_tracker.clone(),
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.ledbat.clone(),
+                crate::simulation::RealTime::new(),
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -1295,14 +1296,14 @@ impl<S: super::Socket> PeerConnection<S> {
     }
 }
 
-async fn packet_sending<S: super::Socket>(
+async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
     socket: &Arc<S>,
     packet_id: u32,
     outbound_sym_key: &Aes128Gcm,
     confirm_receipt: Vec<u32>,
     payload: impl Into<SymmetricMessagePayload>,
-    sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
+    sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
     tracing::trace!(
@@ -1568,6 +1569,7 @@ mod tests {
         // Initialize LEDBAT and TokenBucket for test
         let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
         let token_bucket = Arc::new(TokenBucket::new(10_000, 10_000_000));
+        let time_source = crate::simulation::RealTime::new();
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
@@ -1581,6 +1583,7 @@ mod tests {
             sent_tracker,
             token_bucket,
             ledbat,
+            time_source,
         ))
         .map_err(|e| e.into());
 

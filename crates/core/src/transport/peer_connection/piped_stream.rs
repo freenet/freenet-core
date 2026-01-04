@@ -76,6 +76,7 @@ use std::sync::Arc;
 use tokio::sync::{Notify, Semaphore};
 
 use super::StreamId;
+use crate::simulation::{RealTime, TimeSource};
 
 /// Configuration for piped stream behavior.
 #[derive(Debug, Clone)]
@@ -179,7 +180,7 @@ pub(crate) struct ForwardFragment {
 /// This struct buffers out-of-order fragments and immediately forwards
 /// in-order fragments to all targets. It implements backpressure through
 /// configurable limits on buffered fragments and concurrent sends.
-pub struct PipedStream {
+pub struct PipedStream<T: TimeSource = RealTime> {
     /// Stream identifier.
     stream_id: StreamId,
     /// Total expected bytes in the stream.
@@ -212,10 +213,13 @@ pub struct PipedStream {
     cancelled: std::sync::atomic::AtomicBool,
     /// Notification for cancellation - wakes waiters in acquire_send_permit.
     cancel_notify: Notify,
+    /// Time source for virtual time support in testing.
+    time_source: T,
 }
 
-impl PipedStream {
-    /// Creates a new piped stream.
+// Production constructor (backward-compatible, uses real time)
+impl PipedStream<RealTime> {
+    /// Creates a new piped stream with real time.
     ///
     /// # Arguments
     ///
@@ -228,6 +232,28 @@ impl PipedStream {
         total_bytes: u64,
         num_targets: usize,
         config: PipedStreamConfig,
+    ) -> Self {
+        Self::new_with_time_source(stream_id, total_bytes, num_targets, config, RealTime::new())
+    }
+}
+
+// Generic implementation (works with any TimeSource)
+impl<T: TimeSource> PipedStream<T> {
+    /// Creates a new piped stream with a custom time source.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - Unique identifier for this stream
+    /// * `total_bytes` - Total expected bytes in the complete stream
+    /// * `num_targets` - Number of target connections to forward to
+    /// * `config` - Configuration for limits and behavior
+    /// * `time_source` - TimeSource for virtual time support (RealTime for production, VirtualTime for tests)
+    pub fn new_with_time_source(
+        stream_id: StreamId,
+        total_bytes: u64,
+        num_targets: usize,
+        config: PipedStreamConfig,
+        time_source: T,
     ) -> Self {
         // Calculate total fragments
         const FRAGMENT_PAYLOAD_SIZE: usize = crate::transport::packet_data::MAX_DATA_SIZE - 40;
@@ -253,6 +279,7 @@ impl PipedStream {
             send_semaphores,
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_notify: Notify::new(),
+            time_source,
         }
     }
 
@@ -504,7 +531,7 @@ impl PipedStream {
     }
 }
 
-impl std::fmt::Debug for PipedStream {
+impl<T: TimeSource> std::fmt::Debug for PipedStream<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipedStream")
             .field("stream_id", &self.stream_id)
@@ -527,6 +554,8 @@ impl std::fmt::Debug for PipedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use crate::simulation::VirtualTime;
 
     fn make_stream_id() -> StreamId {
         StreamId::next()
@@ -836,7 +865,6 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_during_permit_wait() {
         use std::sync::Arc;
-        use std::time::Duration;
 
         // Create stream with only 1 concurrent send allowed
         let config = PipedStreamConfig {
@@ -844,7 +872,14 @@ mod tests {
             max_buffered_bytes: 1024 * 1024,
             max_concurrent_sends: 1,
         };
-        let stream = Arc::new(PipedStream::new(make_stream_id(), 4000, 1, config));
+        let time_source = VirtualTime::new();
+        let stream = Arc::new(PipedStream::new_with_time_source(
+            make_stream_id(),
+            4000,
+            1,
+            config,
+            time_source.clone(),
+        ));
 
         // Acquire the only permit
         let _permit = stream.acquire_send_permit(0).await.unwrap();
@@ -854,47 +889,55 @@ mod tests {
         let stream_clone = Arc::clone(&stream);
         let waiter = tokio::spawn(async move { stream_clone.acquire_send_permit(0).await });
 
-        // Give the waiter time to start waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Give the waiter time to start waiting using virtual time
+        time_source.advance(Duration::from_millis(10));
 
         // Cancel the stream - should wake the waiter
         stream.cancel();
 
         // The waiter should return Cancelled, not hang
-        let result = tokio::time::timeout(Duration::from_millis(100), waiter)
-            .await
-            .expect("waiter should not timeout")
-            .expect("task should not panic");
+        // Use a select with a timeout to ensure the waiter completes quickly
+        let result = tokio::select! {
+            waiter_result = waiter => {
+                Some(waiter_result.expect("task should not panic"))
+            }
+            _ = time_source.sleep(Duration::from_millis(100)) => {
+                None
+            }
+        };
 
-        assert!(matches!(result, Err(PipedStreamError::Cancelled)));
+        assert!(result.is_some(), "waiter should not timeout");
+        assert!(matches!(result.unwrap(), Err(PipedStreamError::Cancelled)));
     }
 
     #[tokio::test]
     async fn test_concurrent_push_and_cancel() {
         use std::sync::Arc;
-        use std::time::Duration;
 
-        let stream = Arc::new(PipedStream::new(
+        let time_source = VirtualTime::new();
+        let stream = Arc::new(PipedStream::new_with_time_source(
             make_stream_id(),
             14000, // ~10 fragments
             1,
             PipedStreamConfig::default(),
+            time_source.clone(),
         ));
 
         // Start pushing fragments
         let stream_clone = Arc::clone(&stream);
+        let time_source_clone = time_source.clone();
         let pusher = tokio::spawn(async move {
             for i in 1..=10 {
                 if stream_clone.is_cancelled() {
                     break;
                 }
                 let _ = stream_clone.push_fragment(i, Bytes::from(format!("frag {}", i)));
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                time_source_clone.sleep(Duration::from_millis(1)).await;
             }
         });
 
-        // Cancel after a short delay
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Cancel after a short delay using virtual time
+        time_source.advance(Duration::from_millis(5));
         stream.cancel();
 
         // Wait for pusher to finish

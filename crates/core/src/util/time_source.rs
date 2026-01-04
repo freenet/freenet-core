@@ -26,6 +26,53 @@ impl TimeSource for InstantTimeSrc {
     }
 }
 
+// Implement simulation::TimeSource for backward compatibility with InstantTimeSrc.
+// NOTE: This is currently unused since InstantTimeSrc is only used with the old
+// TimeSource trait (not simulation::TimeSource). We keep this implementation for
+// potential future use and to ensure InstantTimeSrc could be used with components
+// that expect simulation::TimeSource. The commented-out implementation is preserved
+// for reference if this ever needs to be enabled.
+//
+// In the future, if InstantTimeSrc needs to be used with simulation::TimeSource,
+// this implementation would need to be fixed to use a proper epoch (like RealTime
+// does) instead of `Instant::now().elapsed()` which always returns ~0.
+/*
+impl crate::simulation::TimeSource for InstantTimeSrc {
+    fn now_nanos(&self) -> u64 {
+        // Would need to use an epoch like RealTime does
+        // Currently this is buggy and would return ~0
+        let elapsed = Instant::now().elapsed();
+        elapsed.as_nanos() as u64
+    }
+
+    fn sleep(&self, duration: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+
+    fn sleep_until(&self, deadline_nanos: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let now = Instant::now().elapsed().as_nanos() as u64;
+        if deadline_nanos <= now {
+            Box::pin(std::future::ready(()))
+        } else {
+            let duration = Duration::from_nanos(deadline_nanos - now);
+            Box::pin(tokio::time::sleep(duration))
+        }
+    }
+
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        Box::pin(async move { tokio::time::timeout(duration, future).await.ok() })
+    }
+}
+*/
+
 /// A time source that caches the current time in a global state to reduce
 /// overhead in performance-critical sections.
 ///

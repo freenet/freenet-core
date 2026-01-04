@@ -303,7 +303,7 @@ mod tests {
 
         // Check resend action for lost packets
         // Packets now use effective_rto() for timeout (not MESSAGE_CONFIRMATION_TIMEOUT)
-        sent_tracker.time_source.advance_time(effective_rto);
+        sent_tracker.time_source.advance(effective_rto);
         for id in [2, 4] {
             match sent_tracker.get_resend() {
                 ResendAction::Resend(packet_id, packet) => {
