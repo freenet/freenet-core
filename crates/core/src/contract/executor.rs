@@ -690,14 +690,31 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// The type parameters are:
 /// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
 /// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
+// Type alias for shared notification storage (used by RuntimePool)
+// Uses std::sync::RwLock (not tokio) because it needs to be accessible from sync contexts
+type SharedNotifications = Arc<
+    std::sync::RwLock<
+        HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
+    >,
+>;
+
+// Type alias for shared subscriber summaries (used by RuntimePool)
+type SharedSummaries = Arc<
+    std::sync::RwLock<
+        HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
+    >,
+>;
+
 pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     mode: OperationMode,
     runtime: R,
     pub state_store: StateStore<S>,
     /// Notification channels for any clients subscribed to updates for a given contract.
+    /// Used when executor is standalone (not in a pool).
     update_notifications:
         HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
     /// Summaries of the state of all clients subscribed to a given contract.
+    /// Used when executor is standalone (not in a pool).
     subscriber_summaries:
         HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
     /// Attested contract instances for a given delegate.
@@ -709,6 +726,14 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     op_sender: Option<OpRequestSender>,
     /// Reference to the operation manager for initiating operations.
     op_manager: Option<Arc<OpManager>>,
+
+    /// Shared notification storage at pool level (when running in a pool).
+    /// When present, this is used instead of per-executor update_notifications
+    /// to ensure subscriptions registered while an executor is checked out are
+    /// still notified when that executor processes updates.
+    shared_notifications: Option<SharedNotifications>,
+    /// Shared subscriber summaries at pool level (when running in a pool).
+    shared_summaries: Option<SharedSummaries>,
 }
 
 impl<R, S> Executor<R, S>
@@ -738,6 +763,8 @@ where
             init_tracker: ContractInitTracker::new(),
             op_sender,
             op_manager,
+            shared_notifications: None,
+            shared_summaries: None,
         })
     }
 
@@ -749,6 +776,18 @@ where
             "freenet-executor-{identifier}-{}-{unique_id}",
             std::process::id()
         ))
+    }
+
+    /// Set shared notification storage for pool-based operation.
+    /// When set, notifications will be sent via shared storage instead of per-executor storage.
+    /// This ensures subscriptions registered while this executor is checked out are still notified.
+    pub(crate) fn set_shared_notifications(
+        &mut self,
+        notifications: SharedNotifications,
+        summaries: SharedSummaries,
+    ) {
+        self.shared_notifications = Some(notifications);
+        self.shared_summaries = Some(summaries);
     }
 
     /// Create all stores including StateStore. Used when creating a standalone executor.
