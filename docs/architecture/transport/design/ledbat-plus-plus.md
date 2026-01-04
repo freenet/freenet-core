@@ -386,13 +386,27 @@ Mobile devices and multi-homed hosts can change network paths during a connectio
 We detect this by monitoring base_delay changes:
 
 ```rust
-// Path changed if RTT differs by >50%
-let path_changed = if exit_base_delay_nanos > 0 && current_base_delay_nanos > 0 {
-    let ratio = current_base_delay_nanos as f64 / exit_base_delay_nanos as f64;
-    ratio > 1.5 || ratio < 0.67  // >50% change in either direction
-} else {
-    false
-};
+/// Constant defining the path change threshold (50% RTT shift)
+const PATH_CHANGE_RTT_THRESHOLD: f64 = 1.5;
+
+/// Helper method to detect significant path changes
+fn has_path_changed(&self, exit_base_delay_nanos: u64) -> bool {
+    let current_base_delay_nanos = self.base_delay().as_nanos() as u64;
+
+    if exit_base_delay_nanos == 0 || current_base_delay_nanos == 0 {
+        return false;
+    }
+
+    // Compute symmetric ratio: max/min ensures ratio >= 1.0
+    // This detects >50% change in either direction
+    let ratio = if current_base_delay_nanos > exit_base_delay_nanos {
+        current_base_delay_nanos as f64 / exit_base_delay_nanos as f64
+    } else {
+        exit_base_delay_nanos as f64 / current_base_delay_nanos as f64
+    };
+
+    ratio > PATH_CHANGE_RTT_THRESHOLD
+}
 ```
 
 When a path change is detected, the BDP proxy is considered stale and is not used.
@@ -426,22 +440,28 @@ The adaptive floor uses a priority system:
 #### 4.6.4 Implementation Details
 
 ```rust
+/// RTT-based scaling factor: 1KB per millisecond of base RTT
+const RTT_SCALING_BYTES_PER_MS: usize = 1024;
+
 fn calculate_adaptive_floor(&self) -> usize {
     let spec_floor = self.min_cwnd * 2;  // RFC 6817 §2.4.2: always >= 2*SMSS
 
     // Priority 1: Explicit configuration
     if let Some(explicit_min) = self.min_ssthresh {
+        let path_changed = self.has_path_changed(exit_base_delay_nanos);
+
         // RTT-based scaling within configured bounds
         let adaptive = if slow_start_exit > 0 && !path_changed {
             slow_start_exit.min(explicit_min)
         } else {
-            (base_delay_ms * 1024).min(explicit_min)  // 1KB per ms of RTT
+            let base_delay_ms = self.base_delay().as_millis() as usize;
+            (base_delay_ms * RTT_SCALING_BYTES_PER_MS).min(explicit_min)
         };
         return adaptive.max(explicit_min).max(spec_floor);
     }
 
     // Priority 2: BDP proxy (if available and path unchanged)
-    if slow_start_exit > 0 && !path_changed {
+    if slow_start_exit > 0 && !self.has_path_changed(exit_base_delay_nanos) {
         return slow_start_exit.min(initial_ssthresh).max(spec_floor);
     }
 
