@@ -893,6 +893,12 @@ impl<T: TimeSource> LedbatController<T> {
         self.peak_cwnd.load(Ordering::Relaxed)
     }
 
+    /// Get elapsed time in nanoseconds since controller creation (for testing).
+    #[cfg(test)]
+    pub fn elapsed_nanos(&self) -> u64 {
+        self.time_source.now_nanos() - self.epoch_nanos
+    }
+
     /// Calculate dynamic GAIN based on base delay (LEDBAT++ Section 4.2)
     ///
     /// GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
@@ -3573,7 +3579,7 @@ mod tests {
         let slowdown_duration = controller
             .last_slowdown_duration_nanos
             .load(Ordering::Acquire);
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
         let next_interval = next_slowdown.saturating_sub(now_nanos);
 
@@ -3628,7 +3634,7 @@ mod tests {
         let controller = LedbatController::new_with_config(config);
 
         // Simulate having just started a slowdown (set phase_start to now)
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         controller
             .slowdown_phase_start_nanos
             .store(now_nanos, Ordering::Release);
@@ -3638,7 +3644,7 @@ mod tests {
 
         // Call complete_slowdown immediately (simulating very short slowdown_duration)
         // This is the scenario that caused the bug
-        let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let completion_nanos = controller.elapsed_nanos();
         controller.complete_slowdown(completion_nanos, high_latency_rtt);
 
         // Get the scheduled next slowdown time
@@ -3715,7 +3721,7 @@ mod tests {
         let controller = LedbatController::new_with_config(config);
 
         // Set up state: cwnd is below skip threshold, next slowdown is due NOW
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         controller
             .next_slowdown_time_nanos
             .store(now_nanos, Ordering::Release);
@@ -5024,12 +5030,12 @@ mod tests {
             controller.base_delay_history.update(rtt);
 
             // Simulate immediate slowdown completion
-            let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            let now_nanos = controller.elapsed_nanos();
             controller
                 .slowdown_phase_start_nanos
                 .store(now_nanos, Ordering::Release);
 
-            let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            let completion_nanos = controller.elapsed_nanos();
             controller.complete_slowdown(completion_nanos, rtt);
 
             let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
@@ -7886,7 +7892,7 @@ mod tests {
 
                 // Trigger initial slowdown
                 controller.congestion_state.enter_in_slowdown();
-                let start_nanos = controller.epoch.elapsed().as_nanos() as u64;
+                let start_nanos = controller.elapsed_nanos();
                 controller.slowdown_phase_start_nanos.store(start_nanos, Ordering::Release);
 
                 // Complete slowdown with a very short duration (simulating quick ramp-up)
