@@ -4,6 +4,8 @@ use std::fmt::Display;
 use std::hash::Hasher;
 use std::ops::Add;
 
+use crate::config::GlobalRng;
+
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -50,9 +52,7 @@ impl Location {
 
     /// Returns a new random location.
     pub fn random() -> Self {
-        use rand::prelude::*;
-        let mut rng = rand::rng();
-        Location(rng.random_range(0.0..=1.0))
+        Location(GlobalRng::random_range(0.0..=1.0))
     }
 
     /// Compute the distance between two locations.

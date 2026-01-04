@@ -25,7 +25,10 @@ use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError, VisitedPeers};
 use crate::ring::KnownPeerKeyLocation;
 use crate::tracing::NetEventLog;
-use crate::{config::GlobalExecutor, contract::StoreResponse};
+use crate::{
+    config::{GlobalExecutor, GlobalRng},
+    contract::StoreResponse,
+};
 
 // pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
 pub(crate) mod combinator;
@@ -103,10 +106,8 @@ impl AuthToken {
     }
 
     pub fn generate() -> AuthToken {
-        use rand::Rng;
-        let mut rng = rand::rng();
         let mut token = [0u8; 32];
-        rng.fill(&mut token);
+        GlobalRng::fill_bytes(&mut token);
         let token_str = bs58::encode(token).into_string();
         AuthToken::from(token_str)
     }

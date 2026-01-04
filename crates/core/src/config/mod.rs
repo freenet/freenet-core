@@ -1540,6 +1540,147 @@ impl GlobalExecutor {
     }
 }
 
+// =============================================================================
+// GlobalRng - Deterministic RNG abstraction for simulation testing
+// =============================================================================
+
+use parking_lot::Mutex;
+use rand::{Rng, RngCore, SeedableRng};
+use rand::rngs::SmallRng;
+
+/// Global seed for deterministic simulation.
+/// Set this before any RNG operations to ensure reproducibility.
+static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
+
+// Thread-local seeded RNG for deterministic operations.
+// Each thread gets its own RNG seeded from the global seed + thread ID.
+std::thread_local! {
+    static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Global RNG abstraction for deterministic simulation testing.
+///
+/// In production mode (no seed set), this delegates to the system RNG.
+/// In simulation mode (seed set via `set_seed`), this uses a deterministic
+/// seeded RNG that produces reproducible results.
+///
+/// # Usage
+/// ```ignore
+/// use freenet::config::GlobalRng;
+///
+/// // Production: uses system randomness
+/// let value = GlobalRng::random_range(0..100);
+///
+/// // Simulation: set seed for reproducibility
+/// GlobalRng::set_seed(0xDEADBEEF);
+/// let value = GlobalRng::random_range(0..100); // Always same result
+/// ```
+pub struct GlobalRng;
+
+impl GlobalRng {
+    /// Sets the global seed for deterministic RNG.
+    /// Call this at test/simulation startup for reproducibility.
+    pub fn set_seed(seed: u64) {
+        *SIMULATION_SEED.lock() = Some(seed);
+        // Clear thread-local RNG so it gets re-seeded
+        THREAD_RNG.with(|rng| {
+            *rng.borrow_mut() = None;
+        });
+    }
+
+    /// Clears the simulation seed, reverting to system RNG.
+    pub fn clear_seed() {
+        *SIMULATION_SEED.lock() = None;
+        THREAD_RNG.with(|rng| {
+            *rng.borrow_mut() = None;
+        });
+    }
+
+    /// Returns true if a simulation seed is set.
+    pub fn is_seeded() -> bool {
+        SIMULATION_SEED.lock().is_some()
+    }
+
+    /// Executes a closure with access to the global RNG.
+    /// Uses seeded RNG if set, otherwise system RNG.
+    #[inline]
+    pub fn with_rng<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut dyn RngCore) -> R,
+    {
+        if let Some(seed) = *SIMULATION_SEED.lock() {
+            // Simulation mode: use thread-local seeded RNG
+            THREAD_RNG.with(|rng_cell| {
+                let mut rng_ref = rng_cell.borrow_mut();
+                if rng_ref.is_none() {
+                    // Seed with global seed XOR'd with thread ID for uniqueness
+                    let thread_id = std::thread::current().id();
+                    let thread_seed = seed ^ (format!("{:?}", thread_id).len() as u64);
+                    *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
+                }
+                f(rng_ref.as_mut().unwrap())
+            })
+        } else {
+            // Production mode: use system RNG
+            f(&mut rand::rng())
+        }
+    }
+
+    /// Generate a random value in the given range.
+    #[inline]
+    pub fn random_range<T, R>(range: R) -> T
+    where
+        T: rand::distr::uniform::SampleUniform,
+        R: rand::distr::uniform::SampleRange<T>,
+    {
+        Self::with_rng(|rng| rng.random_range(range))
+    }
+
+    /// Generate a random boolean with the given probability of being true.
+    #[inline]
+    pub fn random_bool(probability: f64) -> bool {
+        Self::with_rng(|rng| rng.random_bool(probability))
+    }
+
+    /// Choose a random element from a slice.
+    #[inline]
+    pub fn choose<'a, T>(slice: &'a [T]) -> Option<&'a T> {
+        if slice.is_empty() {
+            None
+        } else {
+            let idx = Self::random_range(0..slice.len());
+            Some(&slice[idx])
+        }
+    }
+
+    /// Shuffle a slice in place.
+    #[inline]
+    pub fn shuffle<T>(slice: &mut [T]) {
+        Self::with_rng(|rng| {
+            use rand::seq::SliceRandom;
+            slice.shuffle(rng);
+        })
+    }
+
+    /// Fill a byte slice with random data.
+    #[inline]
+    pub fn fill_bytes(dest: &mut [u8]) {
+        Self::with_rng(|rng| rng.fill_bytes(dest))
+    }
+
+    /// Generate a random u64.
+    #[inline]
+    pub fn random_u64() -> u64 {
+        Self::with_rng(|rng| rng.random())
+    }
+
+    /// Generate a random u32.
+    #[inline]
+    pub fn random_u32() -> u32 {
+        Self::with_rng(|rng| rng.random())
+    }
+}
+
 pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: Option<String>) {
     #[cfg(feature = "trace")]
     {

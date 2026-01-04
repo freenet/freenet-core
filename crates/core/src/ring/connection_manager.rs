@@ -1,11 +1,11 @@
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use rand::prelude::IndexedRandom;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::config::GlobalRng;
 use crate::topology::{Limits, TopologyManager};
 
 use super::*;
@@ -748,7 +748,7 @@ impl ConnectionManager {
         let candidates: Vec<PeerKeyLocation> = connections
             .values()
             .filter_map(|conns| {
-                let conn = conns.choose(&mut rand::rng())?;
+                let conn = GlobalRng::choose(conns)?;
                 let addr = conn.location.socket_addr()?;
                 if self.is_transient(addr) {
                     return None;
