@@ -5,8 +5,12 @@ on:
     # Run at 3 AM UTC every day
     - cron: '0 3 * * *'
   workflow_dispatch:
-    # Allow manual triggering
+    # Allow manual triggering from any branch
     inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI.'
+        required: false
+        default: ''
       madsim_seed:
         description: 'MadSim seed for reproducibility (hex, e.g., 0xDEADBEEF)'
         required: false
@@ -35,6 +39,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Show checked out ref
+        run: |
+          echo "Checked out ref: $(git rev-parse --abbrev-ref HEAD || git rev-parse HEAD)"
+          echo "Commit: $(git rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,6 +95,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
