@@ -555,6 +555,7 @@ impl std::error::Error for InsertError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use crate::simulation::VirtualTime;
     use std::time::Duration;
 

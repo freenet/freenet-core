@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{GlobalExecutor, PCK_VERSION};
-use crate::transport::crypto::intro_packet_size;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::symmetric_message::OutboundConnection;

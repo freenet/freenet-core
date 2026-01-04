@@ -249,6 +249,7 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
+    use crate::config::GlobalExecutor;
     use crate::simulation::RealTime;
     use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
