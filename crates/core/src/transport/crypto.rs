@@ -22,6 +22,7 @@ pub const PACKET_TYPE_SIZE: usize = 1;
 
 /// Size of encrypted intro packet:
 /// packet_type (1) + ephemeral_public (32) + encrypted_data + tag (16)
+#[allow(dead_code)] // Used in tests and as public API
 pub const fn intro_packet_size(plaintext_len: usize) -> usize {
     PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + plaintext_len + CHACHA_TAG_SIZE
 }

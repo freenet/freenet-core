@@ -239,6 +239,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
     }
 
     /// Check if this is a symmetric packet by examining the packet type discriminator.
+    #[allow(dead_code)] // Provides API completeness, may be used in future
     pub(super) fn is_symmetric_packet(&self) -> bool {
         self.packet_type() == Some(PACKET_TYPE_SYMMETRIC)
     }
@@ -421,7 +422,7 @@ mod packet_type_discrimination_tests {
     #[test]
     fn test_packet_type_with_invalid_type_byte() {
         let invalid_packet = [0xFFu8; 100]; // Invalid type 0xFF
-        let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&invalid_packet);
+        let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(invalid_packet);
 
         assert_eq!(
             packet.packet_type(),
@@ -441,7 +442,7 @@ mod packet_type_discrimination_tests {
     #[test]
     fn test_packet_type_with_empty_packet() {
         let empty: [u8; 0] = [];
-        let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&empty);
+        let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(empty);
 
         assert_eq!(
             packet.packet_type(),
