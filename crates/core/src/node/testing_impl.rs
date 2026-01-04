@@ -1201,7 +1201,10 @@ impl SimNetwork {
         // before gateways are ready to receive connections
         let registration_timeout = Duration::from_secs(10);
         let poll_interval = Duration::from_millis(10);
-        let start = std::time::Instant::now();
+        // Use tokio::time::Instant instead of std::time::Instant to work correctly
+        // with start_paused = true in tests. std::time::Instant uses wall-clock time
+        // which doesn't advance when tokio's time is paused.
+        let start = tokio::time::Instant::now();
 
         'wait_loop: loop {
             let mut all_registered = true;
