@@ -55,18 +55,31 @@ jobs:
           prefix-key: bench
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Download baseline from main branch for comparison
-      # PRs compare against main's baseline; main branch updates the baseline
-      # Note: Cache keys include SHA so each main commit creates a new baseline
-      # restore-keys finds the most recent baseline from main
-      - name: Download main branch baseline
+      # Determine baseline commit (merge-base for PRs, current SHA for main)
+      # This eliminates false positives from "missing recent improvements"
+      - name: Determine Baseline Commit
+        id: baseline-commit
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For PRs: use merge-base (where branch diverged from main)
+            BASE_SHA=$(git merge-base origin/${{ github.base_ref }} HEAD)
+            echo "📍 Using merge-base for PR: $BASE_SHA"
+          else
+            # For main branch: use current commit
+            BASE_SHA=${{ github.sha }}
+            echo "📍 Using current commit for main: $BASE_SHA"
+          fi
+          echo "sha=$BASE_SHA" >> $GITHUB_OUTPUT
+
+      # Download baseline from merge-base commit (eliminates stale baseline problem)
+      - name: Download Baseline from Merge-Base
         id: baseline-cache
         uses: actions/cache/restore@v5
         with:
           path: target/criterion
-          # Try to find an exact match first (won't happen for PRs)
-          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
-          # Fall back to most recent main branch baseline
+          # Try exact match with merge-base SHA
+          key: criterion-baseline-main-${{ runner.os }}-${{ steps.baseline-commit.outputs.sha }}
+          # Fall back to recent main baseline if merge-base not cached
           restore-keys: |
             criterion-baseline-main-${{ runner.os }}-
 
@@ -107,16 +120,14 @@ jobs:
       - name: Run Transport Layer Benchmarks
         id: bench_transport
         run: |
-          echo "## Transport Layer Performance" >> $GITHUB_STEP_SUMMARY
+          echo "## Transport Layer Performance (Streamlined)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "These benchmarks test the actual transport code with mock sockets:" >> $GITHUB_STEP_SUMMARY
-          echo "- **Allocation overhead**: Packet allocation, fragmentation, preparation" >> $GITHUB_STEP_SUMMARY
-          echo "- **Crypto operations**: AES-GCM encrypt/decrypt, nonce generation" >> $GITHUB_STEP_SUMMARY
-          echo "- **Serialization**: Packet serialization performance" >> $GITHUB_STEP_SUMMARY
-          echo "- **Channel throughput**: Async message passing (mock I/O)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Connection establishment**: Full handshake timing" >> $GITHUB_STEP_SUMMARY
-          echo "- **Message throughput**: Full pipeline (serialize → encrypt → channel → decrypt)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Streaming buffer**: Lock-free buffer operations" >> $GITHUB_STEP_SUMMARY
+          echo "Focused on what matters - sustained throughput and critical paths:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Warm connection throughput**: Sustained bulk transfer (PRIMARY METRIC)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Connection establishment**: Cold-start handshake timing" >> $GITHUB_STEP_SUMMARY
+          echo "- **Streaming buffer**: Lock-free buffer operations (critical path)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note**: Micro-benchmarks moved to \`transport_extended\` (runs nightly)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run transport benchmarks (requires bench feature)
