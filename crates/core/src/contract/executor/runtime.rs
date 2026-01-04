@@ -6,10 +6,27 @@ use super::{
 };
 use crate::node::OpManager;
 use freenet_stdlib::prelude::RelatedContract;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
+
+// Type alias for shared notification storage
+// Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
+// never during WASM execution (get_state_delta)
+type SharedNotifications = Arc<
+    RwLock<
+        HashMap<
+            ContractInstanceId,
+            Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>,
+        >,
+    >,
+>;
+
+// Type alias for shared subscriber summaries
+type SharedSummaries =
+    Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
 
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
@@ -73,6 +90,12 @@ pub struct RuntimePool {
     replacements_count: AtomicUsize,
     /// Shared StateStore used by all executors (ReDb uses exclusive file locking)
     shared_state_store: StateStore<Storage>,
+    /// Shared notification channels for all subscribed clients.
+    /// Stored at pool level to avoid race condition where subscriptions registered
+    /// while an executor is checked out would be missed by that executor.
+    shared_notifications: SharedNotifications,
+    /// Shared subscriber summaries for computing deltas.
+    shared_summaries: SharedSummaries,
 }
 
 impl RuntimePool {
@@ -94,14 +117,24 @@ impl RuntimePool {
 
         let (_, _, _, shared_state_store) = Executor::<Runtime>::get_stores(&config).await?;
 
+        // Create shared notification storage BEFORE creating executors
+        // so we can pass references to each executor
+        let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
+        let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
+
         for i in 0..pool_size_usize {
-            let executor = Executor::from_config_with_shared_store(
+            let mut executor = Executor::from_config_with_shared_store(
                 config.clone(),
                 shared_state_store.clone(),
                 Some(op_sender.clone()),
                 Some(op_manager.clone()),
             )
             .await?;
+
+            // Set shared notification storage so this executor uses pool-level storage
+            executor
+                .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+
             runtimes.push(Some(executor));
 
             // Yield to prevent async starvation during CPU-intensive WASM engine creation
@@ -122,6 +155,8 @@ impl RuntimePool {
             checked_out: AtomicUsize::new(0),
             replacements_count: AtomicUsize::new(0),
             shared_state_store,
+            shared_notifications,
+            shared_summaries,
         })
     }
 
@@ -235,13 +270,21 @@ impl RuntimePool {
     /// Uses the shared StateStore to avoid opening a new database connection.
     async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
         tracing::warn!("Creating replacement executor due to previous failure");
-        Executor::from_config_with_shared_store(
+        let mut executor = Executor::from_config_with_shared_store(
             self.config.clone(),
             self.shared_state_store.clone(),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
         )
-        .await
+        .await?;
+
+        // Set shared notification storage so the replacement executor uses pool-level storage
+        executor.set_shared_notifications(
+            self.shared_notifications.clone(),
+            self.shared_summaries.clone(),
+        );
+
+        Ok(executor)
     }
 }
 
@@ -337,27 +380,48 @@ impl ContractExecutor for RuntimePool {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        // Register with all available executors to ensure notifications work
-        // regardless of which executor handles subsequent operations
+        // Register in shared storage at pool level.
+        // This ensures notifications work regardless of which executor is checked out
+        // when the subscription is registered or when updates arrive.
         let owned_summary = summary.map(StateSummary::into_owned);
 
-        let last_error = self
-            .runtimes
-            .iter_mut()
-            .flatten()
-            .filter_map(|executor| {
-                executor
-                    .register_contract_notifier(
-                        instance_id,
-                        cli_id,
-                        notification_ch.clone(),
-                        owned_summary.clone(),
-                    )
-                    .err()
-            })
-            .last();
+        // Brief lock acquisition for registration (fast operation)
+        let mut notifications = self.shared_notifications.write().unwrap();
+        let channels = notifications.entry(instance_id).or_default();
 
-        last_error.map_or(Ok(()), Err)
+        // Check if this client is already registered
+        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
+            let (_, existing_ch) = &channels[i];
+            if !existing_ch.same_channel(&notification_ch) {
+                // Client reconnected with new channel, update it
+                channels[i] = (cli_id, notification_ch);
+                tracing::debug!(
+                    client = %cli_id,
+                    contract = %instance_id,
+                    "Updated notification channel for existing subscription"
+                );
+            }
+        } else {
+            // Insert in sorted order for efficient lookup
+            let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
+            channels.insert(insert_pos, (cli_id, notification_ch));
+            tracing::debug!(
+                client = %cli_id,
+                contract = %instance_id,
+                total_subscribers = channels.len(),
+                "Registered new subscription in shared pool storage"
+            );
+        }
+        drop(notifications); // Explicitly release lock before acquiring the next
+
+        // Also register the summary
+        let mut summaries = self.shared_summaries.write().unwrap();
+        summaries
+            .entry(instance_id)
+            .or_default()
+            .insert(cli_id, owned_summary);
+
+        Ok(())
     }
 
     fn execute_delegate_request(
@@ -382,16 +446,20 @@ impl ContractExecutor for RuntimePool {
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
-        // Collect subscription info from all executors, deduplicating by (instance_id, client_id).
-        // Subscriptions are intentionally registered with ALL executors to ensure notifications
-        // work regardless of which executor handles subsequent operations, but we only want to
-        // report each unique subscription once.
-        let mut seen = std::collections::HashSet::new();
-        self.runtimes
+        // Read subscription info from shared storage at pool level
+        // Brief read lock - just iterating over data
+        let notifications = self.shared_notifications.read().unwrap();
+        notifications
             .iter()
-            .flatten()
-            .flat_map(|executor| executor.get_subscription_info())
-            .filter(|sub| seen.insert((sub.instance_id, sub.client_id)))
+            .flat_map(|(instance_id, clients)| {
+                clients
+                    .iter()
+                    .map(move |(client_id, _)| crate::message::SubscriptionInfo {
+                        instance_id: *instance_id,
+                        client_id: *client_id,
+                        last_update: None, // Pool doesn't track last update time
+                    })
+            })
             .collect()
     }
 }
@@ -1998,16 +2066,44 @@ impl Executor<Runtime> {
         tracing::debug!(contract = %key, "notify of contract update");
         let key = *key;
         let instance_id = *key.id();
-        if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
-            let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
-            // in general there should be less than 32 failures
+
+        // Check if we're using shared storage (pool mode) or per-executor storage (standalone mode)
+        if let (Some(shared_notifications), Some(shared_summaries)) = (
+            self.shared_notifications.as_ref(),
+            self.shared_summaries.as_ref(),
+        ) {
+            // Use shared pool-level storage for notifications
+            // This ensures subscriptions registered while this executor was checked out are notified
+            //
+            // CRITICAL: We use the snapshot pattern to avoid holding locks during WASM execution.
+            // Locks are only held briefly during clone, never during get_state_delta.
+
+            // Step 1: Clone notifiers and summaries under minimal lock scope (fast)
+            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> = {
+                let notifications = shared_notifications.read().unwrap();
+                match notifications.get(&instance_id) {
+                    Some(notifiers) => notifiers.clone(),
+                    None => return Ok(()), // No subscribers for this contract
+                }
+            };
+
+            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> = {
+                let summaries = shared_summaries.read().unwrap();
+                summaries.get(&instance_id).cloned().unwrap_or_default()
+            };
+            // Locks released here - snapshot complete
+
+            // Step 2: Process notifications WITHOUT holding any locks
+            // get_state_delta() calls WASM which can be slow
             let mut failures = Vec::with_capacity(32);
-            for (peer_key, notifier) in notifiers.iter() {
-                let peer_summary = summaries.get_mut(peer_key).unwrap();
+
+            for (peer_key, notifier) in &notifiers_snapshot {
+                let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
+
                 let update = match peer_summary {
                     Some(summary) => self
                         .runtime
-                        .get_state_delta(&key, params, new_state, &*summary)
+                        .get_state_delta(&key, params, new_state, summary)
                         .map_err(|err| {
                             tracing::error!("{err}");
                             ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
@@ -2016,6 +2112,7 @@ impl Executor<Runtime> {
                         .into(),
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
+
                 if let Err(err) =
                     notifier.send(Ok(
                         ContractResponse::UpdateNotification { key, update }.into()
@@ -2026,20 +2123,82 @@ impl Executor<Runtime> {
                         client = %peer_key,
                         contract = %key,
                         error = %err,
-                        phase = "notification_send_failed",
-                        "Failed to send update notification to client"
+                        phase = "notification_send_failed_shared",
+                        "Failed to send update notification to client (shared storage)"
                     );
                 } else {
                     tracing::debug!(
                         client = %peer_key,
                         contract = %key,
-                        phase = "notification_sent",
-                        "Sent update notification to client"
+                        phase = "notification_sent_shared",
+                        "Sent update notification to client (shared storage)"
                     );
                 }
             }
+
+            // Step 3: Clean up failed notifiers under separate brief lock acquisition
             if !failures.is_empty() {
-                notifiers.retain(|(c, _)| !failures.contains(c));
+                let mut notifications = shared_notifications.write().unwrap();
+                if let Some(notifiers) = notifications.get_mut(&instance_id) {
+                    notifiers.retain(|(c, _)| !failures.contains(c));
+                }
+                drop(notifications);
+
+                // Also clean up orphaned summaries for failed clients
+                let mut summaries = shared_summaries.write().unwrap();
+                if let Some(contract_summaries) = summaries.get_mut(&instance_id) {
+                    for failed_client in &failures {
+                        contract_summaries.remove(failed_client);
+                    }
+                }
+            }
+        } else {
+            // Fallback to per-executor storage (standalone mode, tests, etc.)
+            if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
+                let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
+                let mut failures = Vec::with_capacity(32);
+
+                for (peer_key, notifier) in notifiers.iter() {
+                    let peer_summary = summaries.get_mut(peer_key).unwrap();
+                    let update = match peer_summary {
+                        Some(summary) => self
+                            .runtime
+                            .get_state_delta(&key, params, new_state, &*summary)
+                            .map_err(|err| {
+                                tracing::error!("{err}");
+                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                            })?
+                            .to_owned()
+                            .into(),
+                        None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                    };
+
+                    if let Err(err) =
+                        notifier.send(Ok(
+                            ContractResponse::UpdateNotification { key, update }.into()
+                        ))
+                    {
+                        failures.push(*peer_key);
+                        tracing::error!(
+                            client = %peer_key,
+                            contract = %key,
+                            error = %err,
+                            phase = "notification_send_failed",
+                            "Failed to send update notification to client"
+                        );
+                    } else {
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_sent",
+                            "Sent update notification to client"
+                        );
+                    }
+                }
+
+                if !failures.is_empty() {
+                    notifiers.retain(|(c, _)| !failures.contains(c));
+                }
             }
         }
         Ok(())
