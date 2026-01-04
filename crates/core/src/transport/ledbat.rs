@@ -628,6 +628,14 @@ pub struct LedbatController<T: TimeSource + Clone = InstantTimeSrc> {
     /// Slow start threshold (bytes)
     ssthresh: AtomicUsize,
 
+    /// Initial ssthresh value (bytes) - used as a floor to prevent death spiral.
+    ///
+    /// When timeouts reset ssthresh, we use this as a minimum floor to ensure
+    /// the controller can still achieve reasonable throughput on high-BDP paths.
+    /// Without this, repeated timeouts could collapse ssthresh to ~5KB, causing
+    /// slow start to exit almost immediately and crippling throughput.
+    initial_ssthresh: usize,
+
     // ===== Unified Congestion State Machine =====
     /// Current congestion control state. This single field replaces the previous
     /// `in_slow_start` boolean and `SlowdownState` enum, ensuring unambiguous
@@ -788,6 +796,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
             epoch,
             bytes_acked_since_update: AtomicUsize::new(0),
             ssthresh: AtomicUsize::new(ssthresh),
+            initial_ssthresh: ssthresh,
             // Unified congestion state: start in SlowStart or CongestionAvoidance
             congestion_state: AtomicCongestionState::new(if config.enable_slow_start {
                 CongestionState::SlowStart
@@ -1386,8 +1395,13 @@ impl<T: TimeSource + Clone> LedbatController<T> {
     ///
     /// This follows standard TCP RTO recovery behavior (RFC 5681):
     /// - Reset cwnd to min_cwnd
-    /// - Set ssthresh to max(old_cwnd/2, 2*min_cwnd)
+    /// - Set ssthresh to max(old_cwnd/2, initial_ssthresh)
     /// - Enter SlowStart state for exponential recovery
+    ///
+    /// The floor uses `initial_ssthresh` (typically 1MB) rather than `2*min_cwnd`
+    /// (~5KB) to prevent the "death spiral" on high-BDP paths. Without this floor,
+    /// repeated timeouts could collapse ssthresh to ~5KB, causing slow start to
+    /// exit almost immediately and crippling throughput on paths with >100ms RTT.
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
@@ -1399,8 +1413,10 @@ impl<T: TimeSource + Clone> LedbatController<T> {
         self.cwnd.store(new_cwnd, Ordering::Release);
 
         // Set ssthresh to half the pre-timeout cwnd (standard TCP RTO recovery)
-        // Floor at 2*min_cwnd to ensure reasonable recovery target
-        let new_ssthresh = (old_cwnd / 2).max(self.min_cwnd * 2);
+        // Floor at initial_ssthresh to prevent death spiral on high-BDP paths.
+        // Using initial_ssthresh (typically 1MB) instead of 2*min_cwnd (~5KB)
+        // ensures slow start can still achieve reasonable throughput after recovery.
+        let new_ssthresh = (old_cwnd / 2).max(self.initial_ssthresh);
         self.ssthresh.store(new_ssthresh, Ordering::Release);
 
         // Transition to SlowStart for fast (exponential) recovery.
@@ -4925,12 +4941,15 @@ mod tests {
             "Should transition to SlowStart on timeout for fast recovery"
         );
 
-        // ssthresh should be set to half the pre-timeout cwnd
-        let expected_ssthresh = pre_timeout_cwnd / 2;
+        // ssthresh should be max(old_cwnd/2, initial_ssthresh) to prevent death spiral
+        // With initial_ssthresh=50000 and pre_timeout_cwnd=80000:
+        // max(80000/2, 50000) = max(40000, 50000) = 50000
+        let initial_ssthresh = 50_000;
+        let expected_ssthresh = (pre_timeout_cwnd / 2).max(initial_ssthresh);
         assert_eq!(
             ssthresh_after, expected_ssthresh,
-            "ssthresh should be half the pre-timeout cwnd ({}/2 = {})",
-            pre_timeout_cwnd, expected_ssthresh
+            "ssthresh should be max(cwnd/2, initial_ssthresh) = max({}/2, {}) = {}",
+            pre_timeout_cwnd, initial_ssthresh, expected_ssthresh
         );
     }
 
@@ -4984,12 +5003,15 @@ mod tests {
             "Should transition to SlowStart on timeout for fast recovery"
         );
 
-        // ssthresh should be set to half the pre-timeout cwnd
-        let expected_ssthresh = pre_timeout_cwnd / 2;
+        // ssthresh should be max(old_cwnd/2, initial_ssthresh) to prevent death spiral
+        // With initial_ssthresh=50000 and pre_timeout_cwnd=60000:
+        // max(60000/2, 50000) = max(30000, 50000) = 50000
+        let initial_ssthresh = 50_000;
+        let expected_ssthresh = (pre_timeout_cwnd / 2).max(initial_ssthresh);
         assert_eq!(
             ssthresh_after, expected_ssthresh,
-            "ssthresh should be half the pre-timeout cwnd ({}/2 = {})",
-            pre_timeout_cwnd, expected_ssthresh
+            "ssthresh should be max(cwnd/2, initial_ssthresh) = max({}/2, {}) = {}",
+            pre_timeout_cwnd, initial_ssthresh, expected_ssthresh
         );
     }
 
@@ -5036,6 +5058,103 @@ mod tests {
             state_after,
             CongestionState::SlowStart,
             "Should transition to SlowStart on timeout"
+        );
+    }
+
+    /// Test that repeated timeouts don't collapse ssthresh to an unusably small value.
+    ///
+    /// This is a regression test for issue #2578 (LEDBAT death spiral).
+    ///
+    /// On high-BDP paths (e.g., 135ms RTT between US and EU), the initial ssthresh
+    /// of 1MB allows slow start to reach useful throughput (~60 Mbit/s). However,
+    /// if timeouts reduce ssthresh to a tiny floor (like 2*min_cwnd ≈ 5KB), slow
+    /// start exits almost immediately and throughput collapses.
+    ///
+    /// The test verifies that after repeated timeouts (simulating network disruption),
+    /// ssthresh remains high enough to achieve reasonable throughput on high-BDP paths.
+    ///
+    /// This is a general test for LEDBAT recovery behavior, not specific to any
+    /// particular ssthresh value. It checks the fundamental property that repeated
+    /// timeouts shouldn't permanently cripple the controller's ability to ramp up.
+    #[test]
+    fn test_repeated_timeouts_maintain_usable_ssthresh_floor() {
+        // Simulate a high-BDP path with 135ms RTT (US to EU)
+        let high_bdp_rtt = Duration::from_millis(135);
+
+        // Calculate minimum useful ssthresh for this path:
+        // At 135ms RTT, to achieve 1 Mbit/s, we need cwnd = rate * RTT
+        // 1 Mbit/s = 125,000 bytes/s, so cwnd = 125,000 * 0.135 = ~17KB
+        // For 10 Mbit/s (a reasonable baseline), we need ~170KB ssthresh
+        // We use 100KB as a conservative floor for "usable" throughput
+        let min_useful_ssthresh = 100 * 1024; // 100 KB
+
+        let config = LedbatConfig {
+            initial_cwnd: 38_000, // IW26 (standard)
+            min_cwnd: 2_848,      // 2 * MSS
+            max_cwnd: 10_000_000, // 10 MB
+            ssthresh: 1_048_576,  // 1 MB (high for high-BDP paths)
+            enable_slow_start: true,
+            enable_periodic_slowdown: false, // Isolate timeout behavior
+            randomize_ssthresh: false,       // Deterministic for testing
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Verify initial ssthresh is 1 MB
+        let initial_ssthresh = controller.ssthresh.load(Ordering::Acquire);
+        assert_eq!(
+            initial_ssthresh, 1_048_576,
+            "Initial ssthresh should be 1 MB"
+        );
+
+        // Simulate worst-case scenario: repeated timeouts before cwnd can grow.
+        // This mimics the death spiral where:
+        // 1. Timeout occurs during slow start
+        // 2. ssthresh = max(cwnd/2, floor) - if floor is too low, ssthresh collapses
+        // 3. cwnd resets to min_cwnd
+        // 4. Next timeout: ssthresh = max(min_cwnd/2, floor) = floor (tiny value)
+        // 5. Repeat - ssthresh stays at floor forever
+        for i in 0..10 {
+            // Reset cwnd to a small value (simulating that cwnd never grew much)
+            controller
+                .cwnd
+                .store(controller.min_cwnd * 2, Ordering::Release);
+
+            controller.on_timeout();
+
+            let ssthresh = controller.ssthresh.load(Ordering::Acquire);
+
+            // After any number of timeouts, ssthresh should remain usable
+            assert!(
+                ssthresh >= min_useful_ssthresh,
+                "After {} timeout(s), ssthresh={} bytes ({} KB) is below minimum \
+                 useful threshold of {} KB for high-BDP paths. \
+                 This would cause transfers on 135ms RTT paths to be extremely slow.",
+                i + 1,
+                ssthresh,
+                ssthresh / 1024,
+                min_useful_ssthresh / 1024
+            );
+        }
+
+        // Verify the controller can achieve reasonable throughput after recovery
+        // by checking that ssthresh allows meaningful slow start growth
+        let final_ssthresh = controller.ssthresh.load(Ordering::Acquire);
+
+        // Calculate theoretical max throughput during slow start:
+        // rate = ssthresh / RTT
+        let max_slow_start_rate = final_ssthresh as f64 / high_bdp_rtt.as_secs_f64();
+        let max_slow_start_rate_mbps = (max_slow_start_rate * 8.0) / 1_000_000.0;
+
+        // Should be able to achieve at least 5 Mbit/s during slow start
+        // (This is conservative - with 100KB ssthresh and 135ms RTT: ~5.9 Mbit/s)
+        assert!(
+            max_slow_start_rate_mbps >= 5.0,
+            "After repeated timeouts, theoretical max slow start rate is only {:.1} Mbit/s \
+             (ssthresh={} KB, RTT={}ms). This is too low for usable throughput on high-BDP paths.",
+            max_slow_start_rate_mbps,
+            final_ssthresh / 1024,
+            high_bdp_rtt.as_millis()
         );
     }
 
