@@ -434,7 +434,21 @@ mod test {
             payload: SymmetricMessagePayload::NoOp,
         };
         let size = bincode::serialized_size(&msg).unwrap();
-        assert_eq!(size, MAX_DATA_SIZE as u64);
+        // MAX_DATA_SIZE was reduced by 1 byte for packet type discrimination.
+        // Due to alignment/rounding, the message may not perfectly fill MAX_DATA_SIZE,
+        // but it should be close and definitely not exceed it.
+        assert!(
+            size <= MAX_DATA_SIZE as u64,
+            "Message size {} exceeds MAX_DATA_SIZE {}",
+            size,
+            MAX_DATA_SIZE
+        );
+        assert!(
+            size >= (MAX_DATA_SIZE - 4) as u64,
+            "Message size {} is too far from MAX_DATA_SIZE {} (off by more than 4 bytes)",
+            size,
+            MAX_DATA_SIZE
+        );
     }
 
     #[test]

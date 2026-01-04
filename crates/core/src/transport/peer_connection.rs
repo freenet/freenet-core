@@ -7,7 +7,7 @@ use std::{collections::HashMap, time::Instant};
 
 use parking_lot::RwLock;
 
-use crate::transport::connection_handler::{NAT_TRAVERSAL_MAX_ATTEMPTS, X25519_INTRO_PACKET_SIZE};
+use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
 use crate::transport::packet_data::UnknownEncryption;
@@ -426,13 +426,13 @@ impl<S: super::Socket> PeerConnection<S> {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
 
-                    // Debug logging for intro-sized packets
-                    if packet_data.data().len() == X25519_INTRO_PACKET_SIZE {
+                    // Debug logging for intro packets
+                    if packet_data.is_intro_packet() {
                         tracing::debug!(
                             peer_addr = %self.remote_conn.remote_addr,
-                            packet_bytes = ?&packet_data.data()[..32], // First 32 bytes
+                            packet_bytes = ?&packet_data.data()[..std::cmp::min(32, packet_data.data().len())], // First 32 bytes
                             packet_len = packet_data.data().len(),
-                            "Received intro-sized packet"
+                            "Received intro packet"
                         );
                     }
 
@@ -446,11 +446,11 @@ impl<S: super::Socket> PeerConnection<S> {
                             "Failed to decrypt packet, might be an intro packet or a partial packet"
                         );
                     }) else {
-                        // Check if this is an intro packet (X25519 encrypted)
-                        if packet_data.data().len() == X25519_INTRO_PACKET_SIZE {
+                        // Check if this is an intro packet (X25519 encrypted) by examining packet type
+                        if packet_data.is_intro_packet() {
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
-                                "Attempting to decrypt potential intro packet"
+                                "Attempting to decrypt intro packet"
                             );
 
                             // Try to decrypt as intro packet
@@ -499,7 +499,7 @@ impl<S: super::Socket> PeerConnection<S> {
                                     tracing::trace!(
                                         peer_addr = %self.remote_conn.remote_addr,
                                         error = ?decrypt_err,
-                                        "intro-sized packet is not a valid intro packet"
+                                        "Packet with intro type marker failed decryption"
                                     );
                                 }
                             }

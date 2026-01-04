@@ -11,10 +11,20 @@ pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
 /// Size of ChaCha20Poly1305 authentication tag
 const CHACHA_TAG_SIZE: usize = 16;
 
+/// Packet type discriminator for intro packets (X25519 encrypted)
+pub const PACKET_TYPE_INTRO: u8 = 0x01;
+
+/// Packet type discriminator for symmetric packets (AES-GCM encrypted)
+pub const PACKET_TYPE_SYMMETRIC: u8 = 0x02;
+
+/// Size of packet type discriminator
+pub const PACKET_TYPE_SIZE: usize = 1;
+
 /// Size of encrypted intro packet:
-/// ephemeral_public (32) + encrypted_data + tag (16)
+/// packet_type (1) + ephemeral_public (32) + encrypted_data + tag (16)
+#[allow(dead_code)] // Used in tests and as public API
 pub const fn intro_packet_size(plaintext_len: usize) -> usize {
-    X25519_PUBLIC_KEY_SIZE + plaintext_len + CHACHA_TAG_SIZE
+    PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + plaintext_len + CHACHA_TAG_SIZE
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,13 +114,13 @@ pub struct TransportPublicKey(PublicKey);
 impl TransportPublicKey {
     /// Encrypt data using static-ephemeral X25519 key exchange.
     ///
-    /// Returns: ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
+    /// Returns: packet_type (1 byte) || ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
     ///
     /// The encryption uses:
     /// 1. Generate ephemeral X25519 keypair
     /// 2. Compute shared_secret = ECDH(ephemeral_private, recipient_static_public)
     /// 3. Use shared_secret as ChaCha20Poly1305 key with zero nonce (safe because key is unique per message)
-    /// 4. Return ephemeral_public || AEAD_encrypt(data)
+    /// 4. Return packet_type || ephemeral_public || AEAD_encrypt(data)
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         // Generate ephemeral keypair using random bytes
         let ephemeral_bytes: [u8; 32] = rand::random();
@@ -128,8 +138,10 @@ impl TransportPublicKey {
 
         let ciphertext = cipher.encrypt(&nonce, data).expect("encryption failure");
 
-        // Prepend ephemeral public key
-        let mut result = Vec::with_capacity(X25519_PUBLIC_KEY_SIZE + ciphertext.len());
+        // Prepend packet type and ephemeral public key
+        let mut result =
+            Vec::with_capacity(PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + ciphertext.len());
+        result.push(PACKET_TYPE_INTRO);
         result.extend_from_slice(ephemeral_public.as_bytes());
         result.extend_from_slice(&ciphertext);
         result
@@ -245,15 +257,21 @@ pub(crate) struct TransportSecretKey(#[zeroize(skip)] StaticSecret);
 impl TransportSecretKey {
     /// Decrypt data that was encrypted with our public key using static-ephemeral X25519.
     ///
-    /// Input format: ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
+    /// Input format: packet_type (1 byte) || ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-        if data.len() < X25519_PUBLIC_KEY_SIZE + CHACHA_TAG_SIZE {
+        if data.len() < PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + CHACHA_TAG_SIZE {
             return Err(DecryptionError::InvalidLength);
         }
 
-        // Extract ephemeral public key
+        // Check packet type
+        if data[0] != PACKET_TYPE_INTRO {
+            return Err(DecryptionError::InvalidPacketType);
+        }
+
+        // Extract ephemeral public key (skip packet type byte)
         let mut ephemeral_bytes = [0u8; 32];
-        ephemeral_bytes.copy_from_slice(&data[..X25519_PUBLIC_KEY_SIZE]);
+        ephemeral_bytes
+            .copy_from_slice(&data[PACKET_TYPE_SIZE..PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE]);
         let ephemeral_public = PublicKey::from(ephemeral_bytes);
 
         // Compute shared secret
@@ -266,7 +284,7 @@ impl TransportSecretKey {
         let nonce = Nonce::default();
 
         // Decrypt the ciphertext
-        let ciphertext = &data[X25519_PUBLIC_KEY_SIZE..];
+        let ciphertext = &data[PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE..];
         cipher
             .decrypt(&nonce, ciphertext)
             .map_err(|_| DecryptionError::DecryptionFailed)
@@ -277,6 +295,7 @@ impl TransportSecretKey {
 pub enum DecryptionError {
     InvalidLength,
     DecryptionFailed,
+    InvalidPacketType,
 }
 
 impl std::fmt::Display for DecryptionError {
@@ -284,6 +303,7 @@ impl std::fmt::Display for DecryptionError {
         match self {
             DecryptionError::InvalidLength => write!(f, "invalid ciphertext length"),
             DecryptionError::DecryptionFailed => write!(f, "decryption failed"),
+            DecryptionError::InvalidPacketType => write!(f, "invalid packet type"),
         }
     }
 }
@@ -401,7 +421,7 @@ fn key_sizes_and_decryption() {
     let sym_key_bytes = rand::random::<[u8; 16]>();
     let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
 
-    // X25519 intro packet: 32 (ephemeral pub) + 16 (data) + 16 (tag) = 64 bytes
+    // X25519 intro packet: 1 (packet type) + 32 (ephemeral pub) + 16 (data) + 16 (tag) = 65 bytes
     assert_eq!(encrypted.len(), intro_packet_size(16));
     assert!(
         encrypted.len() <= super::packet_data::MAX_PACKET_SIZE,
@@ -526,11 +546,11 @@ mod crypto_tests {
     #[test]
     fn test_intro_packet_size() {
         // Protocol version (8) + symmetric key (16) = 24 bytes plaintext
-        // Encrypted: 32 (ephemeral pub) + 24 (data) + 16 (tag) = 72 bytes
-        assert_eq!(intro_packet_size(24), 72);
+        // Encrypted: 1 (packet type) + 32 (ephemeral pub) + 24 (data) + 16 (tag) = 73 bytes
+        assert_eq!(intro_packet_size(24), 73);
 
         // Compare to old RSA: 256 bytes
-        // New X25519: 72 bytes (3.5x smaller!)
+        // New X25519: 73 bytes (3.5x smaller!)
     }
 
     #[test]
@@ -582,5 +602,80 @@ mod crypto_tests {
 
         let result = keypair.secret.decrypt(&encrypted);
         assert_eq!(result.unwrap_err(), DecryptionError::DecryptionFailed);
+    }
+}
+
+#[cfg(test)]
+mod packet_type_tests {
+    use super::*;
+
+    #[test]
+    fn test_intro_packet_has_correct_type_byte() {
+        let keypair = TransportKeypair::new();
+        let data = b"test data for intro packet";
+        let encrypted = keypair.public.encrypt(data);
+
+        assert_eq!(
+            encrypted[0], PACKET_TYPE_INTRO,
+            "First byte of intro packet should be PACKET_TYPE_INTRO (0x01)"
+        );
+        assert_eq!(encrypted.len(), intro_packet_size(data.len()));
+    }
+
+    #[test]
+    fn test_intro_packet_decryption_validates_type() {
+        let keypair = TransportKeypair::new();
+        let data = b"test";
+        let mut encrypted = keypair.public.encrypt(data);
+
+        // Corrupt the packet type byte
+        encrypted[0] = PACKET_TYPE_SYMMETRIC; // Wrong type
+
+        let result = keypair.secret.decrypt(&encrypted);
+        assert!(
+            matches!(result, Err(DecryptionError::InvalidPacketType)),
+            "Decryption should fail with InvalidPacketType when packet type is wrong"
+        );
+    }
+
+    #[test]
+    fn test_intro_packet_decryption_rejects_invalid_type() {
+        let keypair = TransportKeypair::new();
+        let data = b"test";
+        let mut encrypted = keypair.public.encrypt(data);
+
+        // Set invalid packet type
+        encrypted[0] = 0xFF;
+
+        let result = keypair.secret.decrypt(&encrypted);
+        assert!(
+            matches!(result, Err(DecryptionError::InvalidPacketType)),
+            "Decryption should fail with InvalidPacketType for unknown type 0xFF"
+        );
+    }
+
+    #[test]
+    fn test_intro_packet_type_preserved_after_encryption() {
+        let keypair = TransportKeypair::new();
+
+        // Test with various data sizes
+        for size in [0, 16, 24, 100, 500] {
+            let data = vec![0xAB; size];
+            let encrypted = keypair.public.encrypt(&data);
+
+            assert_eq!(
+                encrypted[0], PACKET_TYPE_INTRO,
+                "Packet type should be PACKET_TYPE_INTRO for data size {}",
+                size
+            );
+
+            // Verify successful decryption
+            let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
+            assert_eq!(
+                decrypted, data,
+                "Decrypted data should match for size {}",
+                size
+            );
+        }
     }
 }
