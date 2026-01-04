@@ -590,6 +590,19 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         println!("Updating service file to add auto-update support...");
     }
 
+    // Create backup of existing service file in case user had customizations
+    let backup_path = service_path.with_extension("service.bak");
+    if let Err(e) = fs::copy(&service_path, &backup_path) {
+        if !quiet {
+            eprintln!(
+                "Warning: Failed to backup service file: {}. Continuing anyway.",
+                e
+            );
+        }
+    } else if !quiet {
+        println!("Backed up existing service file to {:?}", backup_path);
+    }
+
     // Generate new service file content
     let log_dir = home_dir.join(".local/state/freenet");
     let new_content = generate_service_file(binary_path, &log_dir);
@@ -647,8 +660,25 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     }
 
     // Ensure wrapper directory exists
-    let wrapper_dir = wrapper_path.parent().unwrap();
+    let wrapper_dir = wrapper_path
+        .parent()
+        .context("Wrapper path has no parent directory")?;
     fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
+
+    // Create backup of existing wrapper script if it exists
+    if wrapper_path.exists() {
+        let backup_path = wrapper_path.with_extension("sh.bak");
+        if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
+            if !quiet {
+                eprintln!(
+                    "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
+                    e
+                );
+            }
+        } else if !quiet {
+            println!("Backed up existing wrapper script to {:?}", backup_path);
+        }
+    }
 
     // Generate and write new wrapper script
     let wrapper_content = generate_wrapper_script(binary_path);
