@@ -601,3 +601,73 @@ mod crypto_tests {
         assert_eq!(result.unwrap_err(), DecryptionError::DecryptionFailed);
     }
 }
+
+#[cfg(test)]
+mod packet_type_tests {
+    use super::*;
+
+    #[test]
+    fn test_intro_packet_has_correct_type_byte() {
+        let keypair = TransportKeypair::new();
+        let data = b"test data for intro packet";
+        let encrypted = keypair.public.encrypt(data);
+        
+        assert_eq!(
+            encrypted[0], PACKET_TYPE_INTRO,
+            "First byte of intro packet should be PACKET_TYPE_INTRO (0x01)"
+        );
+        assert_eq!(encrypted.len(), intro_packet_size(data.len()));
+    }
+
+    #[test]
+    fn test_intro_packet_decryption_validates_type() {
+        let keypair = TransportKeypair::new();
+        let data = b"test";
+        let mut encrypted = keypair.public.encrypt(data);
+        
+        // Corrupt the packet type byte
+        encrypted[0] = PACKET_TYPE_SYMMETRIC; // Wrong type
+        
+        let result = keypair.secret.decrypt(&encrypted);
+        assert!(
+            matches!(result, Err(DecryptionError::InvalidPacketType)),
+            "Decryption should fail with InvalidPacketType when packet type is wrong"
+        );
+    }
+
+    #[test]
+    fn test_intro_packet_decryption_rejects_invalid_type() {
+        let keypair = TransportKeypair::new();
+        let data = b"test";
+        let mut encrypted = keypair.public.encrypt(data);
+        
+        // Set invalid packet type
+        encrypted[0] = 0xFF;
+        
+        let result = keypair.secret.decrypt(&encrypted);
+        assert!(
+            matches!(result, Err(DecryptionError::InvalidPacketType)),
+            "Decryption should fail with InvalidPacketType for unknown type 0xFF"
+        );
+    }
+
+    #[test]
+    fn test_intro_packet_type_preserved_after_encryption() {
+        let keypair = TransportKeypair::new();
+        
+        // Test with various data sizes
+        for size in [0, 16, 24, 100, 500] {
+            let data = vec![0xAB; size];
+            let encrypted = keypair.public.encrypt(&data);
+            
+            assert_eq!(
+                encrypted[0], PACKET_TYPE_INTRO,
+                "Packet type should be PACKET_TYPE_INTRO for data size {}", size
+            );
+            
+            // Verify successful decryption
+            let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
+            assert_eq!(decrypted, data, "Decrypted data should match for size {}", size);
+        }
+    }
+}

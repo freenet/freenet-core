@@ -7,9 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::PCK_VERSION;
-use crate::transport::crypto::intro_packet_size;
 use crate::transport::crypto::TransportSecretKey;
-use crate::transport::packet_data::{AsymmetricX25519, UnknownEncryption};
+use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::symmetric_message::OutboundConnection;
 use crate::util::backoff::ExponentialBackoff;
 use aes_gcm::{Aes128Gcm, KeyInit};
@@ -44,14 +43,6 @@ use super::{
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Size of protocol version (8 bytes) + symmetric key (16 bytes) = 24 bytes plaintext
-const INTRO_PLAINTEXT_SIZE: usize = 8 + 16;
-
-/// Size of X25519 encrypted intro packets.
-/// Format: packet_type (1) + ephemeral_public (32) + encrypted_data (24) + ChaCha20Poly1305 tag (16) = 73 bytes
-/// Packet type discrimination (issue #2559) eliminates ambiguity with symmetric packets.
-pub(crate) const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAINTEXT_SIZE);
 
 /// Minimum interval between asymmetric decryption attempts for the same address.
 /// Prevents CPU exhaustion from attackers sending intro-sized packets.
@@ -605,8 +596,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             // Issue #2554: Don't clear rate-limit tracking here.
                                             // Let the rate limit expire naturally (1 second) to prevent
                                             // packets still in flight from being routed to asymmetric
-                                            // decryption. A 72-byte symmetric packet arriving during the
-                                            // transition window would otherwise trigger decryption errors.
+                                            // decryption. Symmetric packets arriving during the transition
+                                            // window would otherwise trigger decryption errors if they're
+                                            // mistakenly processed as intro packets.
                                             // Don't reinsert - connection is truly dead
                                             continue;
                                         }
@@ -1216,10 +1208,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             /// Initial state of the joiner
             StartOutbound,
             /// Initial state of the joinee, at this point NAT has been already traversed
-            RemoteInbound {
-                /// Encrypted intro packet for comparison
-                intro_packet: PacketData<AsymmetricX25519>,
-            },
+            RemoteInbound,
         }
 
         fn decrypt_asym(
@@ -1252,9 +1241,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 let outbound_key =
                     Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
                 *outbound_sym_key = Some(outbound_key.clone());
-                *state = ConnectionState::RemoteInbound {
-                    intro_packet: packet.assert_asymmetric(),
-                };
+                *state = ConnectionState::RemoteInbound;
                 return Ok(());
             }
             tracing::trace!(
@@ -1318,7 +1305,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             attempts += 1;
                         }
-                        ConnectionState::RemoteInbound { .. } => {
+                        ConnectionState::RemoteInbound => {
                             tracing::trace!(
                                 peer_addr = %remote_addr,
                                 direction = "outbound",
@@ -1506,7 +1493,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 );
                                 continue;
                             }
-                            ConnectionState::RemoteInbound { .. } => {
+                            ConnectionState::RemoteInbound => {
                                 // next packet should be an acknowledgement packet, but might also be a repeated
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet() {
