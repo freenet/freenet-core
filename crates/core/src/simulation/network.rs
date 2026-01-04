@@ -4,7 +4,7 @@
 //! the scheduler for deterministic message delivery.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -85,12 +85,20 @@ pub struct SimulatedNetwork {
     fault_config: Arc<Mutex<FaultConfig>>,
     /// Network configuration
     config: SimulatedNetworkConfig,
-    /// Messages currently in flight
-    in_flight: Arc<Mutex<HashMap<EventId, InFlightMessage>>>,
-    /// Delivered messages waiting to be consumed (per peer)
-    /// Uses VecDeque for O(1) front removal in recv()
+    /// Messages currently in flight.
+    ///
+    /// Uses BTreeMap instead of HashMap to ensure deterministic iteration order
+    /// when cancelling messages or collecting debug information. HashMap iteration
+    /// order depends on internal hashing state which can vary between runs,
+    /// breaking simulation reproducibility.
+    in_flight: Arc<Mutex<BTreeMap<EventId, InFlightMessage>>>,
+    /// Delivered messages waiting to be consumed (per peer).
+    /// Uses VecDeque for O(1) front removal in recv().
+    ///
+    /// Uses BTreeMap instead of HashMap to ensure deterministic iteration order.
+    /// SocketAddr implements Ord, providing stable ordering by IP then port.
     #[allow(clippy::type_complexity)]
-    delivered: Arc<Mutex<HashMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>>>,
+    delivered: Arc<Mutex<BTreeMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>>>,
     /// Network statistics
     stats: Arc<Mutex<NetworkStats>>,
 }
@@ -107,8 +115,8 @@ impl SimulatedNetwork {
             scheduler,
             fault_config: Arc::new(Mutex::new(FaultConfig::new())),
             config,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            delivered: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(BTreeMap::new())),
+            delivered: Arc::new(Mutex::new(BTreeMap::new())),
             stats: Arc::new(Mutex::new(NetworkStats::default())),
         }
     }

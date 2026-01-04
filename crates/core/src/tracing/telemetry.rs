@@ -25,11 +25,12 @@ use std::time::{Duration, Instant};
 use either::Either;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use rand::Rng as _;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::config::TelemetryConfig;
+use crate::config::GlobalRng;
+
+use crate::config::{GlobalExecutor, TelemetryConfig};
 use crate::message::Transaction;
 use crate::router::RouteEvent;
 use crate::transport::TRANSPORT_METRICS;
@@ -130,7 +131,7 @@ impl TelemetryReporter {
             transport_snapshot_interval_secs,
             transfer_event_receiver,
         );
-        tokio::spawn(worker.run());
+        GlobalExecutor::spawn(worker.run());
 
         Some(Self { sender })
     }
@@ -364,7 +365,7 @@ impl TelemetryWorker {
                 } else {
                     (self.backoff_ms * 2).min(MAX_BACKOFF_MS)
                 };
-                let jitter = rand::rng().random_range(0..=(base_backoff / 4));
+                let jitter = GlobalRng::random_range(0..=(base_backoff / 4));
                 self.backoff_ms = base_backoff + jitter;
                 self.last_send = Instant::now();
 

@@ -555,6 +555,7 @@ impl std::error::Error for InsertError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalExecutor;
     use crate::simulation::VirtualTime;
     use std::time::Duration;
 
@@ -917,7 +918,7 @@ mod tests {
         let barrier_clone = Arc::clone(&barrier);
 
         // Spawn a task that waits for notification
-        let waiter = tokio::spawn(async move {
+        let waiter = GlobalExecutor::spawn(async move {
             barrier_clone.wait().await;
             buffer_clone.notifier().listen().await;
             true

@@ -36,7 +36,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, WebsocketApiConfig},
+    config::{Address, GatewayConfig, GlobalExecutor, GlobalRng, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -59,7 +59,7 @@ use tracing::Instrument;
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 // Re-export types for dev_tool and testing
-pub use network_bridge::NetworkStats;
+pub use network_bridge::{EventLoopExitReason, NetworkStats};
 
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
@@ -538,7 +538,7 @@ async fn report_result(
 
                     // Spawn fire-and-forget task to avoid blocking report_result()
                     // while still guaranteeing message delivery
-                    tokio::spawn(async move {
+                    GlobalExecutor::spawn(async move {
                         if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
                             tracing::error!(
                                 "CRITICAL: Result router channel closed - dual-path delivery broken. \
@@ -1078,7 +1078,7 @@ where
                                         let contract_key = *contract;
                                         if op_manager.ring.mark_subscription_pending(contract_key) {
                                             let op_manager_clone = op_manager.clone();
-                                            tokio::spawn(async move {
+                                            GlobalExecutor::spawn(async move {
                                                 let instance_id = *contract_key.id();
                                                 let sub_op = crate::operations::subscribe::start_op(
                                                     instance_id,
@@ -1404,12 +1404,10 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerId {
 
 impl PeerId {
     pub fn random() -> Self {
-        use rand::Rng;
-        let mut rng = rand::rng();
         let mut addr = [0; 4];
-        rng.fill(&mut addr[..]);
+        GlobalRng::fill_bytes(&mut addr[..]);
         // Use random port instead of get_free_port() for speed - tests don't actually bind
-        let port: u16 = rng.random_range(1024..65535);
+        let port: u16 = GlobalRng::random_range(1024u16..65535u16);
 
         let pub_key = PEER_ID.with(|peer_id| {
             let mut peer_id = peer_id.borrow_mut();

@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
+use freenet::config::GlobalExecutor;
 use freenet::generated::{
     topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
 };
@@ -40,7 +41,7 @@ pub async fn start_server(
     let changes_record_path = config.log_directory.clone();
     let (changes, rx) = tokio::sync::broadcast::channel(10000);
     let changes_recorder = changes_record_path.map(|data_dir| {
-        tokio::task::spawn(async move {
+        GlobalExecutor::spawn(async move {
             if let Err(err) = crate::network_metrics_server::record_saver(data_dir, rx).await {
                 tracing::error!(error = %err, "Record saver failed");
             }
@@ -48,7 +49,7 @@ pub async fn start_server(
     });
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let barrier_cp = barrier.clone();
-    let server = tokio::task::spawn(async move {
+    let server = GlobalExecutor::spawn(async move {
         if let Err(err) = crate::network_metrics_server::run_server(barrier_cp, changes).await {
             tracing::error!(error = %err, "Network metrics server failed");
         }

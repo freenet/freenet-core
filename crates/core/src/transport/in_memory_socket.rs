@@ -19,6 +19,9 @@
 //! let socket = InMemorySocket::bind(addr).await?;
 //! ```
 
+use crate::config::GlobalExecutor;
+
+use dashmap::DashMap;
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -30,7 +33,7 @@ use std::{
 use tokio::sync::Mutex;
 
 use super::Socket;
-use crate::simulation::{RealTime, TimeSource};
+use crate::simulation::{RealTime, TimeSource, VirtualTime};
 
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;
@@ -38,8 +41,19 @@ const MAX_PACKET_SIZE: usize = 65535;
 /// Global registry mapping socket addresses to their network names.
 /// This is used during `InMemorySocket::bind()` to determine which network
 /// a socket belongs to. The mapping is thread-safe and works across async tasks.
-static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+///
+/// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+/// This eliminates coarse-grained lock contention when multiple sockets
+/// are being registered/looked up simultaneously during test startup.
+static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> = LazyLock::new(DashMap::new);
+
+/// Global registry mapping network names to their VirtualTime instances.
+/// This enables SimulationSocket to use network-scoped VirtualTime for
+/// deterministic time control in simulation tests.
+///
+/// Each SimNetwork registers its VirtualTime here on creation and
+/// unregisters it on drop, providing test isolation.
+static NETWORK_TIME_SOURCES: LazyLock<DashMap<String, VirtualTime>> = LazyLock::new(DashMap::new);
 
 /// Registers a socket address with a network name.
 ///
@@ -55,25 +69,49 @@ static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
 /// let socket = InMemorySocket::bind(addr).await?;
 /// ```
 pub fn register_address_network(addr: SocketAddr, network_name: &str) {
-    ADDRESS_NETWORKS
-        .write()
-        .unwrap()
-        .insert(addr, network_name.to_string());
+    ADDRESS_NETWORKS.insert(addr, network_name.to_string());
 }
 
 /// Unregisters a socket address from the network mapping.
 fn unregister_address_network(addr: &SocketAddr) {
-    ADDRESS_NETWORKS.write().unwrap().remove(addr);
+    ADDRESS_NETWORKS.remove(addr);
 }
 
 /// Gets the network name for an address, if registered.
 fn get_address_network(addr: &SocketAddr) -> Option<String> {
-    ADDRESS_NETWORKS.read().unwrap().get(addr).cloned()
+    ADDRESS_NETWORKS.get(addr).map(|r| r.value().clone())
 }
 
 /// Clears all address-network mappings. Useful for test cleanup.
 pub fn clear_all_address_networks() {
-    ADDRESS_NETWORKS.write().unwrap().clear();
+    ADDRESS_NETWORKS.clear();
+}
+
+/// Registers a VirtualTime instance for a network.
+///
+/// This should be called when creating a SimNetwork to enable
+/// SimulationSocket to use the network's VirtualTime for deterministic
+/// time control.
+///
+/// # Arguments
+/// * `network_name` - The unique name of the simulation network
+/// * `virtual_time` - The VirtualTime instance to use for this network
+pub fn register_network_time_source(network_name: &str, virtual_time: VirtualTime) {
+    NETWORK_TIME_SOURCES.insert(network_name.to_string(), virtual_time);
+}
+
+/// Unregisters a VirtualTime instance for a network.
+///
+/// This should be called when dropping a SimNetwork to clean up.
+pub fn unregister_network_time_source(network_name: &str) {
+    NETWORK_TIME_SOURCES.remove(network_name);
+}
+
+/// Gets the VirtualTime for a network, if registered.
+/// Currently unused but reserved for future VirtualTime integration.
+#[allow(dead_code)]
+fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
+    NETWORK_TIME_SOURCES.get(network_name).map(|r| r.clone())
 }
 
 /// Result of checking packet delivery through fault injection.
@@ -213,7 +251,7 @@ impl SocketRegistry {
             } else {
                 // Inbox is locked, spawn delivery task
                 let inbox = inbox.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     inbox.lock().await.push(data, from);
                 });
                 true
@@ -232,27 +270,31 @@ impl SocketRegistry {
 /// Global map of network name -> socket registry.
 ///
 /// Each SimNetwork gets its own registry, providing test isolation.
-static SOCKET_REGISTRIES: LazyLock<RwLock<HashMap<String, Arc<RwLock<SocketRegistry>>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+///
+/// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+/// This is particularly beneficial for the get-or-create pattern in
+/// `get_or_create_registry()`, which previously required dropping a read
+/// lock and reacquiring a write lock. DashMap's `entry()` API handles
+/// this atomically without the lock upgrade overhead.
+static SOCKET_REGISTRIES: LazyLock<DashMap<String, Arc<RwLock<SocketRegistry>>>> =
+    LazyLock::new(DashMap::new);
 
 /// Gets or creates the socket registry for a network.
 fn get_or_create_registry(network_name: &str) -> Arc<RwLock<SocketRegistry>> {
-    let registries = SOCKET_REGISTRIES.read().unwrap();
-    if let Some(registry) = registries.get(network_name) {
-        return registry.clone();
-    }
-    drop(registries);
-
-    let mut registries = SOCKET_REGISTRIES.write().unwrap();
-    registries
+    // DashMap's entry API handles the get-or-insert atomically,
+    // eliminating the previous read-lock-check-then-write-lock pattern.
+    SOCKET_REGISTRIES
         .entry(network_name.to_string())
         .or_insert_with(|| Arc::new(RwLock::new(SocketRegistry::default())))
+        .value()
         .clone()
 }
 
 /// Gets the socket registry for a network, if it exists.
 fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
-    SOCKET_REGISTRIES.read().unwrap().get(network_name).cloned()
+    SOCKET_REGISTRIES
+        .get(network_name)
+        .map(|r| r.value().clone())
 }
 
 /// Delivers a packet to a target socket within a network.
@@ -299,7 +341,7 @@ pub fn clear_network_sockets(network_name: &str) {
 
 /// Clears all socket registries (useful between test runs).
 pub fn clear_all_socket_registries() {
-    SOCKET_REGISTRIES.write().unwrap().clear();
+    SOCKET_REGISTRIES.clear();
 }
 
 /// An in-memory socket implementing the `Socket` trait.
@@ -399,7 +441,7 @@ impl<T: TimeSource> InMemorySocket<T> {
                 let network_name = self.network_name.clone();
                 let from = self.addr;
                 let time_source = self.time_source.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     time_source.sleep(delay).await;
                     deliver_packet_to_network(&network_name, target, data, from);
                 });
@@ -479,6 +521,75 @@ impl<T: TimeSource> Drop for InMemorySocket<T> {
             addr = %self.addr,
             "InMemorySocket dropped"
         );
+    }
+}
+
+// =============================================================================
+// SimulationSocket - VirtualTime-backed socket for deterministic simulation
+// =============================================================================
+
+/// A simulation socket that uses RealTime (backed by tokio::time::Instant).
+///
+/// This socket works correctly with tokio's paused time (`start_paused = true`)
+/// because RealTime uses `tokio::time::Instant` for time tracking and
+/// `tokio::time::sleep` for delays. When tokio's time is paused, time only
+/// advances when sleep is called, providing predictable test behavior.
+///
+/// # Test Isolation
+///
+/// Each SimNetwork has a unique network name. Sockets are isolated by network
+/// name through the address registry, ensuring parallel tests don't interfere.
+///
+/// # Usage
+///
+/// SimulationSocket is used automatically by SimNetwork's in-memory node builder.
+/// You don't need to create it directly.
+pub struct SimulationSocket(InMemorySocket<RealTime>);
+
+impl std::fmt::Debug for SimulationSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationSocket")
+            .field("addr", &self.0.addr)
+            .field("network", &self.0.network_name)
+            .finish()
+    }
+}
+
+impl Socket for SimulationSocket {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        // Look up the network name for this address to verify it's registered
+        let network_name = get_address_network(&addr).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "No network registered for address {}. \
+                     Call register_address_network() before binding SimulationSocket.",
+                    addr
+                ),
+            )
+        })?;
+
+        tracing::debug!(
+            addr = %addr,
+            network = %network_name,
+            "SimulationSocket binding with RealTime"
+        );
+
+        // Create the socket with RealTime (uses tokio::time::Instant)
+        let inner = InMemorySocket::bind_with_time_source(addr, RealTime::new()).await?;
+        Ok(Self(inner))
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, target).await
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to_blocking(buf, target)
     }
 }
 

@@ -49,6 +49,31 @@ use crate::{
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
+/// Represents the different ways the event loop can exit.
+///
+/// This enum is used instead of string-based error matching to provide
+/// type-safe handling of shutdown conditions.
+#[derive(Debug)]
+pub enum EventLoopExitReason {
+    /// Graceful shutdown via NodeEvent::Disconnect or ClosedChannel
+    GracefulShutdown,
+    /// Unexpected stream termination (priority_select returned None)
+    UnexpectedStreamEnd,
+}
+
+impl std::fmt::Display for EventLoopExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventLoopExitReason::GracefulShutdown => write!(f, "Graceful shutdown"),
+            EventLoopExitReason::UnexpectedStreamEnd => {
+                write!(f, "Network event stream ended unexpectedly")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EventLoopExitReason {}
+
 type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
@@ -548,6 +573,10 @@ impl P2pConnManager {
             message_processor,
         };
 
+        // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)
+        // vs unexpected stream end
+        let mut graceful_shutdown = false;
+
         while let Some(result) = select_stream.as_mut().next().await {
             // Process the result using the existing handler
             let event = ctx
@@ -722,7 +751,7 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
-                                    tokio::spawn(async move {
+                                    GlobalExecutor::spawn(async move {
                                         match timeout(Duration::from_secs(20), result.recv()).await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
@@ -948,6 +977,7 @@ impl P2pConnManager {
                                         phase = "shutdown",
                                         "Cleanup complete - exiting event loop"
                                     );
+                                    graceful_shutdown = true;
                                     break;
                                 }
                             }
@@ -1585,6 +1615,7 @@ impl P2pConnManager {
                                     phase = "shutdown",
                                     "Disconnecting from network"
                                 );
+                                graceful_shutdown = true;
                                 break;
                             }
                             NodeEvent::ClientDisconnected { client_id } => {
@@ -1601,7 +1632,13 @@ impl P2pConnManager {
                 }
             }
         }
-        Err(anyhow::anyhow!("Network event stream ended unexpectedly"))
+        if graceful_shutdown {
+            // Return typed error for graceful shutdown - callers can use downcast_ref()
+            // to identify this as a clean exit rather than an actual error
+            Err(EventLoopExitReason::GracefulShutdown.into())
+        } else {
+            Err(EventLoopExitReason::UnexpectedStreamEnd.into())
+        }
     }
 
     /// Process a SelectResult from the priority select stream
@@ -2421,7 +2458,7 @@ impl P2pConnManager {
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
             // Yield to allow the spawned peer_connection_listener task to start.
@@ -2573,7 +2610,7 @@ impl P2pConnManager {
                                 if ring.mark_subscription_pending(contract) {
                                     let op_manager = self.bridge.op_manager.clone();
                                     let contract_key = contract;
-                                    tokio::spawn(async move {
+                                    GlobalExecutor::spawn(async move {
                                         // Guard ensures complete_subscription_request is called
                                         // even if the task panics
                                         let guard = SubscriptionRecoveryGuard::new(
@@ -2624,7 +2661,7 @@ impl P2pConnManager {
                 let ttl = connection_manager.transient_ttl();
                 let drop_tx = self.bridge.ev_listener_tx.clone();
                 let cm = connection_manager.clone();
-                tokio::spawn(async move {
+                GlobalExecutor::spawn(async move {
                     sleep(ttl).await;
                     if cm.drop_transient(peer_addr).is_some() {
                         tracing::info!(%peer_addr, "Transient connection expired; dropping");
@@ -3411,6 +3448,7 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 
 #[cfg(test)]
 mod tests {
+    use crate::config::GlobalExecutor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -3439,7 +3477,7 @@ mod tests {
         let processed_clone = processed.clone();
 
         // Simulate peer_connection_listener pattern
-        let listener = tokio::spawn(async move {
+        let listener = GlobalExecutor::spawn(async move {
             // Drain-then-select loop (simplified)
             loop {
                 // Phase 1: Drain pending messages (like the loop at start of peer_connection_listener)
@@ -3486,7 +3524,7 @@ mod tests {
 
         // Send messages with timing that causes them to arrive DURING the select! wait
         // This is the race condition that causes message loss without the drain
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             // Wait for listener to enter select!
             sleep(Duration::from_millis(10)).await;
 
@@ -3527,7 +3565,7 @@ mod tests {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Buggy listener - NO drain before shutdown (demonstrates the bug)
-        let listener = tokio::spawn(async move {
+        let listener = GlobalExecutor::spawn(async move {
             // Drain at loop start (the original PR #2255 fix)
             loop {
                 match rx.try_recv() {

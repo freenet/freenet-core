@@ -8,6 +8,8 @@
 
 use std::{collections::HashSet, net::SocketAddr, ops::Range, time::Duration};
 
+use crate::config::GlobalRng;
+
 use super::rng::SimulationRng;
 
 /// A network partition between sets of peers.
@@ -122,11 +124,9 @@ impl FaultConfig {
     ///
     /// This is useful for the in-memory transport bridge where we don't
     /// have access to the simulation's deterministic RNG.
-    /// Note: This is non-deterministic; use `should_drop_message` with
-    /// a seeded RNG for deterministic fault injection.
+    /// Note: Uses GlobalRng which is deterministic when a seed is set.
     pub fn should_drop_message_random(&self) -> bool {
-        use rand::Rng;
-        self.message_loss_rate > 0.0 && rand::rng().random_bool(self.message_loss_rate)
+        self.message_loss_rate > 0.0 && GlobalRng::random_bool(self.message_loss_rate)
     }
 
     /// Generates a latency duration for a message.

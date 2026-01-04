@@ -1,7 +1,7 @@
 //! In-memory node builder for simulation testing.
 //!
 //! This module provides a `Builder` that uses the production event loop (`P2pConnManager`)
-//! with `InMemorySocket` for testing without real network I/O.
+//! with `SimulationSocket` for testing without real network I/O.
 //!
 //! Each node must have the network context set before binding sockets. This is done
 //! automatically by the `run_node` and `run_node_with_shared_storage` methods using
@@ -22,15 +22,43 @@ use crate::{
     node::{
         network_bridge::{event_loop_notification_channel, p2p_protoc::P2pConnManager},
         op_state_manager::OpManager,
-        MessageProcessor, NetEventRegister,
+        EventLoopExitReason, MessageProcessor, NetEventRegister,
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
-    transport::in_memory_socket::{register_address_network, InMemorySocket},
+    transport::in_memory_socket::{register_address_network, SimulationSocket},
     wasm_runtime::MockStateStorage,
 };
 
 use super::Builder;
+
+/// Converts the event loop result to a test-compatible result.
+///
+/// The event loop returns `Result<Infallible, anyhow::Error>` where:
+/// - `Ok(Infallible)` is impossible (Infallible can't be constructed)
+/// - `Err(EventLoopExitReason::GracefulShutdown)` means clean exit
+/// - `Err(other)` means actual error
+///
+/// In testing, graceful shutdown is treated as success.
+fn handle_event_loop_result(
+    result: Result<std::convert::Infallible, anyhow::Error>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(_infallible) => Ok(()),
+        Err(e) => {
+            // Use downcast_ref for type-safe error matching instead of string comparison
+            if e.downcast_ref::<EventLoopExitReason>()
+                .map(|r| matches!(r, EventLoopExitReason::GracefulShutdown))
+                .unwrap_or(false)
+            {
+                tracing::info!("Node exited via graceful shutdown");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 impl<ER> Builder<ER> {
     #[allow(dead_code)]
@@ -137,9 +165,9 @@ impl<ER> Builder<ER> {
         );
         register_address_network(local_addr, &self.network_name);
 
-        // Run the production event loop with InMemorySocket
+        // Run the production event loop with SimulationSocket
         let result = conn_manager
-            .run_event_listener_with_socket::<InMemorySocket>(
+            .run_event_listener_with_socket::<SimulationSocket>(
                 op_manager,
                 wait_for_event,
                 notification_channel,
@@ -154,11 +182,7 @@ impl<ER> Builder<ER> {
             let _ = handle.await;
         }
 
-        // Convert Infallible to () for test compatibility
-        match result {
-            Ok(_infallible) => Ok(()),
-            Err(e) => Err(e),
-        }
+        handle_event_loop_result(result)
     }
 
     /// Runs a node with shared in-memory storage for deterministic simulation.
@@ -278,9 +302,9 @@ impl<ER> Builder<ER> {
         );
         register_address_network(local_addr, &self.network_name);
 
-        // Run the production event loop with InMemorySocket
+        // Run the production event loop with SimulationSocket
         let result = conn_manager
-            .run_event_listener_with_socket::<InMemorySocket>(
+            .run_event_listener_with_socket::<SimulationSocket>(
                 op_manager,
                 wait_for_event,
                 notification_channel,
@@ -295,11 +319,7 @@ impl<ER> Builder<ER> {
             let _ = handle.await;
         }
 
-        // Convert Infallible to () for test compatibility
-        match result {
-            Ok(_infallible) => Ok(()),
-            Err(e) => Err(e),
-        }
+        handle_event_loop_result(result)
     }
 }
 

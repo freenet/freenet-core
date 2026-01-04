@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use freenet::{
-    config::{Config, ConfigArgs},
+    config::{Config, ConfigArgs, GlobalExecutor},
     local_node::{Executor, NodeConfig, OperationMode},
     run_local_node, run_network_node,
     server::serve_gateway,
@@ -128,7 +128,7 @@ async fn run_network_node_with_signals(
     // Spawn a task to listen for shutdown signals and trigger graceful shutdown
     let signal_task = {
         let shutdown_handle = shutdown_handle.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             #[cfg(unix)]
             let shutdown_reason = tokio::select! {
                 _ = signal::ctrl_c() => "received SIGINT (Ctrl+C)",
@@ -149,7 +149,7 @@ async fn run_network_node_with_signals(
     // Spawn a task to monitor for version mismatches and check for updates.
     // This is temporary alpha-testing infrastructure to reduce manual update burden.
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
-    let update_check_task = tokio::spawn(async move {
+    let update_check_task = GlobalExecutor::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;

@@ -1,6 +1,7 @@
 mod isotonic_estimator;
 mod util;
 
+use crate::config::GlobalRng;
 use crate::ring::{Distance, Location, PeerKeyLocation};
 pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
@@ -158,8 +159,6 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
-        use rand::seq::SliceRandom;
-
         let mut peer_distances: Vec<_> = peers
             .into_iter()
             .map(|peer| {
@@ -171,8 +170,7 @@ impl Router {
             })
             .collect();
 
-        let rng = &mut rand::rng();
-        peer_distances.shuffle(rng);
+        GlobalRng::shuffle(&mut peer_distances);
         peer_distances.sort_by_key(|&(_, distance)| distance);
         peer_distances.truncate(self.consider_n_closest_peers);
         peer_distances.into_iter().map(|(peer, _)| peer).collect()
@@ -201,8 +199,6 @@ impl Router {
         }
 
         if !self.has_sufficient_historical_data() {
-            use rand::seq::SliceRandom;
-
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
@@ -213,8 +209,7 @@ impl Router {
                 })
                 .collect();
 
-            let rng = &mut rand::rng();
-            peer_distances.shuffle(rng);
+            GlobalRng::shuffle(&mut peer_distances);
             peer_distances.sort_by_key(|&(_, distance)| distance);
             peer_distances.truncate(k);
             peer_distances.into_iter().map(|(peer, _)| peer).collect()
@@ -338,8 +333,6 @@ pub enum RouteOutcome {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-
     use crate::ring::Distance;
 
     use super::*;
@@ -383,16 +376,18 @@ mod tests {
 
         // Create NUM_EVENTS random events
         let mut events = vec![];
-        let mut rng = rand::rng();
         for _ in 0..NUM_EVENTS {
-            let peer = peers[rng.random_range(0..NUM_PEERS)].clone();
+            let peer = peers[GlobalRng::random_range(0..NUM_PEERS)].clone();
             let contract_location = Location::random();
-            let simulated_prediction =
-                simulate_prediction(&mut rng, peer.clone(), contract_location);
+            let simulated_prediction = GlobalRng::with_rng(|rng| {
+                simulate_prediction(rng, peer.clone(), contract_location)
+            });
             let event = RouteEvent {
                 peer,
                 contract_location,
-                outcome: if rng.random_range(0.0..1.0) > simulated_prediction.failure_probability {
+                outcome: if GlobalRng::random_range(0.0..1.0)
+                    > simulated_prediction.failure_probability
+                {
                     RouteOutcome::Success {
                         time_to_response_start: Duration::from_secs_f64(
                             simulated_prediction.time_to_response_start,
@@ -518,10 +513,11 @@ mod tests {
     }
 
     fn simulate_prediction(
-        random: &mut rand::rngs::ThreadRng,
+        random: &mut dyn rand::RngCore,
         peer: PeerKeyLocation,
         target_location: Location,
     ) -> RoutingPrediction {
+        use rand::Rng;
         let distance = peer.location().unwrap().distance(target_location);
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();

@@ -6,10 +6,10 @@
 //!
 //! The actual socket implementation lives in `transport/in_memory_socket.rs`.
 
+use dashmap::DashMap;
 use std::{
-    collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, LazyLock, RwLock},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -183,9 +183,12 @@ impl FaultInjectorState {
 ///
 /// Each network (identified by name) can have its own fault injector configuration.
 /// This prevents test interference when multiple tests run concurrently.
-static FAULT_INJECTORS: LazyLock<
-    RwLock<HashMap<String, Arc<std::sync::Mutex<FaultInjectorState>>>>,
-> = LazyLock::new(|| RwLock::new(HashMap::new()));
+///
+/// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+/// This eliminates lock contention when multiple networks are being
+/// configured or queried simultaneously during test setup.
+static FAULT_INJECTORS: LazyLock<DashMap<String, Arc<std::sync::Mutex<FaultInjectorState>>>> =
+    LazyLock::new(DashMap::new);
 
 /// Sets the fault injector for a specific network.
 ///
@@ -212,7 +215,6 @@ pub fn set_fault_injector(
     network_name: &str,
     state: Option<Arc<std::sync::Mutex<FaultInjectorState>>>,
 ) {
-    let mut injectors = FAULT_INJECTORS.write().unwrap();
     match state {
         Some(s) => {
             // Set the network name on the state
@@ -220,23 +222,23 @@ pub fn set_fault_injector(
                 let mut state = s.lock().unwrap();
                 state.network_name = Some(network_name.to_string());
             }
-            injectors.insert(network_name.to_string(), s);
+            FAULT_INJECTORS.insert(network_name.to_string(), s);
         }
         None => {
-            injectors.remove(network_name);
+            FAULT_INJECTORS.remove(network_name);
         }
     }
 }
 
 /// Returns the fault injector for a specific network, if set.
 pub fn get_fault_injector(network_name: &str) -> Option<Arc<std::sync::Mutex<FaultInjectorState>>> {
-    FAULT_INJECTORS.read().unwrap().get(network_name).cloned()
+    FAULT_INJECTORS.get(network_name).map(|r| r.value().clone())
 }
 
 /// Clears all fault injectors. Useful for test cleanup.
 #[allow(dead_code)]
 pub fn clear_all_fault_injectors() {
-    FAULT_INJECTORS.write().unwrap().clear();
+    FAULT_INJECTORS.clear();
 }
 
 #[cfg(test)]

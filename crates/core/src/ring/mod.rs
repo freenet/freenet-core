@@ -10,7 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::seq::SliceRandom;
 use tracing::Instrument;
 
 use either::Either;
@@ -30,7 +29,7 @@ use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::transport::{ObservedAddr, TransportPublicKey};
 use crate::util::Contains;
 use crate::{
-    config::GlobalExecutor,
+    config::{GlobalExecutor, GlobalRng},
     message::{NetMessage, NetMessageV1, Transaction},
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
     operations::{connect::ConnectOp, OpEnum},
@@ -315,13 +314,11 @@ impl Ring {
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
-        use rand::Rng;
-
         // Add random initial delay (30-60 seconds) to prevent synchronized recovery
         // across all peers. This avoids "thundering herd" problems and prevents the
         // recovery task from firing at exactly the same time as test stabilization
         // periods or other network operations that happen at fixed intervals.
-        let initial_delay = Duration::from_secs(rand::rng().random_range(30..=60));
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=60u64));
         tokio::time::sleep(initial_delay).await;
 
         let mut interval = tokio::time::interval(interval_duration);
@@ -341,7 +338,7 @@ impl Ring {
             // Shuffle to prevent starvation: without this, the same failing contracts
             // (first N in iteration order) would always be tried first, blocking later
             // contracts from ever being attempted when they hit the batch limit.
-            orphaned_contracts.shuffle(&mut rand::rng());
+            GlobalRng::shuffle(&mut orphaned_contracts);
 
             // Get op_manager to spawn subscription requests
             let Some(op_manager) = ring.upgrade_op_manager() else {
@@ -374,7 +371,7 @@ impl Ring {
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
 
-                    tokio::spawn(async move {
+                    GlobalExecutor::spawn(async move {
                         // Guard ensures complete_subscription_request is called even on panic
                         let guard =
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);

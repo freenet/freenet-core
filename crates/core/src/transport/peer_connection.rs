@@ -7,6 +7,7 @@ use std::{collections::HashMap, time::Instant};
 
 use parking_lot::RwLock;
 
+use crate::config::GlobalExecutor;
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
@@ -237,7 +238,7 @@ impl<S: super::Socket> PeerConnection<S> {
             Arc::new(RwLock::new(BTreeMap::new()));
         let pending_pings_for_task = pending_pings.clone();
 
-        let keep_alive_handle = tokio::spawn(async move {
+        let keep_alive_handle = GlobalExecutor::spawn(async move {
             tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
@@ -1085,10 +1086,9 @@ impl<S: super::Socket> PeerConnection<S> {
                         );
                         return Ok(Some(msg));
                     }
-                    self.inbound_stream_futures
-                        .push(tokio::spawn(inbound_stream::recv_stream(
-                            stream_id, receiver, stream,
-                        )));
+                    self.inbound_stream_futures.push(GlobalExecutor::spawn(
+                        inbound_stream::recv_stream(stream_id, receiver, stream),
+                    ));
                 }
                 Ok(None)
             }
@@ -1168,7 +1168,7 @@ impl<S: super::Socket> PeerConnection<S> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        let task = tokio::spawn(
+        let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
                 stream_id,
                 self.remote_conn.last_packet_id.clone(),
@@ -1574,7 +1574,7 @@ mod tests {
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
-        let outbound = tokio::task::spawn(send_stream(
+        let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(sender)),
@@ -1592,7 +1592,7 @@ mod tests {
             // need to take care of decrypting and deserializing the inbound data before collecting into the message
             let (tx, rx) = fast_channel::bounded(1);
             let stream = InboundStream::new(MSG_LEN as u64);
-            let inbound_msg = tokio::task::spawn(recv_stream(stream_id, rx, stream));
+            let inbound_msg = GlobalExecutor::spawn(recv_stream(stream_id, rx, stream));
             while let Ok((_, network_packet)) = receiver.recv_async().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)

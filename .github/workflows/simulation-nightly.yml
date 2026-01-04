@@ -1,0 +1,119 @@
+name: Simulation Tests (Nightly)
+
+on:
+  schedule:
+    # Run at 3 AM UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    # Allow manual triggering from any branch
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI.'
+        required: false
+        default: ''
+      madsim_seed:
+        description: 'MadSim seed for reproducibility (hex, e.g., 0xDEADBEEF)'
+        required: false
+        default: ''
+
+# Cancel in-progress runs when a new run is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  madsim-simulation:
+    name: MadSim Deterministic Simulation
+    runs-on: self-hosted
+    timeout-minutes: 45
+
+    env:
+      RUST_LOG: info
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 16777216
+      # Use mold linker to avoid rust-lld crashes
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # MadSim seed - use input if provided, otherwise use fixed seed for reproducibility
+      MADSIM_SEED: ${{ github.event.inputs.madsim_seed || '0xDEADBEEF' }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Show checked out ref
+        run: |
+          echo "Checked out ref: $(git rev-parse --abbrev-ref HEAD || git rev-parse HEAD)"
+          echo "Commit: $(git rev-parse HEAD)"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Use separate cache key for MadSim builds
+          prefix-key: madsim
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clean test directories
+        run: |
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
+      - name: Run simulation tests with MadSim
+        run: |
+          echo "Running with MadSim seed: $MADSIM_SEED"
+          RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network -- --test-threads=1
+        env:
+          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+
+      - name: Run simulation integration tests with MadSim
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p freenet --test simulation_integration -- --test-threads=1
+        env:
+          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+
+      - name: Run fdev single-process test with MadSim
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 --seed 42 --disable-metrics single-process
+        env:
+          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+
+  # Also run without MadSim for comparison (helps identify MadSim-specific issues)
+  standard-simulation:
+    name: Standard Simulation (Comparison)
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 16777216
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clean test directories
+        run: |
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
+      - name: Run simulation tests (standard mode)
+        run: |
+          cargo test -p freenet --test sim_network -- --test-threads=1
+
+      - name: Run simulation integration tests (standard mode)
+        run: |
+          cargo test -p freenet --test simulation_integration -- --test-threads=1

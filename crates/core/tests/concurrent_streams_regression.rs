@@ -107,7 +107,7 @@ async fn bench_concurrent_streams(
     (total_elapsed, aggregate_mbps)
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_concurrent_streams_bottleneck() {
     info!("=== Concurrent Streams Bottleneck Test ===");
 

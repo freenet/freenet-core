@@ -5,7 +5,10 @@ use std::{
 };
 
 use clap::ArgGroup;
-use freenet::{config::ConfigPathsArgs, dev_tool::OperationMode};
+use freenet::{
+    config::{ConfigPathsArgs, GlobalExecutor},
+    dev_tool::OperationMode,
+};
 
 mod commands;
 mod state;
@@ -25,7 +28,7 @@ pub async fn run_local_executor(config: ExecutorConfig) -> anyhow::Result<()> {
 
     let app_state = state::AppState::new(&config).await?;
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
-    let runtime = tokio::task::spawn(commands::wasm_runtime(
+    let runtime = GlobalExecutor::spawn(commands::wasm_runtime(
         config.clone(),
         receiver,
         app_state.clone(),

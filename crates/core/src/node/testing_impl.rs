@@ -86,7 +86,10 @@ use crate::{
     ring::{Distance, Location, PeerKeyLocation},
     simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
-    transport::TransportPublicKey,
+    transport::{
+        in_memory_socket::{register_network_time_source, unregister_network_time_source},
+        TransportPublicKey,
+    },
 };
 
 mod in_memory;
@@ -473,6 +476,9 @@ impl SimNetwork {
 
         // VirtualTime is always enabled for deterministic simulation
         let virtual_time = VirtualTime::new();
+
+        // Register the VirtualTime for this network so SimulationSocket can use it
+        register_network_time_source(name, virtual_time.clone());
 
         let mut net = Self {
             name: name.into(),
@@ -1201,7 +1207,10 @@ impl SimNetwork {
         // before gateways are ready to receive connections
         let registration_timeout = Duration::from_secs(10);
         let poll_interval = Duration::from_millis(10);
-        let start = std::time::Instant::now();
+        // Use tokio::time::Instant instead of std::time::Instant to work correctly
+        // with start_paused = true in tests. std::time::Instant uses wall-clock time
+        // which doesn't advance when tokio's time is paused.
+        let start = tokio::time::Instant::now();
 
         'wait_loop: loop {
             let mut all_registered = true;
@@ -2206,6 +2215,9 @@ impl Drop for SimNetwork {
         // Clean up the fault injector for this network
         use crate::node::network_bridge::set_fault_injector;
         set_fault_injector(&self.name, None);
+
+        // Clean up the VirtualTime registration for this network
+        unregister_network_time_source(&self.name);
 
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));

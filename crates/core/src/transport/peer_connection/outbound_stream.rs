@@ -249,6 +249,7 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
+    use crate::config::GlobalExecutor;
     use crate::simulation::RealTime;
     use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
@@ -319,7 +320,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let background_task = tokio::spawn(send_stream(
+        let background_task = GlobalExecutor::spawn(send_stream(
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -393,7 +394,7 @@ mod tests {
         let key_clone = key.clone();
 
         // Spawn receiver task to collect packets
-        let receiver_task = tokio::spawn(async move {
+        let receiver_task = GlobalExecutor::spawn(async move {
             let mut packet_count = 0;
             let mut total_bytes = 0;
             while let Ok((addr, packet)) = outbound_receiver.recv_async().await {
@@ -416,7 +417,7 @@ mod tests {
         });
 
         // Spawn the send_stream task
-        let send_task = tokio::spawn(send_stream(
+        let send_task = GlobalExecutor::spawn(send_stream(
             stream_id,
             last_packet_id.clone(),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -492,7 +493,7 @@ mod tests {
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
 
         // Spawn receiver task to collect packets
-        let receiver_task = tokio::spawn(async move {
+        let receiver_task = GlobalExecutor::spawn(async move {
             let mut packet_count = 0;
             while let Ok((addr, _packet)) = outbound_receiver.recv_async().await {
                 assert_eq!(addr, destination_addr);
@@ -502,7 +503,7 @@ mod tests {
         });
 
         // Spawn the send_stream task
-        let send_task = tokio::spawn(send_stream(
+        let send_task = GlobalExecutor::spawn(send_stream(
             stream_id,
             last_packet_id.clone(),
             Arc::new(TestSocket::new(outbound_sender)),

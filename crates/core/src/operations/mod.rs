@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use crate::{
     client_events::HostResult,
+    config::GlobalExecutor,
     contract::{ContractError, ExecutorError},
     message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
@@ -487,7 +488,7 @@ fn start_subscription_request_internal(
 
     let op_manager_cloned = op_manager.clone();
 
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         tokio::task::yield_now().await;
 
         let sub_op = subscribe::start_op_with_id(*key.id(), child_tx);

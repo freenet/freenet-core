@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use once_cell::sync::Lazy;
-use rand::{rng, Rng};
 
+use crate::config::GlobalRng;
 use crate::transport::crypto::{
     TransportPublicKey, PACKET_TYPE_INTRO, PACKET_TYPE_SIZE, PACKET_TYPE_SYMMETRIC,
 };
@@ -31,7 +31,11 @@ const UDP_HEADER_SIZE: usize = 8;
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Random prefix generated once at startup to ensure nonce uniqueness across process restarts.
-static NONCE_RANDOM_PREFIX: Lazy<[u8; 4]> = Lazy::new(|| rng().random());
+static NONCE_RANDOM_PREFIX: Lazy<[u8; 4]> = Lazy::new(|| {
+    let mut bytes = [0u8; 4];
+    GlobalRng::fill_bytes(&mut bytes);
+    bytes
+});
 
 /// Generate a unique 12-byte nonce using counter + random prefix.
 /// This is faster than random generation while ensuring uniqueness.
@@ -291,7 +295,7 @@ mod tests {
     fn test_encryption_decryption() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        rand::rng().fill(&mut key);
+        GlobalRng::fill_bytes(&mut key);
 
         // Create a key object for AES-GCM
         let key = (&key).into();
@@ -312,7 +316,7 @@ mod tests {
     fn test_encryption_decryption_corrupted() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        rand::rng().fill(&mut key);
+        GlobalRng::fill_bytes(&mut key);
 
         // Create a key object for AES-GCM
         let key = (&key).into();

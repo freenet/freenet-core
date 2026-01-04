@@ -44,7 +44,7 @@ const DEFAULT_CONNECTIVITY_TARGET: f64 = 0.75;
 const DEFAULT_MIN_CONNECTIONS: usize = 5;
 const DEFAULT_MAX_CONNECTIONS: usize = 7;
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 #[ignore = "Large soak test - run manually (see file header for instructions)"]
 async fn large_network_soak() -> anyhow::Result<()> {
     let peer_count = env::var("SOAK_PEER_COUNT")

@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{config::ConfigPaths, node::PeerId};
+use crate::{
+    config::{ConfigPaths, GlobalRng},
+    node::PeerId,
+};
 use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
@@ -86,7 +89,7 @@ pub fn get_free_port() -> Result<u16, ()> {
 fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
-    rand::rng().random_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
+    GlobalRng::random_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
 // This is extremely inefficient for large sizes but is not what
@@ -149,7 +152,7 @@ where
         assert!(matches!(upper, Some(s) if s == size));
         Shuffle {
             inner: self,
-            rng: StdRng::seed_from_u64(rand::random()),
+            rng: StdRng::seed_from_u64(GlobalRng::random_u64()),
             memorized: BTreeMap::new(),
             done: HashSet::with_capacity(size),
             done_counter: 0,
@@ -187,9 +190,9 @@ pub(crate) mod test {
             #[inline]
             #[allow(unused_braces)]
             pub(crate) fn $name() -> [u8; $size] {
-                let mut rng = rand::rng();
+                use crate::config::GlobalRng;
                 let mut rnd_bytes = [0u8; $size];
-                rng.fill(rnd_bytes.as_mut_slice());
+                GlobalRng::fill_bytes(&mut rnd_bytes);
                 rnd_bytes
             }
         };
@@ -197,9 +200,9 @@ pub(crate) mod test {
             #[inline]
             #[allow(unused_braces)]
             pub(crate) fn $name() -> Vec<u8> {
-                let mut rng = rand::rng();
+                use crate::config::GlobalRng;
                 let mut rnd_bytes = vec![0u8; $size];
-                rng.fill(rnd_bytes.as_mut_slice());
+                GlobalRng::fill_bytes(&mut rnd_bytes);
                 rnd_bytes
             }
         };

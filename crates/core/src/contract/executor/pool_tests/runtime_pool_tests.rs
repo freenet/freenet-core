@@ -7,6 +7,7 @@
 //! - Health checking and replacement
 //! - Behavior under load
 
+use crate::config::GlobalExecutor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,7 +184,7 @@ async fn test_semaphore_concurrent_access() {
             let max_concurrent = max_concurrent.clone();
             let current = current.clone();
 
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 // Acquire permit (blocking if none available)
                 let permit = semaphore.acquire().await.unwrap();
 
@@ -319,7 +320,7 @@ async fn test_pool_recovers_after_exhaustion() {
 
     // Spawn task that will wait for permit
     let sem_clone = semaphore.clone();
-    let waiter = tokio::spawn(async move {
+    let waiter = GlobalExecutor::spawn(async move {
         let _ = sem_clone.acquire().await.unwrap();
     });
 
@@ -345,7 +346,7 @@ async fn test_high_contention_semaphore() {
         .map(|_| {
             let semaphore = semaphore.clone();
             let operations = operations.clone();
-            tokio::spawn(async move {
+            GlobalExecutor::spawn(async move {
                 for _ in 0..10 {
                     let permit = semaphore.acquire().await.unwrap();
                     // Very short work

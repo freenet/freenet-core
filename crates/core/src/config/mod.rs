@@ -1494,7 +1494,18 @@ pub enum Address {
     HostAddress(SocketAddr),
 }
 
-pub(crate) struct GlobalExecutor;
+/// Global async executor abstraction for spawning tasks.
+///
+/// This abstraction allows swapping the underlying executor for deterministic
+/// simulation testing. In production, it delegates to tokio. With MadSim enabled
+/// (`RUSTFLAGS="--cfg madsim"`), tokio is replaced with a deterministic runtime.
+///
+/// # Usage
+/// ```ignore
+/// use freenet::config::GlobalExecutor;
+/// GlobalExecutor::spawn(async { /* task */ });
+/// ```
+pub struct GlobalExecutor;
 
 impl GlobalExecutor {
     /// Returns the runtime handle if it was initialized or none if it was already
@@ -1526,6 +1537,233 @@ impl GlobalExecutor {
         } else {
             unreachable!("ASYNC_RT should be initialized if Handle::try_current fails")
         }
+    }
+}
+
+// =============================================================================
+// GlobalRng - Deterministic RNG abstraction for simulation testing
+// =============================================================================
+
+use parking_lot::Mutex;
+use rand::rngs::SmallRng;
+use rand::{Rng, RngCore, SeedableRng};
+
+/// Global seed for deterministic simulation.
+/// Set this before any RNG operations to ensure reproducibility.
+static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
+
+// Thread-local seeded RNG for deterministic operations.
+// Each thread gets its own RNG seeded from the global seed + thread ID.
+std::thread_local! {
+    static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Global RNG abstraction for deterministic simulation testing.
+///
+/// In production mode (no seed set), this delegates to the system RNG.
+/// In simulation mode (seed set via `set_seed`), this uses a deterministic
+/// seeded RNG that produces reproducible results.
+///
+/// # Test Isolation
+///
+/// For test isolation, prefer `scoped_seed()` or `SeedGuard` over `set_seed()`:
+///
+/// ```ignore
+/// use freenet::config::GlobalRng;
+///
+/// // Option 1: Scoped seed (recommended for tests)
+/// // Automatically clears seed when closure returns
+/// GlobalRng::scoped_seed(0xDEADBEEF, || {
+///     let value = GlobalRng::random_range(0..100); // Deterministic
+/// });
+/// // Seed automatically cleared here
+///
+/// // Option 2: RAII guard (for complex control flow)
+/// {
+///     let _guard = GlobalRng::seed_guard(0xDEADBEEF);
+///     let value = GlobalRng::random_range(0..100); // Deterministic
+/// } // Seed automatically cleared when guard drops
+///
+/// // Option 3: Manual set/clear (use with caution)
+/// GlobalRng::set_seed(0xDEADBEEF);
+/// // ... operations ...
+/// GlobalRng::clear_seed(); // Don't forget this!
+/// ```
+pub struct GlobalRng;
+
+/// RAII guard that clears the GlobalRng seed when dropped.
+///
+/// This ensures test isolation by automatically restoring the RNG to
+/// production mode (system randomness) when the guard goes out of scope,
+/// even if the test panics.
+///
+/// # Example
+/// ```ignore
+/// use freenet::config::GlobalRng;
+///
+/// #[test]
+/// fn my_deterministic_test() {
+///     let _guard = GlobalRng::seed_guard(12345);
+///     // All RNG operations are now deterministic
+///     assert_eq!(GlobalRng::random_range(0..100), 42); // Always same value
+/// } // Guard drops here, seed is cleared
+/// ```
+pub struct SeedGuard {
+    // Private field prevents external construction
+    _private: (),
+}
+
+impl Drop for SeedGuard {
+    fn drop(&mut self) {
+        GlobalRng::clear_seed();
+    }
+}
+
+impl GlobalRng {
+    /// Sets the global seed for deterministic RNG.
+    ///
+    /// **Warning:** For test isolation, prefer `scoped_seed()` or `seed_guard()`
+    /// which automatically clean up the seed state.
+    ///
+    /// Call this at test/simulation startup for reproducibility.
+    /// Must call `clear_seed()` when done to avoid affecting other tests.
+    pub fn set_seed(seed: u64) {
+        *SIMULATION_SEED.lock() = Some(seed);
+        // Clear thread-local RNG so it gets re-seeded
+        THREAD_RNG.with(|rng| {
+            *rng.borrow_mut() = None;
+        });
+    }
+
+    /// Clears the simulation seed, reverting to system RNG.
+    pub fn clear_seed() {
+        *SIMULATION_SEED.lock() = None;
+        THREAD_RNG.with(|rng| {
+            *rng.borrow_mut() = None;
+        });
+    }
+
+    /// Returns true if a simulation seed is set.
+    pub fn is_seeded() -> bool {
+        SIMULATION_SEED.lock().is_some()
+    }
+
+    /// Creates a RAII guard that sets the seed and clears it on drop.
+    ///
+    /// This is the recommended way to use deterministic RNG in tests,
+    /// as it guarantees cleanup even if the test panics.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let _guard = GlobalRng::seed_guard(12345);
+    /// // All operations here use seeded RNG
+    /// let x = GlobalRng::random_range(0..100);
+    /// // Guard drops at end of scope, seed cleared automatically
+    /// ```
+    pub fn seed_guard(seed: u64) -> SeedGuard {
+        Self::set_seed(seed);
+        SeedGuard { _private: () }
+    }
+
+    /// Executes a closure with a seeded RNG, then clears the seed.
+    ///
+    /// This is the safest way to use deterministic RNG in tests:
+    /// - The seed is automatically cleared when the closure returns
+    /// - Works correctly even if the closure panics (uses catch_unwind internally)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = GlobalRng::scoped_seed(12345, || {
+    ///     // Deterministic operations
+    ///     GlobalRng::random_range(0..100)
+    /// });
+    /// // Seed is cleared here, regardless of success or panic
+    /// ```
+    pub fn scoped_seed<F, R>(seed: u64, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = Self::seed_guard(seed);
+        f()
+    }
+
+    /// Executes a closure with access to the global RNG.
+    /// Uses seeded RNG if set, otherwise system RNG.
+    #[inline]
+    pub fn with_rng<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut dyn RngCore) -> R,
+    {
+        if let Some(seed) = *SIMULATION_SEED.lock() {
+            // Simulation mode: use thread-local seeded RNG
+            THREAD_RNG.with(|rng_cell| {
+                let mut rng_ref = rng_cell.borrow_mut();
+                if rng_ref.is_none() {
+                    // Seed with global seed XOR'd with thread ID for uniqueness
+                    let thread_id = std::thread::current().id();
+                    let thread_seed = seed ^ (format!("{:?}", thread_id).len() as u64);
+                    *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
+                }
+                f(rng_ref.as_mut().unwrap())
+            })
+        } else {
+            // Production mode: use system RNG
+            f(&mut rand::rng())
+        }
+    }
+
+    /// Generate a random value in the given range.
+    #[inline]
+    pub fn random_range<T, R>(range: R) -> T
+    where
+        T: rand::distr::uniform::SampleUniform,
+        R: rand::distr::uniform::SampleRange<T>,
+    {
+        Self::with_rng(|rng| rng.random_range(range))
+    }
+
+    /// Generate a random boolean with the given probability of being true.
+    #[inline]
+    pub fn random_bool(probability: f64) -> bool {
+        Self::with_rng(|rng| rng.random_bool(probability))
+    }
+
+    /// Choose a random element from a slice.
+    #[inline]
+    pub fn choose<T>(slice: &[T]) -> Option<&T> {
+        if slice.is_empty() {
+            None
+        } else {
+            let idx = Self::random_range(0..slice.len());
+            Some(&slice[idx])
+        }
+    }
+
+    /// Shuffle a slice in place.
+    #[inline]
+    pub fn shuffle<T>(slice: &mut [T]) {
+        Self::with_rng(|rng| {
+            use rand::seq::SliceRandom;
+            slice.shuffle(rng);
+        })
+    }
+
+    /// Fill a byte slice with random data.
+    #[inline]
+    pub fn fill_bytes(dest: &mut [u8]) {
+        Self::with_rng(|rng| rng.fill_bytes(dest))
+    }
+
+    /// Generate a random u64.
+    #[inline]
+    pub fn random_u64() -> u64 {
+        Self::with_rng(|rng| rng.random())
+    }
+
+    /// Generate a random u32.
+    #[inline]
+    pub fn random_u32() -> u32 {
+        Self::with_rng(|rng| rng.random())
     }
 }
 

@@ -13,6 +13,7 @@ use freenet_stdlib::{
 };
 
 use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::config::GlobalExecutor;
 use crate::node::IsOperationCompleted;
 use crate::transport::peer_connection::StreamId;
 use crate::{
@@ -642,7 +643,7 @@ async fn start_update_after_put(op_manager: &OpManager, key: ContractKey, new_st
 
     let op_manager_cloned = op_manager.clone();
 
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         tokio::task::yield_now().await;
 
         // Wrap the state as UpdateData::State for the update operation

@@ -7,6 +7,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, ClientId, HostResult, OpenRequest};
+use crate::config::GlobalExecutor;
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
@@ -31,7 +32,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
         let channels = clients.map(|client| {
             let (tx, rx) = channel(1);
             let (tx_host, rx_host) = channel(1);
-            tokio::task::spawn(client_fn(client, rx, tx_host));
+            GlobalExecutor::spawn(client_fn(client, rx, tx_host));
             (tx, rx_host)
         });
         let mut clients = [(); N].map(|_| None);

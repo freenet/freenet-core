@@ -14,7 +14,9 @@ use super::{
 };
 
 /// Unique identifier for an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Derives `Ord` to support use as BTreeMap key for deterministic iteration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(u64);
 
 impl EventId {
