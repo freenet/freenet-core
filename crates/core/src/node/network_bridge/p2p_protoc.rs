@@ -314,6 +314,8 @@ pub(in crate::node) struct P2pConnManager {
     bandwidth_limit: Option<usize>,
     /// Global bandwidth manager for fair sharing across all connections.
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Minimum ssthresh floor for LEDBAT timeout recovery.
+    ledbat_min_ssthresh: Option<usize>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
     message_processor: Arc<MessageProcessor>,
@@ -397,6 +399,7 @@ impl P2pConnManager {
                         config.config.network_api.min_bandwidth_per_connection,
                     ))
                 }),
+            ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             blocked_addresses: config.blocked_addresses.clone(),
             message_processor,
         })
@@ -460,6 +463,7 @@ impl P2pConnManager {
             check_version,
             bandwidth_limit,
             global_bandwidth,
+            ledbat_min_ssthresh,
             blocked_addresses,
             message_processor,
         } = self;
@@ -471,6 +475,7 @@ impl P2pConnManager {
             is_gateway,
             bandwidth_limit,
             global_bandwidth,
+            ledbat_min_ssthresh,
         )
         .await?;
 
@@ -538,6 +543,7 @@ impl P2pConnManager {
             check_version,
             bandwidth_limit,
             global_bandwidth: None, // Already used for connection handler, not needed in ctx
+            ledbat_min_ssthresh,
             blocked_addresses,
             message_processor,
         };
