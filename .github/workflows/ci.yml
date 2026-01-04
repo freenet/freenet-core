@@ -111,7 +111,8 @@ jobs:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      RUST_MIN_STACK: 16777216
+      # 64MB required for LLVM inliner pass on large workspaces
+      RUST_MIN_STACK: 67108864
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       # rust-lld occasionally segfaults with "relocation R_X86_64_PLT32 out of range"
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
@@ -165,9 +166,8 @@ jobs:
       LIBRARY_PATH: /usr/lib
       PKG_CONFIG_PATH: /usr/lib/pkgconfig
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # The river workspace builds many crates fresh (no cache), which can
-      # exhaust default stack space during parallel compilation
-      RUST_MIN_STACK: 16777216
+      # 64MB required for LLVM inliner pass on large workspaces
+      RUST_MIN_STACK: 67108864
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold

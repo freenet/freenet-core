@@ -359,17 +359,14 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // Give extra time for peers to connect to gateway
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Connect to websockets
-    let uri_gw = gateway.ws_url();
-    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    // Connect to websockets using node-specific IPs
+    let (stream_gw, _) = connect_async(&gateway.ws_url()).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri1 = peer1.ws_url();
-    let (stream1, _) = connect_async(&uri1).await?;
+    let (stream1, _) = connect_async(&peer1.ws_url()).await?;
     let mut client1 = WebApi::start(stream1);
 
-    let uri2 = peer2.ws_url();
-    let (stream2, _) = connect_async(&uri2).await?;
+    let (stream2, _) = connect_async(&peer2.ws_url()).await?;
     let mut client2 = WebApi::start(stream2);
 
     // Retry loop to wait for full mesh connectivity.
@@ -749,13 +746,11 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     let gateway = ctx.node("gateway")?;
     let peer = ctx.node("peer")?;
 
-    // Connect to websockets
-    let uri_gw = gateway.ws_url();
-    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    // Connect to websockets using node-specific IPs
+    let (stream_gw, _) = connect_async(&gateway.ws_url()).await?;
     let mut client_gw = WebApi::start(stream_gw);
 
-    let uri_peer = peer.ws_url();
-    let (stream_peer, _) = connect_async(&uri_peer).await?;
+    let (stream_peer, _) = connect_async(&peer.ws_url()).await?;
     let mut client_peer = WebApi::start(stream_peer);
 
     // Poll for connection establishment with a deadline.
