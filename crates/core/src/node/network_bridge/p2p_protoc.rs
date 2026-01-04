@@ -49,6 +49,31 @@ use crate::{
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
+/// Represents the different ways the event loop can exit.
+///
+/// This enum is used instead of string-based error matching to provide
+/// type-safe handling of shutdown conditions.
+#[derive(Debug)]
+pub enum EventLoopExitReason {
+    /// Graceful shutdown via NodeEvent::Disconnect or ClosedChannel
+    GracefulShutdown,
+    /// Unexpected stream termination (priority_select returned None)
+    UnexpectedStreamEnd,
+}
+
+impl std::fmt::Display for EventLoopExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventLoopExitReason::GracefulShutdown => write!(f, "Graceful shutdown"),
+            EventLoopExitReason::UnexpectedStreamEnd => {
+                write!(f, "Network event stream ended unexpectedly")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EventLoopExitReason {}
+
 type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
@@ -1608,11 +1633,11 @@ impl P2pConnManager {
             }
         }
         if graceful_shutdown {
-            // Return a specific error that callers can identify as graceful shutdown
-            // (The return type is Infallible, so we can't return Ok here)
-            Err(anyhow::anyhow!("Graceful shutdown"))
+            // Return typed error for graceful shutdown - callers can use downcast_ref()
+            // to identify this as a clean exit rather than an actual error
+            Err(EventLoopExitReason::GracefulShutdown.into())
         } else {
-            Err(anyhow::anyhow!("Network event stream ended unexpectedly"))
+            Err(EventLoopExitReason::UnexpectedStreamEnd.into())
         }
     }
 

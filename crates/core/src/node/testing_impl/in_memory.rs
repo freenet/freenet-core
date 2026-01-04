@@ -22,7 +22,7 @@ use crate::{
     node::{
         network_bridge::{event_loop_notification_channel, p2p_protoc::P2pConnManager},
         op_state_manager::OpManager,
-        MessageProcessor, NetEventRegister,
+        EventLoopExitReason, MessageProcessor, NetEventRegister,
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
@@ -31,6 +31,34 @@ use crate::{
 };
 
 use super::Builder;
+
+/// Converts the event loop result to a test-compatible result.
+///
+/// The event loop returns `Result<Infallible, anyhow::Error>` where:
+/// - `Ok(Infallible)` is impossible (Infallible can't be constructed)
+/// - `Err(EventLoopExitReason::GracefulShutdown)` means clean exit
+/// - `Err(other)` means actual error
+///
+/// In testing, graceful shutdown is treated as success.
+fn handle_event_loop_result(
+    result: Result<std::convert::Infallible, anyhow::Error>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(_infallible) => Ok(()),
+        Err(e) => {
+            // Use downcast_ref for type-safe error matching instead of string comparison
+            if e.downcast_ref::<EventLoopExitReason>()
+                .map(|r| matches!(r, EventLoopExitReason::GracefulShutdown))
+                .unwrap_or(false)
+            {
+                tracing::info!("Node exited via graceful shutdown");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 impl<ER> Builder<ER> {
     #[allow(dead_code)]
@@ -154,16 +182,7 @@ impl<ER> Builder<ER> {
             let _ = handle.await;
         }
 
-        // Convert Infallible to () for test compatibility
-        // Graceful shutdown is treated as success in testing
-        match result {
-            Ok(_infallible) => Ok(()),
-            Err(e) if e.to_string() == "Graceful shutdown" => {
-                tracing::info!("Node exited via graceful shutdown");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        handle_event_loop_result(result)
     }
 
     /// Runs a node with shared in-memory storage for deterministic simulation.
@@ -300,16 +319,7 @@ impl<ER> Builder<ER> {
             let _ = handle.await;
         }
 
-        // Convert Infallible to () for test compatibility
-        // Graceful shutdown is treated as success in testing
-        match result {
-            Ok(_infallible) => Ok(()),
-            Err(e) if e.to_string() == "Graceful shutdown" => {
-                tracing::info!("Node exited via graceful shutdown");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        handle_event_loop_result(result)
     }
 }
 

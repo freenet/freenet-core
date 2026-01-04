@@ -7,6 +7,7 @@
 //! 4. Small networks establish connectivity reliably
 
 use freenet::dev_tool::SimNetwork;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -1326,4 +1327,159 @@ async fn test_minimal_network() {
     assert_eq!(all_addrs.len(), 2, "Should track 2 node addresses");
 
     tracing::info!("Minimal network test passed");
+}
+
+// =============================================================================
+// Graceful Shutdown Regression Tests
+// =============================================================================
+
+/// Regression test for graceful shutdown deadlock fix (commit 27af7c3).
+///
+/// This test verifies that:
+/// 1. Dropping the EventChain stream signals peers to disconnect
+/// 2. Peer tasks exit gracefully without deadlocking
+/// 3. The "Graceful shutdown" error is properly treated as success
+///
+/// Previously, the test framework would deadlock because:
+/// - EventChain held a watch::Sender that peers waited on
+/// - Stream wasn't dropped when events completed
+/// - Peers waited forever for more events
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+async fn test_graceful_shutdown_no_deadlock() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0xDEAD_BEEF_CAFE;
+
+    // Create a small network
+    let mut sim = SimNetwork::new(
+        "graceful-shutdown-test",
+        1, // 1 gateway
+        2, // 2 nodes
+        7,
+        3,
+        10,
+        2,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start the network and get handles
+    let handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 3)
+        .await;
+
+    assert_eq!(handles.len(), 3, "Should have 3 node handles");
+
+    // Create event stream (this borrows the watch::Sender)
+    let mut stream = Some(sim.event_chain(3, None));
+
+    // Consume all events
+    while let Some(s) = stream.as_mut() {
+        if s.next().await.is_none() {
+            break;
+        }
+        // Small delay between events
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    tracing::info!("All events consumed, dropping stream to signal shutdown");
+
+    // CRITICAL: Drop the stream to release the watch::Sender
+    // This signals peers to disconnect. Without this, peers wait forever.
+    drop(stream.take());
+
+    // Verify peers exit within a reasonable timeout (no deadlock)
+    // If the bug recurs, this will timeout
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(10), async {
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    tracing::info!("Peer {} exited successfully", i);
+                }
+                Ok(Err(e)) => {
+                    // Check if it's a graceful shutdown (which is fine)
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("Graceful shutdown") || msg.contains("graceful"),
+                        "Unexpected error from peer {}: {}",
+                        i,
+                        e
+                    );
+                    tracing::info!("Peer {} exited with graceful shutdown", i);
+                }
+                Err(join_err) => {
+                    panic!("Peer {} task panicked or was cancelled: {:?}", i, join_err);
+                }
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        shutdown_result.is_ok(),
+        "Peers should exit within timeout - possible deadlock!"
+    );
+
+    tracing::info!("Graceful shutdown test passed - no deadlock");
+}
+
+/// Tests that the typed EventLoopExitReason error is properly handled.
+///
+/// This test verifies the fix for fragile string-based error matching.
+/// The EventLoopExitReason enum should be used instead of comparing
+/// error message strings.
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+async fn test_graceful_shutdown_typed_error() {
+    use freenet::dev_tool::SimNetwork;
+    use freenet::EventLoopExitReason;
+
+    const SEED: u64 = 0x74ED_E880;
+
+    // Create minimal network
+    let mut sim = SimNetwork::new(
+        "typed-error-test",
+        1, // 1 gateway
+        1, // 1 node
+        7,
+        3,
+        10,
+        2,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Trigger shutdown by dropping the network
+    drop(sim);
+
+    // Wait for handles with timeout
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        for handle in handles {
+            let result = handle.await;
+            // The handle should complete (either Ok or graceful shutdown error)
+            assert!(result.is_ok(), "Handle should complete without panic");
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "Shutdown should complete within timeout");
+
+    // Verify the error type exists and has correct Display impl
+    let graceful = EventLoopExitReason::GracefulShutdown;
+    let unexpected = EventLoopExitReason::UnexpectedStreamEnd;
+
+    assert_eq!(graceful.to_string(), "Graceful shutdown");
+    assert_eq!(
+        unexpected.to_string(),
+        "Network event stream ended unexpectedly"
+    );
+
+    tracing::info!("Typed error test passed");
 }
