@@ -87,7 +87,7 @@ criterion_group!(
 // - Component tests (channels, packet creation)
 // These don't correlate with real-world throughput
 criterion_main!(
-    warm_throughput_ci,     // PRIMARY: sustained bulk transfer
-    connection_setup_ci,    // Cold-start matters for UX
-    streaming_buffer_ci,    // Critical path component
+    warm_throughput_ci,  // PRIMARY: sustained bulk transfer
+    connection_setup_ci, // Cold-start matters for UX
+    streaming_buffer_ci, // Critical path component
 );
