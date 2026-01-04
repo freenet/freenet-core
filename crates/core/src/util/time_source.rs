@@ -208,6 +208,7 @@ impl SharedMockTimeSource {
     }
 
     /// Create a new shared mock time source with a specific initial elapsed time.
+    #[allow(dead_code)] // Utility for future test expansion
     pub fn with_instant(start: Instant) -> Self {
         Self {
             epoch: start,

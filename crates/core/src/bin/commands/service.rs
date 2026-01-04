@@ -153,7 +153,7 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn generate_service_file(binary_path: &Path, log_dir: &Path) -> String {
+pub fn generate_service_file(binary_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"[Unit]
 Description=Freenet Node
@@ -364,7 +364,7 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn generate_wrapper_script(binary_path: &Path) -> String {
+pub fn generate_wrapper_script(binary_path: &Path) -> String {
     format!(
         r#"#!/bin/bash
 # Freenet service wrapper for auto-update support.

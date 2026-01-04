@@ -8,6 +8,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+use super::service::generate_service_file;
+#[cfg(target_os = "macos")]
+use super::service::generate_wrapper_script;
+
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
 #[derive(Args, Debug, Clone)]
@@ -151,6 +156,17 @@ impl UpdateCommand {
                 "Successfully updated to version {}",
                 release.tag_name.trim_start_matches('v')
             );
+        }
+
+        // Check if service file needs updating (for users who installed before v0.1.75)
+        if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
+            if !self.quiet {
+                eprintln!(
+                    "Warning: Failed to update service file: {}. \
+                     Run 'freenet service install' to update manually.",
+                    e
+                );
+            }
         }
 
         // Automatically restart service if running
@@ -544,6 +560,149 @@ fn verify_binary(binary_path: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Check if the service file needs updating (missing auto-update hook) and update if so.
+/// This ensures users who installed before v0.1.75 get the ExecStopPost hook.
+#[cfg(target_os = "linux")]
+fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
+    let home_dir = match dirs::home_dir() {
+        Some(dir) => dir,
+        None => return Ok(()), // Can't update service file without home dir
+    };
+
+    let service_path = home_dir.join(".config/systemd/user/freenet.service");
+
+    // Only update if service file exists (user has installed as service)
+    if !service_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&service_path).context("Failed to read service file")?;
+
+    // Check if the auto-update hook is present
+    if content.contains("ExecStopPost=") {
+        return Ok(()); // Already has the hook
+    }
+
+    if !quiet {
+        println!("Updating service file to add auto-update support...");
+    }
+
+    // Create backup of existing service file in case user had customizations
+    let backup_path = service_path.with_extension("service.bak");
+    if let Err(e) = fs::copy(&service_path, &backup_path) {
+        if !quiet {
+            eprintln!(
+                "Warning: Failed to backup service file: {}. Continuing anyway.",
+                e
+            );
+        }
+    } else if !quiet {
+        println!("Backed up existing service file to {:?}", backup_path);
+    }
+
+    // Generate new service file content
+    let log_dir = home_dir.join(".local/state/freenet");
+    let new_content = generate_service_file(binary_path, &log_dir);
+
+    // Write the updated service file
+    fs::write(&service_path, new_content).context("Failed to write updated service file")?;
+
+    // Reload systemd daemon
+    let status = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("Failed to reload systemd")?;
+
+    if !status.success() && !quiet {
+        eprintln!("Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually.");
+    } else if !quiet {
+        println!("Service file updated with auto-update hook.");
+    }
+
+    Ok(())
+}
+
+/// Check if the wrapper script needs updating (missing or outdated) and update if so.
+#[cfg(target_os = "macos")]
+fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
+    let home_dir = match dirs::home_dir() {
+        Some(dir) => dir,
+        None => return Ok(()), // Can't update wrapper without home dir
+    };
+
+    let plist_path = home_dir.join("Library/LaunchAgents/org.freenet.node.plist");
+
+    // Only update if plist exists (user has installed as service)
+    if !plist_path.exists() {
+        return Ok(());
+    }
+
+    let wrapper_path = home_dir.join(".local/bin/freenet-service-wrapper.sh");
+
+    // Check if wrapper script exists and has the update logic
+    let needs_update = if wrapper_path.exists() {
+        let content = fs::read_to_string(&wrapper_path).context("Failed to read wrapper script")?;
+        // Check for key auto-update markers
+        !content.contains("EXIT_CODE=$?") || !content.contains("freenet update")
+    } else {
+        true
+    };
+
+    if !needs_update {
+        return Ok(());
+    }
+
+    if !quiet {
+        println!("Updating service wrapper to add auto-update support...");
+    }
+
+    // Ensure wrapper directory exists
+    let wrapper_dir = wrapper_path
+        .parent()
+        .context("Wrapper path has no parent directory")?;
+    fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
+
+    // Create backup of existing wrapper script if it exists
+    if wrapper_path.exists() {
+        let backup_path = wrapper_path.with_extension("sh.bak");
+        if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
+            if !quiet {
+                eprintln!(
+                    "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
+                    e
+                );
+            }
+        } else if !quiet {
+            println!("Backed up existing wrapper script to {:?}", backup_path);
+        }
+    }
+
+    // Generate and write new wrapper script
+    let wrapper_content = generate_wrapper_script(binary_path);
+    fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&wrapper_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&wrapper_path, perms)?;
+    }
+
+    if !quiet {
+        println!("Service wrapper updated with auto-update hook.");
+    }
+
+    Ok(())
+}
+
+/// No-op on other platforms
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> {
     Ok(())
 }
 
