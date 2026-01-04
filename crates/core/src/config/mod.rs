@@ -791,7 +791,10 @@ pub struct NetworkArgs {
     ///
     /// Default: None (uses spec-compliant 2*min_cwnd ≈ 5.7KB floor)
     #[arg(long, env = "LEDBAT_MIN_SSTHRESH")]
-    #[serde(rename = "ledbat-min-ssthresh", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "ledbat-min-ssthresh",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ledbat_min_ssthresh: Option<usize>,
 }
 
