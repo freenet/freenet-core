@@ -115,7 +115,7 @@ impl Default for LedbatConfig {
             initial_cwnd: 38_000,           // 26 * MSS (IW26)
             min_cwnd: 2_848,                // 2 * MSS
             max_cwnd: 1_000_000_000,        // 1 GB
-            ssthresh: DEFAULT_SSTHRESH,     // 100 KB
+            ssthresh: DEFAULT_SSTHRESH,     // 1 MB
             enable_slow_start: true,        // Enable by default
             delay_exit_threshold: 0.75,     // LEDBAT++: exit at 3/4 * TARGET (45ms)
             randomize_ssthresh: true,       // Enable jitter by default
@@ -1167,10 +1167,16 @@ impl<T: TimeSource + Clone> LedbatController<T> {
                 // Check if wait period is over
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown {
-                    self.start_slowdown(now_nanos, base_delay);
+                    if self.start_slowdown(now_nanos, base_delay) {
+                        // Slowdown started, stay in state machine
+                        return true;
+                    }
+                    // Slowdown skipped (cwnd too small) - transition to normal operation
+                    // so congestion avoidance can grow cwnd
+                    self.congestion_state.enter_congestion_avoidance();
+                    return false;
                 }
-                // Always return true to prevent fall-through to congestion avoidance.
-                // While waiting, cwnd should remain stable, not be subject to app-limited cap.
+                // Still waiting for slowdown timer - keep cwnd stable
                 true
             }
             CongestionState::InSlowdown => {
