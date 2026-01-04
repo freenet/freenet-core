@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::PCK_VERSION;
 use crate::transport::crypto::TransportSecretKey;
@@ -40,6 +40,7 @@ use super::{
     token_bucket::TokenBucket,
     Socket, TransportError,
 };
+use crate::simulation::{RealTime, TimeSource};
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
@@ -199,6 +200,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
 
+        let time_source = RealTime::new();
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket,
@@ -208,12 +210,13 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             new_connection_notifier: new_connection_sender,
             this_addr: socket_addr,
             dropped_packets: HashMap::new(),
-            last_drop_warning: Instant::now(),
+            last_drop_warning_nanos: time_source.now_nanos(),
             bandwidth_limit,
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
+            time_source,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -342,7 +345,7 @@ impl ExpectedInboundTracker {
 }
 
 /// Handles UDP transport internally.
-struct UdpPacketsListener<S = UdpSocket> {
+struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S>)>,
@@ -351,7 +354,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     new_connection_notifier: mpsc::Sender<PeerConnection<S>>,
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
-    last_drop_warning: Instant,
+    last_drop_warning_nanos: u64,
     bandwidth_limit: Option<usize>,
     /// Global bandwidth manager for fair sharing across all connections.
     /// When set, per-connection rates are derived from total_limit / active_connections.
@@ -361,7 +364,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     ledbat_min_ssthresh: Option<usize>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
     /// Rate limiting for asymmetric decryption attempts to prevent DoS (issue #2277).
-    last_asym_attempt: HashMap<SocketAddr, Instant>,
+    last_asym_attempt: HashMap<SocketAddr, u64>,
+    time_source: T,
 }
 
 type OngoingConnection<S> = (
@@ -391,7 +395,7 @@ type GwOngoingConnectionResult<S> = Option<
 >;
 
 #[cfg(any(test, feature = "bench"))]
-impl<T> Drop for UdpPacketsListener<T> {
+impl<S, T: TimeSource> Drop for UdpPacketsListener<S, T> {
     fn drop(&mut self) {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
@@ -407,7 +411,7 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(any(test, feature = "bench"))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
-impl<S: Socket> UdpPacketsListener<S> {
+impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
         tracing::debug!(
@@ -422,31 +426,30 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
-        let mut rate_limit_cleanup = tokio::time::interval(RATE_LIMIT_CLEANUP_INTERVAL);
-        rate_limit_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
+        let mut last_rate_limit_cleanup_nanos = self.time_source.now_nanos();
 
         'outer: loop {
             tokio::select! {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
-                            if let Some(time) = outdated_peer.get(&remote_addr) {
-                                if time.elapsed() < Duration::from_secs(60 * 10) {
+                            if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
+                                let now_nanos = self.time_source.now_nanos();
+                                if now_nanos.saturating_sub(*time_nanos) < Duration::from_secs(60 * 10).as_nanos() as u64 {
                                     let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
                                     // Peer was marked outdated due to version mismatch.
                                     // Check if this is a valid intro packet with current version
                                     // (peer may have upgraded). If so, allow reconnection.
                                     if packet_data.is_intro_packet() {
                                         // Rate limit asymmetric decryption to prevent DoS
-                                        let now = Instant::now();
                                         let rate_limited = self
                                             .last_asym_attempt
                                             .get(&remote_addr)
-                                            .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
+                                            .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
 
                                         if !rate_limited {
-                                            self.last_asym_attempt.insert(remote_addr, now);
+                                            self.last_asym_attempt.insert(remote_addr, now_nanos);
                                             if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
                                                 let decrypted_data = decrypted.data();
                                                 let proto_len = PROTOC_VERSION.len();
@@ -499,16 +502,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     && packet_data.is_intro_packet()
                                 {
                                     // Rate limit asymmetric decryption attempts to prevent DoS
-                                    let now = Instant::now();
+                                    let now_nanos = self.time_source.now_nanos();
                                     let rate_limited = self
                                         .last_asym_attempt
                                         .get(&remote_addr)
-                                        .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
+                                        .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
 
                                     if rate_limited {
                                         false
                                     } else {
-                                        self.last_asym_attempt.insert(remote_addr, now);
+                                        self.last_asym_attempt.insert(remote_addr, now_nanos);
                                         // Try asymmetric decryption and validate intro packet structure
                                         match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
                                             Ok(decrypted) => {
@@ -562,8 +565,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             *dropped_count += 1;
 
                                             // Log warning every 10 seconds if packets are being dropped
-                                            let now = Instant::now();
-                                            if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {
+                                            let now_nanos = self.time_source.now_nanos();
+                                            if now_nanos.saturating_sub(self.last_drop_warning_nanos) > Duration::from_secs(10).as_nanos() as u64 {
                                                 let total_dropped: u64 = self.dropped_packets.values().sum();
                                                 tracing::warn!(
                                                     total_dropped,
@@ -580,7 +583,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     }
                                                 }
                                                 self.dropped_packets.clear();
-                                                self.last_drop_warning = now;
+                                                self.last_drop_warning_nanos = now_nanos;
                                             }
 
                                             // Drop the packet instead of falling through - prevents symmetric packets
@@ -718,11 +721,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // When a connection closes, subsequent symmetric packets fall through here.
                                 // Without rate limiting, each packet triggers asymmetric decryption which
                                 // fails (causing "decryption failed" errors) and blocks legitimate reconnects.
-                                let now = Instant::now();
+                                let now_nanos = self.time_source.now_nanos();
                                 let rate_limited = self
                                     .last_asym_attempt
                                     .get(&remote_addr)
-                                    .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
+                                    .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
                                 if rate_limited {
                                     tracing::trace!(
                                         peer_addr = %remote_addr,
@@ -731,7 +734,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     );
                                     continue;
                                 }
-                                self.last_asym_attempt.insert(remote_addr, now);
+                                self.last_asym_attempt.insert(remote_addr, now_nanos);
 
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
@@ -832,7 +835,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Issue #2292: Previously used fragile string matching on error messages.
                             // Now we use proper typed error matching.
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
-                                outdated_peer.insert(remote_addr, Instant::now());
+                                outdated_peer.insert(remote_addr, self.time_source.now_nanos());
                                 // Signal version mismatch for auto-update detection
                                 crate::transport::signal_version_mismatch();
                             }
@@ -996,11 +999,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
                 // Periodic cleanup of expired rate limit entries (issue #2554)
-                _ = rate_limit_cleanup.tick() => {
-                    let now = Instant::now();
-                    self.last_asym_attempt.retain(|_, last_attempt| {
-                        now.duration_since(*last_attempt) < ASYM_DECRYPTION_RATE_LIMIT
+                // Check if cleanup interval has passed and perform cleanup
+                _ = async {}, if {
+                    let now_nanos = self.time_source.now_nanos();
+                    now_nanos.saturating_sub(last_rate_limit_cleanup_nanos) >= RATE_LIMIT_CLEANUP_INTERVAL.as_nanos() as u64
+                } => {
+                    let now_nanos = self.time_source.now_nanos();
+                    self.last_asym_attempt.retain(|_, last_attempt_nanos| {
+                        now_nanos.saturating_sub(*last_attempt_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
                     });
+                    last_rate_limit_cleanup_nanos = now_nanos;
                 }
             }
         }
@@ -1021,6 +1029,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let global_bandwidth = self.global_bandwidth.clone();
         let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
+        let time_source = self.time_source.clone();
 
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
@@ -1083,9 +1092,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv_async());
-            match timeout.await {
-                Ok(Ok(packet)) => {
+            let timeout_result = tokio::select! {
+                result = next_inbound.recv_async() => Some(result),
+                _ = time_source.sleep(Duration::from_secs(5)) => None,
+            };
+            match timeout_result {
+                Some(Ok(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                         tracing::debug!(
                             peer_addr = %remote_addr,
@@ -1098,12 +1110,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     })?;
                 }
-                Ok(Err(_)) => {
+                Some(Err(_)) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection closed".into(),
                     });
                 }
-                Err(_) => {
+                None => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection timed out waiting for response".into(),
                     });
@@ -1257,6 +1269,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let global_bandwidth = self.global_bandwidth.clone();
         let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
+        let time_source = self.time_source.clone();
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
@@ -1268,10 +1281,8 @@ impl<S: Socket> UdpPacketsListener<S> {
             );
             let mut state = ConnectionState::StartOutbound {};
             let mut attempts = 0usize;
-            let start_time = Instant::now();
+            let start_time_nanos = time_source.now_nanos();
             let overall_deadline = Duration::from_secs(3);
-            let mut resend_tick = tokio::time::interval(INITIAL_INTERVAL);
-            resend_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
@@ -1289,7 +1300,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
             // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
-            while start_time.elapsed() < overall_deadline {
+            while time_source.now_nanos().saturating_sub(start_time_nanos) < overall_deadline.as_nanos() as u64 {
                 // Send a packet if we haven't exceeded the max attempts
                 if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
                     match state {
@@ -1328,10 +1339,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                 }
-                let next_inbound_result =
-                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv_async());
-                match next_inbound_result.await {
-                    Ok(Ok(packet)) => {
+                let next_inbound_result = tokio::select! {
+                    result = next_inbound.recv_async() => Some(result),
+                    _ = time_source.sleep(Duration::from_millis(200)) => None,
+                };
+                match next_inbound_result {
+                    Some(Ok(packet)) => {
                         tracing::trace!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -1560,7 +1573,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         }
                     }
-                    Ok(Err(_)) => {
+                    Some(Err(_)) => {
                         tracing::debug!(
                             bind_addr = %this_addr,
                             peer_addr = %remote_addr,
@@ -1569,7 +1582,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         );
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
-                    Err(_) => {
+                    None => {
                         tracing::trace!(
                             bind_addr = %this_addr,
                             peer_addr = %remote_addr,
@@ -1579,13 +1592,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                 }
 
-                resend_tick.tick().await;
+                time_source.sleep(INITIAL_INTERVAL).await;
             }
 
+            let elapsed_nanos = time_source.now_nanos().saturating_sub(start_time_nanos);
+            let elapsed_ms = elapsed_nanos / 1_000_000;
             tracing::warn!(
                 peer_addr = %remote_addr,
                 attempts,
-                elapsed_ms = start_time.elapsed().as_millis(),
+                elapsed_ms,
                 direction = "outbound",
                 "Outbound handshake failed: max connection attempts reached"
             );
