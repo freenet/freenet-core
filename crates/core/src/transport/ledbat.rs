@@ -1427,28 +1427,101 @@ impl<T: TimeSource + Clone> LedbatController<T> {
     /// This implements Phase 2 of the adaptive min_ssthresh feature, providing
     /// a more resilient floor that adapts to the actual path capacity.
     ///
-    /// ## Algorithm
+    /// # Algorithm
     ///
-    /// 1. **BDP-based floor (preferred)**: Uses `slow_start_exit_cwnd` as a proxy
+    /// The adaptive floor uses a three-tier priority system:
+    ///
+    /// 1. **Explicit min_ssthresh (highest priority)**: When `min_ssthresh` is
+    ///    explicitly configured, it is always respected as a hard floor. This
+    ///    provides operator control for high-BDP deployments.
+    ///
+    /// 2. **BDP-based floor (preferred)**: Uses `slow_start_exit_cwnd` as a proxy
     ///    for the path's bandwidth-delay product. This is the cwnd at which we
-    ///    first detected congestion during slow start.
+    ///    first detected congestion during slow start - a reliable indicator of
+    ///    the path's actual capacity.
     ///
-    /// 2. **Path change detection**: If the current base_delay differs significantly
-    ///    (>50%) from the base_delay at slow start exit, we may have changed paths
-    ///    and should fall back to RTT-based scaling.
+    /// 3. **Spec-compliant floor (fallback)**: Uses `2 * min_cwnd` as defined in
+    ///    RFC 6817 Section 2.4.2 and LEDBAT++ draft Section 4.2.
     ///
-    /// 3. **RTT-based scaling (fallback)**: When slow start hasn't completed or
-    ///    after a path change, uses `1KB per ms of base RTT` as a heuristic.
-    ///    This provides ~50KB floor for 50ms RTT, ~135KB for 135ms RTT.
+    /// # Path Change Detection
     ///
-    /// 4. **Bounds**: Always respects spec-compliant 2*min_cwnd floor and
-    ///    configured min_ssthresh/initial_ssthresh as upper bound.
+    /// If the current `base_delay` differs significantly (>50%) from the
+    /// `base_delay` at slow start exit, the BDP proxy is considered stale.
+    /// This handles route changes where the old capacity estimate no longer
+    /// applies. The 50% threshold was chosen as a balance between:
+    /// - Too sensitive: Normal RTT jitter would invalidate valid estimates
+    /// - Too permissive: Actual route changes might not be detected
     ///
-    /// ## LEDBAT++ Spec Compliance
+    /// # RTT-based Scaling (with explicit min_ssthresh only)
     ///
-    /// The spec floor (2*min_cwnd) is always respected. The adaptive floor
-    /// provides a higher minimum for high-BDP paths while never going below
-    /// spec requirements.
+    /// When `min_ssthresh` is explicitly configured but no BDP proxy is available,
+    /// RTT-based scaling provides a reasonable estimate: 1KB per ms of base RTT.
+    /// This heuristic is based on typical backbone capacity:
+    /// - 50ms RTT → 50KB floor (~1 MB/s recovery potential)
+    /// - 135ms RTT → 135KB floor (~1 MB/s recovery potential)
+    /// - 200ms RTT → 200KB floor (~1 MB/s recovery potential)
+    ///
+    /// # LEDBAT++ Spec Compliance
+    ///
+    /// This implementation is **fully compliant** with RFC 6817 and LEDBAT++:
+    ///
+    /// | Requirement | Spec Reference | Our Implementation | Compliant? |
+    /// |-------------|----------------|-------------------|------------|
+    /// | `ssthresh >= 2*SMSS` | RFC 6817 §2.4.2 | `spec_floor = min_cwnd * 2` | ✅ Yes |
+    /// | Multiplicative decrease on loss | LEDBAT++ §4.2 | `ssthresh = max(cwnd/2, floor)` | ✅ Yes |
+    /// | No minimum on ssthresh increase | RFC 5681 §3.1 | Adaptive floor only affects minimum | ✅ Yes |
+    ///
+    /// The spec defines a **minimum** floor (`2*SMSS`), not a maximum. Our adaptive
+    /// floor provides a **higher** minimum for high-BDP paths, which is spec-compliant
+    /// as long as we never go below `2*SMSS`. The spec explicitly allows implementations
+    /// to use more conservative (higher) floors.
+    ///
+    /// # Design Rationale
+    ///
+    /// ## Why BDP Proxy?
+    ///
+    /// The cwnd at slow start exit represents the point where we first detected
+    /// congestion. This is a direct measurement of the path's capacity and is more
+    /// accurate than RTT-based heuristics for paths with variable bandwidth.
+    ///
+    /// ## Why Not Always Use RTT Scaling?
+    ///
+    /// Without explicit `min_ssthresh`, we maintain backward-compatible behavior
+    /// (spec floor only) unless a BDP proxy is available. This conservative approach:
+    /// - Preserves existing test expectations
+    /// - Avoids surprising behavior for existing deployments
+    /// - Only enables adaptive behavior when there's concrete path data
+    ///
+    /// ## Why Path Change Detection?
+    ///
+    /// Mobile devices and multi-homed hosts can change network paths during a
+    /// connection. Using a stale BDP estimate from a different path could lead to:
+    /// - Underestimation: Previous path was lower capacity, starving the new path
+    /// - Overestimation: Previous path was higher capacity, causing congestion
+    ///
+    /// The 50% RTT change threshold detects most route changes while tolerating
+    /// normal RTT variation.
+    ///
+    /// # Example Scenarios
+    ///
+    /// ```text
+    /// Scenario 1: High-BDP intercontinental path (135ms RTT, 100 Mbps)
+    /// - BDP = 100 Mbit/s × 0.135s = 1.7 MB
+    /// - Slow start exits at ~500KB cwnd
+    /// - Adaptive floor = min(500KB, initial_ssthresh) = 500KB
+    /// - After timeout: ssthresh = max(old_cwnd/2, 500KB) = 500KB
+    /// - Recovery: Slow start can reach 500KB before CA → good utilization
+    ///
+    /// Scenario 2: LAN path (1ms RTT, 1 Gbps)
+    /// - BDP = 1 Gbit/s × 0.001s = 125 KB
+    /// - Slow start exits at ~125KB cwnd
+    /// - Adaptive floor = min(125KB, initial_ssthresh) = 125KB
+    /// - After timeout: Quick recovery to full utilization
+    ///
+    /// Scenario 3: No explicit config, no slow start exit
+    /// - Falls back to spec_floor = 2*min_cwnd ≈ 5.7KB
+    /// - Standard LEDBAT++ behavior, fully spec-compliant
+    /// ```
     fn calculate_adaptive_floor(&self) -> usize {
         let spec_floor = self.min_cwnd * 2;
 

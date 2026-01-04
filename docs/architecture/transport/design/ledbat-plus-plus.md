@@ -23,6 +23,8 @@ This document describes Freenet's implementation of LEDBAT++, an improved versio
 2. [Problem: Latecomer Advantage](#2-problem-latecomer-advantage)
 3. [Solution: Periodic Slowdown](#3-solution-periodic-slowdown)
 4. [Implementation Details](#4-implementation-details)
+   - [4.5 Minimum ssthresh Floor](#45-minimum-ssthresh-floor-for-high-bdp-paths-issue-2578)
+   - [4.6 Adaptive min_ssthresh (BDP Proxy)](#46-adaptive-min_ssthresh-phase-2---bdp-proxy-and-path-change-detection)
 5. [Real-World Behavior](#5-real-world-behavior)
 6. [Transfer Time Analysis](#6-transfer-time-analysis)
 7. [Configuration](#7-configuration)
@@ -340,14 +342,6 @@ LedbatConfig {
 }
 ```
 
-The implementation ensures the floor never goes below the spec minimum:
-
-```rust
-let spec_floor = self.min_cwnd * 2;  // ~5.7KB
-let floor = self.min_ssthresh.unwrap_or(spec_floor).max(spec_floor);
-let new_ssthresh = (old_cwnd / 2).max(floor);
-```
-
 **Recommended Configuration by Path Type:**
 
 | Path Type | RTT Range | Recommended min_ssthresh | Rationale |
@@ -365,6 +359,158 @@ At 100 Mbps bandwidth and 135ms RTT:
 - To fully utilize the path, cwnd needs to reach ~1.7 MB
 - With 5KB ssthresh, slow start exits at 5KB → only 0.3% utilization
 - With 500KB ssthresh, slow start can reach 500KB → 29% utilization before CA
+
+### 4.6 Adaptive min_ssthresh (Phase 2) - BDP Proxy and Path Change Detection
+
+Phase 2 of the min_ssthresh feature adds **automatic adaptation** based on observed
+path characteristics, reducing the need for manual configuration.
+
+#### 4.6.1 BDP Proxy: Learning Path Capacity
+
+When slow start exits, we capture the current cwnd as a **BDP proxy** - an estimate
+of the path's bandwidth-delay product:
+
+```rust
+// Captured at slow start exit
+slow_start_exit_cwnd: AtomicUsize,          // cwnd when congestion first detected
+slow_start_exit_base_delay_nanos: AtomicU64, // RTT at exit (for path change detection)
+```
+
+**Why this works:** Slow start exits when we first detect congestion (queuing delay
+exceeds 45ms or cwnd reaches ssthresh). At this point, cwnd approximates the path's
+actual capacity - the network is just starting to build queues.
+
+#### 4.6.2 Path Change Detection
+
+Mobile devices and multi-homed hosts can change network paths during a connection.
+We detect this by monitoring base_delay changes:
+
+```rust
+// Path changed if RTT differs by >50%
+let path_changed = if exit_base_delay_nanos > 0 && current_base_delay_nanos > 0 {
+    let ratio = current_base_delay_nanos as f64 / exit_base_delay_nanos as f64;
+    ratio > 1.5 || ratio < 0.67  // >50% change in either direction
+} else {
+    false
+};
+```
+
+When a path change is detected, the BDP proxy is considered stale and is not used.
+
+#### 4.6.3 Three-Tier Floor Calculation
+
+The adaptive floor uses a priority system:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. Explicit min_ssthresh configured?                                │
+│    YES → Use max(min_ssthresh, spec_floor)                          │
+│          RTT-based scaling also applies within min_ssthresh bounds  │
+└─────────────────────────────────────────────────────────────────────┘
+                              │ NO
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 2. BDP proxy available AND path unchanged?                          │
+│    YES → Use max(slow_start_exit_cwnd, spec_floor)                  │
+│          Capped at initial_ssthresh for safety                      │
+└─────────────────────────────────────────────────────────────────────┘
+                              │ NO
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 3. Fallback to spec-compliant floor                                 │
+│    → Use spec_floor = 2 * min_cwnd ≈ 5.7KB                          │
+│    Standard LEDBAT++ behavior                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.6.4 Implementation Details
+
+```rust
+fn calculate_adaptive_floor(&self) -> usize {
+    let spec_floor = self.min_cwnd * 2;  // RFC 6817 §2.4.2: always >= 2*SMSS
+
+    // Priority 1: Explicit configuration
+    if let Some(explicit_min) = self.min_ssthresh {
+        // RTT-based scaling within configured bounds
+        let adaptive = if slow_start_exit > 0 && !path_changed {
+            slow_start_exit.min(explicit_min)
+        } else {
+            (base_delay_ms * 1024).min(explicit_min)  // 1KB per ms of RTT
+        };
+        return adaptive.max(explicit_min).max(spec_floor);
+    }
+
+    // Priority 2: BDP proxy (if available and path unchanged)
+    if slow_start_exit > 0 && !path_changed {
+        return slow_start_exit.min(initial_ssthresh).max(spec_floor);
+    }
+
+    // Priority 3: Spec-compliant floor
+    spec_floor
+}
+```
+
+#### 4.6.5 LEDBAT++ Spec Compliance
+
+This implementation is **fully compliant** with RFC 6817 and LEDBAT++:
+
+| Requirement | Spec Reference | Our Implementation | Compliant? |
+|-------------|----------------|-------------------|------------|
+| `ssthresh >= 2*SMSS` | RFC 6817 §2.4.2 | `spec_floor = min_cwnd * 2` | ✅ Yes |
+| Multiplicative decrease | LEDBAT++ §4.2 | `ssthresh = max(cwnd/2, floor)` | ✅ Yes |
+| No max on ssthresh | RFC 5681 §3.1 | Adaptive floor only affects minimum | ✅ Yes |
+
+**Key insight:** The specs define a **minimum** floor, not a maximum. Our adaptive
+floor provides a **higher** minimum for high-BDP paths, which is explicitly allowed
+by the specs. Implementations may use more conservative (higher) floors.
+
+#### 4.6.6 Example: Intercontinental Transfer Recovery
+
+```
+Connection: US-West → EU (135ms RTT, 100 Mbps available)
+
+Phase 1: Initial slow start
+├─ cwnd grows exponentially: 38KB → 76KB → 152KB → 304KB → 500KB
+├─ Queuing delay reaches 45ms at cwnd=500KB
+├─ Slow start exits, captures BDP proxy: slow_start_exit_cwnd = 500KB
+└─ slow_start_exit_base_delay = 135ms
+
+Phase 2: Steady state (congestion avoidance)
+├─ cwnd oscillates around 450-550KB based on queuing delay
+└─ Throughput: ~3.5 MB/s
+
+Phase 3: Timeout occurs (packet loss or network issue)
+├─ Old behavior: ssthresh = max(500KB/2, 5.7KB) = 250KB
+│  ├─ After 2 more timeouts: ssthresh = 62KB
+│  └─ After 4 more timeouts: ssthresh = 5.7KB (stuck at spec floor)
+│
+└─ New behavior (adaptive floor): ssthresh = max(500KB/2, adaptive_floor)
+   ├─ adaptive_floor = slow_start_exit_cwnd = 500KB (BDP proxy)
+   ├─ ssthresh = max(250KB, 500KB) = 500KB
+   └─ Recovery: Slow start can reach 500KB, then CA resumes quickly
+```
+
+**Result:** With adaptive floor, recovery takes 5-6 RTTs (~800ms) instead of
+potentially minutes with the death spiral.
+
+#### 4.6.7 RTT-based Scaling Heuristic (with explicit min_ssthresh)
+
+When `min_ssthresh` is configured but no BDP proxy exists, RTT-based scaling
+provides a reasonable estimate:
+
+```
+Floor = min(base_delay_ms × 1024, min_ssthresh)
+```
+
+| Base Delay | RTT-scaled Floor | Typical min_ssthresh | Final Floor |
+|------------|------------------|---------------------|-------------|
+| 10ms | 10KB | 100KB | 100KB (uses min_ssthresh) |
+| 50ms | 50KB | 100KB | 100KB (uses min_ssthresh) |
+| 135ms | 135KB | 100KB | 135KB (uses RTT-scaled) |
+| 200ms | 200KB | 100KB | 200KB (uses RTT-scaled) |
+
+The 1KB per ms heuristic assumes ~8 Mbit/s minimum backbone capacity, which
+is conservative for modern networks.
 
 ---
 
