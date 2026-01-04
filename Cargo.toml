@@ -48,14 +48,19 @@ opt-level = 3
 # panic = "abort"
 
 # ==============================================================================
-# MadSim Deterministic Simulation Notes
+# MadSim Deterministic Simulation Patches
 # ==============================================================================
-# Current determinism approach uses single-threaded tokio with start_paused:
-#   #[tokio::test(flavor = "current_thread", start_paused = true)]
+# These patches enable deterministic simulation testing.
+# When built with RUSTFLAGS="--cfg madsim", randomness becomes deterministic.
 #
-# This provides deterministic scheduling without external patches.
-# GlobalExecutor::spawn is used throughout to enable future MadSim integration.
+# Enable with: RUSTFLAGS="--cfg madsim" cargo test
 #
-# For full MadSim support, patches for getrandom/quanta would be needed but
-# require version matching. See docs/architecture/testing/deterministic-simulation-roadmap.md
+# Note: tokio patch not included because madsim-rs/tokio (v1.38.0) is too old
+# for current dependencies (axum 0.8 requires tokio ≥1.44). Determinism is
+# achieved via single-threaded tokio with start_paused=true instead.
+#
+# See docs/architecture/testing/deterministic-simulation-roadmap.md for details.
 # ==============================================================================
+[patch.crates-io]
+# Patch getrandom for deterministic randomness (makes rand seeding consistent)
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git", branch = "madsim" }
