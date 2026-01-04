@@ -5,24 +5,28 @@ use super::{
     STALE_INIT_THRESHOLD,
 };
 use crate::node::OpManager;
-use dashmap::DashMap;
 use freenet_stdlib::prelude::RelatedContract;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
 
 // Type alias for shared notification storage
-// Uses DashMap for concurrent access without blocking - critical because
-// send_update_notification calls WASM (get_state_delta) and we must not hold locks during that
+// Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
+// never during WASM execution (get_state_delta)
 type SharedNotifications = Arc<
-    DashMap<ContractInstanceId, Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>>,
+    RwLock<
+        HashMap<
+            ContractInstanceId,
+            Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>,
+        >,
+    >,
 >;
 
 // Type alias for shared subscriber summaries
 type SharedSummaries =
-    Arc<DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
+    Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
 
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
@@ -115,8 +119,8 @@ impl RuntimePool {
 
         // Create shared notification storage BEFORE creating executors
         // so we can pass references to each executor
-        let shared_notifications: SharedNotifications = Arc::new(DashMap::new());
-        let shared_summaries: SharedSummaries = Arc::new(DashMap::new());
+        let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
+        let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
 
         for i in 0..pool_size_usize {
             let mut executor = Executor::from_config_with_shared_store(
@@ -381,8 +385,9 @@ impl ContractExecutor for RuntimePool {
         // when the subscription is registered or when updates arrive.
         let owned_summary = summary.map(StateSummary::into_owned);
 
-        // Use DashMap's entry API for lock-free per-key access
-        let mut channels = self.shared_notifications.entry(instance_id).or_default();
+        // Brief lock acquisition for registration (fast operation)
+        let mut notifications = self.shared_notifications.write().unwrap();
+        let channels = notifications.entry(instance_id).or_default();
 
         // Check if this client is already registered
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
@@ -407,10 +412,11 @@ impl ContractExecutor for RuntimePool {
                 "Registered new subscription in shared pool storage"
             );
         }
-        // DashMap entry guard dropped here, releasing per-key lock
+        drop(notifications); // Explicitly release lock before acquiring the next
 
-        // Also register the summary (separate per-key lock)
-        self.shared_summaries
+        // Also register the summary
+        let mut summaries = self.shared_summaries.write().unwrap();
+        summaries
             .entry(instance_id)
             .or_default()
             .insert(cli_id, owned_summary);
@@ -441,20 +447,18 @@ impl ContractExecutor for RuntimePool {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         // Read subscription info from shared storage at pool level
-        // DashMap iter() provides consistent iteration without holding a global lock
-        self.shared_notifications
+        // Brief read lock - just iterating over data
+        let notifications = self.shared_notifications.read().unwrap();
+        notifications
             .iter()
-            .flat_map(|entry| {
-                let instance_id = *entry.key();
-                entry
-                    .value()
+            .flat_map(|(instance_id, clients)| {
+                clients
                     .iter()
                     .map(move |(client_id, _)| crate::message::SubscriptionInfo {
-                        instance_id,
+                        instance_id: *instance_id,
                         client_id: *client_id,
                         last_update: None, // Pool doesn't track last update time
                     })
-                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -2071,22 +2075,23 @@ impl Executor<Runtime> {
             // Use shared pool-level storage for notifications
             // This ensures subscriptions registered while this executor was checked out are notified
             //
-            // CRITICAL: We must NOT hold DashMap locks while calling WASM (get_state_delta).
-            // Clone the data under minimal lock scope, then process without locks.
+            // CRITICAL: We use the snapshot pattern to avoid holding locks during WASM execution.
+            // Locks are only held briefly during clone, never during get_state_delta.
 
-            // Step 1: Clone notifiers and summaries under minimal lock scope
-            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> =
-                match shared_notifications.get(&instance_id) {
-                    Some(entry) => entry.value().clone(),
+            // Step 1: Clone notifiers and summaries under minimal lock scope (fast)
+            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> = {
+                let notifications = shared_notifications.read().unwrap();
+                match notifications.get(&instance_id) {
+                    Some(notifiers) => notifiers.clone(),
                     None => return Ok(()), // No subscribers for this contract
-                };
+                }
+            };
 
-            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
-                shared_summaries
-                    .get(&instance_id)
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_default();
-            // Locks released here
+            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> = {
+                let summaries = shared_summaries.read().unwrap();
+                summaries.get(&instance_id).cloned().unwrap_or_default()
+            };
+            // Locks released here - snapshot complete
 
             // Step 2: Process notifications WITHOUT holding any locks
             // get_state_delta() calls WASM which can be slow
@@ -2131,15 +2136,19 @@ impl Executor<Runtime> {
                 }
             }
 
-            // Step 3: Clean up failed notifiers under separate lock acquisition
+            // Step 3: Clean up failed notifiers under separate brief lock acquisition
             if !failures.is_empty() {
-                if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
+                let mut notifications = shared_notifications.write().unwrap();
+                if let Some(notifiers) = notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
+                drop(notifications);
+
                 // Also clean up orphaned summaries for failed clients
-                if let Some(mut summaries) = shared_summaries.get_mut(&instance_id) {
+                let mut summaries = shared_summaries.write().unwrap();
+                if let Some(contract_summaries) = summaries.get_mut(&instance_id) {
                     for failed_client in &failures {
-                        summaries.remove(failed_client);
+                        contract_summaries.remove(failed_client);
                     }
                 }
             }
