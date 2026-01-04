@@ -19,28 +19,31 @@
 //! time advancement automatically. Use `tokio::time::advance()` for explicit
 //! time control when needed.
 
+use std::{future::Future, pin::Pin, time::Duration};
+
+#[cfg(not(madsim))]
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    future::Future,
-    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
-    time::Duration,
 };
 
 /// Unique identifier for a wakeup registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WakeupId(u64);
 
+#[cfg(not(madsim))]
 impl WakeupId {
     fn new(id: u64) -> Self {
         Self(id)
     }
+}
 
+impl WakeupId {
     /// Returns the inner ID value.
     pub fn as_u64(&self) -> u64 {
         self.0
@@ -48,6 +51,7 @@ impl WakeupId {
 }
 
 /// A pending wakeup in the virtual time system.
+#[cfg(not(madsim))]
 #[derive(Debug)]
 pub struct Wakeup {
     /// When this wakeup should fire (virtual nanoseconds since epoch)
@@ -59,6 +63,7 @@ pub struct Wakeup {
     waker: Option<Waker>,
 }
 
+#[cfg(not(madsim))]
 impl Wakeup {
     fn new(deadline: u64, id: WakeupId) -> Self {
         Self {
@@ -69,20 +74,24 @@ impl Wakeup {
     }
 }
 
+#[cfg(not(madsim))]
 impl PartialEq for Wakeup {
     fn eq(&self, other: &Self) -> bool {
         self.deadline == other.deadline && self.id == other.id
     }
 }
 
+#[cfg(not(madsim))]
 impl Eq for Wakeup {}
 
+#[cfg(not(madsim))]
 impl PartialOrd for Wakeup {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(not(madsim))]
 impl Ord for Wakeup {
     fn cmp(&self, other: &Self) -> Ordering {
         // Min-heap: reverse ordering so smallest deadline comes first
