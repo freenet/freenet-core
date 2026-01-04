@@ -379,12 +379,15 @@ mod tests {
         for _ in 0..NUM_EVENTS {
             let peer = peers[GlobalRng::random_range(0..NUM_PEERS)].clone();
             let contract_location = Location::random();
-            let simulated_prediction =
-                GlobalRng::with_rng(|rng| simulate_prediction(rng, peer.clone(), contract_location));
+            let simulated_prediction = GlobalRng::with_rng(|rng| {
+                simulate_prediction(rng, peer.clone(), contract_location)
+            });
             let event = RouteEvent {
                 peer,
                 contract_location,
-                outcome: if GlobalRng::random_range(0.0..1.0) > simulated_prediction.failure_probability {
+                outcome: if GlobalRng::random_range(0.0..1.0)
+                    > simulated_prediction.failure_probability
+                {
                     RouteOutcome::Success {
                         time_to_response_start: Duration::from_secs_f64(
                             simulated_prediction.time_to_response_start,

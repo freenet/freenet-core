@@ -5,7 +5,10 @@ use std::{
 };
 
 use clap::ArgGroup;
-use freenet::{config::{ConfigPathsArgs, GlobalExecutor}, dev_tool::OperationMode};
+use freenet::{
+    config::{ConfigPathsArgs, GlobalExecutor},
+    dev_tool::OperationMode,
+};
 
 mod commands;
 mod state;

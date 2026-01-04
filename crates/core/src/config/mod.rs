@@ -1545,8 +1545,8 @@ impl GlobalExecutor {
 // =============================================================================
 
 use parking_lot::Mutex;
-use rand::{Rng, RngCore, SeedableRng};
 use rand::rngs::SmallRng;
+use rand::{Rng, RngCore, SeedableRng};
 
 /// Global seed for deterministic simulation.
 /// Set this before any RNG operations to ensure reproducibility.

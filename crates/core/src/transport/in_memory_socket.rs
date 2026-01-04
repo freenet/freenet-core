@@ -45,8 +45,7 @@ const MAX_PACKET_SIZE: usize = 65535;
 /// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
 /// This eliminates coarse-grained lock contention when multiple sockets
 /// are being registered/looked up simultaneously during test startup.
-static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> =
-    LazyLock::new(DashMap::new);
+static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> = LazyLock::new(DashMap::new);
 
 /// Registers a socket address with a network name.
 ///
@@ -258,7 +257,9 @@ fn get_or_create_registry(network_name: &str) -> Arc<RwLock<SocketRegistry>> {
 
 /// Gets the socket registry for a network, if it exists.
 fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
-    SOCKET_REGISTRIES.get(network_name).map(|r| r.value().clone())
+    SOCKET_REGISTRIES
+        .get(network_name)
+        .map(|r| r.value().clone())
 }
 
 /// Delivers a packet to a target socket within a network.
