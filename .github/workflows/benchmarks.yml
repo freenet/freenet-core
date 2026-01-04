@@ -38,6 +38,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Need enough history to find merge-base with target branch
+          fetch-depth: 0
 
       # Install system dependencies required for linking
       - name: Install system dependencies
