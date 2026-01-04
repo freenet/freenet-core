@@ -38,6 +38,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Need enough history to find merge-base with target branch
+          fetch-depth: 0
 
       # Install system dependencies required for linking
       - name: Install system dependencies
@@ -55,65 +58,124 @@ jobs:
           prefix-key: bench
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Download baseline from main branch for comparison
-      # PRs compare against main's baseline; main branch updates the baseline
-      # Note: Cache keys include SHA so each main commit creates a new baseline
-      # restore-keys finds the most recent baseline from main
-      - name: Download main branch baseline
+      # Determine baseline commit (merge-base for PRs, current SHA for main)
+      # This eliminates false positives from "missing recent improvements"
+      - name: Determine Baseline Commit
+        id: baseline-commit
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For PRs: use merge-base (where branch diverged from main)
+            BASE_SHA=$(git merge-base origin/${{ github.base_ref }} HEAD)
+            echo "📍 Using merge-base for PR: $BASE_SHA"
+          else
+            # For main branch: use current commit
+            BASE_SHA=${{ github.sha }}
+            echo "📍 Using current commit for main: $BASE_SHA"
+          fi
+          echo "sha=$BASE_SHA" >> $GITHUB_OUTPUT
+
+      # Download baseline from merge-base commit (eliminates stale baseline problem)
+      - name: Download Baseline from Merge-Base
         id: baseline-cache
         uses: actions/cache/restore@v5
         with:
           path: target/criterion
-          # Try to find an exact match first (won't happen for PRs)
-          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
-          # Fall back to most recent main branch baseline
+          # Try exact match with merge-base SHA
+          key: criterion-baseline-main-${{ runner.os }}-${{ steps.baseline-commit.outputs.sha }}
+          # Fall back to recent main baseline if merge-base not cached
           restore-keys: |
             criterion-baseline-main-${{ runner.os }}-
 
       - name: Report baseline status
         run: |
+          echo "## Baseline Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           if [ "${{ steps.baseline-cache.outputs.cache-hit }}" == "true" ]; then
-            echo "✅ Loaded exact baseline match" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Exact baseline match**: Using baseline from this exact commit" >> $GITHUB_STEP_SUMMARY
+            echo "- Cache key: \`criterion-baseline-main-${{ runner.os }}-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           elif [ -d "target/criterion" ]; then
-            echo "✅ Loaded baseline from main branch (via restore-keys)" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Restored from fallback**: Using most recent main branch baseline (via restore-keys)" >> $GITHUB_STEP_SUMMARY
+            echo "- Cache key prefix: \`criterion-baseline-main-${{ runner.os }}-\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Warning**: Baseline may be from an older commit if main has advanced" >> $GITHUB_STEP_SUMMARY
+
+            # Try to determine baseline age
+            if [ -f "target/criterion/.baseline_info" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Baseline details:**" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat target/criterion/.baseline_info >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+
+            # Show when criterion directory was last modified
+            BASELINE_AGE=$(find target/criterion -name "base" -type d -printf '%T+\n' 2>/dev/null | head -1 || echo "unknown")
+            if [ "$BASELINE_AGE" != "unknown" ]; then
+              echo "- Last modified: \`$BASELINE_AGE\`" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "⚠️ No baseline found - this run will establish the baseline" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No baseline found** - This run will establish the baseline" >> $GITHUB_STEP_SUMMARY
+            echo "- All benchmarks will show as \"new\" with no comparison" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
 
       # Run Transport Layer Benchmarks (actual code with mock I/O)
       - name: Run Transport Layer Benchmarks
         id: bench_transport
         run: |
-          echo "## Transport Layer Performance" >> $GITHUB_STEP_SUMMARY
+          echo "## Transport Layer Performance (Streamlined)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "These benchmarks test the actual transport code with mock sockets:" >> $GITHUB_STEP_SUMMARY
-          echo "- **Message throughput**: Full pipeline (serialize → encrypt → channel → decrypt)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Connection establishment**: Full handshake timing" >> $GITHUB_STEP_SUMMARY
+          echo "Focused on what matters - sustained throughput and critical paths:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Warm connection throughput**: Sustained bulk transfer (PRIMARY METRIC)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Connection establishment**: Cold-start handshake timing" >> $GITHUB_STEP_SUMMARY
+          echo "- **Streaming buffer**: Lock-free buffer operations (critical path)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note**: Micro-benchmarks moved to \`transport_extended\` (runs nightly)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run transport benchmarks (requires bench feature)
           # Uses transport_ci benchmark suite - fast, deterministic subset for CI
           cargo bench --bench transport_ci --features bench 2>&1 | tee bench_output.txt
 
-          if grep -q "regressed" bench_output.txt; then
-            echo "regression_detected=true" >> $GITHUB_OUTPUT
-            echo "### ⚠️ Transport Regressions Detected" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -B5 "regressed" bench_output.txt | tail -30 >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
+      # Parse benchmark results with structured script
+      - name: Parse Benchmark Results
+        id: parse_results
+        run: |
+          # Install Python (should already be available on ubuntu-latest)
+          python3 --version
+
+          # Run parser script
+          if python3 scripts/parse_bench_output.py bench_output.txt > parsed_output.txt 2>&1; then
             echo "regression_detected=false" >> $GITHUB_OUTPUT
-            echo "### ✅ No Transport Regressions" >> $GITHUB_STEP_SUMMARY
+            PARSE_EXIT=0
+          else
+            # Script exits with 1 if regressions found
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+            PARSE_EXIT=$?
           fi
 
-          # Also capture any improvements
-          if grep -q "improved" bench_output.txt; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🚀 Performance Improvements" >> $GITHUB_STEP_SUMMARY
+          # Append parsed results to summary
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat bench_summary.md >> $GITHUB_STEP_SUMMARY 2>/dev/null || {
+            echo "⚠️ Failed to parse benchmark results" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -A2 "improved" bench_output.txt >> $GITHUB_STEP_SUMMARY || true
+            tail -50 bench_output.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
+          }
+
+          exit 0  # Don't fail the step even if regressions found
+
+      # Save baseline metadata for tracking
+      - name: Save Baseline Metadata
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p target/criterion
+          cat > target/criterion/.baseline_info <<EOF
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref }}
+          Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow Run: ${{ github.run_id }}
+          EOF
 
       # Save baseline for future comparisons (only on main branch)
       # Each main branch commit creates a new baseline with SHA in the key
@@ -128,60 +190,29 @@ jobs:
 
       # Post comment on PR with regression summary
       - name: Comment on PR
-        if: github.event_name == 'pull_request' && steps.bench_transport.outputs.regression_detected == 'true'
+        if: github.event_name == 'pull_request' && steps.parse_results.outputs.regression_detected == 'true'
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('bench_output.txt', 'utf8');
-            const lines = output.split('\n');
 
-            // Criterion outputs benchmark results like:
-            // level0/crypto/encrypt   time:   [1.234 µs 1.250 µs 1.270 µs]
-            //                         change: [+1.23% +2.34% +3.45%] (p = 0.00 < 0.01)
-            //                         Performance has regressed.
-            //
-            // We need to capture the benchmark name (line with "time:") along with regression info
+            // Try to read the parsed PR comment from the Python script
+            let body;
+            try {
+              body = fs.readFileSync('bench_pr_comment.md', 'utf8');
+            } catch (error) {
+              // Fallback to simple message if parsing failed
+              body = `## ⚠️ Performance Benchmark Regressions Detected
 
-            let regressions = [];
-            let currentBenchmark = null;
+            Some benchmarks show performance regressions compared to the baseline.
 
-            for (let i = 0; i < lines.length; i++) {
-              const line = lines[i];
+            [View full benchmark results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})
 
-              // Capture benchmark name (lines containing "time:" have the benchmark name at the start)
-              if (line.includes('time:')) {
-                currentBenchmark = line.split('time:')[0].trim();
-              }
-
-              // When we find a regression, include the benchmark name
-              if (line.includes('Performance has regressed')) {
-                // Look back for the change line
-                const changeLine = i > 0 ? lines[i - 1] : '';
-                const changeMatch = changeLine.match(/change:\s*\[([\d.+%-]+)\s+([\d.+%-]+)\s+([\d.+%-]+)\]/);
-                const changeStr = changeMatch ? changeMatch[2] : 'unknown';
-
-                if (currentBenchmark) {
-                  regressions.push(`• ${currentBenchmark}: ${changeStr}`);
-                }
-              }
+            > **Note:** This is informational only and does not block the PR.`;
             }
 
-            const regressionsText = regressions.length > 0
-              ? regressions.slice(0, 15).join('\n')
-              : 'See workflow summary for details';
-
-            const body = `## ⚠️ Performance Benchmark Regressions Detected
-
-            The following benchmarks show performance regression compared to the baseline:
-
-            \`\`\`
-            ${regressionsText}
-            \`\`\`
-
-            > **Note:** This is informational only and does not block the PR. Please review if the regression is expected or needs investigation.
-
-            [View full benchmark results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+            // Add link to workflow run
+            body += `\n\n[View full benchmark results and summary](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -197,6 +228,9 @@ jobs:
           name: benchmark-results
           path: |
             bench_output.txt
+            bench_results.json
+            bench_summary.md
+            bench_pr_comment.md
             target/criterion/**/report/index.html
           retention-days: 30
 

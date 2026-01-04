@@ -47,6 +47,7 @@ How to configure the transport layer.
 How to measure and validate transport performance.
 
 - **[Benchmark Methodology](benchmarking/methodology.md)** - Benchmark levels (0-3), noise reduction strategies, running and interpreting results
+- **[CI Benchmark Guide](benchmarking/ci-guide.md)** - Interpreting CI benchmark results, handling regression warnings, understanding false positives
 
 ### Historical Reference
 Historical baselines and validation results from development.

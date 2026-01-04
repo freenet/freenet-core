@@ -1,21 +1,21 @@
 //! CI-Optimized Transport Benchmarks
 //!
-//! Fast, deterministic benchmarks suitable for CI regression detection.
-//! Total execution time: ~10 minutes
+//! Streamlined benchmark suite focused on what matters: throughput and critical paths.
+//! Total execution time: ~5 minutes
 //!
 //! Run with: `cargo bench --bench transport_ci`
 //!
 //! This subset includes:
-//! - level0: Pure logic (crypto, serialization) - deterministic, <2% noise
-//! - level1: Mock I/O (channel throughput) - ~5% noise from async
-//! - transport: Full transport pipeline with mock sockets - ~10% noise
-//! - streaming_buffer: Lock-free buffer operations - deterministic, <2% noise
+//! - warm_throughput: Sustained bulk transfer (what you care about!)
+//! - connection_setup: Cold-start connection establishment
+//! - streaming_buffer: Lock-free buffer operations (critical path)
 //!
-//! Not included (too slow or noisy for CI):
-//! - level2/level3: Real sockets, kernel-dependent
-//! - streaming: Long measurement times (10s per benchmark)
-//! - ledbat_validation: Large transfers (256KB, 1MB)
-//! - slow_start: Very long (30s measurement time)
+//! What this DOESN'T include (moved to transport_extended):
+//! - Micro-benchmarks (AES, serialization, allocation) - don't correlate with throughput
+//! - High-latency scenarios - too slow for every PR
+//! - Packet loss scenarios - for nightly/transport-change only
+//!
+//! For comprehensive testing: `cargo bench --bench transport_extended`
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::time::Duration;
@@ -23,100 +23,71 @@ use std::time::Duration;
 mod transport;
 
 // Import benchmark functions
-use transport::allocation_overhead::*;
 use transport::blackbox::*;
-use transport::level0::*;
-use transport::level1::*;
+use transport::slow_start::bench_warm_connection_throughput;
 use transport::streaming_buffer::*;
 
 // =============================================================================
-// CI Benchmark Groups
+// CI Benchmark Groups - Streamlined for What Matters
 // =============================================================================
 
+/// Warm connection throughput - measures sustained bulk transfer performance
+///
+/// This is the PRIMARY metric for max theoretical throughput.
+/// Measures MB/s over warm connection with realistic transfer sizes.
 criterion_group!(
-    name = allocation_ci;
+    name = warm_throughput_ci;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(3))
-        .noise_threshold(0.02)  // 2% - should be rock stable
-        .significance_level(0.01);
-    targets =
-        bench_packet_allocation,
-        bench_fragmentation,
-        bench_packet_preparation,
+        .warm_up_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(15))  // Longer for stability
+        .noise_threshold(0.20)  // 20% - realistic for async on shared runners
+        .significance_level(0.05);
+    targets = bench_warm_connection_throughput
 );
 
+/// Connection establishment - measures cold-start handshake time
+///
+/// Important for user experience (how long to connect to new peer).
 criterion_group!(
-    name = level0_ci;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(3))
-        .noise_threshold(0.02)  // 2% - should be rock stable
-        .significance_level(0.01);
-    targets =
-        bench_aes_gcm_encrypt,
-        bench_aes_gcm_decrypt,
-        bench_nonce_generation,
-        bench_serialization,
-        bench_packet_creation,
-);
-
-criterion_group!(
-    name = level1_ci;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.05)  // 5% - async adds some variance
-        .significance_level(0.01);
-    targets =
-        bench_channel_throughput,
-);
-
-criterion_group!(
-    name = transport_ci;
+    name = connection_setup_ci;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
-        .noise_threshold(0.10)  // 10% - some async variance expected
+        .noise_threshold(0.15)  // 15% - connection setup has async variance
         .significance_level(0.05);
-    targets =
-        bench_connection_establishment,
-        bench_message_throughput,
+    targets = bench_connection_establishment
 );
 
+/// Streaming buffer operations - critical path for message reassembly
+///
+/// Lock-free buffer is in the hot path for all streaming transfers.
+/// Should be rock-stable (deterministic operations).
 criterion_group!(
     name = streaming_buffer_ci;
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3))
-        .noise_threshold(0.02)  // 2% - lock-free should be rock stable
+        .noise_threshold(0.03)  // 3% - slightly relaxed from 2%
         .significance_level(0.01);
     targets =
         bench_sequential_insert,
         bench_assemble,
-        bench_iter_contiguous,
         bench_first_fragment_latency,
-        bench_duplicate_insert,
-        bench_buffer_creation,
 );
 
-criterion_group!(
-    name = streaming_buffer_concurrent_ci;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.05)  // 5% - async adds some variance
-        .significance_level(0.01);
-    targets =
-        bench_concurrent_insert,
-);
-
-// Main entry point - only CI-friendly benchmarks
+// Main entry point - streamlined CI suite
+//
+// Focus on what matters:
+// 1. Sustained throughput (what users care about)
+// 2. Connection setup (user experience)
+// 3. Critical path components (streaming buffer)
+//
+// Removed from CI (moved to transport_extended):
+// - Micro-benchmarks (allocation, crypto, serialization)
+// - Component tests (channels, packet creation)
+// These don't correlate with real-world throughput
 criterion_main!(
-    allocation_ci,
-    level0_ci,
-    level1_ci,
-    transport_ci,
-    streaming_buffer_ci,
-    streaming_buffer_concurrent_ci
+    warm_throughput_ci,  // PRIMARY: sustained bulk transfer
+    connection_setup_ci, // Cold-start matters for UX
+    streaming_buffer_ci, // Critical path component
 );

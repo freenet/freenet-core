@@ -1,0 +1,231 @@
+name: Extended Performance Benchmarks
+
+on:
+  # Run nightly at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Run when transport code changes
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks-extended.yml'
+
+  pull_request:
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks-extended.yml'
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit is pushed
+concurrency:
+  group: benchmarks-extended-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extended-benchmark:
+    name: Extended Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Extended benchmarks take longer
+    # Don't fail workflow if regressions detected
+    continue-on-error: true
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_LOG: error
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Need history for merge-base
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench-extended
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Determine baseline commit (merge-base for PRs, current for main)
+      - name: Determine Baseline Commit
+        id: baseline-commit
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BASE_SHA=$(git merge-base origin/${{ github.base_ref }} HEAD)
+            echo "Using merge-base for PR: $BASE_SHA"
+          else
+            BASE_SHA=${{ github.sha }}
+            echo "Using current commit for main: $BASE_SHA"
+          fi
+          echo "sha=$BASE_SHA" >> $GITHUB_OUTPUT
+
+      # Download baseline from merge-base commit
+      - name: Download Baseline
+        id: baseline-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: target/criterion
+          key: criterion-extended-main-${{ runner.os }}-${{ steps.baseline-commit.outputs.sha }}
+          restore-keys: |
+            criterion-extended-main-${{ runner.os }}-
+
+      - name: Report Baseline Status
+        run: |
+          echo "## Extended Benchmark Baseline" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.baseline-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ **Exact baseline match**: Comparing against merge-base commit" >> $GITHUB_STEP_SUMMARY
+            echo "- Commit: ${{ steps.baseline-commit.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+          elif [ -d "target/criterion" ]; then
+            echo "⚠️ **Restored from fallback**: Using recent main branch baseline" >> $GITHUB_STEP_SUMMARY
+            echo "- Target commit: ${{ steps.baseline-commit.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Actual baseline may be from an older commit" >> $GITHUB_STEP_SUMMARY
+
+            if [ -f "target/criterion/.baseline_info" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Baseline info:**" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat target/criterion/.baseline_info >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "📊 **No baseline**: This run will establish the baseline" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # Run Extended Benchmarks
+      - name: Run Extended Benchmark Suite
+        id: bench_extended
+        run: |
+          echo "## Extended Transport Performance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Comprehensive resilience and performance testing:" >> $GITHUB_STEP_SUMMARY
+          echo "- **High-latency paths**: 100ms, 200ms, 500ms RTT (detects ssthresh death spiral)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Packet loss**: 1%, 5% loss rates (tests reliability layer)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Large transfers**: 10MB, 50MB (sustained throughput)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Micro-benchmarks**: Component-level validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Run extended benchmark suite
+          cargo bench --bench transport_extended --features bench 2>&1 | tee bench_output.txt || true
+
+      # Parse results with structured script
+      - name: Parse Benchmark Results
+        id: parse_results
+        run: |
+          python3 --version
+
+          if python3 scripts/parse_bench_output.py bench_output.txt > parsed_output.txt 2>&1; then
+            echo "regression_detected=false" >> $GITHUB_OUTPUT
+          else
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+          fi
+
+          # Append parsed results
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat bench_summary.md >> $GITHUB_STEP_SUMMARY 2>/dev/null || {
+            echo "⚠️ Failed to parse results" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -100 bench_output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          }
+
+          exit 0
+
+      # Save baseline metadata
+      - name: Save Baseline Metadata
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p target/criterion
+          cat > target/criterion/.baseline_info <<EOF
+          Benchmark Suite: Extended (transport_extended)
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref }}
+          Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow Run: ${{ github.run_id }}
+          Run Type: ${{ github.event_name }}
+          EOF
+
+      # Save baseline for future comparisons (only on main)
+      - name: Save Baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v5
+        with:
+          path: target/criterion
+          key: criterion-extended-main-${{ runner.os }}-${{ github.sha }}
+
+      # Post PR comment if regressions detected
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.parse_results.outputs.regression_detected == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+
+            let body;
+            try {
+              body = fs.readFileSync('bench_pr_comment.md', 'utf8');
+            } catch (error) {
+              body = `## ⚠️ Extended Benchmark Regressions Detected
+
+            Some extended benchmarks show performance regressions.
+
+            **Note**: Extended benchmarks include high-latency and packet-loss scenarios
+            which have higher variance than standard CI benchmarks.
+
+            [View full results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+            }
+
+            body += `\n\n[View full benchmark summary](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # Upload results as artifacts
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v6
+        with:
+          name: extended-benchmark-results
+          path: |
+            bench_output.txt
+            bench_results.json
+            bench_summary.md
+            bench_pr_comment.md
+            target/criterion/**/report/index.html
+          retention-days: 90  # Keep extended results longer
+
+  # Summary job that always succeeds
+  benchmark-summary:
+    name: Extended Benchmark Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: extended-benchmark
+    if: always()
+
+    steps:
+      - name: Check Status
+        run: |
+          if [ "${{ needs.extended-benchmark.result }}" == "failure" ]; then
+            echo "⚠️ Extended benchmarks detected regressions (non-blocking)"
+          elif [ "${{ needs.extended-benchmark.result }}" == "cancelled" ]; then
+            echo "⚠️ Extended benchmarks were cancelled"
+          else
+            echo "✅ Extended benchmarks completed successfully"
+          fi
