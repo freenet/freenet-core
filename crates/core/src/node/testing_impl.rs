@@ -478,7 +478,7 @@ impl SimNetwork {
         let virtual_time = VirtualTime::new();
 
         // Register the VirtualTime for this network so SimulationSocket can use it
-        register_network_time_source(&name, virtual_time.clone());
+        register_network_time_source(name, virtual_time.clone());
 
         let mut net = Self {
             name: name.into(),

@@ -108,6 +108,8 @@ pub fn unregister_network_time_source(network_name: &str) {
 }
 
 /// Gets the VirtualTime for a network, if registered.
+/// Currently unused but reserved for future VirtualTime integration.
+#[allow(dead_code)]
 fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
     NETWORK_TIME_SOURCES.get(network_name).map(|r| r.clone())
 }
