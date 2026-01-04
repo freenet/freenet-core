@@ -96,6 +96,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    ledbat_min_ssthresh: Option<usize>,
 ) -> Result<(OutboundConnectionHandler<S>, InboundConnectionHandler<S>), TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
@@ -121,6 +122,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         (listen_host, listen_port).into(),
         bandwidth_limit,
         global_bandwidth,
+        ledbat_min_ssthresh,
     )?;
     Ok((
         och,
@@ -200,6 +202,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
         global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+        ledbat_min_ssthresh: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -217,6 +220,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             last_drop_warning: Instant::now(),
             bandwidth_limit,
             global_bandwidth,
+            ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
         };
@@ -246,7 +250,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None, None)
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -263,6 +267,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             is_gateway,
             socket_addr,
             bandwidth_limit,
+            None,
             None,
         )
     }
@@ -360,6 +365,9 @@ struct UdpPacketsListener<S = UdpSocket> {
     /// Global bandwidth manager for fair sharing across all connections.
     /// When set, per-connection rates are derived from total_limit / active_connections.
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Minimum ssthresh floor for LEDBAT timeout recovery.
+    /// Prevents ssthresh death spiral on high-latency paths.
+    ledbat_min_ssthresh: Option<usize>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
     /// Rate limiting for asymmetric decryption attempts to prevent DoS (issue #2277).
     last_asym_attempt: HashMap<SocketAddr, Instant>,
@@ -1020,6 +1028,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let secret = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
+        let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
 
         let (inbound_from_remote, next_inbound) =
@@ -1115,7 +1124,10 @@ impl<S: Socket> UdpPacketsListener<S> {
             // Initialize LEDBAT congestion controller with slow start (RFC 6817)
             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
             let ledbat = Arc::new(LedbatController::new_with_config(
-                crate::transport::ledbat::LedbatConfig::default(),
+                crate::transport::ledbat::LedbatConfig {
+                    min_ssthresh: ledbat_min_ssthresh,
+                    ..Default::default()
+                },
             ));
 
             // Initialize token bucket for smooth packet pacing
@@ -1257,6 +1269,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
+        let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
@@ -1408,8 +1421,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
                                             let ledbat =
                                                 Arc::new(LedbatController::new_with_config(
-                                                    crate::transport::ledbat::LedbatConfig::default(
-                                                    ),
+                                                    crate::transport::ledbat::LedbatConfig {
+                                                        min_ssthresh: ledbat_min_ssthresh,
+                                                        ..Default::default()
+                                                    },
                                                 ));
 
                                             // Initialize token bucket
@@ -1513,7 +1528,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // Initialize LEDBAT congestion controller with slow start (RFC 6817)
                                 // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
                                 let ledbat = Arc::new(LedbatController::new_with_config(
-                                    crate::transport::ledbat::LedbatConfig::default(),
+                                    crate::transport::ledbat::LedbatConfig {
+                                        min_ssthresh: ledbat_min_ssthresh,
+                                        ..Default::default()
+                                    },
                                 ));
 
                                 // Initialize token bucket

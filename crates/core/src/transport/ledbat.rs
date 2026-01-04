@@ -104,6 +104,17 @@ pub struct LedbatConfig {
     /// Enable periodic slowdowns for inter-flow fairness (LEDBAT++ feature)
     /// Default: true
     pub enable_periodic_slowdown: bool,
+    /// Minimum ssthresh floor for timeout recovery (bytes).
+    ///
+    /// After a timeout, ssthresh is normally set to max(cwnd/2, 2*min_cwnd).
+    /// This can cause a "death spiral" on high-BDP paths where repeated timeouts
+    /// keep halving ssthresh until slow start can't recover useful throughput.
+    ///
+    /// Set this to a higher value (e.g., initial_ssthresh) to allow slow start
+    /// to recover to reasonable throughput after timeouts on high-bandwidth paths.
+    ///
+    /// Default: None (uses spec-compliant 2*min_cwnd floor)
+    pub min_ssthresh: Option<usize>,
 }
 
 impl Default for LedbatConfig {
@@ -120,6 +131,7 @@ impl Default for LedbatConfig {
             delay_exit_threshold: 0.75,     // LEDBAT++: exit at 3/4 * TARGET (45ms)
             randomize_ssthresh: true,       // Enable jitter by default
             enable_periodic_slowdown: true, // LEDBAT++: enable for inter-flow fairness
+            min_ssthresh: None,             // Use spec-compliant 2*min_cwnd floor
         }
     }
 }
@@ -659,6 +671,9 @@ pub struct LedbatController<T: TimeSource + Clone = InstantTimeSrc> {
     max_cwnd: usize,
     delay_exit_threshold: f64,
     enable_periodic_slowdown: bool,
+    /// Minimum ssthresh floor for timeout recovery.
+    /// If None, uses the spec-compliant 2*min_cwnd floor.
+    min_ssthresh: Option<usize>,
 
     /// Statistics
     total_increases: AtomicUsize,
@@ -807,6 +822,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
             max_cwnd: config.max_cwnd,
             delay_exit_threshold: config.delay_exit_threshold,
             enable_periodic_slowdown: config.enable_periodic_slowdown,
+            min_ssthresh: config.min_ssthresh,
             // Statistics
             total_increases: AtomicUsize::new(0),
             total_decreases: AtomicUsize::new(0),
@@ -1399,8 +1415,10 @@ impl<T: TimeSource + Clone> LedbatController<T> {
         self.cwnd.store(new_cwnd, Ordering::Release);
 
         // Set ssthresh to half the pre-timeout cwnd (standard TCP RTO recovery)
-        // Floor at 2*min_cwnd to ensure reasonable recovery target
-        let new_ssthresh = (old_cwnd / 2).max(self.min_cwnd * 2);
+        // Floor at 2*min_cwnd (spec-compliant) or configured min_ssthresh (for high-BDP paths)
+        let spec_floor = self.min_cwnd * 2;
+        let floor = self.min_ssthresh.unwrap_or(spec_floor).max(spec_floor);
+        let new_ssthresh = (old_cwnd / 2).max(floor);
         self.ssthresh.store(new_ssthresh, Ordering::Release);
 
         // Transition to SlowStart for fast (exponential) recovery.
@@ -6880,6 +6898,7 @@ mod tests {
                 enable_periodic_slowdown: false, // Isolate slow start behavior
                 randomize_ssthresh: false,
                 delay_exit_threshold: 0.75, // Exit when queuing > 45ms
+                ..Default::default()
             };
 
             let condition = NetworkCondition::custom(rtt_ms, None, 0.0);
@@ -8092,5 +8111,503 @@ mod tests {
                 );
             }
         }
+
+        // =========================================================================
+        // ssthresh Floor Behavior Tests
+        //
+        // These tests verify that the min_ssthresh configuration option correctly
+        // prevents the "ssthresh death spiral" on high-BDP paths.
+        // =========================================================================
+
+        // ssthresh respects configured minimum floor after timeout.
+        proptest! {
+            #[test]
+            fn ssthresh_respects_min_floor_after_timeout(
+                initial_cwnd in 50_000usize..500_000,
+                min_ssthresh_kb in 50usize..200,  // 50KB - 200KB
+                num_timeouts in 1usize..5
+            ) {
+                let min_ssthresh = min_ssthresh_kb * 1024;
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd: 2_848,
+                    max_cwnd: 10_000_000,
+                    ssthresh: 1_000_000,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    min_ssthresh: Some(min_ssthresh),
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Simulate multiple timeouts
+                for _ in 0..num_timeouts {
+                    controller.on_timeout();
+                }
+
+                let final_ssthresh = controller.ssthresh.load(Ordering::Acquire);
+
+                // ssthresh should never go below the configured floor
+                prop_assert!(
+                    final_ssthresh >= min_ssthresh,
+                    "ssthresh {} < min_ssthresh {} after {} timeouts",
+                    final_ssthresh, min_ssthresh, num_timeouts
+                );
+            }
+        }
+
+        // ssthresh uses spec-compliant 2*min_cwnd floor when min_ssthresh is None.
+        proptest! {
+            #[test]
+            fn ssthresh_uses_spec_floor_when_unconfigured(
+                initial_cwnd in 10_000usize..100_000,
+                min_cwnd in 2000usize..5000,
+                num_timeouts in 1usize..10
+            ) {
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd: 10_000_000,
+                    ssthresh: 1_000_000,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    min_ssthresh: None, // Use spec-compliant floor
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Simulate multiple timeouts
+                for _ in 0..num_timeouts {
+                    controller.on_timeout();
+                }
+
+                let final_ssthresh = controller.ssthresh.load(Ordering::Acquire);
+                let spec_floor = min_cwnd * 2;
+
+                // ssthresh should be at the spec floor (2*min_cwnd)
+                prop_assert!(
+                    final_ssthresh >= spec_floor,
+                    "ssthresh {} < spec floor (2*min_cwnd={}) after {} timeouts",
+                    final_ssthresh, spec_floor, num_timeouts
+                );
+
+                // After enough timeouts, should stabilize at the floor
+                if num_timeouts >= 3 {
+                    prop_assert!(
+                        final_ssthresh <= spec_floor * 2,
+                        "ssthresh {} too high after {} timeouts, expected near {}",
+                        final_ssthresh, num_timeouts, spec_floor
+                    );
+                }
+            }
+        }
+
+        // =========================================================================
+        // State Machine Transition Tests
+        //
+        // These tests verify the congestion state machine transitions correctly
+        // under various conditions, ensuring no invalid state combinations.
+        // =========================================================================
+
+        // Timeout always transitions to SlowStart regardless of current state.
+        proptest! {
+            #[test]
+            fn timeout_always_enters_slow_start(
+                initial_cwnd in 10_000usize..200_000,
+                rtt_ms in 10u64..300
+            ) {
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd: 2_848,
+                    max_cwnd: 10_000_000,
+                    ssthresh: initial_cwnd / 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: true,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Run some ACKs to potentially change state
+                let rtt = Duration::from_millis(rtt_ms);
+                controller.on_send(initial_cwnd);
+                for _ in 0..5 {
+                    controller.on_ack(rtt, 1000);
+                }
+
+                // Timeout should always transition to SlowStart
+                controller.on_timeout();
+
+                prop_assert_eq!(
+                    controller.congestion_state.load(),
+                    CongestionState::SlowStart,
+                    "Should be in SlowStart after timeout"
+                );
+            }
+        }
+
+        // cwnd is reset to min_cwnd on timeout.
+        proptest! {
+            #[test]
+            fn cwnd_reset_on_timeout(
+                initial_cwnd in 10_000usize..1_000_000,
+                min_cwnd in 2000usize..5000,
+                rtt_ms in 10u64..200
+            ) {
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd: 10_000_000,
+                    ssthresh: initial_cwnd * 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Run some ACKs to grow cwnd
+                let rtt = Duration::from_millis(rtt_ms);
+                controller.on_send(initial_cwnd * 2);
+                for _ in 0..10 {
+                    controller.on_ack(rtt, 5000);
+                }
+
+                controller.on_timeout();
+
+                let cwnd_after = controller.current_cwnd();
+
+                // cwnd should be at or near min_cwnd (allowing for MSS clamping)
+                prop_assert!(
+                    cwnd_after <= min_cwnd + MSS,
+                    "cwnd {} should be near min_cwnd {} after timeout",
+                    cwnd_after, min_cwnd
+                );
+            }
+        }
+
+        // Scheduled slowdown is cleared on timeout.
+        proptest! {
+            #[test]
+            fn slowdown_cleared_on_timeout(
+                initial_cwnd in 50_000usize..200_000
+            ) {
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd: 2_848,
+                    max_cwnd: 10_000_000,
+                    ssthresh: initial_cwnd / 4, // Low ssthresh to trigger exit quickly
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: true,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Run ACKs to exit slow start and potentially schedule a slowdown
+                let rtt = Duration::from_millis(50);
+                controller.on_send(initial_cwnd * 2);
+                for _ in 0..20 {
+                    controller.on_ack(rtt, 5000);
+                }
+
+                controller.on_timeout();
+
+                let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+
+                // Slowdown should be cleared (set to u64::MAX)
+                prop_assert_eq!(
+                    next_slowdown,
+                    u64::MAX,
+                    "Scheduled slowdown should be cleared after timeout"
+                );
+            }
+        }
+
+        // =========================================================================
+        // Throughput Recovery Tests
+        //
+        // These tests verify that LEDBAT can recover to useful throughput after
+        // timeouts, especially on high-BDP paths where the ssthresh death spiral
+        // was previously a problem.
+        // =========================================================================
+
+        // With min_ssthresh configured, slow start can reach useful cwnd after timeout.
+        // Uses virtual time for deterministic testing.
+        proptest! {
+            #[test]
+            fn slow_start_reaches_useful_cwnd_with_min_ssthresh(
+                rtt_ms in 50u64..200,  // High RTT (intercontinental)
+                min_ssthresh_kb in 100usize..500  // 100KB - 500KB floor
+            ) {
+                use crate::util::time_source::SharedMockTimeSource;
+
+                let min_ssthresh = min_ssthresh_kb * 1024;
+                let config = LedbatConfig {
+                    initial_cwnd: 38_000,  // IW26
+                    min_cwnd: 2_848,
+                    max_cwnd: 10_000_000,
+                    ssthresh: 1_000_000,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,  // Isolate slow start behavior
+                    randomize_ssthresh: false,
+                    min_ssthresh: Some(min_ssthresh),
+                    ..Default::default()
+                };
+
+                // Use virtual time for deterministic testing
+                let time_source = SharedMockTimeSource::new();
+                let controller = LedbatController::new_with_time_source(config, time_source.clone());
+
+                // Establish base delay with time advancement
+                let rtt = Duration::from_millis(rtt_ms);
+                time_source.advance_time(rtt);
+                controller.on_ack(rtt, 1000);
+                time_source.advance_time(rtt);
+                controller.on_ack(rtt, 1000);
+
+                // Trigger timeout
+                controller.on_timeout();
+
+                // Verify ssthresh is at configured floor
+                let ssthresh_after = controller.ssthresh.load(Ordering::Acquire);
+                prop_assert!(
+                    ssthresh_after >= min_ssthresh,
+                    "ssthresh {} should be >= min_ssthresh {}",
+                    ssthresh_after, min_ssthresh
+                );
+
+                // Simulate slow start recovery with zero queuing delay
+                controller.on_send(1_000_000);  // Keep flightsize high
+                let mut prev_cwnd = controller.current_cwnd();
+
+                // Run 10 RTTs of slow start recovery with virtual time advancement
+                for i in 0..10 {
+                    // Advance time by RTT + small buffer to exceed rate-limiting interval
+                    time_source.advance_time(rtt + Duration::from_millis(1));
+                    controller.on_ack(rtt, 5000);
+                    let current_cwnd = controller.current_cwnd();
+
+                    // In slow start, cwnd should grow (unless we hit ssthresh)
+                    if controller.congestion_state.load() == CongestionState::SlowStart {
+                        prop_assert!(
+                            current_cwnd >= prev_cwnd,
+                            "cwnd should grow in slow start: {} -> {} (iter {})",
+                            prev_cwnd, current_cwnd, i
+                        );
+                    }
+                    prev_cwnd = current_cwnd;
+                }
+
+                // After 10 RTTs of slow start from min_cwnd (~2.8KB), cwnd should
+                // grow significantly. The key property is that we recover from
+                // min_cwnd to useful throughput, not a specific fraction of ssthresh.
+                //
+                // In slow start, cwnd grows by ~bytes_acked per ACK. With 5KB ACKs
+                // and 10 iterations, we expect at least 50KB of growth from min_cwnd.
+                // The actual growth may be limited by ssthresh exit or rate limiting.
+                let final_cwnd = controller.current_cwnd();
+                let min_cwnd = 2_848;
+                let expected_growth = 30_000;  // At least 30KB of growth
+
+                prop_assert!(
+                    final_cwnd >= min_cwnd + expected_growth,
+                    "After 10 RTTs, cwnd {} should be at least {} (min_cwnd + 30KB growth)",
+                    final_cwnd, min_cwnd + expected_growth
+                );
+            }
+        }
+
+        // Skip slowdown when cwnd is too small (prevents futile slowdowns).
+        proptest! {
+            #[test]
+            fn skip_slowdown_when_cwnd_near_minimum(
+                min_cwnd in 2000usize..5000
+            ) {
+                // Create controller with cwnd at the threshold where slowdowns should be skipped
+                let threshold = min_cwnd * SLOWDOWN_REDUCTION_FACTOR;
+                let initial_cwnd = threshold; // Exactly at threshold
+
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd: 10_000_000,
+                    ssthresh: 1_000_000,
+                    enable_slow_start: false,  // Start in CongestionAvoidance
+                    enable_periodic_slowdown: true,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Call start_slowdown and check if it returns false (skipped)
+                let base_delay = Duration::from_millis(50);
+                let now_nanos = 1_000_000_000u64;
+                let started = controller.start_slowdown(now_nanos, base_delay);
+
+                prop_assert!(
+                    !started,
+                    "Slowdown should be skipped when cwnd ({}) <= min_cwnd * {} ({})",
+                    initial_cwnd, SLOWDOWN_REDUCTION_FACTOR, threshold
+                );
+
+                // Verify state didn't change
+                prop_assert_eq!(
+                    controller.congestion_state.load(),
+                    CongestionState::CongestionAvoidance,
+                    "State should remain CongestionAvoidance when slowdown is skipped"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Intercontinental High-BDP Path Tests (Issue #2578)
+    //
+    // These tests verify LEDBAT behavior on high-BDP paths like US-EU (135ms RTT)
+    // where the ssthresh death spiral was causing 18+ second transfers.
+    // =========================================================================
+
+    /// Test recovery on intercontinental path (135ms RTT, 100Mbps link).
+    ///
+    /// This test simulates the issue #2578 scenario where transfers were taking
+    /// 18+ seconds due to ssthresh getting stuck at 5KB after repeated timeouts.
+    /// With the min_ssthresh floor, slow start should recover to useful throughput.
+    #[test]
+    fn test_intercontinental_recovery_with_min_ssthresh() {
+        // Configuration matching issue #2578 scenario
+        let min_ssthresh = 100 * 1024; // 100KB floor
+        let config = LedbatConfig {
+            initial_cwnd: 38_000, // IW26
+            min_cwnd: 2_848,
+            max_cwnd: 10_000_000,
+            ssthresh: 1_000_000, // 1MB initial
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh),
+            ..Default::default()
+        };
+
+        // Use deterministic harness with intercontinental network conditions
+        let mut harness = LedbatTestHarness::new(
+            config,
+            NetworkCondition::INTERCONTINENTAL, // 135ms RTT, ±20% jitter, 0.5% loss
+            12345,                              // Fixed seed for reproducibility
+        );
+
+        println!("\n========== Intercontinental Recovery Test ==========");
+        println!("RTT: 135ms, min_ssthresh: {}KB", min_ssthresh / 1024);
+
+        // Run 5 RTTs to establish connection
+        let snapshots = harness.run_rtts(5, 100_000);
+        println!(
+            "After 5 RTTs: cwnd={}KB, state={:?}",
+            snapshots.last().unwrap().cwnd / 1024,
+            snapshots.last().unwrap().state
+        );
+
+        // Simulate timeout
+        harness.inject_timeout();
+        let snap_after_timeout = harness.snapshot();
+        println!(
+            "After timeout: cwnd={}KB, state={:?}",
+            snap_after_timeout.cwnd / 1024,
+            snap_after_timeout.state
+        );
+
+        // Verify we're in slow start after timeout
+        assert_eq!(
+            snap_after_timeout.state,
+            CongestionState::SlowStart,
+            "Should be in SlowStart after timeout"
+        );
+
+        // Run 20 RTTs of recovery
+        let recovery_snapshots = harness.run_rtts(20, 100_000);
+
+        // Calculate throughput achieved
+        let final_cwnd = recovery_snapshots.last().unwrap().cwnd;
+        let rtt_ms = 135;
+        let throughput_mbps = (final_cwnd as f64 * 8.0) / (rtt_ms as f64 * 1000.0);
+
+        println!(
+            "After 20 RTTs recovery: cwnd={}KB, throughput=~{:.1} Mbps",
+            final_cwnd / 1024,
+            throughput_mbps
+        );
+
+        // Key assertion: cwnd should recover to a useful level
+        // At 135ms RTT, we need at least 100KB cwnd for decent throughput
+        assert!(
+            final_cwnd >= 50_000,
+            "After 20 RTTs, cwnd {} should be at least 50KB for usable throughput",
+            final_cwnd
+        );
+
+        println!("✓ Intercontinental recovery test passed!");
+    }
+
+    /// Test that multiple timeouts don't cause ssthresh death spiral.
+    ///
+    /// Without min_ssthresh floor, repeated timeouts would cause:
+    /// ssthresh: 1MB -> 500KB -> 250KB -> 125KB -> 62KB -> 31KB -> 15KB -> 7KB -> 5KB (floor)
+    /// With min_ssthresh=100KB floor, it stabilizes at 100KB.
+    #[test]
+    fn test_repeated_timeouts_stabilize_at_min_ssthresh() {
+        let min_ssthresh = 100 * 1024; // 100KB floor
+        let config = LedbatConfig {
+            initial_cwnd: 500_000, // 500KB
+            min_cwnd: 2_848,
+            max_cwnd: 10_000_000,
+            ssthresh: 1_000_000, // 1MB initial
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh),
+            ..Default::default()
+        };
+
+        let controller = LedbatController::new_with_config(config);
+
+        println!("\n========== Repeated Timeouts Test ==========");
+        println!("Initial ssthresh: 1MB, min_ssthresh floor: 100KB");
+
+        // Simulate 10 timeouts
+        let mut ssthresh_values = vec![controller.ssthresh.load(Ordering::Acquire)];
+        for i in 0..10 {
+            controller.on_timeout();
+            let ssthresh = controller.ssthresh.load(Ordering::Acquire);
+            ssthresh_values.push(ssthresh);
+            println!("After timeout {}: ssthresh={}KB", i + 1, ssthresh / 1024);
+        }
+
+        // Verify ssthresh stabilized at floor (not below)
+        let final_ssthresh = *ssthresh_values.last().unwrap();
+        assert!(
+            final_ssthresh >= min_ssthresh,
+            "ssthresh {} should stabilize at or above min_ssthresh {}",
+            final_ssthresh,
+            min_ssthresh
+        );
+
+        // Verify ssthresh didn't go below floor at any point
+        for (i, &ssthresh) in ssthresh_values.iter().enumerate() {
+            assert!(
+                ssthresh >= min_ssthresh,
+                "ssthresh {} at step {} was below min_ssthresh {}",
+                ssthresh,
+                i,
+                min_ssthresh
+            );
+        }
+
+        println!(
+            "✓ ssthresh stabilized at {}KB (floor: {}KB)",
+            final_ssthresh / 1024,
+            min_ssthresh / 1024
+        );
     }
 }

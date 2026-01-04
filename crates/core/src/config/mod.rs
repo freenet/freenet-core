@@ -115,6 +115,7 @@ impl Default for ConfigArgs {
                 max_connections: None,
                 streaming_enabled: None,   // Default: disabled
                 streaming_threshold: None, // Default: 64KB (set in NetworkApiConfig)
+                ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -305,6 +306,10 @@ impl ConfigArgs {
                     .streaming_threshold
                     .get_or_insert(cfg.network_api.streaming_threshold);
             }
+            // Merge LEDBAT min_ssthresh: CLI args override config file, config file overrides default
+            if self.network_api.ledbat_min_ssthresh.is_none() {
+                self.network_api.ledbat_min_ssthresh = cfg.network_api.ledbat_min_ssthresh;
+            }
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
@@ -491,6 +496,10 @@ impl ConfigArgs {
                     .network_api
                     .streaming_threshold
                     .unwrap_or_else(default_streaming_threshold),
+                ledbat_min_ssthresh: self
+                    .network_api
+                    .ledbat_min_ssthresh
+                    .or_else(default_ledbat_min_ssthresh),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -766,6 +775,27 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub streaming_threshold: Option<usize>,
+
+    /// Minimum ssthresh floor for LEDBAT timeout recovery (bytes).
+    ///
+    /// On high-latency paths (>100ms RTT), repeated timeouts can cause ssthresh
+    /// to collapse to ~5KB, severely limiting throughput recovery.
+    /// Setting a higher floor prevents this "ssthresh death spiral".
+    ///
+    /// Recommended values by network type:
+    /// - LAN (<10ms RTT): None (use default)
+    /// - Regional (10-50ms): None (use default)
+    /// - Continental (50-100ms): 51200 (50KB)
+    /// - Intercontinental (100-200ms): 102400-512000 (100KB-500KB)
+    /// - Satellite (500ms+): 524288-2097152 (500KB-2MB)
+    ///
+    /// Default: None (uses spec-compliant 2*min_cwnd ≈ 5.7KB floor)
+    #[arg(long, env = "LEDBAT_MIN_SSTHRESH")]
+    #[serde(
+        rename = "ledbat-min-ssthresh",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ledbat_min_ssthresh: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -890,6 +920,21 @@ pub struct NetworkApiConfig {
         rename = "streaming-threshold"
     )]
     pub streaming_threshold: usize,
+
+    /// Minimum ssthresh floor for LEDBAT timeout recovery (bytes).
+    ///
+    /// On high-latency paths (>100ms RTT), repeated timeouts can cause ssthresh
+    /// to collapse to ~5KB, severely limiting throughput recovery.
+    /// Setting a higher floor prevents this "ssthresh death spiral".
+    ///
+    /// Default: 102400 (100KB) - suitable for intercontinental connections.
+    /// Set to None for LAN-only deployments.
+    #[serde(
+        default = "default_ledbat_min_ssthresh",
+        rename = "ledbat-min-ssthresh",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ledbat_min_ssthresh: Option<usize>,
 }
 
 mod port_allocation;
@@ -919,6 +964,16 @@ fn default_max_connections() -> usize {
 /// Transfers larger than this will use streaming when `streaming_enabled` is true.
 fn default_streaming_threshold() -> usize {
     64 * 1024
+}
+
+/// Default minimum ssthresh for LEDBAT timeout recovery.
+///
+/// Returns `Some(100KB)` - suitable for intercontinental connections where
+/// repeated timeouts could otherwise cause ssthresh to collapse to ~5KB.
+///
+/// See: docs/architecture/transport/configuration/bandwidth-configuration.md
+fn default_ledbat_min_ssthresh() -> Option<usize> {
+    Some(100 * 1024) // 100KB floor
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
