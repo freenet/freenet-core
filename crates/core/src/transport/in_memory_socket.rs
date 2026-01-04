@@ -21,6 +21,7 @@
 
 use crate::config::GlobalExecutor;
 
+use dashmap::DashMap;
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -40,8 +41,12 @@ const MAX_PACKET_SIZE: usize = 65535;
 /// Global registry mapping socket addresses to their network names.
 /// This is used during `InMemorySocket::bind()` to determine which network
 /// a socket belongs to. The mapping is thread-safe and works across async tasks.
-static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+///
+/// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+/// This eliminates coarse-grained lock contention when multiple sockets
+/// are being registered/looked up simultaneously during test startup.
+static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> =
+    LazyLock::new(DashMap::new);
 
 /// Registers a socket address with a network name.
 ///
@@ -57,25 +62,22 @@ static ADDRESS_NETWORKS: LazyLock<RwLock<HashMap<SocketAddr, String>>> =
 /// let socket = InMemorySocket::bind(addr).await?;
 /// ```
 pub fn register_address_network(addr: SocketAddr, network_name: &str) {
-    ADDRESS_NETWORKS
-        .write()
-        .unwrap()
-        .insert(addr, network_name.to_string());
+    ADDRESS_NETWORKS.insert(addr, network_name.to_string());
 }
 
 /// Unregisters a socket address from the network mapping.
 fn unregister_address_network(addr: &SocketAddr) {
-    ADDRESS_NETWORKS.write().unwrap().remove(addr);
+    ADDRESS_NETWORKS.remove(addr);
 }
 
 /// Gets the network name for an address, if registered.
 fn get_address_network(addr: &SocketAddr) -> Option<String> {
-    ADDRESS_NETWORKS.read().unwrap().get(addr).cloned()
+    ADDRESS_NETWORKS.get(addr).map(|r| r.value().clone())
 }
 
 /// Clears all address-network mappings. Useful for test cleanup.
 pub fn clear_all_address_networks() {
-    ADDRESS_NETWORKS.write().unwrap().clear();
+    ADDRESS_NETWORKS.clear();
 }
 
 /// Result of checking packet delivery through fault injection.
@@ -234,27 +236,29 @@ impl SocketRegistry {
 /// Global map of network name -> socket registry.
 ///
 /// Each SimNetwork gets its own registry, providing test isolation.
-static SOCKET_REGISTRIES: LazyLock<RwLock<HashMap<String, Arc<RwLock<SocketRegistry>>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+///
+/// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+/// This is particularly beneficial for the get-or-create pattern in
+/// `get_or_create_registry()`, which previously required dropping a read
+/// lock and reacquiring a write lock. DashMap's `entry()` API handles
+/// this atomically without the lock upgrade overhead.
+static SOCKET_REGISTRIES: LazyLock<DashMap<String, Arc<RwLock<SocketRegistry>>>> =
+    LazyLock::new(DashMap::new);
 
 /// Gets or creates the socket registry for a network.
 fn get_or_create_registry(network_name: &str) -> Arc<RwLock<SocketRegistry>> {
-    let registries = SOCKET_REGISTRIES.read().unwrap();
-    if let Some(registry) = registries.get(network_name) {
-        return registry.clone();
-    }
-    drop(registries);
-
-    let mut registries = SOCKET_REGISTRIES.write().unwrap();
-    registries
+    // DashMap's entry API handles the get-or-insert atomically,
+    // eliminating the previous read-lock-check-then-write-lock pattern.
+    SOCKET_REGISTRIES
         .entry(network_name.to_string())
         .or_insert_with(|| Arc::new(RwLock::new(SocketRegistry::default())))
+        .value()
         .clone()
 }
 
 /// Gets the socket registry for a network, if it exists.
 fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
-    SOCKET_REGISTRIES.read().unwrap().get(network_name).cloned()
+    SOCKET_REGISTRIES.get(network_name).map(|r| r.value().clone())
 }
 
 /// Delivers a packet to a target socket within a network.
@@ -301,7 +305,7 @@ pub fn clear_network_sockets(network_name: &str) {
 
 /// Clears all socket registries (useful between test runs).
 pub fn clear_all_socket_registries() {
-    SOCKET_REGISTRIES.write().unwrap().clear();
+    SOCKET_REGISTRIES.clear();
 }
 
 /// An in-memory socket implementing the `Socket` trait.

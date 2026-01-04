@@ -78,7 +78,8 @@ use super::{EventKind, NetLogMessage};
 use crate::{config::GlobalExecutor, message::Transaction, node::PeerId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use dashmap::DashMap;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Trait for sources that provide event logs.
@@ -210,7 +211,11 @@ impl EventSource for AOFEventSource {
 /// ```
 pub struct WebSocketEventCollector {
     events: Arc<RwLock<Vec<NetLogMessage>>>,
-    peer_labels: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Peer ID to human-readable label mapping.
+    ///
+    /// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
+    /// Peer labels may be registered from multiple tasks during test setup.
+    peer_labels: Arc<DashMap<PeerId, String>>,
     port: u16,
 }
 
@@ -228,7 +233,7 @@ impl WebSocketEventCollector {
     /// its own separated AOF file and EventRegister instance.
     pub async fn new(port: u16) -> Result<Self> {
         let events = Arc::new(RwLock::new(Vec::new()));
-        let peer_labels = Arc::new(RwLock::new(HashMap::new()));
+        let peer_labels = Arc::new(DashMap::new());
 
         let collector = Self {
             events: events.clone(),
@@ -248,7 +253,7 @@ impl WebSocketEventCollector {
     async fn run_server(
         port: u16,
         events: Arc<RwLock<Vec<NetLogMessage>>>,
-        _peer_labels: Arc<RwLock<HashMap<PeerId, String>>>,
+        _peer_labels: Arc<DashMap<PeerId, String>>,
     ) -> Result<()> {
         use futures::StreamExt;
         use tokio::net::TcpListener;
@@ -297,8 +302,8 @@ impl WebSocketEventCollector {
     }
 
     /// Register a label for a peer ID.
-    pub async fn register_peer_label(&self, peer_id: PeerId, label: String) {
-        self.peer_labels.write().await.insert(peer_id, label);
+    pub fn register_peer_label(&self, peer_id: PeerId, label: String) {
+        self.peer_labels.insert(peer_id, label);
     }
 
     /// Get the port this collector is listening on.

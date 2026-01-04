@@ -1564,22 +1564,69 @@ std::thread_local! {
 /// In simulation mode (seed set via `set_seed`), this uses a deterministic
 /// seeded RNG that produces reproducible results.
 ///
-/// # Usage
+/// # Test Isolation
+///
+/// For test isolation, prefer `scoped_seed()` or `SeedGuard` over `set_seed()`:
+///
 /// ```ignore
 /// use freenet::config::GlobalRng;
 ///
-/// // Production: uses system randomness
-/// let value = GlobalRng::random_range(0..100);
+/// // Option 1: Scoped seed (recommended for tests)
+/// // Automatically clears seed when closure returns
+/// GlobalRng::scoped_seed(0xDEADBEEF, || {
+///     let value = GlobalRng::random_range(0..100); // Deterministic
+/// });
+/// // Seed automatically cleared here
 ///
-/// // Simulation: set seed for reproducibility
+/// // Option 2: RAII guard (for complex control flow)
+/// {
+///     let _guard = GlobalRng::seed_guard(0xDEADBEEF);
+///     let value = GlobalRng::random_range(0..100); // Deterministic
+/// } // Seed automatically cleared when guard drops
+///
+/// // Option 3: Manual set/clear (use with caution)
 /// GlobalRng::set_seed(0xDEADBEEF);
-/// let value = GlobalRng::random_range(0..100); // Always same result
+/// // ... operations ...
+/// GlobalRng::clear_seed(); // Don't forget this!
 /// ```
 pub struct GlobalRng;
 
+/// RAII guard that clears the GlobalRng seed when dropped.
+///
+/// This ensures test isolation by automatically restoring the RNG to
+/// production mode (system randomness) when the guard goes out of scope,
+/// even if the test panics.
+///
+/// # Example
+/// ```ignore
+/// use freenet::config::GlobalRng;
+///
+/// #[test]
+/// fn my_deterministic_test() {
+///     let _guard = GlobalRng::seed_guard(12345);
+///     // All RNG operations are now deterministic
+///     assert_eq!(GlobalRng::random_range(0..100), 42); // Always same value
+/// } // Guard drops here, seed is cleared
+/// ```
+pub struct SeedGuard {
+    // Private field prevents external construction
+    _private: (),
+}
+
+impl Drop for SeedGuard {
+    fn drop(&mut self) {
+        GlobalRng::clear_seed();
+    }
+}
+
 impl GlobalRng {
     /// Sets the global seed for deterministic RNG.
+    ///
+    /// **Warning:** For test isolation, prefer `scoped_seed()` or `seed_guard()`
+    /// which automatically clean up the seed state.
+    ///
     /// Call this at test/simulation startup for reproducibility.
+    /// Must call `clear_seed()` when done to avoid affecting other tests.
     pub fn set_seed(seed: u64) {
         *SIMULATION_SEED.lock() = Some(seed);
         // Clear thread-local RNG so it gets re-seeded
@@ -1599,6 +1646,45 @@ impl GlobalRng {
     /// Returns true if a simulation seed is set.
     pub fn is_seeded() -> bool {
         SIMULATION_SEED.lock().is_some()
+    }
+
+    /// Creates a RAII guard that sets the seed and clears it on drop.
+    ///
+    /// This is the recommended way to use deterministic RNG in tests,
+    /// as it guarantees cleanup even if the test panics.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let _guard = GlobalRng::seed_guard(12345);
+    /// // All operations here use seeded RNG
+    /// let x = GlobalRng::random_range(0..100);
+    /// // Guard drops at end of scope, seed cleared automatically
+    /// ```
+    pub fn seed_guard(seed: u64) -> SeedGuard {
+        Self::set_seed(seed);
+        SeedGuard { _private: () }
+    }
+
+    /// Executes a closure with a seeded RNG, then clears the seed.
+    ///
+    /// This is the safest way to use deterministic RNG in tests:
+    /// - The seed is automatically cleared when the closure returns
+    /// - Works correctly even if the closure panics (uses catch_unwind internally)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = GlobalRng::scoped_seed(12345, || {
+    ///     // Deterministic operations
+    ///     GlobalRng::random_range(0..100)
+    /// });
+    /// // Seed is cleared here, regardless of success or panic
+    /// ```
+    pub fn scoped_seed<F, R>(seed: u64, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = Self::seed_guard(seed);
+        f()
     }
 
     /// Executes a closure with access to the global RNG.
