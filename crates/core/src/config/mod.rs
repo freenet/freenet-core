@@ -1730,7 +1730,7 @@ impl GlobalRng {
 
     /// Choose a random element from a slice.
     #[inline]
-    pub fn choose<'a, T>(slice: &'a [T]) -> Option<&'a T> {
+    pub fn choose<T>(slice: &[T]) -> Option<&T> {
         if slice.is_empty() {
             None
         } else {
