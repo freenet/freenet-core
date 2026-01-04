@@ -33,7 +33,7 @@ use std::{
 use tokio::sync::Mutex;
 
 use super::Socket;
-use crate::simulation::{RealTime, TimeSource};
+use crate::simulation::{RealTime, TimeSource, VirtualTime};
 
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;
@@ -46,6 +46,14 @@ const MAX_PACKET_SIZE: usize = 65535;
 /// This eliminates coarse-grained lock contention when multiple sockets
 /// are being registered/looked up simultaneously during test startup.
 static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> = LazyLock::new(DashMap::new);
+
+/// Global registry mapping network names to their VirtualTime instances.
+/// This enables SimulationSocket to use network-scoped VirtualTime for
+/// deterministic time control in simulation tests.
+///
+/// Each SimNetwork registers its VirtualTime here on creation and
+/// unregisters it on drop, providing test isolation.
+static NETWORK_TIME_SOURCES: LazyLock<DashMap<String, VirtualTime>> = LazyLock::new(DashMap::new);
 
 /// Registers a socket address with a network name.
 ///
@@ -77,6 +85,31 @@ fn get_address_network(addr: &SocketAddr) -> Option<String> {
 /// Clears all address-network mappings. Useful for test cleanup.
 pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
+}
+
+/// Registers a VirtualTime instance for a network.
+///
+/// This should be called when creating a SimNetwork to enable
+/// SimulationSocket to use the network's VirtualTime for deterministic
+/// time control.
+///
+/// # Arguments
+/// * `network_name` - The unique name of the simulation network
+/// * `virtual_time` - The VirtualTime instance to use for this network
+pub fn register_network_time_source(network_name: &str, virtual_time: VirtualTime) {
+    NETWORK_TIME_SOURCES.insert(network_name.to_string(), virtual_time);
+}
+
+/// Unregisters a VirtualTime instance for a network.
+///
+/// This should be called when dropping a SimNetwork to clean up.
+pub fn unregister_network_time_source(network_name: &str) {
+    NETWORK_TIME_SOURCES.remove(network_name);
+}
+
+/// Gets the VirtualTime for a network, if registered.
+fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
+    NETWORK_TIME_SOURCES.get(network_name).map(|r| r.clone())
 }
 
 /// Result of checking packet delivery through fault injection.
@@ -486,6 +519,75 @@ impl<T: TimeSource> Drop for InMemorySocket<T> {
             addr = %self.addr,
             "InMemorySocket dropped"
         );
+    }
+}
+
+// =============================================================================
+// SimulationSocket - VirtualTime-backed socket for deterministic simulation
+// =============================================================================
+
+/// A simulation socket that uses RealTime (backed by tokio::time::Instant).
+///
+/// This socket works correctly with tokio's paused time (`start_paused = true`)
+/// because RealTime uses `tokio::time::Instant` for time tracking and
+/// `tokio::time::sleep` for delays. When tokio's time is paused, time only
+/// advances when sleep is called, providing predictable test behavior.
+///
+/// # Test Isolation
+///
+/// Each SimNetwork has a unique network name. Sockets are isolated by network
+/// name through the address registry, ensuring parallel tests don't interfere.
+///
+/// # Usage
+///
+/// SimulationSocket is used automatically by SimNetwork's in-memory node builder.
+/// You don't need to create it directly.
+pub struct SimulationSocket(InMemorySocket<RealTime>);
+
+impl std::fmt::Debug for SimulationSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationSocket")
+            .field("addr", &self.0.addr)
+            .field("network", &self.0.network_name)
+            .finish()
+    }
+}
+
+impl Socket for SimulationSocket {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        // Look up the network name for this address to verify it's registered
+        let network_name = get_address_network(&addr).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "No network registered for address {}. \
+                     Call register_address_network() before binding SimulationSocket.",
+                    addr
+                ),
+            )
+        })?;
+
+        tracing::debug!(
+            addr = %addr,
+            network = %network_name,
+            "SimulationSocket binding with RealTime"
+        );
+
+        // Create the socket with RealTime (uses tokio::time::Instant)
+        let inner = InMemorySocket::bind_with_time_source(addr, RealTime::new()).await?;
+        Ok(Self(inner))
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, target).await
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to_blocking(buf, target)
     }
 }
 

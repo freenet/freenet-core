@@ -1,7 +1,7 @@
 //! In-memory node builder for simulation testing.
 //!
 //! This module provides a `Builder` that uses the production event loop (`P2pConnManager`)
-//! with `InMemorySocket` for testing without real network I/O.
+//! with `SimulationSocket` for testing without real network I/O.
 //!
 //! Each node must have the network context set before binding sockets. This is done
 //! automatically by the `run_node` and `run_node_with_shared_storage` methods using
@@ -26,7 +26,7 @@ use crate::{
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
-    transport::in_memory_socket::{register_address_network, InMemorySocket},
+    transport::in_memory_socket::{register_address_network, SimulationSocket},
     wasm_runtime::MockStateStorage,
 };
 
@@ -165,9 +165,9 @@ impl<ER> Builder<ER> {
         );
         register_address_network(local_addr, &self.network_name);
 
-        // Run the production event loop with InMemorySocket
+        // Run the production event loop with SimulationSocket
         let result = conn_manager
-            .run_event_listener_with_socket::<InMemorySocket>(
+            .run_event_listener_with_socket::<SimulationSocket>(
                 op_manager,
                 wait_for_event,
                 notification_channel,
@@ -302,9 +302,9 @@ impl<ER> Builder<ER> {
         );
         register_address_network(local_addr, &self.network_name);
 
-        // Run the production event loop with InMemorySocket
+        // Run the production event loop with SimulationSocket
         let result = conn_manager
-            .run_event_listener_with_socket::<InMemorySocket>(
+            .run_event_listener_with_socket::<SimulationSocket>(
                 op_manager,
                 wait_for_event,
                 notification_channel,
