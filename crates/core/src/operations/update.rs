@@ -1078,7 +1078,22 @@ pub(crate) async fn request_update(
     let target_from_upstream = op_manager
         .ring
         .get_upstream(&key)
-        .filter(|upstream| upstream.socket_addr() != Some(sender_addr));
+        .filter(|upstream| upstream.socket_addr() != Some(sender_addr))
+        .filter(|upstream| {
+            // Verify the upstream peer is still connected before using it as a target.
+            // Without this check, we might try to send to a disconnected peer instead
+            // of falling through to the proximity cache or ring-based fallback.
+            upstream
+                .socket_addr()
+                .map(|addr| {
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(addr)
+                        .is_some()
+                })
+                .unwrap_or(false)
+        });
 
     // Check proximity cache for neighbors that have announced caching this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
