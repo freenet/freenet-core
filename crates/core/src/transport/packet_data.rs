@@ -5,7 +5,9 @@ use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use once_cell::sync::Lazy;
 use rand::{rng, Rng};
 
-use crate::transport::crypto::{TransportPublicKey, PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC, PACKET_TYPE_SIZE};
+use crate::transport::crypto::{
+    TransportPublicKey, PACKET_TYPE_INTRO, PACKET_TYPE_SIZE, PACKET_TYPE_SYMMETRIC,
+};
 
 use super::crypto::TransportSecretKey;
 use super::TransportError;
@@ -186,7 +188,8 @@ impl<const N: usize> PacketData<Plaintext, N> {
             .encrypt_in_place_detached(
                 &nonce.into(),
                 &[],
-                &mut buffer[PACKET_TYPE_SIZE + NONCE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE + payload_length],
+                &mut buffer
+                    [PACKET_TYPE_SIZE + NONCE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE + payload_length],
             )
             .unwrap();
 
@@ -373,19 +376,25 @@ mod tests {
 #[cfg(test)]
 mod packet_type_discrimination_tests {
     use super::*;
-    use aes_gcm::KeyInit;
     use crate::transport::crypto::TransportKeypair;
+    use aes_gcm::KeyInit;
 
     #[test]
     fn test_is_intro_packet_with_valid_intro() {
         let keypair = TransportKeypair::new();
         let data = b"test intro packet data";
         let encrypted = keypair.public().encrypt(data);
-        
+
         let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&encrypted);
-        
-        assert!(packet.is_intro_packet(), "Should identify valid intro packet");
-        assert!(!packet.is_symmetric_packet(), "Intro packet should not be identified as symmetric");
+
+        assert!(
+            packet.is_intro_packet(),
+            "Should identify valid intro packet"
+        );
+        assert!(
+            !packet.is_symmetric_packet(),
+            "Intro packet should not be identified as symmetric"
+        );
         assert_eq!(packet.packet_type(), Some(PACKET_TYPE_INTRO));
     }
 
@@ -395,11 +404,17 @@ mod packet_type_discrimination_tests {
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test symmetric data");
         let encrypted = plaintext.encrypt_symmetric(&cipher);
-        
+
         let unknown = PacketData::<UnknownEncryption, 1000>::from_buf(encrypted.data());
-        
-        assert!(unknown.is_symmetric_packet(), "Should identify valid symmetric packet");
-        assert!(!unknown.is_intro_packet(), "Symmetric packet should not be identified as intro");
+
+        assert!(
+            unknown.is_symmetric_packet(),
+            "Should identify valid symmetric packet"
+        );
+        assert!(
+            !unknown.is_intro_packet(),
+            "Symmetric packet should not be identified as intro"
+        );
         assert_eq!(unknown.packet_type(), Some(PACKET_TYPE_SYMMETRIC));
     }
 
@@ -407,18 +422,32 @@ mod packet_type_discrimination_tests {
     fn test_packet_type_with_invalid_type_byte() {
         let invalid_packet = [0xFFu8; 100]; // Invalid type 0xFF
         let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&invalid_packet);
-        
-        assert_eq!(packet.packet_type(), None, "Should return None for invalid packet type");
-        assert!(!packet.is_intro_packet(), "Invalid type should not be intro");
-        assert!(!packet.is_symmetric_packet(), "Invalid type should not be symmetric");
+
+        assert_eq!(
+            packet.packet_type(),
+            None,
+            "Should return None for invalid packet type"
+        );
+        assert!(
+            !packet.is_intro_packet(),
+            "Invalid type should not be intro"
+        );
+        assert!(
+            !packet.is_symmetric_packet(),
+            "Invalid type should not be symmetric"
+        );
     }
 
     #[test]
     fn test_packet_type_with_empty_packet() {
         let empty: [u8; 0] = [];
         let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&empty);
-        
-        assert_eq!(packet.packet_type(), None, "Empty packet should return None");
+
+        assert_eq!(
+            packet.packet_type(),
+            None,
+            "Empty packet should return None"
+        );
         assert!(!packet.is_intro_packet());
         assert!(!packet.is_symmetric_packet());
     }
@@ -429,15 +458,16 @@ mod packet_type_discrimination_tests {
         let max_plaintext = vec![0xAB; MAX_DATA_SIZE];
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
-        
+
         let plaintext = PacketData::<Plaintext, MAX_PACKET_SIZE>::from_buf_plain(&max_plaintext);
         let encrypted = plaintext.encrypt_symmetric(&cipher);
-        
+
         assert!(
             encrypted.size <= MAX_PACKET_SIZE,
             "Encrypted packet ({} bytes) should not exceed MAX_PACKET_SIZE ({} bytes). \
              MAX_DATA_SIZE may need adjustment.",
-            encrypted.size, MAX_PACKET_SIZE
+            encrypted.size,
+            MAX_PACKET_SIZE
         );
     }
 
@@ -447,9 +477,10 @@ mod packet_type_discrimination_tests {
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test data");
         let encrypted = plaintext.encrypt_symmetric(&cipher);
-        
+
         assert_eq!(
-            encrypted.data()[0], PACKET_TYPE_SYMMETRIC,
+            encrypted.data()[0],
+            PACKET_TYPE_SYMMETRIC,
             "First byte should be PACKET_TYPE_SYMMETRIC (0x02)"
         );
     }
@@ -460,20 +491,26 @@ mod packet_type_discrimination_tests {
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test");
         let mut encrypted = plaintext.encrypt_symmetric(&cipher);
-        
+
         // Corrupt packet type
         encrypted.data[0] = PACKET_TYPE_INTRO; // Wrong type
-        
+
         let unknown = PacketData::<UnknownEncryption, 1000>::from_buf(encrypted.data());
         let result = unknown.try_decrypt_sym(&cipher);
-        
-        assert!(result.is_err(), "Decryption should fail when packet type is wrong");
+
+        assert!(
+            result.is_err(),
+            "Decryption should fail when packet type is wrong"
+        );
     }
 
     #[test]
     fn test_packet_type_values() {
         assert_eq!(PACKET_TYPE_INTRO, 0x01, "PACKET_TYPE_INTRO should be 0x01");
-        assert_eq!(PACKET_TYPE_SYMMETRIC, 0x02, "PACKET_TYPE_SYMMETRIC should be 0x02");
+        assert_eq!(
+            PACKET_TYPE_SYMMETRIC, 0x02,
+            "PACKET_TYPE_SYMMETRIC should be 0x02"
+        );
         assert_eq!(PACKET_TYPE_SIZE, 1, "PACKET_TYPE_SIZE should be 1 byte");
     }
 }

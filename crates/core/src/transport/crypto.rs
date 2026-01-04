@@ -138,7 +138,8 @@ impl TransportPublicKey {
         let ciphertext = cipher.encrypt(&nonce, data).expect("encryption failure");
 
         // Prepend packet type and ephemeral public key
-        let mut result = Vec::with_capacity(PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + ciphertext.len());
+        let mut result =
+            Vec::with_capacity(PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE + ciphertext.len());
         result.push(PACKET_TYPE_INTRO);
         result.extend_from_slice(ephemeral_public.as_bytes());
         result.extend_from_slice(&ciphertext);
@@ -268,7 +269,8 @@ impl TransportSecretKey {
 
         // Extract ephemeral public key (skip packet type byte)
         let mut ephemeral_bytes = [0u8; 32];
-        ephemeral_bytes.copy_from_slice(&data[PACKET_TYPE_SIZE..PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE]);
+        ephemeral_bytes
+            .copy_from_slice(&data[PACKET_TYPE_SIZE..PACKET_TYPE_SIZE + X25519_PUBLIC_KEY_SIZE]);
         let ephemeral_public = PublicKey::from(ephemeral_bytes);
 
         // Compute shared secret
@@ -611,7 +613,7 @@ mod packet_type_tests {
         let keypair = TransportKeypair::new();
         let data = b"test data for intro packet";
         let encrypted = keypair.public.encrypt(data);
-        
+
         assert_eq!(
             encrypted[0], PACKET_TYPE_INTRO,
             "First byte of intro packet should be PACKET_TYPE_INTRO (0x01)"
@@ -624,10 +626,10 @@ mod packet_type_tests {
         let keypair = TransportKeypair::new();
         let data = b"test";
         let mut encrypted = keypair.public.encrypt(data);
-        
+
         // Corrupt the packet type byte
         encrypted[0] = PACKET_TYPE_SYMMETRIC; // Wrong type
-        
+
         let result = keypair.secret.decrypt(&encrypted);
         assert!(
             matches!(result, Err(DecryptionError::InvalidPacketType)),
@@ -640,10 +642,10 @@ mod packet_type_tests {
         let keypair = TransportKeypair::new();
         let data = b"test";
         let mut encrypted = keypair.public.encrypt(data);
-        
+
         // Set invalid packet type
         encrypted[0] = 0xFF;
-        
+
         let result = keypair.secret.decrypt(&encrypted);
         assert!(
             matches!(result, Err(DecryptionError::InvalidPacketType)),
@@ -654,20 +656,25 @@ mod packet_type_tests {
     #[test]
     fn test_intro_packet_type_preserved_after_encryption() {
         let keypair = TransportKeypair::new();
-        
+
         // Test with various data sizes
         for size in [0, 16, 24, 100, 500] {
             let data = vec![0xAB; size];
             let encrypted = keypair.public.encrypt(&data);
-            
+
             assert_eq!(
                 encrypted[0], PACKET_TYPE_INTRO,
-                "Packet type should be PACKET_TYPE_INTRO for data size {}", size
+                "Packet type should be PACKET_TYPE_INTRO for data size {}",
+                size
             );
-            
+
             // Verify successful decryption
             let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
-            assert_eq!(decrypted, data, "Decrypted data should match for size {}", size);
+            assert_eq!(
+                decrypted, data,
+                "Decrypted data should match for size {}",
+                size
+            );
         }
     }
 }

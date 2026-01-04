@@ -440,12 +440,14 @@ mod test {
         assert!(
             size <= MAX_DATA_SIZE as u64,
             "Message size {} exceeds MAX_DATA_SIZE {}",
-            size, MAX_DATA_SIZE
+            size,
+            MAX_DATA_SIZE
         );
         assert!(
             size >= (MAX_DATA_SIZE - 4) as u64,
             "Message size {} is too far from MAX_DATA_SIZE {} (off by more than 4 bytes)",
-            size, MAX_DATA_SIZE
+            size,
+            MAX_DATA_SIZE
         );
     }
 
