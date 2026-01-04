@@ -5,7 +5,7 @@ use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use once_cell::sync::Lazy;
 use rand::{rng, Rng};
 
-use crate::transport::crypto::TransportPublicKey;
+use crate::transport::crypto::{TransportPublicKey, PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC, PACKET_TYPE_SIZE};
 
 use super::crypto::TransportSecretKey;
 use super::TransportError;
@@ -91,12 +91,17 @@ fn internal_sym_decryption<const N: usize>(
     size: usize,
     inbound_sym_key: &Aes128Gcm,
 ) -> Result<([u8; N], usize), aes_gcm::Error> {
-    debug_assert!(data.len() >= NONCE_SIZE + TAG_SIZE);
+    debug_assert!(data.len() >= PACKET_TYPE_SIZE + NONCE_SIZE + TAG_SIZE);
 
-    let nonce = (&data[..NONCE_SIZE]).into();
+    // Check packet type (first byte should be PACKET_TYPE_SYMMETRIC)
+    if data[0] != PACKET_TYPE_SYMMETRIC {
+        return Err(aes_gcm::Error);
+    }
+
+    let nonce = (&data[PACKET_TYPE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE]).into();
     // Adjusted to extract the tag from the end of the encrypted data
     let tag = (&data[size - TAG_SIZE..size]).into();
-    let encrypted_data = &data[NONCE_SIZE..size - TAG_SIZE];
+    let encrypted_data = &data[PACKET_TYPE_SIZE + NONCE_SIZE..size - TAG_SIZE];
     let mut buffer = [0u8; N];
     let buffer_len = encrypted_data.len();
     buffer[..buffer_len].copy_from_slice(encrypted_data);
@@ -167,26 +172,30 @@ impl<const N: usize> PacketData<Plaintext, N> {
         let nonce = generate_nonce();
 
         let mut buffer = [0u8; N];
-        buffer[..NONCE_SIZE].copy_from_slice(&nonce);
+        // Prepend packet type
+        buffer[0] = PACKET_TYPE_SYMMETRIC;
+        buffer[PACKET_TYPE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE].copy_from_slice(&nonce);
 
         // Encrypt the data in place
         let payload_length = self.size;
-        buffer[NONCE_SIZE..NONCE_SIZE + payload_length].copy_from_slice(self.data());
+        buffer[PACKET_TYPE_SIZE + NONCE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE + payload_length]
+            .copy_from_slice(self.data());
         let tag = cipher
             .encrypt_in_place_detached(
                 &nonce.into(),
                 &[],
-                &mut buffer[NONCE_SIZE..NONCE_SIZE + payload_length],
+                &mut buffer[PACKET_TYPE_SIZE + NONCE_SIZE..PACKET_TYPE_SIZE + NONCE_SIZE + payload_length],
             )
             .unwrap();
 
         // Append the tag to the buffer
-        buffer[NONCE_SIZE + payload_length..NONCE_SIZE + payload_length + TAG_SIZE]
+        buffer[PACKET_TYPE_SIZE + NONCE_SIZE + payload_length
+            ..PACKET_TYPE_SIZE + NONCE_SIZE + payload_length + TAG_SIZE]
             .copy_from_slice(&tag);
 
         PacketData {
             data: buffer,
-            size: NONCE_SIZE + payload_length + TAG_SIZE,
+            size: PACKET_TYPE_SIZE + NONCE_SIZE + payload_length + TAG_SIZE,
             data_type: PhantomData,
         }
     }
@@ -205,12 +214,28 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
         }
     }
 
-    pub(super) fn is_intro_packet(
-        &self,
-        actual_intro_packet: &PacketData<AsymmetricX25519, N>,
-    ) -> bool {
-        self.size == actual_intro_packet.size
-            && self.data[..self.size] == actual_intro_packet.data[..actual_intro_packet.size]
+    /// Get the packet type discriminator from the first byte.
+    /// Returns None if the packet is too small or has an invalid packet type.
+    pub(super) fn packet_type(&self) -> Option<u8> {
+        if self.size < PACKET_TYPE_SIZE {
+            return None;
+        }
+        let packet_type = self.data[0];
+        if packet_type == PACKET_TYPE_INTRO || packet_type == PACKET_TYPE_SYMMETRIC {
+            Some(packet_type)
+        } else {
+            None
+        }
+    }
+
+    /// Check if this is an intro packet by examining the packet type discriminator.
+    pub(super) fn is_intro_packet(&self) -> bool {
+        self.packet_type() == Some(PACKET_TYPE_INTRO)
+    }
+
+    /// Check if this is a symmetric packet by examining the packet type discriminator.
+    pub(super) fn is_symmetric_packet(&self) -> bool {
+        self.packet_type() == Some(PACKET_TYPE_SYMMETRIC)
     }
 
     pub(crate) fn try_decrypt_sym(

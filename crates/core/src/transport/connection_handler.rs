@@ -49,8 +49,8 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 const INTRO_PLAINTEXT_SIZE: usize = 8 + 16;
 
 /// Size of X25519 encrypted intro packets.
-/// Format: ephemeral_public (32) + encrypted_data + ChaCha20Poly1305 tag (16) = 72 bytes
-/// Used to detect new peer identities from existing addresses (issue #2277).
+/// Format: packet_type (1) + ephemeral_public (32) + encrypted_data (24) + ChaCha20Poly1305 tag (16) = 73 bytes
+/// Packet type discrimination (issue #2559) eliminates ambiguity with symmetric packets.
 pub(crate) const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAINTEXT_SIZE);
 
 /// Minimum interval between asymmetric decryption attempts for the same address.
@@ -442,11 +442,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             if let Some(time) = outdated_peer.get(&remote_addr) {
                                 if time.elapsed() < Duration::from_secs(60 * 10) {
+                                    let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
                                     // Peer was marked outdated due to version mismatch.
                                     // Check if this is a valid intro packet with current version
                                     // (peer may have upgraded). If so, allow reconnection.
-                                    if size == X25519_INTRO_PACKET_SIZE {
-                                        let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
+                                    if packet_data.is_intro_packet() {
                                         // Rate limit asymmetric decryption to prevent DoS
                                         let now = Instant::now();
                                         let rate_limited = self
@@ -482,7 +482,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             continue; // Rate limited
                                         }
                                     } else {
-                                        continue; // Not an intro packet size
+                                        continue; // Not an intro packet
                                     }
                                 } else {
                                     outdated_peer.remove(&remote_addr);
@@ -501,11 +501,11 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
                                 // Issue #2277: Check if this is a new intro packet from a peer that
-                                // restarted with a new identity. X25519 intro packets are 72 bytes.
+                                // restarted with a new identity. Use packet type discriminator to identify intro packets.
                                 // If we can decrypt it as an intro, a new peer is connecting from the
                                 // same IP:port (e.g., NAT assigned the same mapping after restart).
                                 let is_new_identity = if self.is_gateway
-                                    && size == X25519_INTRO_PACKET_SIZE
+                                    && packet_data.is_intro_packet()
                                 {
                                     // Rate limit asymmetric decryption attempts to prevent DoS
                                     let now = Instant::now();
@@ -618,9 +618,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // Issue #2292: Filter out duplicate intro packets during gateway handshake.
                                 // The peer sends multiple intro packets for NAT traversal reliability.
                                 // After we detect a new identity and create a gateway_connection, subsequent
-                                // intro packets should be ignored - we're waiting for a symmetric
-                                // ACK response which is a different size.
-                                if size == X25519_INTRO_PACKET_SIZE {
+                                // intro packets should be ignored - we're waiting for a symmetric ACK response.
+                                if packet_data.is_intro_packet() {
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
                                         direction = "inbound",
@@ -1507,18 +1506,14 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 );
                                 continue;
                             }
-                            ConnectionState::RemoteInbound {
-                                // this is the packet encrypted with our public key
-                                ref intro_packet,
-                                ..
-                            } => {
+                            ConnectionState::RemoteInbound { .. } => {
                                 // next packet should be an acknowledgement packet, but might also be a repeated
                                 // intro packet so we need to handle that
-                                if packet.is_intro_packet(intro_packet) {
+                                if packet.is_intro_packet() {
                                     tracing::trace!(
                                         peer_addr = %remote_addr,
                                         direction = "outbound",
-                                        "Received intro packet"
+                                        "Received repeated intro packet"
                                     );
                                     continue;
                                 }
