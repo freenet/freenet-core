@@ -24,7 +24,7 @@ use rand::{Rng, SeedableRng};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task, task_local,
+    task_local,
 };
 use tracing::{span, Instrument};
 use version_cmp::PROTOC_VERSION;
@@ -227,7 +227,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        task::spawn(RANDOM_U64.scope(
+        GlobalExecutor::spawn(RANDOM_U64.scope(
             {
                 let mut rng = StdRng::seed_from_u64(rand::random());
                 rng.random()

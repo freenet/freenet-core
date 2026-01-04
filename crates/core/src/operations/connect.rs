@@ -98,7 +98,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task::{self, JoinHandle};
+use tokio::task::JoinHandle;
 
 use either::Either;
 
@@ -1609,7 +1609,7 @@ pub(crate) async fn initial_join_procedure(
         gateways.iter().take(needed_to_cover_max).count().max(2)
     };
     let gateways = gateways.to_vec();
-    let handle = task::spawn(async move {
+    let handle = GlobalExecutor::spawn(async move {
         if gateways.is_empty() {
             tracing::warn!(
                 phase = "error",

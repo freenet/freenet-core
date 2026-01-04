@@ -20,6 +20,7 @@ use axum::{
     routing::get,
     Router,
 };
+use freenet::config::GlobalExecutor;
 use freenet::dev_tool::{
     EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel,
     PeerMessage, PeerStatus, SimNetwork, TransportPublicKey,
@@ -231,7 +232,7 @@ pub async fn run_network(
         .unwrap_or(Duration::from_millis(200));
     let (connectivity_timeout, network_connection_percent) =
         test_config.get_connection_check_params();
-    let events_generated = tokio::task::spawn(async move {
+    let events_generated = GlobalExecutor::spawn(async move {
         tracing::info!(
             "Waiting for network to be sufficiently connected ({}ms timeout, {}%)",
             connectivity_timeout.as_millis(),
@@ -261,7 +262,7 @@ pub async fn run_network(
                 match res? {
                     Ok(()) => {
                         tracing::info!("Test events generated successfully");
-                        *events_generated = tokio::task::spawn(futures::future::pending::<anyhow::Result<()>>());
+                        *events_generated = GlobalExecutor::spawn(futures::future::pending::<anyhow::Result<()>>());
                         continue;
                     }
                     Err(e) => {

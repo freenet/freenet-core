@@ -1574,7 +1574,7 @@ mod tests {
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
-        let outbound = tokio::task::spawn(send_stream(
+        let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(sender)),
@@ -1592,7 +1592,7 @@ mod tests {
             // need to take care of decrypting and deserializing the inbound data before collecting into the message
             let (tx, rx) = fast_channel::bounded(1);
             let stream = InboundStream::new(MSG_LEN as u64);
-            let inbound_msg = tokio::task::spawn(recv_stream(stream_id, rx, stream));
+            let inbound_msg = GlobalExecutor::spawn(recv_stream(stream_id, rx, stream));
             while let Ok((_, network_packet)) = receiver.recv_async().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)
