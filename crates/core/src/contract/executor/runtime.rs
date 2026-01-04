@@ -5,28 +5,24 @@ use super::{
     STALE_INIT_THRESHOLD,
 };
 use crate::node::OpManager;
+use dashmap::DashMap;
 use freenet_stdlib::prelude::RelatedContract;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 // Type alias for shared notification storage
-// Uses std::sync::RwLock (not tokio) because register_contract_notifier is sync
-// and needs to be callable from both sync and async contexts without blocking the runtime
+// Uses DashMap for concurrent access without blocking - critical because
+// send_update_notification calls WASM (get_state_delta) and we must not hold locks during that
 type SharedNotifications = Arc<
-    RwLock<
-        HashMap<
-            ContractInstanceId,
-            Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>,
-        >,
-    >,
+    DashMap<ContractInstanceId, Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>>,
 >;
 
 // Type alias for shared subscriber summaries
 type SharedSummaries =
-    Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
+    Arc<DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
 
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
@@ -119,8 +115,8 @@ impl RuntimePool {
 
         // Create shared notification storage BEFORE creating executors
         // so we can pass references to each executor
-        let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
-        let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
+        let shared_notifications: SharedNotifications = Arc::new(DashMap::new());
+        let shared_summaries: SharedSummaries = Arc::new(DashMap::new());
 
         for i in 0..pool_size_usize {
             let mut executor = Executor::from_config_with_shared_store(
@@ -385,9 +381,8 @@ impl ContractExecutor for RuntimePool {
         // when the subscription is registered or when updates arrive.
         let owned_summary = summary.map(StateSummary::into_owned);
 
-        // Use std::sync::RwLock since this is called from sync context
-        let mut notifications = self.shared_notifications.write().unwrap();
-        let channels = notifications.entry(instance_id).or_default();
+        // Use DashMap's entry API for lock-free per-key access
+        let mut channels = self.shared_notifications.entry(instance_id).or_default();
 
         // Check if this client is already registered
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
@@ -412,11 +407,13 @@ impl ContractExecutor for RuntimePool {
                 "Registered new subscription in shared pool storage"
             );
         }
+        // DashMap entry guard dropped here, releasing per-key lock
 
-        // Also register the summary
-        let mut summaries = self.shared_summaries.write().unwrap();
-        let contract_summaries = summaries.entry(instance_id).or_default();
-        contract_summaries.insert(cli_id, owned_summary);
+        // Also register the summary (separate per-key lock)
+        self.shared_summaries
+            .entry(instance_id)
+            .or_default()
+            .insert(cli_id, owned_summary);
 
         Ok(())
     }
@@ -444,17 +441,20 @@ impl ContractExecutor for RuntimePool {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         // Read subscription info from shared storage at pool level
-        let notifications = self.shared_notifications.read().unwrap();
-        notifications
+        // DashMap iter() provides consistent iteration without holding a global lock
+        self.shared_notifications
             .iter()
-            .flat_map(|(instance_id, clients)| {
-                clients
+            .flat_map(|entry| {
+                let instance_id = *entry.key();
+                entry
+                    .value()
                     .iter()
                     .map(move |(client_id, _)| crate::message::SubscriptionInfo {
-                        instance_id: *instance_id,
+                        instance_id,
                         client_id: *client_id,
                         last_update: None, // Pool doesn't track last update time
                     })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -2070,57 +2070,77 @@ impl Executor<Runtime> {
         ) {
             // Use shared pool-level storage for notifications
             // This ensures subscriptions registered while this executor was checked out are notified
-            let mut notifications = shared_notifications.write().unwrap();
-            let mut summaries = shared_summaries.write().unwrap();
+            //
+            // CRITICAL: We must NOT hold DashMap locks while calling WASM (get_state_delta).
+            // Clone the data under minimal lock scope, then process without locks.
 
-            if let Some(notifiers) = notifications.get_mut(&instance_id) {
-                let mut contract_summaries = summaries.get_mut(&instance_id);
-                let mut failures = Vec::with_capacity(32);
+            // Step 1: Clone notifiers and summaries under minimal lock scope
+            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> =
+                match shared_notifications.get(&instance_id) {
+                    Some(entry) => entry.value().clone(),
+                    None => return Ok(()), // No subscribers for this contract
+                };
 
-                for (peer_key, notifier) in notifiers.iter() {
-                    let peer_summary = contract_summaries
-                        .as_mut()
-                        .and_then(|s| s.get_mut(peer_key))
-                        .and_then(|s| s.as_ref());
+            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
+                shared_summaries
+                    .get(&instance_id)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+            // Locks released here
 
-                    let update = match peer_summary {
-                        Some(summary) => self
-                            .runtime
-                            .get_state_delta(&key, params, new_state, summary)
-                            .map_err(|err| {
-                                tracing::error!("{err}");
-                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                            })?
-                            .to_owned()
-                            .into(),
-                        None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
-                    };
+            // Step 2: Process notifications WITHOUT holding any locks
+            // get_state_delta() calls WASM which can be slow
+            let mut failures = Vec::with_capacity(32);
 
-                    if let Err(err) =
-                        notifier.send(Ok(
-                            ContractResponse::UpdateNotification { key, update }.into()
-                        ))
-                    {
-                        failures.push(*peer_key);
-                        tracing::error!(
-                            client = %peer_key,
-                            contract = %key,
-                            error = %err,
-                            phase = "notification_send_failed_shared",
-                            "Failed to send update notification to client (shared storage)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            client = %peer_key,
-                            contract = %key,
-                            phase = "notification_sent_shared",
-                            "Sent update notification to client (shared storage)"
-                        );
-                    }
+            for (peer_key, notifier) in &notifiers_snapshot {
+                let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
+
+                let update = match peer_summary {
+                    Some(summary) => self
+                        .runtime
+                        .get_state_delta(&key, params, new_state, summary)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                        })?
+                        .to_owned()
+                        .into(),
+                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                };
+
+                if let Err(err) =
+                    notifier.send(Ok(
+                        ContractResponse::UpdateNotification { key, update }.into()
+                    ))
+                {
+                    failures.push(*peer_key);
+                    tracing::error!(
+                        client = %peer_key,
+                        contract = %key,
+                        error = %err,
+                        phase = "notification_send_failed_shared",
+                        "Failed to send update notification to client (shared storage)"
+                    );
+                } else {
+                    tracing::debug!(
+                        client = %peer_key,
+                        contract = %key,
+                        phase = "notification_sent_shared",
+                        "Sent update notification to client (shared storage)"
+                    );
                 }
+            }
 
-                if !failures.is_empty() {
+            // Step 3: Clean up failed notifiers under separate lock acquisition
+            if !failures.is_empty() {
+                if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
+                }
+                // Also clean up orphaned summaries for failed clients
+                if let Some(mut summaries) = shared_summaries.get_mut(&instance_id) {
+                    for failed_client in &failures {
+                        summaries.remove(failed_client);
+                    }
                 }
             }
         } else {

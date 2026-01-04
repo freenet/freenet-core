@@ -691,19 +691,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
 /// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
 // Type alias for shared notification storage (used by RuntimePool)
-// Uses std::sync::RwLock (not tokio) because it needs to be accessible from sync contexts
-type SharedNotifications = Arc<
-    std::sync::RwLock<
-        HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
-    >,
->;
+// Uses DashMap for concurrent access without blocking - critical because
+// send_update_notification calls WASM (get_state_delta) and we must not hold locks during that
+type SharedNotifications =
+    Arc<dashmap::DashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>>;
 
 // Type alias for shared subscriber summaries (used by RuntimePool)
-type SharedSummaries = Arc<
-    std::sync::RwLock<
-        HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
-    >,
->;
+type SharedSummaries =
+    Arc<dashmap::DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
 
 pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     mode: OperationMode,
