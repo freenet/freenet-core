@@ -135,9 +135,15 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
 }
 
 /// Real-time implementation that delegates to tokio.
+///
+/// Uses `tokio::time::Instant` for time tracking to ensure consistency with
+/// `tokio::time::sleep()`. This is important for tests using `start_paused = true`
+/// where tokio's virtual time is used - using `std::time::Instant` would cause
+/// timing loops to run much longer than expected because wall-clock time doesn't
+/// advance with paused tokio time.
 #[derive(Clone)]
 pub struct RealTime {
-    epoch: std::time::Instant,
+    epoch: tokio::time::Instant,
 }
 
 impl Default for RealTime {
@@ -149,7 +155,7 @@ impl Default for RealTime {
 impl RealTime {
     pub fn new() -> Self {
         Self {
-            epoch: std::time::Instant::now(),
+            epoch: tokio::time::Instant::now(),
         }
     }
 }
