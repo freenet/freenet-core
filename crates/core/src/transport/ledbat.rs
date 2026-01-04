@@ -9379,7 +9379,9 @@ mod tests {
                 "Without path change detection, BDP proxy should still be used. floor={}, spec_floor={}",
                 floor_after, spec_floor
             );
-            println!("Note: base_delay window not fully flushed, testing BDP proxy behavior instead");
+            println!(
+                "Note: base_delay window not fully flushed, testing BDP proxy behavior instead"
+            );
         }
     }
 
