@@ -196,6 +196,56 @@ bandwidth-limit = 100000000                # 100 MB/s per connection
 total-bandwidth-limit = 500000000          # 500 MB/s total
 ```
 
+## LEDBAT Configuration for High-Latency Paths
+
+### The ssthresh Death Spiral Problem (Issue #2578)
+
+On high-latency paths (>100ms RTT, e.g., US-EU intercontinental), repeated packet
+timeouts can cause the slow start threshold (ssthresh) to collapse:
+
+```
+After 8 timeouts: ssthresh drops from 1MB → 5KB
+Result: Slow start exits immediately, throughput limited to ~300 Kbit/s
+```
+
+This manifests as:
+- Transfers that should take 2-3 seconds taking 18+ seconds
+- Throughput dropping to <500 Kbit/s despite available bandwidth
+
+### Solution: Configure min_ssthresh
+
+Set a minimum floor for ssthresh in `LedbatConfig`:
+
+```rust
+LedbatConfig {
+    min_ssthresh: Some(100 * 1024),  // 100KB floor
+    ..Default::default()
+}
+```
+
+### Recommended min_ssthresh by Network Type
+
+| Network Type | RTT | min_ssthresh | Example Use Case |
+|--------------|-----|--------------|------------------|
+| LAN | <10ms | `None` | Local testing |
+| Regional | 10-50ms | `None` | Same-country peers |
+| Continental | 50-100ms | `Some(50KB)` | Cross-country |
+| **Intercontinental** | 100-200ms | **`Some(100KB-500KB)`** | **US-EU, US-Asia** |
+| Satellite | 500ms+ | `Some(500KB-2MB)` | Remote/satellite links |
+
+### Gateway Operators
+
+For gateways serving global traffic, configure a higher floor:
+
+```rust
+LedbatConfig {
+    min_ssthresh: Some(500 * 1024),  // 500KB - good for intercontinental
+    ..Default::default()
+}
+```
+
+---
+
 ## Troubleshooting
 
 ### Slow transfers despite high bandwidth limit
@@ -203,6 +253,7 @@ total-bandwidth-limit = 500000000          # 500 MB/s total
 1. Check LEDBAT is not detecting congestion (high queuing delay)
 2. Verify the receiving peer has sufficient bandwidth
 3. Check if too many connections are sharing the global pool
+4. **For high-latency paths (>100ms RTT):** Configure `min_ssthresh` (see above)
 
 ### Connections getting starved
 

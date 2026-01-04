@@ -309,6 +309,63 @@ We use `SLOWDOWN_REDUCTION_FACTOR = 4` instead of the spec's minimum (factor of 
 - Still probes for inter-flow fairness
 - Recovers in fewer RTTs
 
+### 4.5 Minimum ssthresh Floor for High-BDP Paths (Issue #2578)
+
+On high-bandwidth-delay-product paths (e.g., intercontinental links with 135ms+ RTT),
+repeated timeouts can cause a **"ssthresh death spiral"** where ssthresh keeps halving
+until it reaches the spec minimum (`2*min_cwnd` ≈ 5KB).
+
+**The Problem:**
+
+```
+Timeout 1: ssthresh = 1MB → 500KB
+Timeout 2: ssthresh = 500KB → 250KB
+Timeout 3: ssthresh = 250KB → 125KB
+...
+Timeout 8: ssthresh = 7KB → 5KB (spec floor)
+```
+
+At 135ms RTT with 5KB ssthresh, slow start exits almost immediately, limiting
+throughput to ~300 Kbit/s instead of the available 60+ Mbit/s. This caused
+18+ second transfers for operations that should complete in 2-3 seconds.
+
+**The Solution:**
+
+Configure `min_ssthresh` in `LedbatConfig` to set a higher floor:
+
+```rust
+LedbatConfig {
+    min_ssthresh: Some(100 * 1024), // 100KB floor for intercontinental paths
+    ..Default::default()
+}
+```
+
+The implementation ensures the floor never goes below the spec minimum:
+
+```rust
+let spec_floor = self.min_cwnd * 2;  // ~5.7KB
+let floor = self.min_ssthresh.unwrap_or(spec_floor).max(spec_floor);
+let new_ssthresh = (old_cwnd / 2).max(floor);
+```
+
+**Recommended Configuration by Path Type:**
+
+| Path Type | RTT Range | Recommended min_ssthresh | Rationale |
+|-----------|-----------|-------------------------|-----------|
+| LAN | <10ms | `None` (default) | Low BDP, spec floor is adequate |
+| Regional | 10-50ms | `None` (default) | Moderate BDP, default sufficient |
+| Continental | 50-100ms | `Some(50KB)` | Higher BDP benefits from floor |
+| **Intercontinental** | 100-200ms | **`Some(100KB-500KB)`** | **High BDP requires higher floor** |
+| Satellite | 500ms+ | `Some(500KB-2MB)` | Very high BDP, maximize recovery |
+
+**BDP Calculation for Reference:**
+
+At 100 Mbps bandwidth and 135ms RTT:
+- BDP = 100 Mbit/s × 0.135s = 13.5 Mbit = **1.7 MB**
+- To fully utilize the path, cwnd needs to reach ~1.7 MB
+- With 5KB ssthresh, slow start exits at 5KB → only 0.3% utilization
+- With 500KB ssthresh, slow start can reach 500KB → 29% utilization before CA
+
 ---
 
 ## 5. Real-World Behavior
@@ -438,11 +495,12 @@ pub struct LedbatConfig {
     pub initial_cwnd: usize,           // Default: 38,000 (IW26)
     pub min_cwnd: usize,               // Default: 2,848 (2 × MSS)
     pub max_cwnd: usize,               // Default: 1,000,000,000 (1 GB)
-    pub ssthresh: usize,               // Default: 100,000 (100 KB)
+    pub ssthresh: usize,               // Default: 1,000,000 (1 MB)
     pub enable_slow_start: bool,       // Default: true
     pub delay_exit_threshold: f64,     // Default: 0.75 (exit at 45ms)
     pub randomize_ssthresh: bool,      // Default: true (±20% jitter)
     pub enable_periodic_slowdown: bool, // Default: true (LEDBAT++)
+    pub min_ssthresh: Option<usize>,   // Default: None (see Section 4.5)
 }
 ```
 
@@ -452,7 +510,8 @@ pub struct LedbatConfig {
 |----------|----------------|
 | LAN only (10ms RTT) | `enable_periodic_slowdown: false` - overhead not worth it |
 | Mixed network | Default settings work well |
-| High latency (>150ms) | Consider `SLOWDOWN_REDUCTION_FACTOR = 2` for gentler dips |
+| High latency (>150ms) | `min_ssthresh: Some(100KB-500KB)` - prevents death spiral |
+| Intercontinental gateway | `min_ssthresh: Some(500KB)` - ensures recovery on high-BDP paths |
 | Single connection | `enable_periodic_slowdown: false` - no competing flows |
 
 ---
