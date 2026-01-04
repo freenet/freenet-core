@@ -1086,10 +1086,9 @@ impl<S: super::Socket> PeerConnection<S> {
                         );
                         return Ok(Some(msg));
                     }
-                    self.inbound_stream_futures
-                        .push(GlobalExecutor::spawn(inbound_stream::recv_stream(
-                            stream_id, receiver, stream,
-                        )));
+                    self.inbound_stream_futures.push(GlobalExecutor::spawn(
+                        inbound_stream::recv_stream(stream_id, receiver, stream),
+                    ));
                 }
                 Ok(None)
             }

@@ -888,7 +888,8 @@ mod tests {
 
         // Spawn a task that tries to acquire a permit (will block)
         let stream_clone = Arc::clone(&stream);
-        let waiter = GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
+        let waiter =
+            GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
 
         // Give the waiter time to start waiting using virtual time
         time_source.advance(Duration::from_millis(10));
@@ -1018,7 +1019,8 @@ mod tests {
 
         // Spawn a waiter
         let stream_clone = Arc::clone(&stream);
-        let waiter = GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
+        let waiter =
+            GlobalExecutor::spawn(async move { stream_clone.acquire_send_permit(0).await });
 
         // Release one permit
         drop(permit1);

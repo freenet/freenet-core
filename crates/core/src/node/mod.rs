@@ -36,7 +36,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GlobalExecutor, GatewayConfig, WebsocketApiConfig},
+    config::{Address, GatewayConfig, GlobalExecutor, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},

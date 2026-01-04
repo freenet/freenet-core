@@ -8022,13 +8022,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "getrandom"
-version = "0.2.11"
-source = "git+https://github.com/madsim-rs/getrandom.git?rev=e79a7ae#e79a7aecbcf8a43a802d30742667b77d75c613bd"
-
-[[patch.unused]]
-name = "quanta"
-version = "0.12.3"
-source = "git+https://github.com/madsim-rs/quanta.git?branch=madsim#ea9ba802327b1d72c4b1c7202c759b0a5243271e"
