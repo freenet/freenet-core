@@ -169,34 +169,36 @@ download_release_binary() {
     esac
 
     local download_url="https://github.com/freenet/freenet-core/releases/download/v${version}/${asset_name}"
-    local tar_file="${target_dir}/${asset_name}"
+    # Use a unique subdirectory to avoid conflicts with gateway's /tmp/freenet runtime dir
+    local extract_dir="${target_dir}/freenet-release-extract-$$"
+    local tar_file="${extract_dir}/${asset_name}"
     local binary_path="${target_dir}/freenet-release-${version}"
 
     echo "  Downloading release binary from GitHub..." >&2
     echo "    URL: $download_url" >&2
 
+    # Create extraction directory
+    mkdir -p "$extract_dir"
+
     # Download the tarball
     if ! curl -L -s -o "$tar_file" "$download_url"; then
         echo "  ⚠️  Failed to download release binary" >&2
+        rm -rf "$extract_dir"
         return 1
     fi
 
-    # Clean up any existing freenet file/directory before extraction
-    # (tar fails if a directory exists where it expects to create a file)
-    rm -rf "${target_dir}/freenet"
-
-    # Extract the binary
-    if ! tar -xzf "$tar_file" -C "$target_dir"; then
+    # Extract the binary to our isolated directory
+    if ! tar -xzf "$tar_file" -C "$extract_dir"; then
         echo "  ⚠️  Failed to extract release binary" >&2
-        rm -f "$tar_file"
+        rm -rf "$extract_dir"
         return 1
     fi
 
     # The tarball contains just "freenet" binary
-    if [[ -f "${target_dir}/freenet" ]]; then
-        mv "${target_dir}/freenet" "$binary_path"
+    if [[ -f "${extract_dir}/freenet" ]]; then
+        mv "${extract_dir}/freenet" "$binary_path"
         chmod +x "$binary_path"
-        rm -f "$tar_file"
+        rm -rf "$extract_dir"
         echo "    Binary: $binary_path" >&2
 
         # Verify the binary
@@ -208,7 +210,7 @@ download_release_binary() {
         return 0
     else
         echo "  ⚠️  Binary not found in tarball" >&2
-        rm -f "$tar_file"
+        rm -rf "$extract_dir"
         return 1
     fi
 }
