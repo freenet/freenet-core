@@ -703,6 +703,23 @@ impl OpManager {
             })
             .unwrap_or_default();
 
+        // Collect upstream peer (for bidirectional propagation through subscription tree)
+        // Updates should flow both toward the root AND toward the leaves
+        let upstream_target: Option<PeerKeyLocation> = self
+            .ring
+            .get_upstream(key)
+            .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
+            .filter(|pk| {
+                pk.socket_addr()
+                    .map(|addr| {
+                        self.ring
+                            .connection_manager
+                            .get_peer_by_addr(addr)
+                            .is_some()
+                    })
+                    .unwrap_or(false)
+            });
+
         // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
         let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
         let mut proximity_targets: HashSet<PeerKeyLocation> = HashSet::new();
@@ -725,11 +742,15 @@ impl OpManager {
             }
         }
 
-        // Combine both sets (HashSet handles deduplication)
+        // Combine all target sets (HashSet handles deduplication)
         let subscriber_count = subscribers.len();
         let proximity_count = proximity_targets.len();
+        let has_upstream = upstream_target.is_some();
         let mut all_targets: HashSet<PeerKeyLocation> = subscribers;
         all_targets.extend(proximity_targets);
+        if let Some(upstream) = upstream_target {
+            all_targets.insert(upstream);
+        }
 
         let targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
 
@@ -747,6 +768,7 @@ impl OpManager {
                 count = targets.len(),
                 subscribers = subscriber_count,
                 proximity = proximity_count,
+                upstream = has_upstream,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
@@ -1049,6 +1071,15 @@ pub(crate) async fn request_update(
         None
     };
 
+    // Check upstream peer in the subscription tree.
+    // This is critical for leaf nodes (subscribers) that want to send updates -
+    // they have no downstream subscribers, but they DO have an upstream peer
+    // through which updates should propagate toward the contract location.
+    let target_from_upstream = op_manager
+        .ring
+        .get_upstream(&key)
+        .filter(|upstream| upstream.socket_addr() != Some(sender_addr));
+
     // Check proximity cache for neighbors that have announced caching this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
     // but not explicitly subscribed (e.g., River chat rooms where both peers cache
@@ -1088,6 +1119,15 @@ pub(crate) async fn request_update(
 
     let target = if let Some(remote_subscriber) = target_from_subscribers {
         remote_subscriber
+    } else if let Some(upstream_peer) = target_from_upstream {
+        // Use upstream peer from subscription tree - this is how leaf nodes send updates
+        // toward the contract location for propagation through the tree.
+        tracing::debug!(
+            %key,
+            target = ?upstream_peer.socket_addr(),
+            "UPDATE: Using upstream peer from subscription tree as target"
+        );
+        upstream_peer
     } else if let Some(proximity_neighbor) = target_from_proximity {
         // Use peer from proximity cache that announced having this contract.
         // This aligns with get_broadcast_targets_update() which also uses proximity cache.

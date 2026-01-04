@@ -637,6 +637,12 @@ impl Ring {
         self.seeding_manager.subscribers_of(contract)
     }
 
+    /// Get the upstream peer for a contract (the peer we subscribed through).
+    /// Returns None if we don't have an upstream for this contract.
+    pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
+        self.seeding_manager.get_upstream(contract)
+    }
+
     /// Get all network subscriptions across all contracts
     pub fn all_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
         self.seeding_manager.all_subscriptions()
