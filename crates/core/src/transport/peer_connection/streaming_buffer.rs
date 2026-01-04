@@ -25,6 +25,7 @@ use event_listener::Event;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
+use crate::simulation::{RealTime, TimeSource};
 use crate::transport::packet_data;
 
 /// Maximum payload size per fragment (excluding metadata overhead).
@@ -66,7 +67,7 @@ pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 ///   reclaim fragments when all consumers have passed them.
 ///
 /// Based on spike implementation from iduartgomez/freenet-core#204.
-pub struct LockFreeStreamBuffer {
+pub struct LockFreeStreamBuffer<T: TimeSource = RealTime> {
     /// Pre-allocated slots for each fragment. Each slot is a pointer to heap-allocated Bytes.
     /// Fragment numbers are 1-indexed, so fragment N is stored at slots[N-1].
     /// NULL means empty/cleared, non-NULL means fragment is present.
@@ -95,10 +96,16 @@ pub struct LockFreeStreamBuffer {
     /// held to wake waiters (not during the actual fragment write), contention
     /// is minimal in practice.
     data_available: Event,
+    /// Time source for handling delays in async operations.
+    /// In production, this is `RealTime` which delegates to tokio.
+    /// In tests, this can be `VirtualTime` for deterministic timing.
+    #[allow(dead_code)]
+    time_source: T,
 }
 
-impl LockFreeStreamBuffer {
-    /// Creates a new buffer pre-allocated for the expected total size.
+// Production constructor (backward-compatible, uses real time)
+impl LockFreeStreamBuffer<RealTime> {
+    /// Creates a new buffer pre-allocated for the expected total size using real time.
     ///
     /// # Arguments
     ///
@@ -108,6 +115,23 @@ impl LockFreeStreamBuffer {
     ///
     /// A new `LockFreeStreamBuffer` with enough slots to hold all fragments.
     pub fn new(total_size: u64) -> Self {
+        Self::new_with_time_source(total_size, RealTime::new())
+    }
+}
+
+// Generic implementation (works with any TimeSource)
+impl<T: TimeSource> LockFreeStreamBuffer<T> {
+    /// Creates a new buffer pre-allocated for the expected total size with a custom time source.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_size` - Total expected bytes in the complete stream
+    /// * `time_source` - TimeSource for handling async delays (RealTime for production, VirtualTime for tests)
+    ///
+    /// # Returns
+    ///
+    /// A new `LockFreeStreamBuffer` with enough slots to hold all fragments.
+    pub fn new_with_time_source(total_size: u64, time_source: T) -> Self {
         let num_fragments = Self::calculate_fragment_count(total_size);
         let fragments: Vec<AtomicPtr<Bytes>> = (0..num_fragments)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
@@ -120,6 +144,7 @@ impl LockFreeStreamBuffer {
             contiguous_fragments: AtomicU32::new(0),
             consumed_frontier: AtomicU32::new(0),
             data_available: Event::new(),
+            time_source,
         }
     }
 
@@ -477,7 +502,7 @@ impl LockFreeStreamBuffer {
 }
 
 /// Ensures all remaining fragments are properly deallocated when the buffer is dropped.
-impl Drop for LockFreeStreamBuffer {
+impl<T: TimeSource> Drop for LockFreeStreamBuffer<T> {
     fn drop(&mut self) {
         for slot in self.fragments.iter() {
             let ptr = slot.load(Ordering::Acquire);
@@ -530,6 +555,8 @@ impl std::error::Error for InsertError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::VirtualTime;
+    use std::time::Duration;
 
     #[test]
     fn test_new_buffer_empty() {
@@ -880,7 +907,11 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::Barrier;
 
-        let buffer = Arc::new(LockFreeStreamBuffer::new(100));
+        let time_source = VirtualTime::new();
+        let buffer = Arc::new(LockFreeStreamBuffer::new_with_time_source(
+            100,
+            time_source.clone(),
+        ));
         let buffer_clone = Arc::clone(&buffer);
         let barrier = Arc::new(Barrier::new(2));
         let barrier_clone = Arc::clone(&barrier);
@@ -894,13 +925,15 @@ mod tests {
 
         // Sync with waiter
         barrier.wait().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        time_source.advance(Duration::from_millis(10));
 
         // Insert should trigger notification
         buffer.insert(1, Bytes::from_static(b"data")).unwrap();
 
-        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), waiter).await;
-        assert!(result.is_ok());
+        // Use time_source.timeout instead of tokio::time::timeout
+        let timeout_future = time_source.timeout(Duration::from_millis(100), waiter);
+        let result = timeout_future.await;
+        assert!(result.is_some());
         assert!(result.unwrap().unwrap());
     }
 

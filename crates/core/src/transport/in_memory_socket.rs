@@ -30,6 +30,7 @@ use std::{
 use tokio::sync::Mutex;
 
 use super::Socket;
+use crate::simulation::{RealTime, TimeSource};
 
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;
@@ -308,7 +309,9 @@ pub fn clear_all_socket_registries() {
 ///
 /// Sockets are scoped to a network (identified by name). Sockets in different
 /// networks cannot communicate with each other, providing test isolation.
-pub struct InMemorySocket {
+///
+/// Supports virtual time for deterministic testing via the `TimeSource` trait.
+pub struct InMemorySocket<T: TimeSource = RealTime> {
     /// Network this socket belongs to
     network_name: String,
     /// This socket's bound address
@@ -317,9 +320,11 @@ pub struct InMemorySocket {
     inbox: Arc<Mutex<SocketInbox>>,
     /// Notifier for packet arrival
     notify: Arc<tokio::sync::Notify>,
+    /// Time source for sleep operations
+    time_source: T,
 }
 
-impl std::fmt::Debug for InMemorySocket {
+impl<T: TimeSource> std::fmt::Debug for InMemorySocket<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemorySocket")
             .field("network_name", &self.network_name)
@@ -328,8 +333,11 @@ impl std::fmt::Debug for InMemorySocket {
     }
 }
 
-impl Socket for InMemorySocket {
-    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+impl<T: TimeSource> InMemorySocket<T> {
+    /// Create a new in-memory socket with a custom time source.
+    ///
+    /// This is the generic constructor for testing with virtual time.
+    pub async fn bind_with_time_source(addr: SocketAddr, time_source: T) -> io::Result<Self> {
         let network_name = get_address_network(&addr).ok_or_else(|| {
             io::Error::other(format!(
                 "No network registered for address {}. Call register_address_network() before binding InMemorySocket.",
@@ -348,10 +356,12 @@ impl Socket for InMemorySocket {
             addr,
             inbox,
             notify,
+            time_source,
         })
     }
 
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    /// Receive data from the socket.
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             // Try to get a packet from inbox
             {
@@ -368,7 +378,8 @@ impl Socket for InMemorySocket {
         }
     }
 
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+    /// Generic async send_to implementation using the time source.
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -384,11 +395,12 @@ impl Socket for InMemorySocket {
                 Ok(buf.len())
             }
             PacketDeliveryDecision::DelayedDelivery(delay) => {
-                // Spawn task to deliver after delay
+                // Spawn task to deliver after delay using time source
                 let network_name = self.network_name.clone();
                 let from = self.addr;
+                let time_source = self.time_source.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                    time_source.sleep(delay).await;
                     deliver_packet_to_network(&network_name, target, data, from);
                 });
                 Ok(buf.len())
@@ -406,7 +418,8 @@ impl Socket for InMemorySocket {
         }
     }
 
-    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+    /// Synchronous send for use in blocking contexts (e.g., spawn_blocking).
+    pub fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -420,6 +433,8 @@ impl Socket for InMemorySocket {
             PacketDeliveryDecision::Drop => Ok(buf.len()),
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // For blocking context, just sleep and deliver
+                // Note: For VirtualTime, this uses wall-clock sleep; consider using
+                // blocking simulation methods if deterministic tests require it.
                 std::thread::sleep(delay);
                 deliver_packet_to_network(&self.network_name, target, data, self.addr);
                 Ok(buf.len())
@@ -437,7 +452,25 @@ impl Socket for InMemorySocket {
     }
 }
 
-impl Drop for InMemorySocket {
+impl Socket for InMemorySocket<RealTime> {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_time_source(addr, RealTime::new()).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        InMemorySocket::<RealTime>::recv_from(self, buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        InMemorySocket::<RealTime>::send_to(self, buf, target).await
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        InMemorySocket::<RealTime>::send_to_blocking(self, buf, target)
+    }
+}
+
+impl<T: TimeSource> Drop for InMemorySocket<T> {
     fn drop(&mut self) {
         unregister_socket(&self.network_name, &self.addr);
         unregister_address_network(&self.addr);
@@ -452,6 +485,7 @@ impl Drop for InMemorySocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::VirtualTime;
 
     #[tokio::test]
     async fn test_socket_bind_and_send() {
@@ -522,5 +556,40 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(err.to_string().contains("No network registered"));
+    }
+
+    #[tokio::test]
+    async fn test_socket_with_virtual_time() {
+        let network = "test-virtual-time";
+        clear_network_sockets(network);
+
+        let addr1: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+
+        // Create virtual time instance
+        let time_source = VirtualTime::new();
+
+        // Register addresses with network before binding
+        register_address_network(addr1, network);
+        register_address_network(addr2, network);
+
+        // Bind sockets with virtual time
+        let socket1 = InMemorySocket::bind_with_time_source(addr1, time_source.clone())
+            .await
+            .unwrap();
+        let socket2 = InMemorySocket::bind_with_time_source(addr2, time_source.clone())
+            .await
+            .unwrap();
+
+        // Send from socket1 to socket2
+        let msg = b"hello from virtual time";
+        socket1.send_to(msg, addr2).await.unwrap();
+
+        // Receive on socket2
+        let mut buf = [0u8; 100];
+        let (len, from) = socket2.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..len], msg);
+        assert_eq!(from, addr1);
     }
 }

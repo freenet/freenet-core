@@ -36,10 +36,10 @@
 //! - Epoch-based timing for rate-limiting updates
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::packet_data::MAX_DATA_SIZE;
-use crate::util::time_source::{InstantTimeSrc, TimeSource};
+use crate::simulation::{RealTime, TimeSource};
 
 /// Maximum segment size (actual packet data capacity)
 const MSS: usize = MAX_DATA_SIZE;
@@ -447,9 +447,9 @@ impl AtomicDelayFilter {
 /// # Type Parameter
 ///
 /// `T` is the time source used for timing operations. In production, this is
-/// `InstantTimeSrc` which uses `Instant::now()`. In tests, this can be
-/// `SharedMockTimeSource` for deterministic virtual time testing.
-struct AtomicBaseDelayHistory<T: TimeSource + Clone> {
+/// `RealTime` which uses `Instant::now()`. In tests, this can be
+/// `VirtualTime` for deterministic virtual time testing.
+struct AtomicBaseDelayHistory<T: TimeSource> {
     /// One bucket per minute, containing minimum delay observed in that minute (nanos)
     buckets: [AtomicU64; BASE_HISTORY_SIZE],
     /// Number of valid buckets (0 to BASE_HISTORY_SIZE)
@@ -462,13 +462,13 @@ struct AtomicBaseDelayHistory<T: TimeSource + Clone> {
     current_minute_start_nanos: AtomicU64,
     /// Time source for getting current time
     time_source: T,
-    /// Epoch instant for time calculations
-    epoch: Instant,
+    /// Epoch in nanoseconds for time calculations
+    epoch_nanos: u64,
 }
 
-impl<T: TimeSource + Clone> AtomicBaseDelayHistory<T> {
+impl<T: TimeSource> AtomicBaseDelayHistory<T> {
     fn new(time_source: T) -> Self {
-        let epoch = time_source.now();
+        let epoch_nanos = time_source.now_nanos();
         Self {
             buckets: std::array::from_fn(|_| AtomicU64::new(EMPTY_DELAY_NANOS)),
             bucket_count: AtomicUsize::new(0),
@@ -476,14 +476,14 @@ impl<T: TimeSource + Clone> AtomicBaseDelayHistory<T> {
             current_minute_min: AtomicU64::new(EMPTY_DELAY_NANOS),
             current_minute_start_nanos: AtomicU64::new(0),
             time_source,
-            epoch,
+            epoch_nanos,
         }
     }
 
     fn update(&self, rtt_sample: Duration) {
         // Safe cast: RTT values are always far below u64::MAX (~584 years)
         let rtt_nanos = rtt_sample.as_nanos() as u64;
-        let now_nanos = self.time_source.now().duration_since(self.epoch).as_nanos() as u64;
+        let now_nanos = self.time_source.now_nanos() - self.epoch_nanos;
         let minute_nanos = 60_000_000_000u64; // 60 seconds in nanos
 
         let minute_start = self.current_minute_start_nanos.load(Ordering::Acquire);
@@ -615,10 +615,10 @@ impl<T: TimeSource + Clone> AtomicBaseDelayHistory<T> {
 ///
 /// ## Type Parameter
 ///
-/// `T` is the time source used for timing operations. Defaults to `InstantTimeSrc`
-/// for production use. In tests, use `SharedMockTimeSource` for deterministic
+/// `T` is the time source used for timing operations. Defaults to `RealTime`
+/// for production use. In tests, use `VirtualTime` for deterministic
 /// virtual time testing via `LedbatController::new_with_time_source()`.
-pub struct LedbatController<T: TimeSource + Clone = InstantTimeSrc> {
+pub struct LedbatController<T: TimeSource = RealTime> {
     /// Congestion window (bytes in flight)
     cwnd: AtomicUsize,
 
@@ -639,18 +639,18 @@ pub struct LedbatController<T: TimeSource + Clone = InstantTimeSrc> {
 
     /// Time source for getting current time.
     ///
-    /// In production, this is `InstantTimeSrc` which wraps `Instant::now()`.
-    /// In tests, `SharedMockTimeSource` allows deterministic virtual time control.
+    /// In production, this is `RealTime` which wraps `Instant::now()`.
+    /// In tests, `VirtualTime` allows deterministic virtual time control.
     time_source: T,
 
-    /// Reference epoch for converting `Instant` to duration-since-start.
+    /// Reference epoch in nanoseconds for converting to duration-since-start.
     ///
-    /// All timing calculations use `time_source.now().duration_since(epoch)`
-    /// rather than `epoch.elapsed()` to ensure tests with mock time sources
-    /// observe the mocked time rather than wall-clock time.
+    /// All timing calculations use `time_source.now_nanos() - epoch_nanos`
+    /// to ensure tests with virtual time sources observe the mocked time
+    /// rather than wall-clock time.
     ///
-    /// This field is set once at construction time from `time_source.now()`.
-    epoch: Instant,
+    /// This field is set once at construction time from `time_source.now_nanos()`.
+    epoch_nanos: u64,
 
     /// Bytes acknowledged since last update
     bytes_acked_since_update: AtomicUsize,
@@ -724,7 +724,7 @@ pub struct LedbatController<T: TimeSource + Clone = InstantTimeSrc> {
 // Production constructors (backward-compatible, use real time)
 // ============================================================================
 
-impl LedbatController<InstantTimeSrc> {
+impl LedbatController<RealTime> {
     /// Create new LEDBAT controller with default config (backward compatible).
     ///
     /// # Arguments
@@ -755,7 +755,7 @@ impl LedbatController<InstantTimeSrc> {
     /// Create new LEDBAT controller with custom configuration.
     ///
     /// This constructor allows full control over slow start parameters
-    /// and other LEDBAT settings. Uses real system time (`InstantTimeSrc`).
+    /// and other LEDBAT settings. Uses real system time (`RealTime`).
     ///
     /// # Example
     /// ```ignore
@@ -769,7 +769,7 @@ impl LedbatController<InstantTimeSrc> {
     /// let controller = LedbatController::new_with_config(config);
     /// ```
     pub fn new_with_config(config: LedbatConfig) -> Self {
-        Self::new_with_time_source(config, InstantTimeSrc::new())
+        Self::new_with_time_source(config, RealTime::new())
     }
 }
 
@@ -777,7 +777,7 @@ impl LedbatController<InstantTimeSrc> {
 // Generic implementation (works with any TimeSource)
 // ============================================================================
 
-impl<T: TimeSource + Clone> LedbatController<T> {
+impl<T: TimeSource> LedbatController<T> {
     /// Create new LEDBAT controller with custom configuration and time source.
     ///
     /// This constructor is the primary entry point for creating a controller
@@ -786,14 +786,15 @@ impl<T: TimeSource + Clone> LedbatController<T> {
     /// # Example
     /// ```ignore
     /// use freenet::transport::ledbat::{LedbatController, LedbatConfig};
-    /// use freenet::util::time_source::SharedMockTimeSource;
+    /// use freenet::simulation::time::VirtualTime;
+    /// use std::time::Duration;
     ///
-    /// let time_source = SharedMockTimeSource::new();
+    /// let time_source = VirtualTime::new();
     /// let config = LedbatConfig::default();
     /// let controller = LedbatController::new_with_time_source(config, time_source.clone());
     ///
     /// // Advance virtual time
-    /// time_source.advance_time(Duration::from_millis(100));
+    /// time_source.advance(Duration::from_millis(100));
     /// ```
     pub fn new_with_time_source(config: LedbatConfig, time_source: T) -> Self {
         // Validate configuration parameters
@@ -824,7 +825,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
             config.ssthresh
         };
 
-        let epoch = time_source.now();
+        let epoch_nanos = time_source.now_nanos();
 
         Self {
             cwnd: AtomicUsize::new(config.initial_cwnd),
@@ -834,7 +835,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
             queuing_delay_nanos: AtomicU64::new(0),
             last_update_nanos: AtomicU64::new(0),
             time_source,
-            epoch,
+            epoch_nanos,
             bytes_acked_since_update: AtomicUsize::new(0),
             ssthresh: AtomicUsize::new(ssthresh),
             // Unified congestion state: start in SlowStart or CongestionAvoidance
@@ -890,6 +891,12 @@ impl<T: TimeSource + Clone> LedbatController<T> {
     /// Get the peak congestion window reached during this controller's lifetime.
     pub fn peak_cwnd(&self) -> usize {
         self.peak_cwnd.load(Ordering::Relaxed)
+    }
+
+    /// Get elapsed time in nanoseconds since controller creation (for testing).
+    #[cfg(test)]
+    pub fn elapsed_nanos(&self) -> u64 {
+        self.time_source.now_nanos() - self.epoch_nanos
     }
 
     /// Calculate dynamic GAIN based on base delay (LEDBAT++ Section 4.2)
@@ -968,7 +975,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
             .store(queuing_delay.as_nanos() as u64, Ordering::Release);
 
         // Rate-limit updates to approximately once per RTT
-        let now_nanos = self.time_source.now().duration_since(self.epoch).as_nanos() as u64;
+        let now_nanos = self.time_source.now_nanos() - self.epoch_nanos;
         let last_update = self.last_update_nanos.load(Ordering::Acquire);
         let elapsed_nanos = now_nanos.saturating_sub(last_update);
 
@@ -1148,7 +1155,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
                     .initial_slow_start_completed
                     .swap(true, Ordering::AcqRel)
             {
-                let now_nanos = self.time_source.now().duration_since(self.epoch).as_nanos() as u64;
+                let now_nanos = self.time_source.now_nanos() - self.epoch_nanos;
                 // Schedule slowdown after 2 RTTs (use base_delay as RTT estimate)
                 let delay_nanos = base_delay.as_nanos() as u64 * SLOWDOWN_DELAY_RTTS as u64;
                 self.next_slowdown_time_nanos
@@ -1208,7 +1215,7 @@ impl<T: TimeSource + Clone> LedbatController<T> {
         queuing_delay: Duration,
         base_delay: Duration,
     ) -> bool {
-        let now_nanos = self.time_source.now().duration_since(self.epoch).as_nanos() as u64;
+        let now_nanos = self.time_source.now_nanos() - self.epoch_nanos;
         let state = self.congestion_state.load();
 
         match state {
@@ -1818,6 +1825,7 @@ pub struct LedbatStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::VirtualTime;
     use crate::util::time_source::SharedMockTimeSource;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
@@ -1914,7 +1922,7 @@ mod tests {
 
     /// Deterministic test harness for LEDBAT.
     ///
-    /// This harness wraps a `LedbatController` with a mock time source, enabling:
+    /// This harness wraps a `LedbatController` with a virtual time source, enabling:
     /// - Virtual time: Advance time instantly without wall-clock delays
     /// - Deterministic jitter: Seeded RNG produces reproducible "random" delays
     /// - Packet loss simulation: Configurable loss rate per network condition
@@ -1935,11 +1943,11 @@ mod tests {
     /// assert!(snapshots.last().unwrap().cwnd > snapshots.first().unwrap().cwnd);
     /// ```
     pub struct LedbatTestHarness {
-        time_source: SharedMockTimeSource,
-        controller: LedbatController<SharedMockTimeSource>,
+        time_source: VirtualTime,
+        controller: LedbatController<VirtualTime>,
         condition: NetworkCondition,
         rng: SmallRng,
-        epoch: std::time::Instant,
+        epoch_nanos: u64,
     }
 
     #[allow(dead_code)] // Methods available for test expansion
@@ -1951,8 +1959,8 @@ mod tests {
         /// * `condition` - Network condition preset (RTT, jitter, loss)
         /// * `seed` - RNG seed for reproducible jitter and loss patterns
         pub fn new(config: LedbatConfig, condition: NetworkCondition, seed: u64) -> Self {
-            let time_source = SharedMockTimeSource::new();
-            let epoch = time_source.current_time();
+            let time_source = VirtualTime::new();
+            let epoch_nanos = time_source.now_nanos();
             let controller = LedbatController::new_with_time_source(config, time_source.clone());
 
             Self {
@@ -1960,26 +1968,23 @@ mod tests {
                 controller,
                 condition,
                 rng: SmallRng::seed_from_u64(seed),
-                epoch,
+                epoch_nanos,
             }
         }
 
         /// Get a reference to the underlying controller for direct access.
-        pub fn controller(&self) -> &LedbatController<SharedMockTimeSource> {
+        pub fn controller(&self) -> &LedbatController<VirtualTime> {
             &self.controller
         }
 
         /// Get current virtual time as nanos since harness creation.
         pub fn current_time_nanos(&self) -> u64 {
-            self.time_source
-                .current_time()
-                .duration_since(self.epoch)
-                .as_nanos() as u64
+            self.time_source.now_nanos() - self.epoch_nanos
         }
 
         /// Advance virtual time by the given duration.
         pub fn advance_time(&mut self, duration: Duration) {
-            self.time_source.advance_time(duration);
+            self.time_source.advance(duration);
         }
 
         /// Calculate RTT with jitter applied.
@@ -2852,7 +2857,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let history = Arc::new(AtomicBaseDelayHistory::new(InstantTimeSrc::new()));
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
         let num_threads = 4;
         let iterations = 100;
 
@@ -2891,7 +2896,7 @@ mod tests {
         use std::thread;
 
         // Create a history and immediately add a sample to establish baseline
-        let history = Arc::new(AtomicBaseDelayHistory::new(InstantTimeSrc::new()));
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
         history.update(Duration::from_millis(100)); // Initial sample
 
         // Verify initial state
@@ -2976,7 +2981,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let history = Arc::new(AtomicBaseDelayHistory::new(InstantTimeSrc::new()));
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
 
         // Many threads all trying to set different minimums
         let num_threads = 8;
@@ -3575,7 +3580,7 @@ mod tests {
         let slowdown_duration = controller
             .last_slowdown_duration_nanos
             .load(Ordering::Acquire);
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
         let next_interval = next_slowdown.saturating_sub(now_nanos);
 
@@ -3630,7 +3635,7 @@ mod tests {
         let controller = LedbatController::new_with_config(config);
 
         // Simulate having just started a slowdown (set phase_start to now)
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         controller
             .slowdown_phase_start_nanos
             .store(now_nanos, Ordering::Release);
@@ -3640,7 +3645,7 @@ mod tests {
 
         // Call complete_slowdown immediately (simulating very short slowdown_duration)
         // This is the scenario that caused the bug
-        let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let completion_nanos = controller.elapsed_nanos();
         controller.complete_slowdown(completion_nanos, high_latency_rtt);
 
         // Get the scheduled next slowdown time
@@ -3717,7 +3722,7 @@ mod tests {
         let controller = LedbatController::new_with_config(config);
 
         // Set up state: cwnd is below skip threshold, next slowdown is due NOW
-        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        let now_nanos = controller.elapsed_nanos();
         controller
             .next_slowdown_time_nanos
             .store(now_nanos, Ordering::Release);
@@ -5026,12 +5031,12 @@ mod tests {
             controller.base_delay_history.update(rtt);
 
             // Simulate immediate slowdown completion
-            let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            let now_nanos = controller.elapsed_nanos();
             controller
                 .slowdown_phase_start_nanos
                 .store(now_nanos, Ordering::Release);
 
-            let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            let completion_nanos = controller.elapsed_nanos();
             controller.complete_slowdown(completion_nanos, rtt);
 
             let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
@@ -7888,7 +7893,7 @@ mod tests {
 
                 // Trigger initial slowdown
                 controller.congestion_state.enter_in_slowdown();
-                let start_nanos = controller.epoch.elapsed().as_nanos() as u64;
+                let start_nanos = controller.elapsed_nanos();
                 controller.slowdown_phase_start_nanos.store(start_nanos, Ordering::Release);
 
                 // Complete slowdown with a very short duration (simulating quick ramp-up)
@@ -8611,7 +8616,7 @@ mod tests {
                 rtt_ms in 50u64..200,  // High RTT (intercontinental)
                 min_ssthresh_kb in 100usize..500  // 100KB - 500KB floor
             ) {
-                use crate::util::time_source::SharedMockTimeSource;
+                use crate::simulation::VirtualTime;
 
                 let min_ssthresh = min_ssthresh_kb * 1024;
                 let config = LedbatConfig {
@@ -8627,14 +8632,14 @@ mod tests {
                 };
 
                 // Use virtual time for deterministic testing
-                let time_source = SharedMockTimeSource::new();
+                let time_source = VirtualTime::new();
                 let controller = LedbatController::new_with_time_source(config, time_source.clone());
 
                 // Establish base delay with time advancement
                 let rtt = Duration::from_millis(rtt_ms);
-                time_source.advance_time(rtt);
+                time_source.advance(rtt);
                 controller.on_ack(rtt, 1000);
-                time_source.advance_time(rtt);
+                time_source.advance(rtt);
                 controller.on_ack(rtt, 1000);
 
                 // Trigger timeout
@@ -8655,7 +8660,7 @@ mod tests {
                 // Run 10 RTTs of slow start recovery with virtual time advancement
                 for i in 0..10 {
                     // Advance time by RTT + small buffer to exceed rate-limiting interval
-                    time_source.advance_time(rtt + Duration::from_millis(1));
+                    time_source.advance(rtt + Duration::from_millis(1));
                     controller.on_ack(rtt, 5000);
                     let current_cwnd = controller.current_cwnd();
 

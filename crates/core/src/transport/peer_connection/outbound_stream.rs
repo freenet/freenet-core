@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aes_gcm::Aes128Gcm;
 use bytes::Bytes;
 
 use crate::{
+    simulation::TimeSource,
     tracing::TransferDirection,
     transport::{
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
@@ -15,7 +16,6 @@ use crate::{
         symmetric_message::{self},
         TransferStats, TransportError,
     },
-    util::time_source::InstantTimeSrc,
 };
 
 use super::StreamId;
@@ -36,18 +36,19 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// Returns `TransferStats` on success with LEDBAT congestion control metrics
 /// for telemetry purposes.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_stream<S: super::super::Socket>(
+pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
     socket: Arc<S>,
     destination_addr: SocketAddr,
     mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
-    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
-    token_bucket: Arc<super::super::token_bucket::TokenBucket>,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
+    token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
     ledbat: Arc<super::super::ledbat::LedbatController>,
+    time_source: T,
 ) -> Result<TransferStats, TransportError> {
-    let start_time = Instant::now();
+    let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
 
     // Emit transfer started telemetry event
@@ -117,9 +118,9 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             if cwnd_wait_iterations <= 10 {
                 tokio::task::yield_now().await;
             } else if cwnd_wait_iterations <= 100 {
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                time_source.sleep(Duration::from_micros(100)).await;
             } else {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                time_source.sleep(Duration::from_millis(1)).await;
             }
         }
 
@@ -140,7 +141,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                 packet_size,
                 "Rate limiting stream transmission"
             );
-            tokio::time::sleep(wait_time).await;
+            time_source.sleep(wait_time).await;
         }
 
         // Zero-copy fragmentation using Bytes::slice()
@@ -167,18 +168,19 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                 fragment_number: next_fragment_number,
                 payload: fragment,
             },
-            &sent_packet_tracker,
+            sent_packet_tracker.as_ref(),
         )
         .await
         {
             // Emit transfer failed telemetry event
             let bytes_sent = (sent_so_far * MAX_DATA_SIZE) as u64;
+            let elapsed = time_source.now().saturating_sub(start_time);
             emit_transfer_failed(
                 stream_id.0 as u64,
                 destination_addr,
                 bytes_sent.min(bytes_to_send),
                 e.to_string(),
-                start_time.elapsed().as_millis() as u64,
+                elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
             return Err(e);
@@ -193,7 +195,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
 
     // Gather LEDBAT stats for telemetry
     let ledbat_stats = ledbat.stats();
-    let elapsed = start_time.elapsed();
+    let elapsed = time_source.now().saturating_sub(start_time);
 
     tracing::debug!(
         stream_id = %stream_id.0,
@@ -240,7 +242,6 @@ pub(super) async fn send_stream<S: super::super::Socket>(
 mod tests {
     use aes_gcm::KeyInit;
     use std::net::Ipv4Addr;
-    use std::time::Instant;
     use tests::packet_data::MAX_PACKET_SIZE;
     use tracing::debug;
 
@@ -248,6 +249,7 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
+    use crate::simulation::RealTime;
     use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
     use crate::transport::packet_data::PacketData;
@@ -301,12 +303,21 @@ mod tests {
             let key = rand::random::<[u8; 16]>();
             Aes128Gcm::new(&key.into())
         };
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+
+        // Use real time for integration testing
+        let time_source = RealTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
 
         // Initialize LEDBAT and TokenBucket for test
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
-        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 10_000_000));
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
 
         let background_task = tokio::spawn(send_stream(
             StreamId::next(),
@@ -318,6 +329,7 @@ mod tests {
             sent_tracker,
             token_bucket,
             ledbat,
+            time_source,
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
@@ -346,7 +358,6 @@ mod tests {
         let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let last_packet_id = Arc::new(AtomicU32::new(0));
         let stream_id = StreamId::next();
 
@@ -356,19 +367,26 @@ mod tests {
         // Set bandwidth limit to 100KB/s (100,000 bytes/second)
         let bandwidth_limit = 100_000;
 
+        // Use real time for integration testing with bandwidth limiting
+        let time_source = RealTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+
         // Initialize LEDBAT and TokenBucket for test
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         // Use small burst capacity (1KB) to ensure rate limiting is observable
         let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
-        let token_bucket = Arc::new(TokenBucket::new(
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             1_000, // 1KB burst - ensures rate limiting kicks in
             bandwidth_limit,
+            time_source.clone(),
         ));
 
         // Expected: 100KB/s with token bucket rate limiting
         // Should throttle appropriately
 
-        let start_time = Instant::now();
+        let start_time = std::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
@@ -408,6 +426,7 @@ mod tests {
             sent_tracker.clone(),
             token_bucket,
             ledbat,
+            time_source,
         ));
 
         // Wait for send task to complete
@@ -446,22 +465,28 @@ mod tests {
         let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let last_packet_id = Arc::new(AtomicU32::new(0));
         let stream_id = StreamId::next();
 
         // Create a large message (10KB)
         let message = vec![0u8; 10_000];
 
+        // Use real time for integration testing without bandwidth limiting
+        let time_source = RealTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+
         // Initialize LEDBAT and TokenBucket with very high rate (effectively unlimited)
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
-        let token_bucket = Arc::new(TokenBucket::new(
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             100_000,       // 100 KB burst capacity
             1_000_000_000, // 1 GB/s rate (effectively unlimited)
+            time_source.clone(),
         ));
 
-        let start_time = Instant::now();
+        let start_time = std::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
@@ -487,6 +512,7 @@ mod tests {
             sent_tracker.clone(),
             token_bucket,
             ledbat,
+            time_source,
         ));
 
         // Wait for send task to complete
