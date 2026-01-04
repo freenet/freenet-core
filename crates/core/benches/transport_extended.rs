@@ -23,18 +23,16 @@ use std::time::Duration;
 mod transport;
 
 use dashmap::DashMap;
-use transport::common::{create_peer_pair_with_delay, new_channels, Channels};
-use transport::mock_transport::{create_mock_peer, PacketDropPolicy};
+use freenet::transport::mock_transport::{create_mock_peer, Channels, PacketDropPolicy};
+use transport::common::{create_peer_pair_with_delay, new_channels};
 
 // Import existing benchmarks
 use transport::allocation_overhead::*;
-use transport::blackbox::*;
 use transport::ledbat_validation::*;
 use transport::level0::*;
 use transport::level1::*;
 use transport::slow_start::*;
 use transport::streaming::*;
-use transport::streaming_buffer::*;
 
 // =============================================================================
 // Extended Benchmark Groups - Resilience Testing
@@ -134,11 +132,12 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                                 .await
                                 .unwrap();
 
-                        // Connect
-                        let (conn_a, conn_b) = tokio::join!(
+                        // Connect (two-level await pattern)
+                        let (conn_a_inner, conn_b_inner) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
-                            peer_b.connect(peer_a_pub, peer_a_addr)
+                            peer_b.connect(peer_a_pub, peer_a_addr),
                         );
+                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
                         let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
                         // Measured transfer with packet loss
