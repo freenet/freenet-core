@@ -100,11 +100,6 @@ pub struct TestConfig {
     #[arg(long)]
     print_network_stats: bool,
 
-    /// Run with deterministic scheduling using Turmoil.
-    /// Turmoil is always available for deterministic simulation.
-    #[arg(long)]
-    pub deterministic: bool,
-
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -192,10 +187,9 @@ pub enum TestMode {
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
-    // Handle deterministic mode with Turmoil
-    if base_config.deterministic {
-        return run_deterministic_simulation(&base_config);
-    }
+    // Note: SingleProcess mode is handled in main.rs before tokio runtime is created
+    // (Turmoil creates its own runtime for deterministic simulation)
+    // This function only handles Network mode now.
 
     let disable_metrics = base_config.disable_metrics || {
         match &base_config.command {
@@ -342,7 +336,6 @@ mod tests {
             min_success_rate: None,
             print_summary: false,
             print_network_stats: false,
-            deterministic: false,
             command: TestMode::SingleProcess,
         })
         .await
@@ -381,7 +374,6 @@ mod tests {
             min_success_rate: None,
             print_summary: false,
             print_network_stats: false,
-            deterministic: false,
             command: TestMode::SingleProcess,
         };
         assert!(config.build_fault_config().is_none());

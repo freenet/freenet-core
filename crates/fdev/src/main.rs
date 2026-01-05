@@ -41,10 +41,10 @@ fn main() -> anyhow::Result<()> {
         freenet::config::set_logger(None, None);
     }
 
-    // Handle deterministic test mode before creating tokio runtime
-    // (Turmoil creates its own runtime internally)
+    // Handle SingleProcess test mode before creating tokio runtime
+    // (Turmoil creates its own runtime internally for deterministic simulation)
     if let SubCommand::Test(ref test_config) = config.sub_command {
-        if test_config.deterministic {
+        if matches!(test_config.command, testing::TestMode::SingleProcess) {
             return testing::run_deterministic_test(test_config);
         }
     }
