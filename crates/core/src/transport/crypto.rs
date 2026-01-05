@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
+use crate::config::GlobalRng;
+
 /// Size of X25519 public key
 pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
 
@@ -88,8 +90,10 @@ impl Default for TransportKeypair {
 
 impl TransportKeypair {
     pub fn new() -> Self {
-        // Generate random bytes for the secret key
-        let secret_bytes: [u8; 32] = rand::random();
+        // Generate random bytes for the secret key using GlobalRng
+        // This allows deterministic key generation in simulation mode
+        let mut secret_bytes = [0u8; 32];
+        GlobalRng::fill_bytes(&mut secret_bytes);
         let secret = StaticSecret::from(secret_bytes);
         let public = PublicKey::from(&secret);
         TransportKeypair {
@@ -122,8 +126,9 @@ impl TransportPublicKey {
     /// 3. Use shared_secret as ChaCha20Poly1305 key with zero nonce (safe because key is unique per message)
     /// 4. Return packet_type || ephemeral_public || AEAD_encrypt(data)
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
-        // Generate ephemeral keypair using random bytes
-        let ephemeral_bytes: [u8; 32] = rand::random();
+        // Generate ephemeral keypair using GlobalRng for deterministic simulation
+        let mut ephemeral_bytes = [0u8; 32];
+        GlobalRng::fill_bytes(&mut ephemeral_bytes);
         let ephemeral_secret = StaticSecret::from(ephemeral_bytes);
         let ephemeral_public = PublicKey::from(&ephemeral_secret);
 

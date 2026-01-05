@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{GlobalExecutor, PCK_VERSION};
+use crate::config::{GlobalExecutor, GlobalRng, PCK_VERSION};
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::symmetric_message::OutboundConnection;
@@ -228,7 +228,9 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
         GlobalExecutor::spawn(RANDOM_U64.scope(
             {
-                let mut rng = StdRng::seed_from_u64(rand::random());
+                // Use GlobalRng for deterministic simulation
+                let seed = GlobalRng::random_u64();
+                let mut rng = StdRng::seed_from_u64(seed);
                 rng.random()
             },
             transport.listen(),
@@ -1285,7 +1287,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let start_time_nanos = time_source.now_nanos();
             let overall_deadline = Duration::from_secs(3);
 
-            let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
+            // Generate symmetric key using GlobalRng for deterministic simulation
+            let mut inbound_sym_key_bytes = [0u8; 16];
+            GlobalRng::fill_bytes(&mut inbound_sym_key_bytes);
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
 
             let mut outbound_sym_key: Option<Aes128Gcm> = None;

@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::time::Duration;
 
 use super::packet_data::MAX_DATA_SIZE;
+use crate::config::GlobalRng;
 use crate::simulation::{RealTime, TimeSource};
 
 /// Maximum segment size (actual packet data capacity)
@@ -818,8 +819,9 @@ impl<T: TimeSource> LedbatController<T> {
 
         // Apply ±20% jitter to ssthresh to prevent synchronization
         let ssthresh = if config.randomize_ssthresh {
-            // Use proper RNG for better entropy distribution
-            let jitter_pct = 0.8 + (rand::random::<u8>() % 40) as f64 / 100.0; // 0.8 to 1.2 (±20%)
+            // Use GlobalRng for deterministic simulation
+            let random_byte = GlobalRng::random_range(0u8..40);
+            let jitter_pct = 0.8 + (random_byte as f64) / 100.0; // 0.8 to 1.2 (±20%)
             ((config.ssthresh as f64) * jitter_pct) as usize
         } else {
             config.ssthresh

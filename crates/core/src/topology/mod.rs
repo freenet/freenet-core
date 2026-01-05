@@ -776,9 +776,10 @@ mod tests {
     /// Generates a random location that is close to the current peer location with a small
     /// world distribution.
     fn random_location(this_peer_location: &Location) -> Location {
+        use crate::config::GlobalRng;
         tracing::debug!("Generating random location");
         let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.001));
-        let location_f64 = if rand::random() {
+        let location_f64 = if GlobalRng::random_bool(0.5) {
             this_peer_location.as_f64() - distance.as_f64()
         } else {
             this_peer_location.as_f64() + distance.as_f64()
