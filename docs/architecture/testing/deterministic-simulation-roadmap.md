@@ -2,56 +2,62 @@
 
 This document analyzes what it would take to make Freenet's simulation tests fully deterministic.
 
-## Current State (January 2025)
+## Current State (January 2026)
 
 SimNetwork achieves **~95% determinism** through:
-- ✅ Seeded RNG for all random decisions
-- ✅ VirtualTime abstraction for time control (with MadSim delegation)
-- ✅ In-memory transport (no real network I/O)
+- ✅ **GlobalRng** for all random decisions (seeded, deterministic)
+- ✅ **VirtualTime** with explicit time control (`sim.advance_time()`)
+- ✅ **TimeSource trait** injected into components (replaces direct `tokio::time::`)
+- ✅ In-memory transport via `SimulationSocket` (no real network I/O)
 - ✅ MockStateStorage (no disk I/O)
 - ✅ Fault injection with deterministic drop decisions
 - ✅ **GlobalExecutor::spawn** - All tokio::spawn calls migrated
-- ✅ **Single-threaded tests** - All SimNetwork tests use `current_thread, start_paused = true`
-- ✅ **MadSim configuration** - Ready for deterministic runtime when enabled
+- ✅ **Single-threaded tests** - All SimNetwork tests use `current_thread` runtime
+- ✅ **No start_paused dependency** - Tests use explicit VirtualTime advancement
 
 ### Recent Progress
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1: Single-threaded tokio | ✅ Complete | Tests use `current_thread, start_paused = true` |
-| Phase 3: GlobalExecutor migration | ✅ Complete | All tokio::spawn → GlobalExecutor::spawn |
-| Phase 3: MadSim configuration | ✅ Complete | Cargo.toml configured for MadSim |
-| Phase 3: VirtualTime MadSim delegation | ✅ Complete | VirtualTime delegates to MadSim when enabled |
+| Phase 1: VirtualTime integration | ✅ Complete | All simulation tests use VirtualTime explicitly |
+| Phase 2: GlobalRng migration | ✅ Complete | `rand::random()` → `GlobalRng` in production code |
+| Phase 3: TimeSource injection | ✅ Complete | Components use `TimeSource` trait, not `tokio::time` |
+| Phase 4: start_paused removal | ✅ Complete | Tests use `sim.advance_time()` + `yield_now()` pattern |
 
-### Remaining Gaps
+### Remaining Gap: Async Scheduling Non-Determinism
 
-**Full determinism still blocked by** (when not using MadSim):
+**Full determinism still blocked by:**
+- ⚠️ **Async task scheduling** - Tokio's scheduler doesn't guarantee ordering
 - ⚠️ Channel message ordering (partially mitigated by single-threaded)
 - ⚠️ `select!` macro branch selection (use `biased` where possible)
 
+**Why this matters for linearizability:**
+To prove linearizability of operations, we need:
+1. Deterministic event ordering (same seed → same execution trace)
+2. Ability to replay exact sequences for formal verification
+3. Control over "happens-before" relationships between events
+
+Without a deterministic scheduler, same-seed runs may produce different interleavings, making it impossible to formally verify consistency properties.
+
 ## Sources of Non-Determinism
 
-### 1. Tokio Task Scheduling (CRITICAL)
+### 1. Tokio Task Scheduling (CRITICAL - REMAINING ISSUE)
 
-**Problem:** Multi-threaded tokio uses work-stealing scheduler where task execution order is non-deterministic.
+**Problem:** Even with single-threaded tokio, task execution order when multiple futures are ready is not guaranteed.
 
-**Locations:**
-- `testing_impl.rs:1196,1219,1237,1297` - `tokio::time::sleep()` calls
-- `testing_impl/in_memory.rs:74,89,121,212,231,262` - `GlobalExecutor::spawn()` calls
+**Impact:** Same seed can produce different event orderings across runs when multiple async tasks are ready to execute simultaneously.
 
-**Impact:** Same seed can produce different event orderings across runs.
+**Solution Required:** Deterministic scheduler (MadSim or custom executor) that guarantees FIFO ordering of ready tasks.
 
-### 2. Real Wall-Clock Time (HIGH)
+### 2. Real Wall-Clock Time (MOSTLY RESOLVED)
 
-**Problem:** 257+ `tokio::time::` calls and 129+ `Instant::now()` calls use real time.
+**Previous Problem:** 257+ `tokio::time::` calls and 129+ `Instant::now()` calls used real time.
 
-**Major Areas:**
-| Area | Files | Calls | Impact |
-|------|-------|-------|--------|
-| Transport/LEDBAT | 7 files | 155+ | Congestion control timing |
-| Contract Executor | 2 files | 36+ | Operation timeouts |
-| Ring/Topology | 2 files | 22+ | Peer discovery intervals |
-| Client Events | 4 files | 45+ | Streaming timeouts |
+**Current Status:**
+- ✅ Simulation tests use `VirtualTime` via `sim.advance_time()`
+- ✅ Transport layer uses `TimeSource` trait (injected)
+- ✅ LEDBAT congestion control uses `TimeSource`
+- ⚠️ Some production code still uses `tokio::time::` (acceptable - only matters in simulation)
 
 ### 3. Channel Message Ordering (MEDIUM)
 
@@ -121,29 +127,35 @@ pub trait TimeSource: Send + Sync + 'static {
 
 ## Approaches to Full Determinism
 
-### Option A: Single-Threaded Tokio (Low Effort, Partial Determinism)
+### Option A: Explicit VirtualTime Control (CURRENT APPROACH - COMPLETE)
 
 **Configuration:**
 ```rust
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn deterministic_test() {
-    // Time only advances when we say
-    tokio::time::advance(Duration::from_millis(100)).await;
+    let mut sim = SimNetwork::new(...).await;
+
+    // Advance time explicitly using VirtualTime
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;  // Let tasks process
+    }
 }
 ```
 
 **What it solves:**
-- ✅ Eliminates thread scheduling randomness
-- ✅ Allows controlled time progression
-- ✅ Tasks run sequentially
+- ✅ Eliminates thread scheduling randomness (single-threaded)
+- ✅ Explicit time control via VirtualTime
+- ✅ Deterministic RNG via GlobalRng
+- ✅ Deterministic network via SimulationSocket
 
 **What remains non-deterministic:**
-- ❌ Message delivery order (channel races)
-- ❌ Task wake-up order (multiple futures ready)
+- ❌ Task wake-up order when multiple futures are ready
+- ❌ Channel message ordering (sender races)
 - ❌ Select! branch selection
 
-**Effort:** 1-2 days
-**Determinism achieved:** ~70-80%
+**Status:** ✅ Complete
+**Determinism achieved:** ~90%
 
 ### Option B: Full VirtualTime Integration (Medium Effort, Good Determinism)
 
@@ -373,79 +385,117 @@ impl DeterministicRuntime {
 
 ## Recommended Roadmap
 
-### Phase 1: Quick Wins (1-2 weeks)
+### Phase 1-4: COMPLETE ✅
 
-| Task | Effort | Impact |
-|------|--------|--------|
-| Switch SimNetwork tests to `current_thread` | 1 day | Eliminate thread scheduling |
-| Add `start_paused = true` to test macro | 1 day | Control time progression |
-| Document determinism limits | 1 day | Set expectations |
+The following phases have been completed:
 
-**Configuration:**
+| Phase | Status | What Was Done |
+|-------|--------|---------------|
+| Phase 1: Single-threaded runtime | ✅ Complete | All tests use `current_thread` |
+| Phase 2: VirtualTime integration | ✅ Complete | `sim.advance_time()` replaces `tokio::time::sleep()` |
+| Phase 3: GlobalRng migration | ✅ Complete | `rand::random()` → `GlobalRng` in production code |
+| Phase 4: TimeSource injection | ✅ Complete | Transport/LEDBAT use `TimeSource` trait |
+
+**Current Pattern:**
 ```rust
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_with_better_determinism() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_with_deterministic_time() {
     let mut sim = SimNetwork::new(..., SEED).await;
 
-    // Advance time in controlled steps
+    // Start network
+    let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
+
+    // Advance time in controlled steps using VirtualTime
     for _ in 0..100 {
-        tokio::time::advance(Duration::from_millis(10)).await;
+        sim.advance_time(Duration::from_millis(10));
+        tokio::task::yield_now().await;
     }
 
     sim.assert_convergence(...).await;
 }
 ```
 
-### Phase 2: VirtualTime Integration (3-4 weeks)
+### Phase 5: Deterministic Scheduler (NEXT - Required for Linearizability)
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Implement VirtualInterval | 2-3 days | simulation/time.rs |
-| Inject TimeSource into transport | 5-7 days | 7 transport files |
-| Replace ring/topology intervals | 3-5 days | 2 ring files |
-| Replace executor timeouts | 2-3 days | 2 contract files |
-| Integration tests | 3-5 days | New test files |
+**The remaining gap:** Async task scheduling is still non-deterministic. When multiple futures are ready simultaneously, tokio doesn't guarantee execution order.
 
-### Phase 3: GlobalExecutor Canonicalization + MadSim (Recommended, 1-2 weeks)
+**Why this matters:**
+- Cannot prove linearizability without deterministic event ordering
+- Same seed may produce different interleavings
+- Formal verification requires exact replay capability
 
-**This is the recommended approach** - achieves ~95% determinism with primarily mechanical changes.
+**Solution Options:**
+
+| Option | Effort | Determinism | Notes |
+|--------|--------|-------------|-------|
+| MadSim integration | 1-2 weeks | ~99% | Drop-in tokio replacement, used by RisingWave |
+| Custom executor | 4-6 weeks | ~99%+ | FoundationDB-style, full control |
+| Accept current state | 0 | ~90% | Sufficient for most testing, not for formal verification |
+
+**Option A: MadSim Integration**
+
+MadSim provides deterministic scheduling but requires package substitution (`--cfg madsim`).
+
+**Challenge**: axum uses tokio features that madsim-tokio doesn't support, blocking global tokio replacement.
+
+**Workaround Options**:
+1. **Separate simulation crate** - Compile simulation tests in a crate without axum dependency
+2. **Feature isolation** - Use feature flags to exclude axum from simulation builds
+
+**Option B: Custom Deterministic Scheduler (Recommended)**
+
+Build a lightweight FIFO scheduler on top of existing `GlobalExecutor`:
+
+```rust
+pub struct DeterministicScheduler {
+    ready_queue: VecDeque<Box<dyn Future<Output = ()>>>,
+    virtual_time: VirtualTime,
+}
+
+impl DeterministicScheduler {
+    /// Execute tasks in FIFO order
+    pub fn step(&mut self) -> bool {
+        if let Some(task) = self.ready_queue.pop_front() {
+            // Poll task once
+            // If pending, re-queue at back (or based on wakeup)
+            true
+        } else {
+            false
+        }
+    }
+}
+```
+
+**Advantages**:
+- No external dependencies (no MadSim/axum conflict)
+- Full control over task ordering
+- Integrates with existing `VirtualTime` and `GlobalRng`
+- Works within current `GlobalExecutor` abstraction
+
+### Phase 6: Linearizability Verification (Future)
+
+Once Phase 5 is complete, we can add:
 
 | Task | Effort | Notes |
 |------|--------|-------|
-| Migrate transport spawns to GlobalExecutor | 2-3 days | 62 calls in 10 files |
-| Migrate client_events spawns | 1 day | 15 calls in 4 files |
-| Migrate node/bridge spawns | 1-2 days | 24 calls in 6 files |
-| Migrate remaining spawns | 1.5 days | 18 calls in 11 files |
-| Add MadSim Cargo configuration | 0.5 day | Cargo.toml changes |
-| Validation with seeded tests | 1-2 days | Verify reproducibility |
-
-**Why MadSim over alternatives:**
-- Drop-in tokio replacement (no API changes needed)
-- Used in production by RisingWave
-- Package substitution via Cargo (no code changes after spawn migration)
-- Patches getrandom/quanta for full determinism
-
-### Phase 4: Full Determinism (Optional, 4-6 weeks)
-
-Only if Phase 3 insufficient:
-
-| Task | Effort | Notes |
-|------|--------|-------|
-| Custom deterministic executor | 4-6 weeks | FoundationDB-style |
-| Deterministic channel shims | 1-2 weeks | Replace tokio::sync |
-| Full replay infrastructure | 1 week | Recording + playback |
+| Jepsen-style history recording | 2-3 weeks | Record all operations with timestamps |
+| Linearizability checker (Knossos-style) | 3-4 weeks | Verify histories are linearizable |
+| Invariant DSL | 2-3 weeks | Express and check system invariants |
+| Property-based testing integration | 1-2 weeks | Automatic shrinking of failing cases |
 
 ---
 
 ## Current vs Target Determinism
 
-| Aspect | Current | Phase 1 | Phase 2 | Phase 3 (MadSim) | Phase 4 |
-|--------|---------|---------|---------|------------------|---------|
-| Task scheduling | ❌ Multi-thread | ✅ Single-thread | ✅ Single-thread | ✅ MadSim executor | ✅ Custom executor |
-| Time control | ⚠️ Partial | ✅ Paused | ✅ VirtualTime | ✅ MadSim time | ✅ VirtualTime |
-| Message order | ❌ Random | ⚠️ Better | ✅ Scheduled | ✅ MadSim channels | ✅ Deterministic |
-| RNG | ✅ Seeded | ✅ Seeded | ✅ Seeded | ✅ Patched getrandom | ✅ Seeded |
-| **Reproducibility** | ~40% | ~70% | ~90% | ~95% | ~99% |
+| Aspect | Current State (Jan 2026) | With MadSim | With Custom Executor |
+|--------|--------------------------|-------------|----------------------|
+| Task scheduling | ⚠️ Single-thread (non-deterministic wake order) | ✅ Deterministic FIFO | ✅ Deterministic FIFO |
+| Time control | ✅ VirtualTime (`sim.advance_time()`) | ✅ MadSim time | ✅ VirtualTime |
+| Message order | ⚠️ Partially deterministic | ✅ Fully deterministic | ✅ Fully deterministic |
+| RNG | ✅ GlobalRng (seeded) | ✅ Patched getrandom | ✅ GlobalRng |
+| Network I/O | ✅ SimulationSocket (in-memory) | ✅ MadSim network | ✅ In-memory |
+| **Reproducibility** | ~90% | ~99% | ~99%+ |
+| **Linearizability proof** | ❌ Not possible | ✅ Possible | ✅ Possible |
 
 ---
 
@@ -584,20 +634,29 @@ vt.advance(Duration::from_secs(1));
 
 ### Test Annotations
 
-All simulation tests use single-threaded tokio for better determinism:
+All simulation tests use single-threaded tokio with explicit VirtualTime control:
 
 ```rust
-// This is the standard test annotation for simulation tests
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+// Standard test annotation (no start_paused - we use VirtualTime explicitly)
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn my_simulation_test() {
-    // Test code here
+    let mut sim = SimNetwork::new(..., SEED).await;
+
+    // Start the network
+    let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
+
+    // Advance time explicitly using VirtualTime
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 }
 ```
 
 When compiled with MadSim:
 - `tokio::test` is intercepted by MadSim
-- Time starts paused and only advances when idle
-- Task scheduling is deterministic
+- Task scheduling becomes deterministic (FIFO ordering)
+- VirtualTime integrates with MadSim's time control
 
 ### Reproducing Failures
 
