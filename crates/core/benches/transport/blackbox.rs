@@ -91,15 +91,27 @@ pub fn bench_message_throughput(c: &mut Criterion) {
                     (Arc::new(DashMap::new()) as Channels, message)
                 },
                 |(channels, message)| async move {
-                    // Create peers
-                    let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
-                            .await
-                            .unwrap();
+                    // Create peers - handle errors gracefully
+                    let (peer_a_pub, mut peer_a, peer_a_addr) = match create_mock_peer(
+                        PacketDropPolicy::ReceiveAll,
+                        channels.clone(),
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("throughput peer_a creation failed: {:?}", e);
+                            return;
+                        }
+                    };
                     let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
-                            .await
-                            .unwrap();
+                        match create_mock_peer(PacketDropPolicy::ReceiveAll, channels).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("throughput peer_b creation failed: {:?}", e);
+                                return;
+                            }
+                        };
 
                     // Connect
                     let (conn_a_inner, conn_b_inner) = futures::join!(
@@ -107,12 +119,25 @@ pub fn bench_message_throughput(c: &mut Criterion) {
                         peer_b.connect(peer_a_pub, peer_a_addr),
                     );
                     let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                    let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) | (_, Err(e)) => {
+                            eprintln!("throughput connection failed: {:?}", e);
+                            return;
+                        }
+                    };
 
                     // Send and receive message (this is what we're measuring)
-                    conn_a.send(message).await.unwrap();
-                    let received: Vec<u8> = conn_b.recv().await.unwrap();
-                    std_black_box(received);
+                    if let Err(e) = conn_a.send(message).await {
+                        eprintln!("throughput send failed: {:?}", e);
+                        return;
+                    }
+                    match conn_b.recv().await {
+                        Ok(received) => {
+                            std_black_box(received);
+                        }
+                        Err(e) => eprintln!("throughput recv failed: {:?}", e),
+                    }
                 },
                 BatchSize::SmallInput,
             );

@@ -127,9 +127,16 @@ ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
 regex = "1"
 
-# CI-optimized benchmark suite (~8 min, deterministic)
+# CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
 name = "transport_ci"
+harness = false
+required-features = ["bench"]
+
+# Extended benchmark suite (~30-45 min, nightly)
+# Includes high-latency paths, packet loss, large transfers, and micro-benchmarks
+[[bench]]
+name = "transport_extended"
 harness = false
 required-features = ["bench"]
 

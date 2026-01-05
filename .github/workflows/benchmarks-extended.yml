@@ -32,8 +32,8 @@ jobs:
     name: Extended Benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 60  # Extended benchmarks take longer
-    # Don't fail workflow if regressions detected
-    continue-on-error: true
+    # Job will fail on severe regressions (>25%) for nightly/main builds
+    # PRs only get informational comments, not failures
 
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -120,7 +120,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run extended benchmark suite
-          cargo bench --bench transport_extended --features bench 2>&1 | tee bench_output.txt || true
+          # Use --color=never to avoid ANSI escape codes in output that break markdown
+          cargo bench --bench transport_extended --features bench --color=never 2>&1 | tee bench_output.txt || true
 
       # Parse results with structured script
       - name: Parse Benchmark Results
@@ -128,10 +129,25 @@ jobs:
         run: |
           python3 --version
 
-          if python3 scripts/parse_bench_output.py bench_output.txt > parsed_output.txt 2>&1; then
+          # Run parser - captures exit code
+          # Exit codes: 0=ok, 1=regressions, 2=severe regressions
+          set +e
+          python3 scripts/parse_bench_output.py bench_output.txt > parsed_output.txt 2>&1
+          PARSE_EXIT=$?
+          set -e
+
+          if [ $PARSE_EXIT -eq 0 ]; then
             echo "regression_detected=false" >> $GITHUB_OUTPUT
-          else
+            echo "severe_regression=false" >> $GITHUB_OUTPUT
+          elif [ $PARSE_EXIT -eq 1 ]; then
             echo "regression_detected=true" >> $GITHUB_OUTPUT
+            echo "severe_regression=false" >> $GITHUB_OUTPUT
+          elif [ $PARSE_EXIT -eq 2 ]; then
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+            echo "severe_regression=true" >> $GITHUB_OUTPUT
+          else
+            echo "regression_detected=false" >> $GITHUB_OUTPUT
+            echo "severe_regression=false" >> $GITHUB_OUTPUT
           fi
 
           # Append parsed results
@@ -139,7 +155,8 @@ jobs:
           cat bench_summary.md >> $GITHUB_STEP_SUMMARY 2>/dev/null || {
             echo "⚠️ Failed to parse results" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -100 bench_output.txt >> $GITHUB_STEP_SUMMARY
+            # Strip ANSI escape codes for clean markdown output
+            tail -100 bench_output.txt | sed 's/\x1b\[[0-9;]*m//g' >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           }
 
@@ -211,7 +228,20 @@ jobs:
             target/criterion/**/report/index.html
           retention-days: 90  # Keep extended results longer
 
-  # Summary job that always succeeds
+      # Fail nightly/main builds on severe throughput regressions (>25%)
+      # PRs only get informational comments, not failures
+      - name: Fail on Severe Regressions
+        if: steps.parse_results.outputs.severe_regression == 'true' && github.event_name != 'pull_request'
+        run: |
+          echo "🚨 SEVERE THROUGHPUT REGRESSION DETECTED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "One or more throughput benchmarks regressed by more than 25%." >> $GITHUB_STEP_SUMMARY
+          echo "This indicates a significant performance problem that should be investigated." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See the benchmark results above for details." >> $GITHUB_STEP_SUMMARY
+          exit 1
+
+  # Summary job - reports status but doesn't block PRs
   benchmark-summary:
     name: Extended Benchmark Summary
     runs-on: ubuntu-latest
@@ -223,7 +253,12 @@ jobs:
       - name: Check Status
         run: |
           if [ "${{ needs.extended-benchmark.result }}" == "failure" ]; then
-            echo "⚠️ Extended benchmarks detected regressions (non-blocking)"
+            if [ "${{ github.event_name }}" == "pull_request" ]; then
+              echo "⚠️ Extended benchmarks detected regressions (informational, not blocking PR)"
+            else
+              echo "🚨 Extended benchmarks failed - severe throughput regression detected (>25%)"
+              echo "This indicates a significant performance problem that should be investigated."
+            fi
           elif [ "${{ needs.extended-benchmark.result }}" == "cancelled" ]; then
             echo "⚠️ Extended benchmarks were cancelled"
           else

@@ -6,7 +6,7 @@
 //! Run with: `cargo bench --bench transport_ci`
 //!
 //! This subset includes:
-//! - warm_throughput: Sustained bulk transfer (what you care about!)
+//! - warm_throughput: Sustained bulk transfer with LEDBAT warmup
 //! - connection_setup: Cold-start connection establishment
 //! - streaming_buffer: Lock-free buffer operations (critical path)
 //!
@@ -24,22 +24,36 @@ mod transport;
 
 // Import benchmark functions
 use transport::blackbox::*;
-use transport::slow_start::bench_warm_connection_throughput;
+use transport::slow_start::{bench_cold_start_throughput, bench_warm_connection_throughput};
 use transport::streaming_buffer::*;
 
 // =============================================================================
 // CI Benchmark Groups - Streamlined for What Matters
 // =============================================================================
 
-// Warm connection throughput - measures sustained bulk transfer performance
+// Cold-start throughput - measures connection establishment + transfer
 //
-// This is the PRIMARY metric for max theoretical throughput.
-// Measures MB/s over warm connection with realistic transfer sizes.
+// Each iteration: connect → measured transfer
+// This captures realistic first-message latency and throughput.
+criterion_group!(
+    name = cold_throughput_ci;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(20))
+        .noise_threshold(0.20)  // 20% - realistic for async on shared runners
+        .significance_level(0.05);
+    targets = bench_cold_start_throughput
+);
+
+// Warm connection throughput - measures sustained transfer after LEDBAT warmup
+//
+// Each iteration: connect → warmup (3 transfers) → measured transfer
+// This measures realistic sustained throughput with warmed LEDBAT state.
 criterion_group!(
     name = warm_throughput_ci;
     config = Criterion::default()
-        .warm_up_time(Duration::from_secs(3))
-        .measurement_time(Duration::from_secs(15))  // Longer for stability
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(30))  // Increased for warmup overhead
         .noise_threshold(0.20)  // 20% - realistic for async on shared runners
         .significance_level(0.05);
     targets = bench_warm_connection_throughput
@@ -52,7 +66,7 @@ criterion_group!(
     name = connection_setup_ci;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(10))
+        .measurement_time(Duration::from_secs(15))
         .noise_threshold(0.15)  // 15% - connection setup has async variance
         .significance_level(0.05);
     targets = bench_connection_establishment
@@ -78,16 +92,13 @@ criterion_group!(
 // Main entry point - streamlined CI suite
 //
 // Focus on what matters:
-// 1. Sustained throughput (what users care about)
-// 2. Connection setup (user experience)
-// 3. Critical path components (streaming buffer)
-//
-// Removed from CI (moved to transport_extended):
-// - Micro-benchmarks (allocation, crypto, serialization)
-// - Component tests (channels, packet creation)
-// These don't correlate with real-world throughput
+// 1. Cold-start throughput (connection + first transfer)
+// 2. Warm connection throughput (sustained transfer after LEDBAT warmup)
+// 3. Connection setup (user experience)
+// 4. Critical path components (streaming buffer)
 criterion_main!(
-    warm_throughput_ci,  // PRIMARY: sustained bulk transfer
+    cold_throughput_ci,  // PRIMARY: cold connection + transfer throughput
+    warm_throughput_ci,  // PRIMARY: warmed connection sustained throughput
     connection_setup_ci, // Cold-start matters for UX
     streaming_buffer_ci, // Critical path component
 );

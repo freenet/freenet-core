@@ -58,13 +58,16 @@ pub struct PeerPair {
     pub peer_b_pub: TransportPublicKey,
     pub peer_b: OutboundConnectionHandler<MockSocket>,
     pub peer_b_addr: SocketAddr,
+    /// Keep channels alive - dropping this closes MockSocket inbound channels
+    #[allow(dead_code)]
+    channels: Channels,
 }
 
 /// Connected peer pair ready for data transfer
 ///
-/// Encapsulates both connections and their peer handlers. The peer handlers
-/// MUST be kept alive - dropping them closes the `inbound_packet_sender`
-/// channel which causes `ConnectionClosed` errors.
+/// Encapsulates both connections and their peer handlers. The channels map
+/// MUST be kept alive - dropping it closes the MockSocket inbound channels
+/// which causes the listener tasks to exit and `ConnectionClosed` errors.
 ///
 /// ## Example
 ///
@@ -76,12 +79,15 @@ pub struct PeerPair {
 pub struct ConnectedPeerPair {
     pub conn_a: PeerConnection<MockSocket>,
     pub conn_b: PeerConnection<MockSocket>,
-    /// Must keep peer_a alive - it holds the inbound_packet_sender channel
+    /// Must keep peer_a alive for send_queue channel
     #[allow(dead_code)]
     peer_a: OutboundConnectionHandler<MockSocket>,
-    /// Must keep peer_b alive - it holds the inbound_packet_sender channel
+    /// Must keep peer_b alive for send_queue channel
     #[allow(dead_code)]
     peer_b: OutboundConnectionHandler<MockSocket>,
+    /// Keep channels alive - dropping this closes MockSocket inbound channels
+    #[allow(dead_code)]
+    channels: Channels,
 }
 
 impl PeerPair {
@@ -102,6 +108,7 @@ impl PeerPair {
             conn_b,
             peer_a: self.peer_a,
             peer_b: self.peer_b,
+            channels: self.channels,
         }
     }
 }
@@ -112,18 +119,32 @@ impl ConnectedPeerPair {
     /// Performs `iterations` send/receive cycles to allow LEDBAT congestion
     /// control to reach steady state before measurements begin.
     ///
+    /// Returns the number of successful warmup iterations. If warmup fails
+    /// early, benchmarks can still proceed (the connection may be less stable).
+    ///
     /// ## Example
     ///
     /// ```rust,ignore
     /// let mut peers = create_connected_peers().await;
-    /// peers.warmup(5, 65536).await; // 5 x 64KB warmup transfers
+    /// let completed = peers.warmup(5, 65536).await; // 5 x 64KB warmup transfers
     /// ```
-    pub async fn warmup(&mut self, iterations: usize, message_size: usize) {
-        for _ in 0..iterations {
+    pub async fn warmup(&mut self, iterations: usize, message_size: usize) -> usize {
+        let mut completed = 0;
+        for i in 0..iterations {
             let msg = vec![0xABu8; message_size];
-            self.conn_a.send(msg).await.expect("warmup send");
-            let _: Vec<u8> = self.conn_b.recv().await.expect("warmup recv");
+            if let Err(e) = self.conn_a.send(msg).await {
+                eprintln!("Warmup send {} failed: {:?}", i, e);
+                break;
+            }
+            match self.conn_b.recv().await {
+                Ok(_) => completed += 1,
+                Err(e) => {
+                    eprintln!("Warmup recv {} failed: {:?}", i, e);
+                    break;
+                }
+            }
         }
+        completed
     }
 
     /// Get mutable references to both connections
@@ -147,7 +168,7 @@ pub async fn create_peer_pair(channels: Channels) -> PeerPair {
             .expect("create peer A");
 
     let (peer_b_pub, peer_b, peer_b_addr) =
-        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+        create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
             .await
             .expect("create peer B");
 
@@ -158,6 +179,7 @@ pub async fn create_peer_pair(channels: Channels) -> PeerPair {
         peer_b_pub,
         peer_b,
         peer_b_addr,
+        channels,
     }
 }
 
@@ -174,7 +196,7 @@ pub async fn create_peer_pair_with_delay(channels: Channels, delay: Duration) ->
     let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_delay(
         PacketDropPolicy::ReceiveAll,
         PacketDelayPolicy::Fixed(delay),
-        channels,
+        channels.clone(),
     )
     .await
     .expect("create peer B");
@@ -186,6 +208,7 @@ pub async fn create_peer_pair_with_delay(channels: Channels, delay: Duration) ->
         peer_b_pub,
         peer_b,
         peer_b_addr,
+        channels,
     }
 }
 
