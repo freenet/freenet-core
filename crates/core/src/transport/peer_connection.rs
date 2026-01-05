@@ -1580,12 +1580,27 @@ mod tests {
             .collect();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-        // Initialize LEDBAT and TokenBucket for test
-        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
-        let token_bucket = Arc::new(TokenBucket::new(10_000, 10_000_000));
-        let time_source = crate::simulation::RealTime::new();
+        // Initialize with VirtualTime for deterministic testing
+        // Token bucket has enough capacity (10KB) for 1KB message without sleeping
+        let time_source = crate::simulation::VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let ledbat = Arc::new(LedbatController::new_with_time_source(
+            crate::transport::ledbat::LedbatConfig {
+                initial_cwnd: 2928,
+                min_cwnd: 2928,
+                max_cwnd: 1_000_000_000,
+                ..Default::default()
+            },
+            time_source.clone(),
+        ));
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
