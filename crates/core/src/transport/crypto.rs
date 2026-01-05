@@ -115,6 +115,18 @@ impl TransportKeypair {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TransportPublicKey(PublicKey);
 
+impl PartialOrd for TransportPublicKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TransportPublicKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
 impl TransportPublicKey {
     /// Encrypt data using static-ephemeral X25519 key exchange.
     ///

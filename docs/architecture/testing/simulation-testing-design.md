@@ -430,44 +430,53 @@ async fn test_node_crash_recovery() {
 
 ### ⚠️ Known Non-Determinism Issues
 
-**Status:** Strict determinism tests FAIL - same seed produces different event counts.
+**Status:** Strict determinism tests FAIL due to tokio task scheduling non-determinism.
 
-A strict determinism test (`test_strict_determinism_exact_event_equality`) revealed that the
-simulation is NOT fully deterministic. Example failure: Run 1 produced 44 events, Run 2 produced
-50 events with identical seed 0xDE7E_2A1E_1234.
+#### Fixes Applied (January 2026)
 
-#### Root Causes Identified (January 2026)
+| Issue | Fix Applied | Status |
+|-------|-------------|--------|
+| HashMap in SocketRegistry | Changed to BTreeMap | ✅ Fixed |
+| try_lock + spawn pattern | Replaced with std::sync::Mutex | ✅ Fixed |
+| Same-deadline message ordering | Added sort by (deadline, source, target) | ✅ Fixed |
+| Connections HashMap in P2pConnManager | Changed to BTreeMap | ✅ Fixed |
+| TransportPublicKey missing Ord | Added Ord implementation | ✅ Fixed |
 
-| Issue | Location | Impact |
-|-------|----------|--------|
-| **HashMap in SocketRegistry** | `transport/in_memory_socket.rs:229` | Non-deterministic iteration order |
-| **try_lock + spawn pattern** | `transport/in_memory_socket.rs:245-256` | Race conditions in packet delivery |
-| **Same-deadline message ordering** | `network_bridge/in_memory.rs:144-168` | Undefined order for concurrent messages |
-| **Concurrent event logging** | `tracing/mod.rs:3550-3675` | DashMap + async mutex don't guarantee order |
-| **Fault injection not wired** | `in_memory_socket.rs:152-159` | Callbacks defined but never called |
+#### Remaining Issue: Tokio Task Scheduling
 
-#### Required Fixes
+The fundamental blocker is that SimNetwork tests run on `tokio::test(current_thread)`, which
+does NOT provide deterministic task scheduling. When multiple async tasks are ready to run,
+tokio picks one based on internal state that varies between runs.
 
-1. Replace `HashMap<SocketAddr, ...>` with `BTreeMap` in SocketRegistry
-2. Remove `try_lock()` + spawn pattern - use deterministic queue or always await
-3. Sort messages by (deadline, source, target) before delivery when deadlines tie
-4. Serialize event logging through single-threaded sink
-5. Wire up `set_packet_delivery_callback()` in P2pConnManager
+**Impact:** Event sequence differs at random points (index 10, 33, etc.) between runs.
 
-### 🔮 Future Enhancements (After Determinism Fixes)
+**Solution Required:** Complete the Turmoil integration. The `turmoil_runner.rs` module exists
+but is currently a placeholder that doesn't run actual Freenet nodes inside Turmoil hosts.
 
-Once determinism issues are resolved, these become possible:
+### 🔮 Future Work: Complete Turmoil Integration
 
-1. **Linearizability checker** - Jepsen/Knossos-style verification
-2. **Property-based testing** - Automatic shrinking with reproducible failures
-3. **Invariant checking DSL** - Declarative assertions on system properties
+To achieve full determinism:
+
+1. **Update turmoil_runner.rs** to run real Freenet nodes:
+   - Create NodeConfig for each Turmoil host
+   - Call `run_node_with_shared_storage()` inside each host
+   - Use Turmoil's `sim.run()` to drive execution
+
+2. **Alternative: Custom deterministic executor**
+   - Control exactly when each task is polled
+   - Require explicit `yield_now()` at deterministic points
+
+Once Turmoil integration is complete, these become possible:
+- Linearizability checker (Jepsen/Knossos-style verification)
+- Property-based testing with automatic shrinking
+- Invariant checking DSL for declarative assertions
 
 ### Implementation Notes
 
-SimNetwork works seamlessly with Turmoil:
-- Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
-- Uses `SimulationSocket` for P2P transport
-- Calls `run_node_with_shared_storage()` which skips `HttpGateway`
-- Turmoil is always enabled as a dependency for deterministic scheduling
+SimNetwork uses:
+- `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- `SimulationSocket` for P2P transport
+- `run_node_with_shared_storage()` which skips `HttpGateway`
+- Plain tokio runtime (NOT Turmoil scheduler - this is the problem)
 
 See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for detailed implementation history.

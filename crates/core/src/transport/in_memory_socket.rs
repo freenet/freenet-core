@@ -23,14 +23,12 @@ use crate::config::GlobalExecutor;
 
 use dashmap::DashMap;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     io,
     net::SocketAddr,
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
-
-use tokio::sync::Mutex;
 
 use super::Socket;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
@@ -193,9 +191,13 @@ struct ReceivedPacket {
 }
 
 /// Per-socket inbox for received packets.
+///
+/// Uses std::sync::Mutex instead of tokio::sync::Mutex for deterministic behavior.
+/// The push/pop operations are very fast (just VecDeque operations), so blocking
+/// is acceptable and eliminates the non-deterministic try_lock + spawn pattern.
 struct SocketInbox {
-    /// Queue of received packets
-    packets: VecDeque<ReceivedPacket>,
+    /// Queue of received packets (protected by std Mutex for deterministic locking)
+    packets: std::sync::Mutex<VecDeque<ReceivedPacket>>,
     /// Notifier for when packets arrive
     notify: Arc<tokio::sync::Notify>,
 }
@@ -203,18 +205,23 @@ struct SocketInbox {
 impl SocketInbox {
     fn new() -> Self {
         Self {
-            packets: VecDeque::new(),
+            packets: std::sync::Mutex::new(VecDeque::new()),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    fn push(&mut self, data: Vec<u8>, from: SocketAddr) {
-        self.packets.push_back(ReceivedPacket { data, from });
+    /// Push a packet to the inbox. Uses blocking lock for deterministic ordering.
+    fn push(&self, data: Vec<u8>, from: SocketAddr) {
+        self.packets
+            .lock()
+            .unwrap()
+            .push_back(ReceivedPacket { data, from });
         self.notify.notify_one();
     }
 
-    fn pop(&mut self) -> Option<ReceivedPacket> {
-        self.packets.pop_front()
+    /// Pop a packet from the inbox. Uses blocking lock for deterministic ordering.
+    fn pop(&self) -> Option<ReceivedPacket> {
+        self.packets.lock().unwrap().pop_front()
     }
 
     fn notifier(&self) -> Arc<tokio::sync::Notify> {
@@ -223,15 +230,19 @@ impl SocketInbox {
 }
 
 /// Registry for sockets within a single network.
+///
+/// Uses BTreeMap instead of HashMap to ensure deterministic iteration order
+/// for reproducible simulation tests. SocketAddr implements Ord, making it
+/// suitable as a BTreeMap key.
 #[derive(Default)]
 struct SocketRegistry {
-    /// Maps socket address to inbox
-    sockets: HashMap<SocketAddr, Arc<Mutex<SocketInbox>>>,
+    /// Maps socket address to inbox (BTreeMap for deterministic ordering)
+    sockets: BTreeMap<SocketAddr, Arc<SocketInbox>>,
 }
 
 impl SocketRegistry {
-    fn register(&mut self, addr: SocketAddr) -> Arc<Mutex<SocketInbox>> {
-        let inbox = Arc::new(Mutex::new(SocketInbox::new()));
+    fn register(&mut self, addr: SocketAddr) -> Arc<SocketInbox> {
+        let inbox = Arc::new(SocketInbox::new());
         self.sockets.insert(addr, inbox.clone());
         inbox
     }
@@ -240,20 +251,15 @@ impl SocketRegistry {
         self.sockets.remove(addr);
     }
 
+    /// Deliver a packet to a target socket.
+    ///
+    /// Uses blocking lock internally for deterministic ordering - no async spawning
+    /// that could introduce non-determinism.
     fn deliver_packet(&self, target: SocketAddr, data: Vec<u8>, from: SocketAddr) -> bool {
         if let Some(inbox) = self.sockets.get(&target) {
-            // Use try_lock to avoid blocking - if we can't get the lock, spawn a task
-            if let Ok(mut guard) = inbox.try_lock() {
-                guard.push(data, from);
-                true
-            } else {
-                // Inbox is locked, spawn delivery task
-                let inbox = inbox.clone();
-                GlobalExecutor::spawn(async move {
-                    inbox.lock().await.push(data, from);
-                });
-                true
-            }
+            // Deterministic: uses std::sync::Mutex internally, no spawning
+            inbox.push(data, from);
+            true
         } else {
             tracing::trace!(target = %target, "No socket registered at target address");
             false
@@ -356,8 +362,8 @@ pub struct InMemorySocket<T: TimeSource = RealTime> {
     network_name: String,
     /// This socket's bound address
     addr: SocketAddr,
-    /// Inbox for received packets
-    inbox: Arc<Mutex<SocketInbox>>,
+    /// Inbox for received packets (uses internal std::sync::Mutex for determinism)
+    inbox: Arc<SocketInbox>,
     /// Notifier for packet arrival
     notify: Arc<tokio::sync::Notify>,
     /// Time source for sleep operations
@@ -387,7 +393,7 @@ impl<T: TimeSource> InMemorySocket<T> {
 
         let registry = get_or_create_registry(&network_name);
         let inbox = registry.write().unwrap().register(addr);
-        let notify = inbox.lock().await.notifier();
+        let notify = inbox.notifier();
 
         tracing::debug!(network = %network_name, addr = %addr, "InMemorySocket bound");
 
@@ -401,16 +407,15 @@ impl<T: TimeSource> InMemorySocket<T> {
     }
 
     /// Receive data from the socket.
+    ///
+    /// Uses blocking std::sync::Mutex internally for deterministic behavior.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
-            // Try to get a packet from inbox
-            {
-                let mut inbox = self.inbox.lock().await;
-                if let Some(packet) = inbox.pop() {
-                    let len = packet.data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&packet.data[..len]);
-                    return Ok((len, packet.from));
-                }
+            // Try to get a packet from inbox (blocking lock for determinism)
+            if let Some(packet) = self.inbox.pop() {
+                let len = packet.data.len().min(buf.len());
+                buf[..len].copy_from_slice(&packet.data[..len]);
+                return Ok((len, packet.from));
             }
 
             // Wait for notification of new packet

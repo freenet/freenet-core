@@ -23,20 +23,29 @@ use std::time::Duration;
 ///
 /// If this test fails, it indicates non-determinism in the simulation.
 ///
-/// # Current Status: FAILING
+/// # Current Status: FAILING (Partially Fixed)
 ///
-/// As of January 2026, this test FAILS - proving the simulation is NOT fully deterministic.
-/// Example failure: Run 1 had 44 events, Run 2 had 50 events with identical seed.
+/// ## Fixes Applied (January 2026):
+/// - SocketRegistry: HashMap → BTreeMap for deterministic iteration
+/// - InMemorySocket: Removed try_lock + spawn pattern, using std::sync::Mutex
+/// - FaultInjectorState: Messages sorted by (deadline, source, target) before delivery
+/// - P2pConnManager: connections and addr_by_pub_key now use BTreeMap
+/// - TransportPublicKey: Added Ord implementation for BTreeMap compatibility
 ///
-/// This is ignored until the root cause is identified and fixed. Potential sources:
-/// - HashMap iteration order (even with deterministic keys)
-/// - Async task scheduling not fully controlled by VirtualTime
-/// - Channel message ordering
-/// - Turmoil not intercepting all tokio primitives
+/// ## Remaining Issue:
+/// The test still fails because SimNetwork runs on plain `tokio::test(current_thread)`,
+/// which does NOT provide deterministic task scheduling. When multiple tasks are ready,
+/// tokio picks one based on internal state that varies between runs.
 ///
-/// TODO: Investigate and fix non-determinism source. This is a P1 issue for
-/// reproducible bug testing. See: https://github.com/freenet/freenet-core/issues/1611
-#[ignore = "Non-determinism detected - see test doc comment for details"]
+/// True determinism requires using Turmoil's deterministic scheduler. The turmoil_runner
+/// module exists but is currently a placeholder that doesn't run real Freenet nodes.
+///
+/// ## To achieve full determinism:
+/// 1. Complete the Turmoil integration to run actual Freenet nodes inside Turmoil hosts
+/// 2. Or use a custom deterministic executor that controls task execution order
+///
+/// See: docs/architecture/testing/simulation-testing-design.md for details
+#[ignore = "Tokio task scheduling is non-deterministic - requires Turmoil integration"]
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_strict_determinism_exact_event_equality() {
     const SEED: u64 = 0xDE7E_2A1E_1234;
