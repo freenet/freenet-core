@@ -2052,8 +2052,13 @@ impl SimNetwork {
 
         // Set up deterministic RNG and time for reproducible simulation
         GlobalRng::set_seed(seed);
-        // Use a fixed base time (2024-01-01 00:00:00 UTC) for deterministic ULID generation
-        GlobalSimulationTime::set_time_ms(1704067200000);
+
+        // Derive simulation epoch from seed for deterministic ULID generation
+        // Base: 2020-01-01 00:00:00 UTC, Range: ~5 years (keeps dates sensible: 2020-2025)
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
 
         // Build Turmoil simulation
         let mut sim = turmoil::Builder::new()
