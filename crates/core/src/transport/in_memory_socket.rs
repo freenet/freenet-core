@@ -544,6 +544,23 @@ impl<T: TimeSource> Drop for InMemorySocket<T> {
 /// You don't need to create it directly.
 pub struct SimulationSocket(InMemorySocket<VirtualTime>);
 
+impl SimulationSocket {
+    /// Bind to the given address (public wrapper for tests)
+    pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        <Self as Socket>::bind(addr).await
+    }
+
+    /// Receive a packet (public wrapper for tests)
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    /// Send a packet (public wrapper for tests)
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, target).await
+    }
+}
+
 impl std::fmt::Debug for SimulationSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimulationSocket")

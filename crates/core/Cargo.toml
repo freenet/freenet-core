@@ -126,6 +126,8 @@ tokio-tungstenite = "0.27.0"
 ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
 regex = "1"
+turmoil = "0.6"
+lazy_static = "1"
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
