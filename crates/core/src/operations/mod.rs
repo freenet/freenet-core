@@ -328,6 +328,8 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
+    #[error("notification channel error: {0}")]
+    NotificationChannelError(String),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]

@@ -454,6 +454,26 @@ impl OpManager {
             .map_err(Into::into)
     }
 
+    /// Non-blocking version of notify_node_event.
+    ///
+    /// Use this when the notification is best-effort and blocking would be harmful
+    /// (e.g., in the client event handling loop where blocking would freeze all
+    /// HTTP/WebSocket processing).
+    ///
+    /// Returns Ok(()) if the message was sent, Err if the channel is full or closed.
+    pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
+        tracing::debug!(event = %msg, "try_notify_node_event: attempting to queue node event");
+        self.to_event_listener
+            .notifications_sender
+            .try_send(Either::Right(msg))
+            .map_err(|err| {
+                OpError::NotificationChannelError(format!(
+                    "Failed to send node event (channel full or closed): {}",
+                    err
+                ))
+            })
+    }
+
     /// Get all network subscription information
     /// Returns a map of contract keys to lists of subscribing peers (as PeerKeyLocations)
     pub fn get_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
