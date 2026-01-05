@@ -462,7 +462,7 @@ impl OpManager {
     ///
     /// Returns Ok(()) if the message was sent, Err if the channel is full or closed.
     pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
-        tracing::info!(event = %msg, "try_notify_node_event: attempting to queue node event");
+        tracing::debug!(event = %msg, "try_notify_node_event: attempting to queue node event");
         self.to_event_listener
             .notifications_sender
             .try_send(Either::Right(msg))

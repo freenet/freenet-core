@@ -1675,9 +1675,19 @@ async fn process_open_request(
                 if let Err(err) =
                     op_manager.try_notify_node_event(NodeEvent::ClientDisconnected { client_id })
                 {
+                    // If notification fails, clean up local subscriptions directly.
+                    // This removes the client's subscription state to prevent memory leaks.
+                    // Note: upstream prune notifications won't be sent (requires the event loop),
+                    // but local state is cleaned up and upstream peers will eventually time out
+                    // their subscription entries or clean up on their own disconnect paths.
+                    let notifications = op_manager
+                        .ring
+                        .remove_client_from_all_subscriptions(client_id);
                     tracing::warn!(
                         %client_id,
-                        "Failed to notify node of client disconnect (channel full or closed): {}",
+                        subscriptions_cleaned = notifications.len(),
+                        "Notification channel full/closed, cleaned up {} subscriptions locally (prune notifications skipped): {}",
+                        notifications.len(),
                         err
                     );
                 }
