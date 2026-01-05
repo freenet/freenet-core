@@ -43,7 +43,7 @@ pub(super) async fn contract_home(
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: Some((assigned_token, instance_id)),
+            assigned_token: Some((assigned_token.clone(), instance_id)),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -136,7 +136,7 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                match get_web_body(&path).await {
+                match get_web_body(&path, &assigned_token).await {
                     Ok(b) => b.into_response(),
                     Err(err) => {
                         tracing::error!("Failed to read webapp after unpacking: {err}");
@@ -238,8 +238,11 @@ pub(super) async fn variable_content(
         .map(|r| r.into_response())
 }
 
-#[instrument(level = "debug")]
-async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiError> {
+#[instrument(level = "debug", skip(auth_token))]
+async fn get_web_body(
+    path: &Path,
+    auth_token: &AuthToken,
+) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "get_web_body: Attempting to read index.html from path: {:?}",
         path
@@ -258,9 +261,25 @@ async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiErro
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    let body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
+    let mut body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
         error_cause: format!("{err}"),
     })?;
+
+    // Inject auth token into HTML so web apps can access it without re-fetching
+    let token_script = format!(
+        r#"<script>window.__FREENET_AUTH_TOKEN__ = "{}";</script>"#,
+        auth_token.as_str()
+    );
+    if let Some(pos) = body.find("</head>") {
+        body.insert_str(pos, &token_script);
+    } else if let Some(pos) = body.find("<body") {
+        // Fallback: insert before <body> if no </head>
+        body.insert_str(pos, &token_script);
+    } else {
+        // Last resort: prepend to document
+        body = format!("{}{}", token_script, body);
+    }
+
     Ok(Html(body))
 }
 
