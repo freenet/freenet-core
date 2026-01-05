@@ -230,6 +230,14 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<()
     res
 }
 
+/// Run a deterministic test from outside the tokio runtime.
+///
+/// Turmoil creates its own tokio runtime, so this must be called
+/// before entering the main tokio runtime.
+pub(crate) fn run_deterministic_test(config: &TestConfig) -> anyhow::Result<()> {
+    run_deterministic_simulation(config)
+}
+
 /// Run a deterministic simulation using Turmoil's scheduler.
 ///
 /// Turmoil is always available - no feature flag required.

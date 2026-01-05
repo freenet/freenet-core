@@ -2080,21 +2080,33 @@ impl SimNetwork {
                 let shared_storage = shared_storage.clone();
 
                 async move {
-                    let node = node.lock().unwrap().take()
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let user_events = user_events.lock().unwrap().take()
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let span = span.lock().unwrap().take()
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let shared_storage = shared_storage.lock().unwrap().take()
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
 
                     node.run_node_with_shared_storage(user_events, span, shared_storage)
                         .await
-                        .map_err(|e| Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )) as Box<dyn std::error::Error>)
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
                 }
             });
         }
@@ -2134,21 +2146,33 @@ impl SimNetwork {
                 let shared_storage = shared_storage.clone();
 
                 async move {
-                    let node = node.lock().unwrap().take()
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let user_events = user_events.lock().unwrap().take()
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let span = span.lock().unwrap().take()
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
-                    let shared_storage = shared_storage.lock().unwrap().take()
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
                         .expect("Turmoil host should only be called once");
 
                     node.run_node_with_shared_storage(user_events, span, shared_storage)
                         .await
-                        .map_err(|e| Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )) as Box<dyn std::error::Error>)
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
                 }
             });
         }
