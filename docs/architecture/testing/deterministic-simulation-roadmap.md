@@ -5,7 +5,8 @@ This document analyzes what it would take to make Freenet's simulation tests ful
 ## Current State (January 2026)
 
 SimNetwork achieves **~99% determinism** through:
-- ✅ **Turmoil integration** - Deterministic async task scheduling (required dependency)
+- ✅ **MadSim integration** - Deterministic async task scheduling via `--cfg madsim` (in CI nightly builds)
+- ✅ **Turmoil integration** - Deterministic simulation framework (optional, for advanced scenarios)
 - ✅ **GlobalRng** for all random decisions (seeded, deterministic)
 - ✅ **VirtualTime** with explicit time control (`sim.advance_time()`)
 - ✅ **TimeSource trait** injected into components (replaces direct `tokio::time::`)
@@ -15,6 +16,7 @@ SimNetwork achieves **~99% determinism** through:
 - ✅ **GlobalExecutor::spawn** - All tokio::spawn calls migrated
 - ✅ **Single-threaded tests** - All SimNetwork tests use `current_thread` runtime
 - ✅ **No start_paused dependency** - Tests use explicit VirtualTime advancement
+- ✅ **CI nightly runs** - simulation-nightly.yml runs with MadSim for full determinism
 
 ### Recent Progress
 
@@ -26,16 +28,22 @@ SimNetwork achieves **~99% determinism** through:
 | Phase 4: start_paused removal | ✅ Complete | Tests use `sim.advance_time()` + `yield_now()` pattern |
 | Phase 5: Turmoil integration | ✅ Complete | Deterministic scheduling via Turmoil (always enabled) |
 
-### Turmoil Integration Complete
+### MadSim Integration Complete (CI Nightly)
 
-**Turmoil provides deterministic async scheduling:**
-- ✅ All SimNetwork nodes run as Turmoil hosts
-- ✅ Test logic runs as Turmoil clients
-- ✅ Turmoil is a required dependency (not optional)
-- ✅ `SimNetwork::run_simulation()` method for deterministic tests
+**MadSim provides deterministic async scheduling:**
+- ✅ All simulation tests can run with `RUSTFLAGS="--cfg madsim"`
+- ✅ CI nightly workflow (simulation-nightly.yml) uses MadSim for full determinism
+- ✅ Both MadSim and standard modes tested for comparison
+- ✅ Package substitution approach - minimal code changes required
+- ✅ `fdev test single-process` works with MadSim
 
-**Remaining minor sources of non-determinism:**
-- ⚠️ Channel message ordering (mostly mitigated by Turmoil's scheduler)
+**Turmoil also available for advanced scenarios:**
+- ✅ `SimNetwork::run_simulation()` method for Turmoil-based deterministic tests
+- ✅ Turmoil hosts model for multi-node scenarios
+- ✅ Works alongside MadSim approach
+
+**Remaining minor sources of non-determinism (in standard mode):**
+- ⚠️ Channel message ordering (fully deterministic with MadSim)
 - ⚠️ `select!` macro branch selection (use `biased` where possible)
 
 **Why this matters for linearizability:**
@@ -208,11 +216,23 @@ let elapsed = time_source.now_nanos() - start;
 **Effort:** 3-4 weeks
 **Determinism achieved:** ~85-90%
 
-### Option C: Turmoil Integration ✅ IMPLEMENTED
+### Option C: MadSim Integration ✅ IMPLEMENTED (Primary)
+
+[MadSim](https://github.com/madsim-rs/madsim) provides deterministic simulation via package substitution.
+
+**Status:** ✅ Integrated and used in CI nightly builds
+
+**How it works:**
+- Compile with `RUSTFLAGS="--cfg madsim"` to enable deterministic mode
+- MadSim replaces tokio with madsim-tokio at the package level
+- All async operations become deterministic
+- Same seed produces identical execution traces
+
+### Option D: Turmoil Integration ✅ IMPLEMENTED (Alternative)
 
 [Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's deterministic simulation framework.
 
-**Status:** ✅ Integrated as a required dependency (not optional)
+**Status:** ✅ Integrated as an optional approach for advanced scenarios
 
 **How it works:**
 - Single-threaded execution across all "hosts"
@@ -243,94 +263,45 @@ sim.run_simulation::<rand::rngs::SmallRng, _, _>(
 
 **Determinism achieved:** ~99%
 
-### Option D: GlobalExecutor Abstraction + MadSim (Recommended)
+### Option E: GlobalExecutor Abstraction + MadSim ✅ IMPLEMENTED
 
-**Current State:**
-```
-GlobalExecutor::spawn usage:  27 calls in 10 files (18%)
-Direct tokio::spawn usage:   119 calls in 31 files (82%)
-```
+**Status:** ✅ Complete - MadSim is integrated and used in CI
 
-**Key Insight:** `GlobalExecutor::spawn` already exists as an abstraction point. By:
-1. Making it the canonical spawn method
-2. Adding a feature flag to swap implementations
-3. Using MadSim's package substitution approach
+**Implementation:**
+- MadSim dependencies added to `Cargo.toml`
+- CI nightly workflow uses `RUSTFLAGS="--cfg madsim"` for deterministic runs
+- Package substitution approach requires no code changes
+- Tests can run in both standard and MadSim modes
 
-We can achieve high determinism with incremental effort.
-
-**MadSim Approach:**
-
-[MadSim](https://github.com/madsim-rs/madsim) provides drop-in tokio replacement via Cargo:
-
+**Current Configuration:**
 ```toml
-# Normal builds use real tokio
-[dependencies]
-tokio = "1.0"
+# Workspace Cargo.toml - patches for MadSim
+[patch.crates-io]
+getrandom = { git = "https://github.com/madsim-rs/getrandom.git", rev = "e79a7ae" }
+quanta = { git = "https://github.com/madsim-rs/quanta.git", branch = "madsim" }
 
-# Simulation builds swap to madsim-tokio
-[target.'cfg(madsim)'.dependencies]
-tokio = { version = "1.0", package = "madsim-tokio" }
-
-[target.'cfg(madsim)'.patch.crates-io]
-getrandom = { git = "https://github.com/madsim-rs/getrandom.git" }
-```
-
-Run with: `RUSTFLAGS="--cfg madsim" cargo test`
-
-**Required Changes for Freenet:**
-
-1. **Canonicalize GlobalExecutor::spawn** (migrate 119 → 0 direct tokio::spawn):
-
-```rust
-// Current GlobalExecutor (just wraps tokio)
-pub struct GlobalExecutor;
-
-impl GlobalExecutor {
-    pub fn spawn<R: Send + 'static>(
-        f: impl Future<Output = R> + Send + 'static,
-    ) -> tokio::task::JoinHandle<R> {
-        tokio::runtime::Handle::current().spawn(f)
-    }
-}
-```
-
-No changes needed to GlobalExecutor itself—MadSim swaps tokio at the package level.
-
-2. **Migrate direct spawns** (119 calls across 31 files):
-
-| Category | Files | Calls | Effort |
-|----------|-------|-------|--------|
-| Transport | 10 files | 62 | 2-3 days |
-| Client Events | 4 files | 15 | 1 day |
-| Node/Bridge | 6 files | 24 | 1-2 days |
-| Operations | 4 files | 4 | 0.5 day |
-| Other | 7 files | 14 | 1 day |
-
-3. **Add madsim dependencies**:
-```toml
+# crates/core/Cargo.toml - MadSim dependencies
 [target.'cfg(madsim)'.dependencies]
 madsim = "0.2"
-tokio = { version = "1.0", package = "madsim-tokio" }
-
-[target.'cfg(madsim)'.patch.crates-io]
-getrandom = { git = "https://github.com/madsim-rs/getrandom.git" }
-quanta = { git = "https://github.com/madsim-rs/quanta.git" }
+madsim-tokio = "0.2"
 ```
 
-**Alternative: Diviner**
+**Running with MadSim:**
+```bash
+# Run simulation tests with full determinism
+RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network -- --test-threads=1
 
-[Diviner](https://github.com/xxuejie/diviner) is a FoundationDB-style executor requiring wrapper types:
+# Run fdev with MadSim
+RUSTFLAGS="--cfg madsim" cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 single-process
 
-```rust
-// Diviner requires explicit wrapper types
-use diviner::time::sleep;  // Not tokio::time::sleep
-use diviner::net::TcpListener;  // Not tokio::net::TcpListener
+# Use specific seed for reproducibility
+RUSTFLAGS="--cfg madsim" MADSIM_SEED=0xDEADBEEF cargo test -p freenet --test simulation_integration
 ```
 
-More invasive than MadSim but provides finer control.
+**CI Integration:**
+See `.github/workflows/simulation-nightly.yml` for the nightly deterministic simulation runs.
 
-**Effort:** 1-2 weeks (primarily mechanical migration)
-**Determinism achieved:** ~95%
+**Determinism achieved:** ~99% (full determinism in MadSim mode)
 
 ---
 
@@ -423,37 +394,35 @@ async fn test_with_deterministic_time() {
 
 ### Phase 5: Deterministic Scheduler ✅ COMPLETE
 
-**Status:** Turmoil has been integrated as a required dependency.
+**Status:** MadSim is integrated and used in CI nightly builds. Turmoil is also available as an alternative.
 
 **What was done:**
-- ✅ Made Turmoil a required (non-optional) dependency
-- ✅ Added `SimNetwork::run_simulation()` method wrapping nodes in Turmoil hosts
-- ✅ Test logic runs as Turmoil clients
-- ✅ Validated with POC tests in `crates/core/tests/turmoil_poc.rs`
+- ✅ MadSim integrated via package substitution (`--cfg madsim`)
+- ✅ CI nightly workflow (simulation-nightly.yml) runs with MadSim
+- ✅ Turmoil integrated as alternative approach via `SimNetwork::run_simulation()`
+- ✅ Both approaches validated with extensive test coverage
+- ✅ `fdev test` works with MadSim for deterministic single-process simulation
 
-**Determinism achieved:** ~99%
+**Determinism achieved:** ~99% (full determinism in MadSim mode)
 
-**Solution Options (Historical):**
+**Implemented Solutions:**
 
-| Option | Effort | Determinism | Notes |
-|--------|--------|-------------|-------|
-| **Turmoil integration** | 1-2 weeks | ~99% | ✅ **IMPLEMENTED** - works with SimulationSocket |
-| MadSim integration | 1-2 weeks | ~99% | Drop-in tokio replacement, used by RisingWave |
-| Custom executor | 4-6 weeks | ~99%+ | FoundationDB-style, full control |
-| Accept current state | 0 | ~90% | Sufficient for most testing, not for formal verification |
+| Option | Effort | Determinism | Status |
+|--------|--------|-------------|--------|
+| **MadSim integration** | 1-2 weeks | ~99% | ✅ **PRIMARY** - Used in CI, drop-in tokio replacement |
+| **Turmoil integration** | 1-2 weeks | ~99% | ✅ **ALTERNATIVE** - Available via `run_simulation()` |
+| Custom executor | 4-6 weeks | ~99%+ | ❌ Not needed - MadSim provides sufficient determinism |
 
-**Option A: MadSim Integration (Recommended for SimNetwork)**
+**MadSim Integration ✅ COMPLETE**
 
 MadSim provides deterministic scheduling via package substitution (`--cfg madsim`).
 
-**Key Finding**: SimNetwork does **NOT** initialize the axum web server. It uses:
-- `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
-- `SimulationSocket` for P2P transport
-- `run_node_with_shared_storage()` which bypasses `HttpGateway`
+**Implementation confirmed**: SimNetwork works perfectly with MadSim because it bypasses the web server:
+- Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- Uses `SimulationSocket` for P2P transport
+- Calls `run_node_with_shared_storage()` which bypasses `HttpGateway`
 
-The axum incompatibility only affects production node paths (`server/mod.rs:run_local_node`), not simulation tests.
-
-**This means**: MadSim can be used for SimNetwork tests without any axum workarounds.
+**Result**: No axum compatibility issues. MadSim works seamlessly with all simulation tests.
 
 **Option B: Custom Deterministic Scheduler (Alternative)**
 
@@ -485,9 +454,9 @@ impl DeterministicScheduler {
 - Integrates with existing `VirtualTime` and `GlobalRng`
 - Works within current `GlobalExecutor` abstraction
 
-**Option C: Turmoil Integration (Validated - Recommended)**
+**Turmoil Integration ✅ COMPLETE (Alternative Approach)**
 
-[Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's deterministic simulation framework. A proof-of-concept (see `crates/core/tests/turmoil_poc.rs`) has validated that:
+[Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's deterministic simulation framework. Implementation validated in `crates/core/tests/turmoil_poc.rs`:
 
 ✅ **Turmoil works with our existing infrastructure:**
 - Basic async code runs correctly inside Turmoil hosts
@@ -497,6 +466,8 @@ impl DeterministicScheduler {
 - Determinism verified: same execution order across runs
 
 **Key Advantage**: No tokio patching required. Turmoil intercepts `tokio::time` automatically.
+
+**Note**: While Turmoil is available, MadSim is the primary approach used in CI for its simplicity and broader ecosystem support.
 
 **Integration Path**:
 1. Wrap SimNetwork node startup in `sim.host()` calls
@@ -537,39 +508,36 @@ Once Phase 5 is complete, we can add:
 
 ## Current vs Target Determinism
 
-| Aspect | Current State (Jan 2026) | With MadSim | With Custom Executor |
-|--------|--------------------------|-------------|----------------------|
+| Aspect | Standard Mode (Jan 2026) | With MadSim (CI Nightly) | With Custom Executor |
+|--------|--------------------------|--------------------------|----------------------|
 | Task scheduling | ⚠️ Single-thread (non-deterministic wake order) | ✅ Deterministic FIFO | ✅ Deterministic FIFO |
-| Time control | ✅ VirtualTime (`sim.advance_time()`) | ✅ MadSim time | ✅ VirtualTime |
+| Time control | ✅ VirtualTime (`sim.advance_time()`) | ✅ MadSim time + VirtualTime | ✅ VirtualTime |
 | Message order | ⚠️ Partially deterministic | ✅ Fully deterministic | ✅ Fully deterministic |
 | RNG | ✅ GlobalRng (seeded) | ✅ Patched getrandom | ✅ GlobalRng |
-| Network I/O | ✅ SimulationSocket (in-memory) | ✅ MadSim network | ✅ In-memory |
-| **Reproducibility** | ~90% | ~99% | ~99%+ |
+| Network I/O | ✅ SimulationSocket (in-memory) | ✅ MadSim network + SimulationSocket | ✅ In-memory |
+| **Reproducibility** | ~90% | **~99% ✅ ACTIVE** | ~99%+ (not needed) |
 | **Linearizability proof** | ❌ Not possible | ✅ Possible | ✅ Possible |
+
+**Note**: MadSim mode is actively used in CI nightly builds. Standard mode is still useful for faster local iteration and comparison testing.
 
 ---
 
 ## Decision Criteria
 
-**Choose Phase 1 only if:**
-- Most test flakiness is from thread scheduling
-- Debugging doesn't require exact replay
-- Quick improvement needed
+**Historical Decision Points (All phases now complete):**
 
-**Proceed to Phase 2 if:**
-- Need to reproduce timing-sensitive bugs
-- Message delivery order matters for correctness
-- Transport layer bugs need deterministic reproduction
+~~**Choose Phase 1 only if:**~~ ✅ Complete - Single-threaded runtime
+~~**Proceed to Phase 2 if:**~~ ✅ Complete - VirtualTime integration
+~~**Proceed to Phase 3 if:**~~ ✅ Complete - GlobalRng migration
+~~**Proceed to Phase 4 if:**~~ ✅ Complete - TimeSource injection
+~~**Proceed to Phase 5 (MadSim):**~~ ✅ **COMPLETE - Active in CI**
 
-**Proceed to Phase 3 (MadSim - Recommended) if:**
-- Want ~95% determinism with minimal code changes
-- Need production-proven framework (used by RisingWave)
-- Team can invest 1-2 weeks for spawn migration
+**Current Recommendation (January 2026):**
+- **For CI and reproducible tests**: Use MadSim mode (`RUSTFLAGS="--cfg madsim"`)
+- **For local development**: Standard mode is faster, use MadSim when investigating flaky tests
+- **For advanced scenarios**: Turmoil available via `SimNetwork::run_simulation()`
 
-**Proceed to Phase 4 if:**
-- Phase 3 insufficient for bug reproduction
-- Need Jepsen-style formal verification
-- Need 99%+ reproducibility guarantee
+All infrastructure is in place. No further phases needed for deterministic simulation testing.
 
 ---
 
@@ -590,23 +558,23 @@ Once Phase 5 is complete, we can add:
 
 ---
 
-## MadSim Usage Guide
+## MadSim Usage Guide ✅ ACTIVE IN CI
 
-This section documents how to use MadSim for deterministic simulation testing.
+This section documents how to use MadSim for deterministic simulation testing. **MadSim is now the primary deterministic testing approach, actively used in CI nightly builds.**
 
 ### Quick Start
 
 Run tests with MadSim's deterministic runtime:
 
 ```bash
-# Run all simulation tests with MadSim
-RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network
+# Run all simulation tests with MadSim (same as CI nightly)
+RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network -- --test-threads=1
 
 # Run specific test
 RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network test_sim_network_basic_connectivity
 
-# Run with a specific seed for reproducibility
-RUSTFLAGS="--cfg madsim" MADSIM_SEED=12345 cargo test -p freenet --test sim_network
+# Run with a specific seed for reproducibility (same as CI default)
+RUSTFLAGS="--cfg madsim" MADSIM_SEED=0xDEADBEEF cargo test -p freenet --test sim_network
 ```
 
 ### How MadSim Works
