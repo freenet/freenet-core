@@ -428,20 +428,37 @@ async fn test_node_crash_recovery() {
 | Single-threaded tests | All tests use `current_thread` runtime |
 | **Turmoil determinism** | ✅ Always enabled - full deterministic scheduling |
 
-### ✅ Determinism Achieved
+### ⚠️ Known Non-Determinism Issues
 
-| Aspect | Implementation |
-|--------|----------------|
-| Determinism level | **~99% ✅** |
-| Async scheduling | Fully deterministic |
-| Reproducibility | Perfect - same seed → same execution |
-| Use case | All tests use Turmoil (always enabled) |
+**Status:** Strict determinism tests FAIL - same seed produces different event counts.
 
-### 🔮 Future Enhancements (Enabled by Turmoil)
+A strict determinism test (`test_strict_determinism_exact_event_equality`) revealed that the
+simulation is NOT fully deterministic. Example failure: Run 1 produced 44 events, Run 2 produced
+50 events with identical seed 0xDE7E_2A1E_1234.
 
-Now that we have full determinism, these become possible:
+#### Root Causes Identified (January 2026)
 
-1. **Linearizability checker** - Jepsen/Knossos-style verification (infrastructure ready)
+| Issue | Location | Impact |
+|-------|----------|--------|
+| **HashMap in SocketRegistry** | `transport/in_memory_socket.rs:229` | Non-deterministic iteration order |
+| **try_lock + spawn pattern** | `transport/in_memory_socket.rs:245-256` | Race conditions in packet delivery |
+| **Same-deadline message ordering** | `network_bridge/in_memory.rs:144-168` | Undefined order for concurrent messages |
+| **Concurrent event logging** | `tracing/mod.rs:3550-3675` | DashMap + async mutex don't guarantee order |
+| **Fault injection not wired** | `in_memory_socket.rs:152-159` | Callbacks defined but never called |
+
+#### Required Fixes
+
+1. Replace `HashMap<SocketAddr, ...>` with `BTreeMap` in SocketRegistry
+2. Remove `try_lock()` + spawn pattern - use deterministic queue or always await
+3. Sort messages by (deadline, source, target) before delivery when deadlines tie
+4. Serialize event logging through single-threaded sink
+5. Wire up `set_packet_delivery_callback()` in P2pConnManager
+
+### 🔮 Future Enhancements (After Determinism Fixes)
+
+Once determinism issues are resolved, these become possible:
+
+1. **Linearizability checker** - Jepsen/Knossos-style verification
 2. **Property-based testing** - Automatic shrinking with reproducible failures
 3. **Invariant checking DSL** - Declarative assertions on system properties
 
