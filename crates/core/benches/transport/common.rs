@@ -18,10 +18,12 @@
 //! peers.warmup(5, 1024).await; // 5 warmup transfers of 1KB each
 //! ```
 
+use criterion::measurement::{Measurement, ValueFormatter};
 use dashmap::DashMap;
+use freenet::simulation::{RealTime, TimeSource, VirtualTime};
 use freenet::transport::mock_transport::{
-    create_mock_peer, create_mock_peer_with_delay, Channels, MockSocket, PacketDelayPolicy,
-    PacketDropPolicy,
+    create_mock_peer, create_mock_peer_with_delay, create_mock_peer_with_virtual_time, Channels,
+    MockSocket, PacketDelayPolicy, PacketDropPolicy,
 };
 use freenet::transport::{OutboundConnectionHandler, PeerConnection, TransportPublicKey};
 use std::net::SocketAddr;
@@ -51,12 +53,15 @@ pub fn create_benchmark_runtime() -> tokio::runtime::Runtime {
 ///
 /// Created by `create_peer_pair()` functions. Call `.connect()` to establish
 /// bidirectional connections and get a `ConnectedPeerPair`.
-pub struct PeerPair {
+///
+/// Generic over `TS: TimeSource` to support both RealTime (wall-clock) and
+/// VirtualTime (instant simulation) timing modes.
+pub struct PeerPair<TS: TimeSource = RealTime> {
     pub peer_a_pub: TransportPublicKey,
-    pub peer_a: OutboundConnectionHandler<MockSocket>,
+    pub peer_a: OutboundConnectionHandler<MockSocket, TS>,
     pub peer_a_addr: SocketAddr,
     pub peer_b_pub: TransportPublicKey,
-    pub peer_b: OutboundConnectionHandler<MockSocket>,
+    pub peer_b: OutboundConnectionHandler<MockSocket, TS>,
     pub peer_b_addr: SocketAddr,
     /// Keep channels alive - dropping this closes MockSocket inbound channels
     #[allow(dead_code)]
@@ -69,6 +74,9 @@ pub struct PeerPair {
 /// MUST be kept alive - dropping it closes the MockSocket inbound channels
 /// which causes the listener tasks to exit and `ConnectionClosed` errors.
 ///
+/// Generic over `TS: TimeSource` to support both RealTime (wall-clock) and
+/// VirtualTime (instant simulation) timing modes.
+///
 /// ## Example
 ///
 /// ```rust,ignore
@@ -76,26 +84,26 @@ pub struct PeerPair {
 /// conn_a.send(message).await.unwrap();
 /// let received: Vec<u8> = conn_b.recv().await.unwrap();
 /// ```
-pub struct ConnectedPeerPair {
-    pub conn_a: PeerConnection<MockSocket>,
-    pub conn_b: PeerConnection<MockSocket>,
+pub struct ConnectedPeerPair<TS: TimeSource = RealTime> {
+    pub conn_a: PeerConnection<MockSocket, TS>,
+    pub conn_b: PeerConnection<MockSocket, TS>,
     /// Must keep peer_a alive for send_queue channel
     #[allow(dead_code)]
-    peer_a: OutboundConnectionHandler<MockSocket>,
+    peer_a: OutboundConnectionHandler<MockSocket, TS>,
     /// Must keep peer_b alive for send_queue channel
     #[allow(dead_code)]
-    peer_b: OutboundConnectionHandler<MockSocket>,
+    peer_b: OutboundConnectionHandler<MockSocket, TS>,
     /// Keep channels alive - dropping this closes MockSocket inbound channels
     #[allow(dead_code)]
     channels: Channels,
 }
 
-impl PeerPair {
+impl<TS: TimeSource> PeerPair<TS> {
     /// Establish bidirectional connections between peers
     ///
     /// This performs the connection handshake and returns a `ConnectedPeerPair`
     /// ready for data transfer.
-    pub async fn connect(mut self) -> ConnectedPeerPair {
+    pub async fn connect(mut self) -> ConnectedPeerPair<TS> {
         let (conn_a_inner, conn_b_inner) = futures::join!(
             self.peer_a.connect(self.peer_b_pub, self.peer_b_addr),
             self.peer_b.connect(self.peer_a_pub, self.peer_a_addr),
@@ -113,7 +121,7 @@ impl PeerPair {
     }
 }
 
-impl ConnectedPeerPair {
+impl<TS: TimeSource> ConnectedPeerPair<TS> {
     /// Warmup the connection with N transfers to stabilize LEDBAT cwnd
     ///
     /// Performs `iterations` send/receive cycles to allow LEDBAT congestion
@@ -153,8 +161,8 @@ impl ConnectedPeerPair {
     pub fn connections_mut(
         &mut self,
     ) -> (
-        &mut PeerConnection<MockSocket>,
-        &mut PeerConnection<MockSocket>,
+        &mut PeerConnection<MockSocket, TS>,
+        &mut PeerConnection<MockSocket, TS>,
     ) {
         (&mut self.conn_a, &mut self.conn_b)
     }
@@ -250,6 +258,286 @@ pub async fn create_connected_peers_with_delay(delay: Duration) -> ConnectedPeer
 /// (e.g., for concurrent stream tests).
 pub fn new_channels() -> Channels {
     Arc::new(DashMap::new())
+}
+
+// =============================================================================
+// VirtualTime Support
+// =============================================================================
+
+/// Create a pair of mock peers with VirtualTime support for instant delay simulation.
+///
+/// When using VirtualTime, delays advance the virtual clock instead of waiting real time.
+/// This enables instant simulation of high-RTT scenarios (e.g., 300ms RTT completes in ~1ms).
+///
+/// The entire transport stack (MockSocket delays AND protocol timers) uses VirtualTime,
+/// ensuring consistent timing behavior for benchmarks.
+pub async fn create_peer_pair_with_virtual_time(
+    channels: Channels,
+    delay: Duration,
+    time_source: VirtualTime,
+) -> PeerPair<VirtualTime> {
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_virtual_time(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source.clone(),
+    )
+    .await
+    .expect("create peer A");
+
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_virtual_time(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source,
+    )
+    .await
+    .expect("create peer B");
+
+    PeerPair {
+        peer_a_pub,
+        peer_a,
+        peer_a_addr,
+        peer_b_pub,
+        peer_b,
+        peer_b_addr,
+        channels,
+    }
+}
+
+/// Create a connected peer pair with VirtualTime for instant high-RTT simulation.
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// let time_source = VirtualTime::new();
+/// let peers = create_connected_peers_with_virtual_time(
+///     Duration::from_millis(100), // Simulated 100ms RTT
+///     time_source.clone(),
+/// ).await;
+///
+/// // Transfer completes in ~1ms wall time but simulates 100ms network delay
+/// peers.conn_a.send(message).await.unwrap();
+/// let received = peers.conn_b.recv().await.unwrap();
+///
+/// // Check virtual time elapsed
+/// let elapsed = Duration::from_nanos(time_source.now_nanos());
+/// ```
+pub async fn create_connected_peers_with_virtual_time(
+    delay: Duration,
+    time_source: VirtualTime,
+) -> ConnectedPeerPair<VirtualTime> {
+    let channels: Channels = Arc::new(DashMap::new());
+    create_peer_pair_with_virtual_time(channels, delay, time_source)
+        .await
+        .connect()
+        .await
+}
+
+/// Create a pair of mock peers with VirtualTime and custom packet drop policy.
+///
+/// Useful for testing packet loss scenarios with instant execution.
+pub async fn create_peer_pair_with_virtual_time_and_loss(
+    channels: Channels,
+    delay: Duration,
+    time_source: VirtualTime,
+    drop_policy: PacketDropPolicy,
+) -> PeerPair<VirtualTime> {
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_virtual_time(
+        drop_policy.clone(),
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source.clone(),
+    )
+    .await
+    .expect("create peer A");
+
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_virtual_time(
+        drop_policy,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source,
+    )
+    .await
+    .expect("create peer B");
+
+    PeerPair {
+        peer_a_pub,
+        peer_a,
+        peer_a_addr,
+        peer_b_pub,
+        peer_b,
+        peer_b_addr,
+        channels,
+    }
+}
+
+/// Create a connected peer pair with VirtualTime and packet loss for resilience testing.
+pub async fn create_connected_peers_with_virtual_time_and_loss(
+    delay: Duration,
+    time_source: VirtualTime,
+    drop_policy: PacketDropPolicy,
+) -> ConnectedPeerPair<VirtualTime> {
+    let channels: Channels = Arc::new(DashMap::new());
+    create_peer_pair_with_virtual_time_and_loss(channels, delay, time_source, drop_policy)
+        .await
+        .connect()
+        .await
+}
+
+// =============================================================================
+// VirtualTime Criterion Measurement
+// =============================================================================
+
+/// Custom Criterion measurement using VirtualTime.
+///
+/// Captures virtual time instead of wall time, enabling instant simulation
+/// of high-latency network scenarios. Benchmarks complete in milliseconds
+/// regardless of simulated RTT, while reporting realistic throughput.
+///
+/// ## How It Works
+///
+/// 1. `start()` captures the current virtual time (nanoseconds)
+/// 2. Benchmark code runs, MockSocket advances virtual time on delays
+/// 3. `end()` returns the elapsed virtual time
+/// 4. Criterion reports throughput as `bytes / virtual_seconds`
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// let time_source = VirtualTime::new();
+/// let mut criterion = Criterion::default()
+///     .with_measurement(VirtualTimeMeasurement::new(time_source.clone()));
+///
+/// // Benchmark runs in ~1ms wall time, reports 640 KB/s for 64KB @ 100ms RTT
+/// ```
+#[derive(Clone)]
+pub struct VirtualTimeMeasurement {
+    time_source: VirtualTime,
+}
+
+impl VirtualTimeMeasurement {
+    /// Create a new VirtualTimeMeasurement with the given time source.
+    pub fn new(time_source: VirtualTime) -> Self {
+        Self { time_source }
+    }
+
+    /// Get the underlying time source for use in benchmarks.
+    pub fn time_source(&self) -> &VirtualTime {
+        &self.time_source
+    }
+}
+
+impl Measurement for VirtualTimeMeasurement {
+    type Intermediate = u64;
+    type Value = Duration;
+
+    fn start(&self) -> Self::Intermediate {
+        self.time_source.now_nanos()
+    }
+
+    fn end(&self, start: Self::Intermediate) -> Self::Value {
+        let end = self.time_source.now_nanos();
+        Duration::from_nanos(end.saturating_sub(start))
+    }
+
+    fn add(&self, v1: &Self::Value, v2: &Self::Value) -> Self::Value {
+        *v1 + *v2
+    }
+
+    fn zero(&self) -> Self::Value {
+        Duration::ZERO
+    }
+
+    fn to_f64(&self, val: &Self::Value) -> f64 {
+        val.as_nanos() as f64
+    }
+
+    fn formatter(&self) -> &dyn ValueFormatter {
+        &VirtualTimeFormatter
+    }
+}
+
+/// Formatter for VirtualTime measurements.
+///
+/// Displays values with "(virtual)" suffix to distinguish from wall-clock measurements.
+struct VirtualTimeFormatter;
+
+impl ValueFormatter for VirtualTimeFormatter {
+    fn scale_values(&self, typical_value: f64, values: &mut [f64]) -> &'static str {
+        if typical_value < 1_000.0 {
+            "ns (virtual)"
+        } else if typical_value < 1_000_000.0 {
+            for v in values.iter_mut() {
+                *v /= 1_000.0;
+            }
+            "µs (virtual)"
+        } else if typical_value < 1_000_000_000.0 {
+            for v in values.iter_mut() {
+                *v /= 1_000_000.0;
+            }
+            "ms (virtual)"
+        } else {
+            for v in values.iter_mut() {
+                *v /= 1_000_000_000.0;
+            }
+            "s (virtual)"
+        }
+    }
+
+    fn scale_throughputs(
+        &self,
+        typical_value: f64,
+        throughput: &criterion::Throughput,
+        values: &mut [f64],
+    ) -> &'static str {
+        match throughput {
+            criterion::Throughput::Bytes(bytes) => {
+                let bytes_per_ns = (*bytes as f64) / typical_value;
+                let bytes_per_sec = bytes_per_ns * 1_000_000_000.0;
+
+                if bytes_per_sec < 1024.0 {
+                    for v in values.iter_mut() {
+                        *v = (*bytes as f64) / *v * 1_000_000_000.0;
+                    }
+                    "B/s (simulated)"
+                } else if bytes_per_sec < 1024.0 * 1024.0 {
+                    for v in values.iter_mut() {
+                        *v = (*bytes as f64) / *v * 1_000_000_000.0 / 1024.0;
+                    }
+                    "KiB/s (simulated)"
+                } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
+                    for v in values.iter_mut() {
+                        *v = (*bytes as f64) / *v * 1_000_000_000.0 / (1024.0 * 1024.0);
+                    }
+                    "MiB/s (simulated)"
+                } else {
+                    for v in values.iter_mut() {
+                        *v = (*bytes as f64) / *v * 1_000_000_000.0 / (1024.0 * 1024.0 * 1024.0);
+                    }
+                    "GiB/s (simulated)"
+                }
+            }
+            criterion::Throughput::Elements(elems) => {
+                for v in values.iter_mut() {
+                    *v = (*elems as f64) / *v * 1_000_000_000.0;
+                }
+                "elem/s (simulated)"
+            }
+            // Handle other throughput types (Bits, BytesDecimal, ElementsAndBytes)
+            _ => {
+                // For other types, just report raw values
+                for v in values.iter_mut() {
+                    *v = 1.0 / *v * 1_000_000_000.0;
+                }
+                "ops/s (simulated)"
+            }
+        }
+    }
+
+    fn scale_for_machines(&self, _values: &mut [f64]) -> &'static str {
+        "ns"
+    }
 }
 
 // =============================================================================
