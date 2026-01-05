@@ -108,8 +108,6 @@ pub fn unregister_network_time_source(network_name: &str) {
 }
 
 /// Gets the VirtualTime for a network, if registered.
-/// Currently unused but reserved for future VirtualTime integration.
-#[allow(dead_code)]
 fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
     NETWORK_TIME_SOURCES.get(network_name).map(|r| r.clone())
 }
@@ -528,12 +526,12 @@ impl<T: TimeSource> Drop for InMemorySocket<T> {
 // SimulationSocket - VirtualTime-backed socket for deterministic simulation
 // =============================================================================
 
-/// A simulation socket that uses RealTime (backed by tokio::time::Instant).
+/// A simulation socket that uses VirtualTime for deterministic simulation.
 ///
-/// This socket works correctly with tokio's paused time (`start_paused = true`)
-/// because RealTime uses `tokio::time::Instant` for time tracking and
-/// `tokio::time::sleep` for delays. When tokio's time is paused, time only
-/// advances when sleep is called, providing predictable test behavior.
+/// This socket uses the network's VirtualTime instance (registered by SimNetwork)
+/// for all time operations. VirtualTime only advances when explicitly called via
+/// `VirtualTime::advance()`, providing fully deterministic test behavior independent
+/// of wall-clock time.
 ///
 /// # Test Isolation
 ///
@@ -544,7 +542,24 @@ impl<T: TimeSource> Drop for InMemorySocket<T> {
 ///
 /// SimulationSocket is used automatically by SimNetwork's in-memory node builder.
 /// You don't need to create it directly.
-pub struct SimulationSocket(InMemorySocket<RealTime>);
+pub struct SimulationSocket(InMemorySocket<VirtualTime>);
+
+impl SimulationSocket {
+    /// Bind to the given address (public wrapper for tests)
+    pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        <Self as Socket>::bind(addr).await
+    }
+
+    /// Receive a packet (public wrapper for tests)
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    /// Send a packet (public wrapper for tests)
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, target).await
+    }
+}
 
 impl std::fmt::Debug for SimulationSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -569,14 +584,26 @@ impl Socket for SimulationSocket {
             )
         })?;
 
+        // Get the VirtualTime for this network (required for simulation)
+        let virtual_time = get_network_time_source(&network_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "No VirtualTime registered for network '{}'. \
+                     SimNetwork should register VirtualTime before nodes bind sockets.",
+                    network_name
+                ),
+            )
+        })?;
+
         tracing::debug!(
             addr = %addr,
             network = %network_name,
-            "SimulationSocket binding with RealTime"
+            "SimulationSocket binding with VirtualTime"
         );
 
-        // Create the socket with RealTime (uses tokio::time::Instant)
-        let inner = InMemorySocket::bind_with_time_source(addr, RealTime::new()).await?;
+        // Create the socket with VirtualTime for deterministic simulation
+        let inner = InMemorySocket::bind_with_time_source(addr, virtual_time).await?;
         Ok(Self(inner))
     }
 

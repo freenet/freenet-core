@@ -21,10 +21,10 @@ cargo run -p fdev -- test --gateways 1 --nodes 5 --events 100 single-process
 ### Key Test Patterns
 
 ```rust
-use freenet::dev_tool::{SimNetwork, FaultConfig, TimeSource};
+use freenet::dev_tool::{SimNetwork, FaultConfig};
 use std::time::Duration;
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]  // Single-threaded for determinism
 async fn example_simulation_test() {
     const SEED: u64 = 0xDEAD_BEEF;
 
@@ -54,6 +54,12 @@ async fn example_simulation_test() {
     // Start the network
     let _handles = sim.start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10).await;
 
+    // Advance time using VirtualTime (NOT tokio::time::sleep!)
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;  // Let tasks process
+    }
+
     // Wait for connectivity
     sim.check_partial_connectivity(Duration::from_secs(30), 0.8)?;
 
@@ -62,6 +68,7 @@ async fn example_simulation_test() {
     while stream.next().await.is_some() {
         // Advance virtual time and deliver pending messages
         sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
     }
     drop(stream);  // Release borrow
 
@@ -79,10 +86,7 @@ async fn example_simulation_test() {
         sim.crash_node(&label);
         assert!(sim.is_node_crashed(&label));
 
-        // Option 1: Simple recovery (unblocks messages, but task stays aborted)
-        // sim.recover_node(&label);
-
-        // Option 2: Full restart with persisted state
+        // Full restart with persisted state
         if sim.can_restart(&label) {
             let handle = sim.restart_node::<rand::rngs::SmallRng>(&label, 0x5678, 5, 10).await;
             assert!(handle.is_some(), "Restart should succeed");
@@ -184,22 +188,28 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 | **Node crash simulation** | `crash_node()` aborts task and blocks messages |
 | **Node restart** | `restart_node()` preserves identity (keypair, address) |
 
-### ⚠️ Partially Working
+### ⚠️ Remaining Limitation
 
-| Feature | Issue | Workaround |
-|---------|-------|------------|
-| Deterministic execution | Multi-threaded Tokio causes non-determinism | Use lenient assertions (percentages) |
-| Gateway registration race | Nodes may start before gateways ready | 3-phase startup with barrier |
+| Feature | Issue | Resolution Path |
+|---------|-------|-----------------|
+| Async task ordering | Tokio doesn't guarantee wake order | MadSim or custom executor needed |
 
-### ❌ Not Yet Implemented
+### ❌ Not Yet Implemented (Blocked on Deterministic Scheduler)
 
-| Feature | Impact |
-|---------|--------|
-| Deterministic executor | Full reproducibility impossible |
-| Clock skew simulation | Can't test time-sensitive bugs |
-| Invariant checking DSL | Manual assertions only |
-| Linearizability checker | Can't prove consistency |
-| Property-based test integration | No automatic shrinking |
+| Feature | Impact | Requires |
+|---------|--------|----------|
+| Linearizability checker | Can't prove consistency | Deterministic scheduler |
+| Property-based test integration | No automatic shrinking | Deterministic scheduler |
+| Invariant checking DSL | Manual assertions only | Deterministic scheduler |
+
+### ✅ Recently Completed
+
+| Feature | Implementation |
+|---------|----------------|
+| Deterministic RNG | `GlobalRng` replaces `rand::random()` |
+| Deterministic time | `VirtualTime` via `sim.advance_time()` |
+| TimeSource injection | Transport/LEDBAT use `TimeSource` trait |
+| Clock skew simulation | Via VirtualTime per-node time offsets (if needed) |
 
 ---
 
@@ -283,34 +293,51 @@ loop {
 
 ## Implementation Roadmap
 
-### Phase 1: Better Use of Existing APIs (Current)
+### Phase 1-3: COMPLETE ✅
 
-- ✅ Refactor `event_chain` to not consume SimNetwork
-- ✅ Use `await_convergence()` instead of arbitrary sleeps
-- ✅ Add verification to fdev single-process mode
-- 🔲 Use VirtualTime in tests (infrastructure exists)
-- 🔲 Single-threaded test runtime for more determinism
+| Phase | Status | Achievements |
+|-------|--------|--------------|
+| Phase 1: API improvements | ✅ Done | `event_chain` refactored, `await_convergence()` added, fdev verification |
+| Phase 2: VirtualTime integration | ✅ Done | `sim.advance_time()`, `TimeSource` trait injection |
+| Phase 3: Deterministic RNG | ✅ Done | `GlobalRng` replaces `rand::random()` |
 
-### Phase 2: Enhanced Fault Injection
+**Current Test Pattern:**
+```rust
+#[tokio::test(flavor = "current_thread")]
+async fn example_test() {
+    let mut sim = SimNetwork::new(..., SEED).await;
+    let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
 
-- 🔲 Node crash simulation (stop processing, drop state)
-- 🔲 Node restart simulation (resume with persisted state)
-- 🔲 Slow node simulation (delayed event processing)
-- 🔲 Clock skew simulation
+    // Explicit time advancement (no tokio::time::sleep)
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
-### Phase 3: Deterministic Executor (Major Effort)
+    sim.assert_convergence(...).await;
+}
+```
 
-- 🔲 Replace `tokio::spawn` with event queue insertions
-- 🔲 Replace all timers with virtual time
-- 🔲 Single-threaded execution loop
-- 🔲 Verify: same seed → identical event sequence
+### Phase 4: Deterministic Scheduler (NEXT)
 
-### Phase 4: Invariant Framework
+Required for linearizability verification:
 
-- 🔲 State snapshot API (query contract states across all nodes)
-- 🔲 Invariant assertion DSL
-- 🔲 Linearizability checker (based on Jepsen's Knossos)
-- 🔲 Property-based test integration
+| Task | Status | Notes |
+|------|--------|-------|
+| MadSim integration | 🔲 Pending | Drop-in tokio replacement, ~99% determinism |
+| OR: Custom executor | 🔲 Alternative | FoundationDB-style, ~99%+ determinism |
+| Verify same seed → identical trace | 🔲 Pending | Blocked on scheduler |
+
+### Phase 5: Formal Verification (Future)
+
+Blocked on Phase 4 completion:
+
+| Task | Status | Notes |
+|------|--------|-------|
+| History recording | 🔲 Pending | Record operation timestamps |
+| Linearizability checker | 🔲 Pending | Knossos-style verification |
+| Invariant DSL | 🔲 Pending | Express system invariants |
+| Property-based testing | 🔲 Pending | Automatic shrinking |
 
 ---
 
@@ -384,23 +411,39 @@ async fn test_node_crash_recovery() {
 
 ---
 
-## Summary: Current Gaps
+## Summary: Current State
 
-| Gap | Impact | Effort | Status |
-|-----|--------|--------|--------|
-| Non-deterministic execution | Can't reliably reproduce all bugs | High | Open |
-| ~~No node crash/restart~~ | ~~Can't test recovery~~ | ~~Medium~~ | ✅ Done |
-| ~~VirtualTime not used in tests~~ | ~~Missing time-control benefits~~ | ~~Low~~ | ✅ Done |
-| ~~In-memory state persistence~~ | ~~Node restart uses disk~~ | ~~Medium~~ | ✅ Done |
-| No linearizability checking | Can't prove consistency | High | Open |
-| No property-based testing | Manual test case design | Medium | Open |
+### ✅ Completed
 
-The infrastructure is solid for what it tests. The main limitation is non-deterministic
-execution, which requires either accepting probabilistic assertions or implementing a
-full deterministic executor (significant effort, following FoundationDB's approach).
+| Feature | Implementation |
+|---------|----------------|
+| VirtualTime | `sim.advance_time()` - explicit time control |
+| Deterministic RNG | `GlobalRng` - seeded, deterministic in simulation |
+| TimeSource injection | Transport/LEDBAT use `TimeSource` trait |
+| Node crash/restart | `crash_node()`, `restart_node()` with state preservation |
+| In-memory state | `MockStateStorage` (Arc-backed, survives restarts) |
+| Single-threaded tests | All tests use `current_thread` runtime |
 
-**Recently Completed:**
-- VirtualTime always enabled (`virtual_time()`, `advance_time()`)
-- Node crash simulation (`crash_node()`)
-- Node restart with preserved identity and state (`restart_node()`)
-- In-memory state persistence via `MockStateStorage` (Arc-backed, survives restarts)
+### ⚠️ Remaining Gap
+
+| Gap | Impact | Resolution |
+|-----|--------|------------|
+| Non-deterministic async scheduling | Can't guarantee same execution trace | MadSim or custom executor |
+| Linearizability checking | Can't formally prove consistency | Blocked on deterministic scheduler |
+| Property-based testing | No automatic shrinking | Blocked on deterministic scheduler |
+
+### Path Forward
+
+The infrastructure achieves ~90% determinism. For full determinism (required for linearizability verification):
+
+1. **MadSim integration** (Recommended) - Drop-in tokio replacement, ~99% determinism
+2. **Custom executor** (Alternative) - FoundationDB-style, ~99%+ determinism
+
+**Key Enabler**: SimNetwork does **NOT** use axum. It bypasses the HTTP gateway entirely:
+- Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- Uses `SimulationSocket` for P2P transport
+- Calls `run_node_with_shared_storage()` which skips `HttpGateway`
+
+This means the previously-noted axum incompatibility with madsim-tokio is NOT a blocker for SimNetwork tests.
+
+See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for detailed analysis.

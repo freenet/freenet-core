@@ -79,18 +79,24 @@ SimulatedNetwork
 
 | Aspect | Mechanism |
 |--------|-----------|
-| RNG seeds | Flow from SimNetwork → peer → transport |
-| Noise mode shuffle | Based on message content hash (FNV-1a) |
+| RNG | `GlobalRng` - seeded, deterministic in simulation mode |
+| Time | `VirtualTime` - explicit advancement via `sim.advance_time()` |
+| Network | `SimulationSocket` - in-memory, uses VirtualTime |
 | Peer label assignment | Derived from master seed |
 | Contract generation | Seeded MemoryEventsGen |
+| Fault injection | Seeded RNG for drop decisions |
 
 ### What is NOT Deterministic
 
 | Aspect | Reason | Mitigation |
 |--------|--------|------------|
-| Tokio scheduling | Multi-threaded async runtime | Assert on event types, not counts |
-| Event ordering | Thread scheduling varies | Use HashSet comparisons |
-| Timing | Real time varies | VirtualTime exists but not integrated |
+| Async task ordering | Tokio doesn't guarantee wake order | Single-threaded helps but not perfect |
+| Channel message order | Multiple senders race | Use HashSet comparisons |
+| `select!` branches | Non-deterministic choice | Use `biased` where possible |
+
+### Path to Full Determinism
+
+For linearizability verification, a deterministic scheduler (MadSim or custom) is required. See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md#phase-5-deterministic-scheduler-next---required-for-linearizability) for details.
 
 ## Known Gaps
 
@@ -268,18 +274,29 @@ sim.assert_operation_success_rate(0.95).await; // Panics if < 95% success
 ### Deterministic Replay Test
 
 ```rust
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_deterministic_replay() {
     const SEED: u64 = 0x1234;
 
     // Run 1
-    let mut sim1 = SimNetwork::new("test", 1, 3, ..., SEED).await;
+    let mut sim1 = SimNetwork::new("test", 1, 3, 7, 3, 10, 2, SEED).await;
     let _handles = sim1.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
+
+    // Advance time using VirtualTime
+    for _ in 0..30 {
+        sim1.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let events1 = sim1.get_event_counts().await;
 
     // Run 2 (same seed)
-    let mut sim2 = SimNetwork::new("test", 1, 3, ..., SEED).await;
+    let mut sim2 = SimNetwork::new("test", 1, 3, 7, 3, 10, 2, SEED).await;
     let _handles = sim2.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
+
+    for _ in 0..30 {
+        sim2.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let events2 = sim2.get_event_counts().await;
 
     // Same event types should appear
@@ -291,9 +308,9 @@ async fn test_deterministic_replay() {
 ### Fault Injection Test
 
 ```rust
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_with_fault_injection() {
-    let mut sim = SimNetwork::new("fault-test", 1, 3, ..., SEED).await;
+    let mut sim = SimNetwork::new("fault-test", 1, 3, 7, 3, 10, 2, SEED).await;
 
     // Configure fault injection with message loss and latency
     sim.with_fault_injection(FaultConfig::builder()
@@ -303,21 +320,42 @@ async fn test_with_fault_injection() {
 
     let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
 
-    // VirtualTime ensures deterministic delivery timing
-    sim.advance_virtual_time();
+    // Advance VirtualTime to allow pending messages to be delivered
+    for _ in 0..50 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+
+    // Check network stats
+    if let Some(stats) = sim.get_network_stats() {
+        println!("Loss rate: {:.1}%", stats.loss_ratio() * 100.0);
+    }
 }
 ```
 
 ## Future Work
 
-1. ~~**Integrate VirtualTime**~~ - PARTIAL: VirtualTime in FaultInjectorState (Phase 2 complete)
-2. ~~**Connect SimulatedNetwork**~~ - DONE: Fault injection bridge with deterministic RNG
-3. ~~**Add StateStore query**~~ - PARTIAL: Event-based state hashes available (`get_contract_state_hashes()`)
-4. ~~**Structured EventSummary**~~ - DONE: Added typed fields
-5. ~~**Operation completion tracking**~~ - DONE: `get_operation_summary()`, `await_operation_completion()`
-6. **Single-threaded mode** - Option for `flavor = "current_thread"`
-7. **Phase 3 VirtualTime** - Replace all tokio::time with VirtualTime throughout codebase
-8. **Unify SimNetwork and SimulatedNetwork** - Run actual node code with deterministic scheduling
+### Completed ✅
+
+1. ~~**Integrate VirtualTime**~~ - ✅ DONE: VirtualTime integrated via `sim.advance_time()`
+2. ~~**Connect SimulatedNetwork**~~ - ✅ DONE: Fault injection bridge with deterministic RNG
+3. ~~**Add StateStore query**~~ - ✅ DONE: Event-based state hashes via `get_contract_state_hashes()`
+4. ~~**Structured EventSummary**~~ - ✅ DONE: Added typed fields
+5. ~~**Operation completion tracking**~~ - ✅ DONE: `get_operation_summary()`, `await_operation_completion()`
+6. ~~**Single-threaded mode**~~ - ✅ DONE: All tests use `current_thread`
+7. ~~**VirtualTime for time control**~~ - ✅ DONE: `TimeSource` trait throughout codebase
+8. ~~**GlobalRng for randomness**~~ - ✅ DONE: `rand::random()` → `GlobalRng`
+
+### In Progress
+
+9. **Deterministic Scheduler** - For linearizability verification, need MadSim or custom executor
+   - Tokio's task ordering is still non-deterministic
+   - Required for formal verification and Jepsen-style testing
+
+### Future
+
+10. **Linearizability Checker** - Jepsen/Knossos-style operation history verification
+11. **Property-based Testing** - Integration with proptest/quickcheck with shrinking
 
 ---
 

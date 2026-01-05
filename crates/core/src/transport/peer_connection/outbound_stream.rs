@@ -45,7 +45,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     outbound_symmetric_key: Aes128Gcm,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
-    ledbat: Arc<super::super::ledbat::LedbatController>,
+    ledbat: Arc<super::super::ledbat::LedbatController<T>>,
     time_source: T,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
@@ -250,7 +250,7 @@ mod tests {
         *,
     };
     use crate::config::GlobalExecutor;
-    use crate::simulation::RealTime;
+    use crate::simulation::{RealTime, VirtualTime};
     use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
     use crate::transport::packet_data::PacketData;
@@ -305,15 +305,24 @@ mod tests {
             Aes128Gcm::new(&key.into())
         };
 
-        // Use real time for integration testing
-        let time_source = RealTime::new();
+        // Use VirtualTime for deterministic testing
+        // Token bucket has enough capacity that no sleeping is needed
+        let time_source = VirtualTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize LEDBAT and TokenBucket for test
+        // Initialize LEDBAT and TokenBucket for test with VirtualTime
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
-        let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
+        let ledbat = Arc::new(LedbatController::new_with_time_source(
+            crate::transport::ledbat::LedbatConfig {
+                initial_cwnd: 1_000_000,
+                min_cwnd: 1_000_000,
+                max_cwnd: 1_000_000_000,
+                ..Default::default()
+            },
+            time_source.clone(),
+        ));
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             1_000_000,
             10_000_000,

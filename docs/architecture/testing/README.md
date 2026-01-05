@@ -20,19 +20,31 @@ We currently use these testing paradigms:
 | Unit Testing | ✅ Mature | ~1,000 tests |
 | Integration Testing | ✅ Mature | ~80 tests |
 | Mock-based Testing | ✅ Mature | Extensive |
-| Simulation Testing | ✅ Mature | SimNetwork |
+| Simulation Testing | ✅ Mature | SimNetwork with VirtualTime |
+| Deterministic Time/RNG | ✅ Complete | `VirtualTime`, `GlobalRng` |
 | Property-based Testing | ⚠️ Limited | LEDBAT only |
 | Fuzz Testing | ⚠️ Underused | Infrastructure exists |
 
-Paradigms we should adopt (see [testing-matrix.md](testing-matrix.md#testing-paradigms-current-vs-potential) for details):
+### Deterministic Simulation Testing (DST) Status
 
-| Paradigm | Priority | Effort |
-|----------|----------|--------|
-| Mutation Testing | High | Low |
-| Contract Fuzzing | High | Low |
-| Expanded Property Testing | High | Medium |
-| Snapshot Testing | Medium | Low |
-| Deterministic Simulation | Medium | High |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| VirtualTime | ✅ Complete | `sim.advance_time()` for explicit control |
+| GlobalRng | ✅ Complete | Seeded RNG replacing `rand::random()` |
+| TimeSource injection | ✅ Complete | Transport/LEDBAT use trait |
+| Single-threaded tests | ✅ Complete | All simulation tests use `current_thread` |
+| **Deterministic scheduler** | ⚠️ Pending | Required for linearizability verification |
+
+See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for the path to full determinism.
+
+### Paradigms to Adopt
+
+| Paradigm | Priority | Effort | Blocked By |
+|----------|----------|--------|------------|
+| Deterministic Scheduler (MadSim) | High | Medium | - |
+| Linearizability Checker | High | High | Deterministic Scheduler |
+| Expanded Property Testing | Medium | Medium | Deterministic Scheduler |
+| Mutation Testing | Low | Low | - |
 
 ## Quick Reference: Which Testing Approach to Use
 

@@ -612,6 +612,82 @@ impl TimeSource for VirtualTime {
     }
 }
 
+// ============================================================================
+// TimeSourceInterval - Interval implementation for TimeSource
+// ============================================================================
+
+/// An interval timer that works with any `TimeSource`.
+///
+/// Similar to `tokio::time::Interval`, but uses the `TimeSource` abstraction
+/// for deterministic simulation support.
+///
+/// # Missed Tick Behavior
+///
+/// Uses "skip" behavior: if time advances past multiple tick deadlines,
+/// we skip to the next future deadline rather than catching up.
+pub struct TimeSourceInterval<T: TimeSource> {
+    time_source: T,
+    period_nanos: u64,
+    next_tick_nanos: u64,
+}
+
+impl<T: TimeSource> TimeSourceInterval<T> {
+    /// Creates a new interval that ticks every `period`.
+    ///
+    /// The first tick is immediate (at creation time).
+    pub fn new(time_source: T, period: Duration) -> Self {
+        let now = time_source.now_nanos();
+        let period_nanos = period.as_nanos() as u64;
+        Self {
+            time_source,
+            period_nanos,
+            // First tick is immediate - set next_tick to now so tick() returns immediately first time
+            next_tick_nanos: now,
+        }
+    }
+
+    /// Creates a new interval that starts ticking at `start` time.
+    pub fn new_at(time_source: T, start_nanos: u64, period: Duration) -> Self {
+        let period_nanos = period.as_nanos() as u64;
+        Self {
+            time_source,
+            period_nanos,
+            next_tick_nanos: start_nanos,
+        }
+    }
+
+    /// Waits for the next tick.
+    ///
+    /// If the next tick deadline has already passed, returns immediately
+    /// and schedules the next tick for the future (skip behavior).
+    pub async fn tick(&mut self) {
+        let now = self.time_source.now_nanos();
+
+        if now >= self.next_tick_nanos {
+            // Deadline has passed - skip to next future tick
+            // Calculate how many periods have elapsed and skip them
+            let elapsed = now - self.next_tick_nanos;
+            let periods_elapsed = elapsed / self.period_nanos + 1;
+            self.next_tick_nanos += periods_elapsed * self.period_nanos;
+            return;
+        }
+
+        // Wait until the deadline
+        self.time_source.sleep_until(self.next_tick_nanos).await;
+        self.next_tick_nanos += self.period_nanos;
+    }
+
+    /// Returns the period of this interval.
+    pub fn period(&self) -> Duration {
+        Duration::from_nanos(self.period_nanos)
+    }
+
+    /// Resets the interval to start ticking from now.
+    pub fn reset(&mut self) {
+        self.next_tick_nanos = self.time_source.now_nanos() + self.period_nanos;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

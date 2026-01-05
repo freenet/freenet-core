@@ -36,13 +36,22 @@ enum Error {
 }
 
 fn main() -> anyhow::Result<()> {
-    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     let config = Config::parse();
     if !config.sub_command.is_child() {
         freenet::config::set_logger(None, None);
     }
+
+    // Handle SingleProcess test mode before creating tokio runtime
+    // (Turmoil creates its own runtime internally for deterministic simulation)
+    if let SubCommand::Test(ref test_config) = config.sub_command {
+        if matches!(test_config.command, testing::TestMode::SingleProcess) {
+            return testing::run_deterministic_test(test_config);
+        }
+    }
+
+    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     tokio_rt.block_on(async move {
         let cwd = std::env::current_dir()?;
         let r = match config.sub_command {
