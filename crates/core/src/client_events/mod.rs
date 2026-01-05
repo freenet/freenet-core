@@ -1668,12 +1668,18 @@ async fn process_open_request(
                     "Received disconnect request from client, triggering subscription cleanup"
                 );
 
-                // Notify the node to clean up this client's subscriptions and trigger tree pruning
-                if let Err(err) = op_manager
-                    .notify_node_event(NodeEvent::ClientDisconnected { client_id })
-                    .await
+                // Notify the node to clean up this client's subscriptions and trigger tree pruning.
+                // Use try_notify (non-blocking) to avoid blocking the client event loop if the
+                // notification channel is full. This is critical because blocking here would
+                // freeze all HTTP/WebSocket processing. See issue #2594.
+                if let Err(err) =
+                    op_manager.try_notify_node_event(NodeEvent::ClientDisconnected { client_id })
                 {
-                    tracing::error!(%client_id, "Failed to notify node of client disconnect: {}", err);
+                    tracing::warn!(
+                        %client_id,
+                        "Failed to notify node of client disconnect (channel full or closed): {}",
+                        err
+                    );
                 }
             }
             ClientRequest::NodeQueries(query) => {
