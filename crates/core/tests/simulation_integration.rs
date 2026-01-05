@@ -20,7 +20,9 @@ use std::time::Duration;
 /// NOTE: Full determinism requires a single-threaded async runtime to control
 /// scheduling. With multi-threaded tokio, message ordering can vary slightly.
 /// This test verifies that the same types of events are captured across runs.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+///
+/// Uses VirtualTime exclusively - no start_paused or tokio::time::sleep().
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_deterministic_replay_events() {
     const SEED: u64 = 0xDEAD_BEEF_1234;
 
@@ -45,8 +47,12 @@ async fn test_deterministic_replay_events() {
             .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
             .await;
 
-        // Wait for connections to establish
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Use VirtualTime advancement instead of tokio::time::sleep
+        // Advance 30x100ms = 3 seconds of virtual time
+        for _ in 0..30 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
+        }
 
         // Capture connectivity state
         let connectivity = sim.node_connectivity();
@@ -113,7 +119,8 @@ async fn test_deterministic_replay_events() {
 }
 
 /// Verifies that different seeds produce different event sequences.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_different_seeds_produce_different_events() {
     const SEED_A: u64 = 0x1111_2222_3333;
     const SEED_B: u64 = 0x4444_5555_6666;
@@ -127,7 +134,11 @@ async fn test_different_seeds_produce_different_events() {
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
             .await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Use VirtualTime advancement instead of tokio::time::sleep
+        for _ in 0..30 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
+        }
         sim.get_deterministic_event_summary().await
     }
 
@@ -156,7 +167,8 @@ async fn test_different_seeds_produce_different_events() {
 /// Tests that simulation produces deterministic results with the same seed.
 ///
 /// VirtualTime is always enabled, making simulation fully deterministic.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_fault_injection_deterministic() {
     const SEED: u64 = 0xFA01_7777_1234;
 
@@ -168,7 +180,11 @@ async fn test_fault_injection_deterministic() {
             .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
             .await;
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Use VirtualTime advancement
+        for _ in 0..30 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
+        }
         sim.get_event_counts().await
     }
 
