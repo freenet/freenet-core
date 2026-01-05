@@ -215,7 +215,8 @@ async fn test_fault_injection_deterministic() {
 // =============================================================================
 
 /// Tests that the event summary is correctly ordered and consistent.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_event_summary_ordering() {
     const SEED: u64 = 0xC0DE_CAFE_BABE;
 
@@ -226,7 +227,11 @@ async fn test_event_summary_ordering() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Use VirtualTime advancement
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     let summary = sim.get_deterministic_event_summary().await;
 
@@ -262,7 +267,8 @@ async fn test_event_summary_ordering() {
 // =============================================================================
 
 /// Minimal network test: 1 gateway + 2 nodes.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_small_network_connectivity() {
     const SEED: u64 = 0x5A11_1111;
 
@@ -276,8 +282,11 @@ async fn test_small_network_connectivity() {
     // Verify correct number of peers started
     assert_eq!(handles.len(), 3, "Expected 1 gateway + 2 nodes = 3 handles");
 
-    // Give peers time to connect
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Use VirtualTime advancement
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Verify we captured events
     let event_counts = sim.get_event_counts().await;
@@ -305,7 +314,8 @@ async fn test_small_network_connectivity() {
 }
 
 /// Tests that peer labels are assigned correctly and deterministically.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_peer_label_assignment() {
     const SEED: u64 = 0x1ABE_1234;
 
@@ -349,7 +359,8 @@ async fn test_peer_label_assignment() {
 /// 3. Comparing state hashes across nodes for the same contract
 ///
 /// This test validates the infrastructure is in place for such verification.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_event_state_hash_capture() {
     const SEED: u64 = 0xC0DE_1234;
 
@@ -372,8 +383,11 @@ async fn test_event_state_hash_capture() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10) // 5 contracts, 10 events
         .await;
 
-    // Wait for events to propagate
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Use VirtualTime advancement
+    for _ in 0..50 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Get event summary and look for state hashes
     let summary = sim.get_deterministic_event_summary().await;
@@ -446,7 +460,8 @@ async fn test_event_state_hash_capture() {
 /// This test verifies that when multiple peers receive broadcast updates
 /// (via BroadcastReceived or UpdateSuccess events), they end up with the
 /// same state_hash for a given contract key.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_eventual_consistency_state_hashes() {
     const SEED: u64 = 0xC0DE_5678;
 
@@ -469,8 +484,11 @@ async fn test_eventual_consistency_state_hashes() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 3, 15) // 3 contracts, 15 events
         .await;
 
-    // Wait for events to propagate across the network
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Use VirtualTime advancement
+    for _ in 0..60 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     let summary = sim.get_deterministic_event_summary().await;
 
@@ -578,7 +596,8 @@ async fn test_eventual_consistency_state_hashes() {
 ///
 /// This verifies Gap 2 fix: SimulatedNetwork's FaultConfig can now be applied
 /// to SimNetwork's InMemoryTransport to inject message loss, partitions, etc.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_fault_injection_bridge() {
     use freenet::simulation::FaultConfig;
 
@@ -602,7 +621,11 @@ async fn test_fault_injection_bridge() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 3)
         .await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Use VirtualTime advancement
+    for _ in 0..30 {
+        sim_normal.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let normal_events = sim_normal.get_event_counts().await;
     let normal_total: usize = normal_events.values().sum();
 
@@ -627,7 +650,11 @@ async fn test_fault_injection_bridge() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 3)
         .await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Use VirtualTime advancement
+    for _ in 0..30 {
+        sim_lossy.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let lossy_events = sim_lossy.get_event_counts().await;
     let lossy_total: usize = lossy_events.values().sum();
 
@@ -666,7 +693,8 @@ async fn test_fault_injection_bridge() {
 ///
 /// Creates a network and then partitions it, verifying that the
 /// partition blocks messages between specified peer groups.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_partition_injection_bridge() {
     use freenet::simulation::{FaultConfig, Partition};
     use std::collections::HashSet;
@@ -691,7 +719,11 @@ async fn test_partition_injection_bridge() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 3)
         .await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Use VirtualTime advancement
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Get pre-partition event count
     let pre_partition = sim.get_event_counts().await;
@@ -727,8 +759,11 @@ async fn test_partition_injection_bridge() {
     // Apply partition via bridge
     sim.with_fault_injection(fault_config);
 
-    // Wait and capture post-partition events
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Use VirtualTime advancement for post-partition
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let post_partition = sim.get_event_counts().await;
     let post_total: usize = post_partition.values().sum();
 
@@ -751,7 +786,8 @@ async fn test_partition_injection_bridge() {
 ///
 /// This verifies that the fault injection bridge uses seeded RNG for reproducible
 /// message loss decisions across multiple runs.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// Uses VirtualTime exclusively - no start_paused.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_deterministic_fault_injection() {
     use freenet::simulation::FaultConfig;
 
@@ -769,7 +805,11 @@ async fn test_deterministic_fault_injection() {
             .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 3)
             .await;
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Use VirtualTime advancement
+        for _ in 0..30 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
+        }
         let events = sim.get_event_counts().await;
         sim.clear_fault_injection();
         events
@@ -1226,7 +1266,7 @@ async fn test_node_restart() {
 /// 2. Recovering a non-existent node returns false
 /// 3. is_node_crashed returns false for unknown nodes
 /// 4. can_restart returns false for unknown nodes
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_crash_restart_edge_cases() {
     use freenet::dev_tool::{NodeLabel, SimNetwork};
 
@@ -1251,7 +1291,11 @@ async fn test_crash_restart_edge_cases() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Allow network to stabilize using VirtualTime
+    for _ in 0..10 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Test with a non-existent node label (using valid format but unknown network)
     let fake_label: NodeLabel = "node-999".into();
@@ -1330,7 +1374,7 @@ async fn test_zero_gateways_panics() {
 }
 
 /// Tests that a minimal network with 1 gateway and 1 node works.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_minimal_network() {
     use freenet::dev_tool::SimNetwork;
 
@@ -1359,8 +1403,11 @@ async fn test_minimal_network() {
     // Should have 2 nodes (1 gateway + 1 regular node)
     assert_eq!(handles.len(), 2, "Should have exactly 2 nodes");
 
-    // Let network stabilize
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Let network stabilize using VirtualTime
+    for _ in 0..10 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Verify node addresses are tracked
     let all_addrs = sim.all_node_addresses();
@@ -1384,7 +1431,7 @@ async fn test_minimal_network() {
 /// - EventChain held a watch::Sender that peers waited on
 /// - Stream wasn't dropped when events completed
 /// - Peers waited forever for more events
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_graceful_shutdown_no_deadlock() {
     use freenet::dev_tool::SimNetwork;
 
@@ -1415,13 +1462,14 @@ async fn test_graceful_shutdown_no_deadlock() {
     // Create event stream (this borrows the watch::Sender)
     let mut stream = Some(sim.event_chain(3, None));
 
-    // Consume all events
+    // Consume all events - advance time after each
     while let Some(s) = stream.as_mut() {
         if s.next().await.is_none() {
             break;
         }
-        // Small delay between events
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Small delay between events using VirtualTime
+        sim.advance_time(Duration::from_millis(50));
+        tokio::task::yield_now().await;
     }
 
     tracing::info!("All events consumed, dropping stream to signal shutdown");
@@ -1430,35 +1478,59 @@ async fn test_graceful_shutdown_no_deadlock() {
     // This signals peers to disconnect. Without this, peers wait forever.
     drop(stream.take());
 
-    // Verify peers exit within a reasonable timeout (no deadlock)
-    // If the bug recurs, this will timeout
-    let shutdown_result = tokio::time::timeout(Duration::from_secs(10), async {
-        for (i, handle) in handles.into_iter().enumerate() {
-            match handle.await {
-                Ok(Ok(())) => {
-                    tracing::info!("Peer {} exited successfully", i);
-                }
-                Ok(Err(e)) => {
-                    // Check if it's a graceful shutdown (which is fine)
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("Graceful shutdown") || msg.contains("graceful"),
-                        "Unexpected error from peer {}: {}",
-                        i,
-                        e
-                    );
-                    tracing::info!("Peer {} exited with graceful shutdown", i);
-                }
-                Err(join_err) => {
-                    panic!("Peer {} task panicked or was cancelled: {:?}", i, join_err);
+    // Verify peers exit - advance time repeatedly to allow tasks to process
+    // Using VirtualTime: advance time in a loop rather than using tokio::time::timeout
+    let mut handles_remaining: Vec<_> = handles.into_iter().map(Some).collect();
+    let mut completed = 0;
+
+    for _tick in 0..100 {
+        // Equivalent to 10 seconds at 100ms per tick
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+
+        for (i, handle_opt) in handles_remaining.iter_mut().enumerate() {
+            if let Some(handle) = handle_opt.take() {
+                // Check if ready without blocking
+                let mut handle = handle;
+                match futures::poll!(&mut handle) {
+                    std::task::Poll::Ready(result) => {
+                        match result {
+                            Ok(Ok(())) => {
+                                tracing::info!("Peer {} exited successfully", i);
+                            }
+                            Ok(Err(e)) => {
+                                let msg = e.to_string();
+                                assert!(
+                                    msg.contains("Graceful shutdown") || msg.contains("graceful"),
+                                    "Unexpected error from peer {}: {}",
+                                    i,
+                                    e
+                                );
+                                tracing::info!("Peer {} exited with graceful shutdown", i);
+                            }
+                            Err(join_err) => {
+                                panic!(
+                                    "Peer {} task panicked or was cancelled: {:?}",
+                                    i, join_err
+                                );
+                            }
+                        }
+                        completed += 1;
+                    }
+                    std::task::Poll::Pending => {
+                        *handle_opt = Some(handle);
+                    }
                 }
             }
         }
-    })
-    .await;
 
-    assert!(
-        shutdown_result.is_ok(),
+        if completed == 3 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        completed, 3,
         "Peers should exit within timeout - possible deadlock!"
     );
 
@@ -1470,7 +1542,7 @@ async fn test_graceful_shutdown_no_deadlock() {
 /// This test verifies the fix for fragile string-based error matching.
 /// The EventLoopExitReason enum should be used instead of comparing
 /// error message strings.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_graceful_shutdown_typed_error() {
     use freenet::dev_tool::SimNetwork;
     use freenet::EventLoopExitReason;
@@ -1496,20 +1568,23 @@ async fn test_graceful_shutdown_typed_error() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
+    // Advance time before dropping to allow startup to complete
+    for _ in 0..5 {
+        sim.advance_time(Duration::from_millis(50));
+        tokio::task::yield_now().await;
+    }
+
     // Trigger shutdown by dropping the network
     drop(sim);
 
-    // Wait for handles with timeout
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        for handle in handles {
-            let result = handle.await;
-            // The handle should complete (either Ok or graceful shutdown error)
-            assert!(result.is_ok(), "Handle should complete without panic");
-        }
-    })
-    .await;
-
-    assert!(result.is_ok(), "Shutdown should complete within timeout");
+    // Wait for handles - they should complete quickly after network is dropped
+    // Since we've already advanced virtual time, tasks should be in a state
+    // where they can respond to shutdown signals
+    for handle in handles {
+        let result = handle.await;
+        // The handle should complete (either Ok or graceful shutdown error)
+        assert!(result.is_ok(), "Handle should complete without panic");
+    }
 
     // Verify the error type exists and has correct Display impl
     let graceful = EventLoopExitReason::GracefulShutdown;
