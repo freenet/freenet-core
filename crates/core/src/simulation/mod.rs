@@ -134,4 +134,4 @@ pub use rng::SimulationRng;
 pub use scheduler::{Event, EventId, EventType, Scheduler, SchedulerConfig};
 #[cfg(not(madsim))]
 pub use time::Wakeup;
-pub use time::{RealTime, TimeSource, VirtualTime, WakeupId};
+pub use time::{RealTime, TimeSource, TimeSourceInterval, VirtualTime, WakeupId};

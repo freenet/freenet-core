@@ -1,7 +1,7 @@
 use super::PacketId;
 use crate::simulation::{RealTime, TimeSource};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
 
@@ -315,14 +315,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     continue;
                 }
                 let wait_until_nanos = entry.timeout_at;
-                // Design Note: ResendAction::WaitUntil returns Instant for API compatibility with callers
-                // that don't use TimeSource. We convert the nanosecond deadline back to an Instant by
-                // computing the delta from now. This works correctly in both production (RealTime) and
-                // tests (VirtualTime) because the difference is what matters, not the absolute value.
-                let wait_until = Instant::now()
-                    + Duration::from_nanos(wait_until_nanos.saturating_sub(now_nanos));
                 self.resend_queue.push_front(entry);
-                return ResendAction::WaitUntil(wait_until);
+                return ResendAction::WaitUntil(wait_until_nanos);
             } else if let Some((packet, _sent_time_nanos)) =
                 self.pending_receipts.remove(&entry.packet_id)
             {
@@ -345,13 +339,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
         }
 
         // Use effective RTO (with backoff) for the wait time
-        ResendAction::WaitUntil(Instant::now() + self.effective_rto())
+        let deadline_nanos = self.time_source.now_nanos() + self.effective_rto().as_nanos() as u64;
+        ResendAction::WaitUntil(deadline_nanos)
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ResendAction {
-    WaitUntil(Instant),
+    /// Wait until the given deadline (nanoseconds since TimeSource epoch) before checking again.
+    WaitUntil(u64),
     Resend(u32, Box<[u8]>),
 }
 
@@ -478,10 +474,10 @@ pub(in crate::transport) mod tests {
 
         // The next call to get_resend should calculate the wait time based on the second packet (id 1)
         match tracker.get_resend() {
-            ResendAction::WaitUntil(wait_until) => {
+            ResendAction::WaitUntil(wait_until_nanos) => {
                 // With virtual time, the deadline should be in the future
-                let now = std::time::Instant::now();
-                assert!(wait_until >= now, "Wait deadline should be in the future");
+                let now_nanos = tracker.time_source.now_nanos();
+                assert!(wait_until_nanos >= now_nanos, "Wait deadline should be in the future");
             }
             _ => panic!("Expected ResendAction::WaitUntil"),
         }

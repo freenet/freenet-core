@@ -45,7 +45,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     outbound_symmetric_key: Aes128Gcm,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
-    ledbat: Arc<super::super::ledbat::LedbatController>,
+    ledbat: Arc<super::super::ledbat::LedbatController<T>>,
     time_source: T,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();

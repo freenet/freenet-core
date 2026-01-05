@@ -1185,6 +1185,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 ledbat,
                 token_bucket,
                 socket,
+                time_source: RealTime::new(),
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -1466,6 +1467,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
+                                                    time_source: RealTime::new(),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -1567,6 +1569,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
+                                        time_source: RealTime::new(),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,

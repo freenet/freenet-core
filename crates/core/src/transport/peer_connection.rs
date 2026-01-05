@@ -3,11 +3,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
 use crate::config::GlobalExecutor;
+use crate::simulation::{RealTime, TimeSource, TimeSourceInterval};
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
@@ -75,11 +76,10 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[must_use]
-pub(crate) struct RemoteConnection<S = super::UdpSocket> {
+pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
-    pub(super) sent_tracker:
-        Arc<parking_lot::Mutex<SentPacketTracker<crate::simulation::RealTime>>>,
+    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     pub(super) last_packet_id: Arc<AtomicU32>,
     pub(super) inbound_packet_recv: FastReceiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
@@ -88,17 +88,19 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
-    pub(super) ledbat: Arc<LedbatController>,
+    pub(super) ledbat: Arc<LedbatController<T>>,
     /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
-    pub(super) token_bucket: Arc<TokenBucket<crate::simulation::RealTime>>,
+    pub(super) token_bucket: Arc<TokenBucket<T>>,
     /// Socket for direct packet sending (bypasses centralized rate limiter)
     pub(super) socket: Arc<S>,
     /// Global bandwidth manager for fair sharing across connections.
     /// When Some, the token_bucket rate is periodically updated based on connection count.
     pub(super) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Time source for deterministic simulation support
+    pub(super) time_source: T,
 }
 
-impl<S> Drop for RemoteConnection<S> {
+impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
     fn drop(&mut self) {
         // Unregister from global bandwidth manager so other connections can use the freed bandwidth
         if let Some(ref global) = self.global_bandwidth {
@@ -164,32 +166,36 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
-pub struct PeerConnection<S = super::UdpSocket> {
-    remote_conn: RemoteConnection<S>,
+pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
+    remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, FastSender<(u32, bytes::Bytes)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     failure_count: usize,
-    first_failure_time: Option<std::time::Instant>,
-    last_packet_report_time: Instant,
+    /// First failure time as nanoseconds since time_source epoch
+    first_failure_time_nanos: Option<u64>,
+    /// Last packet report time as nanoseconds since time_source epoch
+    last_packet_report_time_nanos: u64,
     keep_alive_handle: Option<JoinHandle<()>>,
-    /// Last time we updated the TokenBucket rate from LEDBAT
+    /// Last rate update time as nanoseconds since time_source epoch
     /// Used to implement RTT-adaptive rate updates (update approximately once per RTT)
-    last_rate_update: Option<std::time::Instant>,
+    last_rate_update_nanos: Option<u64>,
     /// Tracks pending ping probes awaiting pong responses.
-    /// Maps ping sequence number -> send timestamp.
+    /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
-    pending_pings: Arc<RwLock<BTreeMap<u64, Instant>>>,
+    pending_pings: Arc<RwLock<BTreeMap<u64, u64>>>,
     /// Registry for streaming inbound streams.
     /// Maps stream IDs to streaming handles for incremental fragment access.
     streaming_registry: Arc<streaming::StreamRegistry>,
     /// Streaming handles for active streams (parallels inbound_streams).
     /// Used for pushing fragments to streaming consumers.
     streaming_handles: HashMap<StreamId, streaming::StreamHandle>,
+    /// Time source for deterministic simulation support
+    time_source: T,
 }
 
-impl<S> std::fmt::Debug for PeerConnection<S> {
+impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerConnection")
             .field("remote_conn", &self.remote_conn.remote_addr)
@@ -197,7 +203,7 @@ impl<S> std::fmt::Debug for PeerConnection<S> {
     }
 }
 
-impl<S> Drop for PeerConnection<S> {
+impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
     fn drop(&mut self) {
         if let Some(handle) = self.keep_alive_handle.take() {
             tracing::debug!(
@@ -223,8 +229,8 @@ impl<S> Drop for PeerConnection<S> {
 const MAX_UNANSWERED_PINGS: usize = 5;
 
 #[allow(private_bounds)]
-impl<S: super::Socket> PeerConnection<S> {
-    pub(super) fn new(remote_conn: RemoteConnection<S>) -> Self {
+impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
+    pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
         // Start the keep-alive task before creating Self
@@ -232,12 +238,15 @@ impl<S: super::Socket> PeerConnection<S> {
         let socket = remote_conn.socket.clone();
         let outbound_key = remote_conn.outbound_symmetric_key.clone();
         let last_packet_id = remote_conn.last_packet_id.clone();
+        let time_source = remote_conn.time_source.clone();
 
         // Shared state for bidirectional liveness detection
-        let pending_pings: Arc<RwLock<BTreeMap<u64, Instant>>> =
+        // Uses u64 nanoseconds for deterministic simulation support
+        let pending_pings: Arc<RwLock<BTreeMap<u64, u64>>> =
             Arc::new(RwLock::new(BTreeMap::new()));
         let pending_pings_for_task = pending_pings.clone();
 
+        let task_time_source = time_source.clone();
         let keep_alive_handle = GlobalExecutor::spawn(async move {
             tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
@@ -245,23 +254,23 @@ impl<S: super::Socket> PeerConnection<S> {
                 "Keep-alive task STARTED for connection"
             );
 
-            let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut interval = TimeSourceInterval::new(task_time_source.clone(), KEEP_ALIVE_INTERVAL);
 
             // Skip the first immediate tick
             interval.tick().await;
 
             let mut tick_count = 0u64;
             let mut ping_seq = 0u64;
-            let task_start = std::time::Instant::now();
+            let task_start_nanos = task_time_source.now_nanos();
 
             loop {
-                let tick_start = std::time::Instant::now();
+                let tick_start_nanos = task_time_source.now_nanos();
                 interval.tick().await;
                 tick_count += 1;
 
-                let elapsed_since_start = task_start.elapsed();
-                let elapsed_since_last_tick = tick_start.elapsed();
+                let now_nanos = task_time_source.now_nanos();
+                let elapsed_since_start_nanos = now_nanos.saturating_sub(task_start_nanos);
+                let elapsed_since_last_tick_nanos = now_nanos.saturating_sub(tick_start_nanos);
 
                 // Use local ping sequence counter
                 let current_ping_seq = ping_seq;
@@ -272,8 +281,8 @@ impl<S: super::Socket> PeerConnection<S> {
                     remote = ?remote_addr,
                     tick_count,
                     ping_sequence = current_ping_seq,
-                    elapsed_since_start_secs = elapsed_since_start.as_secs_f64(),
-                    tick_interval_ms = elapsed_since_last_tick.as_millis(),
+                    elapsed_since_start_secs = Duration::from_nanos(elapsed_since_start_nanos).as_secs_f64(),
+                    tick_interval_ms = Duration::from_nanos(elapsed_since_last_tick_nanos).as_millis(),
                     "Keep-alive tick - sending Ping"
                 );
 
@@ -294,10 +303,10 @@ impl<S: super::Socket> PeerConnection<S> {
                     }
                 };
 
-                // Record the pending ping before sending
+                // Record the pending ping before sending (using nanoseconds)
                 {
                     let mut pending = pending_pings_for_task.write();
-                    pending.insert(current_ping_seq, Instant::now());
+                    pending.insert(current_ping_seq, task_time_source.now_nanos());
                 }
 
                 // Send the keep-alive Ping packet directly to socket
@@ -320,11 +329,12 @@ impl<S: super::Socket> PeerConnection<S> {
                         );
                     }
                     Err(e) => {
+                        let elapsed = Duration::from_nanos(task_time_source.now_nanos().saturating_sub(task_start_nanos));
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             error = ?e,
-                            elapsed_since_start_secs = task_start.elapsed().as_secs_f64(),
+                            elapsed_since_start_secs = elapsed.as_secs_f64(),
                             total_ticks = tick_count,
                             "Keep-alive task STOPPING - socket error"
                         );
@@ -333,10 +343,11 @@ impl<S: super::Socket> PeerConnection<S> {
                 }
             }
 
+            let elapsed = Duration::from_nanos(task_time_source.now_nanos().saturating_sub(task_start_nanos));
             tracing::warn!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
-                total_lifetime_secs = task_start.elapsed().as_secs_f64(),
+                total_lifetime_secs = elapsed.as_secs_f64(),
                 total_ticks = tick_count,
                 "Keep-alive task EXITING"
             );
@@ -347,6 +358,7 @@ impl<S: super::Socket> PeerConnection<S> {
             "PeerConnection created with persistent keep-alive task"
         );
 
+        let now_nanos = time_source.now_nanos();
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
@@ -354,20 +366,21 @@ impl<S: super::Socket> PeerConnection<S> {
             inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
             failure_count: 0,
-            first_failure_time: None,
-            last_packet_report_time: Instant::now(),
+            first_failure_time_nanos: None,
+            last_packet_report_time_nanos: now_nanos,
             keep_alive_handle: Some(keep_alive_handle),
-            last_rate_update: None,
+            last_rate_update_nanos: None,
             pending_pings,
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: HashMap::new(),
+            time_source,
         }
     }
 
     #[instrument(name = "peer_connection", skip_all)]
-    pub async fn send<T>(&mut self, data: T) -> Result
+    pub async fn send<D>(&mut self, data: D) -> Result
     where
-        T: Serialize + Send + std::fmt::Debug,
+        D: Serialize + Send + std::fmt::Debug,
     {
         // Serialize directly on async runtime - bincode is fast enough (<1ms for typical messages)
         // that spawn_blocking overhead isn't worth it. Using spawn_blocking here caused chronic
@@ -393,40 +406,36 @@ impl<S: super::Socket> PeerConnection<S> {
     #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
+        let mut resend_check_sleep: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+            Some(self.time_source.sleep(Duration::from_millis(10)));
 
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(120);
-        let mut last_received = std::time::Instant::now();
+        const KILL_CONNECTION_AFTER_NANOS: u64 = KILL_CONNECTION_AFTER.as_nanos() as u64;
+        let mut last_received_nanos = self.time_source.now_nanos();
 
         // Check for timeout periodically
-        let mut timeout_check = tokio::time::interval(Duration::from_secs(5));
-        timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut timeout_check = TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
 
         // Background ACK timer - sends pending ACKs proactively every 100ms
         // This prevents delays when there's no outgoing traffic to piggyback ACKs on
         // Use interval_at to delay the first tick - unlike the keep-alive task which can
         // block to skip its first tick, we're inside a select! loop so we delay instead
-        let mut ack_check = tokio::time::interval_at(
-            tokio::time::Instant::now() + ACK_CHECK_INTERVAL,
-            ACK_CHECK_INTERVAL,
-        );
-        ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let ack_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
+        let mut ack_check = TimeSourceInterval::new_at(self.time_source.clone(), ack_start_nanos, ACK_CHECK_INTERVAL);
 
         // Rate update timer - updates TokenBucket rate based on LEDBAT cwnd every 100ms
         // This allows the token bucket to adapt to network conditions dynamically
-        let mut rate_update_check = tokio::time::interval_at(
-            tokio::time::Instant::now() + ACK_CHECK_INTERVAL,
-            ACK_CHECK_INTERVAL,
-        );
-        rate_update_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let rate_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
+        let mut rate_update_check = TimeSourceInterval::new_at(self.time_source.clone(), rate_start_nanos, ACK_CHECK_INTERVAL);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
+        const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv_async() => {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-                    last_received = std::time::Instant::now();
+                    last_received_nanos = self.time_source.now_nanos();
 
                     // Debug logging for intro packets
                     if packet_data.is_intro_packet() {
@@ -506,19 +515,19 @@ impl<S: super::Socket> PeerConnection<S> {
                                 }
                             }
                         }
-                        let now = Instant::now();
-                        if let Some(first_failure_time) = self.first_failure_time {
-                            if now.duration_since(first_failure_time) <= FAILURE_TIME_WINDOW {
+                        let now_nanos = self.time_source.now_nanos();
+                        if let Some(first_failure_time_nanos) = self.first_failure_time_nanos {
+                            if now_nanos.saturating_sub(first_failure_time_nanos) <= FAILURE_TIME_WINDOW_NANOS {
                                 self.failure_count += 1;
                             } else {
                                 // Reset the failure count and time window
                                 self.failure_count = 1;
-                                self.first_failure_time = Some(now);
+                                self.first_failure_time_nanos = Some(now_nanos);
                             }
                         } else {
                             // Initialize the failure count and time window
                             self.failure_count = 1;
-                            self.first_failure_time = Some(now);
+                            self.first_failure_time_nanos = Some(now_nanos);
                         }
 
                         if self.failure_count > NAT_TRAVERSAL_MAX_ATTEMPTS {
@@ -549,11 +558,12 @@ impl<S: super::Socket> PeerConnection<S> {
                     match &payload {
                         SymmetricMessagePayload::NoOp => {
                             if confirm_receipt.is_empty() {
+                                let elapsed_nanos = self.time_source.now_nanos().saturating_sub(last_received_nanos);
                                 tracing::debug!(
                                     target: "freenet_core::transport::keepalive_received",
                                     remote = ?self.remote_conn.remote_addr,
                                     packet_id,
-                                    time_since_last_received_ms = last_received.elapsed().as_millis(),
+                                    time_since_last_received_ms = Duration::from_nanos(elapsed_nanos).as_millis(),
                                     "Received NoOp keep-alive packet (no receipts)"
                                 );
                             } else {
@@ -617,15 +627,17 @@ impl<S: super::Socket> PeerConnection<S> {
                         );
                     }
 
-                    let current_time = Instant::now();
-                    let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
+                    let current_time_nanos = self.time_source.now_nanos();
+                    let message_confirmation_timeout_nanos = MESSAGE_CONFIRMATION_TIMEOUT.as_nanos() as u64;
+                    let should_send_receipts = if current_time_nanos > self.last_packet_report_time_nanos + message_confirmation_timeout_nanos {
+                        let elapsed_nanos = current_time_nanos.saturating_sub(self.last_packet_report_time_nanos);
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
-                            elapsed_ms = current_time.duration_since(self.last_packet_report_time).as_millis(),
+                            elapsed_ms = Duration::from_nanos(elapsed_nanos).as_millis(),
                             timeout_ms = MESSAGE_CONFIRMATION_TIMEOUT.as_millis(),
                             "Timeout reached, should send receipts"
                         );
-                        self.last_packet_report_time = current_time;
+                        self.last_packet_report_time_nanos = current_time_nanos;
                         true
                     } else {
                         false
@@ -743,10 +755,12 @@ impl<S: super::Socket> PeerConnection<S> {
                     }
                 }
                 _ = timeout_check.tick() => {
-                    let elapsed = last_received.elapsed();
+                    let now_nanos = self.time_source.now_nanos();
+                    let elapsed_nanos = now_nanos.saturating_sub(last_received_nanos);
+                    let elapsed = Duration::from_nanos(elapsed_nanos);
 
                     // Check for traditional timeout (no packets received)
-                    if elapsed > KILL_CONNECTION_AFTER {
+                    if elapsed_nanos > KILL_CONNECTION_AFTER_NANOS {
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_timeout",
                             remote = ?self.remote_conn.remote_addr,
@@ -780,8 +794,8 @@ impl<S: super::Socket> PeerConnection<S> {
                     // This handles edge cases where pong responses are lost but connection stays alive.
                     {
                         let mut pending = self.pending_pings.write();
-                        let stale_threshold = Instant::now() - KILL_CONNECTION_AFTER;
-                        pending.retain(|_, sent_at| *sent_at > stale_threshold);
+                        let stale_threshold_nanos = now_nanos.saturating_sub(KILL_CONNECTION_AFTER_NANOS);
+                        pending.retain(|_, sent_at_nanos| *sent_at_nanos > stale_threshold_nanos);
                     }
 
                     // Re-read count after cleanup
@@ -806,16 +820,17 @@ impl<S: super::Socket> PeerConnection<S> {
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
+                    let remaining_nanos = KILL_CONNECTION_AFTER_NANOS.saturating_sub(elapsed_nanos);
                     tracing::trace!(
                         target: "freenet_core::transport::keepalive_health",
                         remote = ?self.remote_conn.remote_addr,
                         elapsed_seconds = elapsed.as_secs_f64(),
-                        remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
+                        remaining_seconds = Duration::from_nanos(remaining_nanos).as_secs_f64(),
                         pending_pings = pending_ping_count,
                         "Connection health check - still alive"
                     );
                 }
-                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
+                _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
                     loop {
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
@@ -826,8 +841,8 @@ impl<S: super::Socket> PeerConnection<S> {
                             .lock()
                             .get_resend();
                         match maybe_resend {
-                            ResendAction::WaitUntil(wait_until) => {
-                                resend_check = Some(tokio::time::sleep_until(wait_until.into()));
+                            ResendAction::WaitUntil(deadline_nanos) => {
+                                resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
@@ -864,7 +879,7 @@ impl<S: super::Socket> PeerConnection<S> {
                 // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
                 _ = rate_update_check.tick() => {
-                    let now = std::time::Instant::now();
+                    let now_nanos = self.time_source.now_nanos();
 
                     // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
                     // Fallback to min_rtt only if base_delay is not yet established
@@ -877,13 +892,13 @@ impl<S: super::Socket> PeerConnection<S> {
 
                     // RTT-adaptive update: only update if at least one RTT has elapsed since last update
                     // This prevents updating too frequently at high RTT or too slowly at low RTT
-                    let should_update = match self.last_rate_update {
+                    let should_update = match self.last_rate_update_nanos {
                         None => true, // First update
-                        Some(last_update) => {
-                            let elapsed = now.duration_since(last_update);
+                        Some(last_update_nanos) => {
+                            let elapsed_nanos = now_nanos.saturating_sub(last_update_nanos);
                             // Update if at least one RTT has passed, with bounds (50ms min, 500ms max)
                             let min_interval = rtt.max(Duration::from_millis(50)).min(Duration::from_millis(500));
-                            elapsed >= min_interval
+                            elapsed_nanos >= min_interval.as_nanos() as u64
                         }
                     };
 
@@ -904,12 +919,12 @@ impl<S: super::Socket> PeerConnection<S> {
                         };
 
                         // Calculate time since last update for debugging RTT-adaptive timing
-                        let since_last_update_ms = self.last_rate_update
-                            .map(|last| now.duration_since(last).as_millis())
+                        let since_last_update_ms = self.last_rate_update_nanos
+                            .map(|last| Duration::from_nanos(now_nanos.saturating_sub(last)).as_millis())
                             .unwrap_or(0);
 
                         self.remote_conn.token_bucket.set_rate(new_rate);
-                        self.last_rate_update = Some(now);
+                        self.last_rate_update_nanos = Some(now_nanos);
 
                         tracing::debug!(
                             peer_addr = %self.remote_conn.remote_addr,
@@ -1179,7 +1194,7 @@ impl<S: super::Socket> PeerConnection<S> {
                 self.remote_conn.sent_tracker.clone(),
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.ledbat.clone(),
-                crate::simulation::RealTime::new(),
+                self.time_source.clone(),
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
