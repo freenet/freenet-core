@@ -1035,6 +1035,12 @@ static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpLi
 /// Each test allocates a contiguous block of indices for its nodes.
 static GLOBAL_NODE_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Reset the global node index counter to initial state.
+/// Used for deterministic simulation testing.
+pub fn reset_global_node_index() {
+    GLOBAL_NODE_INDEX.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Allocate a block of unique global node indices for a test.
 ///
 /// This ensures that parallel tests get non-overlapping IP address ranges.

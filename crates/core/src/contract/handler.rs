@@ -261,6 +261,12 @@ pub(crate) fn contract_handler_channel() -> (
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Reset the event ID counter to initial state.
+/// Used for deterministic simulation testing.
+pub fn reset_event_id_counter() {
+    EV_ID.store(0, SeqCst);
+}
+
 impl Stream for ContractHandlerChannel<WaitingResolution> {
     type Item = (ClientId, WaitingTransaction);
 

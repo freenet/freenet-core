@@ -89,6 +89,51 @@ pub mod dev_tool {
         FaultConfig, FaultConfigBuilder, Partition, SimulationRng, TimeSource, VirtualTime,
         WakeupId,
     };
+
+    // Re-export counter reset functions for deterministic simulation testing
+    pub use crate::client_events::RequestId;
+    pub use crate::contract::reset_event_id_counter;
+    pub use crate::node::reset_channel_id_counter;
+    pub use crate::test_utils::reset_global_node_index;
+    pub use crate::transport::reset_nonce_counter;
+    pub use crate::transport::StreamId;
+
+    /// Reset all global simulation state for deterministic testing.
+    ///
+    /// This function resets all atomic counters and global registries to their
+    /// initial state, ensuring that simulation runs with the same seed produce
+    /// identical results.
+    ///
+    /// Call this at the start of each simulation run, AFTER setting the RNG seed
+    /// with `GlobalRng::set_seed()`.
+    ///
+    /// # What gets reset:
+    /// - Request ID counter
+    /// - Client ID counter
+    /// - Event ID counter
+    /// - Channel ID counter
+    /// - Stream ID counter
+    /// - Nonce counter
+    /// - Global node index
+    /// - Socket registries
+    /// - Address network mappings
+    pub fn reset_all_simulation_state() {
+        // Reset RNG (caller should set seed after this)
+        crate::config::GlobalRng::clear_seed();
+
+        // Reset all atomic counters
+        crate::client_events::RequestId::reset_counter();
+        crate::client_events::ClientId::reset_counter();
+        crate::contract::reset_event_id_counter();
+        crate::node::reset_channel_id_counter();
+        crate::transport::StreamId::reset_counter();
+        crate::transport::reset_nonce_counter();
+        crate::test_utils::reset_global_node_index();
+
+        // Reset global registries
+        crate::transport::in_memory_socket::clear_all_socket_registries();
+        crate::transport::in_memory_socket::clear_all_address_networks();
+    }
 }
 
 pub mod test_utils;

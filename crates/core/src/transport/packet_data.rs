@@ -37,6 +37,14 @@ static NONCE_RANDOM_PREFIX: Lazy<[u8; 4]> = Lazy::new(|| {
     bytes
 });
 
+/// Reset the nonce counter to initial state.
+/// Used for deterministic simulation testing.
+/// Note: This should be called AFTER GlobalRng::set_seed() so the prefix
+/// is regenerated deterministically on next use.
+pub fn reset_nonce_counter() {
+    NONCE_COUNTER.store(0, Ordering::SeqCst);
+}
+
 /// Generate a unique 12-byte nonce using counter + random prefix.
 /// This is faster than random generation while ensuring uniqueness.
 #[inline]

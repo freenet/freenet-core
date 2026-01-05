@@ -123,10 +123,18 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
 #[serde(transparent)]
 pub struct StreamId(u32);
 
+/// Static counter for StreamId generation - must be at module level for reset access
+static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 impl StreamId {
     pub fn next() -> Self {
-        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Release))
+        Self(STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release))
+    }
+
+    /// Reset the stream ID counter to initial state.
+    /// Used for deterministic simulation testing.
+    pub fn reset_counter() {
+        STREAM_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

@@ -36,18 +36,20 @@ use std::time::Duration;
 /// - Converted HashMap→BTreeMap in topology/mod.rs (source_creation_times, usage maps)
 /// - Converted HashMap→BTreeMap in contract/executor.rs (pending_responses)
 /// - Added cleanup of global static state between runs (socket registries)
+/// - Added reset functions for all global atomic counters
+/// - Created central `reset_all_simulation_state()` function
 ///
-/// ## Remaining Issues:
-/// - Event counts still differ between runs (e.g., 116 vs 109)
-/// - This suggests non-determinism in event generation timing, not iteration order
-/// - Global atomic counters (REQUEST_ID_COUNTER, CLIENT_ID, etc.) don't reset
-/// - Turmoil may not provide full determinism for all async scheduling patterns
+/// ## Remaining Issue: std::time::Instant vs tokio::time::Instant
+/// - Event counts still differ between runs (e.g., 122 vs 109)
+/// - **Root cause**: Code uses `std::time::Instant::now()` which Turmoil doesn't intercept
+/// - Turmoil only intercepts `tokio::time::Instant` operations
+/// - ~40 instances of `std::time::Instant::now()` in hot paths (connect, topology, ring, backoff)
 ///
 /// ## To fully fix:
-/// - Reset all global atomic counters between runs
-/// - Ensure all time-dependent operations use VirtualTime
-/// - Investigate Turmoil's scheduling determinism guarantees
-#[ignore = "Event count non-determinism - see doc comment"]
+/// - Replace `std::time::Instant` with `tokio::time::Instant` in simulation-relevant code
+/// - Key files: operations/connect.rs, topology/mod.rs, ring/mod.rs, util/backoff.rs
+/// - This will allow Turmoil to control all time-dependent operations
+#[ignore = "std::time::Instant not intercepted by Turmoil - see doc comment"]
 #[test]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;
@@ -63,9 +65,8 @@ fn test_strict_determinism_exact_event_equality() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
-        // Clean up global state from previous runs to ensure determinism
-        freenet::transport::in_memory_socket::clear_all_socket_registries();
-        freenet::transport::in_memory_socket::clear_all_address_networks();
+        // Reset all global simulation state for determinism
+        freenet::dev_tool::reset_all_simulation_state();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

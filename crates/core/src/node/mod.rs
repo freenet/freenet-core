@@ -59,7 +59,7 @@ use tracing::Instrument;
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 // Re-export types for dev_tool and testing
-pub use network_bridge::{EventLoopExitReason, NetworkStats};
+pub use network_bridge::{reset_channel_id_counter, EventLoopExitReason, NetworkStats};
 
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};

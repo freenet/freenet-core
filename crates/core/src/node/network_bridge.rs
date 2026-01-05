@@ -103,10 +103,20 @@ impl Clone for ConnectionError {
     }
 }
 
+use std::sync::atomic::AtomicU64;
+
+/// Static counter for channel ID generation
+static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the channel ID counter to initial state.
+/// Used for deterministic simulation testing.
+pub fn reset_channel_id_counter() {
+    CHANNEL_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
 
     let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let (notification_tx, notification_rx) = mpsc::channel(100);

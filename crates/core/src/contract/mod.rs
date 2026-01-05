@@ -22,6 +22,7 @@ pub(crate) use handler::{
 };
 
 pub use executor::{Executor, ExecutorError, OperationMode};
+pub use handler::reset_event_id_counter;
 
 use executor::ContractExecutor;
 use tracing::Instrument;
