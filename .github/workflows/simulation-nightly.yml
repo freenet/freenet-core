@@ -69,6 +69,7 @@ jobs:
         run: cargo build -p fdev --release
 
       # Medium scale test with convergence checking (20 nodes)
+      # Expects 100% success rate - no fault injection
       - name: Medium scale test (20 nodes, seed 0xDEADBEEF)
         run: |
           echo "Running medium scale simulation (20 nodes)"
@@ -82,11 +83,12 @@ jobs:
             --max-connections 15 \
             --min-connections 5 \
             --check-convergence 60 \
-            --min-success-rate 0.7 \
+            --min-success-rate 1.0 \
             --print-summary \
             single-process
 
       # Medium scale with different seed (explores different code paths)
+      # Expects 100% success rate - no fault injection
       - name: Medium scale test (20 nodes, seed 0xCAFEBABE)
         run: |
           echo "Running medium scale simulation with alternate seed"
@@ -100,11 +102,12 @@ jobs:
             --max-connections 15 \
             --min-connections 5 \
             --check-convergence 60 \
-            --min-success-rate 0.7 \
+            --min-success-rate 1.0 \
             --print-summary \
             single-process
 
       # Fault tolerance test with message loss
+      # Expects 100% success rate - eventual consistency handles retries
       - name: Fault tolerance test (5% message loss)
         run: |
           echo "Running fault tolerance simulation with 5% message loss"
@@ -116,12 +119,13 @@ jobs:
             --events 150 \
             --message-loss 0.05 \
             --check-convergence 90 \
-            --min-success-rate 0.6 \
+            --min-success-rate 1.0 \
             --print-summary \
             --print-network-stats \
             single-process
 
       # High latency test
+      # Expects 100% success rate - latency shouldn't cause failures
       - name: High latency test (50-200ms latency)
         run: |
           echo "Running high latency simulation"
@@ -134,12 +138,13 @@ jobs:
             --latency-min 50 \
             --latency-max 200 \
             --check-convergence 120 \
-            --min-success-rate 0.7 \
+            --min-success-rate 1.0 \
             --print-summary \
             --print-network-stats \
             single-process
 
       # Larger scale test (40 nodes) - more events, longer timeout
+      # Expects 100% success rate - no fault injection
       - name: Large scale test (40 nodes)
         run: |
           echo "Running large scale simulation (40 nodes)"
@@ -153,7 +158,7 @@ jobs:
             --max-connections 20 \
             --min-connections 8 \
             --check-convergence 120 \
-            --min-success-rate 0.65 \
+            --min-success-rate 1.0 \
             --print-summary \
             single-process
 
