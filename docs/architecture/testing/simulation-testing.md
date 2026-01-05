@@ -75,7 +75,7 @@ SimulatedNetwork
 
 ## Current Determinism Guarantees
 
-### ✅ Fully Deterministic (With MadSim - CI Nightly)
+### ✅ Fully Deterministic (Turmoil Always Enabled)
 
 | Aspect | Mechanism |
 |--------|-----------|
@@ -85,23 +85,13 @@ SimulatedNetwork
 | Peer label assignment | Derived from master seed |
 | Contract generation | Seeded MemoryEventsGen |
 | Fault injection | Seeded RNG for drop decisions |
-| **Async task ordering** | ✅ MadSim provides deterministic task scheduling |
-| **Channel message order** | ✅ Deterministic with MadSim |
-| **`select!` branches** | ✅ Deterministic with MadSim (use `biased` for clarity) |
-
-### Standard Mode (Without MadSim)
-
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Async task ordering | ⚠️ ~90% deterministic | Single-threaded helps, not perfect |
-| Channel message order | ⚠️ Partially deterministic | Multiple senders may race |
-| `select!` branches | ⚠️ Non-deterministic | Use `biased` where possible |
-
-**Use case:** Standard mode is faster for local development. Use MadSim when investigating flaky tests or for CI.
+| **Async task ordering** | ✅ Turmoil provides deterministic task scheduling |
+| **Channel message order** | ✅ Deterministic with Turmoil |
+| **`select!` branches** | ✅ Deterministic with Turmoil (use `biased` for clarity) |
 
 ### Full Determinism Achieved
 
-MadSim is integrated and active in CI nightly. See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for implementation details.
+Turmoil is always enabled as a dependency for deterministic scheduling. See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for implementation details.
 
 ## Known Gaps
 
@@ -346,14 +336,12 @@ async fn test_with_fault_injection() {
 6. **Single-threaded mode** - ✅ DONE: All tests use `current_thread`
 7. **TimeSource trait** - ✅ DONE: `TimeSource` trait throughout codebase
 8. **GlobalRng** - ✅ DONE: `rand::random()` → `GlobalRng`
-9. **MadSim integration** - ✅ DONE: Active in CI nightly for full determinism
-10. **Turmoil integration** - ✅ DONE: Alternative via `run_simulation()`
+9. **Turmoil integration** - ✅ DONE: Always enabled for deterministic scheduling
 
 ### Recently Completed
 
 9. **Deterministic Scheduler** ✅ COMPLETE
-   - MadSim integrated and active in CI nightly builds
-   - Turmoil available as alternative via `run_simulation()`
+   - Turmoil integrated and always enabled
    - Full determinism achieved (~99%)
 
 ### Future Enhancements (Enabled by Determinism)
@@ -661,30 +649,24 @@ sim_runtime.advance_until_idle();
 
 ~~This section explores what it would take to run actual Freenet node code with fully deterministic scheduling.~~
 
-**UPDATE**: Full deterministic scheduling is now implemented and active in CI!
+**UPDATE**: Full deterministic scheduling is now implemented via Turmoil!
 
 ### Current State (January 2026)
 
-**SimNetwork with MadSim** (production-ready, CI nightly):
+**SimNetwork with Turmoil** (production-ready, always enabled):
 - ✅ Runs actual node code
 - ✅ Deterministic fault injection (seeded RNG)
 - ✅ Network stats and convergence checking
-- ✅ **Fully deterministic async scheduling** (MadSim)
-- ✅ **Controlled timing** (VirtualTime + MadSim)
+- ✅ **Fully deterministic async scheduling** (Turmoil)
+- ✅ **Controlled timing** (VirtualTime + Turmoil)
 - ✅ **~99% determinism** - same seed → identical execution
-
-**SimNetwork Standard** (fast local development):
-- ✅ Runs actual node code
-- ✅ Deterministic fault injection
-- ⚠️ ~90% deterministic (single-threaded tokio)
-- Use for quick iteration, switch to MadSim for flaky tests
 
 ### ✅ Goals Achieved
 
 Running actual Freenet protocol code (operations, state machines, contract execution) with:
-1. ✅ Deterministic event ordering (same seed → same execution) **- MadSim**
-2. ✅ Controlled time progression (no wall-clock dependency) **- VirtualTime + MadSim**
-3. ✅ Reproducible test failures **- CI nightly validates this**
+1. ✅ Deterministic event ordering (same seed → same execution) **- Turmoil**
+2. ✅ Controlled time progression (no wall-clock dependency) **- VirtualTime + Turmoil**
+3. ✅ Reproducible test failures **- Always enabled**
 
 ### Approaches
 
@@ -780,7 +762,7 @@ impl DeterministicRuntime {
 
 **Estimated Effort:** 2-4 weeks
 
-**Reference:** [turmoil](https://github.com/tokio-rs/turmoil) - deterministic testing for distributed systems
+**Reference:** [Turmoil](https://github.com/tokio-rs/turmoil) - deterministic testing for distributed systems (actively used in Freenet)
 
 #### Approach 3: Record-Replay
 

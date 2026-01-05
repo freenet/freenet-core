@@ -20,9 +20,9 @@ We currently use these testing paradigms:
 | Unit Testing | ✅ Mature | ~1,000 tests |
 | Integration Testing | ✅ Mature | ~80 tests |
 | Mock-based Testing | ✅ Mature | Extensive |
-| Simulation Testing | ✅ Mature | SimNetwork with VirtualTime + MadSim |
+| Simulation Testing | ✅ Mature | SimNetwork with VirtualTime + Turmoil |
 | Deterministic Time/RNG | ✅ Complete | `VirtualTime`, `GlobalRng` |
-| **Deterministic Scheduling** | ✅ **Complete** | **MadSim in CI nightly** |
+| **Deterministic Scheduling** | ✅ **Complete** | **Turmoil (always enabled)** |
 | Property-based Testing | ⚠️ Limited | LEDBAT only |
 | Fuzz Testing | ⚠️ Underused | Infrastructure exists |
 
@@ -34,8 +34,7 @@ We currently use these testing paradigms:
 | GlobalRng | ✅ Complete | Seeded RNG replacing `rand::random()` |
 | TimeSource injection | ✅ Complete | Transport/LEDBAT use trait |
 | Single-threaded tests | ✅ Complete | All simulation tests use `current_thread` |
-| **Deterministic scheduler** | ✅ **Complete** | **MadSim active in CI nightly (~99% determinism)** |
-| Turmoil integration | ✅ Complete | Alternative via `run_simulation()` |
+| **Deterministic scheduler** | ✅ **Complete** | **Turmoil (always enabled, ~99% determinism)** |
 
 Full determinism achieved. See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for implementation details.
 
@@ -43,8 +42,8 @@ Full determinism achieved. See [deterministic-simulation-roadmap.md](determinist
 
 | Paradigm | Status | Notes |
 |----------|--------|-------|
-| ~~Deterministic Scheduler (MadSim)~~ | ✅ **ADOPTED** | **Active in CI nightly** |
-| Linearizability Checker | 🔮 Future | Now possible with MadSim |
+| ~~Deterministic Scheduler (Turmoil)~~ | ✅ **ADOPTED** | **Always enabled** |
+| Linearizability Checker | 🔮 Future | Now possible with Turmoil |
 | Expanded Property Testing | 🔮 Future | Determinism enables this |
 | Mutation Testing | 🔮 Future | Low priority |
 
@@ -75,8 +74,8 @@ cargo test -p freenet --test isolated_node_regression
 # SimNetwork simulation tests
 cargo test -p freenet --test simulation_integration
 
-# SimNetwork with MadSim (deterministic, same as CI nightly)
-RUSTFLAGS="--cfg madsim" cargo test -p freenet --test simulation_integration -- --test-threads=1
+# SimNetwork with deterministic scheduling (Turmoil always enabled)
+cargo test -p freenet --test simulation_integration -- --test-threads=1
 
 # Real network tests (requires feature)
 cargo test -p freenet --test test_network_integration --features test-network
@@ -87,6 +86,6 @@ cargo test -p freenet --test large_network --features test-network -- --ignored
 # fdev CLI testing
 cargo run -p fdev -- test --gateways 1 --nodes 5 --events 100 single-process
 
-# fdev with MadSim (deterministic, same as CI nightly)
-RUSTFLAGS="--cfg madsim" cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 --seed 42 single-process
+# fdev with deterministic scheduling (Turmoil always enabled)
+cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 --seed 42 single-process
 ```

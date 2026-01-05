@@ -132,6 +132,5 @@ pub use fault::{FaultConfig, FaultConfigBuilder, Partition};
 pub use network::{SimulatedNetwork, SimulatedNetworkConfig};
 pub use rng::SimulationRng;
 pub use scheduler::{Event, EventId, EventType, Scheduler, SchedulerConfig};
-#[cfg(not(madsim))]
 pub use time::Wakeup;
 pub use time::{RealTime, TimeSource, TimeSourceInterval, VirtualTime, WakeupId};

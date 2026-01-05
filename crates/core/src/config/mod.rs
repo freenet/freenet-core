@@ -1497,8 +1497,8 @@ pub enum Address {
 /// Global async executor abstraction for spawning tasks.
 ///
 /// This abstraction allows swapping the underlying executor for deterministic
-/// simulation testing. In production, it delegates to tokio. With MadSim enabled
-/// (`RUSTFLAGS="--cfg madsim"`), tokio is replaced with a deterministic runtime.
+/// simulation testing. In production, it delegates to tokio. For deterministic
+/// simulation, use Turmoil which provides deterministic task scheduling.
 ///
 /// # Usage
 /// ```ignore

@@ -10,8 +10,8 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 |----------|----------|-----------|---------|-------------|-------|
 | **Unit Tests** | `src/**/*.rs` | Mocks | Mocks | Full | Single component |
 | **`#[freenet_test]` Macro** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-10 nodes |
-| **SimNetwork** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **MadSim (~99%)** | 1-20 nodes |
-| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **MadSim support** | 1-50 nodes |
+| **SimNetwork** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **Turmoil (~99%)** | 1-20 nodes |
+| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **Turmoil (always on)** | 1-50 nodes |
 | **freenet-test-network** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-40+ nodes |
 
 ---
@@ -69,7 +69,7 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 |-----------|---------------|-----|
 | **Speed** | Unit tests | No I/O, no network setup |
 | **Isolation** | Unit tests | Tests single component |
-| **Reproducibility** | SimNetwork + MadSim | Full determinism in CI |
+| **Reproducibility** | SimNetwork + Turmoil | Full determinism (Turmoil always enabled) |
 | **Realism** | test-network | Real processes, real UDP |
 | **Fault injection** | SimNetwork/fdev | Built-in FaultConfig |
 | **Scale** | test-network | Separate processes, real topology |
@@ -263,7 +263,7 @@ This section analyzes what testing paradigms we currently use versus industry be
 
 | Paradigm | What It Is | Value for Freenet | Effort | Priority |
 |----------|------------|-------------------|--------|----------|
-| ~~**Deterministic Simulation**~~ | ~~FoundationDB-style executor~~ | ✅ **IMPLEMENTED via MadSim** | - | - |
+| ~~**Deterministic Simulation**~~ | ~~FoundationDB-style executor~~ | ✅ **IMPLEMENTED via Turmoil** | - | - |
 | **Linearizability Checking** | Jepsen/Knossos-style consistency proofs | Prove correctness properties | High | Low |
 | **Model Checking** | TLA+ / formal specification | Verify protocol design before code | Medium | Low |
 | **Mutation Testing** | cargo-mutants | Find untested code paths | Low | High |

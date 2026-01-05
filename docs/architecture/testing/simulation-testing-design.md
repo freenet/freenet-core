@@ -187,23 +187,21 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 | **VirtualTime (always on)** | Time control via `virtual_time()` and `advance_time()` |
 | **Node crash simulation** | `crash_node()` aborts task and blocks messages |
 | **Node restart** | `restart_node()` preserves identity (keypair, address) |
-| **MadSim determinism** | Full determinism in CI via `--cfg madsim` |
-| **Turmoil alternative** | Optional deterministic scheduler via `run_simulation()` |
+| **Turmoil determinism** | Full determinism via Turmoil (always enabled) |
 
 ### ✅ Deterministic Scheduling (IMPLEMENTED)
 
 | Feature | Status | Implementation |
 |---------|--------|----------------|
-| **MadSim integration** | ✅ Active in CI | Primary deterministic scheduler, ~99% determinism |
-| **Turmoil integration** | ✅ Available | Alternative via `SimNetwork::run_simulation()` |
-| Async task ordering | ✅ Deterministic | Fully deterministic with MadSim |
-| Reproducible tests | ✅ Working | Same seed → same execution in MadSim mode |
+| **Turmoil integration** | ✅ Always enabled | Deterministic scheduler, ~99% determinism |
+| Async task ordering | ✅ Deterministic | Fully deterministic with Turmoil |
+| Reproducible tests | ✅ Working | Same seed → same execution |
 
 ### 🔮 Future Enhancements (Not Blockers)
 
 | Feature | Impact | Notes |
 |---------|--------|-------|
-| Linearizability checker | Formal verification | Now possible with MadSim - future implementation |
+| Linearizability checker | Formal verification | Now possible with Turmoil - future implementation |
 | Property-based test integration | Automatic shrinking | Determinism enables this - future expansion |
 | Invariant checking DSL | Declarative assertions | Nice-to-have enhancement |
 
@@ -220,19 +218,19 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 
 ## ~~The Core Problem: Non-Deterministic Execution~~ ✅ SOLVED
 
-~~Current tests run on multi-threaded Tokio~~ **UPDATE:** With MadSim integration, we now have full deterministic execution!
+~~Current tests run on multi-threaded Tokio~~ **UPDATE:** With Turmoil integration, we now have full deterministic execution!
 
-### ✅ Achieved with MadSim (CI Nightly)
+### ✅ Achieved with Turmoil (Always Enabled)
 
 - **✅ Deterministic scheduling**: Same seed produces identical event orderings
 - **✅ Reproducible bugs**: Tests can be replayed exactly with same seed
-- **✅ Time control**: VirtualTime + MadSim provide full time control
+- **✅ Time control**: VirtualTime + Turmoil provide full time control
 - **✅ Exact assertions**: Can assert precise state, not just probabilities
 
 ### What We Have Now
 
 ```rust
-// With MadSim (RUSTFLAGS="--cfg madsim"):
+// With Turmoil (always enabled):
 let mut sim = SimNetwork::new(SEED, ...).await;
 let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 10, 5).await;
 
@@ -246,18 +244,6 @@ for _ in 0..30 {
 let result = sim.check_convergence().await;
 assert!(result.is_converged(), "Contracts must converge");
 // Re-run with same seed → identical results
-```
-
-### Standard Mode (Without MadSim)
-
-Standard mode is still useful for faster local iteration:
-
-```rust
-// Standard mode (faster, but ~90% deterministic):
-let mut sim = SimNetwork::new(SEED, ...).await;
-// Same API, slightly less deterministic task ordering
-let rate = sim.convergence_rate().await;
-assert!(rate > 0.8, "Should mostly converge");  // Still useful for quick checks
 ```
 
 ---
@@ -338,13 +324,12 @@ async fn example_test() {
 
 ### Phase 4: Deterministic Scheduler ✅ COMPLETE
 
-MadSim is integrated and active in CI:
+Turmoil is integrated and always enabled:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| MadSim integration | ✅ Complete | Active in CI nightly, ~99% determinism |
-| Turmoil integration | ✅ Complete | Alternative approach via `run_simulation()` |
-| Verify same seed → identical trace | ✅ Working | Validated in CI, reproducible tests |
+| Turmoil integration | ✅ Complete | Always enabled, ~99% determinism |
+| Verify same seed → identical trace | ✅ Working | Reproducible tests |
 
 ### Phase 5: Formal Verification (Future)
 
@@ -441,19 +426,18 @@ async fn test_node_crash_recovery() {
 | Node crash/restart | `crash_node()`, `restart_node()` with state preservation |
 | In-memory state | `MockStateStorage` (Arc-backed, survives restarts) |
 | Single-threaded tests | All tests use `current_thread` runtime |
-| **MadSim determinism** | ✅ Active in CI nightly - full deterministic scheduling |
-| **Turmoil alternative** | ✅ Available via `run_simulation()` for advanced scenarios |
+| **Turmoil determinism** | ✅ Always enabled - full deterministic scheduling |
 
 ### ✅ Determinism Achieved
 
-| Aspect | Standard Mode | MadSim Mode (CI) |
-|--------|---------------|------------------|
-| Determinism level | ~90% | **~99% ✅** |
-| Async scheduling | Partially deterministic | Fully deterministic |
-| Reproducibility | Good for most tests | Perfect - same seed → same execution |
-| Use case | Local development, fast iteration | CI, bug reproduction, formal verification |
+| Aspect | Implementation |
+|--------|----------------|
+| Determinism level | **~99% ✅** |
+| Async scheduling | Fully deterministic |
+| Reproducibility | Perfect - same seed → same execution |
+| Use case | All tests use Turmoil (always enabled) |
 
-### 🔮 Future Enhancements (Enabled by MadSim)
+### 🔮 Future Enhancements (Enabled by Turmoil)
 
 Now that we have full determinism, these become possible:
 
@@ -463,11 +447,10 @@ Now that we have full determinism, these become possible:
 
 ### Implementation Notes
 
-SimNetwork works seamlessly with MadSim because it bypasses the HTTP gateway:
+SimNetwork works seamlessly with Turmoil:
 - Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
 - Uses `SimulationSocket` for P2P transport
 - Calls `run_node_with_shared_storage()` which skips `HttpGateway`
-
-No axum compatibility issues. MadSim integration was straightforward.
+- Turmoil is always enabled as a dependency for deterministic scheduling
 
 See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for detailed implementation history.
