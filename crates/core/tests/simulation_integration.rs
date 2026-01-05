@@ -45,11 +45,16 @@ use std::time::Duration;
 /// - Turmoil only intercepts `tokio::time::Instant` operations
 /// - ~40 instances of `std::time::Instant::now()` in hot paths (connect, topology, ring, backoff)
 ///
-/// ## To fully fix:
-/// - Replace `std::time::Instant` with `tokio::time::Instant` in simulation-relevant code
-/// - Key files: operations/connect.rs, topology/mod.rs, ring/mod.rs, util/backoff.rs
-/// - This will allow Turmoil to control all time-dependent operations
-#[ignore = "std::time::Instant not intercepted by Turmoil - see doc comment"]
+/// ## Fixes Applied (January 2026):
+/// - Replaced `std::time::Instant` with `tokio::time::Instant` in:
+///   - operations/connect.rs, topology/mod.rs, ring/mod.rs, util/backoff.rs
+///   - contract/executor.rs, node/network_bridge/p2p_protoc.rs
+///   - topology/connection_evaluator.rs, topology/meter.rs, topology/running_average.rs
+///   - ring/connection.rs, ring/connection_manager.rs
+///   - operations/orphan_streams.rs, tracing/telemetry.rs
+/// - Added GlobalSimulationTime for deterministic ULID generation
+/// - Transaction::new() now uses GlobalSimulationTime::new_ulid()
+/// - run_simulation() now sets GlobalSimulationTime for reproducible transaction IDs
 #[test]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;

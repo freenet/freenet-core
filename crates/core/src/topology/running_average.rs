@@ -1,6 +1,7 @@
 use crate::topology::rate::Rate;
+use std::collections::VecDeque;
 use std::time::Duration;
-use std::{collections::VecDeque, time::Instant};
+use tokio::time::Instant;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunningAverage {

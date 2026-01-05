@@ -92,7 +92,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
@@ -1780,7 +1781,6 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::Instant;
 
     struct TestRelayContext {
         self_loc: PeerKeyLocation,

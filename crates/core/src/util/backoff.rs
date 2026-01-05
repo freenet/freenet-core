@@ -31,7 +31,8 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Stateless exponential backoff delay calculator.
 ///

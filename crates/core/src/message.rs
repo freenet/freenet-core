@@ -50,7 +50,7 @@ impl Transaction {
 
     pub(crate) fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
-        let id = Ulid::new();
+        let id = crate::config::GlobalSimulationTime::new_ulid();
         Self::update(ty.0, id, None)
     }
 
@@ -58,7 +58,7 @@ impl Transaction {
     /// for atomicity tracking in composite operations.
     pub(crate) fn new_child_of<T: TxType>(parent: &Transaction) -> Self {
         let ty = <T as TxType>::tx_type_id();
-        let id = Ulid::new();
+        let id = crate::config::GlobalSimulationTime::new_ulid();
         Self::update(ty.0, id, Some(parent.id))
     }
 
@@ -124,7 +124,7 @@ impl Transaction {
     /// This will allow, for example, to compare against any older transactions,
     /// in order to remove them.
     pub fn ttl_transaction() -> Self {
-        let id = Ulid::new();
+        let id = crate::config::GlobalSimulationTime::new_ulid();
         let ts = id.timestamp_ms();
         const TTL_MS: u64 = crate::config::OPERATION_TTL.as_millis() as u64;
         let ttl_epoch: u64 = ts - TTL_MS;

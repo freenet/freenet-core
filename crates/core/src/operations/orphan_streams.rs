@@ -30,7 +30,8 @@
 //! - Wire operations handlers to call `claim_or_wait()` when metadata arrives
 //! - Add periodic GC task to clean up expired orphans via `gc_expired()`
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::oneshot;

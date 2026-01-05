@@ -20,7 +20,8 @@
 //! TODO(#2456): Enable HTTPS once TLS is configured on the collector server.
 //! Currently the server only accepts HTTP connections.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use either::Either;
 use futures::future::BoxFuture;

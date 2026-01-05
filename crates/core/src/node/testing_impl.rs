@@ -2047,11 +2047,13 @@ impl SimNetwork {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = turmoil::Result> + 'static,
     {
-        use crate::config::GlobalRng;
+        use crate::config::{GlobalRng, GlobalSimulationTime};
         use std::sync::Mutex;
 
-        // Set up deterministic RNG
+        // Set up deterministic RNG and time for reproducible simulation
         GlobalRng::set_seed(seed);
+        // Use a fixed base time (2024-01-01 00:00:00 UTC) for deterministic ULID generation
+        GlobalSimulationTime::set_time_ms(1704067200000);
 
         // Build Turmoil simulation
         let mut sim = turmoil::Builder::new()

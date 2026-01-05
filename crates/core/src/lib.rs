@@ -117,9 +117,13 @@ pub mod dev_tool {
     /// - Global node index
     /// - Socket registries
     /// - Address network mappings
+    /// - Simulation time
     pub fn reset_all_simulation_state() {
         // Reset RNG (caller should set seed after this)
         crate::config::GlobalRng::clear_seed();
+
+        // Reset simulation time (caller should set time after this if needed)
+        crate::config::GlobalSimulationTime::clear_time();
 
         // Reset all atomic counters
         crate::client_events::RequestId::reset_counter();

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use freenet_stdlib::prelude::*;
 

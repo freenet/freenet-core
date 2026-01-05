@@ -65,7 +65,8 @@ use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
-use std::{collections::BTreeMap, time::Instant};
+use std::collections::BTreeMap;
+use tokio::time::Instant;
 use tracing::{debug, error, event, info, span, warn, Level};
 
 pub mod connection_evaluator;

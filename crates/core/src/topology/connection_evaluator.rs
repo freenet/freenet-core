@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// `ConnectionEvaluator` is used to evaluate connection scores within a specified time window.
 ///
