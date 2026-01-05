@@ -2196,7 +2196,7 @@ pub mod mock_transport {
                         let mut to = tokio::time::interval(config.wait_time);
                         to.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         to.tick().await;
-                        let start = std::time::Instant::now();
+                        let start = tokio::time::Instant::now();
                         let iters = test_gen_cp.expected_iterations();
                         while messages.len() < iters {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
@@ -2742,7 +2742,7 @@ pub mod mock_transport {
                     wait_time = wait_time.as_secs()
                 );
 
-                let now = std::time::Instant::now();
+                let now = tokio::time::Instant::now();
                 tests.push_back(GlobalExecutor::spawn(
                     run_test(
                         TestConfig {
@@ -2876,7 +2876,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(conn)
         });
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let peer_b_conn = tokio::time::timeout(
             Duration::from_secs(5),
             peer_b.connect(gw_pub.clone(), gw_addr).await,
@@ -3181,7 +3181,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(conn)
         });
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let peer_conn_b = tokio::time::timeout(
             Duration::from_secs(5),
             peer.connect(gw_b_pub.clone(), gw_addr).await,
@@ -3313,7 +3313,7 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>(conn)
         });
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let peer_b_conn = tokio::time::timeout(
             Duration::from_secs(5),
             peer_b.connect(gw_pub.clone(), gw_addr).await,

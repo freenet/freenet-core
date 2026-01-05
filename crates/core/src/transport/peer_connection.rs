@@ -1339,7 +1339,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
 ) -> Result<()> {
-    let start_time = std::time::Instant::now();
+    let start_time = tokio::time::Instant::now();
     tracing::trace!(
         peer_addr = %remote_addr,
         packet_id,

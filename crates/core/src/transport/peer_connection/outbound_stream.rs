@@ -401,7 +401,7 @@ mod tests {
         // Expected: 100KB/s with token bucket rate limiting
         // Should throttle appropriately
 
-        let start_time = std::time::Instant::now();
+        let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
@@ -501,7 +501,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let start_time = std::time::Instant::now();
+        let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();

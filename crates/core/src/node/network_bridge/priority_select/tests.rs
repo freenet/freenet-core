@@ -1072,7 +1072,7 @@ async fn test_sparse_messages_reproduce_race() {
             tracing::info!(
                 "Sender: Sending message {} at {:?}",
                 i,
-                std::time::Instant::now()
+                tokio::time::Instant::now()
             );
             let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
                 crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
@@ -1183,7 +1183,7 @@ async fn test_stream_no_lost_messages_sparse_arrivals() {
             tracing::info!(
                 "Sender: Sending message {} at {:?}",
                 i,
-                std::time::Instant::now()
+                tokio::time::Instant::now()
             );
             tx.send(format!("msg{}", i)).await.unwrap();
             tracing::info!("Sender: Message {} sent successfully", i);

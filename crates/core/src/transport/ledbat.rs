@@ -4933,7 +4933,7 @@ mod tests {
 
         // Simulate sustained transfer for transfer_duration
         // Process one ACK per RTT interval
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut ack_count = 0;
         let mut cwnd_sum: u64 = 0;
 
@@ -5866,8 +5866,8 @@ mod tests {
     //
     // Implementation notes:
     // - Duration comparisons use tolerance where exact equality is fragile.
-    // - Tests use wall-clock sleep() because LEDBAT internally uses std::time::Instant
-    //   for epoch timing, which is not affected by tokio's mock time.
+    // - LEDBAT uses TimeSource trait for deterministic simulation testing.
+    // - Tests use tokio::time which is controlled by Turmoil in simulation mode.
     // =========================================================================
 
     /// Helper for approximate Duration comparison with tolerance.
