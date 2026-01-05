@@ -42,7 +42,8 @@ fi
 echo "Running clippy on packages:$packages"
 for pkg in $packages; do
     echo "  Checking $pkg..."
-    cargo clippy -p "$pkg" --all-targets -- -D warnings || exit 1
+    # Include 'bench' feature so benchmarks compile (they use test-only modules)
+    cargo clippy -p "$pkg" --all-targets --features bench -- -D warnings || exit 1
 done
 
 echo "Clippy passed for all changed packages"
