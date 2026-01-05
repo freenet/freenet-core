@@ -439,4 +439,11 @@ The infrastructure achieves ~90% determinism. For full determinism (required for
 1. **MadSim integration** (Recommended) - Drop-in tokio replacement, ~99% determinism
 2. **Custom executor** (Alternative) - FoundationDB-style, ~99%+ determinism
 
+**Key Enabler**: SimNetwork does **NOT** use axum. It bypasses the HTTP gateway entirely:
+- Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- Uses `SimulationSocket` for P2P transport
+- Calls `run_node_with_shared_storage()` which skips `HttpGateway`
+
+This means the previously-noted axum incompatibility with madsim-tokio is NOT a blocker for SimNetwork tests.
+
 See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for detailed analysis.

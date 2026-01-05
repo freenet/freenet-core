@@ -432,17 +432,20 @@ async fn test_with_deterministic_time() {
 | Custom executor | 4-6 weeks | ~99%+ | FoundationDB-style, full control |
 | Accept current state | 0 | ~90% | Sufficient for most testing, not for formal verification |
 
-**Option A: MadSim Integration**
+**Option A: MadSim Integration (Recommended for SimNetwork)**
 
-MadSim provides deterministic scheduling but requires package substitution (`--cfg madsim`).
+MadSim provides deterministic scheduling via package substitution (`--cfg madsim`).
 
-**Challenge**: axum uses tokio features that madsim-tokio doesn't support, blocking global tokio replacement.
+**Key Finding**: SimNetwork does **NOT** initialize the axum web server. It uses:
+- `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- `SimulationSocket` for P2P transport
+- `run_node_with_shared_storage()` which bypasses `HttpGateway`
 
-**Workaround Options**:
-1. **Separate simulation crate** - Compile simulation tests in a crate without axum dependency
-2. **Feature isolation** - Use feature flags to exclude axum from simulation builds
+The axum incompatibility only affects production node paths (`server/mod.rs:run_local_node`), not simulation tests.
 
-**Option B: Custom Deterministic Scheduler (Recommended)**
+**This means**: MadSim can be used for SimNetwork tests without any axum workarounds.
+
+**Option B: Custom Deterministic Scheduler (Alternative)**
 
 Build a lightweight FIFO scheduler on top of existing `GlobalExecutor`:
 
