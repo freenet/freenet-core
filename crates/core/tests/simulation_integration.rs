@@ -915,9 +915,7 @@ async fn test_latency_injection() {
     // With latency injection, messages are queued and delivered after their deadline.
     // We should see more messages delivered in the fast run (immediate delivery)
     // compared to the slow run (delayed delivery).
-    tracing::info!(
-        "VirtualTime latency injection test passed - deterministic timing verified"
-    );
+    tracing::info!("VirtualTime latency injection test passed - deterministic timing verified");
 }
 
 // =============================================================================
@@ -1509,10 +1507,7 @@ async fn test_graceful_shutdown_no_deadlock() {
                                 tracing::info!("Peer {} exited with graceful shutdown", i);
                             }
                             Err(join_err) => {
-                                panic!(
-                                    "Peer {} task panicked or was cancelled: {:?}",
-                                    i, join_err
-                                );
+                                panic!("Peer {} task panicked or was cancelled: {:?}", i, join_err);
                             }
                         }
                         completed += 1;

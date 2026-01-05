@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
@@ -242,8 +242,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
         // Shared state for bidirectional liveness detection
         // Uses u64 nanoseconds for deterministic simulation support
-        let pending_pings: Arc<RwLock<BTreeMap<u64, u64>>> =
-            Arc::new(RwLock::new(BTreeMap::new()));
+        let pending_pings: Arc<RwLock<BTreeMap<u64, u64>>> = Arc::new(RwLock::new(BTreeMap::new()));
         let pending_pings_for_task = pending_pings.clone();
 
         let task_time_source = time_source.clone();
@@ -254,7 +253,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "Keep-alive task STARTED for connection"
             );
 
-            let mut interval = TimeSourceInterval::new(task_time_source.clone(), KEEP_ALIVE_INTERVAL);
+            let mut interval =
+                TimeSourceInterval::new(task_time_source.clone(), KEEP_ALIVE_INTERVAL);
 
             // Skip the first immediate tick
             interval.tick().await;
@@ -329,7 +329,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                     }
                     Err(e) => {
-                        let elapsed = Duration::from_nanos(task_time_source.now_nanos().saturating_sub(task_start_nanos));
+                        let elapsed = Duration::from_nanos(
+                            task_time_source
+                                .now_nanos()
+                                .saturating_sub(task_start_nanos),
+                        );
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
@@ -343,7 +347,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 }
             }
 
-            let elapsed = Duration::from_nanos(task_time_source.now_nanos().saturating_sub(task_start_nanos));
+            let elapsed = Duration::from_nanos(
+                task_time_source
+                    .now_nanos()
+                    .saturating_sub(task_start_nanos),
+            );
             tracing::warn!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
@@ -406,27 +414,37 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check_sleep: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
-            Some(self.time_source.sleep(Duration::from_millis(10)));
+        let mut resend_check_sleep: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        > = Some(self.time_source.sleep(Duration::from_millis(10)));
 
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(120);
         const KILL_CONNECTION_AFTER_NANOS: u64 = KILL_CONNECTION_AFTER.as_nanos() as u64;
         let mut last_received_nanos = self.time_source.now_nanos();
 
         // Check for timeout periodically
-        let mut timeout_check = TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
+        let mut timeout_check =
+            TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
 
         // Background ACK timer - sends pending ACKs proactively every 100ms
         // This prevents delays when there's no outgoing traffic to piggyback ACKs on
         // Use interval_at to delay the first tick - unlike the keep-alive task which can
         // block to skip its first tick, we're inside a select! loop so we delay instead
         let ack_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
-        let mut ack_check = TimeSourceInterval::new_at(self.time_source.clone(), ack_start_nanos, ACK_CHECK_INTERVAL);
+        let mut ack_check = TimeSourceInterval::new_at(
+            self.time_source.clone(),
+            ack_start_nanos,
+            ACK_CHECK_INTERVAL,
+        );
 
         // Rate update timer - updates TokenBucket rate based on LEDBAT cwnd every 100ms
         // This allows the token bucket to adapt to network conditions dynamically
         let rate_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
-        let mut rate_update_check = TimeSourceInterval::new_at(self.time_source.clone(), rate_start_nanos, ACK_CHECK_INTERVAL);
+        let mut rate_update_check = TimeSourceInterval::new_at(
+            self.time_source.clone(),
+            rate_start_nanos,
+            ACK_CHECK_INTERVAL,
+        );
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;

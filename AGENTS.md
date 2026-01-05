@@ -136,6 +136,120 @@ Run these in any worktree before pushing a branch or opening a PR.
 - The repository uses the special `TODO-` `MUST-FIX` marker to block commits that temporarily disable tests. If a test must be skipped, leave a `// TODO-` `MUST-FIX:` comment explaining why and create a follow-up issue.
 - Never remove or ignore failing tests without understanding the root cause.
 
+### Deterministic Simulation Testing (DST) Guidelines
+
+The codebase uses deterministic simulation testing to ensure reproducible test results. When working with simulation code or tests in `crates/core`, follow these guidelines:
+
+#### ❌ DON'T: Use Non-Deterministic Time Sources
+
+```rust
+// BAD - Uses real time, non-deterministic
+use std::time::Instant;
+let start = Instant::now();
+
+// BAD - Uses tokio's real time
+tokio::time::sleep(Duration::from_secs(1)).await;
+
+// BAD - tokio::time::timeout depends on real time
+tokio::time::timeout(Duration::from_secs(5), async { ... }).await;
+```
+
+#### ✅ DO: Use VirtualTime and TimeSource
+
+```rust
+// GOOD - Use TimeSource trait for time operations
+use crate::transport::TimeSource;
+
+// For sleeping in simulation tests, advance VirtualTime explicitly:
+for _ in 0..10 {
+    sim.advance_time(Duration::from_millis(100));
+    tokio::task::yield_now().await;
+}
+
+// For components that need time, inject TimeSource:
+fn new_with_time_source<T: TimeSource>(time_source: T) -> Self { ... }
+```
+
+#### ❌ DON'T: Use Non-Deterministic Random Sources
+
+```rust
+// BAD - Uses system entropy, non-deterministic
+let value: u64 = rand::random();
+
+// BAD - Creates unseeded RNG
+let mut rng = rand::thread_rng();
+```
+
+#### ✅ DO: Use GlobalRng
+
+```rust
+// GOOD - Uses seeded RNG in simulation mode
+use crate::config::GlobalRng;
+
+// Generate random values
+let value = GlobalRng::random_u64();
+let in_range = GlobalRng::random_range(0u8..100);
+
+// Fill byte arrays
+let mut bytes = [0u8; 32];
+GlobalRng::fill_bytes(&mut bytes);
+
+// For complex RNG operations
+let result = GlobalRng::with_rng(|rng| {
+    use rand::Rng;
+    rng.random::<f64>()
+});
+```
+
+#### ❌ DON'T: Use Real Network I/O in Simulation
+
+```rust
+// BAD - Real UDP socket in simulation code
+use tokio::net::UdpSocket;
+let socket = UdpSocket::bind("0.0.0.0:0").await?;
+```
+
+#### ✅ DO: Use SimulationSocket
+
+```rust
+// GOOD - In-memory socket with VirtualTime
+use crate::transport::SimulationSocket;
+let socket = SimulationSocket::bind(addr).await?;
+```
+
+#### Key Abstractions
+
+| Concern | Abstraction | Location |
+|---------|-------------|----------|
+| Time | `TimeSource` trait, `VirtualTime`, `RealTime` | `crates/core/src/transport/` |
+| RNG | `GlobalRng` | `crates/core/src/config.rs` |
+| Sockets | `Socket` trait, `SimulationSocket` | `crates/core/src/transport/` |
+| Async execution | `GlobalExecutor` | `crates/core/src/config.rs` |
+
+#### Test Pattern: Advancing Virtual Time
+
+When migrating tests from `start_paused = true` to explicit VirtualTime:
+
+```rust
+// OLD PATTERN (implicit tokio paused time):
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_foo() {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+}
+
+// NEW PATTERN (explicit VirtualTime):
+#[tokio::test(flavor = "current_thread")]
+async fn test_foo() {
+    // Advance time explicitly, yielding to let tasks process
+    for _ in 0..30 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+}
+```
+
+This makes time progression explicit and deterministic, independent of tokio's internal time handling.
+
 ### Integration Testing with `freenet-test-network`
 - Use the `freenet-test-network` crate from https://github.com/freenet/freenet-test-network to spin up gateways and peers for integration tests.
 - Add it as a dev-dependency using either a path (if cloned locally) or git dependency, and construct networks with the builder API.

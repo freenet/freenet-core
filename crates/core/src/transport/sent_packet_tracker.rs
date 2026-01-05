@@ -477,7 +477,10 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(wait_until_nanos) => {
                 // With virtual time, the deadline should be in the future
                 let now_nanos = tracker.time_source.now_nanos();
-                assert!(wait_until_nanos >= now_nanos, "Wait deadline should be in the future");
+                assert!(
+                    wait_until_nanos >= now_nanos,
+                    "Wait deadline should be in the future"
+                );
             }
             _ => panic!("Expected ResendAction::WaitUntil"),
         }
