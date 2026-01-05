@@ -18,9 +18,8 @@ The simulation testing framework enables reproducible testing of the Freenet net
 | Component | File | Purpose |
 |-----------|------|---------|
 | `VirtualTime` | `time.rs` | Deterministic time with wakeup scheduling |
+| `TimeSource` | `time.rs` | Trait for real vs virtual time |
 | `SimulationRng` | `rng.rs` | Thread-safe seeded RNG |
-| `Scheduler` | `scheduler.rs` | Priority-queue event ordering |
-| `SimulatedNetwork` | `network.rs` | Deterministic message delivery |
 | `FaultConfig` | `fault.rs` | Message loss, partitions, crashes |
 
 ### Test Infrastructure (`crates/core/src/node/testing_impl.rs`)
@@ -32,11 +31,9 @@ The simulation testing framework enables reproducible testing of the Freenet net
 | `TestEventListener` | Captures network events for verification |
 | `EventSummary` | Structured event data for assertions |
 
-## Two Simulation Systems
+## SimNetwork Architecture
 
-### 1. SimNetwork (Async-Based)
-
-The existing `SimNetwork` uses the tokio async runtime:
+SimNetwork is the production-ready simulation framework:
 
 ```
 SimNetwork
@@ -44,34 +41,19 @@ SimNetwork
     │   └── Message channels between nodes
     ├── TestEventListener (shared)
     │   └── Captures all network events
-    └── EventChain
-        └── Generates Put/Get/Subscribe events
+    ├── EventChain
+    │   └── Generates Put/Get/Subscribe events
+    ├── VirtualTime (always enabled)
+    │   └── Controlled time progression
+    └── FaultInjectorState
+        └── Message loss, partitions, latency
 ```
 
 **Characteristics:**
 - Nodes run as actual async tasks
-- Uses real time (`tokio::time`)
-- Realistic concurrency behavior
-- Non-deterministic event ordering (multi-threaded tokio)
-
-### 2. SimulatedNetwork (Synchronous)
-
-The new `SimulatedNetwork` is purely synchronous:
-
-```
-SimulatedNetwork
-    ├── Scheduler (event queue)
-    │   └── VirtualTime (controlled time)
-    ├── FaultConfig
-    │   └── Message loss, partitions
-    └── Delivered queues (per peer)
-```
-
-**Characteristics:**
-- Synchronous, event-driven
-- Uses VirtualTime (fully controlled)
-- Fully deterministic
-- Not yet integrated with actual nodes
+- Uses Turmoil for deterministic task scheduling
+- VirtualTime for controlled time progression
+- ~99% determinism with same seed
 
 ## Current Determinism Guarantees
 
