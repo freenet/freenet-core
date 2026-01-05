@@ -4,7 +4,8 @@ This document analyzes what it would take to make Freenet's simulation tests ful
 
 ## Current State (January 2026)
 
-SimNetwork achieves **~95% determinism** through:
+SimNetwork achieves **~99% determinism** through:
+- ✅ **Turmoil integration** - Deterministic async task scheduling (required dependency)
 - ✅ **GlobalRng** for all random decisions (seeded, deterministic)
 - ✅ **VirtualTime** with explicit time control (`sim.advance_time()`)
 - ✅ **TimeSource trait** injected into components (replaces direct `tokio::time::`)
@@ -23,12 +24,18 @@ SimNetwork achieves **~95% determinism** through:
 | Phase 2: GlobalRng migration | ✅ Complete | `rand::random()` → `GlobalRng` in production code |
 | Phase 3: TimeSource injection | ✅ Complete | Components use `TimeSource` trait, not `tokio::time` |
 | Phase 4: start_paused removal | ✅ Complete | Tests use `sim.advance_time()` + `yield_now()` pattern |
+| Phase 5: Turmoil integration | ✅ Complete | Deterministic scheduling via Turmoil (always enabled) |
 
-### Remaining Gap: Async Scheduling Non-Determinism
+### Turmoil Integration Complete
 
-**Full determinism still blocked by:**
-- ⚠️ **Async task scheduling** - Tokio's scheduler doesn't guarantee ordering
-- ⚠️ Channel message ordering (partially mitigated by single-threaded)
+**Turmoil provides deterministic async scheduling:**
+- ✅ All SimNetwork nodes run as Turmoil hosts
+- ✅ Test logic runs as Turmoil clients
+- ✅ Turmoil is a required dependency (not optional)
+- ✅ `SimNetwork::run_simulation()` method for deterministic tests
+
+**Remaining minor sources of non-determinism:**
+- ⚠️ Channel message ordering (mostly mitigated by Turmoil's scheduler)
 - ⚠️ `select!` macro branch selection (use `biased` where possible)
 
 **Why this matters for linearizability:**
@@ -201,41 +208,40 @@ let elapsed = time_source.now_nanos() - start;
 **Effort:** 3-4 weeks
 **Determinism achieved:** ~85-90%
 
-### Option C: Turmoil Integration (Medium Effort, High Determinism)
+### Option C: Turmoil Integration ✅ IMPLEMENTED
 
-[Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's experimental deterministic simulation framework.
+[Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's deterministic simulation framework.
+
+**Status:** ✅ Integrated as a required dependency (not optional)
 
 **How it works:**
 - Single-threaded execution across all "hosts"
-- Each host gets its own tokio Runtime
+- Each host gets its own tokio Runtime (with Turmoil's scheduler)
 - Explicit time control via simulation stepping
-- Simulated network with tokio::net-compatible types
+- Works with our SimulationSocket for in-memory networking
 
-**API Example:**
+**SimNetwork Integration:**
 ```rust
-let mut sim = Builder::new().build();
+let sim = SimNetwork::new("test", 1, 5, 7, 3, 10, 2, 42).await;
 
-sim.host("server", || async move {
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    // ...
-});
-
-sim.client("test", async move {
-    // Test code
-});
-
-// Run simulation
-sim.run().unwrap();
+sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+    42,   // seed
+    10,   // max_contract_num
+    100,  // iterations
+    Duration::from_secs(60),
+    || async {
+        // Test assertions run inside Turmoil
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(())
+    },
+)?;
 ```
 
-**Challenges for Freenet:**
-- Experimental framework (breaking changes possible)
-- Requires auditing all dependencies for non-determinism
-- Different code path than production
-- Limited community adoption
+**Key Files:**
+- `crates/core/src/node/testing_impl/turmoil_runner.rs` - Turmoil runner module
+- `crates/core/tests/turmoil_poc.rs` - POC tests validating Turmoil + SimulationSocket
 
-**Effort:** 2-3 weeks for prototype, ongoing maintenance
-**Determinism achieved:** ~95%
+**Determinism achieved:** ~99%
 
 ### Option D: GlobalExecutor Abstraction + MadSim (Recommended)
 
@@ -415,20 +421,23 @@ async fn test_with_deterministic_time() {
 }
 ```
 
-### Phase 5: Deterministic Scheduler (NEXT - Required for Linearizability)
+### Phase 5: Deterministic Scheduler ✅ COMPLETE
 
-**The remaining gap:** Async task scheduling is still non-deterministic. When multiple futures are ready simultaneously, tokio doesn't guarantee execution order.
+**Status:** Turmoil has been integrated as a required dependency.
 
-**Why this matters:**
-- Cannot prove linearizability without deterministic event ordering
-- Same seed may produce different interleavings
-- Formal verification requires exact replay capability
+**What was done:**
+- ✅ Made Turmoil a required (non-optional) dependency
+- ✅ Added `SimNetwork::run_simulation()` method wrapping nodes in Turmoil hosts
+- ✅ Test logic runs as Turmoil clients
+- ✅ Validated with POC tests in `crates/core/tests/turmoil_poc.rs`
 
-**Solution Options:**
+**Determinism achieved:** ~99%
+
+**Solution Options (Historical):**
 
 | Option | Effort | Determinism | Notes |
 |--------|--------|-------------|-------|
-| **Turmoil integration** | 1-2 weeks | ~99% | **Validated via POC** - works with SimulationSocket |
+| **Turmoil integration** | 1-2 weeks | ~99% | ✅ **IMPLEMENTED** - works with SimulationSocket |
 | MadSim integration | 1-2 weeks | ~99% | Drop-in tokio replacement, used by RisingWave |
 | Custom executor | 4-6 weeks | ~99%+ | FoundationDB-style, full control |
 | Accept current state | 0 | ~90% | Sufficient for most testing, not for formal verification |
