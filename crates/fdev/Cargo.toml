@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 http = "1.4"
 
 # internal
-freenet = { path = "../core", version = "0.1.82" }
+freenet = { path = "../core", version = "0.1.84" }
 freenet-stdlib = { workspace = true }
 
 [features]
