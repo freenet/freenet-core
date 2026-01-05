@@ -1522,6 +1522,25 @@ impl SimNetwork {
         counts
     }
 
+    /// Returns a handle to the event logs that can be accessed after `run_simulation` consumes `self`.
+    ///
+    /// This is useful for tests that need to compare event logs between runs when using
+    /// Turmoil's deterministic scheduler via `run_simulation()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let sim = SimNetwork::new(...).await;
+    /// let logs_handle = sim.event_logs_handle();
+    ///
+    /// sim.run_simulation::<SmallRng, _, _>(...)?;
+    ///
+    /// // Access logs after simulation completes
+    /// let logs = logs_handle.lock().await;
+    /// ```
+    pub fn event_logs_handle(&self) -> Arc<tokio::sync::Mutex<Vec<crate::tracing::NetLogMessage>>> {
+        self.event_listener.logs.clone()
+    }
+
     /// Recommended to calling after `check_connectivity` to ensure enough time
     /// elapsed for all peers to become connected.
     ///

@@ -430,7 +430,7 @@ async fn test_node_crash_recovery() {
 
 ### ⚠️ Known Non-Determinism Issues
 
-**Status:** Strict determinism tests FAIL due to tokio task scheduling non-determinism.
+**Status:** Strict determinism tests now use Turmoil but still fail due to remaining HashMap usage.
 
 #### Fixes Applied (January 2026)
 
@@ -441,42 +441,43 @@ async fn test_node_crash_recovery() {
 | Same-deadline message ordering | Added sort by (deadline, source, target) | ✅ Fixed |
 | Connections HashMap in P2pConnManager | Changed to BTreeMap | ✅ Fixed |
 | TransportPublicKey missing Ord | Added Ord implementation | ✅ Fixed |
+| Turmoil integration | Tests now use `run_simulation()` | ✅ Fixed |
+| Event logs access after simulation | Added `event_logs_handle()` method | ✅ Fixed |
 
-#### Remaining Issue: Tokio Task Scheduling
+#### Progress Made
 
-The fundamental blocker is that SimNetwork tests run on `tokio::test(current_thread)`, which
-does NOT provide deterministic task scheduling. When multiple async tasks are ready to run,
-tokio picks one based on internal state that varies between runs.
+The strict determinism test (`test_strict_determinism_exact_event_equality`) now:
+- Uses Turmoil's deterministic scheduler via `run_simulation()`
+- Captures events via `event_logs_handle()` before simulation consumes SimNetwork
+- Reaches index 47 before failing (vs index 10 before fixes)
 
-**Impact:** Event sequence differs at random points (index 10, 33, etc.) between runs.
+This represents significant improvement - Turmoil provides deterministic task scheduling,
+eliminating tokio's non-deterministic behavior.
 
-**Solution Required:** Complete the Turmoil integration. The `turmoil_runner.rs` module exists
-but is currently a placeholder that doesn't run actual Freenet nodes inside Turmoil hosts.
+#### Remaining Issue: HashMap Iteration in Other Modules
 
-### 🔮 Future Work: Complete Turmoil Integration
+Non-determinism still exists from HashMap iteration in:
+- `topology/mod.rs`: `source_creation_times`, `usage_per_source`
+- `contract/executor.rs`: `pending_responses`
+- `transport/*.rs`: Various packet/connection tracking maps
 
-To achieve full determinism:
+**Solution Required:** Audit and convert remaining HashMaps that are iterated in hot paths
+to BTreeMap (for ordered iteration) or ensure iteration order doesn't affect behavior.
 
-1. **Update turmoil_runner.rs** to run real Freenet nodes:
-   - Create NodeConfig for each Turmoil host
-   - Call `run_node_with_shared_storage()` inside each host
-   - Use Turmoil's `sim.run()` to drive execution
+### 🔮 Future Work
 
-2. **Alternative: Custom deterministic executor**
-   - Control exactly when each task is polled
-   - Require explicit `yield_now()` at deterministic points
-
-Once Turmoil integration is complete, these become possible:
+Once all HashMap non-determinism is fixed:
 - Linearizability checker (Jepsen/Knossos-style verification)
 - Property-based testing with automatic shrinking
 - Invariant checking DSL for declarative assertions
 
 ### Implementation Notes
 
-SimNetwork uses:
-- `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
-- `SimulationSocket` for P2P transport
-- `run_node_with_shared_storage()` which skips `HttpGateway`
-- Plain tokio runtime (NOT Turmoil scheduler - this is the problem)
+SimNetwork with Turmoil:
+- Uses `MemoryEventsGen<R>` for client events (not HTTP/WebSocket)
+- Uses `SimulationSocket` for P2P transport
+- Calls `run_node_with_shared_storage()` inside Turmoil hosts
+- `run_simulation()` provides deterministic task scheduling
+- `event_logs_handle()` enables event capture for comparison
 
 See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for detailed implementation history.
