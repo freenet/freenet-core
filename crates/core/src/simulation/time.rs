@@ -529,20 +529,20 @@ mod tests {
     // Tests for the standard VirtualTime implementation (non-MadSim).
     // These use internal APIs like register_wakeup() that only exist in the standard impl.
 
-        #[test]
+    #[test]
     fn test_virtual_time_starts_at_zero() {
         let vt = VirtualTime::new();
         assert_eq!(vt.now_nanos(), 0);
     }
 
-        #[test]
+    #[test]
     fn test_virtual_time_advance() {
         let vt = VirtualTime::new();
         vt.advance(Duration::from_secs(10));
         assert_eq!(vt.now_nanos(), 10_000_000_000);
     }
 
-        #[test]
+    #[test]
     fn test_virtual_time_wakeup_ordering() {
         let vt = VirtualTime::new();
 
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(triggered.len(), 1);
     }
 
-        #[test]
+    #[test]
     fn test_virtual_time_same_deadline_fifo() {
         let vt = VirtualTime::new();
 
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(triggered[2], id3);
     }
 
-        #[test]
+    #[test]
     fn test_virtual_time_advance_to_next() {
         let vt = VirtualTime::new();
 
@@ -616,7 +616,7 @@ mod tests {
         assert!(t2 > t1);
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_virtual_time_sleep_immediate() {
         let vt = VirtualTime::with_initial_time(1000);
 
