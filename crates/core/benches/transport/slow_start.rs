@@ -175,7 +175,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("slow_start/warm_connection");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
+    group.measurement_time(Duration::from_secs(25)); // ~408ms/iter × 10 samples + warmup
 
     // Use 16KB only - mock transport is unreliable with larger sizes
     let transfer_size = 16 * 1024;
