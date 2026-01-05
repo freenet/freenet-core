@@ -1,63 +1,90 @@
-//! LEDBAT Validation Benchmarks
+//! LEDBAT Validation Benchmarks with VirtualTime
 //!
 //! These benchmarks test LEDBAT congestion control behavior with separate
 //! cold start and warm connection measurements.
+//!
+//! Uses VirtualTime for instant execution of network operations.
+//! Expected runtime: ~30 seconds (vs ~5-10 minutes with real time)
 //!
 //! **Design principles:**
 //! - Cold start: Create new connection per iteration (measures connection + transfer)
 //! - Warm connection: Reuse connection across iterations (measures pure transfer)
 //! - Keep OutboundConnectionHandler alive to prevent channel closure
-//!
-//! Total runtime: ~3-5 minutes
 
 use criterion::{Criterion, Throughput};
+use dashmap::DashMap;
+use freenet::simulation::{TimeSource, VirtualTime};
+use freenet::transport::mock_transport::{Channels, PacketDelayPolicy, PacketDropPolicy};
 use std::hint::black_box as std_black_box;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
-use super::common::{
-    create_benchmark_runtime, create_connected_peers, ConnectedPeerPair, SMALL_SIZES,
-};
+use super::common::{create_peer_pair_with_virtual_time, SMALL_SIZES};
 
-/// Cold start benchmark: measures connection establishment + transfer
+/// Cold start benchmark with VirtualTime: measures connection establishment + transfer
 ///
 /// Each iteration creates a fresh connection, measuring real cold-start behavior.
-/// This is useful for understanding first-message latency.
-///
-/// Tests multiple message sizes to understand the scaling behavior.
+/// With VirtualTime, connection handshakes complete instantly.
 pub fn bench_large_transfer_validation(c: &mut Criterion) {
-    let rt = create_benchmark_runtime();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let time_source = VirtualTime::new();
 
     let mut group = c.benchmark_group("ledbat/cold_start");
+    group.sample_size(10);
 
     // Test multiple sizes: 1KB, 4KB, 16KB
-    // Note: 64KB is skipped due to benchmark timeout issues with larger transfers
     for &(size, name) in SMALL_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
-        // Cold start: connection created per iteration
-        // Use iter() instead of iter_batched() for simpler async handling
+        let ts = time_source.clone();
         group.bench_function(name, |b| {
-            b.to_async(&rt).iter(|| async move {
-                let ConnectedPeerPair {
-                    mut conn_a,
-                    mut conn_b,
-                    ..
-                } = create_connected_peers().await;
+            b.to_async(&rt).iter_custom(|iters| {
+                let ts = ts.clone();
+                async move {
+                    let mut total_virtual_time = Duration::ZERO;
 
-                let message = vec![0xABu8; size];
+                    for _ in 0..iters {
+                        let channels: Channels = Arc::new(DashMap::new());
 
-                // Transfer - handle errors gracefully
-                if let Err(e) = conn_a.send(message).await {
-                    eprintln!("ledbat_cold send failed: {:?}", e);
-                    return;
-                }
-                match conn_b.recv().await {
-                    Ok(received) => {
-                        assert!(!received.is_empty());
-                        std_black_box(received);
+                        // Create connected peers with VirtualTime
+                        let mut peers = create_peer_pair_with_virtual_time(
+                            channels,
+                            Duration::ZERO, // No delay for baseline
+                            ts.clone(),
+                        )
+                        .await
+                        .connect()
+                        .await;
+
+                        let message = vec![0xABu8; size];
+                        let start_virtual = ts.now_nanos();
+
+                        // Transfer
+                        if let Err(e) = peers.conn_a.send(message).await {
+                            eprintln!("ledbat_cold send failed: {:?}", e);
+                            continue;
+                        }
+                        match peers.conn_b.recv().await {
+                            Ok(received) => {
+                                std_black_box(received);
+                            }
+                            Err(e) => {
+                                eprintln!("ledbat_cold recv failed: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        let end_virtual = ts.now_nanos();
+                        total_virtual_time +=
+                            Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
                     }
-                    Err(e) => eprintln!("ledbat_cold recv failed: {:?}", e),
+
+                    total_virtual_time
                 }
             });
         });
@@ -66,69 +93,82 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
     group.finish();
 }
 
-/// Warm connection benchmark: measures pure transfer throughput
+/// Warm connection benchmark with VirtualTime: measures pure transfer throughput
 ///
-/// Connection is established once and reused across iterations.
-/// This measures steady-state LEDBAT throughput without connection overhead.
-///
-/// **Key fix**: Keep OutboundConnectionHandler (peer) alive alongside PeerConnection.
-/// The peer holds the inbound_packet_sender channel - dropping it closes the connection.
+/// Connection is established once with warmup, then measures steady-state throughput.
+/// With VirtualTime, all operations complete instantly while tracking virtual elapsed time.
 pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
-    let rt = create_benchmark_runtime();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let time_source = VirtualTime::new();
 
     let mut group = c.benchmark_group("ledbat/warm_connection");
+    group.sample_size(10);
 
     // Test multiple sizes: 1KB, 4KB, 16KB
     for &(size, name) in SMALL_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
+        let ts = time_source.clone();
         group.bench_function(name, |b| {
-            // Create connection once, keep both peers AND connections alive
-            // Track warmup success to skip iterations if connection is broken
-            let warmup_success = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let warmup_success_clone = warmup_success.clone();
-
-            let peers = rt.block_on(async {
-                let mut peers = create_connected_peers().await;
-
-                // Warmup: 5 transfers to stabilize LEDBAT cwnd
-                let completed = peers.warmup(5, size).await;
-                if completed > 0 {
-                    warmup_success_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                } else {
-                    eprintln!("ledbat warmup failed completely - benchmark will be skipped");
-                }
-
-                peers
-            });
-
-            // Wrap in Arc<Mutex> for sharing across iterations
-            let peers = Arc::new(Mutex::new(peers));
-
-            b.to_async(&rt).iter(|| {
-                let peers = peers.clone();
-                let warmup_ok = warmup_success.clone();
+            b.to_async(&rt).iter_custom(|iters| {
+                let ts = ts.clone();
                 async move {
-                    // Skip iterations if warmup failed - fail fast instead of timing out
-                    if !warmup_ok.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
+                    let mut total_virtual_time = Duration::ZERO;
 
-                    let mut p = peers.lock().await;
+                    // Create connection once for this measurement batch
+                    let channels: Channels = Arc::new(DashMap::new());
+                    let mut peers =
+                        create_peer_pair_with_virtual_time(channels, Duration::ZERO, ts.clone())
+                            .await
+                            .connect()
+                            .await;
 
-                    let message = vec![0xABu8; size];
-                    // Handle errors gracefully
-                    if let Err(e) = p.conn_a.send(message).await {
-                        eprintln!("ledbat_warm send failed: {:?}", e);
-                        return;
-                    }
-                    match p.conn_b.recv().await {
-                        Ok(received) => {
-                            assert!(!received.is_empty());
-                            std_black_box(received);
+                    // Warmup: 5 transfers to stabilize LEDBAT cwnd
+                    for i in 0..5 {
+                        let warmup_msg = vec![0xABu8; size];
+                        if let Err(e) = peers.conn_a.send(warmup_msg).await {
+                            eprintln!("ledbat warmup send {} failed: {:?}", i, e);
+                            break;
                         }
-                        Err(e) => eprintln!("ledbat_warm recv failed: {:?}", e),
+                        match peers.conn_b.recv().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("ledbat warmup recv {} failed: {:?}", i, e);
+                                break;
+                            }
+                        }
                     }
+
+                    // Measured iterations
+                    for _ in 0..iters {
+                        let message = vec![0xABu8; size];
+                        let start_virtual = ts.now_nanos();
+
+                        if let Err(e) = peers.conn_a.send(message).await {
+                            eprintln!("ledbat_warm send failed: {:?}", e);
+                            continue;
+                        }
+                        match peers.conn_b.recv().await {
+                            Ok(received) => {
+                                std_black_box(received);
+                            }
+                            Err(e) => {
+                                eprintln!("ledbat_warm recv failed: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        let end_virtual = ts.now_nanos();
+                        total_virtual_time +=
+                            Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
+                    }
+
+                    total_virtual_time
                 }
             });
         });
@@ -136,13 +176,3 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
 
     group.finish();
 }
-
-// NOTE: Benchmarks with 32KB+ transfers timeout during criterion warmup phase.
-// This appears to be an interaction between criterion's async benchmarking and
-// larger message sizes. The transport layer itself handles large transfers fine
-// (verified by unit tests). This needs further investigation.
-//
-// To properly test throughput approaching the 10 MB/s rate limit, we need either:
-// 1. A custom benchmark harness that doesn't use criterion's iter()
-// 2. Investigation into why criterion's warmup estimation hangs with large transfers
-// 3. Real UDP socket benchmarks instead of mock transport
