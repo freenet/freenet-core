@@ -302,12 +302,11 @@ mod tests {
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
         let (outbound_sender, outbound_receiver) = fast_channel::bounded(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(())
-            .take(100_000)
-            .map(|_| rand::random::<u8>())
-            .collect();
+        let mut message = vec![0u8; 100_000];
+        crate::config::GlobalRng::fill_bytes(&mut message);
         let cipher = {
-            let key = rand::random::<[u8; 16]>();
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
             Aes128Gcm::new(&key.into())
         };
 

@@ -6703,7 +6703,7 @@ mod tests {
     /// Test determinism: same seed produces identical behavior.
     #[test]
     fn test_harness_determinism() {
-        // Disable randomize_ssthresh since that uses rand::random() outside our control
+        // Disable randomize_ssthresh for extra determinism certainty in this test
         let config = LedbatConfig {
             randomize_ssthresh: false,
             ..Default::default()

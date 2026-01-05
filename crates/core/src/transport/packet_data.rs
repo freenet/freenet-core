@@ -405,7 +405,8 @@ mod packet_type_discrimination_tests {
 
     #[test]
     fn test_is_symmetric_packet_with_valid_symmetric() {
-        let key = rand::random::<[u8; 16]>();
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test symmetric data");
         let encrypted = plaintext.encrypt_symmetric(&cipher);
@@ -461,7 +462,8 @@ mod packet_type_discrimination_tests {
     fn test_max_data_size_fits_in_max_packet_size() {
         // Create maximum size plaintext
         let max_plaintext = vec![0xAB; MAX_DATA_SIZE];
-        let key = rand::random::<[u8; 16]>();
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
 
         let plaintext = PacketData::<Plaintext, MAX_PACKET_SIZE>::from_buf_plain(&max_plaintext);
@@ -478,7 +480,8 @@ mod packet_type_discrimination_tests {
 
     #[test]
     fn test_symmetric_encryption_includes_packet_type() {
-        let key = rand::random::<[u8; 16]>();
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test data");
         let encrypted = plaintext.encrypt_symmetric(&cipher);
@@ -492,7 +495,8 @@ mod packet_type_discrimination_tests {
 
     #[test]
     fn test_symmetric_decryption_validates_packet_type() {
-        let key = rand::random::<[u8; 16]>();
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
         let plaintext = PacketData::<Plaintext, 1000>::from_buf_plain(b"test");
         let mut encrypted = plaintext.encrypt_symmetric(&cipher);

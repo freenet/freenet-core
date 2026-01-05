@@ -1592,11 +1592,10 @@ mod tests {
         const MSG_LEN: usize = 1000;
         let (sender, receiver) = fast_channel::bounded(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(0)
-            .take(MSG_LEN)
-            .map(|_| rand::random::<u8>())
-            .collect();
-        let key = rand::random::<[u8; 16]>();
+        let mut message = vec![0u8; MSG_LEN];
+        crate::config::GlobalRng::fill_bytes(&mut message);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
 
         // Initialize with VirtualTime for deterministic testing
