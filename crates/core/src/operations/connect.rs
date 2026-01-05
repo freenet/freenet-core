@@ -1652,8 +1652,14 @@ pub(crate) async fn initial_join_procedure(
             let unconnected_count = unconnected_gateways.len();
 
             if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
-                // Filter out gateways that are in backoff due to previous failures
-                // This prevents hammering acceptors that consistently fail (e.g., NAT issues)
+                // Filter out gateways that are in backoff due to previous failures.
+                // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
+                //
+                // Design note: We track backoff per-gateway rather than per-acceptor because
+                // location-based routing is deterministic - the same gateway will route to
+                // the same acceptor for a given target location. So if a connect through
+                // gateway G fails (likely due to NAT issues with the acceptor it routes to),
+                // backing off G is equivalent to backing off that acceptor.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut min_remaining: Option<Duration> = None;
