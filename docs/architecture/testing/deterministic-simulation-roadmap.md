@@ -428,6 +428,7 @@ async fn test_with_deterministic_time() {
 
 | Option | Effort | Determinism | Notes |
 |--------|--------|-------------|-------|
+| **Turmoil integration** | 1-2 weeks | ~99% | **Validated via POC** - works with SimulationSocket |
 | MadSim integration | 1-2 weeks | ~99% | Drop-in tokio replacement, used by RisingWave |
 | Custom executor | 4-6 weeks | ~99%+ | FoundationDB-style, full control |
 | Accept current state | 0 | ~90% | Sufficient for most testing, not for formal verification |
@@ -474,6 +475,43 @@ impl DeterministicScheduler {
 - Full control over task ordering
 - Integrates with existing `VirtualTime` and `GlobalRng`
 - Works within current `GlobalExecutor` abstraction
+
+**Option C: Turmoil Integration (Validated - Recommended)**
+
+[Turmoil](https://github.com/tokio-rs/turmoil) is Tokio's deterministic simulation framework. A proof-of-concept (see `crates/core/tests/turmoil_poc.rs`) has validated that:
+
+✅ **Turmoil works with our existing infrastructure:**
+- Basic async code runs correctly inside Turmoil hosts
+- `tokio::sync::mpsc` channels work across Turmoil hosts
+- Global registries (like SimulationSocket uses) work correctly
+- **Our actual `SimulationSocket` works inside Turmoil hosts**
+- Determinism verified: same execution order across runs
+
+**Key Advantage**: No tokio patching required. Turmoil intercepts `tokio::time` automatically.
+
+**Integration Path**:
+1. Wrap SimNetwork node startup in `sim.host()` calls
+2. Use Turmoil's time instead of (or alongside) VirtualTime
+3. Keep SimulationSocket for network (already works)
+
+```rust
+#[test]
+fn test_with_turmoil() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new().build();
+
+    // Each node is a Turmoil host
+    sim.host("gateway", || async {
+        let socket = SimulationSocket::bind(addr).await?;
+        // Node code runs here with deterministic scheduling
+        Ok(())
+    });
+
+    sim.run()
+}
+```
+
+**Effort**: 1-2 weeks to adapt SimNetwork to use Turmoil's host model
+**Determinism**: ~99% (deterministic scheduling + our existing infrastructure)
 
 ### Phase 6: Linearizability Verification (Future)
 
