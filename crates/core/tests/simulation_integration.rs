@@ -1429,7 +1429,12 @@ async fn test_minimal_network() {
 /// - EventChain held a watch::Sender that peers waited on
 /// - Stream wasn't dropped when events completed
 /// - Peers waited forever for more events
-#[test_log::test(tokio::test(flavor = "current_thread"))]
+///
+/// NOTE: start_paused is required because internal node code uses tokio::time
+/// functions. Without it, time-based operations would block indefinitely.
+/// This test uses tokio::time primitives (not VirtualTime) because it tests
+/// the actual shutdown behavior which relies on tokio's time driver.
+#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
 async fn test_graceful_shutdown_no_deadlock() {
     use freenet::dev_tool::SimNetwork;
 
@@ -1460,14 +1465,13 @@ async fn test_graceful_shutdown_no_deadlock() {
     // Create event stream (this borrows the watch::Sender)
     let mut stream = Some(sim.event_chain(3, None));
 
-    // Consume all events - advance time after each
+    // Consume all events
     while let Some(s) = stream.as_mut() {
         if s.next().await.is_none() {
             break;
         }
-        // Small delay between events using VirtualTime
-        sim.advance_time(Duration::from_millis(50));
-        tokio::task::yield_now().await;
+        // Small delay between events
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     tracing::info!("All events consumed, dropping stream to signal shutdown");
@@ -1476,56 +1480,35 @@ async fn test_graceful_shutdown_no_deadlock() {
     // This signals peers to disconnect. Without this, peers wait forever.
     drop(stream.take());
 
-    // Verify peers exit - advance time repeatedly to allow tasks to process
-    // Using VirtualTime: advance time in a loop rather than using tokio::time::timeout
-    let mut handles_remaining: Vec<_> = handles.into_iter().map(Some).collect();
-    let mut completed = 0;
-
-    for _tick in 0..100 {
-        // Equivalent to 10 seconds at 100ms per tick
-        sim.advance_time(Duration::from_millis(100));
-        tokio::task::yield_now().await;
-
-        for (i, handle_opt) in handles_remaining.iter_mut().enumerate() {
-            if let Some(handle) = handle_opt.take() {
-                // Check if ready without blocking
-                let mut handle = handle;
-                match futures::poll!(&mut handle) {
-                    std::task::Poll::Ready(result) => {
-                        match result {
-                            Ok(Ok(())) => {
-                                tracing::info!("Peer {} exited successfully", i);
-                            }
-                            Ok(Err(e)) => {
-                                let msg = e.to_string();
-                                assert!(
-                                    msg.contains("Graceful shutdown") || msg.contains("graceful"),
-                                    "Unexpected error from peer {}: {}",
-                                    i,
-                                    e
-                                );
-                                tracing::info!("Peer {} exited with graceful shutdown", i);
-                            }
-                            Err(join_err) => {
-                                panic!("Peer {} task panicked or was cancelled: {:?}", i, join_err);
-                            }
-                        }
-                        completed += 1;
-                    }
-                    std::task::Poll::Pending => {
-                        *handle_opt = Some(handle);
-                    }
+    // Verify peers exit within a reasonable timeout (no deadlock)
+    // If the bug recurs, this will timeout
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(10), async {
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    tracing::info!("Peer {} exited successfully", i);
+                }
+                Ok(Err(e)) => {
+                    // Check if it's a graceful shutdown (which is fine)
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("Graceful shutdown") || msg.contains("graceful"),
+                        "Unexpected error from peer {}: {}",
+                        i,
+                        e
+                    );
+                    tracing::info!("Peer {} exited with graceful shutdown", i);
+                }
+                Err(join_err) => {
+                    panic!("Peer {} task panicked or was cancelled: {:?}", i, join_err);
                 }
             }
         }
+    })
+    .await;
 
-        if completed == 3 {
-            break;
-        }
-    }
-
-    assert_eq!(
-        completed, 3,
+    assert!(
+        shutdown_result.is_ok(),
         "Peers should exit within timeout - possible deadlock!"
     );
 
