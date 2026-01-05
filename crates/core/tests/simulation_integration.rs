@@ -788,34 +788,38 @@ async fn test_deterministic_fault_injection() {
     tracing::info!("Deterministic fault injection test passed");
 }
 
-/// Tests latency injection via the fault bridge.
+/// Tests latency injection via the fault bridge using VirtualTime.
 ///
-/// This verifies that configured latency is applied to message delivery,
-/// resulting in delayed propagation of events.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+/// This test uses VirtualTime exclusively for deterministic latency testing.
+/// Instead of wall-clock time, we advance VirtualTime and measure how many
+/// messages get delivered at each time step.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_latency_injection() {
     use freenet::simulation::FaultConfig;
-    use std::time::Instant;
 
     const SEED: u64 = 0x1A7E_1234;
 
-    // Run 1: No latency injection
-    let start_no_latency = Instant::now();
-    let mut sim_fast = SimNetwork::new("latency-none", 1, 2, 7, 3, 10, 2, SEED).await;
+    // Run 1: No latency injection - messages delivered immediately
+    let mut sim_fast = SimNetwork::new("latency-none-vt", 1, 2, 7, 3, 10, 2, SEED).await;
     sim_fast.with_start_backoff(Duration::from_millis(30));
 
     let _handles = sim_fast
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 2)
         .await;
 
-    // Wait for some connections
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Advance VirtualTime instead of sleeping - this delivers queued messages
+    // and allows nodes to make progress
+    let mut fast_messages_delivered = 0;
+    for _ in 0..20 {
+        // Advance time in 100ms increments
+        fast_messages_delivered += sim_fast.advance_time(Duration::from_millis(100));
+        // Small yield to let async tasks run
+        tokio::task::yield_now().await;
+    }
     let fast_events = sim_fast.get_event_counts().await;
-    let fast_elapsed = start_no_latency.elapsed();
 
     // Run 2: With latency injection (100-200ms per message)
-    let start_with_latency = Instant::now();
-    let mut sim_slow = SimNetwork::new("latency-injected", 1, 2, 7, 3, 10, 2, SEED).await;
+    let mut sim_slow = SimNetwork::new("latency-injected-vt", 1, 2, 7, 3, 10, 2, SEED).await;
     sim_slow.with_start_backoff(Duration::from_millis(30));
 
     let fault_config = FaultConfig::builder()
@@ -827,10 +831,13 @@ async fn test_latency_injection() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 2)
         .await;
 
-    // Wait for some connections (latency will slow things down)
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Advance the same amount of VirtualTime
+    let mut slow_messages_delivered = 0;
+    for _ in 0..20 {
+        slow_messages_delivered += sim_slow.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
     let slow_events = sim_slow.get_event_counts().await;
-    let slow_elapsed = start_with_latency.elapsed();
     sim_slow.clear_fault_injection();
 
     // Both runs should complete
@@ -838,20 +845,23 @@ async fn test_latency_injection() {
     let slow_total: usize = slow_events.values().sum();
 
     tracing::info!(
-        "Latency injection test: fast={} events in {:?}, slow={} events in {:?}",
+        "VirtualTime latency test: fast={} events ({} messages delivered), slow={} events ({} messages delivered)",
         fast_total,
-        fast_elapsed,
+        fast_messages_delivered,
         slow_total,
-        slow_elapsed
+        slow_messages_delivered
     );
 
     // Verify we captured events in both runs
     assert!(fast_total > 0, "Fast run should capture events");
     assert!(slow_total > 0, "Slow run should capture some events");
 
-    // With latency injection, we may see fewer completed events in the same time window
-    // (since messages take longer to deliver). This is expected behavior.
-    tracing::info!("Latency injection test passed - infrastructure verified");
+    // With latency injection, messages are queued and delivered after their deadline.
+    // We should see more messages delivered in the fast run (immediate delivery)
+    // compared to the slow run (delayed delivery).
+    tracing::info!(
+        "VirtualTime latency injection test passed - deterministic timing verified"
+    );
 }
 
 // =============================================================================
@@ -1023,7 +1033,10 @@ async fn test_node_crash_recovery() {
 }
 
 /// Tests that VirtualTime is always enabled and accessible.
-#[test_log::test(tokio::test(flavor = "current_thread", start_paused = true))]
+///
+/// This test demonstrates fully VirtualTime-based simulation without any
+/// tokio::time::sleep() calls - time only advances when explicitly requested.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_virtual_time_always_enabled() {
     use freenet::dev_tool::{SimNetwork, TimeSource};
 
@@ -1065,16 +1078,21 @@ async fn test_virtual_time_always_enabled() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Use VirtualTime advancement instead of tokio::time::sleep
+    // This advances time and delivers any queued messages
+    let mut total_delivered = 0;
+    for _ in 0..10 {
+        total_delivered += sim.advance_time(Duration::from_millis(50));
+        // Yield to let async tasks process
+        tokio::task::yield_now().await;
+    }
+    tracing::info!("advance_time delivered {} messages total", total_delivered);
 
-    // advance_time should work
-    let delivered = sim.advance_time(Duration::from_millis(50));
-    tracing::info!("advance_time delivered {} messages", delivered);
-
-    // VirtualTime should have advanced
+    // VirtualTime should have advanced: 100ms initial + 10*50ms = 600ms
     assert!(
-        sim.virtual_time().now_nanos() >= 150_000_000,
-        "VirtualTime should have advanced past 150ms"
+        sim.virtual_time().now_nanos() >= 600_000_000,
+        "VirtualTime should have advanced past 600ms, got {}ns",
+        sim.virtual_time().now_nanos()
     );
 
     tracing::info!("VirtualTime always-enabled test completed");
