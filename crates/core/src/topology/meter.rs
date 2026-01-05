@@ -210,8 +210,12 @@ impl Ord for AttributionSource {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (AttributionSource::Peer(a), AttributionSource::Peer(b)) => a.cmp(b),
-            (AttributionSource::Peer(_), AttributionSource::Delegate(_)) => std::cmp::Ordering::Less,
-            (AttributionSource::Delegate(_), AttributionSource::Peer(_)) => std::cmp::Ordering::Greater,
+            (AttributionSource::Peer(_), AttributionSource::Delegate(_)) => {
+                std::cmp::Ordering::Less
+            }
+            (AttributionSource::Delegate(_), AttributionSource::Peer(_)) => {
+                std::cmp::Ordering::Greater
+            }
             // DelegateKey doesn't implement Ord, but this variant is never used in practice
             (AttributionSource::Delegate(a), AttributionSource::Delegate(b)) => {
                 format!("{:?}", a).cmp(&format!("{:?}", b))

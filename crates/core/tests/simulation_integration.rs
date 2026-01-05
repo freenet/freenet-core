@@ -81,8 +81,7 @@ fn test_strict_determinism_exact_event_equality() {
         // Create SimNetwork and get event logs handle before run_simulation consumes it
         let (sim, logs_handle) = rt.block_on(async {
             let sim = SimNetwork::new(
-                name,
-                1,  // gateways
+                name, 1,  // gateways
                 3,  // nodes
                 7,  // ring_max_htl
                 3,  // rnd_if_htl_above
@@ -1701,14 +1700,9 @@ fn test_turmoil_determinism() {
 
         let sim = rt.block_on(async {
             SimNetwork::new(
-                name,
-                1, // 1 gateway
+                name, 1, // 1 gateway
                 2, // 2 nodes
-                7,
-                3,
-                10,
-                2,
-                seed,
+                7, 3, 10, 2, seed,
             )
             .await
         });

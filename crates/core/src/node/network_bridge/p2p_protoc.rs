@@ -8,13 +8,13 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::time::Instant;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
