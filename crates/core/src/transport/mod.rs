@@ -95,6 +95,16 @@ pub struct TransferStats {
     pub slowdowns_triggered: u32,
     /// Minimum observed RTT (base delay) at completion.
     pub base_delay: Duration,
+    /// Final slow start threshold at completion (bytes).
+    /// Key diagnostic for death spiral: if ssthresh collapses to min_cwnd,
+    /// slow start can't recover useful throughput.
+    pub final_ssthresh_bytes: u32,
+    /// Effective minimum ssthresh floor (bytes).
+    /// This floor prevents ssthresh from collapsing too low during timeouts.
+    pub min_ssthresh_floor_bytes: u32,
+    /// Total retransmission timeouts (RTO events) during transfer.
+    /// High values indicate severe congestion or path issues.
+    pub total_timeouts: u32,
 }
 
 impl TransferStats {

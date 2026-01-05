@@ -406,6 +406,9 @@ pub fn emit_transfer_completed(
     final_cwnd_bytes: Option<u32>,
     slowdowns_triggered: Option<u32>,
     final_srtt_ms: Option<u32>,
+    final_ssthresh_bytes: Option<u32>,
+    min_ssthresh_floor_bytes: Option<u32>,
+    total_timeouts: Option<u32>,
     direction: TransferDirection,
 ) {
     let sender_guard = TRANSFER_EVENT_SENDER.read();
@@ -420,6 +423,9 @@ pub fn emit_transfer_completed(
             final_cwnd_bytes,
             slowdowns_triggered,
             final_srtt_ms,
+            final_ssthresh_bytes,
+            min_ssthresh_floor_bytes,
+            total_timeouts,
             direction,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
@@ -478,6 +484,9 @@ mod tests {
             final_cwnd_bytes: 40000,
             slowdowns_triggered: 1,
             base_delay: Duration::from_millis(10),
+            final_ssthresh_bytes: 100000,
+            min_ssthresh_floor_bytes: 5696,
+            total_timeouts: 0,
         };
 
         metrics.record_transfer_completed(&stats);
@@ -502,6 +511,9 @@ mod tests {
             final_cwnd_bytes: 40000,
             slowdowns_triggered: 1,
             base_delay: Duration::from_millis(10),
+            final_ssthresh_bytes: 100000,
+            min_ssthresh_floor_bytes: 5696,
+            total_timeouts: 0,
         };
 
         metrics.record_transfer_completed(&stats);
@@ -525,6 +537,9 @@ mod tests {
                 final_cwnd_bytes: 35000,
                 slowdowns_triggered: 1,
                 base_delay: Duration::from_millis(10),
+                final_ssthresh_bytes: 100000,
+                min_ssthresh_floor_bytes: 5696,
+                total_timeouts: 0,
             };
             metrics.record_transfer_completed(&stats);
         }
