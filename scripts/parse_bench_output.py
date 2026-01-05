@@ -19,11 +19,57 @@ from typing import List, Optional
 from enum import Enum
 
 
+# ANSI escape code pattern for stripping color codes from terminal output
+ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Remove ANSI escape codes from text.
+
+    Terminal output often contains color codes like \x1b[1m\x1b[94m that
+    render incorrectly in markdown. This strips them for clean output.
+    """
+    return ANSI_ESCAPE_PATTERN.sub('', text)
+
+
 class ChangeType(Enum):
     REGRESSION = "regression"
     IMPROVEMENT = "improvement"
     NO_CHANGE = "no_change"
     NEW_BENCHMARK = "new"
+
+
+# Threshold for "severe" regression that should fail nightly builds
+# Only applies to throughput benchmarks (cold_start, warm_connection, rtt_scenarios)
+SEVERE_REGRESSION_THRESHOLD = 25.0  # percent
+
+# Benchmark name patterns that are throughput-critical
+# These are the benchmarks that should fail nightly if severely regressed
+THROUGHPUT_BENCHMARK_PATTERNS = [
+    "cold_start",
+    "warm_connection",
+    "rtt_scenarios",
+    "sustained_throughput",
+    "large_file",
+]
+
+
+def is_throughput_benchmark(name: str) -> bool:
+    """Check if a benchmark is throughput-critical."""
+    name_lower = name.lower()
+    return any(pattern in name_lower for pattern in THROUGHPUT_BENCHMARK_PATTERNS)
+
+
+def parse_change_percent(change_str: Optional[str]) -> Optional[float]:
+    """Parse change percentage string to float. Returns None if unparseable."""
+    if not change_str:
+        return None
+    try:
+        # Remove % and +/- signs, parse as float
+        cleaned = change_str.strip().replace('%', '').replace('+', '')
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -34,6 +80,18 @@ class BenchmarkResult:
     change_type: ChangeType
     confidence: Optional[str]  # e.g., "p = 0.00 < 0.01"
     throughput: Optional[str] = None
+
+    def is_severe_regression(self) -> bool:
+        """Check if this is a severe regression on a throughput benchmark."""
+        if self.change_type != ChangeType.REGRESSION:
+            return False
+        if not is_throughput_benchmark(self.name):
+            return False
+        change = parse_change_percent(self.change_percent)
+        if change is None:
+            return False
+        # Regression means time increased, so positive change is bad
+        return change > SEVERE_REGRESSION_THRESHOLD
 
 
 def parse_criterion_output(output: str) -> List[BenchmarkResult]:
@@ -56,8 +114,18 @@ def parse_criterion_output(output: str) -> List[BenchmarkResult]:
         # Try to match time line (could have name on same line or be indented)
         time_match = re.search(r'time:\s+\[(.+?)\]', line)
         if time_match:
-            time_values = time_match.group(1).strip().split()
-            time_estimate = time_values[1]  # Take middle value
+            # Parse time values - format is "142.35 ns 143.12 ns 143.94 ns"
+            # We want the middle value with its unit, e.g., "143.12 ns"
+            time_content = time_match.group(1).strip()
+            time_parts = time_content.split()
+            # Parts are: [value, unit, value, unit, value, unit]
+            # Middle value is at index 2-3
+            if len(time_parts) >= 4:
+                time_estimate = f"{time_parts[2]} {time_parts[3]}"
+            elif len(time_parts) >= 2:
+                time_estimate = f"{time_parts[0]} {time_parts[1]}"
+            else:
+                time_estimate = time_content
 
             # Try to extract benchmark name from this line first
             bench_name = line.split('time:')[0].strip()
@@ -65,12 +133,18 @@ def parse_criterion_output(output: str) -> List[BenchmarkResult]:
             # If name is empty (indented line), look at previous line
             if not bench_name and i > 0:
                 prev_line = lines[i - 1].strip()
-                # Skip empty lines and metadata lines
-                if prev_line and not prev_line.startswith('Gnuplot') and not prev_line.startswith('Running') and not prev_line.startswith('Found'):
+                # Skip empty lines, metadata lines, and criterion output lines
+                skip_prefixes = (
+                    'Gnuplot', 'Running', 'Found', 'Benchmarking',
+                    'change:', 'thrpt:', 'time:', 'Performance has',
+                    'No change', 'Warning'
+                )
+                if prev_line and not any(prev_line.startswith(p) for p in skip_prefixes):
                     bench_name = prev_line
 
-            # Skip if we still don't have a benchmark name
-            if not bench_name:
+            # Skip if we still don't have a valid benchmark name
+            # Valid names should contain '/' (group/benchmark format)
+            if not bench_name or '/' not in bench_name:
                 i += 1
                 continue
 
@@ -127,6 +201,7 @@ def parse_criterion_output(output: str) -> List[BenchmarkResult]:
 def format_markdown_summary(results: List[BenchmarkResult]) -> str:
     """Generate a markdown summary suitable for GitHub Actions."""
     regressions = [r for r in results if r.change_type == ChangeType.REGRESSION]
+    severe_regressions = [r for r in results if r.is_severe_regression()]
     improvements = [r for r in results if r.change_type == ChangeType.IMPROVEMENT]
     no_change = [r for r in results if r.change_type == ChangeType.NO_CHANGE]
 
@@ -135,18 +210,35 @@ def format_markdown_summary(results: List[BenchmarkResult]) -> str:
     # Summary stats
     md.append("## Benchmark Results Summary\n")
     md.append(f"- **Total benchmarks**: {len(results)}")
+    if severe_regressions:
+        md.append(f"- **Severe regressions (>{SEVERE_REGRESSION_THRESHOLD}%)**: {len(severe_regressions)} 🚨")
     md.append(f"- **Regressions**: {len(regressions)} ⚠️" if regressions else "- **Regressions**: 0 ✅")
     md.append(f"- **Improvements**: {len(improvements)} 🚀" if improvements else "- **Improvements**: 0")
     md.append(f"- **No significant change**: {len(no_change)}")
     md.append("")
 
-    # Detailed regressions
-    if regressions:
-        md.append("### ⚠️ Performance Regressions")
+    # Severe regressions (these fail nightly)
+    if severe_regressions:
+        md.append(f"### 🚨 Severe Throughput Regressions (>{SEVERE_REGRESSION_THRESHOLD}%)")
+        md.append("")
+        md.append("**These regressions will fail nightly builds.**")
         md.append("")
         md.append("| Benchmark | Time | Change | Confidence |")
         md.append("|-----------|------|--------|------------|")
-        for r in sorted(regressions, key=lambda x: float(x.change_percent.strip('%+')) if x.change_percent else 0, reverse=True):
+        for r in sorted(severe_regressions, key=lambda x: parse_change_percent(x.change_percent) or 0, reverse=True):
+            conf = r.confidence or "N/A"
+            change = r.change_percent or "N/A"
+            md.append(f"| `{r.name}` | {r.time_estimate} | **{change}** | {conf} |")
+        md.append("")
+
+    # Other regressions
+    other_regressions = [r for r in regressions if not r.is_severe_regression()]
+    if other_regressions:
+        md.append("### ⚠️ Other Performance Regressions")
+        md.append("")
+        md.append("| Benchmark | Time | Change | Confidence |")
+        md.append("|-----------|------|--------|------------|")
+        for r in sorted(other_regressions, key=lambda x: parse_change_percent(x.change_percent) or 0, reverse=True):
             conf = r.confidence or "N/A"
             change = r.change_percent or "N/A"
             md.append(f"| `{r.name}` | {r.time_estimate} | **{change}** | {conf} |")
@@ -238,11 +330,20 @@ def main():
         print(f"Error: File '{input_file}' not found", file=sys.stderr)
         sys.exit(1)
 
+    # Strip ANSI escape codes from terminal output
+    # This ensures clean markdown even when cargo outputs colored warnings
+    output = strip_ansi_codes(output)
+
     results = parse_criterion_output(output)
 
     if not results:
         print("Warning: No benchmark results found in input", file=sys.stderr)
         sys.exit(0)
+
+    # Analyze regressions
+    has_regressions = any(r.change_type == ChangeType.REGRESSION for r in results)
+    severe_regressions = [r for r in results if r.is_severe_regression()]
+    has_severe_regressions = len(severe_regressions) > 0
 
     # Write JSON output
     json_output = {
@@ -250,8 +351,10 @@ def main():
         'summary': {
             'total': len(results),
             'regressions': len([r for r in results if r.change_type == ChangeType.REGRESSION]),
+            'severe_regressions': len(severe_regressions),
             'improvements': len([r for r in results if r.change_type == ChangeType.IMPROVEMENT]),
-            'no_change': len([r for r in results if r.change_type == ChangeType.NO_CHANGE])
+            'no_change': len([r for r in results if r.change_type == ChangeType.NO_CHANGE]),
+            'severe_regression_threshold': SEVERE_REGRESSION_THRESHOLD,
         }
     }
 
@@ -271,9 +374,19 @@ def main():
     # Print summary to stdout
     print(format_markdown_summary(results))
 
-    # Exit with code 1 if regressions found (for CI)
-    has_regressions = any(r.change_type == ChangeType.REGRESSION for r in results)
-    sys.exit(1 if has_regressions else 0)
+    # Exit codes:
+    # 0 = no regressions
+    # 1 = regressions detected (informational)
+    # 2 = severe regressions detected (should fail nightly)
+    if has_severe_regressions:
+        print(f"\n🚨 SEVERE REGRESSIONS DETECTED: {len(severe_regressions)} throughput benchmark(s) regressed >{SEVERE_REGRESSION_THRESHOLD}%", file=sys.stderr)
+        for r in severe_regressions:
+            print(f"  - {r.name}: {r.change_percent}", file=sys.stderr)
+        sys.exit(2)
+    elif has_regressions:
+        sys.exit(1)
+    else:
+        sys.exit(0)
 
 
 if __name__ == '__main__':

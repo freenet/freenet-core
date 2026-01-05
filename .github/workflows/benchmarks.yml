@@ -135,7 +135,8 @@ jobs:
 
           # Run transport benchmarks (requires bench feature)
           # Uses transport_ci benchmark suite - fast, deterministic subset for CI
-          cargo bench --bench transport_ci --features bench 2>&1 | tee bench_output.txt
+          # Use --color=never to avoid ANSI escape codes in output that break markdown
+          cargo bench --bench transport_ci --features bench --color=never 2>&1 | tee bench_output.txt
 
       # Parse benchmark results with structured script
       - name: Parse Benchmark Results
@@ -159,7 +160,8 @@ jobs:
           cat bench_summary.md >> $GITHUB_STEP_SUMMARY 2>/dev/null || {
             echo "⚠️ Failed to parse benchmark results" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -50 bench_output.txt >> $GITHUB_STEP_SUMMARY
+            # Strip ANSI escape codes for clean markdown output
+            tail -50 bench_output.txt | sed 's/\x1b\[[0-9;]*m//g' >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           }
 
