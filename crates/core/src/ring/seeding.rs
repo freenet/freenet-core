@@ -16,10 +16,16 @@ use tracing::{debug, info, warn};
 const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Initial backoff duration for subscription retries.
-const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(5);
+///
+/// Set to 30 seconds to match connection backoff timing. Subscription requests
+/// arrive at similar intervals to connection requests (~60s), so the same
+/// rationale applies: shorter backoffs are ineffective. See issue #2595.
+const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Maximum backoff duration for subscription retries.
-const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
+///
+/// Set to 10 minutes to match connection backoff timing. See issue #2595.
+const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(600); // 10 minutes
 
 /// Maximum number of tracked subscription backoff entries.
 const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
