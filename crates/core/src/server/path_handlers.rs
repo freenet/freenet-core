@@ -265,7 +265,9 @@ async fn get_web_body(
         error_cause: format!("{err}"),
     })?;
 
-    // Inject auth token into HTML so web apps can access it without re-fetching
+    // Inject auth token into HTML so web apps can access it without re-fetching.
+    // Safety: AuthToken uses base58 encoding which only produces alphanumeric characters
+    // (0-9, A-Z, a-z excluding 0, O, I, l), so no escaping is needed for the JavaScript string.
     let token_script = format!(
         r#"<script>window.__FREENET_AUTH_TOKEN__ = "{}";</script>"#,
         auth_token.as_str()
