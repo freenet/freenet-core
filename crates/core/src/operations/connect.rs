@@ -1373,6 +1373,17 @@ impl Operation for ConnectOp {
 
                             if acceptance.satisfied {
                                 self.state = Some(ConnectState::Completed);
+                                // Clear gateway backoff on successful connect completion
+                                // This ensures successful gateways aren't penalized by previous failures
+                                if let Some(gw_addr) = self.get_next_hop_addr() {
+                                    let mut backoff = op_manager.gateway_backoff.lock();
+                                    backoff.record_success(gw_addr);
+                                    tracing::debug!(
+                                        gateway_addr = %gw_addr,
+                                        tx = %self.id,
+                                        "Cleared gateway backoff on successful connect"
+                                    );
+                                }
                             }
                         }
 
@@ -1641,14 +1652,67 @@ pub(crate) async fn initial_join_procedure(
             let unconnected_count = unconnected_gateways.len();
 
             if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
+                // Filter out gateways that are in backoff due to previous failures.
+                // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
+                //
+                // Design note: We track backoff per-gateway rather than per-acceptor because
+                // location-based routing is deterministic - the same gateway will route to
+                // the same acceptor for a given target location. So if a connect through
+                // gateway G fails (likely due to NAT issues with the acceptor it routes to),
+                // backing off G is equivalent to backing off that acceptor.
+                let (eligible_gateways, min_backoff) = {
+                    let backoff = op_manager.gateway_backoff.lock();
+                    let mut min_remaining: Option<Duration> = None;
+                    let eligible: Vec<_> = unconnected_gateways
+                        .into_iter()
+                        .filter(|gw| {
+                            if let Some(addr) = gw.socket_addr() {
+                                if backoff.is_in_backoff(addr) {
+                                    // Track the minimum remaining backoff for logging/waiting
+                                    if let Some(remaining) = backoff.remaining_backoff(addr) {
+                                        min_remaining = Some(
+                                            min_remaining
+                                                .map(|m| m.min(remaining))
+                                                .unwrap_or(remaining),
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        gateway = %gw,
+                                        "Skipping gateway due to backoff from previous failures"
+                                    );
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .collect();
+                    (eligible, min_remaining)
+                };
+
+                let eligible_count = eligible_gateways.len();
+
+                if eligible_count == 0 {
+                    // All gateways are in backoff - wait for the shortest one
+                    if let Some(min_wait) = min_backoff {
+                        tracing::info!(
+                            wait_secs = min_wait.as_secs(),
+                            total_gateways = unconnected_count,
+                            "All gateways in backoff, waiting for shortest backoff to expire"
+                        );
+                        tokio::time::sleep(min_wait).await;
+                        continue;
+                    }
+                }
+
                 tracing::info!(
-                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
+                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    number_of_parallel_connections.min(unconnected_count)
+                    number_of_parallel_connections.min(eligible_count),
+                    unconnected_count - eligible_count
                 );
                 let select_all = FuturesUnordered::new();
-                for gateway in unconnected_gateways
+                for gateway in eligible_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
