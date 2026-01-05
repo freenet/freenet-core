@@ -98,12 +98,35 @@ pub struct ConnectedPeerPair<TS: TimeSource = RealTime> {
     channels: Channels,
 }
 
-impl<TS: TimeSource> PeerPair<TS> {
-    /// Establish bidirectional connections between peers
+impl PeerPair<RealTime> {
+    /// Establish bidirectional connections between peers (RealTime variant)
     ///
     /// This performs the connection handshake and returns a `ConnectedPeerPair`
     /// ready for data transfer.
-    pub async fn connect(mut self) -> ConnectedPeerPair<TS> {
+    pub async fn connect(mut self) -> ConnectedPeerPair<RealTime> {
+        let (conn_a_inner, conn_b_inner) = futures::join!(
+            self.peer_a.connect(self.peer_b_pub, self.peer_b_addr),
+            self.peer_b.connect(self.peer_a_pub, self.peer_a_addr),
+        );
+        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+        let (conn_a, conn_b) = (conn_a.expect("connect A"), conn_b.expect("connect B"));
+
+        ConnectedPeerPair {
+            conn_a,
+            conn_b,
+            peer_a: self.peer_a,
+            peer_b: self.peer_b,
+            channels: self.channels,
+        }
+    }
+}
+
+impl PeerPair<VirtualTime> {
+    /// Establish bidirectional connections between peers (VirtualTime variant)
+    ///
+    /// This performs the connection handshake and returns a `ConnectedPeerPair`
+    /// ready for data transfer. Uses VirtualTime for instant delay simulation.
+    pub async fn connect(mut self) -> ConnectedPeerPair<VirtualTime> {
         let (conn_a_inner, conn_b_inner) = futures::join!(
             self.peer_a.connect(self.peer_b_pub, self.peer_b_addr),
             self.peer_b.connect(self.peer_a_pub, self.peer_a_addr),

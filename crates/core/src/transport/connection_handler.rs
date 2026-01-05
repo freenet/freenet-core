@@ -580,7 +580,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             "Listening for packets"
         );
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S, T>> = BTreeMap::new();
+        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S, T>> =
+            BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
             SocketAddr,
             FastSender<PacketData<UnknownEncryption>>,
@@ -1605,11 +1606,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 } else {
                                                     bandwidth_limit.unwrap_or(10_000_000)
                                                 };
-                                            let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                                                10_000, // capacity = 10 KB burst
-                                                initial_rate,
-                                                time_source.clone(),
-                                            ));
+                                            let token_bucket =
+                                                Arc::new(TokenBucket::new_with_time_source(
+                                                    10_000, // capacity = 10 KB burst
+                                                    initial_rate,
+                                                    time_source.clone(),
+                                                ));
 
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
@@ -1728,7 +1730,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             .expect("should be set at this stage"),
                                         remote_addr,
                                         sent_tracker: Arc::new(parking_lot::Mutex::new(
-                                            SentPacketTracker::new_with_time_source(time_source.clone()),
+                                            SentPacketTracker::new_with_time_source(
+                                                time_source.clone(),
+                                            ),
                                         )),
                                         last_packet_id: Arc::new(AtomicU32::new(0)),
                                         inbound_packet_recv: inbound_recv,
