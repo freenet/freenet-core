@@ -11,6 +11,163 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 // =============================================================================
+// STRICT Determinism Test - Exact Event Equality
+// =============================================================================
+
+/// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
+///
+/// This test goes beyond just checking event types - it verifies:
+/// 1. Exact same number of events
+/// 2. Exact same event counts per type
+/// 3. Exact same event sequence (order, content)
+///
+/// If this test fails, it indicates non-determinism in the simulation.
+///
+/// # Current Status: FAILING
+///
+/// As of January 2026, this test FAILS - proving the simulation is NOT fully deterministic.
+/// Example failure: Run 1 had 44 events, Run 2 had 50 events with identical seed.
+///
+/// This is ignored until the root cause is identified and fixed. Potential sources:
+/// - HashMap iteration order (even with deterministic keys)
+/// - Async task scheduling not fully controlled by VirtualTime
+/// - Channel message ordering
+/// - Turmoil not intercepting all tokio primitives
+///
+/// TODO: Investigate and fix non-determinism source. This is a P1 issue for
+/// reproducible bug testing. See: https://github.com/freenet/freenet-core/issues/1611
+#[ignore = "Non-determinism detected - see test doc comment for details"]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_strict_determinism_exact_event_equality() {
+    const SEED: u64 = 0xDE7E_2A1E_1234;
+
+    /// Captures all simulation state for comparison
+    #[derive(Debug, PartialEq)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<(String, String)>, // (event_kind, contract_key or "none")
+        total_events: usize,
+        connectivity: Vec<(String, usize)>, // (node_label_suffix, connection_count)
+    }
+
+    async fn run_and_trace(name: &str, seed: u64) -> SimulationTrace {
+        let mut sim = SimNetwork::new(
+            name,
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            seed,
+        )
+        .await;
+
+        sim.with_start_backoff(Duration::from_millis(50));
+
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 2, 5)
+            .await;
+
+        // Advance time deterministically
+        for _ in 0..40 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
+        }
+
+        // Capture event counts
+        let event_counts = sim.get_event_counts().await;
+        let total_events: usize = event_counts.values().sum();
+
+        // Capture full event sequence
+        let summary = sim.get_deterministic_event_summary().await;
+        let event_sequence: Vec<(String, String)> = summary
+            .iter()
+            .map(|e| {
+                (
+                    e.event_kind_name.clone(),
+                    e.contract_key.clone().unwrap_or_else(|| "none".to_string()),
+                )
+            })
+            .collect();
+
+        // Capture connectivity (normalized by label suffix)
+        let connectivity = sim.node_connectivity();
+        let mut conn_trace: Vec<(String, usize)> = connectivity
+            .iter()
+            .map(|(label, (_key, conns))| {
+                let suffix = if let Some(pos) = label.to_string().rfind("-gateway-") {
+                    label.to_string()[pos + 1..].to_string()
+                } else if let Some(pos) = label.to_string().rfind("-node-") {
+                    label.to_string()[pos + 1..].to_string()
+                } else {
+                    label.to_string()
+                };
+                (suffix, conns.len())
+            })
+            .collect();
+        conn_trace.sort_by(|a, b| a.0.cmp(&b.0));
+
+        SimulationTrace {
+            event_counts,
+            event_sequence,
+            total_events,
+            connectivity: conn_trace,
+        }
+    }
+
+    // Run simulation twice with identical seed
+    let trace1 = run_and_trace("strict-det-run1", SEED).await;
+    let trace2 = run_and_trace("strict-det-run2", SEED).await;
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "STRICT DETERMINISM FAILURE: Total event counts differ!\nRun 1: {}\nRun 2: {}",
+        trace1.total_events, trace2.total_events
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "STRICT DETERMINISM FAILURE: Event counts per type differ!\nRun 1: {:?}\nRun 2: {:?}",
+        trace1.event_counts, trace2.event_counts
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence
+    assert_eq!(
+        trace1.event_sequence.len(),
+        trace2.event_sequence.len(),
+        "STRICT DETERMINISM FAILURE: Event sequence lengths differ!"
+    );
+
+    for (i, (e1, e2)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "STRICT DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 1: {:?}\nRun 2: {:?}",
+            i, e1, e2
+        );
+    }
+
+    // STRICT ASSERTION 4: Exact same connectivity
+    assert_eq!(
+        trace1.connectivity, trace2.connectivity,
+        "STRICT DETERMINISM FAILURE: Connectivity differs!\nRun 1: {:?}\nRun 2: {:?}",
+        trace1.connectivity, trace2.connectivity
+    );
+
+    tracing::info!(
+        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 2 runs",
+        trace1.total_events
+    );
+}
+
+// =============================================================================
 // Test 1: End-to-End Deterministic Replay with Event Verification
 // =============================================================================
 
