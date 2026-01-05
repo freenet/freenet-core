@@ -719,6 +719,8 @@ pub struct LedbatController<T: TimeSource = RealTime> {
     periodic_slowdowns: AtomicUsize,
     /// Peak congestion window reached during this controller's lifetime
     peak_cwnd: AtomicUsize,
+    /// Total retransmission timeouts (RTO events)
+    total_timeouts: AtomicUsize,
 }
 
 // ============================================================================
@@ -872,6 +874,7 @@ impl<T: TimeSource> LedbatController<T> {
             slow_start_exits: AtomicUsize::new(0),
             periodic_slowdowns: AtomicUsize::new(0),
             peak_cwnd: AtomicUsize::new(config.initial_cwnd),
+            total_timeouts: AtomicUsize::new(0),
         }
     }
 
@@ -1682,6 +1685,7 @@ impl<T: TimeSource> LedbatController<T> {
     /// - Enter SlowStart state for exponential recovery
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
+        self.total_timeouts.fetch_add(1, Ordering::Relaxed);
 
         // Save old cwnd for ssthresh calculation before resetting
         let old_cwnd = self.cwnd.load(Ordering::Acquire);
@@ -1791,6 +1795,9 @@ impl<T: TimeSource> LedbatController<T> {
             min_cwnd_events: self.min_cwnd_events.load(Ordering::Relaxed),
             slow_start_exits: self.slow_start_exits.load(Ordering::Relaxed),
             periodic_slowdowns: self.periodic_slowdowns.load(Ordering::Relaxed),
+            ssthresh: self.ssthresh.load(Ordering::Relaxed),
+            min_ssthresh_floor: self.calculate_adaptive_floor(),
+            total_timeouts: self.total_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -1822,6 +1829,16 @@ pub struct LedbatStats {
     pub slow_start_exits: usize,
     /// Number of periodic slowdowns completed (LEDBAT++ feature).
     pub periodic_slowdowns: usize,
+    /// Current slow start threshold (bytes).
+    /// When cwnd >= ssthresh, we exit slow start and enter congestion avoidance.
+    pub ssthresh: usize,
+    /// Effective minimum ssthresh floor (bytes).
+    /// This is the floor that prevents ssthresh death spiral on high-BDP paths.
+    /// Based on explicit config, BDP proxy, or RTT scaling.
+    pub min_ssthresh_floor: usize,
+    /// Total retransmission timeouts (RTO events).
+    /// High timeout counts indicate severe congestion or path issues.
+    pub total_timeouts: usize,
 }
 
 #[cfg(test)]
@@ -9598,5 +9615,209 @@ mod tests {
         );
 
         println!("✓ Full cycle test passed");
+    }
+
+    // =========================================================================
+    // Large Transfer Throughput Regression Test
+    //
+    // This test catches the production issue where 2.3MB transfers on 135ms RTT
+    // paths take ~19 seconds instead of ~3 seconds. It simulates the transfer
+    // and asserts it completes in a reasonable number of RTTs.
+    // =========================================================================
+
+    /// Regression test: 2.3MB transfer after timeout recovery should complete reasonably.
+    ///
+    /// This test catches the death spiral issue where:
+    /// - Production: 2.3MB transfer taking ~19 seconds (140 RTTs, avg cwnd ~16KB)
+    /// - Expected: 2.3MB transfer in ~6 seconds (45 RTTs, avg cwnd ~50KB)
+    ///
+    /// The test simulates a connection that experienced multiple timeouts
+    /// (as happens in production on congested paths) and then verifies that
+    /// a large transfer can still complete in reasonable time via slow start recovery.
+    #[test]
+    fn test_large_transfer_throughput_regression() {
+        // Match production scenario: River UI contract on nova→technic path
+        let transfer_size: usize = 2_300_000; // 2.3MB
+        let rtt = Duration::from_millis(135); // Intercontinental RTT
+        let min_ssthresh = 100 * 1024; // 100KB floor (deployed in v0.1.82)
+
+        let config = LedbatConfig {
+            initial_cwnd: 38_000, // IW26
+            min_cwnd: 2_848,
+            max_cwnd: 10_000_000,
+            ssthresh: 1_000_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh),
+            ..Default::default()
+        };
+
+        let mut harness = LedbatTestHarness::new(
+            config,
+            NetworkCondition::INTERCONTINENTAL,
+            54321, // Fixed seed
+        );
+
+        println!("\n========== Large Transfer After Timeout Recovery Test ==========");
+        println!(
+            "Transfer: {} MB, RTT: {}ms, min_ssthresh: {}KB",
+            transfer_size / 1_000_000,
+            rtt.as_millis(),
+            min_ssthresh / 1024
+        );
+
+        // Phase 1: Simulate the connection being in a bad state from previous congestion
+        // This is what happens in production - transfers start from a degraded state
+        println!("\nPhase 1: Simulating prior congestion (3 timeouts)...");
+        for i in 1..=3 {
+            harness.inject_timeout();
+            println!(
+                "  Timeout {}: cwnd={}KB, ssthresh={}KB",
+                i,
+                harness.snapshot().cwnd / 1024,
+                harness.controller.ssthresh.load(Ordering::Acquire) / 1024
+            );
+        }
+
+        let snap_after_timeouts = harness.snapshot();
+        println!(
+            "After timeouts: cwnd={}KB, state={:?}",
+            snap_after_timeouts.cwnd / 1024,
+            snap_after_timeouts.state
+        );
+
+        // Phase 2: Now attempt the large transfer from this degraded state
+        println!("\nPhase 2: Starting 2.3MB transfer from degraded state...");
+        let mut bytes_sent: usize = 0;
+        let mut rtts_elapsed = 0;
+        let mut cwnd_samples: Vec<usize> = Vec::new();
+        let max_rtts = 150; // Safety limit - production bug was ~140 RTTs
+
+        while bytes_sent < transfer_size && rtts_elapsed < max_rtts {
+            // Get current cwnd
+            let snap = harness.snapshot();
+            let cwnd = snap.cwnd;
+            cwnd_samples.push(cwnd);
+
+            // Send one RTT worth of data (capped at remaining bytes)
+            let bytes_this_rtt = cwnd.min(transfer_size - bytes_sent);
+            bytes_sent += bytes_this_rtt;
+            rtts_elapsed += 1;
+
+            // Simulate ACKs for this RTT
+            harness.run_rtts(1, bytes_this_rtt);
+
+            // Log progress every 10 RTTs
+            if rtts_elapsed % 10 == 0 {
+                println!(
+                    "  RTT {}: cwnd={}KB, sent={}KB ({:.0}%)",
+                    rtts_elapsed,
+                    cwnd / 1024,
+                    bytes_sent / 1024,
+                    (bytes_sent as f64 / transfer_size as f64) * 100.0
+                );
+            }
+        }
+
+        // Calculate statistics
+        let avg_cwnd: usize = cwnd_samples.iter().sum::<usize>() / cwnd_samples.len();
+        let min_cwnd_observed = *cwnd_samples.iter().min().unwrap();
+        let max_cwnd_observed = *cwnd_samples.iter().max().unwrap();
+        let simulated_time_ms = rtts_elapsed as u64 * rtt.as_millis() as u64;
+        let throughput_mbps = (bytes_sent as f64 * 8.0) / (simulated_time_ms as f64 * 1000.0);
+
+        println!("\nResults:");
+        println!(
+            "  Bytes sent: {} / {} ({:.1}%)",
+            bytes_sent,
+            transfer_size,
+            (bytes_sent as f64 / transfer_size as f64) * 100.0
+        );
+        println!("  RTTs elapsed: {}", rtts_elapsed);
+        println!(
+            "  Simulated time: {:.1}s",
+            simulated_time_ms as f64 / 1000.0
+        );
+        println!("  Average cwnd: {}KB", avg_cwnd / 1024);
+        println!(
+            "  Min/Max cwnd: {}KB / {}KB",
+            min_cwnd_observed / 1024,
+            max_cwnd_observed / 1024
+        );
+        println!("  Throughput: {:.1} Mbps", throughput_mbps);
+
+        // Get final stats including new telemetry fields
+        let final_stats = harness.controller.stats();
+        println!("\nLEDBAT Stats:");
+        println!("  ssthresh: {}KB", final_stats.ssthresh / 1024);
+        println!(
+            "  min_ssthresh_floor: {}KB",
+            final_stats.min_ssthresh_floor / 1024
+        );
+        println!("  total_timeouts: {}", final_stats.total_timeouts);
+        println!("  total_losses: {}", final_stats.total_losses);
+        println!("  slow_start_exits: {}", final_stats.slow_start_exits);
+
+        // Key assertions - these would fail with the death spiral bug
+        //
+        // Without min_ssthresh fix:
+        //   ssthresh collapses to 5KB, avg_cwnd ~16KB, ~140 RTTs (~19s)
+        // With min_ssthresh fix:
+        //   ssthresh stays at 100KB floor, avg_cwnd ~50KB+, ~45 RTTs (~6s)
+        //
+        // Thresholds set to catch death spiral while allowing margin:
+        // - Max 80 RTTs (~11s) - production bug showed 140 RTTs (19s)
+        // - Min 30KB avg cwnd - production bug showed ~16KB average
+
+        assert!(
+            bytes_sent >= transfer_size,
+            "Transfer should complete: sent {} of {} bytes",
+            bytes_sent,
+            transfer_size
+        );
+
+        assert!(
+            rtts_elapsed <= 80,
+            "Transfer took {} RTTs ({:.1}s) - too slow! Expected <= 80 RTTs (~11s). \
+             Average cwnd was {}KB. This indicates a death spiral or recovery issue. \
+             ssthresh={}KB, min_floor={}KB",
+            rtts_elapsed,
+            simulated_time_ms as f64 / 1000.0,
+            avg_cwnd / 1024,
+            final_stats.ssthresh / 1024,
+            final_stats.min_ssthresh_floor / 1024
+        );
+
+        assert!(
+            avg_cwnd >= 30_000,
+            "Average cwnd was {}KB - too low! Expected >= 30KB. \
+             This indicates cwnd is not recovering properly after timeouts. \
+             ssthresh={}KB, min_floor={}KB",
+            avg_cwnd / 1024,
+            final_stats.ssthresh / 1024,
+            final_stats.min_ssthresh_floor / 1024
+        );
+
+        // Verify ssthresh didn't collapse below the floor
+        assert!(
+            final_stats.ssthresh >= min_ssthresh,
+            "Final ssthresh {}KB should be >= min_ssthresh floor {}KB - death spiral detected!",
+            final_stats.ssthresh / 1024,
+            min_ssthresh / 1024
+        );
+
+        // Verify the telemetry captured the initial timeouts
+        assert_eq!(
+            final_stats.total_timeouts, 3,
+            "total_timeouts should have captured the 3 injected timeouts"
+        );
+
+        println!(
+            "\n✓ Large transfer completed in {} RTTs ({:.1}s) with avg cwnd {}KB - PASSED",
+            rtts_elapsed,
+            simulated_time_ms as f64 / 1000.0,
+            avg_cwnd / 1024
+        );
     }
 }

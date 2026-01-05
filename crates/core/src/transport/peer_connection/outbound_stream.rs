@@ -223,6 +223,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         Some(ledbat_stats.cwnd as u32),
         Some(ledbat_stats.periodic_slowdowns as u32),
         Some(ledbat_stats.base_delay.as_millis() as u32),
+        Some(ledbat_stats.ssthresh as u32),
+        Some(ledbat_stats.min_ssthresh_floor as u32),
+        Some(ledbat_stats.total_timeouts as u32),
         TransferDirection::Send,
     );
 
@@ -235,6 +238,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         final_cwnd_bytes: ledbat_stats.cwnd as u32,
         slowdowns_triggered: ledbat_stats.periodic_slowdowns as u32,
         base_delay: ledbat_stats.base_delay,
+        final_ssthresh_bytes: ledbat_stats.ssthresh as u32,
+        min_ssthresh_floor_bytes: ledbat_stats.min_ssthresh_floor as u32,
+        total_timeouts: ledbat_stats.total_timeouts as u32,
     })
 }
 

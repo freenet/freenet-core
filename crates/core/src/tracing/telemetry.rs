@@ -1149,6 +1149,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     final_cwnd_bytes,
                     slowdowns_triggered,
                     final_srtt_ms,
+                    final_ssthresh_bytes,
+                    min_ssthresh_floor_bytes,
+                    total_timeouts,
                     direction,
                     timestamp,
                 } => {
@@ -1163,6 +1166,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "final_cwnd_bytes": final_cwnd_bytes,
                         "slowdowns_triggered": slowdowns_triggered,
                         "final_srtt_ms": final_srtt_ms,
+                        "final_ssthresh_bytes": final_ssthresh_bytes,
+                        "min_ssthresh_floor_bytes": min_ssthresh_floor_bytes,
+                        "total_timeouts": total_timeouts,
                         "direction": format!("{:?}", direction),
                         "timestamp": timestamp,
                     })

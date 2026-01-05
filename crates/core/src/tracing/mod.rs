@@ -3145,6 +3145,16 @@ pub enum TransferEvent {
         slowdowns_triggered: Option<u32>,
         /// Final smoothed RTT at completion (milliseconds).
         final_srtt_ms: Option<u32>,
+        /// Final slow start threshold at completion (bytes).
+        /// Key diagnostic for death spiral: if ssthresh collapses to min_cwnd,
+        /// slow start can't recover useful throughput.
+        final_ssthresh_bytes: Option<u32>,
+        /// Effective minimum ssthresh floor (bytes).
+        /// This floor prevents ssthresh from collapsing too low during timeouts.
+        min_ssthresh_floor_bytes: Option<u32>,
+        /// Total retransmission timeouts (RTO events) during transfer.
+        /// High values indicate severe congestion or path issues.
+        total_timeouts: Option<u32>,
         /// Whether we were sending or receiving.
         direction: TransferDirection,
         timestamp: u64,
