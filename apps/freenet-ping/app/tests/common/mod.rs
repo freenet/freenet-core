@@ -165,7 +165,10 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             bandwidth_limit: None,
             blocked_addresses,
             transient_budget: None,
-            transient_ttl_secs: None,
+            // Use a longer TTL for tests (120s) to prevent connections from expiring
+            // during test operations. The default 30s can cause flaky failures when
+            // transient connections expire before being promoted or before operations complete.
+            transient_ttl_secs: Some(120),
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
             streaming_enabled: None,

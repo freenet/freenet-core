@@ -31,10 +31,10 @@ use transport::streaming_buffer::*;
 // CI Benchmark Groups - Streamlined for What Matters
 // =============================================================================
 
-/// Warm connection throughput - measures sustained bulk transfer performance
-///
-/// This is the PRIMARY metric for max theoretical throughput.
-/// Measures MB/s over warm connection with realistic transfer sizes.
+// Warm connection throughput - measures sustained bulk transfer performance
+//
+// This is the PRIMARY metric for max theoretical throughput.
+// Measures MB/s over warm connection with realistic transfer sizes.
 criterion_group!(
     name = warm_throughput_ci;
     config = Criterion::default()
@@ -45,9 +45,9 @@ criterion_group!(
     targets = bench_warm_connection_throughput
 );
 
-/// Connection establishment - measures cold-start handshake time
-///
-/// Important for user experience (how long to connect to new peer).
+// Connection establishment - measures cold-start handshake time
+//
+// Important for user experience (how long to connect to new peer).
 criterion_group!(
     name = connection_setup_ci;
     config = Criterion::default()
@@ -58,10 +58,10 @@ criterion_group!(
     targets = bench_connection_establishment
 );
 
-/// Streaming buffer operations - critical path for message reassembly
-///
-/// Lock-free buffer is in the hot path for all streaming transfers.
-/// Should be rock-stable (deterministic operations).
+// Streaming buffer operations - critical path for message reassembly
+//
+// Lock-free buffer is in the hot path for all streaming transfers.
+// Should be rock-stable (deterministic operations).
 criterion_group!(
     name = streaming_buffer_ci;
     config = Criterion::default()
