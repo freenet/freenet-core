@@ -100,6 +100,11 @@ pub struct TestConfig {
     #[arg(long)]
     print_network_stats: bool,
 
+    /// Run with deterministic scheduling using Turmoil.
+    /// Turmoil is always available for deterministic simulation.
+    #[arg(long)]
+    pub deterministic: bool,
+
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -187,6 +192,11 @@ pub enum TestMode {
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
+    // Handle deterministic mode with Turmoil
+    if base_config.deterministic {
+        return run_deterministic_simulation(&base_config);
+    }
+
     let disable_metrics = base_config.disable_metrics || {
         match &base_config.command {
             TestMode::Network(config) => matches!(config.mode, network::Process::Peer),
@@ -218,6 +228,38 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<()
         }
     }
     res
+}
+
+/// Run a deterministic simulation using Turmoil's scheduler.
+///
+/// Turmoil is always available - no feature flag required.
+fn run_deterministic_simulation(config: &TestConfig) -> anyhow::Result<(), Error> {
+    use freenet::dev_tool::{run_turmoil_simulation, TurmoilConfig};
+
+    tracing::info!("Running deterministic simulation with Turmoil");
+
+    let name = config
+        .name
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(randomize_test_name);
+
+    let turmoil_config = TurmoilConfig::builder()
+        .name(&name)
+        .gateways(config.gateways)
+        .nodes(config.nodes)
+        .ring_max_htl(config.ring_max_htl)
+        .rnd_if_htl_above(config.rnd_if_htl_above)
+        .max_connections(config.max_connections)
+        .min_connections(config.min_connections)
+        .seed(config.seed())
+        .max_contract_num(config.max_contract_number.unwrap_or(config.nodes * 10))
+        .iterations(config.events as usize)
+        .simulation_duration(Duration::from_secs(300))
+        .build();
+
+    run_turmoil_simulation::<rand::rngs::SmallRng>(turmoil_config)
+        .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
 }
 
 async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwork, Error> {
@@ -292,6 +334,7 @@ mod tests {
             min_success_rate: None,
             print_summary: false,
             print_network_stats: false,
+            deterministic: false,
             command: TestMode::SingleProcess,
         })
         .await
@@ -330,6 +373,7 @@ mod tests {
             min_success_rate: None,
             print_summary: false,
             print_network_stats: false,
+            deterministic: false,
             command: TestMode::SingleProcess,
         };
         assert!(config.build_fault_config().is_none());

@@ -73,10 +73,10 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{
-            ContractDistribution, ConvergedContract, ConvergenceResult, DivergedContract,
-            EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
-            PeerMessage, PeerStatus, PutOperationStats, RunningNode, SimNetwork,
-            UpdateOperationStats,
+            run_turmoil_simulation, ContractDistribution, ConvergedContract, ConvergenceResult,
+            DivergedContract, EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats,
+            OperationSummary, PeerMessage, PeerStatus, PutOperationStats, RunningNode, SimNetwork,
+            TurmoilConfig, TurmoilResult, UpdateOperationStats,
         },
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };

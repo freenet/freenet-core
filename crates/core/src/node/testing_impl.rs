@@ -94,8 +94,10 @@ use crate::{
 
 mod in_memory;
 mod network;
+pub mod turmoil_runner;
 
 pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
+pub use self::turmoil_runner::{run_turmoil_simulation, TurmoilConfig, TurmoilResult};
 
 pub(crate) type EventId = u32;
 
@@ -1965,6 +1967,201 @@ impl SimNetwork {
                 summary.update.success_rate() * 100.0,
             );
         }
+    }
+
+    // =========================================================================
+    // Turmoil-based Deterministic Simulation
+    // =========================================================================
+
+    /// Runs the simulation with deterministic scheduling using Turmoil.
+    ///
+    /// This method sets up all nodes as Turmoil hosts and runs the simulation
+    /// deterministically. All tokio async operations are scheduled by Turmoil's
+    /// deterministic scheduler, making tests reproducible.
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - Seed for random event generation
+    /// * `max_contract_num` - Maximum number of contracts in the simulation
+    /// * `iterations` - Number of iterations/events to run
+    /// * `simulation_duration` - Maximum duration for the simulation
+    /// * `test_fn` - A closure containing the test logic to run inside Turmoil
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use freenet::dev_tool::SimNetwork;
+    /// use std::time::Duration;
+    ///
+    /// let sim = SimNetwork::new("test", 1, 5, 7, 3, 10, 2, 42).await;
+    ///
+    /// sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+    ///     42,
+    ///     10,
+    ///     100,
+    ///     Duration::from_secs(60),
+    ///     || async {
+    ///         // Test assertions here
+    ///         tokio::time::sleep(Duration::from_secs(5)).await;
+    ///         Ok(())
+    ///     },
+    /// )?;
+    /// ```
+    ///
+    /// # Determinism
+    ///
+    /// Running with the same seed will produce the same execution order and
+    /// results. This is essential for:
+    /// - Reproducing bugs
+    /// - Property-based testing
+    /// - CI reliability
+    pub fn run_simulation<R, F, Fut>(
+        mut self,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+        simulation_duration: Duration,
+        test_fn: F,
+    ) -> turmoil::Result
+    where
+        R: RandomEventGenerator + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = turmoil::Result> + 'static,
+    {
+        use crate::config::GlobalRng;
+        use std::sync::Mutex;
+
+        // Set up deterministic RNG
+        GlobalRng::set_seed(seed);
+
+        // Build Turmoil simulation
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(simulation_duration)
+            .build();
+
+        // Get total peer count for event generation
+        let total_peer_num = self.gateways.len() + self.nodes.len();
+
+        // Register all gateways as Turmoil hosts
+        // Turmoil's sim.host requires Fn (can be called multiple times),
+        // so we wrap non-Clone values in Arc<Mutex<Option<T>>> and take them on first call
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                receiver_ch,
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+            let span = tracing::info_span!("turmoil_gateway", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )) as Box<dyn std::error::Error>)
+                }
+            });
+        }
+
+        // Register all regular nodes as Turmoil hosts
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                receiver_ch,
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+            let span = tracing::info_span!("turmoil_node", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage.lock().unwrap().take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )) as Box<dyn std::error::Error>)
+                }
+            });
+        }
+
+        // Register the test function as a Turmoil client
+        sim.client("test", async move {
+            // Give nodes time to start
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            test_fn().await
+        });
+
+        // Run the simulation
+        sim.run()
     }
 }
 

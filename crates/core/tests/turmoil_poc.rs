@@ -86,13 +86,11 @@ fn test_turmoil_with_channels() -> turmoil::Result {
 #[test]
 fn test_turmoil_with_global_state() -> turmoil::Result {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     // Global registry (similar to SimulationSocket's PEER_REGISTRY)
-    lazy_static::lazy_static! {
-        static ref REGISTRY: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>> =
-            Mutex::new(HashMap::new());
-    }
+    static REGISTRY: LazyLock<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
@@ -197,7 +195,7 @@ fn test_turmoil_determinism() -> turmoil::Result {
 #[allow(clippy::type_complexity)]
 fn test_turmoil_with_socket_pattern() -> turmoil::Result {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     // Simplified socket registry (mirrors SimulationSocket's approach)
     struct SocketRegistry {
@@ -226,9 +224,7 @@ fn test_turmoil_with_socket_pattern() -> turmoil::Result {
         }
     }
 
-    lazy_static::lazy_static! {
-        static ref SOCKETS: SocketRegistry = SocketRegistry::new();
-    }
+    static SOCKETS: LazyLock<SocketRegistry> = LazyLock::new(SocketRegistry::new);
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))

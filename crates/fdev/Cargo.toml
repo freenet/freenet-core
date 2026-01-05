@@ -49,3 +49,4 @@ freenet-stdlib = { workspace = true }
 
 [features]
 trace-ot = ["freenet/trace-ot"]
+# Note: Turmoil-based deterministic simulation is now always enabled in freenet core
