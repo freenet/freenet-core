@@ -7,7 +7,6 @@
 //! 4. Small networks establish connectivity reliably
 
 use freenet::dev_tool::SimNetwork;
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -1456,8 +1455,8 @@ fn test_graceful_shutdown_no_deadlock() {
     // Run under Turmoil - this handles all tokio::time calls deterministically
     let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
         SEED,
-        10,  // max_contract_num
-        3,   // iterations
+        10,                      // max_contract_num
+        3,                       // iterations
         Duration::from_secs(30), // simulation_duration
         || async {
             // Wait for nodes to establish connections
