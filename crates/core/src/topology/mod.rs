@@ -65,10 +65,7 @@ use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Instant,
-};
+use std::{collections::BTreeMap, time::Instant};
 use tracing::{debug, error, event, info, span, warn, Level};
 
 pub mod connection_evaluator;
@@ -107,7 +104,7 @@ use request_density_tracker::DensityMapError;
 pub(crate) struct TopologyManager {
     limits: Limits,
     meter: Meter,
-    source_creation_times: HashMap<AttributionSource, Instant>,
+    source_creation_times: BTreeMap<AttributionSource, Instant>,
     slow_connection_evaluator: ConnectionEvaluator,
     fast_connection_evaluator: ConnectionEvaluator,
     request_density_tracker: RequestDensityTracker,
@@ -123,7 +120,7 @@ impl TopologyManager {
         TopologyManager {
             meter: Meter::new_with_window_size(100),
             limits,
-            source_creation_times: HashMap::new(),
+            source_creation_times: BTreeMap::new(),
             slow_connection_evaluator: ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,
             ),
@@ -289,7 +286,7 @@ impl TopologyManager {
         let _enter = function_span.enter();
 
         let mut total_usage: Rate = Rate::new_per_second(0.0);
-        let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
+        let mut usage_per_source: BTreeMap<AttributionSource, Rate> = BTreeMap::new();
 
         // Step 1: Collect data
         let collect_data_span = span!(Level::DEBUG, "collect_data");
@@ -541,7 +538,7 @@ impl TopologyManager {
     }
 
     fn calculate_usage_proportion(&mut self, at_time: Instant) -> (ResourceType, RateProportion) {
-        let mut usage_rate_per_type = HashMap::new();
+        let mut usage_rate_per_type = BTreeMap::new();
         for resource_type in ResourceType::all() {
             let usage = self.extrapolated_usage(&resource_type, at_time);
             let proportion = usage.total.proportion_of(&self.limits.get(&resource_type));
@@ -1194,7 +1191,7 @@ pub(crate) enum TopologyAdjustment {
 struct Usage {
     total: Rate,
     #[allow(unused)]
-    per_source: HashMap<AttributionSource, Rate>,
+    per_source: BTreeMap<AttributionSource, Rate>,
 }
 
 pub(crate) struct Limits {

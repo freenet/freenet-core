@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
@@ -22,16 +21,16 @@ const ESTIMATED_USAGE_RATE_CACHE_TIME: Duration = Duration::from_secs(60);
 pub(crate) struct Meter {
     attribution_meters: AttributionMeters,
     running_average_window_size: usize,
-    cached_estimated_usage_rate: DashMap<ResourceType, (Rate, Instant)>,
+    cached_estimated_usage_rate: RwLock<BTreeMap<ResourceType, (Rate, Instant)>>,
 }
 
 impl Meter {
     /// Creates a new `Meter`.
     pub fn new_with_window_size(running_average_window_size: usize) -> Self {
         Meter {
-            attribution_meters: AttributionMeters::new(),
+            attribution_meters: RwLock::new(BTreeMap::new()),
             running_average_window_size,
-            cached_estimated_usage_rate: DashMap::new(),
+            cached_estimated_usage_rate: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -42,7 +41,8 @@ impl Meter {
         resource: &ResourceType,
         at_time: Instant,
     ) -> Option<Rate> {
-        match self.attribution_meters.get(attribution) {
+        let meters = self.attribution_meters.read().unwrap();
+        match meters.get(attribution) {
             Some(attribution_meters) => {
                 match attribution_meters.map.get(resource) {
                     Some(meter) => {
@@ -75,37 +75,41 @@ impl Meter {
         resource: &ResourceType,
         at_time: Instant,
     ) -> Option<Rate> {
-        if let Some(cached) = self.cached_estimated_usage_rate.get(resource) {
-            let (cached_rate, cached_time) = cached.value();
-            if at_time - *cached_time <= ESTIMATED_USAGE_RATE_CACHE_TIME {
-                return Some(*cached_rate);
+        {
+            let cache = self.cached_estimated_usage_rate.read().unwrap();
+            if let Some((cached_rate, cached_time)) = cache.get(resource) {
+                if at_time - *cached_time <= ESTIMATED_USAGE_RATE_CACHE_TIME {
+                    return Some(*cached_rate);
+                }
             }
         }
 
         match self.calculate_estimated_usage_rate(resource, at_time) {
             Some(estimated_usage_rate) => {
-                self.cached_estimated_usage_rate
-                    .insert(*resource, (estimated_usage_rate, at_time));
+                let mut cache = self.cached_estimated_usage_rate.write().unwrap();
+                cache.insert(*resource, (estimated_usage_rate, at_time));
                 Some(estimated_usage_rate)
             }
             None => None,
         }
     }
 
-    /// Returns a HashMap of AttributionSource to Rate of the usage rate for
+    /// Returns a BTreeMap of AttributionSource to Rate of the usage rate for
     /// each attribution source. This does not adjust the usage rate for sources
     /// that are ramping up.
     pub(crate) fn get_usage_rates(
         &self,
         resource: &ResourceType,
         at_time: Instant,
-    ) -> HashMap<AttributionSource, Rate> {
-        let mut rates = HashMap::new();
+    ) -> BTreeMap<AttributionSource, Rate> {
+        let mut rates = BTreeMap::new();
+        let meters = self.attribution_meters.read().unwrap();
 
-        for attribution_meter in self.attribution_meters.iter() {
-            let attribution = attribution_meter.key();
-            if let Some(rate) = self.attributed_usage_rate(attribution, resource, at_time) {
-                rates.insert(attribution.clone(), rate);
+        for (attribution, attribution_meter) in meters.iter() {
+            if let Some(meter) = attribution_meter.map.get(resource) {
+                if let Some(rate) = meter.get_rate_at_time(at_time) {
+                    rates.insert(attribution.clone(), rate);
+                }
             }
         }
 
@@ -133,13 +137,13 @@ impl Meter {
     /// This function may panic if `DEFAULT_USAGE_PERCENTILE` is set to an invalid value that is not within
     /// the range [0.0, 1.0].
     fn calculate_estimated_usage_rate(
-        &mut self,
+        &self,
         resource: &ResourceType,
         at_time: Instant,
     ) -> Option<Rate> {
-        let rates: Vec<Rate> = self
-            .attribution_meters
-            .iter()
+        let meters = self.attribution_meters.read().unwrap();
+        let rates: Vec<Rate> = meters
+            .values()
             // Filter out resources with no Rate and collect their rates
             .filter_map(|t| {
                 t.map
@@ -176,11 +180,11 @@ impl Meter {
         at_time: Instant,
     ) {
         // Report the usage for a specific attribution
-        let resource_map = self
-            .attribution_meters
+        let mut meters = self.attribution_meters.write().unwrap();
+        let resource_map = meters
             .entry(attribution.clone())
             .or_insert_with(ResourceTotals::new);
-        let mut resource_value = resource_map
+        let resource_value = resource_map
             .map
             .entry(resource)
             .or_insert_with(|| RunningAverage::new(self.running_average_window_size));
@@ -195,7 +199,27 @@ pub(crate) enum AttributionSource {
     Delegate(DelegateKey),
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
+impl PartialOrd for AttributionSource {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AttributionSource {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (AttributionSource::Peer(a), AttributionSource::Peer(b)) => a.cmp(b),
+            (AttributionSource::Peer(_), AttributionSource::Delegate(_)) => std::cmp::Ordering::Less,
+            (AttributionSource::Delegate(_), AttributionSource::Peer(_)) => std::cmp::Ordering::Greater,
+            // DelegateKey doesn't implement Ord, but this variant is never used in practice
+            (AttributionSource::Delegate(a), AttributionSource::Delegate(b)) => {
+                format!("{:?}", a).cmp(&format!("{:?}", b))
+            }
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub(crate) enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
@@ -210,17 +234,17 @@ impl ResourceType {
     }
 }
 
-type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
+type AttributionMeters = RwLock<BTreeMap<AttributionSource, ResourceTotals>>;
 
 /// A structure that holds running averages of resource usage for different resource types.
 struct ResourceTotals {
-    pub map: DashMap<ResourceType, RunningAverage>,
+    pub map: BTreeMap<ResourceType, RunningAverage>,
 }
 
 impl ResourceTotals {
     fn new() -> Self {
         ResourceTotals {
-            map: DashMap::new(),
+            map: BTreeMap::new(),
         }
     }
 }
@@ -242,7 +266,7 @@ mod tests {
                 Instant::now(),
             )
             .is_none());
-        assert!(meter.attribution_meters.is_empty());
+        assert!(meter.attribution_meters.read().unwrap().is_empty());
     }
 
     #[test]

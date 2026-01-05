@@ -394,9 +394,9 @@ pub(crate) async fn run_op_request_mediator(
     to_event_loop_tx: mpsc::Sender<Transaction>,
     mut from_event_loop_rx: mpsc::Receiver<OpEnum>,
 ) {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    let mut pending_responses: HashMap<Transaction, PendingRequest> = HashMap::new();
+    let mut pending_responses: BTreeMap<Transaction, PendingRequest> = BTreeMap::new();
     let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -513,7 +513,7 @@ pub(crate) async fn run_op_request_mediator(
                     "Mediator channels closed, shutting down"
                 );
                 // Notify any remaining waiters
-                for (tx, pending) in pending_responses.drain() {
+                for (tx, pending) in std::mem::take(&mut pending_responses) {
                     tracing::debug!(tx = %tx, "Notifying orphaned waiter of shutdown");
                     let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
                 }

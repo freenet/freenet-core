@@ -32,15 +32,22 @@ use std::time::Duration;
 /// - Fixed HashMap→BTreeMap in SocketRegistry, P2pConnManager.connections
 /// - Fixed try_lock+spawn race condition in SocketInbox
 /// - Fixed message ordering for same-deadline messages
+/// - Converted DashMap→BTreeMap in topology/meter.rs for deterministic iteration
+/// - Converted HashMap→BTreeMap in topology/mod.rs (source_creation_times, usage maps)
+/// - Converted HashMap→BTreeMap in contract/executor.rs (pending_responses)
+/// - Added cleanup of global static state between runs (socket registries)
 ///
-/// Test now reaches index 47 (vs index 10 before fixes), showing significant
-/// improvement. Remaining non-determinism likely comes from other HashMaps
-/// in topology, contract executor, or transport layers.
+/// ## Remaining Issues:
+/// - Event counts still differ between runs (e.g., 116 vs 109)
+/// - This suggests non-determinism in event generation timing, not iteration order
+/// - Global atomic counters (REQUEST_ID_COUNTER, CLIENT_ID, etc.) don't reset
+/// - Turmoil may not provide full determinism for all async scheduling patterns
 ///
 /// ## To fully fix:
-/// - Audit and convert remaining HashMaps that are iterated in hot paths
-/// - Key candidates: topology/mod.rs, contract/executor.rs, transport/*.rs
-#[ignore = "Remaining HashMap iteration non-determinism - see doc comment"]
+/// - Reset all global atomic counters between runs
+/// - Ensure all time-dependent operations use VirtualTime
+/// - Investigate Turmoil's scheduling determinism guarantees
+#[ignore = "Event count non-determinism - see doc comment"]
 #[test]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;
@@ -56,6 +63,10 @@ fn test_strict_determinism_exact_event_equality() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
+        // Clean up global state from previous runs to ensure determinism
+        freenet::transport::in_memory_socket::clear_all_socket_registries();
+        freenet::transport::in_memory_socket::clear_all_address_networks();
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
