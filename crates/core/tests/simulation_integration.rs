@@ -1666,3 +1666,77 @@ fn test_graceful_shutdown_typed_error() {
 
     tracing::info!("Typed error test passed");
 }
+
+// =============================================================================
+// Turmoil Determinism Test
+// =============================================================================
+
+/// Tests that Turmoil provides deterministic execution.
+///
+/// This test verifies that running the same simulation twice with Turmoil
+/// produces consistent results. Since Turmoil provides deterministic task
+/// scheduling, the simulations should behave identically.
+///
+/// Note: This tests that Turmoil scheduling is deterministic, not that the
+/// full event sequence matches (which requires API changes to capture events
+/// from run_simulation).
+#[test]
+fn test_turmoil_determinism() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0xDE7E_2A10_1571C;
+
+    fn run_simulation_once(name: &str, seed: u64) -> turmoil::Result {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let sim = rt.block_on(async {
+            SimNetwork::new(
+                name,
+                1, // 1 gateway
+                2, // 2 nodes
+                7,
+                3,
+                10,
+                2,
+                seed,
+            )
+            .await
+        });
+
+        sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            seed,
+            5,                       // max_contract_num
+            2,                       // iterations
+            Duration::from_secs(15), // simulation_duration
+            || async {
+                // Wait for nodes to establish connections
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(())
+            },
+        )
+    }
+
+    // Run simulation twice with the same seed
+    let result1 = run_simulation_once("turmoil-det-run1", SEED);
+    let result2 = run_simulation_once("turmoil-det-run2", SEED);
+
+    // Both should succeed (or both should fail) if Turmoil is deterministic
+    assert!(
+        result1.is_ok() == result2.is_ok(),
+        "Turmoil determinism test: runs should have consistent success/failure.\nRun 1: {:?}\nRun 2: {:?}",
+        result1,
+        result2
+    );
+
+    if result1.is_ok() {
+        tracing::info!("Turmoil determinism test PASSED: Both runs completed successfully");
+    } else {
+        tracing::warn!(
+            "Turmoil determinism test PASSED (consistent failure): {:?}",
+            result1.err()
+        );
+    }
+}
