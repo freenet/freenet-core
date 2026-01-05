@@ -96,7 +96,7 @@ freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { version = "0.5.0", optional = true }
 tokio-stream = "0.1.17"
 freenet-test-network = { version = "0.1.20", optional = true }
-turmoil = "0.6"  # Deterministic simulation scheduling (always enabled for SimNetwork)
+turmoil = "0.7"  # Deterministic simulation scheduling (always enabled for SimNetwork)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"  # For sendmmsg syscall batching on Linux
