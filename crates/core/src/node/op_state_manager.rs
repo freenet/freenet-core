@@ -375,6 +375,37 @@ impl OpManager {
         }
     }
 
+    /// Send a result to the client via the result router, awaiting delivery.
+    ///
+    /// This ensures the result is actually queued for delivery before returning,
+    /// preventing race conditions where the operation is marked complete before
+    /// the client receives the response.
+    pub(crate) async fn send_client_result(&self, tx: Transaction, host_result: HostResult) {
+        if let Err(err) = self.result_router_tx.send((tx, host_result)).await {
+            tracing::error!(
+                %tx,
+                error = %err,
+                "failed to dispatch operation result to client"
+            );
+            return;
+        }
+
+        if let Err(err) = self
+            .to_event_listener
+            .notifications_sender
+            .send(Either::Right(NodeEvent::TransactionCompleted(tx)))
+            .await
+        {
+            tracing::warn!(
+                %tx,
+                error = %err,
+                "failed to notify event loop about transaction completion"
+            );
+        }
+    }
+
+    /// Fire-and-forget version for cases where blocking is not acceptable.
+    /// Use sparingly - prefer send_client_result() to ensure delivery.
     fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
         let router_tx = self.result_router_tx.clone();
         let notifier = self.to_event_listener.clone();
