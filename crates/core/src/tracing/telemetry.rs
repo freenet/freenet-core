@@ -471,6 +471,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 PutEvent::Request { .. } => "put_request".to_string(),
                 PutEvent::PutSuccess { .. } => "put_success".to_string(),
                 PutEvent::PutFailure { .. } => "put_failure".to_string(),
+                PutEvent::ResponseSent { .. } => "put_response_sent".to_string(),
                 PutEvent::BroadcastEmitted { .. } => "put_broadcast_emitted".to_string(),
                 PutEvent::BroadcastReceived { .. } => "put_broadcast_received".to_string(),
             }
@@ -482,6 +483,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 GetEvent::GetSuccess { .. } => "get_success".to_string(),
                 GetEvent::GetNotFound { .. } => "get_not_found".to_string(),
                 GetEvent::GetFailure { .. } => "get_failure".to_string(),
+                GetEvent::ResponseSent { .. } => "get_response_sent".to_string(),
             }
         }
         EventKind::Subscribe(subscribe_event) => {
@@ -490,6 +492,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::Request { .. } => "subscribe_request".to_string(),
                 SubscribeEvent::SubscribeSuccess { .. } => "subscribe_success".to_string(),
                 SubscribeEvent::SubscribeNotFound { .. } => "subscribe_not_found".to_string(),
+                SubscribeEvent::ResponseSent { .. } => "subscribe_response_sent".to_string(),
                 SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
                 SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
                 SubscribeEvent::DownstreamAdded { .. } => "downstream_added".to_string(),
@@ -758,6 +761,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "timestamp": timestamp,
                     })
                 }
+                PutEvent::ResponseSent {
+                    id,
+                    from,
+                    to,
+                    key,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "response_sent",
+                        "id": id.to_string(),
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "key": key.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
             }
         }
         EventKind::Get(get_event) => {
@@ -848,6 +867,25 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "timestamp": timestamp,
                     })
                 }
+                GetEvent::ResponseSent {
+                    id,
+                    from,
+                    to,
+                    key,
+                    timestamp,
+                } => {
+                    let mut json = serde_json::json!({
+                        "type": "get_response_sent",
+                        "id": id.to_string(),
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "timestamp": timestamp,
+                    });
+                    if let Some(k) = key {
+                        json["key"] = serde_json::Value::String(k.to_string());
+                    }
+                    json
+                }
             }
         }
         EventKind::Subscribe(subscribe_event) => {
@@ -910,6 +948,25 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
+                }
+                SubscribeEvent::ResponseSent {
+                    id,
+                    from,
+                    to,
+                    key,
+                    timestamp,
+                } => {
+                    let mut json = serde_json::json!({
+                        "type": "subscribe_response_sent",
+                        "id": id.to_string(),
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "timestamp": timestamp,
+                    });
+                    if let Some(k) = key {
+                        json["key"] = serde_json::Value::String(k.to_string());
+                    }
+                    json
                 }
                 SubscribeEvent::SeedingStarted {
                     instance_id,

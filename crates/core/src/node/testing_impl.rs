@@ -1840,6 +1840,7 @@ impl SimNetwork {
                         PutEvent::Request { .. } => summary.put.requested += 1,
                         PutEvent::PutSuccess { .. } => summary.put.succeeded += 1,
                         PutEvent::PutFailure { .. } => summary.put.failed += 1,
+                        PutEvent::ResponseSent { .. } => {}, // Response tracking, doesn't affect summary
                         PutEvent::BroadcastEmitted { .. } => summary.put.broadcasts_emitted += 1,
                         PutEvent::BroadcastReceived { .. } => summary.put.broadcasts_received += 1,
                     }

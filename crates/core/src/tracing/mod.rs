@@ -1100,7 +1100,11 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
+    pub fn from_outbound_msg(
+        msg: &'a NetMessage,
+        ring: &'a Ring,
+        target_addr: Option<std::net::SocketAddr>,
+    ) -> Either<Self, Vec<Self>> {
         let own_loc = ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {
             return Either::Right(vec![]);
@@ -1128,6 +1132,60 @@ impl<'a> NetEventLog<'a> {
                     latency_ms: None, // RTT not available in message path
                     this_peer_connection_count: connection_count,
                     initiated_by: Some(peer_id.clone()), // We (the joiner) initiated
+                })
+            }
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id, key })) => {
+                // Track outbound Put response for message routing visibility
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
+                EventKind::Put(PutEvent::ResponseSent {
+                    id: *id,
+                    from: own_loc.clone(),
+                    to,
+                    key: *key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessage::V1(NetMessageV1::Get(GetMsg::Response { id, .. })) => {
+                // Track outbound Get response for message routing visibility
+                // Key may not be available for NotFound responses, but include if present
+                let key = match msg {
+                    NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                        result: GetMsgResult::Found { key, .. },
+                        ..
+                    })) => Some(*key),
+                    _ => None,
+                };
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
+                EventKind::Get(GetEvent::ResponseSent {
+                    id: *id,
+                    from: own_loc.clone(),
+                    to,
+                    key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response { id, .. })) => {
+                // Track outbound Subscribe response for message routing visibility
+                let key = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                        result: SubscribeMsgResult::Subscribed { key },
+                        ..
+                    })) => Some(*key),
+                    _ => None,
+                };
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
+                EventKind::Subscribe(SubscribeEvent::ResponseSent {
+                    id: *id,
+                    from: own_loc.clone(),
+                    to,
+                    key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             _ => EventKind::Ignored,
@@ -2664,6 +2722,19 @@ pub(crate) enum PutEvent {
         elapsed_ms: u64,
         timestamp: u64,
     },
+    /// Put response being sent back to the requester.
+    ///
+    /// Tracks when this peer sends a successful put response to an upstream peer.
+    /// This provides sender-side visibility for debugging message routing.
+    ResponseSent {
+        id: Transaction,
+        /// The peer sending the response.
+        from: PeerKeyLocation,
+        /// The peer receiving the response.
+        to: PeerKeyLocation,
+        key: ContractKey,
+        timestamp: u64,
+    },
     BroadcastEmitted {
         id: Transaction,
         upstream: PeerKeyLocation,
@@ -2702,6 +2773,7 @@ impl PutEvent {
             PutEvent::Request { key, .. }
             | PutEvent::PutSuccess { key, .. }
             | PutEvent::PutFailure { key, .. }
+            | PutEvent::ResponseSent { key, .. }
             | PutEvent::BroadcastEmitted { key, .. }
             | PutEvent::BroadcastReceived { key, .. } => *key,
         }
@@ -2881,14 +2953,29 @@ pub(crate) enum GetEvent {
         elapsed_ms: u64,
         timestamp: u64,
     },
+    /// Get response being sent back to the requester.
+    ///
+    /// Tracks when this peer sends a get response (success or not found) to an upstream peer.
+    /// This provides sender-side visibility for debugging message routing and understanding
+    /// how search results propagate back through the network.
+    ResponseSent {
+        id: Transaction,
+        /// The peer sending the response.
+        from: PeerKeyLocation,
+        /// The peer receiving the response.
+        to: PeerKeyLocation,
+        key: Option<ContractKey>,
+        timestamp: u64,
+    },
 }
 
 impl GetEvent {
     /// Returns the contract key for this event if available.
-    /// Only GetSuccess has the full key; other variants have instance_id.
+    /// Only GetSuccess and ResponseSent may have the full key; other variants have instance_id.
     fn contract_key(&self) -> Option<ContractKey> {
         match self {
             GetEvent::GetSuccess { key, .. } => Some(*key),
+            GetEvent::ResponseSent { key, .. } => *key,
             _ => None,
         }
     }
@@ -2943,6 +3030,19 @@ pub(crate) enum SubscribeEvent {
         hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Subscribe response being sent back to the requester.
+    ///
+    /// Tracks when this peer sends a subscribe response (success or not found) to an upstream peer.
+    /// This provides sender-side visibility for debugging subscription propagation.
+    ResponseSent {
+        id: Transaction,
+        /// The peer sending the response.
+        from: PeerKeyLocation,
+        /// The peer receiving the response.
+        to: PeerKeyLocation,
+        key: Option<ContractKey>,
         timestamp: u64,
     },
     /// A local client started seeding a contract (via WebSocket subscription).
@@ -3046,6 +3146,7 @@ impl SubscribeEvent {
             | SubscribeEvent::UpstreamSet { key, .. }
             | SubscribeEvent::Unsubscribed { key, .. }
             | SubscribeEvent::SubscriptionState { key, .. } => Some(*key),
+            SubscribeEvent::ResponseSent { key, .. } => *key,
             _ => None,
         }
     }
