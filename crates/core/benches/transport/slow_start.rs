@@ -48,9 +48,6 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                         // Create fresh VirtualTime for each iteration to avoid time accumulation
                         let ts = VirtualTime::new();
 
-                        // Spawn auto-advance task BEFORE connection
-                        let auto_advance = spawn_auto_advance_task(ts.clone());
-
                         let channels: Channels = Arc::new(DashMap::new());
                         let message: Vec<u8> = vec![0xABu8; transfer_size];
 
@@ -67,7 +64,6 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("cold_start peer_a creation failed: {:?}", e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -84,14 +80,12 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("cold_start peer_b creation failed: {:?}", e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
 
-                        let start_virtual = ts.now_nanos();
-
-                        // Connect both peers concurrently
+                        // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                        // VirtualTime inflation during handshake)
                         let (conn_a_future, conn_b_future) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
                             peer_b.connect(peer_a_pub, peer_a_addr),
@@ -110,6 +104,12 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                 continue;
                             }
                         };
+
+                        // Spawn auto-advance task AFTER connection is established
+                        // to avoid VirtualTime inflation during handshake
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
+                        let start_virtual = ts.now_nanos();
 
                         // Send from B to A
                         let send_result = conn_b.send(message).await;
@@ -192,7 +192,6 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                 for _ in 0..iters {
                     // Create fresh VirtualTime for each iteration
                     let ts = VirtualTime::new();
-                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     let channels: Channels = Arc::new(DashMap::new());
 
@@ -209,7 +208,6 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("warm peer_a creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -226,91 +224,87 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("warm peer_b creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
 
+                    // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                    // VirtualTime inflation during handshake)
+                    let (conn_a_inner, conn_b_inner) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
+
+                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+
+                    let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) => {
+                            eprintln!("warm conn_a connect failed: {:?}", e);
+                            continue;
+                        }
+                        (_, Err(e)) => {
+                            eprintln!("warm conn_b connect failed: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    // Spawn auto-advance task AFTER connection is established
+                    // to avoid VirtualTime inflation during handshake
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
+
                     const WARMUP_COUNT: usize = 3;
                     let warmup_size = 1000; // < MAX_DATA_SIZE
 
+                    // Perform warmup transfers to stabilize LEDBAT cwnd
+                    for i in 0..WARMUP_COUNT {
+                        let warmup_msg = vec![0xABu8; warmup_size];
+                        if let Err(e) = conn_a.send(warmup_msg).await {
+                            eprintln!("warm warmup send {} failed: {:?}", i, e);
+                            break;
+                        }
+                        match conn_b.recv().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("warm warmup recv {} failed: {:?}", i, e);
+                                break;
+                            }
+                        }
+                    }
+
                     let start_virtual = ts.now_nanos();
 
-                    // Spawn receiver task
-                    let receiver = tokio::spawn(async move {
-                        let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("warm receiver connect failed: {:?}", e);
-                                return None;
-                            }
-                        };
-
-                        // Receive warmup transfers
-                        for i in 0..WARMUP_COUNT {
-                            match conn.recv().await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("warm warmup recv {} failed: {:?}", i, e);
-                                    return None;
-                                }
-                            }
+                    // Send measured transfer
+                    let message = vec![0xABu8; transfer_size];
+                    let sent_ok = match conn_a.send(message).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("warm measured send failed: {:?}", e);
+                            false
                         }
+                    };
 
-                        // Receive measured transfer
-                        match conn.recv().await {
-                            Ok(received) => Some(received),
+                    // Receive measured transfer
+                    if sent_ok {
+                        match conn_b.recv().await {
+                            Ok(received) => {
+                                std_black_box(received);
+                            }
                             Err(e) => {
                                 eprintln!("warm measured recv failed: {:?}", e);
-                                None
                             }
                         }
-                    });
-
-                    // Spawn sender task
-                    let sender = tokio::spawn(async move {
-                        let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("warm sender connect failed: {:?}", e);
-                                return false;
-                            }
-                        };
-
-                        // Yield to let receiver start
-                        tokio::task::yield_now().await;
-
-                        // Send warmup transfers
-                        for i in 0..WARMUP_COUNT {
-                            let warmup_msg = vec![0xABu8; warmup_size];
-                            if let Err(e) = conn.send(warmup_msg).await {
-                                eprintln!("warm warmup send {} failed: {:?}", i, e);
-                                return false;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-
-                        // Send measured transfer
-                        let message = vec![0xABu8; transfer_size];
-                        match conn.send(message).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("warm measured send failed: {:?}", e);
-                                false
-                            }
-                        }
-                    });
-
-                    let (recv_result, _) = tokio::join!(receiver, sender);
-                    if let Ok(Some(received)) = recv_result {
-                        std_black_box(received);
                     }
 
                     let end_virtual = ts.now_nanos();
                     total_virtual_time +=
                         Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
+
+                    // Keep peers and connections alive until end of iteration
+                    drop(conn_a);
+                    drop(conn_b);
+                    drop(peer_a);
+                    drop(peer_b);
 
                     auto_advance.abort();
                     drop(channels);
@@ -346,7 +340,6 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                 for _ in 0..iters {
                     // Create fresh VirtualTime for each iteration
                     let ts = VirtualTime::new();
-                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     let channels: Channels = Arc::new(DashMap::new());
                     let message = vec![0xABu8; transfer_size];
@@ -363,7 +356,6 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("cwnd_evolution peer_a creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -380,59 +372,66 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("cwnd_evolution peer_b creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
 
+                    // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                    // VirtualTime inflation during handshake)
+                    let (conn_a_inner, conn_b_inner) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
+
+                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+
+                    let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) => {
+                            eprintln!("cwnd_evolution conn_a connect failed: {:?}", e);
+                            continue;
+                        }
+                        (_, Err(e)) => {
+                            eprintln!("cwnd_evolution conn_b connect failed: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    // Spawn auto-advance task AFTER connection is established
+                    // to avoid VirtualTime inflation during handshake
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let start_virtual = ts.now_nanos();
 
-                    let receiver = tokio::spawn(async move {
-                        let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("cwnd_evolution receiver connect failed: {:?}", e);
-                                return None;
-                            }
-                        };
+                    // Send from A to B
+                    let send_result = conn_a.send(message).await;
+                    let sent_ok = match send_result {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("cwnd_evolution send failed: {:?}", e);
+                            false
+                        }
+                    };
 
-                        match conn.recv().await {
+                    // Receive at B
+                    let received_data = if sent_ok {
+                        match conn_b.recv().await {
                             Ok(received) => Some(received),
                             Err(e) => {
                                 eprintln!("cwnd_evolution recv failed: {:?}", e);
                                 None
                             }
                         }
-                    });
-
-                    let sender = tokio::spawn(async move {
-                        let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("cwnd_evolution sender connect failed: {:?}", e);
-                                return None;
-                            }
-                        };
-
-                        tokio::task::yield_now().await;
-
-                        if let Err(e) = conn.send(message).await {
-                            eprintln!("cwnd_evolution send failed: {:?}", e);
-                            return None;
-                        }
-                        Some(())
-                    });
-
-                    let (recv_result, _) = tokio::join!(receiver, sender);
+                    } else {
+                        None
+                    };
 
                     let end_virtual = ts.now_nanos();
                     let elapsed_virtual =
                         Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
                     total_virtual_time += elapsed_virtual;
 
-                    if let Ok(Some(received)) = recv_result {
+                    if let Some(received) = received_data {
                         let throughput_mbps = (0.016 / elapsed_virtual.as_secs_f64()) * 8.0;
                         if iters == 1 {
                             println!(
@@ -442,6 +441,12 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                         }
                         std_black_box(received);
                     }
+
+                    // Keep peers and connections alive until end of iteration
+                    drop(conn_a);
+                    drop(conn_b);
+                    drop(peer_a);
+                    drop(peer_b);
 
                     auto_advance.abort();
                     drop(channels);
@@ -483,7 +488,6 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                     for _ in 0..iters {
                         // Create fresh VirtualTime for each iteration
                         let ts = VirtualTime::new();
-                        let auto_advance = spawn_auto_advance_task(ts.clone());
 
                         let channels: Channels = Arc::new(DashMap::new());
                         let delay = if rtt_ms == 0 {
@@ -504,7 +508,6 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("rtt_{} peer_a creation failed: {:?}", rtt_ms, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -521,62 +524,69 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("rtt_{} peer_b creation failed: {:?}", rtt_ms, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
 
+                        // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                        // VirtualTime inflation during handshake)
+                        let (conn_a_inner, conn_b_inner) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
+
+                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+
+                        let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                            (Ok(a), Ok(b)) => (a, b),
+                            (Err(e), _) => {
+                                eprintln!("rtt_{} conn_a connect failed: {:?}", rtt_ms, e);
+                                continue;
+                            }
+                            (_, Err(e)) => {
+                                eprintln!("rtt_{} conn_b connect failed: {:?}", rtt_ms, e);
+                                continue;
+                            }
+                        };
+
+                        // Spawn auto-advance task AFTER connection is established
+                        // to avoid VirtualTime inflation during handshake
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let message = vec![0xABu8; transfer_size];
                         let start_virtual = ts.now_nanos();
 
-                        let receiver = tokio::spawn(async move {
-                            let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("rtt receiver connect failed: {:?}", e);
-                                    return None;
-                                }
-                            };
+                        // Send from A to B
+                        let send_result = conn_a.send(message).await;
+                        let sent_ok = match send_result {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("rtt_{} send failed: {:?}", rtt_ms, e);
+                                false
+                            }
+                        };
 
-                            match conn.recv().await {
-                                Ok(received) => Some(received),
+                        // Receive at B
+                        if sent_ok {
+                            match conn_b.recv().await {
+                                Ok(received) => {
+                                    std_black_box(received);
+                                }
                                 Err(e) => {
-                                    eprintln!("rtt recv failed: {:?}", e);
-                                    None
+                                    eprintln!("rtt_{} recv failed: {:?}", rtt_ms, e);
                                 }
                             }
-                        });
-
-                        let sender = tokio::spawn(async move {
-                            let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("rtt sender connect failed: {:?}", e);
-                                    return false;
-                                }
-                            };
-
-                            tokio::task::yield_now().await;
-
-                            match conn.send(message).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    eprintln!("rtt send failed: {:?}", e);
-                                    false
-                                }
-                            }
-                        });
-
-                        let (recv_result, _) = tokio::join!(receiver, sender);
-                        if let Ok(Some(received)) = recv_result {
-                            std_black_box(received);
                         }
 
                         let end_virtual = ts.now_nanos();
                         total_virtual_time +=
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
+
+                        // Keep peers and connections alive until end of iteration
+                        drop(conn_a);
+                        drop(conn_b);
+                        drop(peer_a);
+                        drop(peer_b);
 
                         auto_advance.abort();
                         drop(channels);
@@ -617,25 +627,31 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
                     for _ in 0..iters {
                         // Create fresh VirtualTime for each iteration
                         let ts = VirtualTime::new();
-                        let auto_advance = spawn_auto_advance_task(ts.clone());
 
                         let delay = Duration::from_millis(10); // 10ms RTT
 
                         // Create peers with VirtualTime and high bandwidth
+                        // Connection happens WITHOUT auto-advance to avoid VirtualTime inflation
                         let mut peers =
                             create_connected_peers_with_virtual_time(delay, ts.clone()).await;
+
+                        // Spawn auto-advance task AFTER connection is established
+                        // to avoid VirtualTime inflation during handshake
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
 
                         let message = vec![0xABu8; 1024 * 1024]; // 1MB
                         let start_virtual = ts.now_nanos();
 
                         if let Err(e) = peers.conn_a.send(message).await {
                             eprintln!("high_bandwidth send failed: {:?}", e);
+                            auto_advance.abort();
                             continue;
                         }
                         let received: Vec<u8> = match peers.conn_b.recv().await {
                             Ok(r) => r,
                             Err(e) => {
                                 eprintln!("high_bandwidth recv failed: {:?}", e);
+                                auto_advance.abort();
                                 continue;
                             }
                         };

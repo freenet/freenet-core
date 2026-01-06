@@ -74,9 +74,6 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                         // Create fresh VirtualTime for each iteration to avoid time accumulation
                         let ts_iter = VirtualTime::new();
 
-                        // Spawn auto-advance task BEFORE connection - safe now due to 1-hour idle timeout
-                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
-
                         let channels: Channels = Arc::new(DashMap::new());
                         let message = vec![0xABu8; transfer_size];
 
@@ -92,7 +89,6 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("sustained {}kb peer_a failed: {:?}", transfer_size_kb, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -109,14 +105,12 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("sustained {}kb peer_b failed: {:?}", transfer_size_kb, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
 
-                        let start_virtual = ts_iter.now_nanos();
-
-                        // Connect both peers concurrently
+                        // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                        // VirtualTime inflation during handshake)
                         let (conn_a_future, conn_b_future) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
                             peer_b.connect(peer_a_pub, peer_a_addr),
@@ -128,15 +122,19 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                             (Ok(a), Ok(b)) => (a, b),
                             (Err(e), _) => {
                                 eprintln!("sustained sender connect failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                             (_, Err(e)) => {
                                 eprintln!("sustained receiver connect failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
+
+                        // Spawn auto-advance task AFTER connection is established
+                        // to avoid VirtualTime inflation during handshake
+                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
+                        let start_virtual = ts_iter.now_nanos();
 
                         // Send from A to B
                         let send_result = conn_a.send(message).await;
@@ -208,9 +206,6 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                     // Create fresh VirtualTime for each iteration
                     let ts_iter = VirtualTime::new();
 
-                    // Spawn auto-advance task BEFORE connection - safe now due to 1-hour idle timeout
-                    let auto_advance = spawn_auto_advance_task(ts_iter.clone());
-
                     let channels: Channels = Arc::new(DashMap::new());
                     let message = vec![0xABu8; transfer_size];
 
@@ -227,7 +222,6 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("packet_loss peer_a creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -245,14 +239,12 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("packet_loss peer_b creation failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
 
-                    let start_virtual = ts_iter.now_nanos();
-
-                    // Connect both peers concurrently
+                    // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                    // VirtualTime inflation during handshake)
                     let (conn_a_future, conn_b_future) = futures::join!(
                         peer_a.connect(peer_b_pub, peer_b_addr),
                         peer_b.connect(peer_a_pub, peer_a_addr),
@@ -264,15 +256,19 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                         (Ok(a), Ok(b)) => (a, b),
                         (Err(e), _) => {
                             eprintln!("packet_loss sender connect failed: {:?}", e);
-                            auto_advance.abort();
                             continue;
                         }
                         (_, Err(e)) => {
                             eprintln!("packet_loss receiver connect failed: {:?}", e);
-                            auto_advance.abort();
                             continue;
                         }
                     };
+
+                    // Spawn auto-advance task AFTER connection is established
+                    // to avoid VirtualTime inflation during handshake
+                    let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
+                    let start_virtual = ts_iter.now_nanos();
 
                     // Send from A to B
                     let send_result = conn_a.send(message).await;
@@ -334,9 +330,6 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                         // Create fresh VirtualTime for each iteration to avoid time accumulation
                         let ts_iter = VirtualTime::new();
 
-                        // Spawn auto-advance task BEFORE connection - safe now due to 1-hour idle timeout
-                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
-
                         let channels: Channels = Arc::new(DashMap::new());
                         let message = vec![0xABu8; transfer_size];
 
@@ -352,7 +345,6 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("large_file {}kb peer_a failed: {:?}", size_kb, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -369,14 +361,12 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("large_file {}kb peer_b failed: {:?}", size_kb, e);
-                                    auto_advance.abort();
                                     continue;
                                 }
                             };
 
-                        let start_virtual = ts_iter.now_nanos();
-
-                        // Connect both peers concurrently
+                        // Connect both peers concurrently (WITHOUT auto-advance to avoid
+                        // VirtualTime inflation during handshake)
                         let (conn_a_future, conn_b_future) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
                             peer_b.connect(peer_a_pub, peer_a_addr),
@@ -388,15 +378,19 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                             (Ok(a), Ok(b)) => (a, b),
                             (Err(e), _) => {
                                 eprintln!("large_file sender connect failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                             (_, Err(e)) => {
                                 eprintln!("large_file receiver connect failed: {:?}", e);
-                                auto_advance.abort();
                                 continue;
                             }
                         };
+
+                        // Spawn auto-advance task AFTER connection is established
+                        // to avoid VirtualTime inflation during handshake
+                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
+                        let start_virtual = ts_iter.now_nanos();
 
                         // Send from A to B
                         let send_result = conn_a.send(message).await;
