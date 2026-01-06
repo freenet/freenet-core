@@ -14,15 +14,15 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{create_peer_pair_with_virtual_time, STREAM_SIZES};
+use super::common::{create_peer_pair_with_virtual_time, spawn_auto_advance_task, STREAM_SIZES};
 
 /// Benchmark large message streaming with VirtualTime (multi-packet transfers)
 ///
 /// This measures the stream fragmentation and reassembly pipeline with
 /// instant virtual time execution.
 pub fn bench_stream_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -41,6 +41,9 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -94,8 +97,8 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
 /// This measures fairness and aggregate throughput when multiple streams
 /// compete for bandwidth.
 pub fn bench_concurrent_streams(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -116,6 +119,9 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                 b.to_async(&rt).iter_custom(|iters| {
                     let ts = ts.clone();
                     async move {
+                        // Spawn auto-advance task to prevent deadlocks
+                        let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let mut total_virtual_time = Duration::ZERO;
 
                         for _ in 0..iters {
@@ -137,32 +143,25 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                             let message = vec![0xABu8; 16384]; // 16KB each
                             let start_virtual = ts.now_nanos();
 
-                            // Spawn concurrent send and receive tasks
-                            let send_task = tokio::spawn(async move {
-                                for _ in 0..n {
-                                    if let Err(e) = conn_a.send(message.clone()).await {
-                                        eprintln!("concurrent send failed: {:?}", e);
+                            // Send all messages sequentially (single-threaded runtime)
+                            for _ in 0..n {
+                                if let Err(e) = conn_a.send(message.clone()).await {
+                                    eprintln!("concurrent send failed: {:?}", e);
+                                    break;
+                                }
+                            }
+
+                            // Receive all messages
+                            let mut results = Vec::new();
+                            for i in 0..n {
+                                match conn_b.recv().await {
+                                    Ok(received) => results.push((i, received.len())),
+                                    Err(e) => {
+                                        eprintln!("concurrent recv failed: {:?}", e);
                                         break;
                                     }
                                 }
-                            });
-
-                            let recv_task = tokio::spawn(async move {
-                                let mut results = Vec::new();
-                                for i in 0..n {
-                                    match conn_b.recv().await {
-                                        Ok(received) => results.push((i, received.len())),
-                                        Err(e) => {
-                                            eprintln!("concurrent recv failed: {:?}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                                results
-                            });
-
-                            send_task.await.ok();
-                            let results = recv_task.await.unwrap_or_default();
+                            }
 
                             let end_virtual = ts.now_nanos();
                             total_virtual_time +=

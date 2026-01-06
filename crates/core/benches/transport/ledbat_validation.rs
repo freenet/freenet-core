@@ -19,15 +19,15 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{create_peer_pair_with_virtual_time, SMALL_SIZES};
+use super::common::{create_peer_pair_with_virtual_time, spawn_auto_advance_task, SMALL_SIZES};
 
 /// Cold start benchmark with VirtualTime: measures connection establishment + transfer
 ///
 /// Each iteration creates a fresh connection, measuring real cold-start behavior.
 /// With VirtualTime, connection handshakes complete instantly.
 pub fn bench_large_transfer_validation(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -46,6 +46,9 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -98,8 +101,8 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
 /// Connection is established once with warmup, then measures steady-state throughput.
 /// With VirtualTime, all operations complete instantly while tracking virtual elapsed time.
 pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -118,6 +121,9 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     // Create connection once for this measurement batch
