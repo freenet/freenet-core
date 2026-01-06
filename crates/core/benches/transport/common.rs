@@ -308,9 +308,7 @@ pub fn new_channels() -> Channels {
 /// ## Returns
 ///
 /// A `JoinHandle` for the monitoring task. Drop it to stop auto-advancing.
-pub fn spawn_auto_advance_task(
-    time_source: VirtualTime,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // Real-time sleep to give protocol tasks time to process packets
