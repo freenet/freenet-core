@@ -966,12 +966,23 @@ impl SimNetwork {
         self.clean_up_tmp_dirs = false;
     }
 
+    /// Derives a deterministic port from seed and peer index for simulation.
+    /// Uses ports in the dynamic range (49152-65535) to avoid conflicts.
+    fn derive_deterministic_port(&self, peer_index: usize) -> u16 {
+        const BASE_PORT: u16 = 50000;
+        const PORT_RANGE: u16 = 10000;
+        // Use peer seed to get a deterministic offset
+        let peer_seed = self.derive_peer_seed(peer_index);
+        BASE_PORT + ((peer_seed % PORT_RANGE as u64) as u16)
+    }
+
     async fn config_gateways(&mut self, num: NonZeroUsize) {
         info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num.into());
         for node_no in 0..num.into() {
             let label = NodeLabel::gateway(&self.name, node_no);
-            let port = crate::util::get_free_port().unwrap();
+            // Use deterministic port for simulation instead of querying system
+            let port = self.derive_deterministic_port(node_no);
             let keypair = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
@@ -1082,7 +1093,7 @@ impl SimNetwork {
             {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
-            let port = crate::util::get_free_port().unwrap();
+            let port = self.derive_deterministic_port(node_no);
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();

@@ -137,6 +137,8 @@ pub mod dev_tool {
         // Reset global registries
         crate::transport::in_memory_socket::clear_all_socket_registries();
         crate::transport::in_memory_socket::clear_all_address_networks();
+        crate::transport::in_memory_socket::clear_all_network_time_sources();
+        crate::node::clear_all_fault_injectors();
     }
 }
 

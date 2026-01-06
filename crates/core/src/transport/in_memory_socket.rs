@@ -85,6 +85,11 @@ pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
 }
 
+/// Clears all network time sources. Useful for test cleanup.
+pub fn clear_all_network_time_sources() {
+    NETWORK_TIME_SOURCES.clear();
+}
+
 /// Registers a VirtualTime instance for a network.
 ///
 /// This should be called when creating a SimNetwork to enable

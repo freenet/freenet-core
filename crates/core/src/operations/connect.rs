@@ -803,6 +803,8 @@ impl ConnectOp {
                 expired.push((peer.clone(), attempt.desired));
             }
         }
+        // Sort by public key for deterministic processing order
+        expired.sort_by(|a, b| a.0.pub_key.cmp(&b.0.pub_key));
         for (peer, desired) in expired {
             if let Some(attempt) = self.forward_attempts.remove(&peer) {
                 self.record_forward_outcome(&attempt.peer, desired, false);

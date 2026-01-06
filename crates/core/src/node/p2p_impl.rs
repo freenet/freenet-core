@@ -61,7 +61,7 @@ impl NodeP2P {
 
         // For small networks, we want to ensure all nodes discover each other quickly
         // to avoid the 10+ second delays on first GET operations
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let max_duration = Duration::from_secs(10);
         let mut last_connection_count = 0;
 
@@ -120,7 +120,7 @@ impl NodeP2P {
 
     pub(super) async fn run_node(mut self) -> anyhow::Result<Infallible> {
         // Record the start time for uptime tracking in shutdown event
-        let start_time = std::time::Instant::now();
+        let start_time = tokio::time::Instant::now();
 
         // Emit peer startup event
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(

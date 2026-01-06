@@ -25,7 +25,11 @@ use std::time::Duration;
 /// If this test fails, it indicates non-determinism in the simulation that Turmoil
 /// doesn't control (e.g., HashMap iteration order, external I/O).
 ///
-/// # Current Status: FAILING (Progress Made)
+/// # Current Status: PASSING (Single Gateway)
+///
+/// The test now passes consistently with 1 gateway + 3 nodes configuration.
+/// Multi-gateway configurations (2+ gateways) still exhibit non-determinism
+/// that requires further investigation.
 ///
 /// ## Improvements (January 2026):
 /// - Switched from plain tokio to Turmoil's deterministic scheduler
@@ -38,12 +42,14 @@ use std::time::Duration;
 /// - Added cleanup of global static state between runs (socket registries)
 /// - Added reset functions for all global atomic counters
 /// - Created central `reset_all_simulation_state()` function
+/// - Made nonce random prefix resettable for deterministic simulation
+/// - Added reset for network time sources and fault injectors
+/// - Made port allocation deterministic in SimNetwork setup
 ///
-/// ## Remaining Issue: std::time::Instant vs tokio::time::Instant
-/// - Event counts still differ between runs (e.g., 122 vs 109)
-/// - **Root cause**: Code uses `std::time::Instant::now()` which Turmoil doesn't intercept
-/// - Turmoil only intercepts `tokio::time::Instant` operations
-/// - ~40 instances of `std::time::Instant::now()` in hot paths (connect, topology, ring, backoff)
+/// ## Remaining Issue: Multi-Gateway Non-Determinism
+/// - With 2+ gateways, event counts/sequences still differ between runs
+/// - Likely due to gateway-to-gateway connection race conditions
+/// - Requires further investigation into gateway connection logic
 ///
 /// ## Fixes Applied (January 2026):
 /// - Replaced `std::time::Instant` with `tokio::time::Instant` in:
@@ -70,8 +76,17 @@ fn test_strict_determinism_exact_event_equality() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
+        use freenet::config::{GlobalRng, GlobalSimulationTime};
+
         // Reset all global simulation state for determinism
         freenet::dev_tool::reset_all_simulation_state();
+
+        // Set seed BEFORE SimNetwork::new() since it uses GlobalRng for keypair generation
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -81,7 +96,7 @@ fn test_strict_determinism_exact_event_equality() {
         // Create SimNetwork and get event logs handle before run_simulation consumes it
         let (sim, logs_handle) = rt.block_on(async {
             let sim = SimNetwork::new(
-                name, 1,  // gateways
+                name, 1,  // gateways - single gateway for determinism
                 3,  // nodes
                 7,  // ring_max_htl
                 3,  // rnd_if_htl_above
@@ -95,14 +110,15 @@ fn test_strict_determinism_exact_event_equality() {
         });
 
         // Run simulation with Turmoil's deterministic scheduler
+        // Use more contracts/iterations for better event coverage
         let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
             seed,
-            2,                       // max_contract_num
-            5,                       // iterations
-            Duration::from_secs(20), // simulation_duration
+            5,                       // max_contract_num
+            10,                      // iterations
+            Duration::from_secs(30), // simulation_duration
             || async {
                 // Wait for nodes to establish connections and generate events
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(())
             },
         );
@@ -141,6 +157,35 @@ fn test_strict_determinism_exact_event_equality() {
         result1,
         result2
     );
+
+    // Debug: Print detailed event breakdown before assertions
+    if trace1.total_events != trace2.total_events {
+        eprintln!("\n=== DETERMINISM DEBUG ===");
+        eprintln!(
+            "Run 1 total: {}, Run 2 total: {}",
+            trace1.total_events, trace2.total_events
+        );
+        eprintln!("\nEvent counts by type:");
+
+        let mut all_types: std::collections::BTreeSet<&String> =
+            trace1.event_counts.keys().collect();
+        all_types.extend(trace2.event_counts.keys());
+
+        for event_type in all_types {
+            let count1 = trace1.event_counts.get(event_type).unwrap_or(&0);
+            let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
+            let diff = (*count2 as i64) - (*count1 as i64);
+            if diff != 0 {
+                eprintln!(
+                    "  {} : {} vs {} (diff: {:+})",
+                    event_type, count1, count2, diff
+                );
+            } else {
+                eprintln!("  {} : {} (same)", event_type, count1);
+            }
+        }
+        eprintln!("=========================\n");
+    }
 
     // STRICT ASSERTION 1: Exact same total event count
     assert_eq!(
@@ -341,9 +386,19 @@ async fn test_different_seeds_produce_different_events() {
 /// Uses VirtualTime exclusively - no start_paused.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_fault_injection_deterministic() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+
     const SEED: u64 = 0xFA01_7777_1234;
 
     async fn run_simulation(name: &str, seed: u64) -> HashMap<String, usize> {
+        // Reset all global state and set up deterministic time/RNG
+        freenet::dev_tool::reset_all_simulation_state();
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed (same logic as run_simulation)
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
         sim.with_start_backoff(Duration::from_millis(50));
 

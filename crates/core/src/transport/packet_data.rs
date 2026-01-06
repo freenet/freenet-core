@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
-use once_cell::sync::Lazy;
 
 use crate::config::GlobalRng;
 use crate::transport::crypto::{
@@ -30,19 +30,30 @@ const UDP_HEADER_SIZE: usize = 8;
 /// This is ~5.5x faster than random nonce generation while maintaining uniqueness.
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Random prefix generated once at startup to ensure nonce uniqueness across process restarts.
-static NONCE_RANDOM_PREFIX: Lazy<[u8; 4]> = Lazy::new(|| {
-    let mut bytes = [0u8; 4];
-    GlobalRng::fill_bytes(&mut bytes);
-    bytes
-});
+/// Random prefix generated lazily to ensure nonce uniqueness across process restarts.
+/// Resettable for deterministic simulation testing.
+static NONCE_RANDOM_PREFIX: Mutex<Option<[u8; 4]>> = Mutex::new(None);
 
-/// Reset the nonce counter to initial state.
+/// Get or generate the nonce random prefix.
+fn get_nonce_prefix() -> [u8; 4] {
+    let mut guard = NONCE_RANDOM_PREFIX.lock().unwrap();
+    if let Some(prefix) = *guard {
+        prefix
+    } else {
+        let mut bytes = [0u8; 4];
+        GlobalRng::fill_bytes(&mut bytes);
+        *guard = Some(bytes);
+        bytes
+    }
+}
+
+/// Reset the nonce counter and prefix to initial state.
 /// Used for deterministic simulation testing.
-/// Note: This should be called AFTER GlobalRng::set_seed() so the prefix
-/// is regenerated deterministically on next use.
+/// Call this AFTER GlobalRng::set_seed() so the prefix is regenerated
+/// deterministically on next use.
 pub fn reset_nonce_counter() {
     NONCE_COUNTER.store(0, Ordering::SeqCst);
+    *NONCE_RANDOM_PREFIX.lock().unwrap() = None;
 }
 
 /// Generate a unique 12-byte nonce using counter + random prefix.
@@ -52,7 +63,7 @@ fn generate_nonce() -> [u8; NONCE_SIZE] {
     let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut nonce = [0u8; NONCE_SIZE];
     // First 4 bytes: random prefix (ensures uniqueness across restarts)
-    nonce[..4].copy_from_slice(&*NONCE_RANDOM_PREFIX);
+    nonce[..4].copy_from_slice(&get_nonce_prefix());
     // Last 8 bytes: counter (ensures uniqueness within this process)
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
     nonce
