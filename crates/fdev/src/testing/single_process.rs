@@ -179,8 +179,9 @@ async fn run_verification(
         }
     }
 
-    // Check minimum success rate
-    if let Some(min_rate) = config.min_success_rate {
+    // Check minimum success rate (enabled by default, set to 0.0 to disable)
+    let min_rate = config.min_success_rate;
+    if min_rate > 0.0 {
         let summary = network.get_operation_summary().await;
         let actual_rate = summary.overall_success_rate();
         if actual_rate < min_rate {
@@ -199,8 +200,9 @@ async fn run_verification(
         );
     }
 
-    // Check convergence
-    if let Some(timeout_secs) = config.check_convergence {
+    // Check convergence (enabled by default, set to 0 to disable)
+    let timeout_secs = config.check_convergence;
+    if timeout_secs > 0 {
         let timeout = Duration::from_secs(timeout_secs);
         let poll_interval = Duration::from_millis(500);
 
@@ -216,7 +218,8 @@ async fn run_verification(
             }
             Err(result) => {
                 let msg = format!(
-                    "Convergence check failed: {} contracts converged, {} still diverged",
+                    "Convergence check failed: {} contracts converged, {} still diverged. \
+                     Eventual consistency requires 100% convergence.",
                     result.converged.len(),
                     result.diverged.len()
                 );
