@@ -161,16 +161,10 @@ async fn test_sim_network_connection_check() {
 /// - Events: 20 contract operations
 /// - Timeout: 45 seconds for connectivity
 ///
-/// **Known Issue:** There's a race condition in `start_with_rand_gen` where nodes
-/// try to connect before the gateway is fully registered. This causes intermittent
-/// failures with "unable to send message" errors. The test is marked `#[ignore]`
-/// until this race condition is fixed. See GitHub issue #2498.
-///
 /// **On failure:** Prints seed for local reproduction
 ///
-/// Run with: `cargo test -p freenet --test sim_network ci_quick_simulation -- --ignored --test-threads=1`
+/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network ci_quick_simulation -- --test-threads=1`
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // TODO: Enable when peer registration race condition is fixed
 async fn ci_quick_simulation() {
     // Use a fixed seed for reproducibility - if this test fails, the seed
     // allows exact reproduction of the failure scenario
