@@ -1022,23 +1022,20 @@ impl SimNetwork {
                 },
             ));
         }
-        configs[0].0.should_connect = false;
+        // All gateways are passive - they don't initiate connections to other gateways.
+        // This ensures deterministic startup order where only regular nodes initiate connections.
+        for config in &mut configs {
+            config.0.should_connect = false;
+        }
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         // Store all gateway configs for use when restarting non-gateway nodes
         self.all_gateway_configs = gateways.clone();
 
-        for (mut this_node, this_config) in configs {
-            for GatewayConfig {
-                peer_key_location,
-                location,
-                ..
-            } in gateways
-                .iter()
-                .filter(|config| this_config.label != config.label)
-            {
-                this_node.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
-            }
+        // Note: Gateways don't need to know about each other - they are passive entry points.
+        // Only regular nodes need to know about gateways. This simplifies the topology and
+        // improves determinism by avoiding gateway-to-gateway connection attempts.
+        for (this_node, this_config) in configs {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
@@ -2214,10 +2211,48 @@ impl SimNetwork {
             });
         }
 
+        // Take the event controller and labels for triggering events
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("user_ev_controller should be set");
+        let labels: Vec<_> = self.labels.clone();
+
         // Register the test function as a Turmoil client
         sim.client("test", async move {
-            // Give nodes time to start
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Use a seeded RNG for deterministic peer selection
+            use rand::prelude::*;
+            use rand::SeedableRng;
+            let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
+
+            // Trigger events by sending signals to peer event generators
+            // Each signal tells one peer to generate its next random event
+            // Use longer delays to ensure each event completes before the next starts
+            for event_id in 0..iterations as u32 {
+                // Pick a random peer to generate an event
+                if let Some((_, peer_key)) = labels.choose(&mut event_rng) {
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(event_id, "Failed to send event signal - receivers dropped");
+                        break;
+                    }
+
+                    // Longer delay between events to allow full processing
+                    // This is critical for determinism - each operation must complete
+                    // before the next one starts
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+
+            // Wait for events to fully propagate through the network
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Run the user's test function
             test_fn().await
         });
 

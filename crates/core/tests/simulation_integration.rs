@@ -23,44 +23,7 @@ use std::time::Duration;
 /// 3. Exact same event sequence (order, content)
 ///
 /// If this test fails, it indicates non-determinism in the simulation that Turmoil
-/// doesn't control (e.g., HashMap iteration order, external I/O).
-///
-/// # Current Status: PASSING (Single Gateway)
-///
-/// The test now passes consistently with 1 gateway + 3 nodes configuration.
-/// Multi-gateway configurations (2+ gateways) still exhibit non-determinism
-/// that requires further investigation.
-///
-/// ## Improvements (January 2026):
-/// - Switched from plain tokio to Turmoil's deterministic scheduler
-/// - Fixed HashMap→BTreeMap in SocketRegistry, P2pConnManager.connections
-/// - Fixed try_lock+spawn race condition in SocketInbox
-/// - Fixed message ordering for same-deadline messages
-/// - Converted DashMap→BTreeMap in topology/meter.rs for deterministic iteration
-/// - Converted HashMap→BTreeMap in topology/mod.rs (source_creation_times, usage maps)
-/// - Converted HashMap→BTreeMap in contract/executor.rs (pending_responses)
-/// - Added cleanup of global static state between runs (socket registries)
-/// - Added reset functions for all global atomic counters
-/// - Created central `reset_all_simulation_state()` function
-/// - Made nonce random prefix resettable for deterministic simulation
-/// - Added reset for network time sources and fault injectors
-/// - Made port allocation deterministic in SimNetwork setup
-///
-/// ## Remaining Issue: Multi-Gateway Non-Determinism
-/// - With 2+ gateways, event counts/sequences still differ between runs
-/// - Likely due to gateway-to-gateway connection race conditions
-/// - Requires further investigation into gateway connection logic
-///
-/// ## Fixes Applied (January 2026):
-/// - Replaced `std::time::Instant` with `tokio::time::Instant` in:
-///   - operations/connect.rs, topology/mod.rs, ring/mod.rs, util/backoff.rs
-///   - contract/executor.rs, node/network_bridge/p2p_protoc.rs
-///   - topology/connection_evaluator.rs, topology/meter.rs, topology/running_average.rs
-///   - ring/connection.rs, ring/connection_manager.rs
-///   - operations/orphan_streams.rs, tracing/telemetry.rs
-/// - Added GlobalSimulationTime for deterministic ULID generation
-/// - Transaction::new() now uses GlobalSimulationTime::new_ulid()
-/// - run_simulation() now sets GlobalSimulationTime for reproducible transaction IDs
+/// doesn't control (e.g., HashMap iteration order, external I/O, real time usage).
 #[test]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;
@@ -97,7 +60,7 @@ fn test_strict_determinism_exact_event_equality() {
         let (sim, logs_handle) = rt.block_on(async {
             let sim = SimNetwork::new(
                 name, 1,  // gateways - single gateway for determinism
-                3,  // nodes
+                6,  // nodes
                 7,  // ring_max_htl
                 3,  // rnd_if_htl_above
                 10, // max_connections
@@ -110,15 +73,17 @@ fn test_strict_determinism_exact_event_equality() {
         });
 
         // Run simulation with Turmoil's deterministic scheduler
-        // Use more contracts/iterations for better event coverage
+        // Use moderate number of iterations - each takes ~200ms so 20 iterations = 4 seconds
+        // Plus 2s startup + 2s final wait = ~8s of event processing
         let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
             seed,
-            5,                       // max_contract_num
-            10,                      // iterations
+            5,                       // max_contract_num - moderate contracts
+            20,                      // iterations - 20 events for diverse coverage
             Duration::from_secs(30), // simulation_duration
             || async {
-                // Wait for nodes to establish connections and generate events
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // Event triggering happens before this function
+                // Just a short wait to ensure everything settled
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(())
             },
         );
@@ -220,6 +185,17 @@ fn test_strict_determinism_exact_event_equality() {
             i, e1, e2
         );
     }
+
+    // Print event breakdown on success for verification
+    eprintln!("\n=== DETERMINISM TEST PASSED ===");
+    eprintln!("Total events matched: {}", trace1.total_events);
+    eprintln!("\nEvent type breakdown:");
+    let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
+    sorted_types.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
+    for (event_type, count) in &sorted_types {
+        eprintln!("  {:20} : {:5}", event_type, count);
+    }
+    eprintln!("================================\n");
 
     tracing::info!(
         "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 2 runs",
@@ -1745,7 +1721,7 @@ fn test_graceful_shutdown_typed_error() {
 fn test_turmoil_determinism() {
     use freenet::dev_tool::SimNetwork;
 
-    const SEED: u64 = 0xDE7E_2A10_1571C;
+    const SEED: u64 = 0x000D_E7E2_A101_571C;
 
     fn run_simulation_once(name: &str, seed: u64) -> turmoil::Result {
         let rt = tokio::runtime::Builder::new_current_thread()
