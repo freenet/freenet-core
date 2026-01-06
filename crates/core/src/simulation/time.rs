@@ -358,6 +358,70 @@ impl VirtualTime {
         let pending = self.state.pending_wakeups.lock().unwrap();
         !pending.iter().any(|w| w.id == id)
     }
+
+    /// Trigger all wakeups that have expired (deadline <= current time).
+    ///
+    /// This is useful when wakeups may have been registered with deadlines at or
+    /// before the current time, or when time was advanced without triggering wakeups.
+    ///
+    /// Returns the list of triggered wakeup IDs.
+    pub fn trigger_expired(&self) -> Vec<WakeupId> {
+        let current = self.now_nanos();
+        let mut triggered = Vec::new();
+        let mut wakers_to_wake = Vec::new();
+
+        {
+            let mut pending = self.state.pending_wakeups.lock().unwrap();
+            let mut pending_wakers = self.state.pending_wakers.lock().unwrap();
+
+            // Pop all wakeups that have expired
+            while let Some(wakeup) = pending.peek() {
+                if wakeup.deadline <= current {
+                    let wakeup = pending.pop().unwrap();
+                    triggered.push(wakeup.id);
+
+                    // Find and remove the associated waker
+                    if let Some(pos) = pending_wakers.iter().position(|(id, _)| *id == wakeup.id) {
+                        let (_, waker) = pending_wakers.swap_remove(pos);
+                        wakers_to_wake.push(waker);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Wake all expired futures outside the lock
+        for waker in wakers_to_wake {
+            waker.wake();
+        }
+
+        triggered
+    }
+
+    /// Auto-advance to the next pending wakeup deadline, if any.
+    ///
+    /// This is useful for benchmarks where we want time to progress automatically
+    /// when all tasks are blocked waiting on VirtualSleep futures. Call this
+    /// periodically from a monitoring task to prevent deadlocks.
+    ///
+    /// Returns the deadline that was advanced to, or None if no wakeups pending.
+    pub fn try_auto_advance(&self) -> Option<u64> {
+        // First, trigger any wakeups that have already expired
+        // This handles the case where time was advanced but wakeups weren't triggered
+        // (e.g., MockSocket advancing time before VirtualSleep futures are polled)
+        self.trigger_expired();
+
+        if let Some(deadline) = self.next_wakeup_deadline() {
+            let current = self.now_nanos();
+            if deadline > current {
+                self.advance_to(deadline);
+            }
+            Some(deadline)
+        } else {
+            None
+        }
+    }
 }
 
 impl TimeSource for VirtualTime {

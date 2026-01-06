@@ -287,6 +287,47 @@ pub fn new_channels() -> Channels {
 // VirtualTime Support
 // =============================================================================
 
+/// Spawn an auto-advance monitoring task for VirtualTime.
+///
+/// This task periodically checks for blocked VirtualSleep futures and advances
+/// time to the next wakeup deadline when needed. This prevents deadlocks when
+/// all tasks are waiting on timeouts.
+///
+/// **Must be called from within a tokio runtime context.**
+///
+/// ## Usage
+///
+/// ```rust,ignore
+/// let time_source = VirtualTime::new();
+/// let _auto_advance_handle = spawn_auto_advance_task(time_source.clone());
+///
+/// // Now VirtualTime benchmarks won't deadlock
+/// let peers = create_peer_pair_with_virtual_time(channels, delay, time_source).await;
+/// ```
+///
+/// ## Returns
+///
+/// A `JoinHandle` for the monitoring task. Drop it to stop auto-advancing.
+pub fn spawn_auto_advance_task(
+    time_source: VirtualTime,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // Real-time sleep to give protocol tasks time to process packets
+            // 100µs provides a balance between speed and reliability
+            tokio::time::sleep(Duration::from_micros(100)).await;
+
+            // Multiple yields to ensure all queued tasks get a chance to run
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+
+            // Try to auto-advance if tasks are blocked waiting on VirtualSleep
+            time_source.try_auto_advance();
+        }
+    })
+}
+
 /// Create a pair of mock peers with VirtualTime support for instant delay simulation.
 ///
 /// When using VirtualTime, delays advance the virtual clock instead of waiting real time.

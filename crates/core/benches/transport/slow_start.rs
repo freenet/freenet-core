@@ -15,15 +15,15 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::create_connected_peers_with_virtual_time;
+use super::common::{create_connected_peers_with_virtual_time, spawn_auto_advance_task};
 
 /// Benchmark fresh connection cold-start throughput with VirtualTime
 ///
 /// Uses VirtualTime for instant execution - 100ms RTT completes in ~1ms wall time.
 /// Measures the actual slow start benefit by tracking virtual time elapsed.
 pub fn bench_cold_start_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -43,6 +43,9 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -84,18 +87,39 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 
                         let start_virtual = ts.now_nanos();
 
-                        // Spawn receiver task
-                        let receiver = tokio::spawn(async move {
-                            let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("cold_start receiver connect failed: {:?}", e);
-                                    return 0;
-                                }
-                            };
+                        // Connect both peers concurrently
+                        let (conn_a_future, conn_b_future) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
 
-                            match conn.recv().await {
+                        let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
+
+                        let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                            (Ok(a), Ok(b)) => (a, b),
+                            (Err(e), _) => {
+                                eprintln!("cold_start receiver connect failed: {:?}", e);
+                                continue;
+                            }
+                            (_, Err(e)) => {
+                                eprintln!("cold_start sender connect failed: {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        // Send from B to A
+                        let send_result = conn_b.send(message).await;
+                        let sent_ok = match send_result {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("cold_start send failed: {:?}", e);
+                                false
+                            }
+                        };
+
+                        // Receive at A
+                        let received_len = if sent_ok {
+                            match conn_a.recv().await {
                                 Ok(received) => {
                                     std_black_box(&received);
                                     received.len()
@@ -105,34 +129,15 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                     0
                                 }
                             }
-                        });
+                        } else {
+                            0
+                        };
 
-                        // Spawn sender task
-                        let sender = tokio::spawn(async move {
-                            let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("cold_start sender connect failed: {:?}", e);
-                                    return false;
-                                }
-                            };
-
-                            // Yield to let receiver task start (no real delay needed with VirtualTime)
-                            tokio::task::yield_now().await;
-
-                            match conn.send(message).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    eprintln!("cold_start send failed: {:?}", e);
-                                    false
-                                }
-                            }
-                        });
-
-                        let (recv_result, send_result) = tokio::join!(receiver, sender);
-                        let received_len = recv_result.unwrap_or(0);
-                        let sent_ok = send_result.unwrap_or(false);
+                        // Keep peers alive until end of iteration
+                        drop(conn_a);
+                        drop(conn_b);
+                        drop(peer_a);
+                        drop(peer_b);
 
                         let end_virtual = ts.now_nanos();
                         total_virtual_time +=
@@ -161,8 +166,8 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 /// Creates fresh connections, performs warmup transfers, then measures.
 /// Uses VirtualTime for instant execution.
 pub fn bench_warm_connection_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -180,6 +185,9 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
         b.to_async(&rt).iter_custom(|iters| {
             let ts = ts.clone();
             async move {
+                // Spawn auto-advance task to prevent deadlocks when tasks are blocked
+                let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
@@ -312,8 +320,8 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 
 /// Instrumented benchmark that captures cwnd evolution with VirtualTime
 pub fn bench_cwnd_evolution(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -330,6 +338,9 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
         b.to_async(&rt).iter_custom(|iters| {
             let ts = ts.clone();
             async move {
+                // Spawn auto-advance task to prevent deadlocks when tasks are blocked
+                let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
@@ -442,8 +453,8 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
 /// Tests various RTT values (0ms, 5ms, 10ms, 25ms, 50ms) to ensure LEDBAT
 /// behaves correctly. With VirtualTime, a 50ms RTT test completes in ~1ms.
 pub fn bench_rtt_scenarios(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -464,6 +475,9 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -573,8 +587,8 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
 /// Benchmark 1MB transfer with high bandwidth limit to test maximum throughput
 #[allow(dead_code)]
 pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -594,6 +608,9 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
