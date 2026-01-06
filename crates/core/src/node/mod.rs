@@ -533,31 +533,13 @@ async fn report_result(
                     );
                 } else {
                     let host_result = op_res.to_host_result();
-                    let router_tx_clone = op_manager.result_router_tx.clone();
-                    let event_notifier = op_manager.to_event_listener.clone();
-
-                    // Spawn fire-and-forget task to avoid blocking report_result()
-                    // while still guaranteeing message delivery
-                    GlobalExecutor::spawn(async move {
-                        if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
-                            tracing::error!(
-                                "CRITICAL: Result router channel closed - dual-path delivery broken. \
-                                 Router or session actor has crashed. Transaction: {}. Error: {}. \
-                                 Consider restarting node.",
-                                transaction,
-                                e
-                            );
-                            // TODO: Consider implementing circuit breaker or automatic recovery
-                        } else {
-                            // Transaction completed successfully, notify to clean up subscriptions
-                            use crate::message::NodeEvent;
-                            use either::Either;
-                            let _ = event_notifier
-                                .notifications_sender
-                                .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
-                                .await;
-                        }
-                    });
+                    // Await result delivery to ensure the client receives the response
+                    // before the operation is considered complete. This prevents timeout
+                    // issues where the operation completes but the response hasn't been
+                    // delivered through the channel chain yet.
+                    op_manager
+                        .send_client_result(transaction, host_result)
+                        .await;
                 }
             }
 
