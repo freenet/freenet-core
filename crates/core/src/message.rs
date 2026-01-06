@@ -6,8 +6,10 @@ use std::{
     borrow::Cow,
     fmt::Display,
     net::SocketAddr,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
+#[cfg(feature = "trace-ot")]
+use std::time::SystemTime;
 
 use crate::{
     client_events::{ClientId, HostResult},
@@ -105,11 +107,12 @@ impl Transaction {
     }
 
     /// Returns the elapsed time since this transaction was created.
+    ///
+    /// Uses simulation time when in simulation mode, otherwise system time.
+    /// This ensures deterministic elapsed time calculations in DST tests.
     pub fn elapsed(&self) -> Duration {
-        let current_unix_epoch_ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("now should be always be later than unix epoch")
-            .as_millis() as u64;
+        use crate::config::GlobalSimulationTime;
+        let current_unix_epoch_ts = GlobalSimulationTime::read_time_ms();
         let this_tx_creation = self.id.timestamp_ms();
         if current_unix_epoch_ts < this_tx_creation {
             Duration::new(0, 0)

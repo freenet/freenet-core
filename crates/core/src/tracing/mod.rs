@@ -46,13 +46,21 @@ pub mod event_aggregator;
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
 
-/// Compute a short hash of contract state for telemetry.
+/// Compute a full hash of contract state for convergence verification.
+/// Returns all 32 bytes of Blake3 hash as 64 hex characters.
+///
+/// This provides cryptographically strong verification that states are identical.
+/// With 256 bits, collision is computationally infeasible.
+pub fn state_hash_full(state: &WrappedState) -> String {
+    let hash = blake3::hash(state.as_ref());
+    hash.to_hex().to_string()
+}
+
+/// Compute a short hash of contract state for telemetry display.
 /// Returns first 4 bytes of Blake3 hash as 8 hex characters.
 ///
 /// This is designed for quick visual comparison in logs and telemetry dashboards,
-/// not for cryptographic verification. With 4 bytes (32 bits), birthday collision
-/// is expected around ~65,000 distinct states. Matching hashes suggest states are
-/// likely identical, but verification requires comparing full states.
+/// not for verification. Use `state_hash_full` for convergence checking.
 pub fn state_hash_short(state: &WrappedState) -> String {
     let hash = blake3::hash(state.as_ref());
     let bytes = hash.as_bytes();

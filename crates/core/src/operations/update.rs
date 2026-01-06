@@ -11,7 +11,7 @@ use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
-    tracing::{state_hash_short, NetEventLog},
+    tracing::{state_hash_full, NetEventLog},
 };
 use std::net::SocketAddr;
 
@@ -243,7 +243,7 @@ impl Operation for UpdateOp {
                             );
 
                             // Compute before hash for telemetry
-                            let hash_before = state_before.as_ref().map(state_hash_short);
+                            let hash_before = state_before.as_ref().map(state_hash_full);
 
                             // Update contract locally
                             let UpdateExecution {
@@ -259,7 +259,7 @@ impl Operation for UpdateOp {
                             .await?;
 
                             // Compute after hash for telemetry
-                            let hash_after = Some(state_hash_short(&updated_value));
+                            let hash_after = Some(state_hash_full(&updated_value));
 
                             // Emit telemetry: UPDATE succeeded at this peer
                             // Use source_addr to get the requester's PeerKeyLocation

@@ -1702,9 +1702,16 @@ impl GlobalRng {
             THREAD_RNG.with(|rng_cell| {
                 let mut rng_ref = rng_cell.borrow_mut();
                 if rng_ref.is_none() {
-                    // Seed with global seed XOR'd with thread ID for uniqueness
+                    // Seed with global seed XOR'd with hashed thread ID for uniqueness
+                    // Use a hash of the thread ID debug string for stable, unique values
                     let thread_id = std::thread::current().id();
-                    let thread_seed = seed ^ (format!("{:?}", thread_id).len() as u64);
+                    let thread_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        thread_id.hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    let thread_seed = seed ^ thread_hash;
                     *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
                 }
                 f(rng_ref.as_mut().unwrap())
@@ -1827,6 +1834,25 @@ impl GlobalSimulationTime {
         if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
             // Deterministic time: base + counter for uniqueness
             let counter = SIMULATION_TIME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            base_time.saturating_add(counter)
+        } else {
+            // Production: use real system time
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_millis() as u64
+        }
+    }
+
+    /// Returns the current time in milliseconds WITHOUT incrementing the counter.
+    ///
+    /// Use this for read-only time checks like elapsed time calculations.
+    /// For ULID generation, use `current_time_ms()` which ensures uniqueness.
+    pub fn read_time_ms() -> u64 {
+        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
+            // Return base time + current counter (without incrementing)
+            let counter = SIMULATION_TIME_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
             base_time.saturating_add(counter)
         } else {
             // Production: use real system time
