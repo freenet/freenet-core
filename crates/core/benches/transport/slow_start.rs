@@ -32,8 +32,6 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("slow_start/cold_start");
     group.sample_size(10);
 
@@ -41,17 +39,18 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
     let transfer_size = 16 * 1024;
     group.throughput(Throughput::Bytes(transfer_size as u64));
 
-    let ts = time_source.clone();
     group.bench_function("16kb_transfer", |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
-                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
+                        // Create fresh VirtualTime for each iteration to avoid time accumulation
+                        let ts = VirtualTime::new();
+
+                        // Spawn auto-advance task BEFORE connection
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let channels: Channels = Arc::new(DashMap::new());
                         let message: Vec<u8> = vec![0xABu8; transfer_size];
 
@@ -68,6 +67,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("cold_start peer_a creation failed: {:?}", e);
+                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -84,6 +84,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("cold_start peer_b creation failed: {:?}", e);
+                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -153,6 +154,8 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                             );
                         }
 
+                        // Abort auto-advance task before next iteration
+                        auto_advance.abort();
                         drop(channels);
                     }
 
@@ -175,25 +178,22 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("slow_start/warm_connection");
     group.sample_size(10);
 
     let transfer_size = 16 * 1024;
     group.throughput(Throughput::Bytes(transfer_size as u64));
 
-    let ts = time_source.clone();
     group.bench_function("16kb_warm", |b| {
         b.to_async(&rt).iter_custom(|iters| {
-            let ts = ts.clone();
             async move {
-                // Spawn auto-advance task to prevent deadlocks when tasks are blocked
-                let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
+                    // Create fresh VirtualTime for each iteration
+                    let ts = VirtualTime::new();
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let channels: Channels = Arc::new(DashMap::new());
 
                     // Create peers with VirtualTime
@@ -209,6 +209,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("warm peer_a creation failed: {:?}", e);
+                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -225,6 +226,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("warm peer_b creation failed: {:?}", e);
+                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -310,6 +312,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                     total_virtual_time +=
                         Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
+                    auto_advance.abort();
                     drop(channels);
                 }
 
@@ -330,24 +333,21 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("slow_start/cwnd_evolution");
     group.sample_size(10);
 
     let transfer_size = 16 * 1024;
-    let ts = time_source.clone();
 
     group.bench_function("16kb_cwnd_trace", |b| {
         b.to_async(&rt).iter_custom(|iters| {
-            let ts = ts.clone();
             async move {
-                // Spawn auto-advance task to prevent deadlocks when tasks are blocked
-                let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
+                    // Create fresh VirtualTime for each iteration
+                    let ts = VirtualTime::new();
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let channels: Channels = Arc::new(DashMap::new());
                     let message = vec![0xABu8; transfer_size];
 
@@ -363,6 +363,7 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("cwnd_evolution peer_a creation failed: {:?}", e);
+                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -379,6 +380,7 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("cwnd_evolution peer_b creation failed: {:?}", e);
+                                auto_advance.abort();
                                 continue;
                             }
                         };
@@ -441,6 +443,7 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                         std_black_box(received);
                     }
 
+                    auto_advance.abort();
                     drop(channels);
                 }
 
@@ -464,8 +467,6 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("slow_start/rtt_scenarios");
     group.sample_size(10);
 
@@ -474,18 +475,16 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
 
     // Test various RTT scenarios - all complete instantly with VirtualTime
     for rtt_ms in [0u64, 5, 10, 25, 50] {
-        let ts = time_source.clone();
-
         group.bench_function(format!("16kb_rtt_{}ms", rtt_ms), |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
-                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
+                        // Create fresh VirtualTime for each iteration
+                        let ts = VirtualTime::new();
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let channels: Channels = Arc::new(DashMap::new());
                         let delay = if rtt_ms == 0 {
                             PacketDelayPolicy::NoDelay
@@ -505,6 +504,7 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("rtt_{} peer_a creation failed: {:?}", rtt_ms, e);
+                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -521,6 +521,7 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     eprintln!("rtt_{} peer_b creation failed: {:?}", rtt_ms, e);
+                                    auto_advance.abort();
                                     continue;
                                 }
                             };
@@ -577,6 +578,7 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                         total_virtual_time +=
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
+                        auto_advance.abort();
                         drop(channels);
                     }
 
@@ -599,27 +601,24 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("slow_start/high_bandwidth");
     group.sample_size(10);
     group.throughput(Throughput::Bytes(1048576)); // 1MB
 
     let bandwidth_limit_mb = 100;
-    let ts = time_source.clone();
 
     group.bench_function(
         format!("1mb_transfer_{}mb_limit", bandwidth_limit_mb),
         |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
-                    // Spawn auto-advance task to prevent deadlocks when tasks are blocked
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
+                        // Create fresh VirtualTime for each iteration
+                        let ts = VirtualTime::new();
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let delay = Duration::from_millis(10); // 10ms RTT
 
                         // Create peers with VirtualTime and high bandwidth
@@ -655,6 +654,7 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
                         }
 
                         std_black_box(received);
+                        auto_advance.abort();
                     }
 
                     total_virtual_time
