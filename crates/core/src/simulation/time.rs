@@ -407,17 +407,30 @@ impl VirtualTime {
     ///
     /// Returns the deadline that was advanced to, or None if no wakeups pending.
     pub fn try_auto_advance(&self) -> Option<u64> {
+        self.try_auto_advance_bounded(Duration::from_secs(1))
+    }
+
+    /// Auto-advance with a maximum step size.
+    ///
+    /// This prevents jumping too far in time, which could trigger idle timeouts
+    /// in protocols that check elapsed time since last packet.
+    ///
+    /// Returns the time advanced to, or None if no pending wakeups or no advancement needed.
+    pub fn try_auto_advance_bounded(&self, max_step: Duration) -> Option<u64> {
         // First, trigger any wakeups that have already expired
-        // This handles the case where time was advanced but wakeups weren't triggered
-        // (e.g., MockSocket advancing time before VirtualSleep futures are polled)
         self.trigger_expired();
 
         if let Some(deadline) = self.next_wakeup_deadline() {
             let current = self.now_nanos();
             if deadline > current {
-                self.advance_to(deadline);
+                // Limit the advance to avoid triggering protocol timeouts
+                let max_advance = current.saturating_add(max_step.as_nanos() as u64);
+                let target = deadline.min(max_advance);
+                self.advance_to(target);
+                return Some(target);
             }
-            Some(deadline)
+            // Deadline already passed or equal to current - already handled by trigger_expired
+            None
         } else {
             None
         }

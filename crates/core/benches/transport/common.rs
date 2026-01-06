@@ -307,28 +307,26 @@ pub fn new_channels() -> Channels {
 ///
 /// ## Returns
 ///
-/// A `JoinHandle` for the monitoring task. Drop it to stop auto-advancing.
+/// A `JoinHandle` for the monitoring task. Call `.abort()` to stop it.
 pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // Yield to let protocol tasks run first
             tokio::task::yield_now().await;
 
-            // Advance ALL pending wakeups in a burst (not just one)
-            // This is critical for performance - without this loop, each advance
-            // would be throttled by the sleep below, causing real-time delays
-            let mut advanced = false;
-            while time_source.try_auto_advance().is_some() {
-                advanced = true;
-                // Yield between advances to let woken tasks process
-                tokio::task::yield_now().await;
+            // Advance time in small steps (10ms) to avoid triggering protocol timeouts
+            // The connection idle timeout is 120s, so we need to advance slowly enough
+            // that packets can be exchanged between advances
+            if time_source
+                .try_auto_advance_bounded(Duration::from_millis(10))
+                .is_some()
+            {
+                // Time advanced - continue to let tasks process
+                continue;
             }
 
-            // Only sleep if nothing was advanced (avoids busy-loop when idle)
-            // Use very short sleep to maintain responsiveness
-            if !advanced {
-                tokio::time::sleep(Duration::from_micros(10)).await;
-            }
+            // No pending wakeups - sleep briefly to avoid busy-loop
+            tokio::time::sleep(Duration::from_micros(50)).await;
         }
     })
 }

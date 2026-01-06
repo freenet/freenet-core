@@ -32,8 +32,6 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("ledbat/cold_start");
     group.sample_size(10);
 
@@ -41,13 +39,14 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
     for &(size, name) in SMALL_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
-        let ts = time_source.clone();
         group.bench_function(name, |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
+                    // Create FRESH VirtualTime for each iter_custom call
+                    let ts = VirtualTime::new();
+
                     // Spawn auto-advance task to prevent deadlocks
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     // Create connection ONCE outside the loop to avoid port exhaustion
                     let channels: Channels = Arc::new(DashMap::new());
@@ -86,6 +85,9 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
                     }
 
+                    // Stop the auto-advance task
+                    auto_advance.abort();
+
                     total_virtual_time
                 }
             });
@@ -106,8 +108,6 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("ledbat/warm_connection");
     group.sample_size(10);
 
@@ -115,13 +115,14 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
     for &(size, name) in SMALL_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
-        let ts = time_source.clone();
         group.bench_function(name, |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
+                    // Create FRESH VirtualTime for each iter_custom call
+                    let ts = VirtualTime::new();
+
                     // Spawn auto-advance task to prevent deadlocks
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     let mut total_virtual_time = Duration::ZERO;
 
@@ -172,6 +173,9 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
                         total_virtual_time +=
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
                     }
+
+                    // Stop the auto-advance task
+                    auto_advance.abort();
 
                     total_virtual_time
                 }

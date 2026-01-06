@@ -27,8 +27,6 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("transport/streaming/throughput");
     group.sample_size(10);
 
@@ -36,13 +34,15 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
     for &size in STREAM_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
-        let ts = time_source.clone();
         group.bench_with_input(BenchmarkId::new("stream", size), &size, |b, &sz| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
+                    // Create FRESH VirtualTime for each iter_custom call
+                    // This prevents time accumulation across criterion iterations
+                    let ts = VirtualTime::new();
+
                     // Spawn auto-advance task to prevent deadlocks
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     // Create connection ONCE outside the loop to avoid port exhaustion
                     let channels: Channels = Arc::new(DashMap::new());
@@ -83,6 +83,9 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
                         std_black_box(received);
                     }
 
+                    // Stop the auto-advance task
+                    auto_advance.abort();
+
                     total_virtual_time
                 }
             });
@@ -103,24 +106,22 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("transport/streaming/concurrent");
     group.sample_size(10);
 
     // Test 2, 5, 10 concurrent streams
     for num_streams in [2, 5, 10] {
-        let ts = time_source.clone();
-
         group.bench_with_input(
             BenchmarkId::new("streams", num_streams),
             &num_streams,
             |b, &n| {
                 b.to_async(&rt).iter_custom(|iters| {
-                    let ts = ts.clone();
                     async move {
+                        // Create FRESH VirtualTime for each iter_custom call
+                        let ts = VirtualTime::new();
+
                         // Spawn auto-advance task to prevent deadlocks
-                        let _auto_advance = spawn_auto_advance_task(ts.clone());
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
 
                         // Create connection ONCE outside the loop to avoid port exhaustion
                         let channels: Channels = Arc::new(DashMap::new());
@@ -165,6 +166,9 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
 
                             std_black_box(results);
                         }
+
+                        // Stop the auto-advance task
+                        auto_advance.abort();
 
                         total_virtual_time
                     }
