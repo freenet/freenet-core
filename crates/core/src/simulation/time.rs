@@ -118,6 +118,15 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static;
+
+    /// Returns the duration after which an idle connection should be considered dead.
+    ///
+    /// VirtualTime uses a very long timeout (1 hour) to avoid premature disconnections
+    /// when time is advanced rapidly by auto-advance tasks. RealTime uses the standard
+    /// 120 seconds.
+    fn connection_idle_timeout(&self) -> Duration {
+        Duration::from_secs(120) // default for RealTime
+    }
 }
 
 /// Real-time implementation that delegates to tokio.
@@ -477,6 +486,12 @@ impl TimeSource for VirtualTime {
                 _ = sleep => None,
             }
         })
+    }
+
+    /// VirtualTime uses a 1-hour timeout to avoid premature disconnections
+    /// when auto-advance advances time faster than packets can be delivered.
+    fn connection_idle_timeout(&self) -> Duration {
+        Duration::from_secs(3600) // 1 hour
     }
 }
 
