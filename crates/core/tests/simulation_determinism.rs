@@ -3,6 +3,11 @@
 //! This test verifies that the core simulation abstractions (VirtualTime, SimulationRng)
 //! behave deterministically. For full network simulation determinism, use SimNetwork
 //! with Turmoil which provides deterministic task scheduling.
+//!
+//! NOTE: These tests use global state and must run serially.
+//! Enable with: cargo test -p freenet --features simulation_tests -- --test-threads=1
+
+#![cfg(feature = "simulation_tests")]
 
 use std::time::Duration;
 

@@ -8,6 +8,11 @@
 //! - Global registry patterns (used by SimulationSocket)
 //! - Deterministic execution with seeded RNG
 //! - SimulationSocket communication within Turmoil
+//!
+//! NOTE: These tests use global state and must run serially.
+//! Enable with: cargo test -p freenet --features simulation_tests -- --test-threads=1
+
+#![cfg(feature = "simulation_tests")]
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};

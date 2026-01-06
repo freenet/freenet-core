@@ -5,6 +5,11 @@
 //! 2. Fault injection works correctly with deterministic outcomes
 //! 3. Network events are captured and comparable
 //! 4. Small networks establish connectivity reliably
+//!
+//! NOTE: These tests use global state (socket registries, RNG) and must run serially.
+//! Enable with: cargo test -p freenet --features simulation_tests --test simulation_integration -- --test-threads=1
+
+#![cfg(feature = "simulation_tests")]
 
 use freenet::dev_tool::SimNetwork;
 use std::collections::HashMap;

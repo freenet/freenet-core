@@ -6,6 +6,11 @@
 //! 3. Handle basic message routing
 //!
 //! This test exercises the PeerRegistry-based messaging introduced to fix issue #2496.
+//!
+//! NOTE: These tests use global state and must run serially.
+//! Enable with: cargo test -p freenet --features simulation_tests -- --test-threads=1
+
+#![cfg(feature = "simulation_tests")]
 
 use freenet::dev_tool::SimNetwork;
 use std::time::Duration;
