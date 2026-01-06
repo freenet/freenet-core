@@ -1,12 +1,13 @@
-//! Proof-of-concept: Using Turmoil for deterministic simulation testing.
+//! Turmoil integration primitives tests.
 //!
-//! This test explores whether we can use Turmoil's deterministic scheduler
-//! while keeping our SimulationSocket for network communication.
+//! These tests verify the foundational integration between Turmoil's
+//! deterministic scheduler and our simulation infrastructure:
 //!
-//! Key questions:
-//! 1. Can Turmoil schedule our async code deterministically?
-//! 2. Does SimulationSocket work across Turmoil hosts?
-//! 3. Can we integrate VirtualTime with Turmoil's clock?
+//! - Async code execution inside Turmoil hosts
+//! - Tokio channels working across Turmoil boundaries
+//! - Global registry patterns (used by SimulationSocket)
+//! - Deterministic execution with seeded RNG
+//! - SimulationSocket communication within Turmoil
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
