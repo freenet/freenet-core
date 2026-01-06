@@ -1378,8 +1378,11 @@ impl<T: TimeSource> LedbatController<T> {
             return false;
         }
 
-        // Save current cwnd as ssthresh and ramp-up target
-        self.ssthresh.store(current_cwnd, Ordering::Release);
+        // Save current cwnd as ssthresh and ramp-up target, applying min_ssthresh floor
+        // This mirrors the logic in on_timeout() which also applies the floor
+        let floor = self.calculate_adaptive_floor();
+        let new_ssthresh = current_cwnd.max(floor);
+        self.ssthresh.store(new_ssthresh, Ordering::Release);
         self.pre_slowdown_cwnd
             .store(current_cwnd, Ordering::Release);
 
@@ -1397,8 +1400,10 @@ impl<T: TimeSource> LedbatController<T> {
         tracing::debug!(
             old_cwnd_kb = current_cwnd / 1024,
             new_cwnd_kb = slowdown_cwnd / 1024,
+            ssthresh_kb = new_ssthresh / 1024,
+            floor_kb = floor / 1024,
             reduction_factor = SLOWDOWN_REDUCTION_FACTOR,
-            "LEDBAT++ periodic slowdown: reducing cwnd proportionally"
+            "LEDBAT++ periodic slowdown: reducing cwnd proportionally, ssthresh floored"
         );
 
         true
@@ -9996,6 +10001,122 @@ mod tests {
             "\n✓ cwnd escaped flightsize trap: {}KB > strict cap {}KB - PASSED",
             final_snap.cwnd / 1024,
             strict_cap / 1024
+        );
+    }
+
+    /// Regression test: Periodic slowdown must apply min_ssthresh floor.
+    ///
+    /// BUG: When a periodic slowdown triggers, `ssthresh` is set to `current_cwnd`
+    /// WITHOUT applying the min_ssthresh floor:
+    ///
+    /// ```ignore
+    /// // Line ~1382 - BUG: no floor applied
+    /// self.ssthresh.store(current_cwnd, Ordering::Release);
+    /// ```
+    ///
+    /// The timeout handler correctly applies the floor:
+    ///
+    /// ```ignore
+    /// // Line ~1718-1720 - CORRECT
+    /// let floor = self.calculate_adaptive_floor();
+    /// let new_ssthresh = (old_cwnd / 2).max(floor);
+    /// ```
+    ///
+    /// This asymmetry defeats the min_ssthresh protection on high-latency paths where
+    /// periodic slowdowns are the primary cwnd reduction mechanism (no packet loss).
+    ///
+    /// SYMPTOM: On 135ms RTT paths, ssthresh gets reduced to ~37KB by periodic
+    /// slowdowns, preventing cwnd from growing past that point even though
+    /// min_ssthresh was configured to 100KB.
+    ///
+    /// This test verifies that ssthresh stays >= min_ssthresh floor after a
+    /// periodic slowdown when cwnd is below the floor.
+    #[test]
+    fn test_periodic_slowdown_applies_min_ssthresh_floor() {
+        // Use a high floor to catch the bug - floor is 200KB
+        let min_ssthresh = 200 * 1024;
+
+        let config = LedbatConfig {
+            // Start with initial_cwnd below min_ssthresh (38KB < 200KB floor)
+            initial_cwnd: 38_000,
+            min_cwnd: 2_848,
+            max_cwnd: 1_000_000,
+            // Set ssthresh just above initial_cwnd so slow start exits quickly
+            // When slow start exits, cwnd will be around 40-80KB, below the 200KB floor
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh), // Configure 200KB floor
+            ..Default::default()
+        };
+
+        let mut harness = LedbatTestHarness::new(
+            config,
+            NetworkCondition::INTERCONTINENTAL, // 135ms RTT
+            42,
+        );
+
+        println!("\n========== Periodic Slowdown min_ssthresh Floor Test ==========");
+        println!(
+            "Config: min_ssthresh={}KB, initial_ssthresh={}KB",
+            min_ssthresh / 1024,
+            50
+        );
+        println!("Strategy: Exit slow start at ~50KB (below 200KB floor), then trigger slowdown");
+
+        // Run until a natural periodic slowdown triggers
+        // With ssthresh=50KB, slow start exits quickly with cwnd around 50KB
+        // Then a periodic slowdown will set ssthresh = current_cwnd (~50KB)
+        // which is below the 200KB floor
+        let result = harness.run_until_slowdown(100, 100_000);
+        assert!(
+            result.is_ok(),
+            "Should trigger a periodic slowdown within 100 RTTs"
+        );
+
+        let snapshots = result.unwrap();
+        let slowdowns_after = snapshots.last().unwrap().periodic_slowdowns;
+
+        // Verify at least one slowdown occurred
+        assert!(
+            slowdowns_after >= 1,
+            "Expected at least 1 periodic slowdown, got {}",
+            slowdowns_after
+        );
+
+        // Check ssthresh after the slowdown
+        let ssthresh_after = harness.controller.ssthresh.load(Ordering::Acquire);
+        let cwnd_after = harness.snapshot().cwnd;
+
+        println!(
+            "After {} slowdowns: ssthresh={}KB, cwnd={}KB, floor={}KB",
+            slowdowns_after,
+            ssthresh_after / 1024,
+            cwnd_after / 1024,
+            min_ssthresh / 1024
+        );
+
+        // KEY ASSERTION: ssthresh must stay at or above the configured floor
+        // BUG: Currently fails because periodic slowdown sets ssthresh = current_cwnd
+        // without applying the floor. Since cwnd at slowdown time is ~50KB and floor
+        // is 200KB, ssthresh ends up at ~50KB instead of being raised to 200KB.
+        assert!(
+            ssthresh_after >= min_ssthresh,
+            "ssthresh ({} bytes = {}KB) fell below min_ssthresh floor ({} bytes = {}KB)!\n\
+             This indicates the periodic slowdown handler is not applying the \
+             min_ssthresh floor. The timeout handler correctly applies the floor \
+             but the periodic slowdown handler at line ~1382 does not.",
+            ssthresh_after,
+            ssthresh_after / 1024,
+            min_ssthresh,
+            min_ssthresh / 1024
+        );
+
+        println!(
+            "✓ ssthresh ({:.0}KB) >= min_ssthresh floor ({:.0}KB) - PASSED",
+            ssthresh_after as f64 / 1024.0,
+            min_ssthresh as f64 / 1024.0
         );
     }
 }
