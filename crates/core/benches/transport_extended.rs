@@ -25,9 +25,8 @@ mod transport;
 
 // Import existing benchmarks
 use transport::allocation_overhead::*;
-// VirtualTime helpers available in common.rs if needed:
-// - create_connected_peers_with_virtual_time
-// - create_peer_pair_with_virtual_time_and_loss
+// VirtualTime helpers
+use transport::common::spawn_auto_advance_task;
 use transport::ledbat_validation::*;
 use transport::level0::*;
 use transport::level1::*;
@@ -43,8 +42,8 @@ use transport::streaming::*;
 /// Tests throughput with varying message sizes. With VirtualTime, even large
 /// transfers complete in milliseconds of wall time.
 pub fn bench_high_latency_sustained(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -68,6 +67,9 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -108,50 +110,48 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
 
                         let start_virtual = ts.now_nanos();
 
-                        let receiver = tokio::spawn(async move {
-                            let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("sustained receiver connect failed: {:?}", e);
-                                    return None;
-                                }
-                            };
+                        // Connect both peers concurrently
+                        let (conn_a_future, conn_b_future) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
 
-                            match conn.recv().await {
-                                Ok(received) => Some(received),
-                                Err(e) => {
-                                    eprintln!("sustained recv failed: {:?}", e);
-                                    None
-                                }
+                        let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
+
+                        let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                            (Ok(a), Ok(b)) => (a, b),
+                            (Err(e), _) => {
+                                eprintln!("sustained sender connect failed: {:?}", e);
+                                continue;
                             }
-                        });
-
-                        let sender = tokio::spawn(async move {
-                            let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("sustained sender connect failed: {:?}", e);
-                                    return false;
-                                }
-                            };
-
-                            tokio::task::yield_now().await;
-
-                            match conn.send(message).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    eprintln!("sustained send failed: {:?}", e);
-                                    false
-                                }
+                            (_, Err(e)) => {
+                                eprintln!("sustained receiver connect failed: {:?}", e);
+                                continue;
                             }
-                        });
+                        };
 
-                        let (recv_result, _) = tokio::join!(receiver, sender);
-                        if let Ok(Some(received)) = recv_result {
-                            std_black_box(received);
+                        // Send from A to B
+                        let send_result = conn_a.send(message).await;
+                        let sent_ok = match send_result {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("sustained send failed: {:?}", e);
+                                false
+                            }
+                        };
+
+                        // Receive at B
+                        if sent_ok {
+                            if let Ok(received) = conn_b.recv().await {
+                                std_black_box(received);
+                            }
                         }
+
+                        // Keep peers alive until end of iteration
+                        drop(conn_a);
+                        drop(conn_b);
+                        drop(peer_a);
+                        drop(peer_b);
 
                         let end_virtual = ts.now_nanos();
                         total_virtual_time +=
@@ -174,8 +174,8 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
 /// Measures throughput degradation under packet loss. With VirtualTime,
 /// retransmission timeouts resolve instantly.
 pub fn bench_packet_loss_resilience(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -194,6 +194,9 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
         b.to_async(&rt).iter_custom(|iters| {
             let ts = ts.clone();
             async move {
+                // Spawn auto-advance task to prevent deadlocks
+                let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
@@ -236,50 +239,38 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
 
                     let start_virtual = ts.now_nanos();
 
-                    let receiver = tokio::spawn(async move {
-                        let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("packet_loss receiver connect failed: {:?}", e);
-                                return None;
-                            }
-                        };
+                    // Connect both peers concurrently
+                    let (conn_a_future, conn_b_future) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
 
-                        match conn.recv().await {
-                            Ok(received) => Some(received),
-                            Err(e) => {
-                                eprintln!("packet_loss recv failed: {:?}", e);
-                                None
-                            }
+                    let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
+
+                    let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) => {
+                            eprintln!("packet_loss sender connect failed: {:?}", e);
+                            continue;
                         }
-                    });
-
-                    let sender = tokio::spawn(async move {
-                        let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                        let mut conn = match conn_future.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("packet_loss sender connect failed: {:?}", e);
-                                return false;
-                            }
-                        };
-
-                        tokio::task::yield_now().await;
-
-                        match conn.send(message).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("packet_loss send failed: {:?}", e);
-                                false
-                            }
+                        (_, Err(e)) => {
+                            eprintln!("packet_loss receiver connect failed: {:?}", e);
+                            continue;
                         }
-                    });
+                    };
 
-                    let (recv_result, _) = tokio::join!(receiver, sender);
-                    if let Ok(Some(received)) = recv_result {
-                        std_black_box(received);
+                    // Send from A to B
+                    let send_result = conn_a.send(message).await;
+                    if send_result.is_ok() {
+                        if let Ok(received) = conn_b.recv().await {
+                            std_black_box(received);
+                        }
                     }
+
+                    drop(conn_a);
+                    drop(conn_b);
+                    drop(peer_a);
+                    drop(peer_b);
 
                     let end_virtual = ts.now_nanos();
                     total_virtual_time +=
@@ -298,8 +289,8 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
 
 /// Large file transfers with VirtualTime - instant even for 1MB
 pub fn bench_large_file_transfers(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // Use single-threaded runtime for deterministic scheduling with VirtualTime
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -322,6 +313,9 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
+                    // Spawn auto-advance task to prevent deadlocks
+                    let _auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
@@ -362,50 +356,38 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
 
                         let start_virtual = ts.now_nanos();
 
-                        let receiver = tokio::spawn(async move {
-                            let conn_future = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("large_file receiver connect failed: {:?}", e);
-                                    return None;
-                                }
-                            };
+                        // Connect both peers concurrently
+                        let (conn_a_future, conn_b_future) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
 
-                            match conn.recv().await {
-                                Ok(received) => Some(received),
-                                Err(e) => {
-                                    eprintln!("large_file recv failed: {:?}", e);
-                                    None
-                                }
+                        let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
+
+                        let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                            (Ok(a), Ok(b)) => (a, b),
+                            (Err(e), _) => {
+                                eprintln!("large_file sender connect failed: {:?}", e);
+                                continue;
                             }
-                        });
-
-                        let sender = tokio::spawn(async move {
-                            let conn_future = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                            let mut conn = match conn_future.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("large_file sender connect failed: {:?}", e);
-                                    return false;
-                                }
-                            };
-
-                            tokio::task::yield_now().await;
-
-                            match conn.send(message).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    eprintln!("large_file send failed: {:?}", e);
-                                    false
-                                }
+                            (_, Err(e)) => {
+                                eprintln!("large_file receiver connect failed: {:?}", e);
+                                continue;
                             }
-                        });
+                        };
 
-                        let (recv_result, _) = tokio::join!(receiver, sender);
-                        if let Ok(Some(received)) = recv_result {
-                            std_black_box(received);
+                        // Send from A to B
+                        let send_result = conn_a.send(message).await;
+                        if send_result.is_ok() {
+                            if let Ok(received) = conn_b.recv().await {
+                                std_black_box(received);
+                            }
                         }
+
+                        drop(conn_a);
+                        drop(conn_b);
+                        drop(peer_a);
+                        drop(peer_b);
 
                         let end_virtual = ts.now_nanos();
                         total_virtual_time +=
