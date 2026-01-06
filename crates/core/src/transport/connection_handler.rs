@@ -2138,19 +2138,22 @@ pub mod mock_transport {
                 }
             };
 
+            // Send packet first so it's available when we yield
+            let result = self.send_to_blocking(buf, target);
+
             // Apply delay using VirtualTime if available, otherwise use wall-clock time
-            if let Some(delay) = delay {
-                if let Some(ref vt) = self.virtual_time {
-                    // Advance virtual time instead of waiting
-                    vt.advance(delay);
-                    // Yield to allow other tasks to process
-                    tokio::task::yield_now().await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                }
+            if let Some(ref vt) = self.virtual_time {
+                // With VirtualTime, always advance time to ensure protocol timeouts fire.
+                // Use provided delay or 10ms minimum for realistic network simulation.
+                // After advancing, yield so other tasks (listeners) can process packets.
+                let advance_time = delay.unwrap_or(Duration::from_millis(10));
+                vt.advance(advance_time);
+                tokio::task::yield_now().await;
+            } else if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
 
-            self.send_to_blocking(buf, target)
+            result
         }
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
