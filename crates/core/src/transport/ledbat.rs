@@ -1378,8 +1378,13 @@ impl<T: TimeSource> LedbatController<T> {
             return false;
         }
 
-        // Save current cwnd as ssthresh and ramp-up target
-        self.ssthresh.store(current_cwnd, Ordering::Release);
+        // Save current cwnd as ssthresh and ramp-up target, applying min_ssthresh floor.
+        // Note: Unlike on_timeout() which halves cwnd before flooring (aggressive response
+        // to packet loss), periodic slowdown preserves cwnd as ssthresh (proactive probe).
+        // Both apply the floor to prevent ssthresh death spiral on high-BDP paths.
+        let floor = self.calculate_adaptive_floor();
+        let new_ssthresh = current_cwnd.max(floor);
+        self.ssthresh.store(new_ssthresh, Ordering::Release);
         self.pre_slowdown_cwnd
             .store(current_cwnd, Ordering::Release);
 
@@ -1397,8 +1402,10 @@ impl<T: TimeSource> LedbatController<T> {
         tracing::debug!(
             old_cwnd_kb = current_cwnd / 1024,
             new_cwnd_kb = slowdown_cwnd / 1024,
+            ssthresh_kb = new_ssthresh / 1024,
+            floor_kb = floor / 1024,
             reduction_factor = SLOWDOWN_REDUCTION_FACTOR,
-            "LEDBAT++ periodic slowdown: reducing cwnd proportionally"
+            "LEDBAT++ periodic slowdown: reducing cwnd proportionally, ssthresh floored"
         );
 
         true
@@ -9996,6 +10003,294 @@ mod tests {
             "\n✓ cwnd escaped flightsize trap: {}KB > strict cap {}KB - PASSED",
             final_snap.cwnd / 1024,
             strict_cap / 1024
+        );
+    }
+
+    /// Regression test: Periodic slowdown must apply min_ssthresh floor.
+    ///
+    /// BUG: When a periodic slowdown triggers, `ssthresh` is set to `current_cwnd`
+    /// WITHOUT applying the min_ssthresh floor:
+    ///
+    /// ```ignore
+    /// // Line ~1382 - BUG: no floor applied
+    /// self.ssthresh.store(current_cwnd, Ordering::Release);
+    /// ```
+    ///
+    /// The timeout handler correctly applies the floor:
+    ///
+    /// ```ignore
+    /// // Line ~1718-1720 - CORRECT
+    /// let floor = self.calculate_adaptive_floor();
+    /// let new_ssthresh = (old_cwnd / 2).max(floor);
+    /// ```
+    ///
+    /// This asymmetry defeats the min_ssthresh protection on high-latency paths where
+    /// periodic slowdowns are the primary cwnd reduction mechanism (no packet loss).
+    ///
+    /// SYMPTOM: On 135ms RTT paths, ssthresh gets reduced to ~37KB by periodic
+    /// slowdowns, preventing cwnd from growing past that point even though
+    /// min_ssthresh was configured to 100KB.
+    ///
+    /// This test verifies that ssthresh stays >= min_ssthresh floor after a
+    /// periodic slowdown when cwnd is below the floor.
+    #[test]
+    fn test_periodic_slowdown_applies_min_ssthresh_floor() {
+        // Use a high floor to catch the bug - floor is 200KB
+        let min_ssthresh = 200 * 1024;
+
+        let config = LedbatConfig {
+            // Start with initial_cwnd below min_ssthresh (38KB < 200KB floor)
+            initial_cwnd: 38_000,
+            min_cwnd: 2_848,
+            max_cwnd: 1_000_000,
+            // Set ssthresh just above initial_cwnd so slow start exits quickly
+            // When slow start exits, cwnd will be around 40-80KB, below the 200KB floor
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh), // Configure 200KB floor
+            ..Default::default()
+        };
+
+        let mut harness = LedbatTestHarness::new(
+            config,
+            NetworkCondition::INTERCONTINENTAL, // 135ms RTT
+            42,
+        );
+
+        println!("\n========== Periodic Slowdown min_ssthresh Floor Test ==========");
+        println!(
+            "Config: min_ssthresh={}KB, initial_ssthresh={}KB",
+            min_ssthresh / 1024,
+            50
+        );
+        println!("Strategy: Exit slow start at ~50KB (below 200KB floor), then trigger slowdown");
+
+        // Run until a natural periodic slowdown triggers
+        // With ssthresh=50KB, slow start exits quickly with cwnd around 50KB
+        // Then a periodic slowdown will set ssthresh = current_cwnd (~50KB)
+        // which is below the 200KB floor
+        let result = harness.run_until_slowdown(100, 100_000);
+        assert!(
+            result.is_ok(),
+            "Should trigger a periodic slowdown within 100 RTTs"
+        );
+
+        let snapshots = result.unwrap();
+        let slowdowns_after = snapshots.last().unwrap().periodic_slowdowns;
+
+        // Verify at least one slowdown occurred
+        assert!(
+            slowdowns_after >= 1,
+            "Expected at least 1 periodic slowdown, got {}",
+            slowdowns_after
+        );
+
+        // Check ssthresh after the slowdown
+        let ssthresh_after = harness.controller.ssthresh.load(Ordering::Acquire);
+        let cwnd_after = harness.snapshot().cwnd;
+
+        println!(
+            "After {} slowdowns: ssthresh={}KB, cwnd={}KB, floor={}KB",
+            slowdowns_after,
+            ssthresh_after / 1024,
+            cwnd_after / 1024,
+            min_ssthresh / 1024
+        );
+
+        // KEY ASSERTION: ssthresh must stay at or above the configured floor
+        // BUG: Currently fails because periodic slowdown sets ssthresh = current_cwnd
+        // without applying the floor. Since cwnd at slowdown time is ~50KB and floor
+        // is 200KB, ssthresh ends up at ~50KB instead of being raised to 200KB.
+        assert!(
+            ssthresh_after >= min_ssthresh,
+            "ssthresh ({} bytes = {}KB) fell below min_ssthresh floor ({} bytes = {}KB)!\n\
+             This indicates the periodic slowdown handler is not applying the \
+             min_ssthresh floor. The timeout handler correctly applies the floor \
+             but the periodic slowdown handler at line ~1382 does not.",
+            ssthresh_after,
+            ssthresh_after / 1024,
+            min_ssthresh,
+            min_ssthresh / 1024
+        );
+
+        println!(
+            "✓ ssthresh ({:.0}KB) >= min_ssthresh floor ({:.0}KB) - PASSED",
+            ssthresh_after as f64 / 1024.0,
+            min_ssthresh as f64 / 1024.0
+        );
+    }
+
+    /// Integration test: Large transfer on high-latency path must complete in reasonable time.
+    ///
+    /// This is the "golden test" that catches the entire class of slow-transfer bugs:
+    /// - ssthresh death spiral (repeated reductions below useful levels)
+    /// - cwnd trapped below ssthresh (can't grow to match BDP)
+    /// - Excessive slowdowns preventing sustained throughput
+    /// - min_ssthresh floor not being applied (in timeout OR periodic slowdown)
+    /// - Any other issue that prevents reasonable throughput on high-BDP paths
+    ///
+    /// The test simulates the real-world scenario that kept failing:
+    /// - ~2.5MB transfer (River UI contract)
+    /// - 135ms RTT (Germany to USA)
+    /// - Starting from minimum cwnd (post-timeout recovery)
+    ///
+    /// If this test passes, we have high confidence the transfer will complete
+    /// in a reasonable time in production.
+    #[test]
+    fn test_large_transfer_high_latency_completes_in_reasonable_time() {
+        // Production scenario parameters
+        let transfer_size = 2_500_000; // 2.5MB (River UI contract size)
+        let rtt_ms = 135; // Germany <-> USA
+        let min_ssthresh = 100 * 1024; // 100KB floor (production config)
+
+        // Calculate acceptable bounds
+        // At 100KB/RTT steady state: 2.5MB / 100KB = 25 RTTs (ideal)
+        // With slow start, ramp-ups, and slowdowns: allow 4x overhead
+        // 25 * 4 = 100 RTTs = 13.5 seconds at 135ms RTT
+        // We'll use 150 RTTs (~20 seconds) as the absolute maximum
+        let max_rtts = 150;
+        let min_avg_throughput_per_rtt = transfer_size / max_rtts; // ~16KB/RTT minimum
+
+        let config = LedbatConfig {
+            initial_cwnd: 2_848, // Start at minimum (simulating post-timeout)
+            min_cwnd: 2_848,
+            max_cwnd: 10_000_000,
+            ssthresh: 1_000_000, // Will be set by recovery
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            min_ssthresh: Some(min_ssthresh),
+            ..Default::default()
+        };
+
+        // Use intercontinental conditions but without packet loss for determinism
+        // (packet loss would cause timeouts which reset progress unpredictably)
+        let condition = NetworkCondition::custom(rtt_ms, Some(0.1), 0.0);
+        let mut harness = LedbatTestHarness::new(config, condition, 42);
+
+        println!("\n========== Large Transfer High-Latency Test ==========");
+        println!(
+            "Transfer: {:.1}MB, RTT: {}ms, min_ssthresh: {}KB",
+            transfer_size as f64 / (1024.0 * 1024.0),
+            rtt_ms,
+            min_ssthresh / 1024
+        );
+        println!(
+            "Success criteria: Complete in <{} RTTs (<{:.1}s)",
+            max_rtts,
+            max_rtts as f64 * rtt_ms as f64 / 1000.0
+        );
+
+        // Track cumulative "bytes transferred" (cwnd per RTT approximates throughput)
+        let mut total_bytes_transferred: usize = 0;
+        let mut rtts_elapsed = 0;
+        let mut min_ssthresh_observed = usize::MAX;
+        let mut max_slowdowns_observed = 0;
+        let mut snapshots_below_floor = 0;
+
+        // Run until we've transferred enough bytes or hit the RTT limit
+        while total_bytes_transferred < transfer_size && rtts_elapsed < max_rtts {
+            harness.step(100_000); // Simulate sending up to 100KB per RTT
+            let snap = harness.snapshot();
+
+            // cwnd represents how much we could send this RTT
+            total_bytes_transferred += snap.cwnd;
+            rtts_elapsed += 1;
+
+            // Track pathological states
+            let ssthresh = harness.controller.ssthresh.load(Ordering::Acquire);
+            min_ssthresh_observed = min_ssthresh_observed.min(ssthresh);
+            max_slowdowns_observed = max_slowdowns_observed.max(snap.periodic_slowdowns);
+
+            if ssthresh < min_ssthresh {
+                snapshots_below_floor += 1;
+            }
+
+            // Progress logging every 25 RTTs
+            if rtts_elapsed % 25 == 0 || total_bytes_transferred >= transfer_size {
+                println!(
+                    "  RTT {}: transferred {:.1}MB/{:.1}MB, cwnd={}KB, ssthresh={}KB, slowdowns={}",
+                    rtts_elapsed,
+                    total_bytes_transferred as f64 / (1024.0 * 1024.0),
+                    transfer_size as f64 / (1024.0 * 1024.0),
+                    snap.cwnd / 1024,
+                    ssthresh / 1024,
+                    snap.periodic_slowdowns
+                );
+            }
+        }
+
+        // Calculate results
+        let transfer_complete = total_bytes_transferred >= transfer_size;
+        let transfer_time_s = rtts_elapsed as f64 * rtt_ms as f64 / 1000.0;
+        let avg_throughput_per_rtt = total_bytes_transferred / rtts_elapsed.max(1);
+        let throughput_mbps =
+            (total_bytes_transferred as f64 * 8.0) / (transfer_time_s * 1_000_000.0);
+
+        println!("\n--- Results ---");
+        println!(
+            "Transfer complete: {} ({:.1}MB in {} RTTs = {:.1}s)",
+            if transfer_complete { "YES" } else { "NO" },
+            total_bytes_transferred as f64 / (1024.0 * 1024.0),
+            rtts_elapsed,
+            transfer_time_s
+        );
+        println!("Throughput: {:.1} Mbps", throughput_mbps);
+        println!(
+            "Avg cwnd/RTT: {}KB (min required: {}KB)",
+            avg_throughput_per_rtt / 1024,
+            min_avg_throughput_per_rtt / 1024
+        );
+        println!(
+            "Min ssthresh observed: {}KB (floor: {}KB)",
+            min_ssthresh_observed / 1024,
+            min_ssthresh / 1024
+        );
+        println!("Total slowdowns: {}", max_slowdowns_observed);
+        println!("RTTs with ssthresh below floor: {}", snapshots_below_floor);
+
+        // Assertions
+        assert!(
+            transfer_complete,
+            "Transfer did not complete in {} RTTs ({:.1}s)! \
+             Only transferred {:.1}MB of {:.1}MB. \
+             This indicates a throughput problem on high-latency paths. \
+             Check: ssthresh floor enforcement, cwnd growth, slowdown frequency.",
+            max_rtts,
+            transfer_time_s,
+            total_bytes_transferred as f64 / (1024.0 * 1024.0),
+            transfer_size as f64 / (1024.0 * 1024.0)
+        );
+
+        assert!(
+            avg_throughput_per_rtt >= min_avg_throughput_per_rtt,
+            "Average throughput {}KB/RTT below minimum {}KB/RTT required for acceptable transfer speed",
+            avg_throughput_per_rtt / 1024,
+            min_avg_throughput_per_rtt / 1024
+        );
+
+        assert_eq!(
+            snapshots_below_floor, 0,
+            "ssthresh fell below min_ssthresh floor {} times! \
+             This indicates the floor is not being enforced in all code paths.",
+            snapshots_below_floor
+        );
+
+        // Warn if close to the limit (indicates fragile throughput)
+        if rtts_elapsed > max_rtts * 3 / 4 {
+            println!(
+                "WARNING: Transfer used {}% of RTT budget - throughput is marginal",
+                rtts_elapsed * 100 / max_rtts
+            );
+        }
+
+        println!(
+            "\n✓ Large transfer test PASSED: {:.1}MB in {:.1}s ({:.1} Mbps)",
+            transfer_size as f64 / (1024.0 * 1024.0),
+            transfer_time_s,
+            throughput_mbps
         );
     }
 }
