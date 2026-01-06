@@ -1663,18 +1663,26 @@ impl Operation for GetOp {
                                 op_manager.ring.record_get_access(key, value.size() as u64);
                                 super::announce_contract_cached(op_manager, &key).await;
 
-                                // Track in GET subscription cache for auto-subscription lifecycle
-                                let evicted = op_manager.ring.record_get_subscription(key);
-                                // Clean up subscription state for evicted contracts
-                                for evicted_key in evicted {
-                                    op_manager.ring.remove_subscription(&evicted_key);
-                                    tracing::debug!(contract = %evicted_key, "Cleaned up evicted GET subscription");
-                                }
+                                // Auto-subscribe to receive updates for this contract
+                                if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                    // Track in GET subscription cache for auto-subscription lifecycle.
+                                    // Note: We do NOT remove subscription state for evicted contracts here,
+                                    // as they may still have active client subscriptions. The background
+                                    // sweep task handles proper cleanup with client subscription checks.
+                                    let evicted = op_manager.ring.record_get_subscription(key);
+                                    if !evicted.is_empty() {
+                                        tracing::debug!(
+                                            evicted_count = evicted.len(),
+                                            "GET subscription cache evicted contracts (cleanup handled by background task)"
+                                        );
+                                    }
 
-                                // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
-                                let child_tx =
-                                    super::start_subscription_request(op_manager, id, key, false);
-                                tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                    // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
+                                    let child_tx = super::start_subscription_request(
+                                        op_manager, id, key, false,
+                                    );
+                                    tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                }
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -1702,18 +1710,25 @@ impl Operation for GetOp {
                                             op_manager.ring.record_get_access(key, value.size() as u64);
                                             super::announce_contract_cached(op_manager, &key).await;
 
-                                            // Track in GET subscription cache for auto-subscription lifecycle
-                                            let evicted = op_manager.ring.record_get_subscription(key);
-                                            // Clean up subscription state for evicted contracts
-                                            for evicted_key in evicted {
-                                                op_manager.ring.remove_subscription(&evicted_key);
-                                                tracing::debug!(contract = %evicted_key, "Cleaned up evicted GET subscription");
-                                            }
+                                            // Auto-subscribe to receive updates for this contract
+                                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                                // Track in GET subscription cache for auto-subscription lifecycle.
+                                                // Note: We do NOT remove subscription state for evicted contracts here,
+                                                // as they may still have active client subscriptions. The background
+                                                // sweep task handles proper cleanup with client subscription checks.
+                                                let evicted = op_manager.ring.record_get_subscription(key);
+                                                if !evicted.is_empty() {
+                                                    tracing::debug!(
+                                                        evicted_count = evicted.len(),
+                                                        "GET subscription cache evicted contracts (cleanup handled by background task)"
+                                                    );
+                                                }
 
-                                            // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
-                                            let child_tx =
-                                                super::start_subscription_request(op_manager, id, key, false);
-                                            tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                                // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
+                                                let child_tx =
+                                                    super::start_subscription_request(op_manager, id, key, false);
+                                                tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                            }
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {

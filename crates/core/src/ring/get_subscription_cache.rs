@@ -22,6 +22,11 @@ use std::time::{Duration, Instant};
 
 use crate::util::time_source::TimeSource;
 
+/// Whether to auto-subscribe to contracts after GET operations.
+/// When enabled, peers automatically subscribe to contracts they fetch,
+/// ensuring they receive updates and preventing state divergence.
+pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
+
 /// Default maximum number of GET-triggered subscriptions to maintain.
 pub const DEFAULT_MAX_ENTRIES: usize = 50;
 
@@ -76,7 +81,9 @@ impl<T: TimeSource> GetSubscriptionCache<T> {
     /// If the contract is already cached, this refreshes its LRU position and timestamp.
     /// If not cached, this adds it and potentially evicts old entries.
     ///
-    /// Returns the list of contracts that were evicted (these need UNSUBSCRIBE).
+    /// Returns contracts evicted from this local cache. Callers should NOT automatically
+    /// remove subscription state for evicted contracts, as they may have active client
+    /// subscriptions. The background sweep task handles proper cleanup with client checks.
     pub fn record_access(&mut self, key: ContractKey) -> Vec<ContractKey> {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
@@ -143,8 +150,10 @@ impl<T: TimeSource> GetSubscriptionCache<T> {
 
     /// Sweep for expired entries beyond max_entries limit.
     ///
-    /// Returns contracts that were evicted (need UNSUBSCRIBE).
-    /// Called periodically by background task.
+    /// Returns contracts evicted from this local cache. Callers should check
+    /// `has_client_subscriptions()` before removing subscription state, as
+    /// evicted contracts may still have active client subscriptions.
+    /// Called periodically by the background sweep task.
     pub fn sweep_expired(&mut self) -> Vec<ContractKey> {
         let now = self.time_source.now();
         let mut evicted = Vec::new();

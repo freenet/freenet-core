@@ -151,7 +151,8 @@ pub(crate) struct SeedingManager {
 
     /// LRU+TTL cache of contracts we should auto-subscribe to based on GET access.
     /// When a GET succeeds, we add the contract here and subscribe to receive updates.
-    /// Eviction triggers UNSUBSCRIBE (unless there's an explicit client subscription).
+    /// On eviction, the background sweep task cleans up local subscription state
+    /// (unless there's an explicit client subscription).
     get_subscription_cache: RwLock<GetSubscriptionCache<InstantTimeSrc>>,
 
     /// Contracts with subscription requests currently in-flight.
@@ -902,8 +903,10 @@ impl SeedingManager {
 
     /// Record a GET access to a contract for auto-subscription tracking.
     ///
-    /// This adds the contract to the GET subscription cache. When eviction occurs,
-    /// returns the list of contracts that were evicted (these need UNSUBSCRIBE).
+    /// This adds the contract to the GET subscription cache. Returns any contracts
+    /// evicted from the local cache. Callers should NOT automatically remove
+    /// subscription state for evicted contracts, as they may have active client
+    /// subscriptions. The background sweep task handles proper cleanup with client checks.
     ///
     /// Called after a successful GET operation to ensure we stay subscribed
     /// to contracts we're actively accessing.
@@ -931,8 +934,10 @@ impl SeedingManager {
 
     /// Sweep for expired entries in the GET subscription cache.
     ///
-    /// Returns contracts that were evicted (need UNSUBSCRIBE).
-    /// Called periodically by background task.
+    /// Returns contracts evicted from this local cache. Callers should check
+    /// `has_client_subscriptions()` before removing subscription state, as
+    /// evicted contracts may still have active client subscriptions.
+    /// Called periodically by the background sweep task.
     pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
         self.get_subscription_cache.write().sweep_expired()
     }

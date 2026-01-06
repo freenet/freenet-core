@@ -41,6 +41,7 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod get_subscription_cache;
+pub use get_subscription_cache::AUTO_SUBSCRIBE_ON_GET;
 mod live_tx;
 mod location;
 mod peer_connection_backoff;
@@ -457,14 +458,14 @@ impl Ring {
 
             // Clean up local subscription state for each expired contract
             for key in expired {
-                // Skip if there's still a client subscription - don't unsubscribe
+                // Skip if there's still a client subscription - don't unsubscribe.
+                // We don't re-add to GET cache because the client subscription
+                // already protects this contract from cleanup.
                 if ring.seeding_manager.has_client_subscriptions(key.id()) {
                     tracing::debug!(
                         %key,
                         "Skipping cleanup for expired GET subscription - has client subscription"
                     );
-                    // Re-add to GET subscription cache since we're keeping it
-                    ring.seeding_manager.record_get_subscription(key);
                     continue;
                 }
 
@@ -797,7 +798,9 @@ impl Ring {
 
     /// Record a GET access for auto-subscription tracking.
     ///
-    /// Returns contracts evicted from the cache that need UNSUBSCRIBE.
+    /// Returns contracts evicted from this local cache. Callers should NOT automatically
+    /// remove subscription state for evicted contracts, as they may have active client
+    /// subscriptions. The background sweep task handles proper cleanup.
     /// Called after successful GET to ensure we stay subscribed to accessed contracts.
     pub fn record_get_subscription(&self, key: ContractKey) -> Vec<ContractKey> {
         self.seeding_manager.record_get_subscription(key)
@@ -812,7 +815,8 @@ impl Ring {
 
     /// Sweep for expired entries in the GET subscription cache.
     ///
-    /// Returns contracts that need UNSUBSCRIBE.
+    /// Returns contracts evicted from this local cache. Callers should check
+    /// `has_client_subscriptions()` before removing subscription state.
     pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
         self.seeding_manager.sweep_expired_get_subscriptions()
     }
@@ -832,6 +836,7 @@ impl Ring {
     /// Remove all subscription state for a contract.
     ///
     /// Used when a GET subscription is evicted to clean up the subscription map.
+    #[allow(dead_code)]
     pub fn remove_subscription(&self, key: &ContractKey) {
         self.seeding_manager.remove_subscription(key)
     }
