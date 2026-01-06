@@ -2008,7 +2008,9 @@ pub mod mock_transport {
     }
 
     /// Channel mapping for mock socket communication between peers.
-    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
+    /// Packet format: (source_addr, data, available_at_nanos)
+    /// available_at_nanos = VirtualTime when packet becomes available (0 = immediate)
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>, u64)>>>;
 
     /// Policy for simulating packet loss in mock transport.
     #[derive(Default, Clone)]
@@ -2036,16 +2038,16 @@ pub mod mock_transport {
 
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
-        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+        /// Inbound packets: (source_addr, data, available_at_nanos)
+        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
-        #[allow(dead_code)] // Used in send_to method
         packet_delay_policy: PacketDelayPolicy,
         num_packets_sent: AtomicUsize,
         rng: std::sync::Mutex<rand::rngs::SmallRng>,
         channels: Channels,
         /// Optional VirtualTime for instant delay simulation in benchmarks.
-        /// When set, delays advance virtual time instead of wall-clock time.
+        /// When set, packet delivery waits until VirtualTime reaches available_at_nanos.
         virtual_time: Option<crate::simulation::VirtualTime>,
     }
 
@@ -2109,55 +2111,87 @@ pub mod mock_transport {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            // tracing::trace!(this = %self.this, "waiting for packet");
-            let Some((remote, packet)) = self.inbound.try_lock().unwrap().recv().await else {
+            // Wait for a packet from the channel
+            let Some((remote, packet, available_at_nanos)) =
+                self.inbound.try_lock().unwrap().recv().await
+            else {
                 tracing::error!(this = %self.this, "connection closed");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
-            // tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
+
+            // Wait until the packet is available (simulates transit delay)
+            // This registers a VirtualTime wakeup that auto-advance will process
+            if let Some(ref vt) = self.virtual_time {
+                if available_at_nanos > 0 {
+                    vt.sleep_until(available_at_nanos).await;
+                }
+            }
+
+            // Deliver the packet
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-            // Inject artificial delay to simulate network latency
-            let delay = match &self.packet_delay_policy {
-                PacketDelayPolicy::NoDelay => None,
-                PacketDelayPolicy::Fixed(delay) => Some(*delay),
-                PacketDelayPolicy::Uniform { min, max } => {
-                    let range = max.as_nanos().saturating_sub(min.as_nanos());
-                    let delay = if range == 0 {
-                        *min // If min == max, use min (avoids division by zero)
-                    } else {
-                        let random_nanos = {
-                            let mut rng = self.rng.try_lock().unwrap();
-                            rng.random::<u128>() % range
-                        };
-                        *min + Duration::from_nanos((random_nanos) as u64)
-                    };
-                    Some(delay)
-                }
-            };
+            let (delay, available_at_nanos) = self.compute_delay_and_timestamp();
 
-            // Send packet first so it's available when we yield
-            let result = self.send_to_blocking(buf, target);
+            // Send packet with delivery timestamp (don't advance VirtualTime here)
+            let result = self.send_packet_internal(buf, target, available_at_nanos);
 
-            // Apply delay using VirtualTime if available, otherwise use wall-clock time
-            if let Some(ref vt) = self.virtual_time {
-                // With VirtualTime, always advance time to ensure protocol timeouts fire.
-                // Use provided delay or 10ms minimum for realistic network simulation.
-                // After advancing, yield so other tasks (listeners) can process packets.
-                let advance_time = delay.unwrap_or(Duration::from_millis(10));
-                vt.advance(advance_time);
-                tokio::task::yield_now().await;
-            } else if let Some(delay) = delay {
+            // For non-VirtualTime with delay, use wall-clock sleep
+            if self.virtual_time.is_none() && !delay.is_zero() {
                 tokio::time::sleep(delay).await;
+            } else {
+                // Just yield to let receiver process
+                tokio::task::yield_now().await;
             }
 
             result
         }
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
+            self.send_packet_internal(buf, target, available_at_nanos)
+        }
+    }
+
+    impl MockSocket {
+        /// Compute delay and delivery timestamp based on packet delay policy.
+        fn compute_delay_and_timestamp(&self) -> (Duration, u64) {
+            let delay = match &self.packet_delay_policy {
+                PacketDelayPolicy::NoDelay => Duration::ZERO,
+                PacketDelayPolicy::Fixed(delay) => *delay,
+                PacketDelayPolicy::Uniform { min, max } => {
+                    let range = max.as_nanos().saturating_sub(min.as_nanos());
+                    if range == 0 {
+                        *min
+                    } else {
+                        let random_nanos = {
+                            let mut rng = self.rng.try_lock().unwrap();
+                            rng.random::<u128>() % range
+                        };
+                        *min + Duration::from_nanos(random_nanos as u64)
+                    }
+                }
+            };
+
+            // Calculate delivery timestamp based on current VirtualTime + delay
+            let available_at_nanos = if let Some(ref vt) = self.virtual_time {
+                vt.now_nanos() + delay.as_nanos() as u64
+            } else {
+                0 // No VirtualTime, deliver immediately
+            };
+
+            (delay, available_at_nanos)
+        }
+
+        /// Internal packet send with explicit delivery timestamp.
+        fn send_packet_internal(
+            &self,
+            buf: &[u8],
+            target: SocketAddr,
+            available_at_nanos: u64,
+        ) -> std::io::Result<usize> {
             let packet_idx = self.num_packets_sent.fetch_add(1, Ordering::Release);
             match &self.packet_drop_policy {
                 PacketDropPolicy::ReceiveAll => {}
@@ -2179,11 +2213,9 @@ pub mod mock_transport {
             let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
                 return Ok(0);
             };
-            // tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
-                .send((self.this, buf.to_vec()))
+                .send((self.this, buf.to_vec(), available_at_nanos))
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            // tracing::trace!(?target, ?self.this, "packet sent to remote");
             Ok(buf.len())
         }
     }
