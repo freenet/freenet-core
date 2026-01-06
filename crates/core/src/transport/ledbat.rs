@@ -1084,7 +1084,26 @@ impl<T: TimeSource> LedbatController<T> {
         // Use pre_ack_flightsize (captured at start of on_ack) to represent actual utilization.
         // Using post-ACK flightsize would always be ~0 in simple send/wait/ack models,
         // incorrectly capping cwnd even when the application is fully utilizing bandwidth.
-        let max_allowed_cwnd = pre_ack_flightsize + (self.allowed_increase_packets * MSS);
+        //
+        // IMPORTANT: Allow cwnd to grow up to ssthresh, breaking the "trapped cwnd"
+        // problem on high-latency paths. Without this:
+        // - On 166ms RTT paths, flightsize may be ~50KB due to ACK timing
+        // - cwnd gets capped at flightsize + 3KB = 53KB
+        // - ssthresh is 102KB, but cwnd can never reach it
+        // - Throughput is stuck at ~75 KB/s instead of ~600 KB/s
+        //
+        // The ssthresh floor only applies when we're trying to grow (capped_change > 0).
+        // During congestion response (capped_change < 0), use the original strict cap
+        // to allow proper cwnd reduction.
+        let basic_cap = pre_ack_flightsize + (self.allowed_increase_packets * MSS);
+        let max_allowed_cwnd = if capped_change > 0.0 {
+            // Growing: allow up to ssthresh to escape the flightsize trap
+            let ssthresh = self.ssthresh.load(Ordering::Acquire);
+            basic_cap.max(ssthresh)
+        } else {
+            // Decreasing or stable: use strict app-limited cap
+            basic_cap
+        };
         new_cwnd = new_cwnd.min(max_allowed_cwnd as f64);
 
         // Enforce bounds
