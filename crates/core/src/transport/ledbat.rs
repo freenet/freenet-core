@@ -9839,4 +9839,163 @@ mod tests {
             avg_cwnd / 1024
         );
     }
+
+    // =========================================================================
+    // Application-Limited Cap Regression Test (Trapped cwnd on High-RTT Paths)
+    //
+    // This test directly validates the fix for the "trapped cwnd" problem where
+    // cwnd gets capped at flightsize + 2*MSS, preventing it from reaching ssthresh
+    // on high-latency paths.
+    //
+    // Unlike test_large_transfer_throughput_regression which uses min_ssthresh
+    // (a separate floor mechanism), this test uses min_ssthresh: None to directly
+    // exercise the ssthresh-as-ceiling logic in the application-limited cap.
+    // =========================================================================
+
+    /// Regression test: cwnd should escape the flightsize trap on high-RTT paths.
+    ///
+    /// This test validates the fix for the "trapped cwnd" problem:
+    /// - On 166ms RTT paths, flightsize may be ~50KB due to ACK timing
+    /// - Without fix: cwnd capped at flightsize + 3KB = 53KB
+    /// - With fix: cwnd can grow up to ssthresh (100KB) when capped_change > 0
+    ///
+    /// The test does NOT use min_ssthresh to ensure we're testing the actual
+    /// application-limited cap fix, not the separate ssthresh floor mechanism.
+    #[test]
+    fn test_cwnd_escapes_flightsize_trap_without_min_ssthresh() {
+        // Setup: High RTT path with NO min_ssthresh floor
+        let ssthresh_value = 100 * 1024; // 100KB - the ceiling we should be able to reach
+
+        let config = LedbatConfig {
+            initial_cwnd: 38_000, // IW26
+            min_cwnd: 2_848,      // ~2 MSS
+            max_cwnd: 10_000_000,
+            ssthresh: ssthresh_value,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false, // Disable to focus on congestion avoidance
+            randomize_ssthresh: false,
+            min_ssthresh: None, // CRITICAL: No floor - test the app-limited cap directly
+            ..Default::default()
+        };
+
+        let mut harness = LedbatTestHarness::new(
+            config,
+            NetworkCondition::INTERCONTINENTAL, // 166ms base RTT
+            99999,                              // Fixed seed
+        );
+
+        println!("\n========== Trapped cwnd Escape Test (No min_ssthresh) ==========");
+        println!("ssthresh: {}KB, min_ssthresh: None", ssthresh_value / 1024);
+
+        // Phase 1: Run slow start until we exit into congestion avoidance
+        // Slow start exits when cwnd >= ssthresh
+        println!("\nPhase 1: Running slow start until exit...");
+        let mut rtts = 0;
+        while harness.snapshot().state == CongestionState::SlowStart && rtts < 20 {
+            // Send full cwnd worth of data
+            let cwnd = harness.snapshot().cwnd;
+            harness.step(cwnd);
+            rtts += 1;
+        }
+
+        let snap_after_ss = harness.snapshot();
+        println!(
+            "After slow start exit: cwnd={}KB, state={:?}, rtts={}",
+            snap_after_ss.cwnd / 1024,
+            snap_after_ss.state,
+            rtts
+        );
+
+        // Verify we're now in congestion avoidance (RampingUp or similar)
+        assert_ne!(
+            snap_after_ss.state,
+            CongestionState::SlowStart,
+            "Should have exited slow start"
+        );
+
+        // Phase 2: Inject a timeout to force ssthresh to a known lower value
+        // This simulates what happens in production after packet loss
+        println!("\nPhase 2: Injecting timeout to set up trapped scenario...");
+        harness.inject_timeout();
+
+        let snap_after_timeout = harness.snapshot();
+        let ssthresh_after_timeout = harness.controller.ssthresh.load(Ordering::Acquire);
+        println!(
+            "After timeout: cwnd={}KB, ssthresh={}KB, state={:?}",
+            snap_after_timeout.cwnd / 1024,
+            ssthresh_after_timeout / 1024,
+            snap_after_timeout.state
+        );
+
+        // Phase 3: Simulate the trapped scenario - small flightsize but need to grow
+        // The key: send only a small amount, so flightsize is small when ACK arrives
+        println!("\nPhase 3: Testing escape from flightsize trap...");
+
+        // Manually create the trapped scenario:
+        // 1. Start with small cwnd (from timeout)
+        // 2. Send a small amount (simulating partial RTT utilization)
+        // 3. Receive ACK - this should allow cwnd to grow toward ssthresh
+        let small_send = 30 * 1024; // 30KB - smaller than ssthresh
+
+        // Run a few RTTs sending only small amounts
+        // This simulates the production scenario where flightsize stays small
+        for i in 1..=10 {
+            let pre_cwnd = harness.snapshot().cwnd;
+            harness.step(small_send);
+            let post_cwnd = harness.snapshot().cwnd;
+
+            if i <= 3 || i == 10 {
+                println!(
+                    "  RTT {}: cwnd {} -> {}KB",
+                    i,
+                    pre_cwnd / 1024,
+                    post_cwnd / 1024
+                );
+            }
+        }
+
+        // Phase 4: Verify cwnd grew beyond the strict flightsize cap
+        let final_snap = harness.snapshot();
+        let final_ssthresh = harness.controller.ssthresh.load(Ordering::Acquire);
+
+        // The strict cap would be: small_send + allowed_increase_packets * MSS
+        // With allowed_increase_packets=2 and MSS=1424, that's ~33KB
+        let strict_cap = small_send + 2 * MSS;
+
+        println!("\nResults:");
+        println!("  Final cwnd: {}KB", final_snap.cwnd / 1024);
+        println!("  Final ssthresh: {}KB", final_ssthresh / 1024);
+        println!("  Strict flightsize cap would be: {}KB", strict_cap / 1024);
+        println!("  State: {:?}", final_snap.state);
+
+        // Key assertion: cwnd should have grown beyond the strict flightsize cap
+        // With the fix, cwnd can grow up to ssthresh when capped_change > 0
+        assert!(
+            final_snap.cwnd > strict_cap,
+            "cwnd ({:.1}KB) should exceed strict flightsize cap ({:.1}KB)! \
+             Without the fix, cwnd gets trapped at flightsize + 3KB. \
+             ssthresh={}KB should be reachable.",
+            final_snap.cwnd as f64 / 1024.0,
+            strict_cap as f64 / 1024.0,
+            final_ssthresh / 1024
+        );
+
+        // Secondary assertion: cwnd should be approaching ssthresh
+        // (might not reach it fully due to congestion avoidance AIMD)
+        let ssthresh_50_pct = final_ssthresh / 2;
+        assert!(
+            final_snap.cwnd >= ssthresh_50_pct,
+            "cwnd ({:.1}KB) should be at least 50% of ssthresh ({:.1}KB). \
+             Got {}% of ssthresh.",
+            final_snap.cwnd as f64 / 1024.0,
+            final_ssthresh as f64 / 1024.0,
+            (final_snap.cwnd * 100) / final_ssthresh
+        );
+
+        println!(
+            "\n✓ cwnd escaped flightsize trap: {}KB > strict cap {}KB - PASSED",
+            final_snap.cwnd / 1024,
+            strict_cap / 1024
+        );
+    }
 }
