@@ -6,6 +6,9 @@
 //! measuring virtual throughput.
 //!
 //! Expected runtime: ~1-2 minutes (vs 30+ minutes with real-time delays)
+//!
+//! **Note:** Uses multi-threaded runtime to allow packet delivery (via real async
+//! channels) to proceed concurrently with VirtualTime operations.
 
 use criterion::{Criterion, Throughput};
 use dashmap::DashMap;
@@ -22,8 +25,9 @@ use super::common::{create_connected_peers_with_virtual_time, spawn_auto_advance
 /// Uses VirtualTime for instant execution - 100ms RTT completes in ~1ms wall time.
 /// Measures the actual slow start benefit by tracking virtual time elapsed.
 pub fn bench_cold_start_throughput(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -164,8 +168,9 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 /// Creates fresh connections, performs warmup transfers, then measures.
 /// Uses VirtualTime for instant execution.
 pub fn bench_warm_connection_throughput(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -318,8 +323,9 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 
 /// Instrumented benchmark that captures cwnd evolution with VirtualTime
 pub fn bench_cwnd_evolution(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -451,8 +457,9 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
 /// Tests various RTT values (0ms, 5ms, 10ms, 25ms, 50ms) to ensure LEDBAT
 /// behaves correctly. With VirtualTime, a 50ms RTT test completes in ~1ms.
 pub fn bench_rtt_scenarios(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -585,8 +592,9 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
 /// Benchmark 1MB transfer with high bandwidth limit to test maximum throughput
 #[allow(dead_code)]
 pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();

@@ -11,6 +11,10 @@
 //! - Large transfers (512KB, 1MB) - sustained throughput
 //! - Micro-benchmarks - component-level validation
 //!
+//! **Note:** VirtualTime benchmarks use multi-threaded runtime to allow packet
+//! delivery (via real async channels) to proceed concurrently with VirtualTime
+//! operations, preventing premature connection timeouts.
+//!
 //! For quick CI checks: `cargo bench --bench transport_ci`
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -42,8 +46,9 @@ use transport::streaming::*;
 /// Tests throughput with varying message sizes. With VirtualTime, even large
 /// transfers complete in milliseconds of wall time.
 pub fn bench_high_latency_sustained(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -174,8 +179,9 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
 /// Measures throughput degradation under packet loss. With VirtualTime,
 /// retransmission timeouts resolve instantly.
 pub fn bench_packet_loss_resilience(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -289,8 +295,9 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
 
 /// Large file transfers with VirtualTime - instant even for 1MB
 pub fn bench_large_file_transfers(c: &mut Criterion) {
-    // Use single-threaded runtime for deterministic scheduling with VirtualTime
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
