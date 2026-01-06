@@ -5,7 +5,10 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, LazyLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, LazyLock,
+    },
     time::Duration,
 };
 
@@ -1497,8 +1500,8 @@ pub enum Address {
 /// Global async executor abstraction for spawning tasks.
 ///
 /// This abstraction allows swapping the underlying executor for deterministic
-/// simulation testing. In production, it delegates to tokio. With MadSim enabled
-/// (`RUSTFLAGS="--cfg madsim"`), tokio is replaced with a deterministic runtime.
+/// simulation testing. In production, it delegates to tokio. For deterministic
+/// simulation, use Turmoil which provides deterministic task scheduling.
 ///
 /// # Usage
 /// ```ignore
@@ -1764,6 +1767,122 @@ impl GlobalRng {
     #[inline]
     pub fn random_u32() -> u32 {
         Self::with_rng(|rng| rng.random())
+    }
+}
+
+// =============================================================================
+// Global Simulation Time
+// =============================================================================
+
+/// Global simulation time base in milliseconds since Unix epoch.
+/// When set, ULID generation uses this instead of system time.
+/// Combined with GlobalRng seeding, this allows fully deterministic transaction IDs.
+static SIMULATION_TIME_MS: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Counter for deterministic time progression within a single millisecond.
+/// Increments with each ULID generation to ensure uniqueness.
+static SIMULATION_TIME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Global simulation time configuration for deterministic testing.
+///
+/// In production mode (no simulation time set), ULID generation uses real system time.
+/// In simulation mode, a configurable base time is used, ensuring reproducible transaction IDs.
+///
+/// # Usage
+///
+/// ```ignore
+/// use freenet::config::GlobalSimulationTime;
+///
+/// // Set simulation time to a known epoch
+/// GlobalSimulationTime::set_time_ms(1704067200000); // 2024-01-01 00:00:00 UTC
+///
+/// // All ULIDs generated after this use simulation time
+/// let tx = Transaction::new::<SomeOp>();
+///
+/// // Clear when done
+/// GlobalSimulationTime::clear_time();
+/// ```
+pub struct GlobalSimulationTime;
+
+impl GlobalSimulationTime {
+    /// Sets the global simulation time base in milliseconds since Unix epoch.
+    ///
+    /// All subsequent ULID generations will use this time (with auto-increment).
+    pub fn set_time_ms(time_ms: u64) {
+        *SIMULATION_TIME_MS.lock() = Some(time_ms);
+        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clears the simulation time, reverting to system time.
+    pub fn clear_time() {
+        *SIMULATION_TIME_MS.lock() = None;
+        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns the current time in milliseconds for ULID generation.
+    ///
+    /// If simulation time is set, returns simulation time + counter increment.
+    /// Otherwise, returns real system time.
+    pub fn current_time_ms() -> u64 {
+        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
+            // Deterministic time: base + counter for uniqueness
+            let counter = SIMULATION_TIME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            base_time.saturating_add(counter)
+        } else {
+            // Production: use real system time
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_millis() as u64
+        }
+    }
+
+    /// Returns true if simulation time is set.
+    pub fn is_simulation_time() -> bool {
+        SIMULATION_TIME_MS.lock().is_some()
+    }
+
+    /// Generates a deterministic ULID using GlobalRng and simulation time.
+    ///
+    /// When both GlobalRng and GlobalSimulationTime are configured:
+    /// - Timestamp: Uses simulation time base + monotonic counter
+    /// - Random: Uses seeded RNG from GlobalRng
+    ///
+    /// When not in simulation mode, uses regular `Ulid::new()`.
+    pub fn new_ulid() -> ulid::Ulid {
+        use ulid::Ulid;
+
+        if GlobalRng::is_seeded() || Self::is_simulation_time() {
+            // Deterministic mode: construct ULID manually
+            let timestamp_ms = Self::current_time_ms();
+
+            // Generate 80 bits of random data using GlobalRng
+            let mut random_bytes = [0u8; 10];
+            GlobalRng::fill_bytes(&mut random_bytes);
+
+            // Construct ULID: 48-bit timestamp (ms) + 80-bit random
+            // ULID format: TTTTTTTTTTRRRRRRRRRRRRRRRRRRRRR (T=timestamp, R=random)
+            let ts = (timestamp_ms as u128) << 80;
+            let rand_high = (random_bytes[0] as u128) << 72;
+            let rand_mid = u64::from_be_bytes([
+                random_bytes[1],
+                random_bytes[2],
+                random_bytes[3],
+                random_bytes[4],
+                random_bytes[5],
+                random_bytes[6],
+                random_bytes[7],
+                random_bytes[8],
+            ]) as u128;
+            let rand_low = (random_bytes[9] as u128) << 56;
+            let ulid_value = ts | rand_high | (rand_mid << 8) | rand_low;
+
+            Ulid(ulid_value)
+        } else {
+            // Production mode: use standard ULID generation
+            Ulid::new()
+        }
     }
 }
 

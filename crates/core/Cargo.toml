@@ -172,31 +172,11 @@ console-subscriber = ["dep:console-subscriber"]
 test-network = ["dep:freenet-test-network"]
 bench = []  # Exposes internal test infrastructure for benchmarking
 bench_full = []  # Enables full benchmark suite (slow, ~78 min)
-
-# ==============================================================================
-# MadSim Configuration for Deterministic Simulation Testing
-# ==============================================================================
-# Enable with: RUSTFLAGS="--cfg madsim" cargo test
-#
-# MadSim provides a deterministic async runtime that enables reproducible testing
-# by controlling task scheduling, time, and randomness. When enabled:
-# - All tokio calls (spawn, time, etc.) go through madsim-tokio
-# - getrandom is patched to use seeded RNG
-# - Failures can be reproduced with the same seed
-#
-# See docs/architecture/testing/deterministic-simulation-roadmap.md for details.
-# ==============================================================================
-
-# MadSim dependencies (only used when --cfg madsim is set)
-[target.'cfg(madsim)'.dependencies]
-madsim = "0.2"
-madsim-tokio = "0.2"
-# Note: Patches for getrandom/quanta are defined in workspace Cargo.toml
+# Feature to enable simulation integration tests (run separately with --test-threads=1)
+simulation_tests = []
 
 # ==============================================================================
 # Lint Configuration
 # ==============================================================================
 
 [lints.rust]
-# Allow the madsim cfg flag which is set externally via RUSTFLAGS
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

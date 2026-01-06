@@ -126,6 +126,9 @@ impl FaultInjectorState {
     /// Advances virtual time and delivers pending messages whose deadline has passed.
     ///
     /// Returns the number of messages delivered.
+    ///
+    /// Messages with the same deadline are delivered in deterministic order sorted by
+    /// (deadline, source_addr, target_addr) to ensure reproducible test behavior.
     pub fn advance_time(&mut self) -> usize {
         use crate::transport::in_memory_socket::deliver_packet_to_network;
 
@@ -141,7 +144,7 @@ impl FaultInjectorState {
         let now = vt.now_nanos();
         let mut delivered = 0;
 
-        // Drain messages with deadline <= now
+        // Collect ready message indices
         let ready_indices: Vec<usize> = self
             .pending_messages
             .iter()
@@ -150,10 +153,24 @@ impl FaultInjectorState {
             .map(|(i, _)| i)
             .collect();
 
-        // Remove in reverse order to maintain indices
-        for idx in ready_indices.into_iter().rev() {
-            let pending = self.pending_messages.remove(idx);
-            // Use socket-level delivery
+        // Extract ready messages (remove in reverse order to maintain indices)
+        let mut ready_messages: Vec<PendingMessage> = ready_indices
+            .into_iter()
+            .rev()
+            .map(|idx| self.pending_messages.remove(idx))
+            .collect();
+
+        // Sort for deterministic delivery order: (deadline, source, target)
+        // This ensures messages with the same deadline are delivered in consistent order
+        ready_messages.sort_by(|a, b| {
+            a.deadline
+                .cmp(&b.deadline)
+                .then_with(|| a.from.cmp(&b.from))
+                .then_with(|| a.target.cmp(&b.target))
+        });
+
+        // Deliver in deterministic order
+        for pending in ready_messages {
             if deliver_packet_to_network(network_name, pending.target, pending.data, pending.from) {
                 delivered += 1;
                 self.stats.messages_delayed_delivered += 1;

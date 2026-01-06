@@ -144,10 +144,19 @@ jobs:
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
       - name: Test
-        # Limit test threads to reduce resource contention on high-core-count runners
-        # Without this, 64+ parallel tests cause timing-sensitive network tests to fail
-        # Output is captured and only shown for failing tests (default cargo test behavior)
+        # Run all tests in parallel (simulation tests excluded via feature flag)
         run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
+
+      - name: Test simulation (serial)
+        # Simulation tests use global state (socket registries, RNG, counters)
+        # and must run serially to avoid race conditions
+        run: |
+          cargo test -p freenet --no-default-features --features trace,websocket,redb,simulation_tests \
+            --test simulation_integration \
+            --test simulation_determinism \
+            --test sim_network \
+            --test turmoil_primitives \
+            -- --test-threads=1
 
   six_peer_regression:
     name: six-peer-regression

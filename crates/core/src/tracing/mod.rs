@@ -878,7 +878,7 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         graceful: bool,
         reason: Option<String>,
-        start_time: std::time::Instant,
+        start_time: tokio::time::Instant,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let uptime_secs = start_time.elapsed().as_secs();

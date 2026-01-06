@@ -70,6 +70,9 @@ pub(crate) mod token_bucket;
 pub use ledbat::LedbatStats;
 // Re-export transport metrics for periodic telemetry snapshots
 pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
+// Re-export reset functions for deterministic simulation testing
+pub use packet_data::reset_nonce_counter;
+pub use peer_connection::StreamId;
 
 use std::time::Duration;
 

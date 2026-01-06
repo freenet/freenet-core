@@ -302,12 +302,11 @@ mod tests {
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
         let (outbound_sender, outbound_receiver) = fast_channel::bounded(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(())
-            .take(100_000)
-            .map(|_| rand::random::<u8>())
-            .collect();
+        let mut message = vec![0u8; 100_000];
+        crate::config::GlobalRng::fill_bytes(&mut message);
         let cipher = {
-            let key = rand::random::<[u8; 16]>();
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
             Aes128Gcm::new(&key.into())
         };
 
@@ -402,7 +401,7 @@ mod tests {
         // Expected: 100KB/s with token bucket rate limiting
         // Should throttle appropriately
 
-        let start_time = std::time::Instant::now();
+        let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
@@ -502,7 +501,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let start_time = std::time::Instant::now();
+        let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
         let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();

@@ -7,13 +7,14 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
@@ -322,11 +323,13 @@ pub(in crate::node) struct P2pConnManager {
     event_listener: Box<dyn NetEventRegister>,
     /// Connections indexed by socket address (the transport-level identifier).
     /// This is the source of truth for active connections.
-    connections: HashMap<SocketAddr, ConnectionEntry>,
+    /// Uses BTreeMap for deterministic iteration order in simulation tests.
+    connections: BTreeMap<SocketAddr, ConnectionEntry>,
     /// Reverse lookup: public key -> socket address.
     /// Used to find connections when we only know the peer's identity.
     /// Must be kept in sync with `connections`.
-    addr_by_pub_key: HashMap<TransportPublicKey, SocketAddr>,
+    /// Uses BTreeMap for deterministic iteration order in simulation tests.
+    addr_by_pub_key: BTreeMap<TransportPublicKey, SocketAddr>,
     conn_event_tx: Option<Sender<ConnEvent>>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
@@ -408,8 +411,8 @@ impl P2pConnManager {
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
-            connections: HashMap::new(),
-            addr_by_pub_key: HashMap::new(),
+            connections: BTreeMap::new(),
+            addr_by_pub_key: BTreeMap::new(),
             conn_event_tx: None,
             key_pair,
             listening_ip: listener_ip,

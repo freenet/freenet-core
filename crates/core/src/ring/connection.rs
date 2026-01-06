@@ -1,4 +1,4 @@
-use std::time::Instant;
+use tokio::time::Instant;
 
 use super::PeerKeyLocation;
 

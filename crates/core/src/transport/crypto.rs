@@ -115,6 +115,18 @@ impl TransportKeypair {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TransportPublicKey(PublicKey);
 
+impl PartialOrd for TransportPublicKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TransportPublicKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
 impl TransportPublicKey {
     /// Encrypt data using static-ephemeral X25519 key exchange.
     ///
@@ -423,7 +435,8 @@ impl<'a> arbitrary::Arbitrary<'a> for TransportPublicKey {
 #[test]
 fn key_sizes_and_decryption() {
     let pair = TransportKeypair::new();
-    let sym_key_bytes = rand::random::<[u8; 16]>();
+    let mut sym_key_bytes = [0u8; 16];
+    crate::config::GlobalRng::fill_bytes(&mut sym_key_bytes);
     let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
 
     // X25519 intro packet: 1 (packet type) + 32 (ephemeral pub) + 16 (data) + 16 (tag) = 65 bytes

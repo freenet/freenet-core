@@ -5,7 +5,8 @@
 //! currently being initialized and queue any operations that arrive during that window.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Initialization taking longer than this logs a warning
 pub(crate) const SLOW_INIT_THRESHOLD: Duration = Duration::from_secs(1);

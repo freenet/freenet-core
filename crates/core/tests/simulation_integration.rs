@@ -5,10 +5,208 @@
 //! 2. Fault injection works correctly with deterministic outcomes
 //! 3. Network events are captured and comparable
 //! 4. Small networks establish connectivity reliably
+//!
+//! NOTE: These tests use global state (socket registries, RNG) and must run serially.
+//! Enable with: cargo test -p freenet --features simulation_tests --test simulation_integration -- --test-threads=1
+
+#![cfg(feature = "simulation_tests")]
 
 use freenet::dev_tool::SimNetwork;
 use std::collections::HashMap;
 use std::time::Duration;
+
+// =============================================================================
+// STRICT Determinism Test - Exact Event Equality
+// =============================================================================
+
+/// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
+///
+/// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.
+/// It verifies:
+/// 1. Exact same number of events
+/// 2. Exact same event counts per type
+/// 3. Exact same event sequence (order, content)
+///
+/// If this test fails, it indicates non-determinism in the simulation that Turmoil
+/// doesn't control (e.g., HashMap iteration order, external I/O, real time usage).
+#[test]
+fn test_strict_determinism_exact_event_equality() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0xDE7E_2A1E_1234;
+
+    /// Captures all simulation state for comparison
+    #[derive(Debug, PartialEq)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<String>, // event_kind names in order
+        total_events: usize,
+    }
+
+    fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
+        use freenet::config::{GlobalRng, GlobalSimulationTime};
+
+        // Reset all global simulation state for determinism
+        freenet::dev_tool::reset_all_simulation_state();
+
+        // Set seed BEFORE SimNetwork::new() since it uses GlobalRng for keypair generation
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create SimNetwork and get event logs handle before run_simulation consumes it
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                name, 1,  // gateways - single gateway for determinism
+                6,  // nodes
+                7,  // ring_max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                2,  // min_connections
+                seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        // Run simulation with Turmoil's deterministic scheduler
+        // Use moderate number of iterations - each takes ~200ms so 20 iterations = 4 seconds
+        // Plus 2s startup + 2s final wait = ~8s of event processing
+        let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            seed,
+            5,                       // max_contract_num - moderate contracts
+            20,                      // iterations - 20 events for diverse coverage
+            Duration::from_secs(30), // simulation_duration
+            || async {
+                // Event triggering happens before this function
+                // Just a short wait to ensure everything settled
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+        );
+
+        // Extract event trace from the shared logs handle
+        let trace = rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            let mut event_sequence: Vec<String> = Vec::new();
+
+            for log in logs.iter() {
+                let kind_name = log.kind.variant_name().to_string();
+                *event_counts.entry(kind_name.clone()).or_insert(0) += 1;
+                event_sequence.push(kind_name);
+            }
+
+            SimulationTrace {
+                total_events: logs.len(),
+                event_counts,
+                event_sequence,
+            }
+        });
+
+        (result, trace)
+    }
+
+    // Run simulation twice with identical seed
+    let (result1, trace1) = run_and_trace("strict-det-run1", SEED);
+    let (result2, trace2) = run_and_trace("strict-det-run2", SEED);
+
+    // Both simulations should have the same outcome (both succeed or both fail)
+    assert_eq!(
+        result1.is_ok(),
+        result2.is_ok(),
+        "STRICT DETERMINISM FAILURE: Simulation outcomes differ!\nRun 1: {:?}\nRun 2: {:?}",
+        result1,
+        result2
+    );
+
+    // Debug: Print detailed event breakdown before assertions
+    if trace1.total_events != trace2.total_events {
+        eprintln!("\n=== DETERMINISM DEBUG ===");
+        eprintln!(
+            "Run 1 total: {}, Run 2 total: {}",
+            trace1.total_events, trace2.total_events
+        );
+        eprintln!("\nEvent counts by type:");
+
+        let mut all_types: std::collections::BTreeSet<&String> =
+            trace1.event_counts.keys().collect();
+        all_types.extend(trace2.event_counts.keys());
+
+        for event_type in all_types {
+            let count1 = trace1.event_counts.get(event_type).unwrap_or(&0);
+            let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
+            let diff = (*count2 as i64) - (*count1 as i64);
+            if diff != 0 {
+                eprintln!(
+                    "  {} : {} vs {} (diff: {:+})",
+                    event_type, count1, count2, diff
+                );
+            } else {
+                eprintln!("  {} : {} (same)", event_type, count1);
+            }
+        }
+        eprintln!("=========================\n");
+    }
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "STRICT DETERMINISM FAILURE: Total event counts differ!\nRun 1: {}\nRun 2: {}",
+        trace1.total_events, trace2.total_events
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "STRICT DETERMINISM FAILURE: Event counts per type differ!\nRun 1: {:?}\nRun 2: {:?}",
+        trace1.event_counts, trace2.event_counts
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence
+    assert_eq!(
+        trace1.event_sequence.len(),
+        trace2.event_sequence.len(),
+        "STRICT DETERMINISM FAILURE: Event sequence lengths differ!"
+    );
+
+    for (i, (e1, e2)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "STRICT DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 1: {:?}\nRun 2: {:?}",
+            i, e1, e2
+        );
+    }
+
+    // Print event breakdown on success for verification
+    eprintln!("\n=== DETERMINISM TEST PASSED ===");
+    eprintln!("Total events matched: {}", trace1.total_events);
+    eprintln!("\nEvent type breakdown:");
+    let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
+    sorted_types.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
+    for (event_type, count) in &sorted_types {
+        eprintln!("  {:20} : {:5}", event_type, count);
+    }
+    eprintln!("================================\n");
+
+    tracing::info!(
+        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 2 runs",
+        trace1.total_events
+    );
+}
 
 // =============================================================================
 // Test 1: End-to-End Deterministic Replay with Event Verification
@@ -169,9 +367,19 @@ async fn test_different_seeds_produce_different_events() {
 /// Uses VirtualTime exclusively - no start_paused.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_fault_injection_deterministic() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+
     const SEED: u64 = 0xFA01_7777_1234;
 
     async fn run_simulation(name: &str, seed: u64) -> HashMap<String, usize> {
+        // Reset all global state and set up deterministic time/RNG
+        freenet::dev_tool::reset_all_simulation_state();
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed (same logic as run_simulation)
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
         sim.with_start_backoff(Duration::from_millis(50));
 
@@ -1499,4 +1707,73 @@ fn test_graceful_shutdown_typed_error() {
     );
 
     tracing::info!("Typed error test passed");
+}
+
+// =============================================================================
+// Turmoil Determinism Test
+// =============================================================================
+
+/// Tests that Turmoil provides deterministic execution.
+///
+/// This test verifies that running the same simulation twice with Turmoil
+/// produces consistent results. Since Turmoil provides deterministic task
+/// scheduling, the simulations should behave identically.
+///
+/// Note: This tests that Turmoil scheduling is deterministic, not that the
+/// full event sequence matches (which requires API changes to capture events
+/// from run_simulation).
+#[test]
+fn test_turmoil_determinism() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0x000D_E7E2_A101_571C;
+
+    fn run_simulation_once(name: &str, seed: u64) -> turmoil::Result {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let sim = rt.block_on(async {
+            SimNetwork::new(
+                name, 1, // 1 gateway
+                2, // 2 nodes
+                7, 3, 10, 2, seed,
+            )
+            .await
+        });
+
+        sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            seed,
+            5,                       // max_contract_num
+            2,                       // iterations
+            Duration::from_secs(15), // simulation_duration
+            || async {
+                // Wait for nodes to establish connections
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(())
+            },
+        )
+    }
+
+    // Run simulation twice with the same seed
+    let result1 = run_simulation_once("turmoil-det-run1", SEED);
+    let result2 = run_simulation_once("turmoil-det-run2", SEED);
+
+    // Both should succeed (or both should fail) if Turmoil is deterministic
+    assert!(
+        result1.is_ok() == result2.is_ok(),
+        "Turmoil determinism test: runs should have consistent success/failure.\nRun 1: {:?}\nRun 2: {:?}",
+        result1,
+        result2
+    );
+
+    if result1.is_ok() {
+        tracing::info!("Turmoil determinism test PASSED: Both runs completed successfully");
+    } else {
+        tracing::warn!(
+            "Turmoil determinism test PASSED (consistent failure): {:?}",
+            result1.err()
+        );
+    }
 }

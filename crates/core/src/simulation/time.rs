@@ -5,23 +5,16 @@
 //! - `RealTime` implementation delegating to tokio
 //! - `VirtualTime` implementation for deterministic simulation
 //!
-//! # MadSim Integration
+//! # Turmoil Integration
 //!
-//! When compiled with `cfg(madsim)`, the `VirtualTime` implementation delegates to
-//! MadSim's deterministic time infrastructure. MadSim replaces tokio with a
-//! deterministic runtime that:
+//! For fully deterministic simulation testing, use Turmoil which provides
+//! deterministic task scheduling. VirtualTime handles time progression while
+//! Turmoil ensures deterministic async execution order.
 //!
-//! - Provides reproducible time progression
-//! - Auto-advances time when the runtime is idle
-//! - Uses `tokio::time` APIs (which MadSim intercepts)
-//!
-//! In MadSim mode, `VirtualTime::advance()` becomes a no-op since MadSim handles
-//! time advancement automatically. Use `tokio::time::advance()` for explicit
-//! time control when needed.
+//! See `crates/core/src/node/testing_impl/turmoil_runner.rs` for Turmoil usage.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-#[cfg(not(madsim))]
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
@@ -36,7 +29,6 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WakeupId(u64);
 
-#[cfg(not(madsim))]
 impl WakeupId {
     fn new(id: u64) -> Self {
         Self(id)
@@ -51,7 +43,6 @@ impl WakeupId {
 }
 
 /// A pending wakeup in the virtual time system.
-#[cfg(not(madsim))]
 #[derive(Debug)]
 pub struct Wakeup {
     /// When this wakeup should fire (virtual nanoseconds since epoch)
@@ -63,7 +54,6 @@ pub struct Wakeup {
     waker: Option<Waker>,
 }
 
-#[cfg(not(madsim))]
 impl Wakeup {
     fn new(deadline: u64, id: WakeupId) -> Self {
         Self {
@@ -74,24 +64,20 @@ impl Wakeup {
     }
 }
 
-#[cfg(not(madsim))]
 impl PartialEq for Wakeup {
     fn eq(&self, other: &Self) -> bool {
         self.deadline == other.deadline && self.id == other.id
     }
 }
 
-#[cfg(not(madsim))]
 impl Eq for Wakeup {}
 
-#[cfg(not(madsim))]
 impl PartialOrd for Wakeup {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-#[cfg(not(madsim))]
 impl Ord for Wakeup {
     fn cmp(&self, other: &Self) -> Ordering {
         // Min-heap: reverse ordering so smallest deadline comes first
@@ -199,7 +185,6 @@ impl TimeSource for RealTime {
 // This implementation provides manual time control via advance() methods.
 // Used when running tests without MadSim deterministic runtime.
 
-#[cfg(not(madsim))]
 /// Internal state for virtual time, shared across clones.
 #[derive(Debug)]
 struct VirtualTimeState {
@@ -213,7 +198,6 @@ struct VirtualTimeState {
     pending_wakers: Mutex<Vec<(WakeupId, Waker)>>,
 }
 
-#[cfg(not(madsim))]
 /// Virtual time implementation for deterministic simulation.
 ///
 /// Time only advances when explicitly stepped via `advance()` or `advance_to()`.
@@ -229,14 +213,12 @@ pub struct VirtualTime {
     state: Arc<VirtualTimeState>,
 }
 
-#[cfg(not(madsim))]
 impl Default for VirtualTime {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(not(madsim))]
 impl VirtualTime {
     /// Creates a new virtual time starting at 0.
     pub fn new() -> Self {
@@ -378,7 +360,6 @@ impl VirtualTime {
     }
 }
 
-#[cfg(not(madsim))]
 impl TimeSource for VirtualTime {
     fn now_nanos(&self) -> u64 {
         self.state.current_nanos.load(AtomicOrdering::SeqCst)
@@ -422,14 +403,12 @@ impl TimeSource for VirtualTime {
     }
 }
 
-#[cfg(not(madsim))]
 /// Future returned by `VirtualTime::sleep()`.
 struct VirtualSleep {
     id: WakeupId,
     state: Arc<VirtualTimeState>,
 }
 
-#[cfg(not(madsim))]
 impl Future for VirtualSleep {
     type Output = ();
 
@@ -465,152 +444,7 @@ impl Future for VirtualSleep {
 //    - Mutex<BinaryHeap<Wakeup>> where Wakeup contains only u64s (Send + Sync)
 //    - Mutex<Vec<(WakeupId, Waker)>> where Waker is Send + Sync
 // All components are Send, so VirtualSleep is safe to send across threads.
-#[cfg(not(madsim))]
 unsafe impl Send for VirtualSleep {}
-
-// ============================================================================
-// MadSim VirtualTime implementation
-// ============================================================================
-//
-// When MadSim is enabled, this implementation delegates to tokio's time APIs,
-// which MadSim intercepts and makes deterministic. Time auto-advances when
-// the runtime is idle.
-
-#[cfg(madsim)]
-/// Virtual time implementation that delegates to MadSim's deterministic runtime.
-///
-/// When compiled with `cfg(madsim)`, this implementation uses tokio's time APIs
-/// which MadSim intercepts to provide deterministic time behavior:
-///
-/// - Time is frozen at start and advances only when:
-///   - The runtime is idle (auto-advance)
-///   - `tokio::time::advance()` is called explicitly
-/// - All time operations are deterministic and reproducible
-///
-/// # Differences from Standard VirtualTime
-///
-/// - `advance()` delegates to `tokio::time::advance()` (async)
-/// - `pending_wakeup_count()` returns 0 (MadSim manages wakeups internally)
-/// - `advance_to_next_wakeup()` returns None (use runtime scheduling instead)
-#[derive(Clone)]
-pub struct VirtualTime {
-    /// Epoch instant for calculating elapsed nanoseconds
-    epoch: std::sync::Arc<tokio::time::Instant>,
-}
-
-#[cfg(madsim)]
-impl Default for VirtualTime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(madsim)]
-impl VirtualTime {
-    /// Creates a new virtual time starting at the current instant.
-    pub fn new() -> Self {
-        Self {
-            epoch: std::sync::Arc::new(tokio::time::Instant::now()),
-        }
-    }
-
-    /// Creates a new virtual time with a given initial offset in nanoseconds.
-    ///
-    /// Note: With MadSim, this advances time to the specified offset.
-    pub fn with_initial_time(initial_nanos: u64) -> Self {
-        let vt = Self::new();
-        // Note: Can't synchronously advance in MadSim, initial time is just recorded
-        let _ = initial_nanos; // Acknowledge but don't use - MadSim starts at 0
-        vt
-    }
-
-    /// Returns the number of pending wakeups.
-    ///
-    /// With MadSim, wakeups are managed internally by the runtime, so this
-    /// always returns 0. Use runtime introspection if needed.
-    pub fn pending_wakeup_count(&self) -> usize {
-        0 // MadSim manages wakeups internally
-    }
-
-    /// Advances time by the given duration.
-    ///
-    /// With MadSim, this calls `tokio::time::advance()` which is intercepted
-    /// by MadSim's deterministic runtime.
-    ///
-    /// Note: This is now a synchronous no-op that logs the intent. For actual
-    /// time advancement with MadSim, use `tokio::time::advance().await` directly
-    /// in async code, or rely on MadSim's auto-advance behavior.
-    pub fn advance(&self, duration: Duration) -> Vec<WakeupId> {
-        // MadSim auto-advances time when runtime is idle.
-        // For explicit advancement, use tokio::time::advance().await in async code.
-        tracing::trace!(
-            "VirtualTime::advance({:?}) called in MadSim mode - time auto-advances on idle",
-            duration
-        );
-        Vec::new() // MadSim doesn't expose triggered wakeup IDs
-    }
-
-    /// Advances time to the given absolute nanoseconds.
-    ///
-    /// With MadSim, time advancement is handled by the runtime.
-    pub fn advance_to(&self, target_nanos: u64) -> Vec<WakeupId> {
-        let current = self.now_nanos();
-        if target_nanos > current {
-            let delta = Duration::from_nanos(target_nanos - current);
-            self.advance(delta)
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Advances to the next pending wakeup, if any.
-    ///
-    /// With MadSim, the runtime handles wakeup scheduling internally.
-    /// This returns None; use runtime scheduling instead.
-    pub fn advance_to_next_wakeup(&self) -> Option<(WakeupId, u64)> {
-        None // MadSim handles this internally
-    }
-
-    /// Returns the deadline of the next pending wakeup, if any.
-    ///
-    /// With MadSim, wakeups are managed internally by the runtime.
-    pub fn next_wakeup_deadline(&self) -> Option<u64> {
-        None // MadSim manages wakeups internally
-    }
-}
-
-#[cfg(madsim)]
-impl TimeSource for VirtualTime {
-    fn now_nanos(&self) -> u64 {
-        self.epoch.elapsed().as_nanos() as u64
-    }
-
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-
-    fn sleep_until(&self, deadline_nanos: u64) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let current = self.now_nanos();
-        if deadline_nanos <= current {
-            Box::pin(std::future::ready(()))
-        } else {
-            let duration = Duration::from_nanos(deadline_nanos - current);
-            Box::pin(tokio::time::sleep(duration))
-        }
-    }
-
-    fn timeout<F, T>(
-        &self,
-        duration: Duration,
-        future: F,
-    ) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        Box::pin(async move { tokio::time::timeout(duration, future).await.ok() })
-    }
-}
 
 // ============================================================================
 // TimeSourceInterval - Interval implementation for TimeSource
@@ -695,14 +529,12 @@ mod tests {
     // Tests for the standard VirtualTime implementation (non-MadSim).
     // These use internal APIs like register_wakeup() that only exist in the standard impl.
 
-    #[cfg(not(madsim))]
     #[test]
     fn test_virtual_time_starts_at_zero() {
         let vt = VirtualTime::new();
         assert_eq!(vt.now_nanos(), 0);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn test_virtual_time_advance() {
         let vt = VirtualTime::new();
@@ -710,7 +542,6 @@ mod tests {
         assert_eq!(vt.now_nanos(), 10_000_000_000);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn test_virtual_time_wakeup_ordering() {
         let vt = VirtualTime::new();
@@ -733,7 +564,6 @@ mod tests {
         assert_eq!(triggered.len(), 1);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn test_virtual_time_same_deadline_fifo() {
         let vt = VirtualTime::new();
@@ -751,7 +581,6 @@ mod tests {
         assert_eq!(triggered[2], id3);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn test_virtual_time_advance_to_next() {
         let vt = VirtualTime::new();
@@ -787,7 +616,6 @@ mod tests {
         assert!(t2 > t1);
     }
 
-    #[cfg(not(madsim))]
     #[tokio::test]
     async fn test_virtual_time_sleep_immediate() {
         let vt = VirtualTime::with_initial_time(1000);

@@ -92,7 +92,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
@@ -802,6 +803,8 @@ impl ConnectOp {
                 expired.push((peer.clone(), attempt.desired));
             }
         }
+        // Sort by public key for deterministic processing order
+        expired.sort_by(|a, b| a.0.pub_key.cmp(&b.0.pub_key));
         for (peer, desired) in expired {
             if let Some(attempt) = self.forward_attempts.remove(&peer) {
                 self.record_forward_outcome(&attempt.peer, desired, false);
@@ -1780,7 +1783,6 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::Instant;
 
     struct TestRelayContext {
         self_loc: PeerKeyLocation,

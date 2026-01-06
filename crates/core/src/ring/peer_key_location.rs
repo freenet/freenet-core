@@ -54,6 +54,23 @@ impl std::fmt::Display for PeerAddr {
     }
 }
 
+impl PartialOrd for PeerAddr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PeerAddr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (PeerAddr::Unknown, PeerAddr::Unknown) => std::cmp::Ordering::Equal,
+            (PeerAddr::Unknown, PeerAddr::Known(_)) => std::cmp::Ordering::Less,
+            (PeerAddr::Known(_), PeerAddr::Unknown) => std::cmp::Ordering::Greater,
+            (PeerAddr::Known(a), PeerAddr::Known(b)) => a.cmp(b),
+        }
+    }
+}
+
 /// The location of a peer in the ring. This location allows routing towards the peer.
 ///
 /// # Identity vs Address

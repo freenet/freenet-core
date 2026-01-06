@@ -202,9 +202,10 @@ where
     // Register the VirtualTime for SimulationSocket to use
     register_network_time_source(&config.name, virtual_time.clone());
 
-    // Build Turmoil simulation
+    // Build Turmoil simulation with seeded RNG for deterministic execution
     let mut sim = turmoil::Builder::new()
         .simulation_duration(config.simulation_duration)
+        .rng_seed(config.seed)
         .build();
 
     // Pre-calculate all node addresses and register them

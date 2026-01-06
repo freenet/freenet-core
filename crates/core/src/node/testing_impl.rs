@@ -966,12 +966,23 @@ impl SimNetwork {
         self.clean_up_tmp_dirs = false;
     }
 
+    /// Derives a deterministic port from seed and peer index for simulation.
+    /// Uses ports in the dynamic range (49152-65535) to avoid conflicts.
+    fn derive_deterministic_port(&self, peer_index: usize) -> u16 {
+        const BASE_PORT: u16 = 50000;
+        const PORT_RANGE: u16 = 10000;
+        // Use peer seed to get a deterministic offset
+        let peer_seed = self.derive_peer_seed(peer_index);
+        BASE_PORT + ((peer_seed % PORT_RANGE as u64) as u16)
+    }
+
     async fn config_gateways(&mut self, num: NonZeroUsize) {
         info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num.into());
         for node_no in 0..num.into() {
             let label = NodeLabel::gateway(&self.name, node_no);
-            let port = crate::util::get_free_port().unwrap();
+            // Use deterministic port for simulation instead of querying system
+            let port = self.derive_deterministic_port(node_no);
             let keypair = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
@@ -1011,23 +1022,20 @@ impl SimNetwork {
                 },
             ));
         }
-        configs[0].0.should_connect = false;
+        // All gateways are passive - they don't initiate connections to other gateways.
+        // This ensures deterministic startup order where only regular nodes initiate connections.
+        for config in &mut configs {
+            config.0.should_connect = false;
+        }
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         // Store all gateway configs for use when restarting non-gateway nodes
         self.all_gateway_configs = gateways.clone();
 
-        for (mut this_node, this_config) in configs {
-            for GatewayConfig {
-                peer_key_location,
-                location,
-                ..
-            } in gateways
-                .iter()
-                .filter(|config| this_config.label != config.label)
-            {
-                this_node.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
-            }
+        // Note: Gateways don't need to know about each other - they are passive entry points.
+        // Only regular nodes need to know about gateways. This simplifies the topology and
+        // improves determinism by avoiding gateway-to-gateway connection attempts.
+        for (this_node, this_config) in configs {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
@@ -1082,7 +1090,7 @@ impl SimNetwork {
             {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
-            let port = crate::util::get_free_port().unwrap();
+            let port = self.derive_deterministic_port(node_no);
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
@@ -1520,6 +1528,25 @@ impl SimNetwork {
             *counts.entry(key.to_string()).or_insert(0) += 1;
         }
         counts
+    }
+
+    /// Returns a handle to the event logs that can be accessed after `run_simulation` consumes `self`.
+    ///
+    /// This is useful for tests that need to compare event logs between runs when using
+    /// Turmoil's deterministic scheduler via `run_simulation()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let sim = SimNetwork::new(...).await;
+    /// let logs_handle = sim.event_logs_handle();
+    ///
+    /// sim.run_simulation::<SmallRng, _, _>(...)?;
+    ///
+    /// // Access logs after simulation completes
+    /// let logs = logs_handle.lock().await;
+    /// ```
+    pub fn event_logs_handle(&self) -> Arc<tokio::sync::Mutex<Vec<crate::tracing::NetLogMessage>>> {
+        self.event_listener.logs.clone()
     }
 
     /// Recommended to calling after `check_connectivity` to ensure enough time
@@ -2029,15 +2056,23 @@ impl SimNetwork {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = turmoil::Result> + 'static,
     {
-        use crate::config::GlobalRng;
+        use crate::config::{GlobalRng, GlobalSimulationTime};
         use std::sync::Mutex;
 
-        // Set up deterministic RNG
+        // Set up deterministic RNG and time for reproducible simulation
         GlobalRng::set_seed(seed);
 
-        // Build Turmoil simulation
+        // Derive simulation epoch from seed for deterministic ULID generation
+        // Base: 2020-01-01 00:00:00 UTC, Range: ~5 years (keeps dates sensible: 2020-2025)
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
             .simulation_duration(simulation_duration)
+            .rng_seed(seed)
             .build();
 
         // Get total peer count for event generation
@@ -2178,10 +2213,48 @@ impl SimNetwork {
             });
         }
 
+        // Take the event controller and labels for triggering events
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("user_ev_controller should be set");
+        let labels: Vec<_> = self.labels.clone();
+
         // Register the test function as a Turmoil client
         sim.client("test", async move {
-            // Give nodes time to start
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Use a seeded RNG for deterministic peer selection
+            use rand::prelude::*;
+            use rand::SeedableRng;
+            let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
+
+            // Trigger events by sending signals to peer event generators
+            // Each signal tells one peer to generate its next random event
+            // Use longer delays to ensure each event completes before the next starts
+            for event_id in 0..iterations as u32 {
+                // Pick a random peer to generate an event
+                if let Some((_, peer_key)) = labels.choose(&mut event_rng) {
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(event_id, "Failed to send event signal - receivers dropped");
+                        break;
+                    }
+
+                    // Longer delay between events to allow full processing
+                    // This is critical for determinism - each operation must complete
+                    // before the next one starts
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+
+            // Wait for events to fully propagate through the network
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Run the user's test function
             test_fn().await
         });
 

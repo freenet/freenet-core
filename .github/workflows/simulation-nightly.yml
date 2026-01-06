@@ -1,5 +1,9 @@
 name: Simulation Tests (Nightly)
 
+# Large-scale simulation tests that are too slow for regular CI.
+# Standard simulation tests (sim_network, simulation_integration, etc.)
+# already run on every PR via the main CI workflow.
+
 on:
   schedule:
     # Run at 3 AM UTC every day
@@ -11,8 +15,8 @@ on:
         description: 'Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI.'
         required: false
         default: ''
-      madsim_seed:
-        description: 'MadSim seed for reproducibility (hex, e.g., 0xDEADBEEF)'
+      seed:
+        description: 'Simulation seed for reproducibility (hex, e.g., 0xDEADBEEF)'
         required: false
         default: ''
 
@@ -22,10 +26,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  madsim-simulation:
-    name: MadSim Deterministic Simulation
+  large-scale-simulation:
+    name: Large Scale Simulation
     runs-on: self-hosted
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     env:
       RUST_LOG: info
@@ -34,8 +38,8 @@ jobs:
       # Use mold linker to avoid rust-lld crashes
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-      # MadSim seed - use input if provided, otherwise use fixed seed for reproducibility
-      MADSIM_SEED: ${{ github.event.inputs.madsim_seed || '0xDEADBEEF' }}
+      # Simulation seed - use input if provided, otherwise use fixed seed for reproducibility
+      SIMULATION_SEED: ${{ github.event.inputs.seed || '0xDEADBEEF' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -53,67 +57,117 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Use separate cache key for MadSim builds
-          prefix-key: madsim
+          prefix-key: simulation-large
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clean test directories
         run: |
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
-      - name: Run simulation tests with MadSim
+      # Build fdev for simulation tests
+      - name: Build fdev
+        run: cargo build -p fdev --release
+
+      # Medium scale test with convergence checking (20 nodes)
+      # Expects 100% success rate - no fault injection
+      - name: Medium scale test (20 nodes, seed 0xDEADBEEF)
         run: |
-          echo "Running with MadSim seed: $MADSIM_SEED"
-          RUSTFLAGS="--cfg madsim" cargo test -p freenet --test sim_network -- --test-threads=1
-        env:
-          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+          echo "Running medium scale simulation (20 nodes)"
+          cargo run -p fdev --release -- test \
+            --name "nightly-medium-20" \
+            --seed 0xDEADBEEF \
+            --gateways 2 \
+            --nodes 18 \
+            --events 200 \
+            --ring-max-htl 10 \
+            --max-connections 15 \
+            --min-connections 5 \
+            --check-convergence 60 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            single-process
 
-      - name: Run simulation integration tests with MadSim
+      # Medium scale with different seed (explores different code paths)
+      # Expects 100% success rate - no fault injection
+      - name: Medium scale test (20 nodes, seed 0xCAFEBABE)
         run: |
-          RUSTFLAGS="--cfg madsim" cargo test -p freenet --test simulation_integration -- --test-threads=1
-        env:
-          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+          echo "Running medium scale simulation with alternate seed"
+          cargo run -p fdev --release -- test \
+            --name "nightly-medium-20-alt" \
+            --seed 0xCAFEBABE \
+            --gateways 2 \
+            --nodes 18 \
+            --events 200 \
+            --ring-max-htl 10 \
+            --max-connections 15 \
+            --min-connections 5 \
+            --check-convergence 60 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            single-process
 
-      - name: Run fdev single-process test with MadSim
+      # Fault tolerance test with message loss
+      # Expects 100% success rate - eventual consistency handles retries
+      - name: Fault tolerance test (5% message loss)
         run: |
-          RUSTFLAGS="--cfg madsim" cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 --seed 42 --disable-metrics single-process
-        env:
-          MADSIM_SEED: ${{ env.MADSIM_SEED }}
+          echo "Running fault tolerance simulation with 5% message loss"
+          cargo run -p fdev --release -- test \
+            --name "nightly-fault-loss" \
+            --seed 0xFA017001 \
+            --gateways 2 \
+            --nodes 12 \
+            --events 150 \
+            --message-loss 0.05 \
+            --check-convergence 90 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            --print-network-stats \
+            single-process
 
-  # Also run without MadSim for comparison (helps identify MadSim-specific issues)
-  standard-simulation:
-    name: Standard Simulation (Comparison)
-    runs-on: self-hosted
-    timeout-minutes: 30
-
-    env:
-      RUST_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      RUST_MIN_STACK: 16777216
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Clean test directories
+      # High latency test
+      # Expects 100% success rate - latency shouldn't cause failures
+      - name: High latency test (50-200ms latency)
         run: |
-          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+          echo "Running high latency simulation"
+          cargo run -p fdev --release -- test \
+            --name "nightly-high-latency" \
+            --seed 0x1A7E0C71 \
+            --gateways 2 \
+            --nodes 12 \
+            --events 100 \
+            --latency-min 50 \
+            --latency-max 200 \
+            --check-convergence 120 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            --print-network-stats \
+            single-process
 
-      - name: Run simulation tests (standard mode)
+      # Larger scale test (40 nodes) - more events, longer timeout
+      # Expects 100% success rate - no fault injection
+      - name: Large scale test (40 nodes)
         run: |
-          cargo test -p freenet --test sim_network -- --test-threads=1
+          echo "Running large scale simulation (40 nodes)"
+          cargo run -p fdev --release -- test \
+            --name "nightly-large-40" \
+            --seed 0x4040BEEF \
+            --gateways 3 \
+            --nodes 37 \
+            --events 300 \
+            --ring-max-htl 12 \
+            --max-connections 20 \
+            --min-connections 8 \
+            --check-convergence 120 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            single-process
 
-      - name: Run simulation integration tests (standard mode)
+      # Large network test - requires riverctl, skipped if not available
+      - name: Run large network test (50+ nodes)
         run: |
-          cargo test -p freenet --test simulation_integration -- --test-threads=1
+          echo "Running large network simulation with seed: $SIMULATION_SEED"
+          if command -v riverctl &> /dev/null; then
+            cargo test -p freenet --test large_network -- --ignored --nocapture --test-threads=1
+          else
+            echo "Skipping large_network test - riverctl not installed"
+          fi

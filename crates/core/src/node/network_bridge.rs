@@ -22,7 +22,10 @@ pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;
 
 // Re-export fault injection types and functions for testing
-pub use in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState, NetworkStats};
+pub use in_memory::{
+    clear_all_fault_injectors, get_fault_injector, set_fault_injector, FaultInjectorState,
+    NetworkStats,
+};
 // Re-export event loop exit reason for graceful shutdown handling
 pub use p2p_protoc::EventLoopExitReason;
 
@@ -103,10 +106,20 @@ impl Clone for ConnectionError {
     }
 }
 
+use std::sync::atomic::AtomicU64;
+
+/// Static counter for channel ID generation
+static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the channel ID counter to initial state.
+/// Used for deterministic simulation testing.
+pub fn reset_channel_id_counter() {
+    CHANNEL_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
 
     let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let (notification_tx, notification_rx) = mpsc::channel(100);

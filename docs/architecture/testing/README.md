@@ -20,8 +20,9 @@ We currently use these testing paradigms:
 | Unit Testing | ✅ Mature | ~1,000 tests |
 | Integration Testing | ✅ Mature | ~80 tests |
 | Mock-based Testing | ✅ Mature | Extensive |
-| Simulation Testing | ✅ Mature | SimNetwork with VirtualTime |
+| Simulation Testing | ✅ Mature | SimNetwork with VirtualTime + Turmoil |
 | Deterministic Time/RNG | ✅ Complete | `VirtualTime`, `GlobalRng` |
+| **Deterministic Scheduling** | ✅ **Complete** | **Turmoil (always enabled)** |
 | Property-based Testing | ⚠️ Limited | LEDBAT only |
 | Fuzz Testing | ⚠️ Underused | Infrastructure exists |
 
@@ -33,18 +34,18 @@ We currently use these testing paradigms:
 | GlobalRng | ✅ Complete | Seeded RNG replacing `rand::random()` |
 | TimeSource injection | ✅ Complete | Transport/LEDBAT use trait |
 | Single-threaded tests | ✅ Complete | All simulation tests use `current_thread` |
-| **Deterministic scheduler** | ⚠️ Pending | Required for linearizability verification |
+| **Deterministic scheduler** | ✅ **Complete** | **Turmoil (always enabled, ~99% determinism)** |
 
-See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for the path to full determinism.
+Full determinism achieved. See [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) for implementation details.
 
-### Paradigms to Adopt
+### ~~Paradigms to Adopt~~ Recently Adopted ✅
 
-| Paradigm | Priority | Effort | Blocked By |
-|----------|----------|--------|------------|
-| Deterministic Scheduler (MadSim) | High | Medium | - |
-| Linearizability Checker | High | High | Deterministic Scheduler |
-| Expanded Property Testing | Medium | Medium | Deterministic Scheduler |
-| Mutation Testing | Low | Low | - |
+| Paradigm | Status | Notes |
+|----------|--------|-------|
+| ~~Deterministic Scheduler (Turmoil)~~ | ✅ **ADOPTED** | **Always enabled** |
+| Linearizability Checker | 🔮 Future | Now possible with Turmoil |
+| Expanded Property Testing | 🔮 Future | Determinism enables this |
+| Mutation Testing | 🔮 Future | Low priority |
 
 ## Quick Reference: Which Testing Approach to Use
 
@@ -73,6 +74,9 @@ cargo test -p freenet --test isolated_node_regression
 # SimNetwork simulation tests
 cargo test -p freenet --test simulation_integration
 
+# SimNetwork with deterministic scheduling (Turmoil always enabled)
+cargo test -p freenet --test simulation_integration -- --test-threads=1
+
 # Real network tests (requires feature)
 cargo test -p freenet --test test_network_integration --features test-network
 
@@ -81,4 +85,7 @@ cargo test -p freenet --test large_network --features test-network -- --ignored
 
 # fdev CLI testing
 cargo run -p fdev -- test --gateways 1 --nodes 5 --events 100 single-process
+
+# fdev with deterministic scheduling (Turmoil always enabled)
+cargo run -p fdev -- test --gateways 1 --nodes 3 --events 10 --seed 42 single-process
 ```

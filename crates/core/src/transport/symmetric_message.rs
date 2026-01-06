@@ -327,7 +327,8 @@ mod test {
     use super::*;
 
     fn gen_key() -> Aes128Gcm {
-        let key = rand::random::<[u8; 16]>();
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         Aes128Gcm::new(&key.into())
     }
 
@@ -356,23 +357,21 @@ mod test {
                 result: Err(Cow::Borrowed("error")),
             },
             SymmetricMessagePayload::ShortMessage {
-                payload: Bytes::from(
-                    std::iter::repeat(())
-                        .take(100)
-                        .map(|_| rand::random::<u8>())
-                        .collect::<Vec<_>>(),
-                ),
+                payload: Bytes::from({
+                    let mut buf = vec![0u8; 100];
+                    crate::config::GlobalRng::fill_bytes(&mut buf);
+                    buf
+                }),
             },
             SymmetricMessagePayload::StreamFragment {
                 stream_id: StreamId::next(),
                 total_length_bytes: 100,
                 fragment_number: 1,
-                payload: Bytes::from(
-                    std::iter::repeat(())
-                        .take(100)
-                        .map(|_| rand::random::<u8>())
-                        .collect::<Vec<_>>(),
-                ),
+                payload: Bytes::from({
+                    let mut buf = vec![0u8; 100];
+                    crate::config::GlobalRng::fill_bytes(&mut buf);
+                    buf
+                }),
             },
             SymmetricMessagePayload::NoOp,
             SymmetricMessagePayload::Ping { sequence: 12345 },

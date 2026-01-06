@@ -3,7 +3,8 @@ use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::config::GlobalRng;
 use crate::topology::{Limits, TopologyManager};

@@ -123,10 +123,18 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
 #[serde(transparent)]
 pub struct StreamId(u32);
 
+/// Static counter for StreamId generation - must be at module level for reset access
+static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 impl StreamId {
     pub fn next() -> Self {
-        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Release))
+        Self(STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release))
+    }
+
+    /// Reset the stream ID counter to initial state.
+    /// Used for deterministic simulation testing.
+    pub fn reset_counter() {
+        STREAM_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1339,7 +1347,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
 ) -> Result<()> {
-    let start_time = std::time::Instant::now();
+    let start_time = tokio::time::Instant::now();
     tracing::trace!(
         peer_addr = %remote_addr,
         packet_id,
@@ -1592,11 +1600,10 @@ mod tests {
         const MSG_LEN: usize = 1000;
         let (sender, receiver) = fast_channel::bounded(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(0)
-            .take(MSG_LEN)
-            .map(|_| rand::random::<u8>())
-            .collect();
-        let key = rand::random::<[u8; 16]>();
+        let mut message = vec![0u8; MSG_LEN];
+        crate::config::GlobalRng::fill_bytes(&mut message);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
         let cipher = Aes128Gcm::new(&key.into());
 
         // Initialize with VirtualTime for deterministic testing

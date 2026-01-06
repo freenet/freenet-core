@@ -55,6 +55,12 @@ impl RequestId {
     pub fn new() -> Self {
         Self(REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
     }
+
+    /// Reset the request ID counter to initial state.
+    /// Used for deterministic simulation testing.
+    pub fn reset_counter() {
+        REQUEST_ID_COUNTER.store(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for RequestId {
@@ -86,6 +92,12 @@ impl ClientId {
 
     pub fn next() -> Self {
         ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Reset the client ID counter to initial state.
+    /// Used for deterministic simulation testing.
+    pub fn reset_counter() {
+        CLIENT_ID.store(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
