@@ -2068,9 +2068,10 @@ impl SimNetwork {
         let epoch_offset = seed % RANGE_MS;
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
 
-        // Build Turmoil simulation
+        // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
             .simulation_duration(simulation_duration)
+            .rng_seed(seed)
             .build();
 
         // Get total peer count for event generation

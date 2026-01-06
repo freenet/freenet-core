@@ -19,11 +19,14 @@ use freenet::transport::in_memory_socket::{
     SimulationSocket,
 };
 
+const SEED: u64 = 0xDEAD_BEEF_CAFE_1234;
+
 /// Basic test: Can we run async code inside Turmoil hosts?
 #[test]
 fn test_turmoil_basic_async() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
+        .rng_seed(SEED)
         .build();
 
     let counter = Arc::new(AtomicU64::new(0));
@@ -50,6 +53,7 @@ fn test_turmoil_basic_async() -> turmoil::Result {
 fn test_turmoil_with_channels() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
+        .rng_seed(SEED)
         .build();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(10);
@@ -94,6 +98,7 @@ fn test_turmoil_with_global_state() -> turmoil::Result {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
+        .rng_seed(SEED)
         .build();
 
     // Server host - registers itself and listens for messages
@@ -145,12 +150,13 @@ fn test_turmoil_with_global_state() -> turmoil::Result {
 fn test_turmoil_determinism() -> turmoil::Result {
     use std::sync::Mutex;
 
-    fn run_simulation(_seed: u64) -> Vec<String> {
+    fn run_simulation(seed: u64) -> Vec<String> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_result = events.clone();
 
         let mut sim = turmoil::Builder::new()
             .simulation_duration(Duration::from_secs(5))
+            .rng_seed(seed)
             .build();
 
         // Multiple concurrent hosts
@@ -228,6 +234,7 @@ fn test_turmoil_with_socket_pattern() -> turmoil::Result {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
+        .rng_seed(SEED)
         .build();
 
     let server_addr: SocketAddr = (Ipv6Addr::LOCALHOST, 8000).into();
@@ -296,6 +303,7 @@ fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(10))
+        .rng_seed(SEED)
         .build();
 
     // Server host using SimulationSocket
