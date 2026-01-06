@@ -53,8 +53,6 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("extended/sustained_throughput");
     group.sample_size(10);
 
@@ -67,17 +65,14 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
-        let ts = time_source.clone();
         group.bench_function(format!("{}kb_transfer", transfer_size_kb), |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
-                    // Spawn auto-advance task to prevent deadlocks
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
+                        // Create fresh VirtualTime for each iteration to avoid time accumulation
+                        let ts_iter = VirtualTime::new();
                         let channels: Channels = Arc::new(DashMap::new());
                         let message = vec![0xABu8; transfer_size];
 
@@ -86,7 +81,7 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                                 PacketDropPolicy::ReceiveAll,
                                 PacketDelayPolicy::NoDelay,
                                 channels.clone(),
-                                ts.clone(),
+                                ts_iter.clone(),
                             )
                             .await
                             {
@@ -102,7 +97,7 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                                 PacketDropPolicy::ReceiveAll,
                                 PacketDelayPolicy::NoDelay,
                                 channels.clone(),
-                                ts.clone(),
+                                ts_iter.clone(),
                             )
                             .await
                             {
@@ -113,9 +108,9 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                                 }
                             };
 
-                        let start_virtual = ts.now_nanos();
+                        let start_virtual = ts_iter.now_nanos();
 
-                        // Connect both peers concurrently
+                        // Connect both peers concurrently (NO auto-advance during handshake)
                         let (conn_a_future, conn_b_future) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
                             peer_b.connect(peer_a_pub, peer_a_addr),
@@ -135,6 +130,9 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                             }
                         };
 
+                        // Spawn auto-advance AFTER connection is established
+                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
                         // Send from A to B
                         let send_result = conn_a.send(message).await;
                         let sent_ok = match send_result {
@@ -152,13 +150,16 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                             }
                         }
 
+                        // Stop auto-advance before cleanup
+                        auto_advance.abort();
+
                         // Keep peers alive until end of iteration
                         drop(conn_a);
                         drop(conn_b);
                         drop(peer_a);
                         drop(peer_b);
 
-                        let end_virtual = ts.now_nanos();
+                        let end_virtual = ts_iter.now_nanos();
                         total_virtual_time +=
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
@@ -186,8 +187,6 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("extended/packet_loss");
     group.sample_size(10);
 
@@ -195,17 +194,14 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
     let loss_factor = 0.01; // 1% loss
     group.throughput(Throughput::Bytes(transfer_size as u64));
 
-    let ts = time_source.clone();
     group.bench_function("1pct_loss/64kb", |b| {
         b.to_async(&rt).iter_custom(|iters| {
-            let ts = ts.clone();
             async move {
-                // Spawn auto-advance task to prevent deadlocks
-                let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                 let mut total_virtual_time = Duration::ZERO;
 
                 for _ in 0..iters {
+                    // Create fresh VirtualTime for each iteration
+                    let ts_iter = VirtualTime::new();
                     let channels: Channels = Arc::new(DashMap::new());
                     let message = vec![0xABu8; transfer_size];
 
@@ -215,7 +211,7 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                             PacketDropPolicy::Factor(loss_factor),
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
-                            ts.clone(),
+                            ts_iter.clone(),
                         )
                         .await
                         {
@@ -232,7 +228,7 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                             PacketDropPolicy::ReceiveAll,
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
-                            ts.clone(),
+                            ts_iter.clone(),
                         )
                         .await
                         {
@@ -243,9 +239,9 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                             }
                         };
 
-                    let start_virtual = ts.now_nanos();
+                    let start_virtual = ts_iter.now_nanos();
 
-                    // Connect both peers concurrently
+                    // Connect both peers concurrently (NO auto-advance during handshake)
                     let (conn_a_future, conn_b_future) = futures::join!(
                         peer_a.connect(peer_b_pub, peer_b_addr),
                         peer_b.connect(peer_a_pub, peer_a_addr),
@@ -265,6 +261,9 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                         }
                     };
 
+                    // Spawn auto-advance AFTER connection is established
+                    let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
                     // Send from A to B
                     let send_result = conn_a.send(message).await;
                     if send_result.is_ok() {
@@ -273,12 +272,15 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
                         }
                     }
 
+                    // Stop auto-advance before cleanup
+                    auto_advance.abort();
+
                     drop(conn_a);
                     drop(conn_b);
                     drop(peer_a);
                     drop(peer_b);
 
-                    let end_virtual = ts.now_nanos();
+                    let end_virtual = ts_iter.now_nanos();
                     total_virtual_time +=
                         Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
@@ -302,8 +304,6 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let time_source = VirtualTime::new();
-
     let mut group = c.benchmark_group("extended/large_files");
     group.sample_size(10);
 
@@ -315,17 +315,14 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
         let transfer_size = size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
-        let ts = time_source.clone();
         group.bench_function(format!("{}kb_transfer", size_kb), |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let ts = ts.clone();
                 async move {
-                    // Spawn auto-advance task to prevent deadlocks
-                    let _auto_advance = spawn_auto_advance_task(ts.clone());
-
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
+                        // Create fresh VirtualTime for each iteration to avoid time accumulation
+                        let ts_iter = VirtualTime::new();
                         let channels: Channels = Arc::new(DashMap::new());
                         let message = vec![0xABu8; transfer_size];
 
@@ -334,7 +331,7 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                                 PacketDropPolicy::ReceiveAll,
                                 PacketDelayPolicy::NoDelay,
                                 channels.clone(),
-                                ts.clone(),
+                                ts_iter.clone(),
                             )
                             .await
                             {
@@ -350,7 +347,7 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                                 PacketDropPolicy::ReceiveAll,
                                 PacketDelayPolicy::NoDelay,
                                 channels.clone(),
-                                ts.clone(),
+                                ts_iter.clone(),
                             )
                             .await
                             {
@@ -361,9 +358,9 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                                 }
                             };
 
-                        let start_virtual = ts.now_nanos();
+                        let start_virtual = ts_iter.now_nanos();
 
-                        // Connect both peers concurrently
+                        // Connect both peers concurrently (NO auto-advance during handshake)
                         let (conn_a_future, conn_b_future) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
                             peer_b.connect(peer_a_pub, peer_a_addr),
@@ -383,6 +380,9 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                             }
                         };
 
+                        // Spawn auto-advance AFTER connection is established
+                        let auto_advance = spawn_auto_advance_task(ts_iter.clone());
+
                         // Send from A to B
                         let send_result = conn_a.send(message).await;
                         if send_result.is_ok() {
@@ -391,12 +391,16 @@ pub fn bench_large_file_transfers(c: &mut Criterion) {
                             }
                         }
 
+                        // Stop auto-advance before cleanup
+                        auto_advance.abort();
+
+                        // Keep peers alive until end of iteration
                         drop(conn_a);
                         drop(conn_b);
                         drop(peer_a);
                         drop(peer_b);
 
-                        let end_virtual = ts.now_nanos();
+                        let end_virtual = ts_iter.now_nanos();
                         total_virtual_time +=
                             Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
