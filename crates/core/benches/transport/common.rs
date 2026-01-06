@@ -289,9 +289,10 @@ pub fn new_channels() -> Channels {
 
 /// Spawn an auto-advance monitoring task for VirtualTime.
 ///
-/// This task periodically checks for blocked VirtualSleep futures and advances
-/// time to the next wakeup deadline when needed. This prevents deadlocks when
-/// all tasks are waiting on timeouts.
+/// This task continuously advances VirtualTime in small increments to ensure
+/// protocol timers fire properly. This is necessary because with multi-threaded
+/// runtime, protocol tasks may be blocked on real async channel operations
+/// (for packet delivery) rather than VirtualTime sleeps.
 ///
 /// **Must be called from within a tokio runtime context.**
 ///
@@ -314,19 +315,18 @@ pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHan
             // Yield to let protocol tasks run first
             tokio::task::yield_now().await;
 
-            // Advance time in small steps (10ms) to avoid triggering protocol timeouts
-            // The connection idle timeout is 120s, so we need to advance slowly enough
-            // that packets can be exchanged between advances
-            if time_source
-                .try_auto_advance_bounded(Duration::from_millis(10))
-                .is_some()
-            {
-                // Time advanced - continue to let tasks process
-                continue;
-            }
+            // Advance time aggressively (10ms per 100µs real = 100x faster than real time)
+            // This allows VirtualTime-based timers to fire quickly.
+            //
+            // With VirtualTime's long idle timeout (configured separately), this won't
+            // cause premature disconnections during benchmarks.
+            time_source.advance(Duration::from_millis(10));
 
-            // No pending wakeups - sleep briefly to avoid busy-loop
-            tokio::time::sleep(Duration::from_micros(50)).await;
+            // Trigger any expired wakeups
+            time_source.trigger_expired();
+
+            // Brief real-time sleep to prevent CPU spinning
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
     })
 }

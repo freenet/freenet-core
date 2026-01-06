@@ -488,10 +488,12 @@ impl TimeSource for VirtualTime {
         })
     }
 
-    /// VirtualTime uses a 1-hour timeout to avoid premature disconnections
+    /// VirtualTime uses a 24-hour timeout to avoid premature disconnections
     /// when auto-advance advances time faster than packets can be delivered.
+    /// With 100x time acceleration (10ms per 100µs), 24 hours of virtual time
+    /// takes ~14 minutes of real time.
     fn connection_idle_timeout(&self) -> Duration {
-        Duration::from_secs(3600) // 1 hour
+        Duration::from_secs(86400) // 24 hours
     }
 }
 
