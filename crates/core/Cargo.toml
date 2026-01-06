@@ -94,7 +94,7 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { version = "0.5.0", optional = true }
-tokio-stream = "0.1.17"
+tokio-stream = "0.1.18"
 freenet-test-network = { version = "0.1.20", optional = true }
 turmoil = "0.7"  # Deterministic simulation scheduling (always enabled for SimNetwork)
 
