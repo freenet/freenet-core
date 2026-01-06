@@ -158,8 +158,10 @@ async fn test_sim_network_connection_check() {
 ///
 /// **Configuration:**
 /// - Network: 5 nodes (1 gateway + 4 peers)
-/// - Events: 20 contract operations
-/// - Timeout: 45 seconds for connectivity
+/// - Events: 100 contract operations
+/// - Success rate: 95% minimum
+/// - Convergence: 100% required (eventual consistency guarantee)
+/// - Timeout: 45 seconds for connectivity, 60 seconds for convergence
 ///
 /// **On failure:** Prints seed for local reproduction
 ///
@@ -176,13 +178,13 @@ async fn ci_quick_simulation() {
     let result = run_ci_simulation(
         "ci-quick-sim",
         SEED,
-        1,                       // gateways
-        4,                       // nodes (1 + 4 = 5 total - small for reliable CI)
-        20,                      // events (contract operations)
-        3,                       // max contracts
-        Duration::from_secs(45), // connectivity timeout
-        Duration::from_secs(30), // convergence timeout
-        0.80,                    // min success rate (80% to account for timing issues in CI)
+        1,                        // gateways
+        4,                        // nodes (1 + 4 = 5 total - small for reliable CI)
+        100,                      // events (contract operations) - enough to test consistency
+        5,                        // max contracts
+        Duration::from_secs(45),  // connectivity timeout
+        Duration::from_secs(60),  // convergence timeout - longer for 100% convergence
+        0.95,                     // min success rate (95% - eventual consistency should achieve this)
     )
     .await;
 
@@ -351,28 +353,29 @@ async fn run_ci_simulation(
                 );
             }
 
-            // Allow some divergence in quick tests due to timing
-            // A longer test would require stricter convergence
+            // Eventual consistency requires 100% convergence
+            // All contracts must have identical state across all replicas
             let diverged_count = result.diverged.len();
             let total_contracts = result.converged.len() + diverged_count;
 
-            if total_contracts > 0 {
-                let convergence_rate = result.converged.len() as f64 / total_contracts as f64;
-                if convergence_rate < 0.5 {
-                    return Err(format!(
-                        "Convergence rate {:.1}% too low: {} converged, {} diverged",
-                        convergence_rate * 100.0,
-                        result.converged.len(),
-                        diverged_count
-                    ));
-                }
-                tracing::warn!(
-                    "Partial convergence: {:.1}% ({}/{})",
-                    convergence_rate * 100.0,
-                    result.converged.len(),
-                    total_contracts
-                );
+            if diverged_count > 0 {
+                return Err(format!(
+                    "Convergence failed: {} contracts diverged out of {} total. \
+                     Eventual consistency requires 100% convergence. Diverged: {:?}",
+                    diverged_count,
+                    total_contracts,
+                    result
+                        .diverged
+                        .iter()
+                        .map(|d| &d.contract_key)
+                        .collect::<Vec<_>>()
+                ));
             }
+
+            tracing::info!(
+                "All {} contracts converged successfully",
+                result.converged.len()
+            );
         }
     }
 
