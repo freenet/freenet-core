@@ -1803,7 +1803,9 @@ impl SimNetwork {
     ///     }
     /// }
     /// ```
-    pub async fn get_contract_state_hashes(&self) -> BTreeMap<String, BTreeMap<SocketAddr, String>> {
+    pub async fn get_contract_state_hashes(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<SocketAddr, String>> {
         let summary = self.get_deterministic_event_summary().await;
 
         // Use BTreeMap for deterministic iteration order in DST

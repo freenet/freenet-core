@@ -2,14 +2,9 @@
 //! Defines the `NetMessage` enum, the standard format for all peer-to-peer communication within the Freenet network.
 //! See `architecture.md`.
 
-use std::{
-    borrow::Cow,
-    fmt::Display,
-    net::SocketAddr,
-    time::Duration,
-};
 #[cfg(feature = "trace-ot")]
 use std::time::SystemTime;
+use std::{borrow::Cow, fmt::Display, net::SocketAddr, time::Duration};
 
 use crate::{
     client_events::{ClientId, HostResult},

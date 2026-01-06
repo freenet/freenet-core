@@ -178,13 +178,13 @@ async fn ci_quick_simulation() {
     let result = run_ci_simulation(
         "ci-quick-sim",
         SEED,
-        1,                        // gateways
-        4,                        // nodes (1 + 4 = 5 total - small for reliable CI)
-        100,                      // events (contract operations) - enough to test consistency
-        5,                        // max contracts
-        Duration::from_secs(45),  // connectivity timeout
-        Duration::from_secs(60),  // convergence timeout - longer for 100% convergence
-        0.95,                     // min success rate (95% - eventual consistency should achieve this)
+        1,                       // gateways
+        4,                       // nodes (1 + 4 = 5 total - small for reliable CI)
+        100,                     // events (contract operations) - enough to test consistency
+        5,                       // max contracts
+        Duration::from_secs(45), // connectivity timeout
+        Duration::from_secs(60), // convergence timeout - longer for 100% convergence
+        0.95, // min success rate (95% - eventual consistency should achieve this)
     )
     .await;
 
@@ -475,12 +475,12 @@ async fn replica_validation_and_stepwise_consistency() {
     // Create a dense network for reliable replication
     let mut sim = SimNetwork::new(
         "replica-validation",
-        2,  // gateways
-        8,  // nodes (10 total - dense enough for replication testing)
-        8,  // ring_max_htl - moderate for focused routing
-        4,  // rnd_if_htl_above
-        8,  // max_connections - higher connectivity
-        4,  // min_connections - ensure each node is well connected
+        2, // gateways
+        8, // nodes (10 total - dense enough for replication testing)
+        8, // ring_max_htl - moderate for focused routing
+        4, // rnd_if_htl_above
+        8, // max_connections - higher connectivity
+        4, // min_connections - ensure each node is well connected
         SEED,
     )
     .await;
@@ -491,8 +491,8 @@ async fn replica_validation_and_stepwise_consistency() {
     let _handles = sim
         .start_with_rand_gen::<rand::rngs::SmallRng>(
             SEED,
-            10,                                        // max_contracts
-            (EVENTS_PER_PHASE * PHASES) as usize,     // total events
+            10,                                   // max_contracts
+            (EVENTS_PER_PHASE * PHASES) as usize, // total events
         )
         .await;
 
@@ -526,7 +526,10 @@ async fn replica_validation_and_stepwise_consistency() {
             }
         }
 
-        tracing::info!("Phase {} events complete, waiting for propagation...", phase);
+        tracing::info!(
+            "Phase {} events complete, waiting for propagation...",
+            phase
+        );
 
         // Give operations time to propagate through the network before checking convergence
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -577,7 +580,7 @@ async fn replica_validation_and_stepwise_consistency() {
                 );
 
                 // Fail if too many contracts have insufficient replicas
-                if conv_result.converged.len() > 0 {
+                if !conv_result.converged.is_empty() {
                     let low_replica_pct =
                         low_replica_count as f64 / conv_result.converged.len() as f64;
                     if low_replica_pct > 0.5 {
@@ -740,10 +743,12 @@ async fn dense_network_replication() {
 
     // Run events
     let mut stream = sim.event_chain(150, None);
-    while let Some(_) = {
+    while {
         use futures::StreamExt;
         stream.next().await
-    } {
+    }
+    .is_some()
+    {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -758,7 +763,10 @@ async fn dense_network_replication() {
             let avg_replicas: f64 = if conv.converged.is_empty() {
                 0.0
             } else {
-                conv.converged.iter().map(|c| c.replica_count).sum::<usize>() as f64
+                conv.converged
+                    .iter()
+                    .map(|c| c.replica_count)
+                    .sum::<usize>() as f64
                     / conv.converged.len() as f64
             };
 
