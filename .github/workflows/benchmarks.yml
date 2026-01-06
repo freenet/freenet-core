@@ -119,6 +119,13 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
+      # Compile benchmarks first (fast fail on compilation errors)
+      - name: Compile Benchmarks
+        run: |
+          echo "## Compiling Benchmarks" >> $GITHUB_STEP_SUMMARY
+          cargo bench --bench transport_ci --features bench --no-run
+          echo "✅ Benchmark compilation successful" >> $GITHUB_STEP_SUMMARY
+
       # Run Transport Layer Benchmarks (actual code with mock I/O)
       - name: Run Transport Layer Benchmarks
         id: bench_transport

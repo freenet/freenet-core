@@ -1,5 +1,7 @@
 use super::PacketId;
-use crate::simulation::{RealTime, TimeSource};
+#[cfg(test)]
+use crate::simulation::RealTime;
+use crate::simulation::TimeSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
@@ -358,6 +360,7 @@ struct ResendQueueEntry {
 }
 
 // Production constructor (backward-compatible, uses real time)
+#[cfg(test)]
 impl SentPacketTracker<RealTime> {
     /// Create a new SentPacketTracker with real time.
     ///

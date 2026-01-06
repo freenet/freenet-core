@@ -34,12 +34,11 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
     group.sample_size(10);
 
     // Use 16KB - standard size for cold start measurement
-    for &transfer_size_kb in &[16] {
-        let transfer_size = transfer_size_kb * 1024;
-        group.throughput(Throughput::Bytes(transfer_size as u64));
+    let transfer_size = 16 * 1024;
+    group.throughput(Throughput::Bytes(transfer_size as u64));
 
-        let ts = time_source.clone();
-        group.bench_function(format!("{}kb_transfer", transfer_size_kb), |b| {
+    let ts = time_source.clone();
+    group.bench_function("16kb_transfer", |b| {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
@@ -157,7 +156,6 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                 }
             });
         });
-    }
     group.finish();
 }
 

@@ -38,6 +38,7 @@ struct BucketState {
 }
 
 // Production constructor (backward-compatible, uses real time)
+#[cfg(test)]
 impl TokenBucket<RealTime> {
     /// Create a new token bucket with real time.
     ///

@@ -106,6 +106,13 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
+      # Compile benchmarks first (fast fail on compilation errors)
+      - name: Compile Extended Benchmarks
+        run: |
+          echo "## Compiling Extended Benchmarks" >> $GITHUB_STEP_SUMMARY
+          cargo bench --bench transport_extended --features bench --no-run
+          echo "✅ Extended benchmark compilation successful" >> $GITHUB_STEP_SUMMARY
+
       # Run Extended Benchmarks
       - name: Run Extended Benchmark Suite
         id: bench_extended

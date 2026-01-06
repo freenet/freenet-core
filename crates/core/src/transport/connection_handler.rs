@@ -358,6 +358,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
     ///
     /// The time_source is passed through to UdpPacketsListener, RemoteConnection,
     /// and PeerConnection so all timing operations use the same source.
+    #[allow(clippy::too_many_arguments)]
     fn config_listener_with_virtual_time(
         socket: Arc<S>,
         keypair: TransportKeypair,
@@ -2387,8 +2388,6 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        use crate::simulation::VirtualTime;
-
         static PORT: AtomicU16 = AtomicU16::new(25000);
 
         let peer_keypair = TransportKeypair::new();
@@ -2396,7 +2395,7 @@ pub mod mock_transport {
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Use provided time source or create a new one
-        let vt = time_source.unwrap_or_else(VirtualTime::new);
+        let vt = time_source.unwrap_or_default();
 
         let socket = Arc::new(
             MockSocket::with_time_source(
