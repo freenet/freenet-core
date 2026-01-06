@@ -49,21 +49,20 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
                     // Spawn auto-advance task to prevent deadlocks
                     let _auto_advance = spawn_auto_advance_task(ts.clone());
 
+                    // Create connection ONCE outside the loop to avoid port exhaustion
+                    let channels: Channels = Arc::new(DashMap::new());
+                    let mut peers = create_peer_pair_with_virtual_time(
+                        channels,
+                        Duration::ZERO,
+                        ts.clone(),
+                    )
+                    .await
+                    .connect()
+                    .await;
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
-                        let channels: Channels = Arc::new(DashMap::new());
-
-                        // Create connected peers with VirtualTime
-                        let mut peers = create_peer_pair_with_virtual_time(
-                            channels,
-                            Duration::ZERO, // No delay for baseline
-                            ts.clone(),
-                        )
-                        .await
-                        .connect()
-                        .await;
-
                         let message = vec![0xABu8; size];
                         let start_virtual = ts.now_nanos();
 

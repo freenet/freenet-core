@@ -311,17 +311,24 @@ pub fn new_channels() -> Channels {
 pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            // Real-time sleep to give protocol tasks time to process packets
-            // 100µs provides a balance between speed and reliability
-            tokio::time::sleep(Duration::from_micros(100)).await;
+            // Yield to let protocol tasks run first
+            tokio::task::yield_now().await;
 
-            // Multiple yields to ensure all queued tasks get a chance to run
-            for _ in 0..5 {
+            // Advance ALL pending wakeups in a burst (not just one)
+            // This is critical for performance - without this loop, each advance
+            // would be throttled by the sleep below, causing real-time delays
+            let mut advanced = false;
+            while time_source.try_auto_advance().is_some() {
+                advanced = true;
+                // Yield between advances to let woken tasks process
                 tokio::task::yield_now().await;
             }
 
-            // Try to auto-advance if tasks are blocked waiting on VirtualSleep
-            time_source.try_auto_advance();
+            // Only sleep if nothing was advanced (avoids busy-loop when idle)
+            // Use very short sleep to maintain responsiveness
+            if !advanced {
+                tokio::time::sleep(Duration::from_micros(10)).await;
+            }
         }
     })
 }

@@ -37,28 +37,28 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         let ts = time_source.clone();
-        group.bench_with_input(BenchmarkId::new("rate_limited", size), &size, |b, &sz| {
+        group.bench_with_input(BenchmarkId::new("stream", size), &size, |b, &sz| {
             b.to_async(&rt).iter_custom(|iters| {
                 let ts = ts.clone();
                 async move {
                     // Spawn auto-advance task to prevent deadlocks
                     let _auto_advance = spawn_auto_advance_task(ts.clone());
 
+                    // Create connection ONCE outside the loop to avoid port exhaustion
+                    let channels: Channels = Arc::new(DashMap::new());
+                    let mut peers = create_peer_pair_with_virtual_time(
+                        channels,
+                        Duration::ZERO,
+                        ts.clone(),
+                    )
+                    .await
+                    .connect()
+                    .await;
+
                     let mut total_virtual_time = Duration::ZERO;
 
                     for _ in 0..iters {
                         let message = vec![0xABu8; sz];
-                        let channels: Channels = Arc::new(DashMap::new());
-
-                        // Create connected peers with VirtualTime
-                        let mut peers = create_peer_pair_with_virtual_time(
-                            channels,
-                            Duration::ZERO, // No delay for baseline measurement
-                            ts.clone(),
-                        )
-                        .await
-                        .connect()
-                        .await;
 
                         let start_virtual = ts.now_nanos();
 
@@ -122,30 +122,26 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                         // Spawn auto-advance task to prevent deadlocks
                         let _auto_advance = spawn_auto_advance_task(ts.clone());
 
+                        // Create connection ONCE outside the loop to avoid port exhaustion
+                        let channels: Channels = Arc::new(DashMap::new());
+                        let mut peers = create_peer_pair_with_virtual_time(
+                            channels,
+                            Duration::ZERO,
+                            ts.clone(),
+                        )
+                        .await
+                        .connect()
+                        .await;
+
                         let mut total_virtual_time = Duration::ZERO;
 
                         for _ in 0..iters {
-                            let channels: Channels = Arc::new(DashMap::new());
-
-                            // Create connected peers with VirtualTime
-                            let peers = create_peer_pair_with_virtual_time(
-                                channels,
-                                Duration::ZERO,
-                                ts.clone(),
-                            )
-                            .await
-                            .connect()
-                            .await;
-
-                            let mut conn_a = peers.conn_a;
-                            let mut conn_b = peers.conn_b;
-
                             let message = vec![0xABu8; 16384]; // 16KB each
                             let start_virtual = ts.now_nanos();
 
                             // Send all messages sequentially (single-threaded runtime)
                             for _ in 0..n {
-                                if let Err(e) = conn_a.send(message.clone()).await {
+                                if let Err(e) = peers.conn_a.send(message.clone()).await {
                                     eprintln!("concurrent send failed: {:?}", e);
                                     break;
                                 }
@@ -154,7 +150,7 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                             // Receive all messages
                             let mut results = Vec::new();
                             for i in 0..n {
-                                match conn_b.recv().await {
+                                match peers.conn_b.recv().await {
                                     Ok(received) => results.push((i, received.len())),
                                     Err(e) => {
                                         eprintln!("concurrent recv failed: {:?}", e);
