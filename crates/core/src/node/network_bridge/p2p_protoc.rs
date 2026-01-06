@@ -242,7 +242,11 @@ impl NetworkBridge for P2pBridge {
 
     async fn send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
+            .register_events(NetEventLog::from_outbound_msg(
+                &msg,
+                &self.op_manager.ring,
+                Some(target_addr),
+            ))
             .await;
         // Look up the full PeerKeyLocation from connection manager for transaction tracking
         let target_loc = self
