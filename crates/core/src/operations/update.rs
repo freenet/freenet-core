@@ -457,6 +457,10 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
+                    // Refresh GET subscription cache TTL when receiving updates
+                    // This keeps actively-updated contracts from being evicted
+                    op_manager.ring.touch_get_subscription(key);
+
                     // Emit telemetry: broadcast applied with resulting state
                     if let Some(event) = NetEventLog::update_broadcast_applied(
                         id,

@@ -1662,6 +1662,15 @@ impl Operation for GetOp {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
                                 op_manager.ring.record_get_access(key, value.size() as u64);
                                 super::announce_contract_cached(op_manager, &key).await;
+
+                                // Track in GET subscription cache for auto-subscription lifecycle
+                                let evicted = op_manager.ring.record_get_subscription(key);
+                                // Clean up subscription state for evicted contracts
+                                for evicted_key in evicted {
+                                    op_manager.ring.remove_subscription(&evicted_key);
+                                    tracing::debug!(contract = %evicted_key, "Cleaned up evicted GET subscription");
+                                }
+
                                 // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                 let child_tx =
                                     super::start_subscription_request(op_manager, id, key, false);
@@ -1692,6 +1701,14 @@ impl Operation for GetOp {
                                             tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
                                             op_manager.ring.record_get_access(key, value.size() as u64);
                                             super::announce_contract_cached(op_manager, &key).await;
+
+                                            // Track in GET subscription cache for auto-subscription lifecycle
+                                            let evicted = op_manager.ring.record_get_subscription(key);
+                                            // Clean up subscription state for evicted contracts
+                                            for evicted_key in evicted {
+                                                op_manager.ring.remove_subscription(&evicted_key);
+                                                tracing::debug!(contract = %evicted_key, "Cleaned up evicted GET subscription");
+                                            }
 
                                             // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                             let child_tx =

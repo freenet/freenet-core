@@ -1,3 +1,4 @@
+use super::get_subscription_cache::{GetSubscriptionCache, DEFAULT_MAX_ENTRIES, DEFAULT_MIN_TTL};
 use super::seeding_cache::{AccessType, SeedingCache};
 use super::{Location, PeerKeyLocation};
 use crate::node::PeerId;
@@ -148,6 +149,11 @@ pub(crate) struct SeedingManager {
     /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
     seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
 
+    /// LRU+TTL cache of contracts we should auto-subscribe to based on GET access.
+    /// When a GET succeeds, we add the contract here and subscribe to receive updates.
+    /// Eviction triggers UNSUBSCRIBE (unless there's an explicit client subscription).
+    get_subscription_cache: RwLock<GetSubscriptionCache<InstantTimeSrc>>,
+
     /// Contracts with subscription requests currently in-flight.
     /// Prevents duplicate requests for the same contract.
     pending_subscription_requests: DashSet<ContractKey>,
@@ -169,6 +175,11 @@ impl SeedingManager {
             client_subscriptions: DashMap::new(),
             seeding_cache: RwLock::new(SeedingCache::new(
                 DEFAULT_SEEDING_BUDGET_BYTES,
+                InstantTimeSrc::new(),
+            )),
+            get_subscription_cache: RwLock::new(GetSubscriptionCache::new(
+                DEFAULT_MAX_ENTRIES,
+                DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
             pending_subscription_requests: DashSet::new(),
@@ -885,6 +896,67 @@ impl SeedingManager {
                 );
             }
         }
+    }
+
+    // --- GET auto-subscription cache management ---
+
+    /// Record a GET access to a contract for auto-subscription tracking.
+    ///
+    /// This adds the contract to the GET subscription cache. When eviction occurs,
+    /// returns the list of contracts that were evicted (these need UNSUBSCRIBE).
+    ///
+    /// Called after a successful GET operation to ensure we stay subscribed
+    /// to contracts we're actively accessing.
+    pub fn record_get_subscription(&self, key: ContractKey) -> Vec<ContractKey> {
+        let evicted = self.get_subscription_cache.write().record_access(key);
+
+        if !evicted.is_empty() {
+            debug!(
+                %key,
+                evicted_count = evicted.len(),
+                "GET subscription cache evicted entries"
+            );
+        }
+
+        evicted
+    }
+
+    /// Refresh the access time for a contract in the GET subscription cache.
+    ///
+    /// Called when an UPDATE is received for a contract we're auto-subscribed to.
+    /// This keeps actively-updated contracts from being evicted.
+    pub fn touch_get_subscription(&self, key: &ContractKey) {
+        self.get_subscription_cache.write().touch(key);
+    }
+
+    /// Sweep for expired entries in the GET subscription cache.
+    ///
+    /// Returns contracts that were evicted (need UNSUBSCRIBE).
+    /// Called periodically by background task.
+    pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
+        self.get_subscription_cache.write().sweep_expired()
+    }
+
+    /// Check if a contract is in the GET subscription cache.
+    #[allow(dead_code)]
+    pub fn is_get_subscription(&self, key: &ContractKey) -> bool {
+        self.get_subscription_cache.read().contains(key)
+    }
+
+    /// Remove a contract from the GET subscription cache.
+    ///
+    /// Called when we explicitly unsubscribe from a contract.
+    #[allow(dead_code)]
+    pub fn remove_get_subscription(&self, key: &ContractKey) {
+        self.get_subscription_cache.write().remove(key);
+    }
+
+    /// Remove all subscription entries for a contract.
+    ///
+    /// Used when a GET subscription expires and we need to clean up local state.
+    /// Does not send any network messages.
+    pub fn remove_subscription(&self, key: &ContractKey) {
+        self.subscriptions.remove(key);
     }
 }
 
