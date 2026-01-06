@@ -289,16 +289,22 @@ pub fn new_channels() -> Channels {
 
 /// Spawn an auto-advance monitoring task for VirtualTime.
 ///
-/// This task advances VirtualTime only when there are pending protocol timers
-/// (wakeups). This prevents inflating RTT measurements during async channel
-/// operations - if VirtualTime advanced unconditionally, RTT would be measured
-/// as the async channel delay PLUS accumulated VirtualTime advancement.
-///
-/// With NoDelay policy, packets are delivered instantly via async channels.
-/// The protocol's RTT measurement is `receive_time - send_time` (both VirtualTime).
-/// If we advance VirtualTime during channel operations, RTT becomes inflated.
+/// This task continuously advances VirtualTime in small increments to ensure
+/// protocol timers fire properly. This is necessary because with multi-threaded
+/// runtime, protocol tasks may be blocked on real async channel operations
+/// (for packet delivery) rather than VirtualTime sleeps.
 ///
 /// **Must be called from within a tokio runtime context.**
+///
+/// ## Usage
+///
+/// ```rust,ignore
+/// let time_source = VirtualTime::new();
+/// let _auto_advance_handle = spawn_auto_advance_task(time_source.clone());
+///
+/// // Now VirtualTime benchmarks won't deadlock
+/// let peers = create_peer_pair_with_virtual_time(channels, delay, time_source).await;
+/// ```
 ///
 /// ## Returns
 ///
@@ -309,18 +315,18 @@ pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHan
             // Yield to let protocol tasks run first
             tokio::task::yield_now().await;
 
-            // Only advance time when there are pending wakeups (protocol timers).
-            // This prevents inflating RTT measurements during async channel ops.
-            if time_source
-                .try_auto_advance_bounded(Duration::from_millis(10))
-                .is_some()
-            {
-                // Time advanced, yield to let protocol tasks process
-                continue;
-            }
+            // Advance time aggressively (10ms per 100µs real = 100x faster than real time)
+            // This allows VirtualTime-based timers to fire quickly.
+            //
+            // With VirtualTime's long idle timeout (configured separately), this won't
+            // cause premature disconnections during benchmarks.
+            time_source.advance(Duration::from_millis(10));
 
-            // No pending wakeups - sleep briefly to avoid busy-loop
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Trigger any expired wakeups
+            time_source.trigger_expired();
+
+            // Brief real-time sleep to prevent CPU spinning
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
     })
 }
