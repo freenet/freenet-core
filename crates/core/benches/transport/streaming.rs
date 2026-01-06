@@ -44,14 +44,11 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
                     // Create connection FIRST before auto-advance to avoid
                     // timeouts during handshake
                     let channels: Channels = Arc::new(DashMap::new());
-                    let mut peers = create_peer_pair_with_virtual_time(
-                        channels,
-                        Duration::ZERO,
-                        ts.clone(),
-                    )
-                    .await
-                    .connect()
-                    .await;
+                    let mut peers =
+                        create_peer_pair_with_virtual_time(channels, Duration::ZERO, ts.clone())
+                            .await
+                            .connect()
+                            .await;
 
                     // Spawn auto-advance task AFTER connection is established
                     let auto_advance = spawn_auto_advance_task(ts.clone());
