@@ -42,20 +42,6 @@ pub fn deterministic_start_index(num_branches: usize) -> usize {
     }
 }
 
-/// Internal helper to get a deterministic ordering for enabled branches
-#[inline]
-pub fn deterministic_order_enabled(enabled: &[usize]) -> Vec<usize> {
-    if enabled.len() <= 1 {
-        return enabled.to_vec();
-    }
-    let start = GlobalRng::random_range(0..enabled.len());
-    let mut result = Vec::with_capacity(enabled.len());
-    for i in 0..enabled.len() {
-        result.push(enabled[(start + i) % enabled.len()]);
-    }
-    result
-}
-
 /// Output enum for 2-branch select (with optional else)
 pub enum Out2<A, B, E> {
     _0(A),
@@ -112,7 +98,10 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out2;
 
+        // Compute random start ONCE, outside poll_fn
         let start = $crate::util::deterministic_select::deterministic_start_index(2);
+        // Pre-compute polling order (stack allocated)
+        let order: [usize; 2] = [start % 2, (start + 1) % 2];
 
         let output = {
             let mut fut1 = $fut1;
@@ -121,8 +110,7 @@ macro_rules! deterministic_select {
             tokio::pin!(fut2);
 
             std::future::poll_fn(|cx| {
-                for i in 0..2 {
-                    let idx = (start + i) % 2;
+                for &idx in &order {
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -157,6 +145,33 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out2;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = {
+            let mut d = 0u8;
+            if !$guard1 { d |= 1 << 0; }
+            if !$guard2 { d |= 1 << 1; }
+            d
+        };
+
+        // Count enabled branches and build order array (stack allocated)
+        let mut order: [usize; 2] = [0, 0];
+        let mut enabled_count = 0usize;
+        if disabled & (1 << 0) == 0 { order[enabled_count] = 0; enabled_count += 1; }
+        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+
+        // If all disabled, panic (no else branch provided)
+        if enabled_count == 0 {
+            panic!("all branches are disabled and there is no else branch");
+        }
+
+        // Compute random start ONCE and shuffle the enabled portion
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            if start == 1 {
+                order.swap(0, 1);
+            }
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -164,18 +179,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut2);
 
             std::future::poll_fn(|cx| {
-                // Evaluate guards and collect enabled branches
-                let mut enabled = Vec::new();
-                if $guard1 { enabled.push(0usize); }
-                if $guard2 { enabled.push(1usize); }
-
-                if enabled.is_empty() {
-                    return Poll::Pending;
-                }
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -210,6 +215,23 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out2;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = if !$guard1 { 1 << 0 } else { 0 };
+
+        // Build order array (stack allocated)
+        let mut order: [usize; 2] = [0, 0];
+        let mut enabled_count = 0usize;
+        if disabled & (1 << 0) == 0 { order[enabled_count] = 0; enabled_count += 1; }
+        order[enabled_count] = 1; enabled_count += 1; // Branch 1 always enabled
+
+        // Compute random start ONCE and shuffle
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            if start == 1 {
+                order.swap(0, 1);
+            }
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -217,13 +239,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut2);
 
             std::future::poll_fn(|cx| {
-                let mut enabled = Vec::new();
-                if $guard1 { enabled.push(0usize); }
-                enabled.push(1usize); // Always enabled
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -258,6 +275,23 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out2;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = if !$guard2 { 1 << 1 } else { 0 };
+
+        // Build order array (stack allocated)
+        let mut order: [usize; 2] = [0, 0];
+        let mut enabled_count = 0usize;
+        order[enabled_count] = 0; enabled_count += 1; // Branch 0 always enabled
+        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+
+        // Compute random start ONCE and shuffle
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            if start == 1 {
+                order.swap(0, 1);
+            }
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -265,13 +299,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut2);
 
             std::future::poll_fn(|cx| {
-                let mut enabled = Vec::new();
-                enabled.push(0usize); // Always enabled
-                if $guard2 { enabled.push(1usize); }
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -309,7 +338,9 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out3;
 
+        // Compute random start ONCE
         let start = $crate::util::deterministic_select::deterministic_start_index(3);
+        let order: [usize; 3] = [start % 3, (start + 1) % 3, (start + 2) % 3];
 
         let output = {
             let mut fut1 = $fut1;
@@ -320,8 +351,7 @@ macro_rules! deterministic_select {
             tokio::pin!(fut3);
 
             std::future::poll_fn(|cx| {
-                for i in 0..3 {
-                    let idx = (start + i) % 3;
+                for &idx in &order {
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -363,6 +393,20 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out3;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = if !$guard3 { 1 << 2 } else { 0 };
+
+        // Build order array (stack allocated)
+        let mut order: [usize; 3] = [0, 1, 0];
+        let mut enabled_count = 2usize; // Branches 0,1 always enabled
+        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+
+        // Compute random start ONCE and rotate
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            order[..enabled_count].rotate_left(start);
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -372,12 +416,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut3);
 
             std::future::poll_fn(|cx| {
-                let mut enabled = vec![0usize, 1usize];
-                if $guard3 { enabled.push(2usize); }
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -419,6 +459,26 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out3;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = {
+            let mut d = 0u8;
+            if !$guard2 { d |= 1 << 1; }
+            if !$guard3 { d |= 1 << 2; }
+            d
+        };
+
+        // Build order array (stack allocated)
+        let mut order: [usize; 3] = [0, 0, 0];
+        let mut enabled_count = 1usize; // Branch 0 always enabled
+        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+
+        // Compute random start ONCE and rotate
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            order[..enabled_count].rotate_left(start);
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -428,13 +488,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut3);
 
             std::future::poll_fn(|cx| {
-                let mut enabled = vec![0usize];
-                if $guard2 { enabled.push(1usize); }
-                if $guard3 { enabled.push(2usize); }
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -466,61 +521,6 @@ macro_rules! deterministic_select {
         }
     }};
 
-    // 3 branches with else: all without guards
-    (
-        $pat1:pat = $fut1:expr => $body1:expr,
-        $pat2:pat = $fut2:expr => $body2:expr,
-        $pat3:pat = $fut3:expr => $body3:expr,
-        else => $else_body:expr $(,)?
-    ) => {{
-        use std::future::Future;
-        use std::task::Poll;
-        use $crate::util::deterministic_select::Out3;
-
-        let start = $crate::util::deterministic_select::deterministic_start_index(3);
-
-        let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
-            tokio::pin!(fut1);
-            tokio::pin!(fut2);
-            tokio::pin!(fut3);
-
-            std::future::poll_fn(|cx| {
-                for i in 0..3 {
-                    let idx = (start + i) % 3;
-                    match idx {
-                        0 => {
-                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
-                                return Poll::Ready(Out3::_0(val));
-                            }
-                        }
-                        1 => {
-                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
-                                return Poll::Ready(Out3::_1(val));
-                            }
-                        }
-                        2 => {
-                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
-                                return Poll::Ready(Out3::_2(val));
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                Poll::Pending
-            }).await
-        };
-
-        match output {
-            Out3::_0($pat1) => $body1,
-            Out3::_1($pat2) => $body2,
-            Out3::_2($pat3) => $body3,
-            Out3::_Else(_) => $else_body,
-        }
-    }};
-
     // ==================== 4 BRANCHES ====================
 
     // 4 branches, no guards, no else
@@ -534,7 +534,14 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out4;
 
+        // Compute random start ONCE
         let start = $crate::util::deterministic_select::deterministic_start_index(4);
+        let order: [usize; 4] = [
+            start % 4,
+            (start + 1) % 4,
+            (start + 2) % 4,
+            (start + 3) % 4,
+        ];
 
         let output = {
             let mut fut1 = $fut1;
@@ -547,8 +554,7 @@ macro_rules! deterministic_select {
             tokio::pin!(fut4);
 
             std::future::poll_fn(|cx| {
-                for i in 0..4 {
-                    let idx = (start + i) % 4;
+                for &idx in &order {
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -583,70 +589,6 @@ macro_rules! deterministic_select {
             Out4::_2($pat3) => $body3,
             Out4::_3($pat4) => $body4,
             Out4::_Else(()) => unreachable!(),
-        }
-    }};
-
-    // 4 branches with else: all without guards
-    (
-        $pat1:pat = $fut1:expr => $body1:expr,
-        $pat2:pat = $fut2:expr => $body2:expr,
-        $pat3:pat = $fut3:expr => $body3:expr,
-        $pat4:pat = $fut4:expr => $body4:expr,
-        else => $else_body:expr $(,)?
-    ) => {{
-        use std::future::Future;
-        use std::task::Poll;
-        use $crate::util::deterministic_select::Out4;
-
-        let start = $crate::util::deterministic_select::deterministic_start_index(4);
-
-        let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
-            let mut fut4 = $fut4;
-            tokio::pin!(fut1);
-            tokio::pin!(fut2);
-            tokio::pin!(fut3);
-            tokio::pin!(fut4);
-
-            std::future::poll_fn(|cx| {
-                for i in 0..4 {
-                    let idx = (start + i) % 4;
-                    match idx {
-                        0 => {
-                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_0(val));
-                            }
-                        }
-                        1 => {
-                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_1(val));
-                            }
-                        }
-                        2 => {
-                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_2(val));
-                            }
-                        }
-                        3 => {
-                            if let Poll::Ready(val) = fut4.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_3(val));
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                Poll::Pending
-            }).await
-        };
-
-        match output {
-            Out4::_0($pat1) => $body1,
-            Out4::_1($pat2) => $body2,
-            Out4::_2($pat3) => $body3,
-            Out4::_3($pat4) => $body4,
-            Out4::_Else(_) => $else_body,
         }
     }};
 
@@ -661,6 +603,25 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out4;
 
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = if !$guard3 { 1 << 2 } else { 0 };
+
+        // Build order array (stack allocated)
+        let mut order: [usize; 4] = [0, 1, 3, 0];
+        let mut enabled_count = 3usize; // Branches 0,1,3 always enabled
+        if disabled & (1 << 2) == 0 {
+            // Insert branch 2 at position 2
+            order[3] = order[2];
+            order[2] = 2;
+            enabled_count = 4;
+        }
+
+        // Compute random start ONCE and rotate
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            order[..enabled_count].rotate_left(start);
+        }
+
         let output = {
             let mut fut1 = $fut1;
             let mut fut2 = $fut2;
@@ -672,13 +633,8 @@ macro_rules! deterministic_select {
             tokio::pin!(fut4);
 
             std::future::poll_fn(|cx| {
-                let mut enabled = vec![0usize, 1usize];
-                if $guard3 { enabled.push(2usize); }
-                enabled.push(3usize);
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
+                for i in 0..enabled_count {
+                    let idx = order[i];
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
@@ -713,73 +669,6 @@ macro_rules! deterministic_select {
             Out4::_2($pat3) => $body3,
             Out4::_3($pat4) => $body4,
             Out4::_Else(()) => unreachable!(),
-        }
-    }};
-
-    // 4 branches with else: third with guard
-    (
-        $pat1:pat = $fut1:expr => $body1:expr,
-        $pat2:pat = $fut2:expr => $body2:expr,
-        $pat3:pat = $fut3:expr, if $guard3:expr => $body3:expr,
-        $pat4:pat = $fut4:expr => $body4:expr,
-        else => $else_body:expr $(,)?
-    ) => {{
-        use std::future::Future;
-        use std::task::Poll;
-        use $crate::util::deterministic_select::Out4;
-
-        let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
-            let mut fut4 = $fut4;
-            tokio::pin!(fut1);
-            tokio::pin!(fut2);
-            tokio::pin!(fut3);
-            tokio::pin!(fut4);
-
-            std::future::poll_fn(|cx| {
-                let mut enabled = vec![0usize, 1usize];
-                if $guard3 { enabled.push(2usize); }
-                enabled.push(3usize);
-
-                let order = $crate::util::deterministic_select::deterministic_order_enabled(&enabled);
-
-                for &idx in &order {
-                    match idx {
-                        0 => {
-                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_0(val));
-                            }
-                        }
-                        1 => {
-                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_1(val));
-                            }
-                        }
-                        2 => {
-                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_2(val));
-                            }
-                        }
-                        3 => {
-                            if let Poll::Ready(val) = fut4.as_mut().poll(cx) {
-                                return Poll::Ready(Out4::_3(val));
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                Poll::Pending
-            }).await
-        };
-
-        match output {
-            Out4::_0($pat1) => $body1,
-            Out4::_1($pat2) => $body2,
-            Out4::_2($pat3) => $body3,
-            Out4::_3($pat4) => $body4,
-            Out4::_Else(_) => $else_body,
         }
     }};
 
@@ -797,7 +686,15 @@ macro_rules! deterministic_select {
         use std::task::Poll;
         use $crate::util::deterministic_select::Out5;
 
+        // Compute random start ONCE
         let start = $crate::util::deterministic_select::deterministic_start_index(5);
+        let order: [usize; 5] = [
+            start % 5,
+            (start + 1) % 5,
+            (start + 2) % 5,
+            (start + 3) % 5,
+            (start + 4) % 5,
+        ];
 
         let output = {
             let mut fut1 = $fut1;
@@ -812,8 +709,7 @@ macro_rules! deterministic_select {
             tokio::pin!(fut5);
 
             std::future::poll_fn(|cx| {
-                for i in 0..5 {
-                    let idx = (start + i) % 5;
+                for &idx in &order {
                     match idx {
                         0 => {
                             if let Poll::Ready(val) = fut1.as_mut().poll(cx) {

@@ -306,10 +306,8 @@ where
     let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
     loop {
-        // Note: This uses tokio::select! because the guard `!results.is_empty()` and
-        // future `results.next()` both reference `results`, creating a borrow conflict
-        // that deterministic_select! cannot resolve (it creates futures before evaluating guards).
-        tokio::select! {
+        // Uses deterministic_select! for DST - guards are evaluated BEFORE futures are created
+        crate::deterministic_select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
                     Ok(request) => {
@@ -368,7 +366,7 @@ where
                         }
                     }
                 });
-            }
+            },
             res = client_responses.recv() => {
                 if let Some((cli_id, request_id, res)) = res {
                     if let Ok(result) = &res {
@@ -388,7 +386,7 @@ where
                         anyhow::bail!(err);
                     }
                 }
-            }
+            },
             res = results.next(), if !results.is_empty() => {
                 let Some(f_res) = res else {
                     unreachable!("results.next() should only return None if results is empty, which is guarded against");
@@ -471,7 +469,7 @@ where
                         client_events.send(cli_id, Err(err)).await?
                     }
                 }
-            }
+            },
         }
     }
 }
