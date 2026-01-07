@@ -42,6 +42,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 
     // Use 16KB only - larger sizes timeout with mock transport
     // (The mock transport is reliable only for smaller messages in benchmark context)
+    #[allow(clippy::single_element_loop)]
     for &transfer_size_kb in &[16] {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));

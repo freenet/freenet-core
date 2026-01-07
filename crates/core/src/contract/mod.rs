@@ -347,7 +347,8 @@ where
                             phase = "unexpected_response",
                             "Unexpected response type from delegate request"
                         );
-                        return Err(ContractError::NoEvHandlerResponse);
+                        // Don't crash the node - log and continue with empty response
+                        Vec::new()
                     }
                     Err(err) => {
                         tracing::error!(
@@ -356,7 +357,10 @@ where
                             phase = "execution_failed",
                             "Failed executing delegate request"
                         );
-                        return Err(ContractError::NoEvHandlerResponse);
+                        // Don't crash the node - log and continue with empty response.
+                        // This can happen during startup if stale delegate state references
+                        // data that is no longer valid (e.g., missing attested contract).
+                        Vec::new()
                     }
                 };
 
