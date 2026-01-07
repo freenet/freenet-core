@@ -1,19 +1,25 @@
 use super::*;
 use crate::node::OpManager;
-use crate::wasm_runtime::{MockStateStorage, StateStorage};
+use crate::wasm_runtime::{InMemoryContractStore, MockStateStorage, StateStorage};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Mock runtime for testing that uses fully in-memory storage.
+///
+/// Unlike the production runtime which uses disk-based storage with background
+/// threads (file watchers, compaction), this runtime keeps everything in memory
+/// for deterministic simulation testing.
 pub(crate) struct MockRuntime {
-    pub contract_store: ContractStore,
+    pub contract_store: InMemoryContractStore,
 }
 
-/// Executor with MockRuntime using disk-based storage (default for backward compatibility)
+/// Executor with MockRuntime using disk-based state storage (for backward compatibility)
 impl Executor<MockRuntime, Storage> {
-    /// Create a mock executor with disk-based storage.
+    /// Create a mock executor with disk-based state storage.
     ///
-    /// This is the original implementation that stores state in SQLite on disk.
-    /// For simulation testing with in-memory storage, use `new_mock_in_memory`.
+    /// Contract code is stored in memory (InMemoryContractStore) for determinism,
+    /// but state is stored on disk (SQLite). For fully in-memory storage, use
+    /// `new_mock_in_memory`.
     pub async fn new_mock(
         identifier: &str,
         op_sender: Option<OpRequestSender>,
@@ -21,13 +27,9 @@ impl Executor<MockRuntime, Storage> {
     ) -> anyhow::Result<Self> {
         let data_dir = Self::test_data_dir(identifier);
 
-        let contracts_data_dir = data_dir.join("contracts");
-        std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
-        let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
+        // Use in-memory contract store for deterministic behavior
+        let contract_store = InMemoryContractStore::new();
 
-        // FIXME: if is sqlite it should be a dir, named <data_dir>/db
-        // let db_path = data_dir.join("db");
-        // let state_store = StateStore::new(Storage::new(&db_path).await?, u16::MAX as u32).unwrap();
         tracing::debug!("creating state store at path: {data_dir:?}");
         std::fs::create_dir_all(&data_dir).expect("directory created");
         let state_store = StateStore::new(Storage::new(&data_dir).await?, u16::MAX as u32).unwrap();
@@ -46,35 +48,31 @@ impl Executor<MockRuntime, Storage> {
     }
 }
 
-/// Executor with MockRuntime using in-memory storage (for deterministic simulation)
+/// Executor with MockRuntime using fully in-memory storage (for deterministic simulation)
 impl Executor<MockRuntime, MockStateStorage> {
-    /// Create a mock executor with shared in-memory storage.
+    /// Create a mock executor with fully in-memory storage.
     ///
     /// This is designed for deterministic simulation testing where:
+    /// - Both contract code and state are stored in memory
+    /// - No disk I/O or background threads (file watchers, compaction)
     /// - State persists across node crash/restart (same MockStateStorage instance)
-    /// - No disk I/O timing variance
     /// - State can be inspected/verified through MockStateStorage methods
     ///
     /// # Arguments
-    /// * `identifier` - Unique identifier for this executor (used for contract store path)
+    /// * `_identifier` - Unused (kept for API compatibility)
     /// * `shared_storage` - A MockStateStorage instance (clone it to share across restarts)
     /// * `op_sender` - Optional channel for network operations
     /// * `op_manager` - Optional reference to the operation manager
     pub async fn new_mock_in_memory(
-        identifier: &str,
+        _identifier: &str,
         shared_storage: MockStateStorage,
         op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
-        let data_dir = Self::test_data_dir(identifier);
-
-        let contracts_data_dir = data_dir.join("contracts");
-        std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
-        let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
-
-        // Use the shared in-memory storage instead of disk
+        // Use fully in-memory storage - no disk I/O, no background threads
+        let contract_store = InMemoryContractStore::new();
         let state_store = StateStore::new(shared_storage, u16::MAX as u32).unwrap();
-        tracing::debug!("created in-memory state store for simulation");
+        tracing::debug!("created fully in-memory executor for deterministic simulation");
 
         let executor = Executor::new(
             state_store,
@@ -210,12 +208,12 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_dir = tempfile::tempdir()?;
         let state_store_path = tmp_dir.path().join("state_store");
         std::fs::create_dir_all(&state_store_path)?;
-        let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
+        // Use in-memory contract store for deterministic behavior
+        let contract_store = InMemoryContractStore::new();
         let state_store =
             StateStore::new(Storage::new(&state_store_path).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
