@@ -69,10 +69,12 @@ impl Executor<MockRuntime, MockStateStorage> {
         op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
-        // Use fully in-memory storage - no disk I/O, no background threads
+        // Use fully in-memory storage with no caching for deterministic simulation:
+        // - InMemoryContractStore: no disk I/O, no background threads
+        // - StateStore::new_uncached: bypasses stretto cache (non-deterministic TinyLFU)
         let contract_store = InMemoryContractStore::new();
-        let state_store = StateStore::new(shared_storage, u16::MAX as u32).unwrap();
-        tracing::debug!("created fully in-memory executor for deterministic simulation");
+        let state_store = StateStore::new_uncached(shared_storage);
+        tracing::debug!("created fully in-memory uncached executor for deterministic simulation");
 
         let executor = Executor::new(
             state_store,
