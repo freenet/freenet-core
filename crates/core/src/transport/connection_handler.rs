@@ -594,7 +594,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
         'outer: loop {
             tokio::select! {
-                biased;
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
@@ -1257,7 +1256,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             // wait until the remote sends the ack packet
             let timeout_result = tokio::select! {
-                biased;
                 result = next_inbound.recv_async() => Some(result),
                 _ = time_source.sleep(Duration::from_secs(5)) => None,
             };
@@ -1514,7 +1512,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
                 }
                 let next_inbound_result = tokio::select! {
-                    biased;
                     result = next_inbound.recv_async() => Some(result),
                     _ = time_source.sleep(Duration::from_millis(200)) => None,
                 };

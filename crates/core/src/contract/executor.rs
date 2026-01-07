@@ -405,7 +405,6 @@ pub(crate) async fn run_op_request_mediator(
 
     loop {
         tokio::select! {
-            biased;
             // Receive new operation requests from executors
             Some((transaction, response_tx)) = op_request_receiver.recv() => {
                 tracing::trace!(

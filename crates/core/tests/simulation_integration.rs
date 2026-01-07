@@ -60,19 +60,15 @@ use std::time::Duration;
 /// - DashMap/DashSet iterations in op_state_manager.rs use .all()/.count() which are
 ///   order-independent
 ///
-/// Additional fixes applied (variance reduced from 5-17% to ~2%):
-/// - Added `biased` keyword to tokio::select! in key simulation paths:
-///   - client_events/mod.rs, node/mod.rs, node/op_state_manager.rs, node/p2p_impl.rs
-///   - contract/executor.rs, operations/subscribe.rs, ring/mod.rs
-///   - transport/connection_handler.rs (3 locations)
-///   - tracing/mod.rs (2 locations), tracing/telemetry.rs
+/// Additional fixes applied:
 /// - Fixed port_allocation.rs to use GlobalRng instead of rand::rng()
 /// - Fixed testing_impl.rs to use tokio::time::Instant in async functions
+/// - Created deterministic_select! macro (util/deterministic_select.rs) that uses
+///   GlobalRng for branch ordering instead of tokio's internal RNG
 ///
-/// Remaining ~2% variance likely from:
-/// 1. Additional select! macros not yet converted to biased
-/// 2. Turmoil's internal scheduling decisions
-/// 3. Subtle timing interactions with VirtualTime
+/// To achieve full determinism, replace tokio::select! with deterministic_select!
+/// in simulation paths. The macro provides the same fairness as non-biased select!
+/// while being deterministic when GlobalRng is seeded.
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {

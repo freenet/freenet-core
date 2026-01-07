@@ -178,8 +178,7 @@ impl NodeP2P {
         );
 
         let join_task = self.initial_join_task.take();
-        let result = tokio::select! {
-            biased;
+        let result = tokio::select!(
             r = f => {
                let Err(e) = r;
                tracing::error!("Network event listener exited: {}", e);
@@ -193,7 +192,7 @@ impl NodeP2P {
                 tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
             }
-        };
+        );
 
         if let Some(handle) = join_task {
             handle.abort();

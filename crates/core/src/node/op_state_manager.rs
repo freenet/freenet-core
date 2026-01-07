@@ -934,7 +934,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut delayed = vec![];
     loop {
         tokio::select! {
-            biased;
             tx = new_transactions.recv() => {
                 if let Some(tx) = tx {
                     ttl_set.insert(Reverse(tx));

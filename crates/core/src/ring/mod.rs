@@ -1151,7 +1151,6 @@ impl Ring {
             }
 
             tokio::select! {
-              biased;
               _ = refresh_density_map.tick() => {
                 self.refresh_density_request_cache();
               }
