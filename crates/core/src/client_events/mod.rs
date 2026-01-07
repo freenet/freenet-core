@@ -306,6 +306,9 @@ where
     let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
     loop {
+        // Note: This uses tokio::select! because the guard `!results.is_empty()` and
+        // future `results.next()` both reference `results`, creating a borrow conflict
+        // that deterministic_select! cannot resolve (it creates futures before evaluating guards).
         tokio::select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
