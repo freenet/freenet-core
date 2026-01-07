@@ -71,7 +71,7 @@ use std::{
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
@@ -1428,7 +1428,7 @@ impl SimNetwork {
     fn connectivity(&self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
         let num_nodes = self.number_of_nodes;
         let mut connected = HashSet::new();
-        let elapsed = Instant::now();
+        let elapsed = std::time::Instant::now();
         while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
         {
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
@@ -1702,7 +1702,8 @@ impl SimNetwork {
         poll_interval: Duration,
         min_contracts: usize,
     ) -> Result<ConvergenceResult, ConvergenceResult> {
-        let start = Instant::now();
+        // Use tokio::time::Instant for deterministic behavior in simulation
+        let start = tokio::time::Instant::now();
 
         loop {
             let result = self.check_convergence().await;
@@ -1946,7 +1947,8 @@ impl SimNetwork {
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<OperationSummary, OperationSummary> {
-        let start = Instant::now();
+        // Use tokio::time::Instant for deterministic behavior in simulation
+        let start = tokio::time::Instant::now();
 
         loop {
             let summary = self.get_operation_summary().await;

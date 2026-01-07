@@ -307,6 +307,7 @@ where
     let mut results = FuturesUnordered::new();
     loop {
         tokio::select! {
+            biased;
             client_request = client_events.recv() => {
                 let req = match client_request {
                     Ok(request) => {

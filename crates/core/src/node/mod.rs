@@ -1455,6 +1455,7 @@ pub async fn run_local_node(
     let mut receiver;
     loop {
         let req = tokio::select! {
+            biased;
             req = ws_proxy.recv() => {
                 receiver = Receiver::Ws;
                 req?

@@ -1654,6 +1654,7 @@ impl EventRegister {
                 futures::future::pending().boxed()
             };
             tokio::select! {
+                biased;
                 cmd = log_recv.recv() => {
                     let Some(cmd) = cmd else { break; };
                     match cmd {
@@ -2288,6 +2289,7 @@ mod opentelemetry_tracer {
 
             loop {
                 tokio::select! {
+                    biased;
                     log_msg = log_recv.recv() => {
                         if let Some(log) = log_msg {
                             #[cfg(not(test))]

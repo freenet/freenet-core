@@ -251,6 +251,7 @@ impl TelemetryWorker {
 
         loop {
             tokio::select! {
+                biased;
                 cmd = self.receiver.recv() => {
                     match cmd {
                         Some(TelemetryCommand::Event(event)) => {

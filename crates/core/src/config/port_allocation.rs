@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
 };
 
-use rand::{rng, seq::SliceRandom};
+use super::GlobalRng;
 
 const LOOPBACK_V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -43,7 +43,7 @@ fn pick_port_from_safe_windows_ranges() -> Option<u16> {
         return None;
     }
 
-    candidates.shuffle(&mut rng());
+    GlobalRng::shuffle(&mut candidates);
     candidates
         .into_iter()
         .take(MAX_SAFE_PORT_ATTEMPTS)

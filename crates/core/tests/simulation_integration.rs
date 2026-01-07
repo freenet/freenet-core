@@ -60,16 +60,19 @@ use std::time::Duration;
 /// - DashMap/DashSet iterations in op_state_manager.rs use .all()/.count() which are
 ///   order-independent
 ///
-/// Potential remaining sources (HIGH LIKELIHOOD - tokio::select! randomness):
-/// 1. tokio::select! without `biased` keyword uses random branch ordering:
-///    - client_events/mod.rs:309 - 3 branches for client event handling
-///    - node/mod.rs:1457 - 2 branches for ws_proxy/gw selection
-///    - node/op_state_manager.rs:936 - cleanup task polling
-///    - node/p2p_impl.rs:181 - main node event loop
-///    The random branch selection is NOT controlled by turmoil's RNG seeding.
-///    Fix would require: biased select everywhere OR custom select using GlobalRng.
-/// 2. tokio::time vs std::time interactions in certain code paths
-/// 3. Some HashMap iteration patterns may remain unfixed
+/// Additional fixes applied (variance reduced from 5-17% to ~2%):
+/// - Added `biased` keyword to tokio::select! in key simulation paths:
+///   - client_events/mod.rs, node/mod.rs, node/op_state_manager.rs, node/p2p_impl.rs
+///   - contract/executor.rs, operations/subscribe.rs, ring/mod.rs
+///   - transport/connection_handler.rs (3 locations)
+///   - tracing/mod.rs (2 locations), tracing/telemetry.rs
+/// - Fixed port_allocation.rs to use GlobalRng instead of rand::rng()
+/// - Fixed testing_impl.rs to use tokio::time::Instant in async functions
+///
+/// Remaining ~2% variance likely from:
+/// 1. Additional select! macros not yet converted to biased
+/// 2. Turmoil's internal scheduling decisions
+/// 3. Subtle timing interactions with VirtualTime
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
