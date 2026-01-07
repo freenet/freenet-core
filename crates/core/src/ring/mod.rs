@@ -617,7 +617,12 @@ impl Ring {
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
 
         let connections = self.connection_manager.get_connections_by_location();
-        for conns in connections.values() {
+        // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
+        // This ensures the `seen.insert()` check behaves consistently across runs
+        let mut sorted_keys: Vec<_> = connections.keys().collect();
+        sorted_keys.sort();
+        for loc in sorted_keys {
+            let conns = connections.get(loc).expect("key exists");
             // Sort connections for deterministic iteration order
             let mut sorted_conns: Vec<_> = conns.iter().collect();
             sorted_conns.sort_by_key(|c| c.location.clone());

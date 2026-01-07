@@ -1860,12 +1860,25 @@ pub(crate) mod test {
                 .take()
                 .zip(self.internal_state.take())
                 .expect("rng should be set");
+
+            // In simulation mode (with simulation_tests feature), run synchronously to ensure
+            // deterministic execution. spawn_blocking uses a real thread pool which turmoil's
+            // deterministic scheduler doesn't control.
+            #[cfg(feature = "simulation_tests")]
+            let (rng, state, res) = {
+                let res = rng.gen_event(&mut state);
+                (rng, state, res)
+            };
+
+            // In production mode, use spawn_blocking for non-blocking async
+            #[cfg(not(feature = "simulation_tests"))]
             let (rng, state, res) = tokio::task::spawn_blocking(move || {
                 let res = rng.gen_event(&mut state);
                 (rng, state, res)
             })
             .await
             .expect("task shouldn't fail");
+
             self.rng = Some(rng);
             self.internal_state = Some(state);
             res

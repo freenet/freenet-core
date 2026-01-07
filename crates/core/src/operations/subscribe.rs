@@ -270,8 +270,12 @@ pub(crate) async fn request_subscribe(
             .ring
             .connection_manager
             .get_connections_by_location();
-        let fallback_target = connections
-            .values()
+        // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
+        let mut sorted_keys: Vec<_> = connections.keys().collect();
+        sorted_keys.sort();
+        let fallback_target = sorted_keys
+            .into_iter()
+            .filter_map(|loc| connections.get(loc))
             .flatten()
             .find(|conn| {
                 conn.location
