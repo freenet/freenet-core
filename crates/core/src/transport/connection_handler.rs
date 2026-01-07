@@ -1255,7 +1255,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let timeout_result = tokio::select! {
+            let timeout_result = crate::deterministic_select! {
                 result = next_inbound.recv_async() => Some(result),
                 _ = time_source.sleep(Duration::from_secs(5)) => None,
             };
@@ -1511,7 +1511,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     }
                 }
-                let next_inbound_result = tokio::select! {
+                let next_inbound_result = crate::deterministic_select! {
                     result = next_inbound.recv_async() => Some(result),
                     _ = time_source.sleep(Duration::from_millis(200)) => None,
                 };

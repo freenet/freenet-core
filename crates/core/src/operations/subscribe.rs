@@ -62,10 +62,10 @@ async fn wait_for_contract_with_timeout(
     }
 
     // Wait for notification or timeout (we don't care which triggers first)
-    tokio::select! {
-        _ = notifier => {}
-        _ = sleep(Duration::from_millis(timeout_ms)) => {}
-    };
+    crate::deterministic_select! {
+        _ = notifier => {},
+        _ = sleep(Duration::from_millis(timeout_ms)) => {},
+    }
 
     // Always verify actual state - don't trust notification alone
     super::has_contract(op_manager, instance_id).await

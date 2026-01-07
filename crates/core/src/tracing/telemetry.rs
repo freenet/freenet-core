@@ -250,6 +250,8 @@ impl TelemetryWorker {
             tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
 
         loop {
+            // Note: This uses tokio::select! because the borrows of `self` in multiple branches
+            // don't work with deterministic_select! which pins futures upfront.
             tokio::select! {
                 cmd = self.receiver.recv() => {
                     match cmd {

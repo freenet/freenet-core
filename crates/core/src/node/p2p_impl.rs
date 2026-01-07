@@ -178,21 +178,21 @@ impl NodeP2P {
         );
 
         let join_task = self.initial_join_task.take();
-        let result = tokio::select!(
+        let result = crate::deterministic_select! {
             r = f => {
                let Err(e) = r;
                tracing::error!("Network event listener exited: {}", e);
                Err(e)
-            }
+            },
             e = self.client_events_task => {
                 tracing::error!("Client events task exited: {:?}", e);
                 Err(e)
-            }
+            },
             e = self.contract_executor_task => {
                 tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
-            }
-        );
+            },
+        };
 
         if let Some(handle) = join_task {
             handle.abort();

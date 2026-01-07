@@ -1150,11 +1150,11 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            tokio::select! {
+            crate::deterministic_select! {
               _ = refresh_density_map.tick() => {
                 self.refresh_density_request_cache();
-              }
-              _ = check_interval.tick() => {}
+              },
+              _ = check_interval.tick() => {},
             }
         }
     }

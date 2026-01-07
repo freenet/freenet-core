@@ -1653,6 +1653,8 @@ impl EventRegister {
             } else {
                 futures::future::pending().boxed()
             };
+            // Note: This uses tokio::select! because the borrow of `ws` in ws_recv
+            // conflicts with ws.as_mut() in branch bodies when using deterministic_select!
             tokio::select! {
                 cmd = log_recv.recv() => {
                     let Some(cmd) = cmd else { break; };
@@ -2287,7 +2289,7 @@ mod opentelemetry_tracer {
             }
 
             loop {
-                tokio::select! {
+                crate::deterministic_select! {
                     log_msg = log_recv.recv() => {
                         if let Some(log) = log_msg {
                             #[cfg(not(test))]
@@ -2301,7 +2303,7 @@ mod opentelemetry_tracer {
                         } else {
                             break;
                         }
-                    }
+                    },
                     finished_tx = finished_tx_notifier.recv() => {
                         if let Some(tx) = finished_tx {
                             #[cfg(not(test))]
@@ -2315,7 +2317,7 @@ mod opentelemetry_tracer {
                         } else {
                             break;
                         }
-                    }
+                    },
                 }
             }
         }
