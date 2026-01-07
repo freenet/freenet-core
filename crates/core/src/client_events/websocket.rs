@@ -1,10 +1,24 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
 use dashmap::DashMap;
+
+/// Tracks auth tokens that have already been warned about to avoid log spam.
+/// When a client repeatedly tries to use an invalid token (e.g., after node restart),
+/// we only want to log the warning once per token rather than flooding the logs.
+static WARNED_INVALID_TOKENS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+/// Maximum number of warned tokens to track before clearing the set.
+/// This prevents unbounded memory growth if many invalid tokens are tried.
+const MAX_WARNED_TOKENS: usize = 1000;
+
+/// Special error message prefix that clients can detect to know they need to refresh
+/// and get a new auth token. This is sent when a client connects with a stale token
+/// that is no longer valid (e.g., after node restart).
+pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 
 /// Interval for sending WebSocket ping frames to keep connection alive.
 /// Idle TCP connections may be closed by the OS, browser, or intermediate
@@ -334,7 +348,8 @@ async fn websocket_commands(
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
-        let auth_and_instance = if let Some(token) = auth_token.as_ref() {
+        // Track whether a token was provided but is invalid (stale/expired)
+        let (auth_and_instance, token_is_invalid) = if let Some(token) = auth_token.as_ref() {
             // Only collect and log map contents when trace is enabled
             if tracing::enabled!(tracing::Level::TRACE) {
                 let map_contents: Vec<_> =
@@ -345,14 +360,37 @@ async fn websocket_commands(
             if let Some(entry) = attested_contracts.get(token) {
                 let attested = entry.value();
                 tracing::trace!(?token, contract_id = ?attested.contract_id, "Found token in attested_contracts map");
-                Some((token.clone(), attested.contract_id))
+                (Some((token.clone(), attested.contract_id)), false)
             } else {
-                tracing::warn!(?token, "Auth token not found in attested_contracts map");
-                None
+                // Rate-limit warnings: only log once per unique token to avoid log spam
+                // when clients repeatedly retry with the same stale token
+                let warned_tokens =
+                    WARNED_INVALID_TOKENS.get_or_init(|| StdMutex::new(HashSet::new()));
+                let token_str = token.as_str().to_string();
+                let mut warned = warned_tokens.lock().unwrap();
+
+                // Clear set if it gets too large to prevent unbounded memory growth
+                if warned.len() >= MAX_WARNED_TOKENS {
+                    warned.clear();
+                }
+
+                if warned.insert(token_str) {
+                    // First time seeing this invalid token - log it
+                    tracing::warn!(
+                        ?token,
+                        "Auth token not found in attested_contracts map. \
+                         This usually means the node was restarted and the client has a stale token. \
+                         Client should refresh the page to get a new token."
+                    );
+                } else {
+                    // Already warned about this token - use debug level to reduce noise
+                    tracing::debug!(?token, "Auth token still not found (already warned)");
+                }
+                (None, true) // Token was provided but is invalid
             }
         } else {
             tracing::trace!("No auth token provided in WebSocket request");
-            None
+            (None, false) // No token provided - not an error
         };
 
         // Only evaluate auth_and_instance for trace when trace is enabled
@@ -361,8 +399,14 @@ async fn websocket_commands(
         } else {
             tracing::trace!(protoc = ?ws.protocol(), "websocket connection established");
         }
-        if let Err(error) =
-            websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
+        if let Err(error) = websocket_interface(
+            rs.clone(),
+            auth_and_instance,
+            token_is_invalid,
+            encoding_protoc,
+            ws,
+        )
+        .await
         {
             // Client-side disconnects (e.g., closing without handshake) are expected
             // and should not be logged as errors. These occur when clients timeout,
@@ -384,6 +428,7 @@ async fn websocket_commands(
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
+    token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
@@ -392,6 +437,36 @@ async fn websocket_interface(
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+
+    // If a token was provided but is invalid (stale/expired), immediately send an error
+    // to the client so it can refresh and get a new token. This prevents endless retry loops.
+    if token_is_invalid {
+        let error_msg = format!(
+            "{}: The auth token is no longer valid. This usually happens after a node restart. \
+             Please refresh the page to get a new token.",
+            AUTH_TOKEN_INVALID_ERROR
+        );
+        let error: ClientError = ErrorKind::Unhandled {
+            cause: std::borrow::Cow::Owned(error_msg),
+        }
+        .into();
+
+        let serialized_error = match encoding_protoc {
+            EncodingProtocol::Flatbuffers => error
+                .into_fbs_bytes()
+                .map_err(|e| anyhow::anyhow!("Failed to serialize error: {:?}", e))?,
+            EncodingProtocol::Native => {
+                bincode::serialize(&Err::<HostResponse, ClientError>(error))?
+            }
+        };
+
+        server_sink
+            .send(Message::Binary(serialized_error.into()))
+            .await?;
+
+        tracing::debug!("Sent AUTH_TOKEN_INVALID error to client");
+        // Don't close connection immediately - let client handle the error gracefully
+    }
 
     // Create ping interval to keep connection alive and prevent idle timeout
     let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
