@@ -66,7 +66,7 @@ use freenet_stdlib::prelude::*;
 use futures::Future;
 use rand::prelude::IndexedRandom;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
@@ -1626,7 +1626,8 @@ impl SimNetwork {
         let summary = self.get_deterministic_event_summary().await;
 
         // Group (contract_key -> peer_addr -> latest_state_hash)
-        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+        // Use BTreeMap for deterministic iteration order in DST
+        let mut contract_states: BTreeMap<String, BTreeMap<SocketAddr, String>> = BTreeMap::new();
 
         for event in &summary {
             if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
@@ -1802,10 +1803,13 @@ impl SimNetwork {
     ///     }
     /// }
     /// ```
-    pub async fn get_contract_state_hashes(&self) -> HashMap<String, HashMap<SocketAddr, String>> {
+    pub async fn get_contract_state_hashes(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<SocketAddr, String>> {
         let summary = self.get_deterministic_event_summary().await;
 
-        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+        // Use BTreeMap for deterministic iteration order in DST
+        let mut contract_states: BTreeMap<String, BTreeMap<SocketAddr, String>> = BTreeMap::new();
 
         for event in &summary {
             if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)

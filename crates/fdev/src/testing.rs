@@ -9,14 +9,25 @@ mod single_process;
 
 use crate::network_metrics_server::{start_server, ServerConfig};
 
+/// Parse a seed value that can be decimal or hex (0x prefix).
+fn parse_seed(s: &str) -> Result<u64, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex seed: {}", e))
+    } else {
+        s.parse().map_err(|e| format!("invalid seed: {}", e))
+    }
+}
+
 /// Testing framework for running Freenet network simulations.
 #[derive(clap::Parser, Clone)]
 pub struct TestConfig {
     /// Test name. If not provided, a random name will be generated.
     #[arg(long)]
     name: Option<String>,
-    /// Seed to use when generating random data. If not provided, a random seed will be used.
-    #[arg(long)]
+    /// Seed to use when generating random data (supports hex with 0x prefix).
+    /// If not provided, a random seed will be used.
+    /// Example: --seed 12345 or --seed 0xDEADBEEF
+    #[arg(long, value_parser = parse_seed)]
     seed: Option<u64>,
     /// Number of total gateways for this test.
     #[arg(long, default_value_t = 2)]
@@ -79,18 +90,20 @@ pub struct TestConfig {
     latency_max: Option<u64>,
 
     // =========================================================================
-    // Verification Options
+    // Verification Options (enabled by default for eventual consistency)
     // =========================================================================
     /// Check convergence after test completion with the specified timeout in seconds.
+    /// Default: 60 seconds. Set to 0 to disable.
     /// Example: --check-convergence 30
-    #[arg(long, value_name = "TIMEOUT_SECS")]
-    check_convergence: Option<u64>,
+    #[arg(long, value_name = "TIMEOUT_SECS", default_value = "60")]
+    check_convergence: u64,
 
     /// Minimum success rate for operations (0.0 to 1.0).
     /// Test will fail if success rate is below this threshold.
+    /// Default: 0.95 (95%). Set to 0.0 to disable.
     /// Example: --min-success-rate 0.95 for 95% success rate
-    #[arg(long, value_name = "RATE")]
-    min_success_rate: Option<f64>,
+    #[arg(long, value_name = "RATE", default_value = "0.95")]
+    min_success_rate: f64,
 
     /// Print operation summary after test completion.
     #[arg(long)]
@@ -331,9 +344,9 @@ mod tests {
             message_loss: None,
             latency_min: None,
             latency_max: None,
-            // Verification options
-            check_convergence: None,
-            min_success_rate: None,
+            // Verification options (defaults: convergence=60s, success_rate=95%)
+            check_convergence: 60,
+            min_success_rate: 0.95,
             print_summary: false,
             print_network_stats: false,
             command: TestMode::SingleProcess,
@@ -370,8 +383,8 @@ mod tests {
             message_loss: None,
             latency_min: None,
             latency_max: None,
-            check_convergence: None,
-            min_success_rate: None,
+            check_convergence: 60,
+            min_success_rate: 0.95,
             print_summary: false,
             print_network_stats: false,
             command: TestMode::SingleProcess,

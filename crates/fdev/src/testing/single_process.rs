@@ -179,8 +179,9 @@ async fn run_verification(
         }
     }
 
-    // Check minimum success rate
-    if let Some(min_rate) = config.min_success_rate {
+    // Check minimum success rate (enabled by default, set to 0.0 to disable)
+    let min_rate = config.min_success_rate;
+    if min_rate > 0.0 {
         let summary = network.get_operation_summary().await;
         let actual_rate = summary.overall_success_rate();
         if actual_rate < min_rate {
@@ -199,24 +200,68 @@ async fn run_verification(
         );
     }
 
-    // Check convergence
-    if let Some(timeout_secs) = config.check_convergence {
+    // Check convergence (enabled by default, set to 0 to disable)
+    let timeout_secs = config.check_convergence;
+    if timeout_secs > 0 {
         let timeout = Duration::from_secs(timeout_secs);
         let poll_interval = Duration::from_millis(500);
 
-        tracing::info!("Checking convergence (timeout: {}s)...", timeout_secs);
+        // Calculate minimum expected contracts based on events
+        // Approximately 30% of events generate new contracts (puts with new keys)
+        // Require at least 1 contract, scale with events
+        let min_expected_contracts = std::cmp::max(1, config.events / 10) as usize;
 
-        match network.await_convergence(timeout, poll_interval, 1).await {
+        tracing::info!(
+            "Checking convergence (timeout: {}s, min contracts: {})...",
+            timeout_secs,
+            min_expected_contracts
+        );
+
+        match network
+            .await_convergence(timeout, poll_interval, min_expected_contracts)
+            .await
+        {
             Ok(result) => {
+                // Additional validation: check minimum replica count
+                // For a proper convergence test, contracts should be replicated to multiple peers
+                const MIN_REPLICA_COUNT: usize = 2;
+                let low_replica_contracts: Vec<_> = result
+                    .converged
+                    .iter()
+                    .filter(|c| c.replica_count < MIN_REPLICA_COUNT)
+                    .collect();
+
+                if !low_replica_contracts.is_empty() {
+                    tracing::warn!(
+                        "{} contracts have fewer than {} replicas (may indicate replication issues)",
+                        low_replica_contracts.len(),
+                        MIN_REPLICA_COUNT
+                    );
+                }
+
+                // Log replica distribution for visibility
+                let avg_replicas: f64 = if result.converged.is_empty() {
+                    0.0
+                } else {
+                    result
+                        .converged
+                        .iter()
+                        .map(|c| c.replica_count)
+                        .sum::<usize>() as f64
+                        / result.converged.len() as f64
+                };
+
                 tracing::info!(
-                    "Convergence check passed: {} contracts converged, {} diverged",
+                    "Convergence check passed: {} contracts converged (avg {:.1} replicas/contract), {} diverged",
                     result.converged.len(),
+                    avg_replicas,
                     result.diverged.len()
                 );
             }
             Err(result) => {
                 let msg = format!(
-                    "Convergence check failed: {} contracts converged, {} still diverged",
+                    "Convergence check failed: {} contracts converged, {} still diverged. \
+                     Eventual consistency requires 100% convergence.",
                     result.converged.len(),
                     result.diverged.len()
                 );

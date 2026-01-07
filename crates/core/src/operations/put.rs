@@ -22,7 +22,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     ring::{KnownPeerKeyLocation, Location, PeerKeyLocation},
-    tracing::{state_hash_short, NetEventLog, OperationFailure},
+    tracing::{state_hash_full, NetEventLog, OperationFailure},
 };
 use either::Either;
 
@@ -432,7 +432,7 @@ impl Operation for PutOp {
                             // Emit put_success telemetry with our own location as target
                             // hop_count is 0 since we stored locally
                             let own_location = op_manager.ring.connection_manager.own_location();
-                            let hash = Some(state_hash_short(&merged_value));
+                            let hash = Some(state_hash_full(&merged_value));
                             if let Some(event) = NetEventLog::put_success(
                                 &id,
                                 &op_manager.ring,
