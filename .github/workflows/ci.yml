@@ -111,8 +111,8 @@ jobs:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # 128MB required for LLVM codegen pass on large workspaces (rustc suggests this value)
-      RUST_MIN_STACK: 134217728
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       # rust-lld occasionally segfaults with "relocation R_X86_64_PLT32 out of range"
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
@@ -175,8 +175,8 @@ jobs:
       LIBRARY_PATH: /usr/lib
       PKG_CONFIG_PATH: /usr/lib/pkgconfig
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # 128MB required for LLVM codegen pass on large workspaces (rustc suggests this value)
-      RUST_MIN_STACK: 134217728
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
