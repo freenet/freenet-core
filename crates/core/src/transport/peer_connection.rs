@@ -886,6 +886,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // flightsize once, maintaining correct accounting.
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
+                            ResendAction::TlpProbe(idx, packet) => {
+                                // TLP (Tail Loss Probe) - send probe to detect tail loss earlier
+                                // Unlike RTO, TLP does NOT call on_timeout() because it's speculative.
+                                // If the probe gets an ACK, no loss occurred. If not, RTO will fire later.
+                                tracing::trace!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    packet_id = idx,
+                                    "Sending TLP probe"
+                                );
+
+                                self.remote_conn
+                                    .socket
+                                    .send_to(&packet, self.remote_conn.remote_addr)
+                                    .await
+                                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                                // Re-register packet for RTO tracking if TLP doesn't get ACKed
+                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                            }
                         }
                     }
                 }
