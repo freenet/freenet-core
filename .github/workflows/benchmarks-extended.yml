@@ -106,7 +106,19 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-      # Run Extended Benchmarks
+      # Compile benchmarks first (fast fail on compilation errors)
+      - name: Compile Extended Benchmarks
+        run: |
+          echo "## Compiling Extended Benchmarks" >> $GITHUB_STEP_SUMMARY
+          cargo bench --bench transport_extended --features bench --no-run --color=never 2>&1 | tee compile_output.txt
+          echo "✅ Extended benchmark compilation successful" >> $GITHUB_STEP_SUMMARY
+
+          # Find the benchmark binary path for direct execution
+          BENCH_BIN=$(find target/release/deps -name 'transport_extended-*' -type f -executable | head -1)
+          echo "BENCH_BIN=$BENCH_BIN" >> $GITHUB_ENV
+          echo "Benchmark binary: $BENCH_BIN"
+
+      # Run Extended Benchmarks - execute pre-compiled binary directly
       - name: Run Extended Benchmark Suite
         id: bench_extended
         run: |
@@ -119,9 +131,8 @@ jobs:
           echo "- **Micro-benchmarks**: Component-level validation" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Run extended benchmark suite
-          # Use --color=never to avoid ANSI escape codes in output that break markdown
-          cargo bench --bench transport_extended --features bench --color=never 2>&1 | tee bench_output.txt || true
+          # Run pre-compiled benchmark binary directly (avoids cargo recompilation check)
+          "$BENCH_BIN" --bench --color never 2>&1 | tee bench_output.txt || true
 
       # Parse results with structured script
       - name: Parse Benchmark Results

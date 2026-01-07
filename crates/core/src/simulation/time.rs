@@ -118,6 +118,15 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static;
+
+    /// Returns the duration after which an idle connection should be considered dead.
+    ///
+    /// VirtualTime uses a very long timeout (1 hour) to avoid premature disconnections
+    /// when time is advanced rapidly by auto-advance tasks. RealTime uses the standard
+    /// 120 seconds.
+    fn connection_idle_timeout(&self) -> Duration {
+        Duration::from_secs(120) // default for RealTime
+    }
 }
 
 /// Real-time implementation that delegates to tokio.
@@ -358,6 +367,83 @@ impl VirtualTime {
         let pending = self.state.pending_wakeups.lock().unwrap();
         !pending.iter().any(|w| w.id == id)
     }
+
+    /// Trigger all wakeups that have expired (deadline <= current time).
+    ///
+    /// This is useful when wakeups may have been registered with deadlines at or
+    /// before the current time, or when time was advanced without triggering wakeups.
+    ///
+    /// Returns the list of triggered wakeup IDs.
+    pub fn trigger_expired(&self) -> Vec<WakeupId> {
+        let current = self.now_nanos();
+        let mut triggered = Vec::new();
+        let mut wakers_to_wake = Vec::new();
+
+        {
+            let mut pending = self.state.pending_wakeups.lock().unwrap();
+            let mut pending_wakers = self.state.pending_wakers.lock().unwrap();
+
+            // Pop all wakeups that have expired
+            while let Some(wakeup) = pending.peek() {
+                if wakeup.deadline <= current {
+                    let wakeup = pending.pop().unwrap();
+                    triggered.push(wakeup.id);
+
+                    // Find and remove the associated waker
+                    if let Some(pos) = pending_wakers.iter().position(|(id, _)| *id == wakeup.id) {
+                        let (_, waker) = pending_wakers.swap_remove(pos);
+                        wakers_to_wake.push(waker);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Wake all expired futures outside the lock
+        for waker in wakers_to_wake {
+            waker.wake();
+        }
+
+        triggered
+    }
+
+    /// Auto-advance to the next pending wakeup deadline, if any.
+    ///
+    /// This is useful for benchmarks where we want time to progress automatically
+    /// when all tasks are blocked waiting on VirtualSleep futures. Call this
+    /// periodically from a monitoring task to prevent deadlocks.
+    ///
+    /// Returns the deadline that was advanced to, or None if no wakeups pending.
+    pub fn try_auto_advance(&self) -> Option<u64> {
+        self.try_auto_advance_bounded(Duration::from_secs(1))
+    }
+
+    /// Auto-advance with a maximum step size.
+    ///
+    /// This prevents jumping too far in time, which could trigger idle timeouts
+    /// in protocols that check elapsed time since last packet.
+    ///
+    /// Returns the time advanced to, or None if no pending wakeups or no advancement needed.
+    pub fn try_auto_advance_bounded(&self, max_step: Duration) -> Option<u64> {
+        // First, trigger any wakeups that have already expired
+        self.trigger_expired();
+
+        if let Some(deadline) = self.next_wakeup_deadline() {
+            let current = self.now_nanos();
+            if deadline > current {
+                // Limit the advance to avoid triggering protocol timeouts
+                let max_advance = current.saturating_add(max_step.as_nanos() as u64);
+                let target = deadline.min(max_advance);
+                self.advance_to(target);
+                return Some(target);
+            }
+            // Deadline already passed or equal to current - already handled by trigger_expired
+            None
+        } else {
+            None
+        }
+    }
 }
 
 impl TimeSource for VirtualTime {
@@ -400,6 +486,14 @@ impl TimeSource for VirtualTime {
                 _ = sleep => None,
             }
         })
+    }
+
+    /// VirtualTime uses a 24-hour timeout to avoid premature disconnections
+    /// when auto-advance advances time faster than packets can be delivered.
+    /// With 100x time acceleration (10ms per 100µs), 24 hours of virtual time
+    /// takes ~14 minutes of real time.
+    fn connection_idle_timeout(&self) -> Duration {
+        Duration::from_secs(86400) // 24 hours
     }
 }
 

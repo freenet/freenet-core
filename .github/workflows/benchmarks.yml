@@ -119,7 +119,19 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-      # Run Transport Layer Benchmarks (actual code with mock I/O)
+      # Compile benchmarks first (fast fail on compilation errors)
+      - name: Compile Benchmarks
+        run: |
+          echo "## Compiling Benchmarks" >> $GITHUB_STEP_SUMMARY
+          cargo bench --bench transport_ci --features bench --no-run --color=never 2>&1 | tee compile_output.txt
+          echo "✅ Benchmark compilation successful" >> $GITHUB_STEP_SUMMARY
+
+          # Find the benchmark binary path for direct execution
+          BENCH_BIN=$(find target/release/deps -name 'transport_ci-*' -type f -executable | head -1)
+          echo "BENCH_BIN=$BENCH_BIN" >> $GITHUB_ENV
+          echo "Benchmark binary: $BENCH_BIN"
+
+      # Run Transport Layer Benchmarks - execute pre-compiled binary directly
       - name: Run Transport Layer Benchmarks
         id: bench_transport
         run: |
@@ -133,10 +145,8 @@ jobs:
           echo "**Note**: Micro-benchmarks moved to \`transport_extended\` (runs nightly)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Run transport benchmarks (requires bench feature)
-          # Uses transport_ci benchmark suite - fast, deterministic subset for CI
-          # Use --color=never to avoid ANSI escape codes in output that break markdown
-          cargo bench --bench transport_ci --features bench --color=never 2>&1 | tee bench_output.txt
+          # Run pre-compiled benchmark binary directly (avoids cargo recompilation check)
+          "$BENCH_BIN" --bench --color never 2>&1 | tee bench_output.txt
 
       # Parse benchmark results with structured script
       - name: Parse Benchmark Results

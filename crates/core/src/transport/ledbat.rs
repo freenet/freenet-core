@@ -727,6 +727,7 @@ pub struct LedbatController<T: TimeSource = RealTime> {
 // Production constructors (backward-compatible, use real time)
 // ============================================================================
 
+#[cfg(test)]
 impl LedbatController<RealTime> {
     /// Create new LEDBAT controller with default config (backward compatible).
     ///

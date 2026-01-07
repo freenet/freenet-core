@@ -426,8 +426,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         > = Some(self.time_source.sleep(Duration::from_millis(10)));
 
-        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(120);
-        const KILL_CONNECTION_AFTER_NANOS: u64 = KILL_CONNECTION_AFTER.as_nanos() as u64;
+        let kill_connection_after = self.time_source.connection_idle_timeout();
+        let kill_connection_after_nanos = kill_connection_after.as_nanos() as u64;
         let mut last_received_nanos = self.time_source.now_nanos();
 
         // Check for timeout periodically
@@ -786,12 +786,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     let elapsed = Duration::from_nanos(elapsed_nanos);
 
                     // Check for traditional timeout (no packets received)
-                    if elapsed_nanos > KILL_CONNECTION_AFTER_NANOS {
+                    if elapsed_nanos > kill_connection_after_nanos {
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_timeout",
                             remote = ?self.remote_conn.remote_addr,
                             elapsed_seconds = elapsed.as_secs_f64(),
-                            timeout_threshold_secs = KILL_CONNECTION_AFTER.as_secs(),
+                            timeout_threshold_secs = kill_connection_after.as_secs(),
                             "CONNECTION TIMEOUT - no packets received for {:.8}s",
                             elapsed.as_secs_f64()
                         );
@@ -816,11 +816,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
-                    // Clean up stale pings older than KILL_CONNECTION_AFTER to prevent unbounded growth.
+                    // Clean up stale pings older than kill_connection_after to prevent unbounded growth.
                     // This handles edge cases where pong responses are lost but connection stays alive.
                     {
                         let mut pending = self.pending_pings.write();
-                        let stale_threshold_nanos = now_nanos.saturating_sub(KILL_CONNECTION_AFTER_NANOS);
+                        let stale_threshold_nanos = now_nanos.saturating_sub(kill_connection_after_nanos);
                         pending.retain(|_, sent_at_nanos| *sent_at_nanos > stale_threshold_nanos);
                     }
 
@@ -846,7 +846,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
-                    let remaining_nanos = KILL_CONNECTION_AFTER_NANOS.saturating_sub(elapsed_nanos);
+                    let remaining_nanos = kill_connection_after_nanos.saturating_sub(elapsed_nanos);
                     tracing::trace!(
                         target: "freenet_core::transport::keepalive_health",
                         remote = ?self.remote_conn.remote_addr,

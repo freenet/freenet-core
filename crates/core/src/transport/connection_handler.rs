@@ -56,11 +56,11 @@ const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub type SerializedMessage = Vec<u8>;
 
-type GatewayConnectionFuture<S> = BoxFuture<
+type GatewayConnectionFuture<S, T> = BoxFuture<
     'static,
     Result<
         (
-            RemoteConnection<S>,
+            RemoteConnection<S, T>,
             InboundRemoteConnection,
             PacketData<SymmetricAES>,
         ),
@@ -68,8 +68,8 @@ type GatewayConnectionFuture<S> = BoxFuture<
     >,
 >;
 
-type TraverseNatFuture<S> =
-    BoxFuture<'static, Result<(RemoteConnection<S>, InboundRemoteConnection), TransportError>>;
+type TraverseNatFuture<S, T> =
+    BoxFuture<'static, Result<(RemoteConnection<S, T>, InboundRemoteConnection), TransportError>>;
 
 /// Maximum retries for socket binding in case of transient port conflicts.
 /// This handles race conditions in test environments where ports are released
@@ -160,23 +160,23 @@ async fn bind_socket_with_retry<S: Socket>(
 }
 
 /// Receives  new inbound connections from the network.
-pub struct InboundConnectionHandler<S = UdpSocket> {
-    new_connection_notifier: mpsc::Receiver<PeerConnection<S>>,
+pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
+    new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
 }
 
-impl<S> InboundConnectionHandler<S> {
-    pub async fn next_connection(&mut self) -> Option<PeerConnection<S>> {
+impl<S, TS: TimeSource> InboundConnectionHandler<S, TS> {
+    pub async fn next_connection(&mut self) -> Option<PeerConnection<S, TS>> {
         self.new_connection_notifier.recv().await
     }
 }
 
 /// Requests a new outbound connection to a remote peer.
-pub struct OutboundConnectionHandler<S = UdpSocket> {
-    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S>)>,
+pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S, TS>)>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
 }
 
-impl<S> Clone for OutboundConnectionHandler<S> {
+impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
     fn clone(&self) -> Self {
         Self {
             send_queue: self.send_queue.clone(),
@@ -346,14 +346,174 @@ impl ExpectedInboundTracker {
     }
 }
 
+// VirtualTime-specific impl block for instant benchmark simulation (test/bench only)
+//
+// This impl block provides methods for creating and using OutboundConnectionHandler with VirtualTime.
+// By being specific to VirtualTime (not generic over TimeSource), it avoids conflicting with
+// the OutboundConnectionHandler<S> impl which uses RealTime by default.
+#[cfg(any(test, feature = "bench"))]
+#[allow(private_bounds)]
+impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
+    /// Configure listener with VirtualTime for instant benchmark execution.
+    ///
+    /// The time_source is passed through to UdpPacketsListener, RemoteConnection,
+    /// and PeerConnection so all timing operations use the same source.
+    #[allow(clippy::too_many_arguments)]
+    fn config_listener_with_virtual_time(
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        socket_addr: SocketAddr,
+        bandwidth_limit: Option<usize>,
+        global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+        ledbat_min_ssthresh: Option<usize>,
+        time_source: crate::simulation::VirtualTime,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<PeerConnection<S, crate::simulation::VirtualTime>>,
+        ),
+        TransportError,
+    > {
+        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
+        let expected_non_gateway = Arc::new(DashSet::new());
+
+        let transport = UdpPacketsListener {
+            is_gateway,
+            socket_listener: socket,
+            this_peer_keypair: keypair,
+            remote_connections: BTreeMap::new(),
+            connection_handler: conn_handler_receiver,
+            new_connection_notifier: new_connection_sender,
+            this_addr: socket_addr,
+            dropped_packets: HashMap::new(),
+            last_drop_warning_nanos: time_source.now_nanos(),
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            expected_non_gateway: expected_non_gateway.clone(),
+            last_asym_attempt: HashMap::new(),
+            time_source,
+        };
+        let connection_handler = OutboundConnectionHandler {
+            send_queue: conn_handler_sender,
+            expected_non_gateway,
+        };
+
+        // Packets are now sent directly to socket from each connection,
+        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
+        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
+        GlobalExecutor::spawn(RANDOM_U64.scope(
+            {
+                let seed = GlobalRng::random_u64();
+                let mut rng = StdRng::seed_from_u64(seed);
+                rng.random()
+            },
+            transport.listen(),
+        ));
+
+        Ok((connection_handler, new_connection_notifier))
+    }
+
+    pub(crate) fn new_test_with_time_source(
+        socket_addr: SocketAddr,
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        bandwidth_limit: Option<usize>,
+        time_source: crate::simulation::VirtualTime,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<PeerConnection<S, crate::simulation::VirtualTime>>,
+        ),
+        TransportError,
+    > {
+        Self::config_listener_with_virtual_time(
+            socket,
+            keypair,
+            is_gateway,
+            socket_addr,
+            bandwidth_limit,
+            None,
+            None,
+            time_source,
+        )
+    }
+
+    /// Connect to a remote peer using VirtualTime.
+    pub async fn connect(
+        &mut self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        PeerConnection<S, crate::simulation::VirtualTime>,
+                        TransportError,
+                    >,
+                > + Send,
+        >,
+    > {
+        if self.expected_non_gateway.insert(remote_addr.ip()) {
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "outbound",
+                "Awaiting outbound handshake response from remote IP"
+            );
+        }
+        let (open_connection, recv_connection) = oneshot::channel();
+        if self
+            .send_queue
+            .send((
+                remote_addr,
+                ConnectionEvent::ConnectionStart {
+                    remote_public_key,
+                    open_connection,
+                },
+            ))
+            .await
+            .is_err()
+        {
+            return async { Err(TransportError::ChannelClosed) }.boxed();
+        }
+        recv_connection
+            .map(|res| match res {
+                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
+                    cause: "Failed to establish connection".into(),
+                }),
+            })
+            .boxed()
+    }
+
+    pub fn expect_incoming(&self, remote_addr: SocketAddr) {
+        if self.expected_non_gateway.insert(remote_addr.ip()) {
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "inbound",
+                "Registered expected inbound handshake from remote IP"
+            );
+        }
+    }
+
+    /// Returns a clone of the expected inbound tracker.
+    pub fn expected_inbound_tracker(&self) -> ExpectedInboundTracker {
+        ExpectedInboundTracker(self.expected_non_gateway.clone())
+    }
+}
+
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
-    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S>)>,
+    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S, T>)>,
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
-    new_connection_notifier: mpsc::Sender<PeerConnection<S>>,
+    new_connection_notifier: mpsc::Sender<PeerConnection<S, T>>,
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning_nanos: u64,
@@ -370,23 +530,23 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     time_source: T,
 }
 
-type OngoingConnection<S> = (
+type OngoingConnection<S, T> = (
     FastSender<PacketData<UnknownEncryption>>,
-    oneshot::Sender<Result<RemoteConnection<S>, TransportError>>,
+    oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
 );
 
-type OngoingConnectionResult<S> = Option<
+type OngoingConnectionResult<S, T> = Option<
     Result<
-        Result<(RemoteConnection<S>, InboundRemoteConnection), (TransportError, SocketAddr)>,
+        Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
         tokio::task::JoinError,
     >,
 >;
 
-type GwOngoingConnectionResult<S> = Option<
+type GwOngoingConnectionResult<S, T> = Option<
     Result<
         Result<
             (
-                RemoteConnection<S>,
+                RemoteConnection<S, T>,
                 InboundRemoteConnection,
                 PacketData<SymmetricAES>,
             ),
@@ -421,7 +581,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             "Listening for packets"
         );
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S>> = BTreeMap::new();
+        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S, T>> =
+            BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
             SocketAddr,
             FastSender<PacketData<UnknownEncryption>>,
@@ -774,7 +935,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
                 },
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
-                    let Some(res): GwOngoingConnectionResult<S> = gw_connection_handshake else {
+                    let Some(res): GwOngoingConnectionResult<S, T> = gw_connection_handshake else {
                         unreachable!("gw_connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
@@ -847,7 +1008,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
                 }
                 connection_handshake = connection_tasks.next(), if !connection_tasks.is_empty() => {
-                    let Some(res): OngoingConnectionResult<S> = connection_handshake else {
+                    let Some(res): OngoingConnectionResult<S, T> = connection_handshake else {
                         unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
@@ -1023,7 +1184,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         remote_addr: SocketAddr,
         inbound_key_bytes: [u8; 16],
     ) -> (
-        GatewayConnectionFuture<S>,
+        GatewayConnectionFuture<S, T>,
         FastSender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
@@ -1124,15 +1285,18 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 }
             }
 
-            let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            ));
 
             // Initialize LEDBAT congestion controller with slow start (RFC 6817)
             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-            let ledbat = Arc::new(LedbatController::new_with_config(
+            let ledbat = Arc::new(LedbatController::new_with_time_source(
                 crate::transport::ledbat::LedbatConfig {
                     min_ssthresh: ledbat_min_ssthresh,
                     ..Default::default()
                 },
+                time_source.clone(),
             ));
 
             // Initialize token bucket for smooth packet pacing
@@ -1142,9 +1306,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             } else {
                 bandwidth_limit.unwrap_or(10_000_000) // 10 MB/s default
             };
-            let token_bucket = Arc::new(TokenBucket::new(
+            let token_bucket = Arc::new(TokenBucket::new_with_time_source(
                 10_000, // capacity = 10 KB burst
                 initial_rate,
+                time_source.clone(),
             ));
 
             let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
@@ -1187,7 +1352,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 ledbat,
                 token_bucket,
                 socket,
-                time_source: RealTime::new(),
+                time_source,
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -1210,7 +1375,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
     ) -> (
-        TraverseNatFuture<S>,
+        TraverseNatFuture<S, T>,
         FastSender<PacketData<UnknownEncryption>>,
     ) {
         tracing::debug!(
@@ -1300,7 +1465,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
             };
 
-            let mut sent_tracker = SentPacketTracker::new();
+            let mut sent_tracker = SentPacketTracker::new_with_time_source(time_source.clone());
 
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
@@ -1426,11 +1591,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             // Initialize LEDBAT congestion controller with slow start (RFC 6817)
                                             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
                                             let ledbat =
-                                                Arc::new(LedbatController::new_with_config(
+                                                Arc::new(LedbatController::new_with_time_source(
                                                     crate::transport::ledbat::LedbatConfig {
                                                         min_ssthresh: ledbat_min_ssthresh,
                                                         ..Default::default()
                                                     },
+                                                    time_source.clone(),
                                                 ));
 
                                             // Initialize token bucket
@@ -1441,10 +1607,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 } else {
                                                     bandwidth_limit.unwrap_or(10_000_000)
                                                 };
-                                            let token_bucket = Arc::new(TokenBucket::new(
-                                                10_000, // capacity = 10 KB burst
-                                                initial_rate,
-                                            ));
+                                            let token_bucket =
+                                                Arc::new(TokenBucket::new_with_time_source(
+                                                    10_000, // capacity = 10 KB burst
+                                                    initial_rate,
+                                                    time_source.clone(),
+                                                ));
 
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
@@ -1471,7 +1639,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
-                                                    time_source: RealTime::new(),
+                                                    time_source: time_source.clone(),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -1530,11 +1698,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 // Initialize LEDBAT congestion controller with slow start (RFC 6817)
                                 // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-                                let ledbat = Arc::new(LedbatController::new_with_config(
+                                let ledbat = Arc::new(LedbatController::new_with_time_source(
                                     crate::transport::ledbat::LedbatConfig {
                                         min_ssthresh: ledbat_min_ssthresh,
                                         ..Default::default()
                                     },
+                                    time_source.clone(),
                                 ));
 
                                 // Initialize token bucket
@@ -1544,9 +1713,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 } else {
                                     bandwidth_limit.unwrap_or(10_000_000)
                                 };
-                                let token_bucket = Arc::new(TokenBucket::new(
+                                let token_bucket = Arc::new(TokenBucket::new_with_time_source(
                                     10_000, // capacity = 10 KB burst
                                     initial_rate,
+                                    time_source.clone(),
                                 ));
 
                                 tracing::info!(
@@ -1561,7 +1731,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             .expect("should be set at this stage"),
                                         remote_addr,
                                         sent_tracker: Arc::new(parking_lot::Mutex::new(
-                                            SentPacketTracker::new(),
+                                            SentPacketTracker::new_with_time_source(
+                                                time_source.clone(),
+                                            ),
                                         )),
                                         last_packet_id: Arc::new(AtomicU32::new(0)),
                                         inbound_packet_recv: inbound_recv,
@@ -1573,7 +1745,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
-                                        time_source: RealTime::new(),
+                                        time_source: time_source.clone(),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
@@ -1661,10 +1833,10 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
-pub(crate) enum ConnectionEvent<S = UdpSocket> {
+pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
-        open_connection: oneshot::Sender<Result<RemoteConnection<S>, TransportError>>,
+        open_connection: oneshot::Sender<Result<RemoteConnection<S, TS>, TransportError>>,
     },
 }
 
@@ -1836,7 +2008,9 @@ pub mod mock_transport {
     }
 
     /// Channel mapping for mock socket communication between peers.
-    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
+    /// Packet format: (source_addr, data, available_at_nanos)
+    /// available_at_nanos = VirtualTime when packet becomes available (0 = immediate)
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>, u64)>>>;
 
     /// Policy for simulating packet loss in mock transport.
     #[derive(Default, Clone)]
@@ -1864,14 +2038,17 @@ pub mod mock_transport {
 
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
-        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+        /// Inbound packets: (source_addr, data, available_at_nanos)
+        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
-        #[allow(dead_code)] // Used in send_to method
         packet_delay_policy: PacketDelayPolicy,
         num_packets_sent: AtomicUsize,
         rng: std::sync::Mutex<rand::rngs::SmallRng>,
         channels: Channels,
+        /// Optional VirtualTime for instant delay simulation in benchmarks.
+        /// When set, packet delivery waits until VirtualTime reaches available_at_nanos.
+        virtual_time: Option<crate::simulation::VirtualTime>,
     }
 
     impl MockSocket {
@@ -1895,6 +2072,35 @@ pub mod mock_transport {
                     SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                 )),
                 channels,
+                virtual_time: None,
+            }
+        }
+
+        /// Create a new MockSocket with VirtualTime support for instant delay simulation.
+        ///
+        /// When `time_source` is provided, packet delays advance virtual time instead of
+        /// waiting wall-clock time. This enables instant simulation of high-RTT scenarios.
+        pub async fn with_time_source(
+            packet_drop_policy: PacketDropPolicy,
+            packet_delay_policy: PacketDelayPolicy,
+            addr: SocketAddr,
+            channels: Channels,
+            time_source: Option<crate::simulation::VirtualTime>,
+        ) -> Self {
+            let (outbound, inbound) = mpsc::unbounded_channel();
+            channels.insert(addr, outbound);
+            static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
+            MockSocket {
+                inbound: Mutex::new(inbound),
+                this: addr,
+                packet_drop_policy,
+                packet_delay_policy,
+                num_packets_sent: AtomicUsize::new(0),
+                rng: std::sync::Mutex::new(rand::rngs::SmallRng::seed_from_u64(
+                    SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                )),
+                channels,
+                virtual_time: time_source,
             }
         }
     }
@@ -1905,41 +2111,87 @@ pub mod mock_transport {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            // tracing::trace!(this = %self.this, "waiting for packet");
-            let Some((remote, packet)) = self.inbound.try_lock().unwrap().recv().await else {
+            // Wait for a packet from the channel
+            let Some((remote, packet, available_at_nanos)) =
+                self.inbound.try_lock().unwrap().recv().await
+            else {
                 tracing::error!(this = %self.this, "connection closed");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
-            // tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
+
+            // Wait until the packet is available (simulates transit delay)
+            // This registers a VirtualTime wakeup that auto-advance will process
+            if let Some(ref vt) = self.virtual_time {
+                if available_at_nanos > 0 {
+                    vt.sleep_until(available_at_nanos).await;
+                }
+            }
+
+            // Deliver the packet
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-            // Inject artificial delay to simulate network latency
-            match &self.packet_delay_policy {
-                PacketDelayPolicy::NoDelay => {}
-                PacketDelayPolicy::Fixed(delay) => {
-                    tokio::time::sleep(*delay).await;
-                }
+            let (delay, available_at_nanos) = self.compute_delay_and_timestamp();
+
+            // Send packet with delivery timestamp (don't advance VirtualTime here)
+            let result = self.send_packet_internal(buf, target, available_at_nanos);
+
+            // For non-VirtualTime with delay, use wall-clock sleep
+            if self.virtual_time.is_none() && !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            } else {
+                // Just yield to let receiver process
+                tokio::task::yield_now().await;
+            }
+
+            result
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
+            self.send_packet_internal(buf, target, available_at_nanos)
+        }
+    }
+
+    impl MockSocket {
+        /// Compute delay and delivery timestamp based on packet delay policy.
+        fn compute_delay_and_timestamp(&self) -> (Duration, u64) {
+            let delay = match &self.packet_delay_policy {
+                PacketDelayPolicy::NoDelay => Duration::ZERO,
+                PacketDelayPolicy::Fixed(delay) => *delay,
                 PacketDelayPolicy::Uniform { min, max } => {
                     let range = max.as_nanos().saturating_sub(min.as_nanos());
-                    let delay = if range == 0 {
-                        *min // If min == max, use min (avoids division by zero)
+                    if range == 0 {
+                        *min
                     } else {
                         let random_nanos = {
                             let mut rng = self.rng.try_lock().unwrap();
                             rng.random::<u128>() % range
                         };
-                        *min + Duration::from_nanos((random_nanos) as u64)
-                    };
-                    tokio::time::sleep(delay).await;
+                        *min + Duration::from_nanos(random_nanos as u64)
+                    }
                 }
-            }
-            self.send_to_blocking(buf, target)
+            };
+
+            // Calculate delivery timestamp based on current VirtualTime + delay
+            let available_at_nanos = if let Some(ref vt) = self.virtual_time {
+                vt.now_nanos() + delay.as_nanos() as u64
+            } else {
+                0 // No VirtualTime, deliver immediately
+            };
+
+            (delay, available_at_nanos)
         }
 
-        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        /// Internal packet send with explicit delivery timestamp.
+        fn send_packet_internal(
+            &self,
+            buf: &[u8],
+            target: SocketAddr,
+            available_at_nanos: u64,
+        ) -> std::io::Result<usize> {
             let packet_idx = self.num_packets_sent.fetch_add(1, Ordering::Release);
             match &self.packet_drop_policy {
                 PacketDropPolicy::ReceiveAll => {}
@@ -1961,11 +2213,9 @@ pub mod mock_transport {
             let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
                 return Ok(0);
             };
-            // tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
-                .send((self.this, buf.to_vec()))
+                .send((self.this, buf.to_vec(), available_at_nanos))
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            // tracing::trace!(?target, ?self.this, "packet sent to remote");
             Ok(buf.len())
         }
     }
@@ -2045,6 +2295,36 @@ pub mod mock_transport {
         .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
+    /// Create a mock peer connection with virtual time support for benchmarking.
+    ///
+    /// When `time_source` is provided, the entire transport stack uses VirtualTime
+    /// for all timing operations. Delays advance virtual time instead of waiting
+    /// real time. This enables instant simulation of high-RTT scenarios
+    /// (e.g., 300ms RTT completes in ~1ms wall time).
+    ///
+    /// Returns the peer's public key, outbound connection handler, and socket address.
+    pub async fn create_mock_peer_with_virtual_time(
+        packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
+        channels: Channels,
+        time_source: crate::simulation::VirtualTime,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+        SocketAddr,
+    )> {
+        create_mock_peer_internal_vt(
+            packet_drop_policy,
+            packet_delay_policy,
+            false,
+            channels,
+            None,
+            Some(time_source),
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
     /// Create a mock gateway connection for testing/benchmarking.
     ///
     /// Returns the gateway's public key, outbound handler, inbound connection receiver, and socket address.
@@ -2109,6 +2389,65 @@ pub mod mock_transport {
             peer_keypair,
             gateway,
             bandwidth_limit,
+        )
+        .expect("failed to create peer");
+        Ok((
+            peer_pub,
+            (peer_conn, inbound_conn),
+            (Ipv4Addr::LOCALHOST, port).into(),
+        ))
+    }
+
+    /// Internal function with VirtualTime support for instant delay simulation.
+    ///
+    /// When time_source is provided, the entire transport stack uses VirtualTime
+    /// for all timing operations (MockSocket delays, protocol timers, retransmit checks).
+    async fn create_mock_peer_internal_vt(
+        packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
+        gateway: bool,
+        channels: Channels,
+        bandwidth_limit: Option<usize>,
+        time_source: Option<crate::simulation::VirtualTime>,
+    ) -> Result<
+        (
+            TransportPublicKey,
+            (
+                OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+                mpsc::Receiver<PeerConnection<MockSocket, crate::simulation::VirtualTime>>,
+            ),
+            SocketAddr,
+        ),
+        anyhow::Error,
+    > {
+        static PORT: AtomicU16 = AtomicU16::new(25000);
+
+        let peer_keypair = TransportKeypair::new();
+        let peer_pub = peer_keypair.public.clone();
+        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Use provided time source or create a new one
+        let vt = time_source.unwrap_or_default();
+
+        let socket = Arc::new(
+            MockSocket::with_time_source(
+                packet_drop_policy,
+                packet_delay_policy,
+                (Ipv4Addr::LOCALHOST, port).into(),
+                channels,
+                Some(vt.clone()),
+            )
+            .await,
+        );
+
+        // Use the same VirtualTime for both MockSocket and protocol layer
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_time_source(
+            (Ipv4Addr::LOCALHOST, port).into(),
+            socket,
+            peer_keypair,
+            gateway,
+            bandwidth_limit,
+            vt,
         )
         .expect("failed to create peer");
         Ok((
