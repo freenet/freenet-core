@@ -42,18 +42,29 @@ use std::time::Duration;
 /// - GlobalRng thread ID seeding (now uses deterministic thread index counter)
 /// - HashMap iteration in subscribe.rs fallback target selection (keys now sorted)
 /// - spawn_blocking in generate_rand_event() removed (MemoryEventsGen is test-only)
+/// - MockRuntime now uses InMemoryContractStore (no background threads, no file watchers)
+/// - StateStore::new_uncached() bypasses stretto cache (non-deterministic TinyLFU admission)
 ///
 /// Note: Simulation already uses MockRuntime which bypasses WASM execution entirely.
 /// The mock executor just stores/retrieves state without running any WASM code.
 ///
 /// Remaining issues:
-/// - Event counts still differ by ~5-10% between runs
-/// - Root cause is unknown - all identified non-determinism sources have been fixed
+/// - Event counts still differ by ~5-17% between runs
+/// - Root cause is still unknown despite extensive investigation
 ///
-/// Next steps for investigation:
-/// 1. Add tracing to identify which specific code paths diverge between runs
-/// 2. Check for any remaining HashMap/DashMap iteration patterns
-/// 3. Verify turmoil's deterministic scheduling is working correctly
+/// Investigated but ruled out:
+/// - ReceivedPacketTracker uses std::time::Instant for cleanup timing, but this only
+///   affects when old packets are cleaned up, not control flow decisions
+/// - Thread-local caches (PeerKeyLocation::random(), TransportKeypair arbitrary) are
+///   only used in unit tests, not simulation paths
+/// - DashMap/DashSet iterations in op_state_manager.rs use .all()/.count() which are
+///   order-independent
+///
+/// Potential remaining sources (need investigation):
+/// 1. Turmoil's internal scheduling may have subtle non-determinism
+/// 2. tokio::time vs std::time interactions in certain code paths
+/// 3. Some HashMap iteration patterns may remain unfixed
+/// 4. Channel receive ordering when multiple senders are active
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
