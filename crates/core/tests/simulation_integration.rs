@@ -41,19 +41,19 @@ use std::time::Duration;
 /// - Vec ordering in ring/mod.rs k_closest_potentially_caching (now sorted)
 /// - GlobalRng thread ID seeding (now uses deterministic thread index counter)
 /// - HashMap iteration in subscribe.rs fallback target selection (keys now sorted)
-/// - spawn_blocking in generate_rand_event() (bypassed in simulation_tests mode)
+/// - spawn_blocking in generate_rand_event() removed (MemoryEventsGen is test-only)
+///
+/// Note: Simulation already uses MockRuntime which bypasses WASM execution entirely.
+/// The mock executor just stores/retrieves state without running any WASM code.
 ///
 /// Remaining issues:
-/// - WASM contract execution uses spawn_blocking which runs on a real thread pool
-///   outside turmoil's control. This affects Update events non-deterministically.
 /// - Event counts still differ by ~5-10% between runs
+/// - Root cause is unknown - all identified non-determinism sources have been fixed
 ///
-/// Root cause: spawn_blocking tasks complete in non-deterministic order because
-/// turmoil only controls the tokio async scheduler, not the blocking thread pool.
-/// Full determinism would require either:
-/// 1. Running WASM execution synchronously in simulation mode (performance impact)
-/// 2. Using a mock contract executor for simulation tests
-/// 3. Implementing deterministic blocking thread scheduling (complex)
+/// Next steps for investigation:
+/// 1. Add tracing to identify which specific code paths diverge between runs
+/// 2. Check for any remaining HashMap/DashMap iteration patterns
+/// 3. Verify turmoil's deterministic scheduling is working correctly
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
