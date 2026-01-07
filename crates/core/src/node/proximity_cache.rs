@@ -151,8 +151,11 @@ impl ProximityCacheManager {
             }
 
             ProximityCacheMessage::CacheStateRequest => {
-                let contracts: Vec<ContractInstanceId> =
+                let mut contracts: Vec<ContractInstanceId> =
                     self.my_cache.iter().map(|r| *r.key()).collect();
+                // Sort for deterministic message order (DashSet iteration is non-deterministic)
+                // ContractInstanceId doesn't impl Ord, so sort by string representation
+                contracts.sort_by_key(|a| a.to_string());
 
                 debug!(
                     peer = %from,
@@ -185,12 +188,15 @@ impl ProximityCacheManager {
     pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<SocketAddr> {
         let contract_id = contract_key.id();
 
-        let neighbors: Vec<SocketAddr> = self
+        let mut neighbors: Vec<SocketAddr> = self
             .neighbor_caches
             .iter()
             .filter(|entry| entry.value().contains(contract_id))
             .map(|entry| *entry.key())
             .collect();
+
+        // Sort for deterministic iteration order (DashMap iteration is non-deterministic)
+        neighbors.sort();
 
         if !neighbors.is_empty() {
             debug!(
