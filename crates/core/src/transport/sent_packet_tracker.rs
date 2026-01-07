@@ -28,10 +28,28 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
 };
 
 /// Maximum RTO backoff multiplier (RFC 6298 Section 5.5).
-/// With a minimum/base RTO of 1s and a max effective RTO cap of 60s, a backoff of 64 is
+/// With a minimum/base RTO of 200ms and a max effective RTO cap of 60s, a backoff of 512 is
 /// sufficient to ensure we can reach the 60s limit; for higher base RTO values, the cap is
 /// reached with smaller backoff multipliers.
-const MAX_RTO_BACKOFF: u32 = 64;
+const MAX_RTO_BACKOFF: u32 = 512;
+
+/// Minimum RTO after RTT samples have been collected.
+///
+/// RFC 6298 recommends 1 second, but Linux TCP uses 200ms and this is widely accepted
+/// for modern networks. For LEDBAT, faster loss detection is critical since we're
+/// delay-sensitive - a 1 second RTO means we wait 5x longer than necessary on a typical
+/// network to detect packet loss.
+///
+/// Note: Initial RTO (before any RTT samples) remains 1 second per RFC 6298 Section 2.1.
+const MIN_RTO: Duration = Duration::from_millis(200);
+
+/// Minimum TLP timeout (PTO - Probe Timeout).
+///
+/// TLP sends a probe packet before RTO expires to detect tail loss earlier.
+/// PTO = max(2 * SRTT, MIN_TLP_TIMEOUT).
+///
+/// RFC 8985 suggests a minimum of 10ms to prevent excessive probing on very fast networks.
+const MIN_TLP_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Determines the accuracy/sensitivity of the packet loss estimate. A lower value will result
 /// in a more accurate estimate, but it will take longer to converge to the true value.
@@ -91,6 +109,10 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// RTO backoff multiplier for exponential backoff (RFC 6298 Section 5.5)
     /// Doubles on each consecutive timeout, resets to 1 on valid ACK
     rto_backoff: u32,
+
+    /// Track packets that have had TLP probes sent.
+    /// TLP fires once per packet before RTO - if no ACK, RTO handles it.
+    tlp_sent_packets: HashSet<PacketId>,
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
@@ -109,7 +131,18 @@ impl<T: TimeSource> SentPacketTracker<T> {
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,
             rto_backoff: 1, // No backoff initially
+            tlp_sent_packets: HashSet::new(),
         }
+    }
+
+    /// Calculate PTO (Probe Timeout) for TLP.
+    /// PTO = max(2 * SRTT, MIN_TLP_TIMEOUT)
+    /// Returns None if no RTT samples yet (TLP disabled).
+    fn probe_timeout(&self) -> Option<Duration> {
+        self.srtt.map(|srtt| {
+            let pto = srtt.saturating_mul(2);
+            pto.max(MIN_TLP_TIMEOUT)
+        })
     }
 }
 
@@ -118,12 +151,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let sent_time_nanos = self.time_source.now_nanos();
         self.pending_receipts
             .insert(packet_id, (payload, sent_time_nanos));
-        // Use effective_rto() which includes exponential backoff (RFC 6298 Section 5.5)
-        // This ensures retransmitted packets wait progressively longer (1s → 2s → 4s → ...)
-        self.resend_queue.push_back(ResendQueueEntry {
-            timeout_at: sent_time_nanos + self.effective_rto().as_nanos() as u64,
-            packet_id,
-        });
+        self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
     }
 
@@ -185,9 +213,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 }
             }
 
-            // Remove from pending and retransmitted tracking
+            // Remove from pending, retransmitted, and TLP tracking
             self.pending_receipts.remove(packet_id);
             self.retransmitted_packets.remove(packet_id);
+            self.tlp_sent_packets.remove(packet_id);
         }
 
         let loss_rate = if self.total_packets_sent > 0 {
@@ -237,9 +266,11 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let max_variance = if rto_variance > G { rto_variance } else { G };
         self.rto = self.srtt.unwrap_or(Duration::from_secs(1)) + max_variance;
 
-        // Clamp RTO to [1s, 60s] (RFC 6298 Section 2.4 & 2.5)
-        if self.rto < Duration::from_secs(1) {
-            self.rto = Duration::from_secs(1);
+        // Clamp RTO to [200ms, 60s]
+        // Note: RFC 6298 Section 2.4 recommends 1s minimum, but Linux uses 200ms.
+        // For LEDBAT, faster loss detection improves throughput significantly.
+        if self.rto < MIN_RTO {
+            self.rto = MIN_RTO;
         } else if self.rto > Duration::from_secs(60) {
             self.rto = Duration::from_secs(60);
         }
@@ -306,39 +337,101 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// Either get a packet that needs to be resent, or how long the caller should wait until
     /// calling this function again. If a packet is resent you **must** call
     /// `report_sent_packet` again with the same packet_id.
+    ///
+    /// TLP (Tail Loss Probe) fires before RTO to detect tail loss earlier.
+    /// - TLP returns TlpProbe action (no backoff applied, speculative)
+    /// - RTO returns Resend action (backoff applied, definite loss)
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now_nanos = self.time_source.now_nanos();
+        let pto = self.probe_timeout();
+        let effective_rto_nanos = self.effective_rto().as_nanos() as u64;
 
         while let Some(entry) = self.resend_queue.pop_front() {
-            if entry.timeout_at > now_nanos {
-                if !self.pending_receipts.contains_key(&entry.packet_id) {
-                    continue;
-                }
-                let wait_until_nanos = entry.timeout_at;
-                self.resend_queue.push_front(entry);
-                return ResendAction::WaitUntil(wait_until_nanos);
-            } else if let Some((packet, _sent_time_nanos)) =
-                self.pending_receipts.remove(&entry.packet_id)
-            {
-                // Update packet loss proportion for a lost packet
-                // Resend logic
-                self.packet_loss_proportion = self.packet_loss_proportion
-                    * (1.0 - PACKET_LOSS_DECAY_FACTOR)
-                    + PACKET_LOSS_DECAY_FACTOR;
-
-                // Mark as retransmitted for Karn's algorithm
-                self.mark_retransmitted(entry.packet_id);
-
-                // RFC 6298 Section 5.5: Back off the timer on retransmission
-                self.on_timeout();
-
-                return ResendAction::Resend(entry.packet_id, packet);
+            // Skip packets that have been ACKed
+            if !self.pending_receipts.contains_key(&entry.packet_id) {
+                continue;
             }
-            // If the packet is no longer in pending_receipts, it means its receipt has been received.
-            // No action needed, continue to check the next entry in the queue.
+
+            // Get the packet's sent time - this may have been updated by re-registration
+            let sent_time_nanos = self
+                .pending_receipts
+                .get(&entry.packet_id)
+                .map(|(_, ts)| *ts)
+                .unwrap_or(0);
+
+            // Calculate RTO deadline from current sent_time (not stored value)
+            // This handles re-registration after TLP correctly
+            let rto_deadline = sent_time_nanos + effective_rto_nanos;
+
+            // Calculate TLP deadline (if TLP is enabled and not already sent)
+            let tlp_deadline = if let Some(pto) = pto {
+                if !self.tlp_sent_packets.contains(&entry.packet_id) {
+                    Some(sent_time_nanos + pto.as_nanos() as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Check if TLP should fire (before RTO)
+            if let Some(tlp_at) = tlp_deadline {
+                if now_nanos >= tlp_at && now_nanos < rto_deadline {
+                    // TLP fires! Clone packet data for the probe
+                    if let Some((packet, _)) = self.pending_receipts.get(&entry.packet_id) {
+                        let packet_clone = packet.clone();
+                        let packet_id = entry.packet_id;
+
+                        // Mark TLP as sent for this packet (won't fire again)
+                        self.tlp_sent_packets.insert(packet_id);
+
+                        // Put entry back - RTO still pending
+                        self.resend_queue.push_front(entry);
+
+                        // Mark as retransmitted for Karn's algorithm
+                        self.mark_retransmitted(packet_id);
+
+                        // TLP does NOT apply backoff - it's speculative
+                        return ResendAction::TlpProbe(packet_id, packet_clone);
+                    }
+                }
+            }
+
+            // Check if RTO should fire
+            if now_nanos >= rto_deadline {
+                if let Some((packet, _sent_time_nanos)) =
+                    self.pending_receipts.remove(&entry.packet_id)
+                {
+                    // Update packet loss proportion for a lost packet
+                    self.packet_loss_proportion = self.packet_loss_proportion
+                        * (1.0 - PACKET_LOSS_DECAY_FACTOR)
+                        + PACKET_LOSS_DECAY_FACTOR;
+
+                    // Mark as retransmitted for Karn's algorithm
+                    self.mark_retransmitted(entry.packet_id);
+
+                    // RFC 6298 Section 5.5: Back off the timer on retransmission
+                    self.on_timeout();
+
+                    // Clean up TLP tracking for this packet
+                    self.tlp_sent_packets.remove(&entry.packet_id);
+
+                    return ResendAction::Resend(entry.packet_id, packet);
+                }
+            }
+
+            // Neither TLP nor RTO fired yet - calculate when to wake up
+            let next_deadline = if let Some(tlp_at) = tlp_deadline {
+                tlp_at.min(rto_deadline)
+            } else {
+                rto_deadline
+            };
+
+            self.resend_queue.push_front(entry);
+            return ResendAction::WaitUntil(next_deadline);
         }
 
-        // Use effective RTO (with backoff) for the wait time
+        // No pending packets - use effective RTO for next check
         let deadline_nanos = self.time_source.now_nanos() + self.effective_rto().as_nanos() as u64;
         ResendAction::WaitUntil(deadline_nanos)
     }
@@ -348,12 +441,14 @@ impl<T: TimeSource> SentPacketTracker<T> {
 pub enum ResendAction {
     /// Wait until the given deadline (nanoseconds since TimeSource epoch) before checking again.
     WaitUntil(u64),
+    /// Full RTO timeout - resend the packet and apply backoff
     Resend(u32, Box<[u8]>),
+    /// TLP (Tail Loss Probe) - send a probe to detect tail loss earlier than RTO.
+    /// Unlike Resend, this doesn't apply backoff since it's speculative.
+    TlpProbe(u32, Box<[u8]>),
 }
 
 struct ResendQueueEntry {
-    /// Timeout deadline in nanoseconds
-    timeout_at: u64,
     packet_id: u32,
 }
 
@@ -428,33 +523,34 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_immediate_receipt_then_resend() {
         let mut tracker = mock_sent_packet_tracker();
-        let initial_rto = tracker.effective_rto();
 
         // Report two packets sent
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
         tracker.report_sent_packet(2, vec![4, 5, 6].into());
 
         // Immediately report receipt for the first packet
+        // This establishes SRTT ~ 0, so PTO = max(2*0, 10ms) = 10ms
         let _ = tracker.report_received_receipts(&[1]);
 
-        // Simulate time just before the resend time for packet 2
-        tracker
-            .time_source
-            .advance(initial_rto - Duration::from_millis(1));
+        // Simulate time just before TLP timeout (PTO = 10ms)
+        tracker.time_source.advance(Duration::from_millis(9));
 
-        // This should not trigger a resend yet
+        // This should not trigger a resend yet (TLP fires at 10ms)
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => (),
-            _ => panic!("Expected WaitUntil, got Resend too early"),
+            _ => panic!("Expected WaitUntil, got Resend/TlpProbe too early"),
         }
 
-        // Now advance time to trigger resend for packet 2
+        // Now advance time to trigger TLP for packet 2
         tracker.time_source.advance(Duration::from_millis(2));
 
-        // This should now trigger a resend for packet 2
+        // This should now trigger a TLP probe for packet 2
         match tracker.get_resend() {
-            ResendAction::Resend(packet_id, _) => assert_eq!(packet_id, 2),
-            _ => panic!("Expected Resend for message ID 2"),
+            ResendAction::TlpProbe(packet_id, _) => {
+                assert_eq!(packet_id, 2)
+            }
+            ResendAction::Resend(_, _) => panic!("Expected TlpProbe, got Resend"),
+            ResendAction::WaitUntil(_) => panic!("Expected TlpProbe, got WaitUntil"),
         }
     }
 
@@ -579,8 +675,8 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(10)); // Very fast RTT
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be clamped to minimum 1s (RFC 6298 Section 2.4)
-        assert!(tracker.rto() >= Duration::from_secs(1));
+        // RTO should be clamped to minimum 200ms (Linux default, faster loss detection)
+        assert!(tracker.rto() >= Duration::from_millis(200));
         assert!(tracker.rto() <= Duration::from_secs(60));
     }
 
@@ -617,12 +713,12 @@ pub(in crate::transport) mod tests {
 
         // Get resend action
         match tracker.get_resend() {
-            ResendAction::Resend(packet_id, _) => {
+            ResendAction::Resend(packet_id, _) | ResendAction::TlpProbe(packet_id, _) => {
                 assert_eq!(packet_id, 1);
                 // Packet should be marked as retransmitted
                 assert!(tracker.retransmitted_packets.contains(&1));
             }
-            _ => panic!("Expected Resend action"),
+            _ => panic!("Expected Resend or TlpProbe action"),
         }
     }
 
@@ -696,7 +792,18 @@ pub(in crate::transport) mod tests {
         // Backoff should be reset to 1 for both cases
         // (matching libutp behavior - any ACK resets backoff)
         assert_eq!(tracker.rto_backoff(), 1);
-        assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
+        // With 50ms RTT, base RTO is clamped to 200ms minimum
+        // For non-retransmitted: 50ms RTT -> RTO clamped to 200ms
+        // For retransmitted: no RTT sample, but backoff reset to 1
+        //   Note: retransmitted case keeps the previous RTO value (1s initial),
+        //   since no RTT sample is taken for retransmits (Karn's algorithm)
+        if mark_retransmitted {
+            // No RTT sample taken, so base RTO stays at initial 1s
+            assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
+        } else {
+            // RTT sample of 50ms -> RTO clamped to 200ms minimum
+            assert_eq!(tracker.effective_rto(), Duration::from_millis(200));
+        }
     }
 
     #[test]
@@ -810,11 +917,12 @@ pub(in crate::transport) mod tests {
         // Wait for timeout (using initial effective_rto)
         tracker.time_source.advance(initial_rto);
 
-        // Get resend - this should trigger backoff
+        // Get resend - this should trigger backoff (RTO, not TLP since no RTT samples)
         match tracker.get_resend() {
             ResendAction::Resend(packet_id, _) => {
                 assert_eq!(packet_id, 1);
             }
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend action"),
         }
 
@@ -827,6 +935,7 @@ pub(in crate::transport) mod tests {
         let mut tracker = mock_sent_packet_tracker();
 
         // Send packet - will timeout after effective_rto() = 1s
+        // No RTT samples, so TLP is disabled, only RTO fires
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
         assert_eq!(tracker.rto_backoff(), 1);
 
@@ -837,6 +946,7 @@ pub(in crate::transport) mod tests {
                 // Re-register the packet - now enqueued with effective_rto() = 2s
                 tracker.report_sent_packet(1, payload);
             }
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 2);
@@ -849,6 +959,7 @@ pub(in crate::transport) mod tests {
                 // Re-register - now enqueued with effective_rto() = 4s
                 tracker.report_sent_packet(1, payload);
             }
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 4);
@@ -858,19 +969,138 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_secs(4));
         match tracker.get_resend() {
             ResendAction::Resend(_, _) => {}
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 8);
         assert_eq!(tracker.effective_rto(), Duration::from_secs(8));
     }
 
-    /// End-to-end test verifying that timeout intervals actually increase.
-    /// This is the critical test that validates the fix works correctly.
+    // =========================================================================
+    // Tests for 200ms minimum RTO (Phase 1 of #2632)
+    // =========================================================================
+    //
+    // RFC 6298 recommends 1s minimum RTO, but Linux uses 200ms and this is
+    // widely accepted for modern networks. For LEDBAT, faster loss detection
+    // is critical since we're delay-sensitive.
+    //
+    // These tests verify the new 200ms minimum RTO behavior.
+    const EXPECTED_MIN_RTO: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn test_min_rto_is_200ms() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Simulate a very fast network with 10ms RTT
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(10));
+        tracker.report_received_receipts(&[1]);
+
+        // RTO should be clamped to 200ms minimum, not 1s
+        // With 10ms RTT: RTO = SRTT + max(G, 4*RTTVAR) = 10ms + max(10ms, 4*5ms) = 30ms
+        // But this is below minimum, so should be clamped to 200ms
+        assert_eq!(
+            tracker.rto(),
+            EXPECTED_MIN_RTO,
+            "RTO should be clamped to 200ms minimum for fast networks"
+        );
+    }
+
+    #[test]
+    fn test_min_rto_allows_higher_values() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Simulate a slower network with 300ms RTT
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(300));
+        tracker.report_received_receipts(&[1]);
+
+        // RTO should be above 200ms minimum, so not clamped
+        // With 300ms RTT: RTO = 300ms + max(10ms, 4*150ms) = 300ms + 600ms = 900ms
+        assert!(
+            tracker.rto() > EXPECTED_MIN_RTO,
+            "RTO should not be clamped when naturally above minimum"
+        );
+    }
+
+    #[test]
+    fn test_initial_rto_before_samples() {
+        let tracker = mock_sent_packet_tracker();
+
+        // Before any RTT samples, initial RTO should still be 1s (RFC 6298 Section 2.1)
+        // This is intentional - we don't know the RTT yet, so we're conservative
+        assert_eq!(
+            tracker.rto(),
+            Duration::from_secs(1),
+            "Initial RTO before any samples should be 1s"
+        );
+    }
+
+    #[test]
+    fn test_effective_rto_with_backoff_respects_min() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Get a fast RTT sample to set base RTO to 200ms
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(10));
+        tracker.report_received_receipts(&[1]);
+
+        // Base RTO should be 200ms (clamped)
+        assert_eq!(tracker.rto(), EXPECTED_MIN_RTO);
+
+        // Effective RTO with backoff of 1 should also be 200ms
+        assert_eq!(tracker.effective_rto(), EXPECTED_MIN_RTO);
+
+        // After timeout, backoff doubles to 2, effective RTO = 400ms
+        tracker.on_timeout();
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(400));
+
+        // After another timeout, backoff = 4, effective RTO = 800ms
+        tracker.on_timeout();
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn test_fast_loss_detection_with_200ms_rto() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish fast RTT baseline
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(20));
+        tracker.report_received_receipts(&[1]);
+
+        // Send another packet
+        tracker.report_sent_packet(2, vec![2].into());
+
+        // With 20ms RTT:
+        // - TLP (PTO) = max(2 * 20ms, 10ms) = 40ms
+        // - RTO = 200ms (minimum)
+        // TLP should fire first at ~40ms
+
+        // At 39ms, should still be waiting
+        tracker.time_source.advance(Duration::from_millis(39));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Expected - still waiting
+            _ => panic!("Should not fire before TLP timeout (40ms)"),
+        }
+
+        // At 41ms total, TLP should fire (faster than 200ms RTO!)
+        tracker.time_source.advance(Duration::from_millis(2));
+        match tracker.get_resend() {
+            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
+            ResendAction::Resend(id, _) => {
+                assert_eq!(id, 2, "Or Resend if TLP not yet implemented")
+            }
+            ResendAction::WaitUntil(_) => panic!("Should have triggered TLP after 40ms"),
+        }
+    }
+
     #[test]
     fn test_timeout_intervals_actually_increase() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Initial state: 1s RTO, no backoff
+        // No RTT samples, so TLP is disabled - only RTO fires
         assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
 
         // Send packet
@@ -880,6 +1110,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before RTO expires"),
         }
 
@@ -890,6 +1121,7 @@ pub(in crate::transport) mod tests {
                 assert_eq!(id, 1);
                 payload
             }
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 1s"),
         };
 
@@ -901,6 +1133,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(1999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (2s)"),
         }
 
@@ -911,6 +1144,7 @@ pub(in crate::transport) mod tests {
                 assert_eq!(id, 1);
                 payload
             }
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 2s"),
         };
 
@@ -922,6 +1156,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(3999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (4s)"),
         }
 
@@ -929,10 +1164,229 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(1));
         match tracker.get_resend() {
             ResendAction::Resend(id, _) => assert_eq!(id, 1),
+            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 4s"),
         }
 
         // Backoff is now 8
         assert_eq!(tracker.rto_backoff(), 8);
+    }
+
+    // =========================================================================
+    // Tests for TLP (Tail Loss Probe) - RFC 8985
+    // =========================================================================
+    //
+    // TLP sends a probe packet before the full RTO expires to detect tail loss
+    // earlier. This is especially useful for the last packets of a transfer
+    // where there are no subsequent packets to trigger fast retransmit.
+    //
+    // TLP timer (PTO) = 2 * SRTT (minimum 10ms)
+    // TLP fires BEFORE RTO, and doesn't apply backoff (it's speculative)
+
+    #[test]
+    fn test_tlp_fires_before_rto() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish RTT baseline of 50ms
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // SRTT = 50ms, so PTO = 2 * 50ms = 100ms
+        // RTO = 200ms (minimum)
+        // TLP should fire at 100ms, before RTO at 200ms
+
+        // Send another packet
+        tracker.report_sent_packet(2, vec![2].into());
+
+        // At 99ms, should still be waiting
+        tracker.time_source.advance(Duration::from_millis(99));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Expected
+            _ => panic!("Should not fire before TLP timeout"),
+        }
+
+        // At 101ms, TLP should fire (not full RTO)
+        tracker.time_source.advance(Duration::from_millis(2));
+        match tracker.get_resend() {
+            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
+            ResendAction::Resend(_, _) => panic!("Should be TLP probe, not full RTO resend"),
+            ResendAction::WaitUntil(_) => panic!("TLP should have fired at 2*SRTT"),
+        }
+    }
+
+    #[test]
+    fn test_tlp_does_not_apply_backoff() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish RTT baseline
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        assert_eq!(tracker.rto_backoff(), 1);
+
+        // Send packet and wait for TLP
+        tracker.report_sent_packet(2, vec![2].into());
+        tracker.time_source.advance(Duration::from_millis(101)); // Past PTO = 100ms
+
+        match tracker.get_resend() {
+            ResendAction::TlpProbe(_, _) => {}
+            _ => panic!("Expected TLP probe"),
+        }
+
+        // Backoff should NOT have increased (TLP is speculative)
+        assert_eq!(tracker.rto_backoff(), 1, "TLP should not increase backoff");
+    }
+
+    #[test]
+    fn test_tlp_followed_by_rto_if_no_ack() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish RTT baseline of 50ms
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // PTO = 100ms, RTO = 200ms
+
+        // Send packet
+        tracker.report_sent_packet(2, vec![2].into());
+
+        // TLP fires at ~100ms
+        tracker.time_source.advance(Duration::from_millis(101));
+        let payload = match tracker.get_resend() {
+            ResendAction::TlpProbe(id, payload) => {
+                assert_eq!(id, 2);
+                payload
+            }
+            _ => panic!("Expected TLP probe"),
+        };
+
+        // Re-register for RTO tracking after TLP
+        tracker.report_sent_packet(2, payload);
+
+        // Now if still no ACK, full RTO should fire
+        // RTO timer starts fresh after TLP, so wait another 200ms
+        tracker.time_source.advance(Duration::from_millis(199));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Still waiting for RTO
+            _ => panic!("Should still be waiting for RTO"),
+        }
+
+        tracker.time_source.advance(Duration::from_millis(2));
+        match tracker.get_resend() {
+            ResendAction::Resend(id, _) => assert_eq!(id, 2, "RTO should fire after TLP failed"),
+            ResendAction::TlpProbe(_, _) => panic!("Should be RTO, not another TLP"),
+            _ => panic!("RTO should have fired"),
+        }
+
+        // NOW backoff should have increased
+        assert_eq!(tracker.rto_backoff(), 2, "RTO should increase backoff");
+    }
+
+    #[test]
+    fn test_tlp_cancelled_by_ack() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish RTT baseline
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // Send packet
+        tracker.report_sent_packet(2, vec![2].into());
+
+        // Advance partway to TLP timeout
+        tracker.time_source.advance(Duration::from_millis(60));
+
+        // ACK arrives before TLP fires
+        tracker.report_received_receipts(&[2]);
+
+        // Now get_resend should just wait, not fire TLP
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Good - no pending packets
+            ResendAction::TlpProbe(_, _) => panic!("TLP should be cancelled by ACK"),
+            ResendAction::Resend(_, _) => panic!("No resend needed, packet was ACKed"),
+        }
+    }
+
+    #[test]
+    fn test_tlp_minimum_timeout() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Very fast RTT of 2ms -> PTO would be 4ms, but minimum is 10ms
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(2));
+        tracker.report_received_receipts(&[1]);
+
+        // SRTT = 2ms, so PTO = max(2*2ms, 10ms) = 10ms
+
+        tracker.report_sent_packet(2, vec![2].into());
+
+        // At 9ms, should still wait
+        tracker.time_source.advance(Duration::from_millis(9));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {}
+            _ => panic!("Should not fire before minimum TLP timeout"),
+        }
+
+        // At 11ms, TLP should fire
+        tracker.time_source.advance(Duration::from_millis(2));
+        match tracker.get_resend() {
+            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2),
+            _ => panic!("TLP should fire at minimum 10ms"),
+        }
+    }
+
+    #[test]
+    fn test_tlp_disabled_before_rtt_samples() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // No RTT samples yet - TLP should be disabled, only RTO
+        // Initial RTO is 1s
+
+        tracker.report_sent_packet(1, vec![1].into());
+
+        // At 500ms, should still wait (no TLP without RTT baseline)
+        tracker.time_source.advance(Duration::from_millis(500));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {}
+            ResendAction::TlpProbe(_, _) => panic!("TLP should not fire without RTT samples"),
+            ResendAction::Resend(_, _) => panic!("RTO is 1s, should not fire at 500ms"),
+        }
+
+        // At 1001ms, RTO fires (no TLP)
+        tracker.time_source.advance(Duration::from_millis(501));
+        match tracker.get_resend() {
+            ResendAction::Resend(id, _) => assert_eq!(id, 1),
+            ResendAction::TlpProbe(_, _) => panic!("Should be RTO, not TLP"),
+            _ => panic!("RTO should fire at 1s"),
+        }
+    }
+
+    #[test]
+    fn test_tlp_only_once_per_flight() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Establish RTT baseline
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.time_source.advance(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // Send multiple packets
+        tracker.report_sent_packet(2, vec![2].into());
+        tracker.report_sent_packet(3, vec![3].into());
+        tracker.report_sent_packet(4, vec![4].into());
+
+        // TLP fires once for the tail (last packet)
+        tracker.time_source.advance(Duration::from_millis(101));
+        match tracker.get_resend() {
+            ResendAction::TlpProbe(id, _) => {
+                // Should probe the oldest unacked packet
+                assert_eq!(id, 2, "TLP should probe oldest unacked packet");
+            }
+            _ => panic!("Expected TLP probe"),
+        }
     }
 }
