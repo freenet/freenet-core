@@ -749,7 +749,11 @@ impl ConnectionManager {
         let candidates: Vec<PeerKeyLocation> = connections
             .values()
             .filter_map(|conns| {
-                let conn = GlobalRng::choose(conns)?;
+                // Sort connections for deterministic selection
+                // (Vec ordering may vary based on async connection establishment order)
+                let mut sorted_conns: Vec<_> = conns.iter().collect();
+                sorted_conns.sort_by_key(|c| c.location.clone());
+                let conn = GlobalRng::choose(&sorted_conns)?;
                 let addr = conn.location.socket_addr()?;
                 if self.is_transient(addr) {
                     return None;

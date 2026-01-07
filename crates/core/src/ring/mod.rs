@@ -618,7 +618,10 @@ impl Ring {
 
         let connections = self.connection_manager.get_connections_by_location();
         for conns in connections.values() {
-            for conn in conns {
+            // Sort connections for deterministic iteration order
+            let mut sorted_conns: Vec<_> = conns.iter().collect();
+            sorted_conns.sort_by_key(|c| c.location.clone());
+            for conn in sorted_conns {
                 if let Some(addr) = conn.location.socket_addr() {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
                         continue;
@@ -627,6 +630,9 @@ impl Ring {
                 candidates.push(conn.location.clone());
             }
         }
+
+        // Sort candidates for deterministic input to select_k_best_peers
+        candidates.sort();
 
         // Note: We intentionally do NOT fall back to known_locations here.
         // known_locations may contain peers we're not currently connected to,

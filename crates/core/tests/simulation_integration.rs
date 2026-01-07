@@ -31,15 +31,23 @@ use std::time::Duration;
 /// doesn't control (e.g., HashMap iteration order, external I/O, real time usage).
 ///
 /// TODO-MUST-FIX: This test is currently ignored due to known non-determinism issues.
-/// Investigation found multiple potential sources:
+/// Investigation found and fixed several sources:
 ///
-/// - HashSet/HashMap iteration order in operations/update.rs (targets selection)
-/// - std::time::Instant vs tokio::time::Instant usage (turmoil only intercepts tokio::time)
-/// - DashMap concurrent access ordering
+/// Fixed:
+/// - HashSet iteration order in operations/update.rs (targets now sorted)
+/// - DashMap iteration order in ring/seeding.rs (results now sorted)
+/// - DashSet iteration order in node/proximity_cache.rs (results now sorted)
+/// - Vec ordering in connection_manager.rs routing_candidates (now sorted before choose)
+/// - Vec ordering in ring/mod.rs k_closest_potentially_caching (now sorted)
+/// - GlobalRng thread ID seeding (now uses deterministic thread index counter)
 ///
-/// The simulation uses turmoil which should provide deterministic scheduling, but event
-/// counts differ by ~10-20% between runs with the same seed. Root cause requires deeper
-/// investigation into turmoil's interaction with our code.
+/// Remaining issues:
+/// - Connection establishment ordering: Connections are added to Vecs in order of
+///   async completion, which may vary between runs even with deterministic scheduling
+/// - Event counts still differ by ~5-10% between runs
+///
+/// Root cause requires deeper investigation into turmoil's task scheduling or
+/// potential additional collection iteration non-determinism.
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
