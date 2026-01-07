@@ -1653,9 +1653,7 @@ impl EventRegister {
             } else {
                 futures::future::pending().boxed()
             };
-            // Note: This uses tokio::select! because the borrow of `ws` in ws_recv
-            // conflicts with ws.as_mut() in branch bodies when using deterministic_select!
-            tokio::select! {
+            crate::deterministic_select! {
                 cmd = log_recv.recv() => {
                     let Some(cmd) = cmd else { break; };
                     match cmd {
@@ -1672,12 +1670,12 @@ impl EventRegister {
                             let _ = reply.send(());
                         }
                     }
-                }
+                },
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
                         received_from_metrics_server(ws, ws_msg).await;
                     }
-                }
+                },
             }
         }
 

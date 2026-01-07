@@ -250,9 +250,7 @@ impl TelemetryWorker {
             tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
 
         loop {
-            // Note: This uses tokio::select! because the borrows of `self` in multiple branches
-            // don't work with deterministic_select! which pins futures upfront.
-            tokio::select! {
+            crate::deterministic_select! {
                 cmd = self.receiver.recv() => {
                     match cmd {
                         Some(TelemetryCommand::Event(event)) => {
@@ -264,7 +262,7 @@ impl TelemetryWorker {
                             break;
                         }
                     }
-                }
+                },
                 transfer_event = self.transfer_event_receiver.recv() => {
                     // Handle per-transfer telemetry events from transport layer
                     if let Some(transfer_event) = transfer_event {
@@ -282,10 +280,10 @@ impl TelemetryWorker {
                         };
                         self.handle_event(event).await;
                     }
-                }
+                },
                 _ = batch_interval.tick() => {
                     self.flush().await;
-                }
+                },
                 _ = transport_snapshot_interval.tick() => {
                     // Emit transport layer metrics snapshot (only if enabled)
                     if self.transport_snapshot_interval_secs > 0 {
@@ -300,7 +298,7 @@ impl TelemetryWorker {
                             self.handle_event(event).await;
                         }
                     }
-                }
+                },
             }
         }
     }

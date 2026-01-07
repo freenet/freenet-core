@@ -3306,9 +3306,8 @@ async fn peer_connection_listener(
         }
 
         // Now wait for either new outbound or inbound messages fairly
-        // Note: This uses tokio::select! because the borrow of `conn` in both branches
-        // doesn't work with deterministic_select! which pins futures upfront.
-        tokio::select! {
+        // Uses deterministic_select! for consistent test behavior under DST
+        crate::deterministic_select! {
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
@@ -3339,7 +3338,7 @@ async fn peer_connection_listener(
                         return;
                     }
                 }
-            }
+            },
             msg = conn.recv() => {
                 match msg {
                     Ok(msg) => match decode_msg(&msg) {
@@ -3399,7 +3398,7 @@ async fn peer_connection_listener(
                         return;
                     }
                 }
-            }
+            },
         }
     }
 }
