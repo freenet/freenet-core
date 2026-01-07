@@ -608,10 +608,11 @@ impl<T: TimeSource> LedbatController<T> {
             CongestionState::CongestionAvoidance => {
                 // Check if it's time for the next scheduled slowdown
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
-                if now_nanos >= next_slowdown && next_slowdown != u64::MAX {
-                    if self.start_slowdown(now_nanos, base_delay) {
-                        return true;
-                    }
+                if now_nanos >= next_slowdown
+                    && next_slowdown != u64::MAX
+                    && self.start_slowdown(now_nanos, base_delay)
+                {
+                    return true;
                 }
                 false
             }
