@@ -70,18 +70,25 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
-  # Clippy runs on GitHub-hosted runner (fast with cache), freeing nova for tests
+  # Clippy runs in parallel with fmt_check for faster fail-fast
+  # Using Ubicloud for faster builds with more cores
   clippy_check:
     name: Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: fmt_check
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 15
+    # No dependencies - runs immediately in parallel with fmt_check
 
     env:
       RUST_LOG: error
+      RUST_MIN_STACK: 268435456
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -92,6 +99,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: clippy
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -- -D warnings
 
   test_all:
@@ -152,8 +162,8 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Run all tests in parallel (simulation tests excluded via feature flag)
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
+        # Run all tests in parallel using all 16 cores (simulation tests excluded via feature flag)
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=16
 
       - name: Test simulation (serial)
         env:
