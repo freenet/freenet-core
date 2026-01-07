@@ -283,31 +283,11 @@ impl Operation for UpdateOp {
                                 }
                             }
 
-                            // Always propagate to subscribers, even if local state didn't change.
-                            // This ensures eventual consistency: subscribers may have stale state
-                            // even if we already have the latest version.
-                            // Get broadcast targets for propagating UPDATE to subscribers
-                            // Use source_addr directly instead of PeerKeyLocation lookup
-                            let sender_addr = source_addr
-                                .expect("remote UpdateMsg::RequestUpdate must have source_addr");
-                            let broadcast_to =
-                                op_manager.get_broadcast_targets_update(key, &sender_addr);
-
                             if !changed {
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
-                                    targets = broadcast_to.len(),
-                                    "UPDATE yielded no local state change, but propagating to {} subscribers",
-                                    broadcast_to.len()
-                                );
-                            }
-
-                            if broadcast_to.is_empty() {
-                                tracing::debug!(
-                                    tx = %id,
-                                    %key,
-                                    "No broadcast targets, completing UPDATE locally"
+                                    "UPDATE yielded no state change, skipping broadcast"
                                 );
 
                                 // Use upstream_addr to determine if we're the originator
@@ -322,24 +302,52 @@ impl Operation for UpdateOp {
 
                                 return_msg = None;
                             } else {
-                                // Broadcast to other peers
-                                match try_to_broadcast(
-                                    *id,
-                                    true, // last_hop - we're handling locally
-                                    op_manager,
-                                    self.state,
-                                    broadcast_to,
-                                    *key,
-                                    updated_value.clone(),
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok((state, msg)) => {
-                                        new_state = state;
-                                        return_msg = msg;
+                                // Get broadcast targets for propagating UPDATE to subscribers
+                                // Use source_addr directly instead of PeerKeyLocation lookup
+                                let sender_addr = source_addr.expect(
+                                    "remote UpdateMsg::RequestUpdate must have source_addr",
+                                );
+                                let broadcast_to =
+                                    op_manager.get_broadcast_targets_update(key, &sender_addr);
+
+                                if broadcast_to.is_empty() {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "No broadcast targets, completing UPDATE locally"
+                                    );
+
+                                    // Use upstream_addr to determine if we're the originator
+                                    if self.upstream_addr.is_none() {
+                                        new_state = Some(UpdateState::Finished {
+                                            key: *key,
+                                            summary: summary.clone(),
+                                        });
+                                    } else {
+                                        new_state = None;
                                     }
-                                    Err(err) => return Err(err),
+
+                                    return_msg = None;
+                                } else {
+                                    // Broadcast to other peers
+                                    match try_to_broadcast(
+                                        *id,
+                                        true, // last_hop - we're handling locally
+                                        op_manager,
+                                        self.state,
+                                        broadcast_to,
+                                        *key,
+                                        updated_value.clone(),
+                                        false,
+                                    )
+                                    .await
+                                    {
+                                        Ok((state, msg)) => {
+                                            new_state = state;
+                                            return_msg = msg;
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
                                 }
                             }
                         } else {
@@ -465,45 +473,42 @@ impl Operation for UpdateOp {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
 
-                    // Always propagate to downstream subscribers, even if local state didn't change.
-                    // This ensures eventual consistency: a peer may already have the latest state
-                    // (received via a different path), but its downstream subscribers may still
-                    // have stale state and need the update.
-                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender_addr);
-
                     if !changed {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            targets = broadcast_to.len(),
-                            "BroadcastTo update produced no local change, but continuing propagation to {} subscribers",
-                            broadcast_to.len()
+                            "BroadcastTo update produced no change, ending propagation"
                         );
+                        new_state = None;
+                        return_msg = None;
                     } else {
+                        let broadcast_to =
+                            op_manager.get_broadcast_targets_update(key, &sender_addr);
+
                         tracing::debug!(
                             "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
                             key,
                             self_location.location()
                         );
-                    }
 
-                    match try_to_broadcast(
-                        *id,
-                        false,
-                        op_manager,
-                        self.state,
-                        broadcast_to,
-                        *key,
-                        updated_value.clone(),
-                        true,
-                    )
-                    .await
-                    {
-                        Ok((state, msg)) => {
-                            new_state = state;
-                            return_msg = msg;
+                        match try_to_broadcast(
+                            *id,
+                            false,
+                            op_manager,
+                            self.state,
+                            broadcast_to,
+                            *key,
+                            updated_value.clone(),
+                            true,
+                        )
+                        .await
+                        {
+                            Ok((state, msg)) => {
+                                new_state = state;
+                                return_msg = msg;
+                            }
+                            Err(err) => return Err(err),
                         }
-                        Err(err) => return Err(err),
                     }
                 }
                 UpdateMsg::Broadcasting {
@@ -772,51 +777,24 @@ impl OpManager {
                 "UPDATE_PROPAGATION"
             );
         } else {
-            // No explicit targets found - use fallback to k-closest peers who might cache this contract
-            // This ensures updates can propagate even when subscription tree is incomplete
             let own_addr = self.ring.connection_manager.get_own_addr();
             let skip_slice = std::slice::from_ref(sender);
-            let fallback_candidates: Vec<PeerKeyLocation> = self
+            let fallback_candidates = self
                 .ring
                 .k_closest_potentially_caching(key, skip_slice, 5)
                 .into_iter()
-                // Only include peers we're actually connected to
-                .filter(|pk| {
-                    pk.socket_addr()
-                        .map(|addr| {
-                            self.ring
-                                .connection_manager
-                                .get_peer_by_addr(addr)
-                                .is_some()
-                        })
-                        .unwrap_or(false)
-                })
-                .collect();
+                .filter_map(|candidate| candidate.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
+                .collect::<Vec<_>>();
 
-            if fallback_candidates.is_empty() {
-                tracing::warn!(
-                    contract = %format!("{:.8}", key),
-                    peer_addr = %sender,
-                    self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
-                    phase = "error",
-                    "UPDATE_PROPAGATION: NO_TARGETS - no fallback candidates available, update will not propagate"
-                );
-            } else {
-                tracing::info!(
-                    contract = %format!("{:.8}", key),
-                    peer_addr = %sender,
-                    targets = %fallback_candidates
-                        .iter()
-                        .filter_map(|s| s.socket_addr())
-                        .map(|addr| format!("{:.8}", addr))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    count = fallback_candidates.len(),
-                    phase = "fallback",
-                    "UPDATE_PROPAGATION: Using k-closest fallback for propagation"
-                );
-                return fallback_candidates;
-            }
+            tracing::warn!(
+                contract = %format!("{:.8}", key),
+                peer_addr = %sender,
+                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
+                fallback_candidates = ?fallback_candidates,
+                phase = "error",
+                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate"
+            );
         }
 
         targets
