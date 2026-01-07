@@ -96,7 +96,7 @@ jobs:
 
   test_all:
     name: Test
-    runs-on: self-hosted
+    runs-on: ubicloud-standard-16
     timeout-minutes: 30
     needs: fmt_check
     # Skip on merge_group - PR already passed full tests, merge queue only needs
@@ -111,15 +111,16 @@ jobs:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # 64MB required for LLVM inliner pass on large workspaces
-      RUST_MIN_STACK: 67108864
-      # Use mold linker to avoid rust-lld crashes (see issue #2519)
-      # rust-lld occasionally segfaults with "relocation R_X86_64_PLT32 out of range"
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -132,6 +133,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
+        env:
+          # Use mold linker to avoid rust-lld crashes (see issue #2519)
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
           cargo build --locked
           export PATH="$PWD/target/debug:$PATH"
@@ -144,10 +149,16 @@ jobs:
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
       - name: Test
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         # Run all tests in parallel (simulation tests excluded via feature flag)
         run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
 
       - name: Test simulation (serial)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         # Simulation tests use global state (socket registries, RNG, counters)
         # and must run serially to avoid race conditions
         run: |
@@ -161,7 +172,7 @@ jobs:
   six_peer_regression:
     name: six-peer-regression
     needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
-    runs-on: self-hosted
+    runs-on: ubicloud-standard-16
     timeout-minutes: 30
     # Skip on merge_group - PR already passed full tests
     # Skip on release PRs - they only bump versions, main already passed CI
@@ -171,20 +182,19 @@ jobs:
 
     env:
       RUST_LOG: error
-      # Ensure lzma-sys can find liblzma on Arch Linux (self-hosted runner)
-      LIBRARY_PATH: /usr/lib
-      PKG_CONFIG_PATH: /usr/lib/pkgconfig
       # Increase rustc stack size to prevent SIGSEGV during compilation
-      # 64MB required for LLVM inliner pass on large workspaces
-      RUST_MIN_STACK: 67108864
-      # Use mold linker to avoid rust-lld crashes (see issue #2519)
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
 
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold liblzma-dev
 
       - name: Checkout river
         uses: actions/checkout@v6
@@ -214,6 +224,9 @@ jobs:
         env:
           FREENET_CORE_PATH: ${{ github.workspace }}
           RUST_LOG: info
+          # Use mold linker to avoid rust-lld crashes (see issue #2519)
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         # Use Docker NAT to simulate realistic network topology where peers
         # are behind NAT and gateways are on the public network. This provides
         # better test coverage for NAT traversal and gateway connection code paths.
@@ -233,7 +246,7 @@ jobs:
 
   claude-ci-analysis:
     name: Claude CI Analysis
-    runs-on: self-hosted
+    runs-on: ubicloud-standard-4
     timeout-minutes: 30
     needs: [clippy_check, fmt_check]  # Removed test_all to avoid dependency skip cascade
     # Only run on PRs with claude-debug label when there's a failure
