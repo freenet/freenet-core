@@ -777,24 +777,52 @@ impl OpManager {
                 "UPDATE_PROPAGATION"
             );
         } else {
+            // No explicit targets found - use fallback to k-closest peers who might cache this contract.
+            // This ensures updates can propagate even when subscription tree is incomplete or
+            // proximity cache announcements haven't reached all peers yet.
             let own_addr = self.ring.connection_manager.get_own_addr();
             let skip_slice = std::slice::from_ref(sender);
-            let fallback_candidates = self
+            let fallback_targets: Vec<PeerKeyLocation> = self
                 .ring
                 .k_closest_potentially_caching(key, skip_slice, 5)
                 .into_iter()
-                .filter_map(|candidate| candidate.socket_addr())
-                .map(|addr| format!("{:.8}", addr))
-                .collect::<Vec<_>>();
+                // Only include peers we're actually connected to
+                .filter(|pk| {
+                    pk.socket_addr()
+                        .map(|addr| {
+                            self.ring
+                                .connection_manager
+                                .get_peer_by_addr(addr)
+                                .is_some()
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
 
-            tracing::warn!(
-                contract = %format!("{:.8}", key),
-                peer_addr = %sender,
-                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
-                fallback_candidates = ?fallback_candidates,
-                phase = "error",
-                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate"
-            );
+            if fallback_targets.is_empty() {
+                tracing::warn!(
+                    contract = %format!("{:.8}", key),
+                    peer_addr = %sender,
+                    self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
+                    phase = "error",
+                    "UPDATE_PROPAGATION: NO_TARGETS - no fallback candidates available"
+                );
+            } else {
+                tracing::info!(
+                    contract = %format!("{:.8}", key),
+                    peer_addr = %sender,
+                    targets = %fallback_targets
+                        .iter()
+                        .filter_map(|s| s.socket_addr())
+                        .map(|addr| format!("{:.8}", addr))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    count = fallback_targets.len(),
+                    phase = "fallback",
+                    "UPDATE_PROPAGATION: Using k-closest fallback for propagation"
+                );
+                return fallback_targets;
+            }
         }
 
         targets
