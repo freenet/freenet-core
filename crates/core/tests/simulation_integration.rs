@@ -60,11 +60,16 @@ use std::time::Duration;
 /// - DashMap/DashSet iterations in op_state_manager.rs use .all()/.count() which are
 ///   order-independent
 ///
-/// Potential remaining sources (need investigation):
-/// 1. Turmoil's internal scheduling may have subtle non-determinism
+/// Potential remaining sources (HIGH LIKELIHOOD - tokio::select! randomness):
+/// 1. tokio::select! without `biased` keyword uses random branch ordering:
+///    - client_events/mod.rs:309 - 3 branches for client event handling
+///    - node/mod.rs:1457 - 2 branches for ws_proxy/gw selection
+///    - node/op_state_manager.rs:936 - cleanup task polling
+///    - node/p2p_impl.rs:181 - main node event loop
+///    The random branch selection is NOT controlled by turmoil's RNG seeding.
+///    Fix would require: biased select everywhere OR custom select using GlobalRng.
 /// 2. tokio::time vs std::time interactions in certain code paths
 /// 3. Some HashMap iteration patterns may remain unfixed
-/// 4. Channel receive ordering when multiple senders are active
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
