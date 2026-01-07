@@ -40,14 +40,20 @@ use std::time::Duration;
 /// - Vec ordering in connection_manager.rs routing_candidates (now sorted before choose)
 /// - Vec ordering in ring/mod.rs k_closest_potentially_caching (now sorted)
 /// - GlobalRng thread ID seeding (now uses deterministic thread index counter)
+/// - HashMap iteration in subscribe.rs fallback target selection (keys now sorted)
+/// - spawn_blocking in generate_rand_event() (bypassed in simulation_tests mode)
 ///
 /// Remaining issues:
-/// - Connection establishment ordering: Connections are added to Vecs in order of
-///   async completion, which may vary between runs even with deterministic scheduling
+/// - WASM contract execution uses spawn_blocking which runs on a real thread pool
+///   outside turmoil's control. This affects Update events non-deterministically.
 /// - Event counts still differ by ~5-10% between runs
 ///
-/// Root cause requires deeper investigation into turmoil's task scheduling or
-/// potential additional collection iteration non-determinism.
+/// Root cause: spawn_blocking tasks complete in non-deterministic order because
+/// turmoil only controls the tokio async scheduler, not the blocking thread pool.
+/// Full determinism would require either:
+/// 1. Running WASM execution synchronously in simulation mode (performance impact)
+/// 2. Using a mock contract executor for simulation tests
+/// 3. Implementing deterministic blocking thread scheduling (complex)
 #[test]
 #[ignore]
 fn test_strict_determinism_exact_event_equality() {
