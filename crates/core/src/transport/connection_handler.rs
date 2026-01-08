@@ -593,10 +593,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let mut last_rate_limit_cleanup_nanos = self.time_source.now_nanos();
 
         'outer: loop {
-            tokio::select! {
-                // DST: biased; ensures deterministic branch selection order
-                biased;
-
+            // DST: Use deterministic_select! for fair but deterministic branch ordering
+            crate::deterministic_select! {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
@@ -1009,7 +1007,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             ongoing_connections.remove(&remote_addr);
                         }
                     }
-                }
+                },
                 connection_handshake = connection_tasks.next(), if !connection_tasks.is_empty() => {
                     let Some(res): OngoingConnectionResult<S, T> = connection_handshake else {
                         unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
@@ -1100,7 +1098,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                     }
-                }
+                },
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else {

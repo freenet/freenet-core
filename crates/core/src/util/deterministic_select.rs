@@ -76,6 +76,29 @@ pub enum Out5<A, B, C, D, E, F> {
     _Else(F),
 }
 
+/// Output enum for 6-branch select (with optional else)
+pub enum Out6<A, B, C, D, E, F, G> {
+    _0(A),
+    _1(B),
+    _2(C),
+    _3(D),
+    _4(E),
+    _5(F),
+    _Else(G),
+}
+
+/// Output enum for 7-branch select (with optional else)
+pub enum Out7<A, B, C, D, E, F, G, H> {
+    _0(A),
+    _1(B),
+    _2(C),
+    _3(D),
+    _4(E),
+    _5(F),
+    _6(G),
+    _Else(H),
+}
+
 /// The `deterministic_select!` macro waits on multiple async operations simultaneously,
 /// returning when one of them completes. Branch ordering is determined by `GlobalRng`
 /// for deterministic but fair selection.
@@ -750,6 +773,212 @@ macro_rules! deterministic_select {
             Out5::_3($pat4) => $body4,
             Out5::_4($pat5) => $body5,
             Out5::_Else(()) => unreachable!(),
+        }
+    }};
+
+    // 5 branches: first without guard, second and third with guards, fourth without, fifth with guard
+    // Pattern: connection_handler.rs recv loop
+    (
+        $pat1:pat = $fut1:expr => $body1:expr,
+        $pat2:pat = $fut2:expr, if $guard2:expr => $body2:expr,
+        $pat3:pat = $fut3:expr, if $guard3:expr => $body3:expr,
+        $pat4:pat = $fut4:expr => $body4:expr,
+        $pat5:pat = $fut5:expr, if $guard5:expr => $body5:expr $(,)?
+    ) => {{
+        use std::future::Future;
+        use std::task::Poll;
+        use $crate::util::deterministic_select::Out5;
+
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = {
+            let mut d = 0u8;
+            if !$guard2 { d |= 1 << 1; }
+            if !$guard3 { d |= 1 << 2; }
+            if !$guard5 { d |= 1 << 4; }
+            d
+        };
+
+        // Build order array (stack allocated)
+        // Branches 0, 3 are always enabled; 1, 2, 4 depend on guards
+        let mut order: [usize; 5] = [0, 3, 0, 0, 0];
+        let mut enabled_count = 2usize;
+        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+        if disabled & (1 << 4) == 0 { order[enabled_count] = 4; enabled_count += 1; }
+
+        // Compute random start ONCE and rotate
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            order[..enabled_count].rotate_left(start);
+        }
+
+        let output = {
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
+            let fut4 = $fut4;
+            let fut5 = $fut5;
+            tokio::pin!(fut1);
+            tokio::pin!(fut2);
+            tokio::pin!(fut3);
+            tokio::pin!(fut4);
+            tokio::pin!(fut5);
+
+            std::future::poll_fn(|cx| {
+                for i in 0..enabled_count {
+                    let idx = order[i];
+                    match idx {
+                        0 => {
+                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
+                                return Poll::Ready(Out5::<_, _, _, _, _, ()>::_0(val));
+                            }
+                        }
+                        1 => {
+                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
+                                return Poll::Ready(Out5::<_, _, _, _, _, ()>::_1(val));
+                            }
+                        }
+                        2 => {
+                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
+                                return Poll::Ready(Out5::<_, _, _, _, _, ()>::_2(val));
+                            }
+                        }
+                        3 => {
+                            if let Poll::Ready(val) = fut4.as_mut().poll(cx) {
+                                return Poll::Ready(Out5::<_, _, _, _, _, ()>::_3(val));
+                            }
+                        }
+                        4 => {
+                            if let Poll::Ready(val) = fut5.as_mut().poll(cx) {
+                                return Poll::Ready(Out5::<_, _, _, _, _, ()>::_4(val));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Poll::Pending
+            }).await
+        };
+
+        match output {
+            Out5::_0($pat1) => $body1,
+            Out5::_1($pat2) => $body2,
+            Out5::_2($pat3) => $body3,
+            Out5::_3($pat4) => $body4,
+            Out5::_4($pat5) => $body5,
+            Out5::_Else(()) => unreachable!(),
+        }
+    }};
+
+    // ==================== 7 BRANCHES ====================
+
+    // 7 branches: first without guard, second and third with guards, rest without guards
+    // Pattern: peer_connection.rs recv loop
+    (
+        $pat1:pat = $fut1:expr => $body1:expr,
+        $pat2:pat = $fut2:expr, if $guard2:expr => $body2:expr,
+        $pat3:pat = $fut3:expr, if $guard3:expr => $body3:expr,
+        $pat4:pat = $fut4:expr => $body4:expr,
+        $pat5:pat = $fut5:expr => $body5:expr,
+        $pat6:pat = $fut6:expr => $body6:expr,
+        $pat7:pat = $fut7:expr => $body7:expr $(,)?
+    ) => {{
+        use std::future::Future;
+        use std::task::Poll;
+        use $crate::util::deterministic_select::Out7;
+
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let disabled: u8 = {
+            let mut d = 0u8;
+            if !$guard2 { d |= 1 << 1; }
+            if !$guard3 { d |= 1 << 2; }
+            d
+        };
+
+        // Build order array (stack allocated)
+        // Branches 0, 3, 4, 5, 6 are always enabled; 1, 2 depend on guards
+        let mut order: [usize; 7] = [0, 3, 4, 5, 6, 0, 0];
+        let mut enabled_count = 5usize;
+        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+
+        // Compute random start ONCE and rotate
+        if enabled_count > 1 {
+            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            order[..enabled_count].rotate_left(start);
+        }
+
+        let output = {
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
+            let fut4 = $fut4;
+            let fut5 = $fut5;
+            let fut6 = $fut6;
+            let fut7 = $fut7;
+            tokio::pin!(fut1);
+            tokio::pin!(fut2);
+            tokio::pin!(fut3);
+            tokio::pin!(fut4);
+            tokio::pin!(fut5);
+            tokio::pin!(fut6);
+            tokio::pin!(fut7);
+
+            std::future::poll_fn(|cx| {
+                for i in 0..enabled_count {
+                    let idx = order[i];
+                    match idx {
+                        0 => {
+                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_0(val));
+                            }
+                        }
+                        1 => {
+                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_1(val));
+                            }
+                        }
+                        2 => {
+                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_2(val));
+                            }
+                        }
+                        3 => {
+                            if let Poll::Ready(val) = fut4.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_3(val));
+                            }
+                        }
+                        4 => {
+                            if let Poll::Ready(val) = fut5.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_4(val));
+                            }
+                        }
+                        5 => {
+                            if let Poll::Ready(val) = fut6.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_5(val));
+                            }
+                        }
+                        6 => {
+                            if let Poll::Ready(val) = fut7.as_mut().poll(cx) {
+                                return Poll::Ready(Out7::<_, _, _, _, _, _, _, ()>::_6(val));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Poll::Pending
+            }).await
+        };
+
+        match output {
+            Out7::_0($pat1) => $body1,
+            Out7::_1($pat2) => $body2,
+            Out7::_2($pat3) => $body3,
+            Out7::_3($pat4) => $body4,
+            Out7::_4($pat5) => $body5,
+            Out7::_5($pat6) => $body6,
+            Out7::_6($pat7) => $body7,
+            Out7::_Else(()) => unreachable!(),
         }
     }};
 }

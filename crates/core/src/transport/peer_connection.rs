@@ -458,10 +458,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
-            tokio::select! {
-                // DST: biased; ensures deterministic branch selection order
-                biased;
-
+            // DST: Use deterministic_select! for fair but deterministic branch ordering
+            crate::deterministic_select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv_async() => {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received_nanos = self.time_source.now_nanos();
@@ -728,7 +726,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         return Ok(msg);
                     }
-                }
+                },
                 inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
                     let Some(res) = inbound_stream else {
                         tracing::error!(
@@ -755,7 +753,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         "Stream finished"
                     );
                     return Ok(msg);
-                }
+                },
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
                     let Some(res) = outbound_stream else {
                         tracing::error!(
@@ -782,7 +780,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                         Err(e) => return Err(e),
                     }
-                }
+                },
                 _ = timeout_check.tick() => {
                     let now_nanos = self.time_source.now_nanos();
                     let elapsed_nanos = now_nanos.saturating_sub(last_received_nanos);
@@ -858,7 +856,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         pending_pings = pending_ping_count,
                         "Connection health check - still alive"
                     );
-                }
+                },
                 _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
                     loop {
                         tracing::trace!(
@@ -891,7 +889,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             }
                         }
                     }
-                }
+                },
                 // Background ACK timer - proactively send pending ACKs
                 // This prevents ACK delays when there's no outgoing traffic to piggyback on
                 _ = ack_check.tick() => {
@@ -904,7 +902,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         self.noop(receipts).await?;
                     }
-                }
+                },
                 // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
                 _ = rate_update_check.tick() => {
