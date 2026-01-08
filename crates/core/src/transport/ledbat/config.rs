@@ -119,3 +119,27 @@ impl Default for LedbatConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_target_delay_is_60ms() {
+        assert_eq!(
+            TARGET,
+            Duration::from_millis(60),
+            "LEDBAT++ TARGET should be 60ms"
+        );
+    }
+
+    #[test]
+    fn test_slow_start_exit_threshold_is_75_percent() {
+        let config = LedbatConfig::default();
+        assert!(
+            (config.delay_exit_threshold - 0.75).abs() < 0.01,
+            "LEDBAT++ delay_exit_threshold should be 0.75, got {}",
+            config.delay_exit_threshold
+        );
+    }
+}
