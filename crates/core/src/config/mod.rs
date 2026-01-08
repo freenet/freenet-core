@@ -1557,8 +1557,7 @@ static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::n
 
 /// Counter for deterministic thread indexing.
 /// Each thread gets a unique, deterministic index for RNG seeding.
-static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Thread-local seeded RNG for deterministic operations.
 // Each thread gets its own RNG seeded from the global seed + deterministic thread index.
@@ -1737,7 +1736,8 @@ impl GlobalRng {
                             new_idx
                         }
                     });
-                    let thread_seed = seed.wrapping_add(thread_index.wrapping_mul(0x9E3779B97F4A7C15));
+                    let thread_seed =
+                        seed.wrapping_add(thread_index.wrapping_mul(0x9E3779B97F4A7C15));
                     *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
                 }
                 f(rng_ref.as_mut().unwrap())

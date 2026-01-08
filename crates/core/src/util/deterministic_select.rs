@@ -127,8 +127,8 @@ macro_rules! deterministic_select {
         let order: [usize; 2] = [start % 2, (start + 1) % 2];
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
 
@@ -149,7 +149,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -171,16 +172,26 @@ macro_rules! deterministic_select {
         // IMPORTANT: Evaluate guards FIRST, before creating futures!
         let disabled: u8 = {
             let mut d = 0u8;
-            if !$guard1 { d |= 1 << 0; }
-            if !$guard2 { d |= 1 << 1; }
+            if !$guard1 {
+                d |= 1 << 0;
+            }
+            if !$guard2 {
+                d |= 1 << 1;
+            }
             d
         };
 
         // Count enabled branches and build order array (stack allocated)
         let mut order: [usize; 2] = [0, 0];
         let mut enabled_count = 0usize;
-        if disabled & (1 << 0) == 0 { order[enabled_count] = 0; enabled_count += 1; }
-        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+        if disabled & (1 << 0) == 0 {
+            order[enabled_count] = 0;
+            enabled_count += 1;
+        }
+        if disabled & (1 << 1) == 0 {
+            order[enabled_count] = 1;
+            enabled_count += 1;
+        }
 
         // If all disabled, panic (no else branch provided)
         if enabled_count == 0 {
@@ -189,7 +200,8 @@ macro_rules! deterministic_select {
 
         // Compute random start ONCE and shuffle the enabled portion
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             if start == 1 {
                 order.swap(0, 1);
             }
@@ -219,7 +231,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -244,12 +257,17 @@ macro_rules! deterministic_select {
         // Build order array (stack allocated)
         let mut order: [usize; 2] = [0, 0];
         let mut enabled_count = 0usize;
-        if disabled & (1 << 0) == 0 { order[enabled_count] = 0; enabled_count += 1; }
-        order[enabled_count] = 1; enabled_count += 1; // Branch 1 always enabled
+        if disabled & (1 << 0) == 0 {
+            order[enabled_count] = 0;
+            enabled_count += 1;
+        }
+        order[enabled_count] = 1;
+        enabled_count += 1; // Branch 1 always enabled
 
         // Compute random start ONCE and shuffle
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             if start == 1 {
                 order.swap(0, 1);
             }
@@ -279,7 +297,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -304,12 +323,17 @@ macro_rules! deterministic_select {
         // Build order array (stack allocated)
         let mut order: [usize; 2] = [0, 0];
         let mut enabled_count = 0usize;
-        order[enabled_count] = 0; enabled_count += 1; // Branch 0 always enabled
-        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
+        order[enabled_count] = 0;
+        enabled_count += 1; // Branch 0 always enabled
+        if disabled & (1 << 1) == 0 {
+            order[enabled_count] = 1;
+            enabled_count += 1;
+        }
 
         // Compute random start ONCE and shuffle
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             if start == 1 {
                 order.swap(0, 1);
             }
@@ -339,7 +363,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -366,9 +391,9 @@ macro_rules! deterministic_select {
         let order: [usize; 3] = [start % 3, (start + 1) % 3, (start + 2) % 3];
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
             tokio::pin!(fut3);
@@ -395,7 +420,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -422,18 +448,22 @@ macro_rules! deterministic_select {
         // Build order array (stack allocated)
         let mut order: [usize; 3] = [0, 1, 0];
         let mut enabled_count = 2usize; // Branches 0,1 always enabled
-        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+        if disabled & (1 << 2) == 0 {
+            order[enabled_count] = 2;
+            enabled_count += 1;
+        }
 
         // Compute random start ONCE and rotate
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             order[..enabled_count].rotate_left(start);
         }
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
             tokio::pin!(fut3);
@@ -461,7 +491,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -485,20 +516,31 @@ macro_rules! deterministic_select {
         // IMPORTANT: Evaluate guards FIRST, before creating futures!
         let disabled: u8 = {
             let mut d = 0u8;
-            if !$guard2 { d |= 1 << 1; }
-            if !$guard3 { d |= 1 << 2; }
+            if !$guard2 {
+                d |= 1 << 1;
+            }
+            if !$guard3 {
+                d |= 1 << 2;
+            }
             d
         };
 
         // Build order array (stack allocated)
         let mut order: [usize; 3] = [0, 0, 0];
         let mut enabled_count = 1usize; // Branch 0 always enabled
-        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
-        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+        if disabled & (1 << 1) == 0 {
+            order[enabled_count] = 1;
+            enabled_count += 1;
+        }
+        if disabled & (1 << 2) == 0 {
+            order[enabled_count] = 2;
+            enabled_count += 1;
+        }
 
         // Compute random start ONCE and rotate
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             order[..enabled_count].rotate_left(start);
         }
 
@@ -533,7 +575,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -559,18 +602,13 @@ macro_rules! deterministic_select {
 
         // Compute random start ONCE
         let start = $crate::util::deterministic_select::deterministic_start_index(4);
-        let order: [usize; 4] = [
-            start % 4,
-            (start + 1) % 4,
-            (start + 2) % 4,
-            (start + 3) % 4,
-        ];
+        let order: [usize; 4] = [start % 4, (start + 1) % 4, (start + 2) % 4, (start + 3) % 4];
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
-            let mut fut4 = $fut4;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
+            let fut4 = $fut4;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
             tokio::pin!(fut3);
@@ -603,7 +641,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -641,7 +680,8 @@ macro_rules! deterministic_select {
 
         // Compute random start ONCE and rotate
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             order[..enabled_count].rotate_left(start);
         }
 
@@ -683,7 +723,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -763,7 +804,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -792,9 +834,15 @@ macro_rules! deterministic_select {
         // IMPORTANT: Evaluate guards FIRST, before creating futures!
         let disabled: u8 = {
             let mut d = 0u8;
-            if !$guard2 { d |= 1 << 1; }
-            if !$guard3 { d |= 1 << 2; }
-            if !$guard5 { d |= 1 << 4; }
+            if !$guard2 {
+                d |= 1 << 1;
+            }
+            if !$guard3 {
+                d |= 1 << 2;
+            }
+            if !$guard5 {
+                d |= 1 << 4;
+            }
             d
         };
 
@@ -802,13 +850,23 @@ macro_rules! deterministic_select {
         // Branches 0, 3 are always enabled; 1, 2, 4 depend on guards
         let mut order: [usize; 5] = [0, 3, 0, 0, 0];
         let mut enabled_count = 2usize;
-        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
-        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
-        if disabled & (1 << 4) == 0 { order[enabled_count] = 4; enabled_count += 1; }
+        if disabled & (1 << 1) == 0 {
+            order[enabled_count] = 1;
+            enabled_count += 1;
+        }
+        if disabled & (1 << 2) == 0 {
+            order[enabled_count] = 2;
+            enabled_count += 1;
+        }
+        if disabled & (1 << 4) == 0 {
+            order[enabled_count] = 4;
+            enabled_count += 1;
+        }
 
         // Compute random start ONCE and rotate
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             order[..enabled_count].rotate_left(start);
         }
 
@@ -857,7 +915,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -890,8 +949,12 @@ macro_rules! deterministic_select {
         // IMPORTANT: Evaluate guards FIRST, before creating futures!
         let disabled: u8 = {
             let mut d = 0u8;
-            if !$guard2 { d |= 1 << 1; }
-            if !$guard3 { d |= 1 << 2; }
+            if !$guard2 {
+                d |= 1 << 1;
+            }
+            if !$guard3 {
+                d |= 1 << 2;
+            }
             d
         };
 
@@ -899,12 +962,19 @@ macro_rules! deterministic_select {
         // Branches 0, 3, 4, 5, 6 are always enabled; 1, 2 depend on guards
         let mut order: [usize; 7] = [0, 3, 4, 5, 6, 0, 0];
         let mut enabled_count = 5usize;
-        if disabled & (1 << 1) == 0 { order[enabled_count] = 1; enabled_count += 1; }
-        if disabled & (1 << 2) == 0 { order[enabled_count] = 2; enabled_count += 1; }
+        if disabled & (1 << 1) == 0 {
+            order[enabled_count] = 1;
+            enabled_count += 1;
+        }
+        if disabled & (1 << 2) == 0 {
+            order[enabled_count] = 2;
+            enabled_count += 1;
+        }
 
         // Compute random start ONCE and rotate
         if enabled_count > 1 {
-            let start = $crate::util::deterministic_select::deterministic_start_index(enabled_count);
+            let start =
+                $crate::util::deterministic_select::deterministic_start_index(enabled_count);
             order[..enabled_count].rotate_left(start);
         }
 
@@ -967,7 +1037,8 @@ macro_rules! deterministic_select {
                     }
                 }
                 Poll::Pending
-            }).await
+            })
+            .await
         };
 
         match output {
@@ -1009,11 +1080,19 @@ mod tests {
             results_run2.push(result);
         }
 
-        assert_eq!(results_run1, results_run2, "Results should be deterministic with same seed");
+        assert_eq!(
+            results_run1, results_run2,
+            "Results should be deterministic with same seed"
+        );
 
         let ones = results_run1.iter().filter(|&&x| x == 1).count();
         let twos = results_run1.iter().filter(|&&x| x == 2).count();
-        assert!(ones > 0 && twos > 0, "Should select from both branches, got {} ones and {} twos", ones, twos);
+        assert!(
+            ones > 0 && twos > 0,
+            "Should select from both branches, got {} ones and {} twos",
+            ones,
+            twos
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1038,7 +1117,10 @@ mod tests {
             results_seed2.push(result);
         }
 
-        assert_ne!(results_seed1, results_seed2, "Different seeds should produce different results");
+        assert_ne!(
+            results_seed1, results_seed2,
+            "Different seeds should produce different results"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1065,7 +1147,10 @@ mod tests {
             results_run2.push(result);
         }
 
-        assert_eq!(results_run1, results_run2, "Results should be deterministic with same seed");
+        assert_eq!(
+            results_run1, results_run2,
+            "Results should be deterministic with same seed"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1090,7 +1175,11 @@ mod tests {
             val = std::future::ready(10) => val + 5,
         };
 
-        assert!(result == 84 || result == 15, "Got unexpected result: {}", result);
+        assert!(
+            result == 84 || result == 15,
+            "Got unexpected result: {}",
+            result
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1116,7 +1205,11 @@ mod tests {
             v = data.get_b() => v,
         };
 
-        assert!(result == 21 || result == 42, "Got unexpected result: {}", result);
+        assert!(
+            result == 21 || result == 42,
+            "Got unexpected result: {}",
+            result
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1128,7 +1221,11 @@ mod tests {
             _ = std::future::ready(()) => 0,
         };
 
-        assert!(result == 42 || result == 0, "Got unexpected result: {}", result);
+        assert!(
+            result == 42 || result == 0,
+            "Got unexpected result: {}",
+            result
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1141,7 +1238,10 @@ mod tests {
             v = std::future::ready(1), if should_enable => v,
             v = std::future::ready(2) => v,
         };
-        assert_eq!(result, 2, "When guard is false, only branch 2 should be selected");
+        assert_eq!(
+            result, 2,
+            "When guard is false, only branch 2 should be selected"
+        );
 
         // When guard is true, both branches can be selected
         let should_enable = true;
@@ -1152,10 +1252,17 @@ mod tests {
                 v = std::future::ready(1), if should_enable => v,
                 v = std::future::ready(2) => v,
             };
-            if result == 1 { got_1 = true; }
-            if result == 2 { got_2 = true; }
+            if result == 1 {
+                got_1 = true;
+            }
+            if result == 2 {
+                got_2 = true;
+            }
         }
-        assert!(got_1 && got_2, "When guard is true, both branches should be selectable");
+        assert!(
+            got_1 && got_2,
+            "When guard is true, both branches should be selectable"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1168,7 +1275,10 @@ mod tests {
             v = std::future::ready(1) => v,
             v = std::future::ready(2), if should_enable => v,
         };
-        assert_eq!(result, 1, "When guard is false, only branch 1 should be selected");
+        assert_eq!(
+            result, 1,
+            "When guard is false, only branch 1 should be selected"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1185,7 +1295,10 @@ mod tests {
             };
             results.push(result);
         }
-        assert!(results.iter().all(|&r| r != 3), "Branch 3 should never be selected when guard is false");
+        assert!(
+            results.iter().all(|&r| r != 3),
+            "Branch 3 should never be selected when guard is false"
+        );
 
         let should_enable = true;
         let mut got_3 = false;
@@ -1195,7 +1308,9 @@ mod tests {
                 v = std::future::ready(2) => v,
                 v = std::future::ready(3), if should_enable => v,
             };
-            if result == 3 { got_3 = true; }
+            if result == 3 {
+                got_3 = true;
+            }
         }
         assert!(got_3, "Branch 3 should be selectable when guard is true");
     }
@@ -1225,6 +1340,9 @@ mod tests {
             results_run2.push(result);
         }
 
-        assert_eq!(results_run1, results_run2, "Results should be deterministic with same seed and guards");
+        assert_eq!(
+            results_run1, results_run2,
+            "Results should be deterministic with same seed and guards"
+        );
     }
 }
