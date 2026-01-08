@@ -1653,7 +1653,7 @@ impl EventRegister {
             } else {
                 futures::future::pending().boxed()
             };
-            tokio::select! {
+            crate::deterministic_select! {
                 cmd = log_recv.recv() => {
                     let Some(cmd) = cmd else { break; };
                     match cmd {
@@ -1670,12 +1670,12 @@ impl EventRegister {
                             let _ = reply.send(());
                         }
                     }
-                }
+                },
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
                         received_from_metrics_server(ws, ws_msg).await;
                     }
-                }
+                },
             }
         }
 
@@ -2287,7 +2287,7 @@ mod opentelemetry_tracer {
             }
 
             loop {
-                tokio::select! {
+                crate::deterministic_select! {
                     log_msg = log_recv.recv() => {
                         if let Some(log) = log_msg {
                             #[cfg(not(test))]
@@ -2301,7 +2301,7 @@ mod opentelemetry_tracer {
                         } else {
                             break;
                         }
-                    }
+                    },
                     finished_tx = finished_tx_notifier.recv() => {
                         if let Some(tx) = finished_tx {
                             #[cfg(not(test))]
@@ -2315,7 +2315,7 @@ mod opentelemetry_tracer {
                         } else {
                             break;
                         }
-                    }
+                    },
                 }
             }
         }

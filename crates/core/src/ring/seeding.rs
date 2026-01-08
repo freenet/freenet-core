@@ -430,7 +430,7 @@ impl SeedingManager {
         // Filter to contracts that:
         // 1. Don't have an upstream subscription
         // 2. Have active interest (local clients OR downstream peers)
-        seeded_contracts
+        let mut result: Vec<ContractKey> = seeded_contracts
             .into_iter()
             .filter(|key| {
                 if self.has_upstream(key) {
@@ -447,12 +447,17 @@ impl SeedingManager {
 
                 has_clients || has_downstream
             })
-            .collect()
+            .collect();
+
+        // Sort by contract ID for deterministic iteration order
+        result.sort_by(|a, b| a.id().cmp(b.id()));
+        result
     }
 
     /// Get all downstream subscribers for a contract (for broadcast targeting).
     pub fn get_downstream(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
-        self.subscriptions
+        let mut result: Vec<PeerKeyLocation> = self
+            .subscriptions
             .get(contract)
             .map(|subs| {
                 subs.iter()
@@ -460,7 +465,10 @@ impl SeedingManager {
                     .map(|e| e.peer.clone())
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Sort for deterministic iteration order
+        result.sort();
+        result
     }
 
     /// Register a client subscription for a contract (WebSocket client subscribed).
@@ -777,19 +785,25 @@ impl SeedingManager {
 
     /// Get all subscriptions across all contracts (for debugging/introspection).
     pub fn all_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
-        self.subscriptions
+        let mut result: Vec<(ContractKey, Vec<PeerKeyLocation>)> = self
+            .subscriptions
             .iter()
             .map(|entry| {
-                let downstream: Vec<PeerKeyLocation> = entry
+                let mut downstream: Vec<PeerKeyLocation> = entry
                     .value()
                     .iter()
                     .filter(|e| e.role == SubscriberType::Downstream)
                     .map(|e| e.peer.clone())
                     .collect();
+                // Sort peers for deterministic order
+                downstream.sort();
                 (*entry.key(), downstream)
             })
             .filter(|(_, subs)| !subs.is_empty())
-            .collect()
+            .collect();
+        // Sort by contract ID for deterministic iteration order
+        result.sort_by(|(a, _), (b, _)| a.id().cmp(b.id()));
+        result
     }
 
     /// Get the number of contracts in the seeding cache.

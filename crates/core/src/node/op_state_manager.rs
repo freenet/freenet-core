@@ -933,12 +933,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
     let mut delayed = vec![];
     loop {
-        tokio::select! {
+        crate::deterministic_select! {
             tx = new_transactions.recv() => {
                 if let Some(tx) = tx {
                     ttl_set.insert(Reverse(tx));
                 }
-            }
+            },
             _ = tick.tick() => {
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -1052,7 +1052,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                     }
                 }
-            }
+            },
         }
     }
 }

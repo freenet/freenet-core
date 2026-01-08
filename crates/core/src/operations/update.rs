@@ -756,7 +756,9 @@ impl OpManager {
             all_targets.insert(upstream);
         }
 
-        let targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
+        // Sort targets for deterministic iteration order (HashSet iteration is non-deterministic)
+        let mut targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
+        targets.sort();
 
         // Trace update propagation for debugging
         if !targets.is_empty() {

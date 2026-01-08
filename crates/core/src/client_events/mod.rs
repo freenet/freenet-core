@@ -306,7 +306,8 @@ where
     let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
     loop {
-        tokio::select! {
+        // Uses deterministic_select! for DST - guards are evaluated BEFORE futures are created
+        crate::deterministic_select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
                     Ok(request) => {
@@ -365,7 +366,7 @@ where
                         }
                     }
                 });
-            }
+            },
             res = client_responses.recv() => {
                 if let Some((cli_id, request_id, res)) = res {
                     if let Ok(result) = &res {
@@ -385,7 +386,7 @@ where
                         anyhow::bail!(err);
                     }
                 }
-            }
+            },
             res = results.next(), if !results.is_empty() => {
                 let Some(f_res) = res else {
                     unreachable!("results.next() should only return None if results is empty, which is guarded against");
@@ -468,7 +469,7 @@ where
                         client_events.send(cli_id, Err(err)).await?
                     }
                 }
-            }
+            },
         }
     }
 }
@@ -1860,12 +1861,12 @@ pub(crate) mod test {
                 .take()
                 .zip(self.internal_state.take())
                 .expect("rng should be set");
-            let (rng, state, res) = tokio::task::spawn_blocking(move || {
-                let res = rng.gen_event(&mut state);
-                (rng, state, res)
-            })
-            .await
-            .expect("task shouldn't fail");
+
+            // Run synchronously - gen_event is fast (just RNG operations) and
+            // running synchronously ensures deterministic execution under turmoil.
+            // spawn_blocking would use a real thread pool outside turmoil's control.
+            let res = rng.gen_event(&mut state);
+
             self.rng = Some(rng);
             self.internal_state = Some(state);
             res

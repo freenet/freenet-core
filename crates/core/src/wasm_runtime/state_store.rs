@@ -51,12 +51,14 @@ pub trait StateStorage {
     ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
 }
 
-/// StateStore wraps a persistent storage backend with an in-memory cache.
+/// StateStore wraps a persistent storage backend with an optional in-memory cache.
 /// It is Clone when the underlying storage S is Clone (e.g., ReDb with Arc<Database>).
+///
+/// For deterministic simulation testing, use `new_uncached()` to bypass the stretto
+/// cache which has non-deterministic TinyLFU admission policy and background workers.
 #[derive(Clone)]
 pub struct StateStore<S: StateStorage> {
-    state_mem_cache: AsyncCache<ContractKey, WrappedState>,
-    // params_mem_cache: AsyncCache<ContractKey, Parameters<'static>>,
+    state_mem_cache: Option<AsyncCache<ContractKey, WrappedState>>,
     store: S,
 }
 
@@ -67,17 +69,33 @@ where
 {
     const AVG_STATE_SIZE: usize = 1_000;
 
+    /// Create a StateStore with stretto caching enabled.
+    ///
     /// # Arguments
     /// - max_size: max number of bytes for the mem cache
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
         let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
         Ok(Self {
-            state_mem_cache: AsyncCache::new(counters, max_size as i64, GlobalExecutor::spawn)
-                .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
-            // params_mem_cache: AsyncCache::new(counters, max_size as i64)
-            //     .map_err(|err| StateStoreError::Any(Box::new(err)))?,
+            state_mem_cache: Some(
+                AsyncCache::new(counters, max_size as i64, GlobalExecutor::spawn)
+                    .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
+            ),
             store,
         })
+    }
+
+    /// Create a StateStore without caching for deterministic simulation.
+    ///
+    /// This bypasses the stretto AsyncCache which has non-deterministic behavior:
+    /// - TinyLFU admission policy can reject inserts non-deterministically
+    /// - Background workers for cache eviction and write batching
+    ///
+    /// Use this constructor for deterministic simulation testing under turmoil.
+    pub fn new_uncached(store: S) -> Self {
+        Self {
+            state_mem_cache: None,
+            store,
+        }
     }
 
     pub async fn update(
@@ -86,17 +104,25 @@ where
         state: WrappedState,
     ) -> Result<(), StateStoreError> {
         // only allow updates for existing contracts
-        if self.state_mem_cache.get(key).await.is_none() {
+        let cache_miss = if let Some(cache) = &self.state_mem_cache {
+            cache.get(key).await.is_none()
+        } else {
+            true
+        };
+
+        if cache_miss {
             self.store
                 .get(key)
                 .await
                 .map_err(Into::into)?
                 .ok_or_else(|| StateStoreError::MissingContract(*key))?;
         }
-        // Update memory cache first to prevent race condition where GET requests
-        // could read stale cached data while persistent store is being updated
-        let cost = state.size() as i64;
-        self.state_mem_cache.insert(*key, state.clone(), cost).await;
+
+        // Update memory cache first (if enabled) to prevent race condition
+        if let Some(cache) = &self.state_mem_cache {
+            let cost = state.size() as i64;
+            cache.insert(*key, state.clone(), cost).await;
+        }
 
         // Then update persistent store
         self.store.store(*key, state).await.map_err(Into::into)?;
@@ -109,9 +135,11 @@ where
         state: WrappedState,
         params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
-        // Update memory cache first to prevent race condition
-        let cost = state.size() as i64;
-        self.state_mem_cache.insert(key, state.clone(), cost).await;
+        // Update memory cache first (if enabled) to prevent race condition
+        if let Some(cache) = &self.state_mem_cache {
+            let cost = state.size() as i64;
+            cache.insert(key, state.clone(), cost).await;
+        }
 
         // Then update persistent stores
         self.store.store(key, state).await.map_err(Into::into)?;
@@ -119,14 +147,15 @@ where
             .store_params(key, params.clone())
             .await
             .map_err(Into::into)?;
-        // let cost = params.size();
-        // self.params_mem_cache.insert(key, params, cost as i64).await;
         Ok(())
     }
 
     pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
-        if let Some(v) = self.state_mem_cache.get(key).await {
-            return Ok(v.value().clone());
+        // Check cache first (if enabled)
+        if let Some(cache) = &self.state_mem_cache {
+            if let Some(v) = cache.get(key).await {
+                return Ok(v.value().clone());
+            }
         }
         let r = self.store.get(key).await.map_err(Into::into)?;
         r.ok_or_else(|| StateStoreError::MissingContract(*key))
@@ -136,9 +165,6 @@ where
         &'a self,
         key: &'a ContractKey,
     ) -> Result<Option<Parameters<'static>>, StateStoreError> {
-        // if let Some(v) = self.params_mem_cache.get(key) {
-        //     return Ok(v.value().clone());
-        // }
         let r = self.store.get_params(key).await.map_err(Into::into)?;
         Ok(r)
     }

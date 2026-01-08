@@ -1555,10 +1555,16 @@ use rand::{Rng, RngCore, SeedableRng};
 /// Set this before any RNG operations to ensure reproducibility.
 static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Counter for deterministic thread indexing.
+/// Each thread gets a unique, deterministic index for RNG seeding.
+static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // Thread-local seeded RNG for deterministic operations.
-// Each thread gets its own RNG seeded from the global seed + thread ID.
+// Each thread gets its own RNG seeded from the global seed + deterministic thread index.
 std::thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
+    // Deterministic thread index assigned at first RNG access
+    static THREAD_INDEX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Global RNG abstraction for deterministic simulation testing.
@@ -1631,10 +1637,15 @@ impl GlobalRng {
     /// Call this at test/simulation startup for reproducibility.
     /// Must call `clear_seed()` when done to avoid affecting other tests.
     pub fn set_seed(seed: u64) {
+        // Reset thread index counter first so threads get fresh indices
+        Self::reset_thread_index_counter();
         *SIMULATION_SEED.lock() = Some(seed);
-        // Clear thread-local RNG so it gets re-seeded
+        // Clear thread-local RNG and index so it gets re-seeded with fresh index
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
+        });
+        THREAD_INDEX.with(|idx| {
+            idx.set(None);
         });
     }
 
@@ -1644,6 +1655,17 @@ impl GlobalRng {
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
+        THREAD_INDEX.with(|idx| {
+            idx.set(None);
+        });
+        // Reset thread index counter for next simulation
+        Self::reset_thread_index_counter();
+    }
+
+    /// Resets the thread index counter for deterministic simulation.
+    /// This should be called between simulation runs to ensure reproducibility.
+    pub fn reset_thread_index_counter() {
+        THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Returns true if a simulation seed is set.
@@ -1702,16 +1724,20 @@ impl GlobalRng {
             THREAD_RNG.with(|rng_cell| {
                 let mut rng_ref = rng_cell.borrow_mut();
                 if rng_ref.is_none() {
-                    // Seed with global seed XOR'd with hashed thread ID for uniqueness
-                    // Use a hash of the thread ID debug string for stable, unique values
-                    let thread_id = std::thread::current().id();
-                    let thread_hash = {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        thread_id.hash(&mut hasher);
-                        hasher.finish()
-                    };
-                    let thread_seed = seed ^ thread_hash;
+                    // Use deterministic thread index for reproducibility
+                    // Thread IDs are not stable across runs, so we use a counter
+                    let thread_index = THREAD_INDEX.with(|idx| {
+                        if let Some(i) = idx.get() {
+                            i
+                        } else {
+                            let new_idx = THREAD_INDEX_COUNTER
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            idx.set(Some(new_idx));
+                            new_idx
+                        }
+                    });
+                    let thread_seed =
+                        seed.wrapping_add(thread_index.wrapping_mul(0x9E3779B97F4A7C15));
                     *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
                 }
                 f(rng_ref.as_mut().unwrap())

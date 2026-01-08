@@ -1,4 +1,5 @@
 pub(crate) mod backoff;
+pub mod deterministic_select;
 pub(crate) mod rate_limit_layer;
 pub(crate) mod time_source;
 pub(crate) mod workspace;

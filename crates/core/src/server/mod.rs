@@ -127,15 +127,15 @@ pub mod local_node {
         }
         let mut receiver;
         loop {
-            let req = tokio::select! {
+            let req = crate::deterministic_select! {
                 req = ws_proxy.recv() => {
                     receiver = Receiver::Ws;
                     req?
-                }
+                },
                 req = gw.recv() => {
                     receiver = Receiver::Gw;
                     req?
-                }
+                },
             };
             let OpenRequest {
                 client_id: id,

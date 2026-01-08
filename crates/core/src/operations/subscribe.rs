@@ -62,10 +62,10 @@ async fn wait_for_contract_with_timeout(
     }
 
     // Wait for notification or timeout (we don't care which triggers first)
-    tokio::select! {
-        _ = notifier => {}
-        _ = sleep(Duration::from_millis(timeout_ms)) => {}
-    };
+    crate::deterministic_select! {
+        _ = notifier => {},
+        _ = sleep(Duration::from_millis(timeout_ms)) => {},
+    }
 
     // Always verify actual state - don't trust notification alone
     super::has_contract(op_manager, instance_id).await
@@ -270,8 +270,12 @@ pub(crate) async fn request_subscribe(
             .ring
             .connection_manager
             .get_connections_by_location();
-        let fallback_target = connections
-            .values()
+        // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
+        let mut sorted_keys: Vec<_> = connections.keys().collect();
+        sorted_keys.sort();
+        let fallback_target = sorted_keys
+            .into_iter()
+            .filter_map(|loc| connections.get(loc))
             .flatten()
             .find(|conn| {
                 conn.location

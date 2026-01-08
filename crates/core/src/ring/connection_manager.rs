@@ -746,10 +746,19 @@ impl ConnectionManager {
         skip_list: impl Contains<SocketAddr>,
     ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
-        let candidates: Vec<PeerKeyLocation> = connections
-            .values()
+        // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
+        // This ensures GlobalRng is called in the same order across runs
+        let mut sorted_keys: Vec<_> = connections.keys().collect();
+        sorted_keys.sort();
+        let candidates: Vec<PeerKeyLocation> = sorted_keys
+            .into_iter()
+            .filter_map(|loc| connections.get(loc))
             .filter_map(|conns| {
-                let conn = GlobalRng::choose(conns)?;
+                // Sort connections for deterministic selection
+                // (Vec ordering may vary based on async connection establishment order)
+                let mut sorted_conns: Vec<_> = conns.iter().collect();
+                sorted_conns.sort_by_key(|c| c.location.clone());
+                let conn = GlobalRng::choose(&sorted_conns)?;
                 let addr = conn.location.socket_addr()?;
                 if self.is_transient(addr) {
                     return None;
