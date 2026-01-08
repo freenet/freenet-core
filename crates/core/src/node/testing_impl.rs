@@ -1622,21 +1622,47 @@ impl SimNetwork {
     /// - Per-contract details of state hashes per peer
     ///
     /// This is useful for testing eventual consistency properties.
+    ///
+    /// # Implementation Note
+    ///
+    /// This method iterates through logs in insertion order (chronological order)
+    /// rather than sorting by transaction ID. This is critical because broadcast
+    /// events are logged with the sender's original transaction ID, not a new
+    /// local timestamp. Sorting by transaction ID would cause delayed broadcasts
+    /// with older transaction IDs to appear before newer local updates in the
+    /// sorted order, resulting in incorrect "latest state" detection.
+    ///
+    /// For example, if Peer A updates to state S3 (tx=T15) and then receives a
+    /// delayed broadcast of state S1 (tx=T1 < T15), the actual state is S1 (the
+    /// broadcast was applied), but tx-sorted order would show S3 as "latest".
     pub async fn check_convergence(&self) -> ConvergenceResult {
-        let summary = self.get_deterministic_event_summary().await;
+        // Get logs in insertion order (chronological order within the simulation).
+        // DO NOT use get_deterministic_event_summary() here - it sorts by transaction ID,
+        // which is incorrect for determining latest state because broadcasts use the
+        // sender's original transaction ID rather than a local timestamp.
+        let logs = self.event_listener.logs.lock().await;
 
         // Group (contract_key -> peer_addr -> latest_state_hash)
         // Use BTreeMap for deterministic iteration order in DST
         let mut contract_states: BTreeMap<String, BTreeMap<SocketAddr, String>> = BTreeMap::new();
 
-        for event in &summary {
-            if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
-            {
+        // Iterate in insertion order - the last event for each (contract, peer) pair
+        // is the actual current state.
+        //
+        // IMPORTANT: Use stored_state_hash() instead of state_hash() to only consider
+        // events that represent actual stored state (PutSuccess, UpdateSuccess, BroadcastApplied).
+        // Using state_hash() would incorrectly include BroadcastReceived events which record
+        // the incoming state hash BEFORE it's applied, not the actual stored state.
+        for log in logs.iter() {
+            let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+            let state_hash = log.kind.stored_state_hash().map(String::from);
+
+            if let (Some(contract_key), Some(state_hash)) = (contract_key, state_hash) {
                 // Keep the latest state for each peer/contract pair
                 contract_states
-                    .entry(contract_key.clone())
+                    .entry(contract_key)
                     .or_default()
-                    .insert(event.peer_addr, state_hash.clone());
+                    .insert(log.peer_id.addr, state_hash);
             }
         }
 

@@ -153,27 +153,87 @@ where
         _related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
-        // todo: instead allow to perform mutations per contract based on incoming value so we can track
-        // state values over the network
+        // Mock runtime implements a simple CRDT-like merge strategy to ensure
+        // deterministic convergence in simulation tests:
+        // - Compare incoming state with current state using blake3 hash
+        // - The state with the lexicographically larger hash wins
+        // - This ensures all peers converge to the same state regardless of
+        //   message arrival order (important for delayed broadcasts)
         match (state, code) {
             (Either::Left(incoming_state), Some(contract)) => {
+                // New contract with code - check if we should accept this state
+                // First store the contract itself
                 self.runtime
                     .contract_store
                     .store_contract(contract.clone())
                     .map_err(ExecutorError::other)?;
-                self.state_store
-                    .store(key, incoming_state.clone(), contract.params().into_owned())
-                    .await
-                    .map_err(ExecutorError::other)?;
-                Ok(UpsertResult::Updated(incoming_state))
+
+                // Check if there's already a state for this contract
+                match self.state_store.get(&key).await {
+                    Ok(current_state) => {
+                        // Compare hashes - larger hash wins (deterministic CRDT merge)
+                        let incoming_hash = blake3::hash(incoming_state.as_ref());
+                        let current_hash = blake3::hash(current_state.as_ref());
+
+                        if incoming_hash.as_bytes() > current_hash.as_bytes() {
+                            // Incoming state wins - update
+                            self.state_store
+                                .update(&key, incoming_state.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+                            Ok(UpsertResult::Updated(incoming_state))
+                        } else if incoming_hash.as_bytes() == current_hash.as_bytes() {
+                            // Same state - no change
+                            Ok(UpsertResult::NoChange)
+                        } else {
+                            // Current state wins - reject incoming
+                            Ok(UpsertResult::NoChange)
+                        }
+                    }
+                    Err(_) => {
+                        // No existing state - store the incoming state
+                        self.state_store
+                            .store(key, incoming_state.clone(), contract.params().into_owned())
+                            .await
+                            .map_err(ExecutorError::other)?;
+                        Ok(UpsertResult::Updated(incoming_state))
+                    }
+                }
             }
             (Either::Left(incoming_state), None) => {
-                // update case
-                self.state_store
-                    .update(&key, incoming_state.clone())
-                    .await
-                    .map_err(ExecutorError::other)?;
-                Ok(UpsertResult::Updated(incoming_state))
+                // Update case - must have existing state
+                match self.state_store.get(&key).await {
+                    Ok(current_state) => {
+                        // Compare hashes - larger hash wins (deterministic CRDT merge)
+                        let incoming_hash = blake3::hash(incoming_state.as_ref());
+                        let current_hash = blake3::hash(current_state.as_ref());
+
+                        if incoming_hash.as_bytes() > current_hash.as_bytes() {
+                            // Incoming state wins - update
+                            self.state_store
+                                .update(&key, incoming_state.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+                            Ok(UpsertResult::Updated(incoming_state))
+                        } else if incoming_hash.as_bytes() == current_hash.as_bytes() {
+                            // Same state - no change
+                            Ok(UpsertResult::NoChange)
+                        } else {
+                            // Current state wins - reject incoming
+                            Ok(UpsertResult::NoChange)
+                        }
+                    }
+                    Err(_) => {
+                        // No existing state for update - this shouldn't happen but handle gracefully
+                        tracing::warn!(
+                            contract = %key,
+                            "Update received for non-existent contract state"
+                        );
+                        Err(ExecutorError::request(StdContractError::MissingContract {
+                            key: key.into(),
+                        }))
+                    }
+                }
             }
             (update, contract) => unreachable!("Invalid combination of state/delta and contract presence: {update:?}, {contract:?}"),
         }
@@ -235,5 +295,410 @@ mod test {
 
         assert_eq!(counter, 1);
         Ok(())
+    }
+
+    /// Helper to create a mock executor with in-memory storage for testing
+    async fn create_test_executor() -> Executor<MockRuntime, MockStateStorage> {
+        let shared_storage = MockStateStorage::new();
+        Executor::new_mock_in_memory("test", shared_storage, None, None)
+            .await
+            .expect("create test executor")
+    }
+
+    /// Helper to create a test contract with given code bytes
+    fn create_test_contract(code_bytes: &[u8]) -> ContractContainer {
+        use freenet_stdlib::prelude::*;
+
+        let code = ContractCode::from(code_bytes.to_vec());
+        let params = Parameters::from(vec![]);
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(code),
+            params,
+        )))
+    }
+
+    /// Test that CRDT merge accepts state with larger hash
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_merge_larger_hash_wins() {
+        let mut executor = create_test_executor().await;
+
+        // Create two states where we know their hash ordering
+        let state_a = WrappedState::new(vec![1, 2, 3]);
+        let state_b = WrappedState::new(vec![4, 5, 6]);
+
+        let hash_a = blake3::hash(state_a.as_ref());
+        let hash_b = blake3::hash(state_b.as_ref());
+
+        // Determine which has larger hash
+        let (smaller_state, larger_state) = if hash_a.as_bytes() < hash_b.as_bytes() {
+            (state_a, state_b)
+        } else {
+            (state_b, state_a)
+        };
+
+        // Create contract
+        let contract = create_test_contract(b"test_contract_code_1");
+        let key = contract.key();
+
+        // First, store the smaller-hash state
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(smaller_state.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("initial store should succeed");
+        assert!(matches!(result, UpsertResult::Updated(_)));
+
+        // Now try to update with larger-hash state - should succeed
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(larger_state.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect("update with larger hash should succeed");
+        assert!(
+            matches!(result, UpsertResult::Updated(_)),
+            "Larger hash should win and update"
+        );
+
+        // Verify the stored state is the larger-hash one
+        let (stored, _) = executor
+            .fetch_contract(key, false)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(
+            stored.unwrap().as_ref(),
+            larger_state.as_ref(),
+            "Stored state should be the larger-hash state"
+        );
+    }
+
+    /// Test that CRDT merge rejects state with smaller hash
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_merge_smaller_hash_rejected() {
+        let mut executor = create_test_executor().await;
+
+        // Create two states where we know their hash ordering
+        let state_a = WrappedState::new(vec![1, 2, 3]);
+        let state_b = WrappedState::new(vec![4, 5, 6]);
+
+        let hash_a = blake3::hash(state_a.as_ref());
+        let hash_b = blake3::hash(state_b.as_ref());
+
+        // Determine which has larger hash
+        let (smaller_state, larger_state) = if hash_a.as_bytes() < hash_b.as_bytes() {
+            (state_a, state_b)
+        } else {
+            (state_b, state_a)
+        };
+
+        // Create contract
+        let contract = create_test_contract(b"test_contract_code_2");
+        let key = contract.key();
+
+        // First, store the larger-hash state
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(larger_state.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("initial store should succeed");
+        assert!(matches!(result, UpsertResult::Updated(_)));
+
+        // Now try to update with smaller-hash state - should be rejected
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(smaller_state.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect("update attempt should not error");
+        assert!(
+            matches!(result, UpsertResult::NoChange),
+            "Smaller hash should be rejected (NoChange)"
+        );
+
+        // Verify the stored state is still the larger-hash one
+        let (stored, _) = executor
+            .fetch_contract(key, false)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(
+            stored.unwrap().as_ref(),
+            larger_state.as_ref(),
+            "Stored state should still be the larger-hash state"
+        );
+    }
+
+    /// Test that equal hash results in NoChange
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_merge_equal_hash_no_change() {
+        let mut executor = create_test_executor().await;
+
+        let state = WrappedState::new(vec![1, 2, 3, 4, 5]);
+        let contract = create_test_contract(b"test_contract_code_3");
+        let key = contract.key();
+
+        // Store initial state
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(state.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("initial store should succeed");
+        assert!(matches!(result, UpsertResult::Updated(_)));
+
+        // Try to update with same state - should be NoChange
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(state.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect("update attempt should not error");
+        assert!(
+            matches!(result, UpsertResult::NoChange),
+            "Same state should result in NoChange"
+        );
+    }
+
+    /// Test that multiple "peers" converge to same state regardless of update order
+    /// This simulates the core convergence property we need for DST
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_merge_peers_converge() {
+        // Create three distinct states
+        let state_1 = WrappedState::new(vec![1, 1, 1]);
+        let state_2 = WrappedState::new(vec![2, 2, 2]);
+        let state_3 = WrappedState::new(vec![3, 3, 3]);
+
+        // Compute hashes and find the "winner" (largest hash)
+        let states = vec![
+            (state_1.clone(), blake3::hash(state_1.as_ref())),
+            (state_2.clone(), blake3::hash(state_2.as_ref())),
+            (state_3.clone(), blake3::hash(state_3.as_ref())),
+        ];
+
+        let winner = states
+            .iter()
+            .max_by_key(|(_, hash)| hash.as_bytes())
+            .map(|(state, _)| state.clone())
+            .unwrap();
+
+        // Simulate 3 peers that receive updates in different orders
+        // All should converge to the same final state (the one with largest hash)
+
+        // Peer A: receives updates in order 1, 2, 3
+        let mut peer_a = create_test_executor().await;
+        let contract = create_test_contract(b"convergence_test_contract");
+        let key = contract.key();
+
+        // Initialize with state_1
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Left(state_1.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        // Update with state_2
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Left(state_2.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Update with state_3
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Left(state_3.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Peer B: receives updates in order 3, 1, 2
+        let mut peer_b = create_test_executor().await;
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Left(state_3.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Left(state_1.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Left(state_2.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Peer C: receives updates in order 2, 3, 1
+        let mut peer_c = create_test_executor().await;
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Left(state_2.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Left(state_3.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Left(state_1.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // All peers should have converged to the same state (largest hash)
+        let (state_a, _) = peer_a.fetch_contract(key, false).await.unwrap();
+        let (state_b, _) = peer_b.fetch_contract(key, false).await.unwrap();
+        let (state_c, _) = peer_c.fetch_contract(key, false).await.unwrap();
+
+        let state_a = state_a.expect("peer A should have state");
+        let state_b = state_b.expect("peer B should have state");
+        let state_c = state_c.expect("peer C should have state");
+
+        // All peers should have the winner state
+        assert_eq!(
+            state_a.as_ref(),
+            winner.as_ref(),
+            "Peer A should converge to winner"
+        );
+        assert_eq!(
+            state_b.as_ref(),
+            winner.as_ref(),
+            "Peer B should converge to winner"
+        );
+        assert_eq!(
+            state_c.as_ref(),
+            winner.as_ref(),
+            "Peer C should converge to winner"
+        );
+
+        // All peers should have the same state
+        assert_eq!(
+            state_a.as_ref(),
+            state_b.as_ref(),
+            "Peer A and B should have same state"
+        );
+        assert_eq!(
+            state_b.as_ref(),
+            state_c.as_ref(),
+            "Peer B and C should have same state"
+        );
+    }
+
+    /// Test that delayed "old" broadcast doesn't overwrite newer state
+    /// This is the specific scenario from issue #2634
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_merge_delayed_broadcast_rejected() {
+        let mut executor = create_test_executor().await;
+
+        // Scenario from issue #2634:
+        // 1. Peer has state S3 (from local update)
+        // 2. Delayed broadcast of old state S1 arrives
+        // 3. S1 should be rejected, S3 should remain
+
+        // Create states where S3 has larger hash than S1
+        // We'll try different byte patterns until we find the right ordering
+        let mut s1 = WrappedState::new(vec![1, 0, 0, 0]);
+        let mut s3 = WrappedState::new(vec![3, 0, 0, 0]);
+
+        // Ensure S3 has larger hash (swap if needed)
+        let hash_s1 = blake3::hash(s1.as_ref());
+        let hash_s3 = blake3::hash(s3.as_ref());
+
+        if hash_s1.as_bytes() > hash_s3.as_bytes() {
+            std::mem::swap(&mut s1, &mut s3);
+        }
+
+        let contract = create_test_contract(b"delayed_broadcast_test");
+        let key = contract.key();
+
+        // Peer already has S3 (the newer state with larger hash)
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(s3.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Delayed broadcast of S1 arrives (older state with smaller hash)
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(s1.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // S1 should be rejected
+        assert!(
+            matches!(result, UpsertResult::NoChange),
+            "Delayed old broadcast should be rejected"
+        );
+
+        // S3 should still be stored
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        assert_eq!(
+            stored.unwrap().as_ref(),
+            s3.as_ref(),
+            "Newer state S3 should still be stored"
+        );
     }
 }

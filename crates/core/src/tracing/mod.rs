@@ -2455,6 +2455,29 @@ impl EventKind {
         }
     }
 
+    /// Returns the state hash only for events representing stored state changes.
+    ///
+    /// This is critical for convergence checking - it only returns hashes for events
+    /// where state was actually stored locally:
+    /// - PutSuccess: State was stored after PUT operation
+    /// - UpdateSuccess: State was updated locally
+    /// - BroadcastApplied: State was stored after applying received broadcast
+    ///
+    /// Does NOT return hashes for:
+    /// - BroadcastReceived: Incoming state that may not have been applied yet
+    /// - BroadcastEmitted: Outgoing state being sent to others
+    ///
+    /// Using `state_hash()` for convergence checking would include BroadcastReceived
+    /// events, which record the incoming state hash before application, not the
+    /// actual stored state after merge/application.
+    pub fn stored_state_hash(&self) -> Option<&str> {
+        match self {
+            EventKind::Put(put) => put.stored_state_hash(),
+            EventKind::Update(upd) => upd.stored_state_hash(),
+            _ => None,
+        }
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -2796,6 +2819,17 @@ impl PutEvent {
             _ => None,
         }
     }
+
+    /// Returns the state hash only for events representing stored state.
+    ///
+    /// Only returns hash for PutSuccess (state actually stored locally).
+    /// Does NOT return hash for BroadcastEmitted/BroadcastReceived (state in transit).
+    fn stored_state_hash(&self) -> Option<&str> {
+        match self {
+            PutEvent::PutSuccess { state_hash, .. } => state_hash.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -2890,6 +2924,27 @@ impl UpdateEvent {
             } => state_hash_after.as_deref(),
             UpdateEvent::BroadcastEmitted { state_hash, .. }
             | UpdateEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the state hash only for events representing stored state.
+    ///
+    /// Only returns hash for:
+    /// - UpdateSuccess: State was updated locally
+    /// - BroadcastApplied: State was stored after applying received broadcast
+    ///
+    /// Does NOT return hash for:
+    /// - BroadcastReceived: Incoming state not yet applied
+    /// - BroadcastEmitted: Outgoing state being sent
+    fn stored_state_hash(&self) -> Option<&str> {
+        match self {
+            UpdateEvent::UpdateSuccess {
+                state_hash_after, ..
+            }
+            | UpdateEvent::BroadcastApplied {
+                state_hash_after, ..
+            } => state_hash_after.as_deref(),
             _ => None,
         }
     }
