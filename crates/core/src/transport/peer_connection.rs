@@ -459,6 +459,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
+                // DST: biased; ensures deterministic branch selection order
+                biased;
+
                 inbound = self.remote_conn.inbound_packet_recv.recv_async() => {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received_nanos = self.time_source.now_nanos();

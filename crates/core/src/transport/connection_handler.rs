@@ -594,6 +594,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
         'outer: loop {
             tokio::select! {
+                // DST: biased; ensures deterministic branch selection order
+                biased;
+
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
