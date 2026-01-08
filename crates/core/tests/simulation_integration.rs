@@ -156,11 +156,15 @@ fn test_strict_determinism_exact_event_equality() {
         (result, trace)
     }
 
-    // Run simulation twice with identical seed
+    // Run simulation THREE times with identical seed to catch:
+    // - State leakage between runs
+    // - Warm-up effects on first run
+    // - Off-by-one patterns that only manifest on odd/even runs
     let (result1, trace1) = run_and_trace("strict-det-run1", SEED);
     let (result2, trace2) = run_and_trace("strict-det-run2", SEED);
+    let (result3, trace3) = run_and_trace("strict-det-run3", SEED);
 
-    // Both simulations should have the same outcome (both succeed or both fail)
+    // All simulations should have the same outcome (all succeed or all fail)
     assert_eq!(
         result1.is_ok(),
         result2.is_ok(),
@@ -168,28 +172,36 @@ fn test_strict_determinism_exact_event_equality() {
         result1,
         result2
     );
+    assert_eq!(
+        result2.is_ok(),
+        result3.is_ok(),
+        "STRICT DETERMINISM FAILURE: Simulation outcomes differ!\nRun 2: {:?}\nRun 3: {:?}",
+        result2,
+        result3
+    );
 
     // Debug: Print detailed event breakdown before assertions
-    if trace1.total_events != trace2.total_events {
+    if trace1.total_events != trace2.total_events || trace2.total_events != trace3.total_events {
         eprintln!("\n=== DETERMINISM DEBUG ===");
         eprintln!(
-            "Run 1 total: {}, Run 2 total: {}",
-            trace1.total_events, trace2.total_events
+            "Run 1 total: {}, Run 2 total: {}, Run 3 total: {}",
+            trace1.total_events, trace2.total_events, trace3.total_events
         );
         eprintln!("\nEvent counts by type:");
 
         let mut all_types: std::collections::BTreeSet<&String> =
             trace1.event_counts.keys().collect();
         all_types.extend(trace2.event_counts.keys());
+        all_types.extend(trace3.event_counts.keys());
 
         for event_type in all_types {
             let count1 = trace1.event_counts.get(event_type).unwrap_or(&0);
             let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
-            let diff = (*count2 as i64) - (*count1 as i64);
-            if diff != 0 {
+            let count3 = trace3.event_counts.get(event_type).unwrap_or(&0);
+            if count1 != count2 || count2 != count3 {
                 eprintln!(
-                    "  {} : {} vs {} (diff: {:+})",
-                    event_type, count1, count2, diff
+                    "  {} : {} vs {} vs {} (DIFFERS)",
+                    event_type, count1, count2, count3
                 );
             } else {
                 eprintln!("  {} : {} (same)", event_type, count1);
@@ -198,37 +210,58 @@ fn test_strict_determinism_exact_event_equality() {
         eprintln!("=========================\n");
     }
 
-    // STRICT ASSERTION 1: Exact same total event count
+    // STRICT ASSERTION 1: Exact same total event count across all 3 runs
     assert_eq!(
         trace1.total_events, trace2.total_events,
         "STRICT DETERMINISM FAILURE: Total event counts differ!\nRun 1: {}\nRun 2: {}",
         trace1.total_events, trace2.total_events
     );
+    assert_eq!(
+        trace2.total_events, trace3.total_events,
+        "STRICT DETERMINISM FAILURE: Total event counts differ!\nRun 2: {}\nRun 3: {}",
+        trace2.total_events, trace3.total_events
+    );
 
-    // STRICT ASSERTION 2: Exact same event counts per type
+    // STRICT ASSERTION 2: Exact same event counts per type across all 3 runs
     assert_eq!(
         trace1.event_counts, trace2.event_counts,
         "STRICT DETERMINISM FAILURE: Event counts per type differ!\nRun 1: {:?}\nRun 2: {:?}",
         trace1.event_counts, trace2.event_counts
     );
+    assert_eq!(
+        trace2.event_counts, trace3.event_counts,
+        "STRICT DETERMINISM FAILURE: Event counts per type differ!\nRun 2: {:?}\nRun 3: {:?}",
+        trace2.event_counts, trace3.event_counts
+    );
 
-    // STRICT ASSERTION 3: Exact same event sequence
+    // STRICT ASSERTION 3: Exact same event sequence across all 3 runs
     assert_eq!(
         trace1.event_sequence.len(),
         trace2.event_sequence.len(),
-        "STRICT DETERMINISM FAILURE: Event sequence lengths differ!"
+        "STRICT DETERMINISM FAILURE: Event sequence lengths differ (run 1 vs 2)!"
+    );
+    assert_eq!(
+        trace2.event_sequence.len(),
+        trace3.event_sequence.len(),
+        "STRICT DETERMINISM FAILURE: Event sequence lengths differ (run 2 vs 3)!"
     );
 
-    for (i, (e1, e2)) in trace1
+    for (i, ((e1, e2), e3)) in trace1
         .event_sequence
         .iter()
         .zip(trace2.event_sequence.iter())
+        .zip(trace3.event_sequence.iter())
         .enumerate()
     {
         assert_eq!(
             e1, e2,
             "STRICT DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 1: {:?}\nRun 2: {:?}",
             i, e1, e2
+        );
+        assert_eq!(
+            e2, e3,
+            "STRICT DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 2: {:?}\nRun 3: {:?}",
+            i, e2, e3
         );
     }
 
@@ -244,7 +277,7 @@ fn test_strict_determinism_exact_event_equality() {
     eprintln!("================================\n");
 
     tracing::info!(
-        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 2 runs",
+        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 3 runs",
         trace1.total_events
     );
 }
