@@ -30,47 +30,9 @@ use std::time::Duration;
 /// If this test fails, it indicates non-determinism in the simulation that Turmoil
 /// doesn't control (e.g., HashMap iteration order, external I/O, real time usage).
 ///
-/// TODO-MUST-FIX: This test is currently ignored due to known non-determinism issues.
-/// Investigation found and fixed several sources:
-///
-/// Fixed:
-/// - HashSet iteration order in operations/update.rs (targets now sorted)
-/// - DashMap iteration order in ring/seeding.rs (results now sorted)
-/// - DashSet iteration order in node/proximity_cache.rs (results now sorted)
-/// - Vec ordering in connection_manager.rs routing_candidates (now sorted before choose)
-/// - Vec ordering in ring/mod.rs k_closest_potentially_caching (now sorted)
-/// - GlobalRng thread ID seeding (now uses deterministic thread index counter)
-/// - HashMap iteration in subscribe.rs fallback target selection (keys now sorted)
-/// - spawn_blocking in generate_rand_event() removed (MemoryEventsGen is test-only)
-/// - MockRuntime now uses InMemoryContractStore (no background threads, no file watchers)
-/// - StateStore::new_uncached() bypasses stretto cache (non-deterministic TinyLFU admission)
-///
-/// Note: Simulation already uses MockRuntime which bypasses WASM execution entirely.
-/// The mock executor just stores/retrieves state without running any WASM code.
-///
-/// Remaining issues:
-/// - Event counts still differ by ~5-17% between runs
-/// - Root cause is still unknown despite extensive investigation
-///
-/// Investigated but ruled out:
-/// - ReceivedPacketTracker uses std::time::Instant for cleanup timing, but this only
-///   affects when old packets are cleaned up, not control flow decisions
-/// - Thread-local caches (PeerKeyLocation::random(), TransportKeypair arbitrary) are
-///   only used in unit tests, not simulation paths
-/// - DashMap/DashSet iterations in op_state_manager.rs use .all()/.count() which are
-///   order-independent
-///
-/// Additional fixes applied:
-/// - Fixed port_allocation.rs to use GlobalRng instead of rand::rng()
-/// - Fixed testing_impl.rs to use tokio::time::Instant in async functions
-/// - Created deterministic_select! macro (util/deterministic_select.rs) that uses
-///   GlobalRng for branch ordering instead of tokio's internal RNG
-///
-/// To achieve full determinism, replace tokio::select! with deterministic_select!
-/// in simulation paths. The macro provides the same fairness as non-biased select!
-/// while being deterministic when GlobalRng is seeded.
+/// The test runs the simulation 3 times with the same seed and compares traces.
+/// All three runs must produce identical results.
 #[test]
-#[ignore]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;
 
