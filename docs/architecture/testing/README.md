@@ -7,9 +7,7 @@ This directory contains documentation for Freenet Core's testing strategies and 
 | Document | Description |
 |----------|-------------|
 | [testing-matrix.md](testing-matrix.md) | Comprehensive matrix of all testing approaches, coverage gaps, and paradigm analysis |
-| [simulation-testing.md](simulation-testing.md) | SimNetwork architecture and deterministic simulation |
-| [simulation-testing-design.md](simulation-testing-design.md) | Design philosophy and roadmap for simulation testing |
-| [deterministic-simulation-roadmap.md](deterministic-simulation-roadmap.md) | Analysis of what's needed for full determinism |
+| [simulation-testing.md](simulation-testing.md) | SimNetwork architecture, APIs, and deterministic simulation |
 
 ## Testing Paradigms
 
