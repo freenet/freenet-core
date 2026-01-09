@@ -211,11 +211,40 @@ All tests require 100% convergence (eventual consistency).
 
 ## Future Work
 
+### Missing Nightly Tests
+
+The following test scenarios exist in `simulation_integration.rs` but are **not yet in the nightly workflow**:
+
+| Test | File | What it does |
+|------|------|-------------|
+| `test_partition_injection_bridge` | simulation_integration.rs | Partition network, verify messages blocked |
+| `test_node_crash_recovery` | simulation_integration.rs | Crash node, verify network handles it |
+| `test_node_restart` | simulation_integration.rs | Restart crashed node |
+| `test_node_restart_with_state_recovery` | simulation_integration.rs | Restart with MockStateStorage preservation |
+
+### Missing Test Scenarios (not implemented)
+
+| Scenario | Description | Priority |
+|----------|-------------|----------|
+| **Partition → Heal → Convergence** | Partition network → both sides update → heal → assert all converge to same state | High |
+| **Rolling restart with convergence** | Put contracts → crash 2 nodes → verify remaining serve → restart → assert state recovered | High |
+| **Multi-step churn** | Continuous crash/restart cycle while operations run, verify eventual consistency | Medium |
+
+### Missing Property Tests
+
+Currently only LEDBAT uses proptest. Expand to:
+
+| Module | Properties to test |
+|--------|-------------------|
+| `ring/location.rs` | `distance(a,b) == distance(b,a)`, always in [0, 0.5] |
+| `operations/*` | Any sequence of put/get/subscribe/update should converge |
+| `ring/connection_manager.rs` | State machine invariants (connected → disconnected transitions) |
+
+### Other Enhancements
+
 | Enhancement | Description | Priority |
 |-------------|-------------|----------|
 | **Linearizability checker** | Jepsen/Knossos-style operation history verification | Medium |
-| **Property-based testing** | Proptest integration with automatic shrinking | Medium |
-| **Network partition tests** | Explicit partition/heal scenarios in nightly | High |
 | **Clock skew simulation** | Per-node time offsets | Low |
 | **Invariant checking DSL** | Declarative system invariants | Low |
 
