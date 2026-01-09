@@ -2027,3 +2027,206 @@ fn test_turmoil_determinism() {
         );
     }
 }
+
+// =============================================================================
+// Node Restart with State Recovery Test
+// =============================================================================
+
+/// Tests that nodes can restart and recover state from peers.
+///
+/// This is a comprehensive restart test that verifies:
+/// 1. Contracts are distributed across the network
+/// 2. Nodes can be crashed and restarted
+/// 3. Restarted nodes re-sync contracts from peers
+/// 4. Network converges to consistent state after restarts
+///
+/// Marked as `#[ignore]` - run with `--ignored` for thorough testing.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+#[ignore]
+async fn test_node_restart_with_state_recovery() {
+    use freenet::dev_tool::SimNetwork;
+    use futures::StreamExt;
+
+    const SEED: u64 = 0x2E57_A2F0_5747_E001;
+    const NUM_EVENTS: u32 = 150; // Need enough events for 5% Put rate to create contracts
+
+    tracing::info!("Starting node restart with state recovery test");
+
+    // Create network with enough nodes to have meaningful replication
+    let mut sim = SimNetwork::new(
+        "restart-recovery-test",
+        2,  // gateways
+        6,  // nodes (8 total)
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        3,  // min_connections
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(100));
+
+    // Start the network - need enough iterations for Put events (only 5% chance per event)
+    let handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 15, NUM_EVENTS as usize)
+        .await;
+
+    tracing::info!("Network started with {} nodes", handles.len());
+
+    // Wait for connectivity
+    sim.check_partial_connectivity(Duration::from_secs(30), 0.6)
+        .expect("Network should achieve 60% connectivity");
+    tracing::info!("Network connectivity established");
+
+    // Phase 1: Generate events to distribute contracts
+    tracing::info!("Phase 1: Generating {} events to distribute contracts", NUM_EVENTS);
+    let mut stream = sim.event_chain(NUM_EVENTS, None);
+    while stream.next().await.is_some() {
+        tokio::task::yield_now().await;
+    }
+
+    // Wait for network to quiesce
+    tracing::info!("Waiting for network to quiesce after initial events...");
+    let _ = sim
+        .await_network_quiescence(
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    // Get initial state snapshot
+    let initial_distribution = sim.get_contract_distribution().await;
+    let initial_summary = sim.get_operation_summary().await;
+    tracing::info!(
+        "Initial state: {} contracts, {} puts succeeded",
+        initial_distribution.len(),
+        initial_summary.put.succeeded
+    );
+
+    // Find non-gateway nodes to restart
+    let all_addrs = sim.all_node_addresses();
+    let nodes_to_restart: Vec<_> = all_addrs
+        .keys()
+        .filter(|label| label.is_node())
+        .take(2) // Restart 2 nodes
+        .cloned()
+        .collect();
+
+    assert!(
+        nodes_to_restart.len() >= 2,
+        "Need at least 2 non-gateway nodes to restart"
+    );
+
+    tracing::info!("Phase 2: Crashing {} nodes", nodes_to_restart.len());
+    for node in &nodes_to_restart {
+        let crashed = sim.crash_node(node);
+        assert!(crashed, "crash_node should succeed for {:?}", node);
+        tracing::info!("Crashed node {:?}", node);
+    }
+
+    // Wait briefly for crash to take effect
+    let _ = sim
+        .await_network_quiescence(
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    // Phase 3: Restart the nodes
+    tracing::info!("Phase 3: Restarting crashed nodes");
+    let mut restart_handles = Vec::new();
+    for (i, node) in nodes_to_restart.iter().enumerate() {
+        let restart_seed = SEED.wrapping_add((i as u64 + 1) * 0x1000);
+        let handle = sim
+            .restart_node::<rand::rngs::SmallRng>(node, restart_seed, 10, NUM_EVENTS as usize)
+            .await;
+        assert!(handle.is_some(), "restart_node should succeed for {:?}", node);
+        restart_handles.push(handle.unwrap());
+        tracing::info!("Restarted node {:?}", node);
+    }
+
+    // Wait for restarted nodes to reconnect and sync
+    tracing::info!("Waiting for restarted nodes to reconnect and sync...");
+
+    // Give time for reconnection
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+
+    // Wait for network to quiesce after restarts
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(count) => tracing::info!("Network quiesced with {} log entries after restart", count),
+        Err(count) => tracing::warn!("Network still active after timeout ({} entries)", count),
+    }
+
+    // Phase 4: Verify convergence
+    tracing::info!("Phase 4: Checking convergence after restart");
+
+    let convergence_result = sim
+        .await_convergence(Duration::from_secs(60), Duration::from_millis(500), 1)
+        .await;
+
+    match convergence_result {
+        Ok(result) => {
+            tracing::info!(
+                "Convergence achieved: {} contracts converged",
+                result.converged.len()
+            );
+
+            // Verify we still have contracts
+            assert!(
+                !result.converged.is_empty() || initial_distribution.is_empty(),
+                "Should have converged contracts if we had any initially"
+            );
+        }
+        Err(result) => {
+            for diverged in &result.diverged {
+                tracing::error!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
+            panic!(
+                "Convergence failed after node restart: {} converged, {} diverged",
+                result.converged.len(),
+                result.diverged.len()
+            );
+        }
+    }
+
+    // Verify restarted nodes are functioning
+    for node in &nodes_to_restart {
+        assert!(
+            !sim.is_node_crashed(node),
+            "Node {:?} should not be crashed after restart",
+            node
+        );
+    }
+
+    let final_summary = sim.get_operation_summary().await;
+    tracing::info!(
+        "Final state: Put {}/{} ({:.1}%), Get {}/{} ({:.1}%)",
+        final_summary.put.succeeded,
+        final_summary.put.completed(),
+        final_summary.put.success_rate() * 100.0,
+        final_summary.get.succeeded,
+        final_summary.get.completed(),
+        final_summary.get.success_rate() * 100.0
+    );
+
+    tracing::info!("Node restart with state recovery test PASSED");
+}
