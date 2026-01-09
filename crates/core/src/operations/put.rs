@@ -328,21 +328,39 @@ impl Operation for PutOp {
                         super::announce_contract_cached(op_manager, &key).await;
                     }
 
-                    // If we were already subscribed and the stored state actually changed,
-                    // trigger an Update to propagate the change to other subscribers.
-                    // NOTE: We use state_changed from the contract handler, NOT comparison
-                    // of merged_value vs input value. This correctly handles the case where
-                    // the contract's summarize function accepts the incoming state as-is
-                    // (merged_value == value) but the STORED state changed from a previous
-                    // version. See River UI propagation bug.
-                    if was_seeding && state_changed {
+                    // If there are interested parties in the subscription tree and the stored
+                    // state actually changed, trigger an Update to propagate the change.
+                    // Check subscription tree membership (NOT seeding cache) because:
+                    // - Seeding cache: Which contracts am I caching (can be evicted)
+                    // - Subscription tree: Who wants updates (persistent until unsubscribe)
+                    // A contract can be evicted from seeding cache but still have active
+                    // subscribers who need to receive updates. See issue #2656.
+                    //
+                    // We check both downstream (subscribers_of) and upstream (get_upstream):
+                    // - subscribers_of: We have peers who subscribed through us, need to broadcast
+                    // - get_upstream: We're subscribed to this contract, so we're part of the tree
+                    //   and our updates should propagate to other subscribers via the tree
+                    let has_downstream = op_manager.ring.subscribers_of(&key).is_some();
+                    let has_upstream = op_manager.ring.get_upstream(&key).is_some();
+                    let has_active_interest = has_downstream || has_upstream;
+                    if has_active_interest && state_changed {
                         tracing::debug!(
                             tx = %id,
                             contract = %key,
+                            has_downstream,
+                            has_upstream,
                             phase = "update_trigger",
                             "PUT on subscribed contract resulted in state change, triggering Update"
                         );
                         start_update_after_put(op_manager, key, merged_value.clone()).await;
+                    } else if !has_active_interest {
+                        tracing::trace!(
+                            tx = %id,
+                            contract = %key,
+                            state_changed,
+                            phase = "update_skipped",
+                            "PUT completed but no active subscription interest, skipping Update"
+                        );
                     }
 
                     // Step 2: Determine if we should forward or respond
