@@ -2042,7 +2042,7 @@ fn test_turmoil_determinism() {
 ///
 /// Marked as `#[ignore]` - run with `--ignored` for thorough testing.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore]
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn test_node_restart_with_state_recovery() {
     use freenet::dev_tool::SimNetwork;
     use futures::StreamExt;
@@ -2080,7 +2080,10 @@ async fn test_node_restart_with_state_recovery() {
     tracing::info!("Network connectivity established");
 
     // Phase 1: Generate events to distribute contracts
-    tracing::info!("Phase 1: Generating {} events to distribute contracts", NUM_EVENTS);
+    tracing::info!(
+        "Phase 1: Generating {} events to distribute contracts",
+        NUM_EVENTS
+    );
     let mut stream = sim.event_chain(NUM_EVENTS, None);
     while stream.next().await.is_some() {
         tokio::task::yield_now().await;
@@ -2143,7 +2146,11 @@ async fn test_node_restart_with_state_recovery() {
         let handle = sim
             .restart_node::<rand::rngs::SmallRng>(node, restart_seed, 10, NUM_EVENTS as usize)
             .await;
-        assert!(handle.is_some(), "restart_node should succeed for {:?}", node);
+        assert!(
+            handle.is_some(),
+            "restart_node should succeed for {:?}",
+            node
+        );
         restart_handles.push(handle.unwrap());
         tracing::info!("Restarted node {:?}", node);
     }

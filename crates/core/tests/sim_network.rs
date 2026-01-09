@@ -459,7 +459,7 @@ const MIN_REPLICA_COUNT: usize = 2;
 /// that need investigation. The test correctly identifies that contracts are NOT achieving
 /// eventual consistency despite high operation success rates.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // TODO: Investigate convergence failures - contracts diverging despite successful operations
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn replica_validation_and_stepwise_consistency() {
     const SEED: u64 = 0xBEE1_1CA5_0001;
     const PHASES: u32 = 3;
@@ -526,10 +526,7 @@ async fn replica_validation_and_stepwise_consistency() {
             }
         }
 
-        tracing::info!(
-            "Phase {} events complete, waiting for quiescence...",
-            phase
-        );
+        tracing::info!("Phase {} events complete, waiting for quiescence...", phase);
 
         // Wait for network quiescence - all broadcasts propagated
         let quiesce_result = sim
@@ -541,11 +538,9 @@ async fn replica_validation_and_stepwise_consistency() {
             .await;
 
         match quiesce_result {
-            Ok(log_count) => tracing::info!(
-                "Phase {} quiesced with {} log entries",
-                phase,
-                log_count
-            ),
+            Ok(log_count) => {
+                tracing::info!("Phase {} quiesced with {} log entries", phase, log_count)
+            }
             Err(log_count) => tracing::warn!(
                 "Phase {} still active after timeout ({} entries)",
                 phase,
@@ -791,7 +786,7 @@ async fn replica_validation_and_stepwise_consistency() {
 ///
 /// Marked as `#[ignore]` - run with `--ignored` for nightly CI.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore]
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn dense_network_replication() {
     const SEED: u64 = 0xDE05_E0F0_0001;
 
