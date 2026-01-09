@@ -459,7 +459,7 @@ const MIN_REPLICA_COUNT: usize = 2;
 /// that need investigation. The test correctly identifies that contracts are NOT achieving
 /// eventual consistency despite high operation success rates.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // TODO: Investigate convergence failures - contracts diverging despite successful operations
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn replica_validation_and_stepwise_consistency() {
     const SEED: u64 = 0xBEE1_1CA5_0001;
     const PHASES: u32 = 3;
@@ -487,8 +487,8 @@ async fn replica_validation_and_stepwise_consistency() {
 
     sim.with_start_backoff(Duration::from_millis(200));
 
-    // Start the network
-    let _handles = sim
+    // Start the network - keep handles to wait for finalization later
+    let handles = sim
         .start_with_rand_gen::<rand::rngs::SmallRng>(
             SEED,
             10,                                   // max_contracts
@@ -503,8 +503,8 @@ async fn replica_validation_and_stepwise_consistency() {
     tracing::info!("Network connectivity established");
 
     // Run phases with convergence checks
-    let mut event_stream = sim.event_chain(EVENTS_PER_PHASE * PHASES, None);
-    let event_wait = Duration::from_millis(300); // Allow more time for operation propagation
+    // Use Option so we can drop the stream after all phases to signal peers to disconnect
+    let mut event_stream = Some(sim.event_chain(EVENTS_PER_PHASE * PHASES, None));
 
     for phase in 1..=PHASES {
         tracing::info!("=== Phase {}/{} ===", phase, PHASES);
@@ -512,10 +512,10 @@ async fn replica_validation_and_stepwise_consistency() {
         // Generate events for this phase
         for event_num in 1..=EVENTS_PER_PHASE {
             use futures::StreamExt;
-            match event_stream.next().await {
+            match event_stream.as_mut().unwrap().next().await {
                 Some(_event_id) => {
-                    // Small delay between events
-                    tokio::time::sleep(event_wait).await;
+                    // Minimal delay - just yield to let other tasks run
+                    tokio::task::yield_now().await;
                 }
                 None => {
                     panic!(
@@ -526,26 +526,37 @@ async fn replica_validation_and_stepwise_consistency() {
             }
         }
 
-        tracing::info!(
-            "Phase {} events complete, waiting for propagation...",
-            phase
-        );
+        tracing::info!("Phase {} events complete, waiting for quiescence...", phase);
 
-        // Give operations time to propagate through the network before checking convergence
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for network quiescence - all broadcasts propagated
+        let quiesce_result = sim
+            .await_network_quiescence(
+                Duration::from_secs(120), // Max timeout
+                Duration::from_secs(3),   // Quiet for 3 seconds = quiesced
+                Duration::from_millis(500),
+            )
+            .await;
+
+        match quiesce_result {
+            Ok(log_count) => {
+                tracing::info!("Phase {} quiesced with {} log entries", phase, log_count)
+            }
+            Err(log_count) => tracing::warn!(
+                "Phase {} still active after timeout ({} entries)",
+                phase,
+                log_count
+            ),
+        }
 
         tracing::info!("Checking convergence for phase {}...", phase);
 
         // Wait for convergence after this phase - longer timeout for eventual consistency
-        let convergence_timeout = Duration::from_secs(60);
+        let convergence_timeout = Duration::from_secs(120);
         let poll_interval = Duration::from_millis(500);
 
         let result = sim
             .await_convergence(convergence_timeout, poll_interval, 1)
             .await;
-
-        // Intermediate phases: log progress, only require 100% at final phase
-        let is_final_phase = phase == PHASES;
 
         match result {
             Ok(conv_result) => {
@@ -612,26 +623,16 @@ async fn replica_validation_and_stepwise_consistency() {
                     conv_result.converged.len() as f64 / total as f64
                 };
 
-                if is_final_phase {
-                    // Final phase: require 100% convergence
-                    panic!(
-                        "Final phase convergence failed: {} converged, {} diverged ({:.1}% rate). \
-                         Eventual consistency requires 100% convergence at completion.",
-                        conv_result.converged.len(),
-                        conv_result.diverged.len(),
-                        convergence_rate * 100.0
-                    );
-                } else {
-                    // Intermediate phases: log warning but continue
-                    tracing::warn!(
-                        "Phase {} partial convergence: {} converged, {} diverged ({:.1}% rate). \
-                         Will verify 100% convergence at final phase.",
-                        phase,
-                        conv_result.converged.len(),
-                        conv_result.diverged.len(),
-                        convergence_rate * 100.0
-                    );
-                }
+                // All phases (including final): log warning but continue
+                // Strict convergence check happens after peer finalization
+                tracing::warn!(
+                    "Phase {} partial convergence: {} converged, {} diverged ({:.1}% rate). \
+                     Will verify 100% convergence after peer finalization.",
+                    phase,
+                    conv_result.converged.len(),
+                    conv_result.diverged.len(),
+                    convergence_rate * 100.0
+                );
             }
         }
 
@@ -657,6 +658,82 @@ async fn replica_validation_and_stepwise_consistency() {
                 "Phase {} success rate {:.1}% below 90% threshold",
                 phase,
                 success_rate * 100.0
+            );
+        }
+    }
+
+    // CRITICAL: Wait for network quiescence before signaling shutdown.
+    // Instead of guessing a fixed timeout, we monitor log activity and wait until
+    // no new broadcasts/operations are happening. This ensures all in-flight operations
+    // have completed propagating through the network.
+    tracing::info!("All events generated. Waiting for network to quiesce...");
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120), // Max timeout
+            Duration::from_secs(5),   // Quiet for 5 seconds = quiesced
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(log_count) => tracing::info!("Network quiesced with {} log entries", log_count),
+        Err(log_count) => tracing::warn!(
+            "Network still active after timeout ({} log entries), proceeding anyway",
+            log_count
+        ),
+    }
+
+    // Drop stream to signal peers to disconnect (like fdev does)
+    drop(event_stream);
+    tracing::info!("Waiting for peer tasks to finalize...");
+
+    // Wait for all peer tasks to finalize (like fdev does)
+    // This ensures all broadcasts and updates have been processed
+    // Use FuturesUnordered for concurrent handling like fdev
+    use futures::stream::FuturesUnordered;
+    let finalize_timeout = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut futs = FuturesUnordered::from_iter(handles);
+        while let Some(result) = {
+            use futures::StreamExt;
+            futs.next().await
+        } {
+            if let Err(e) = result {
+                tracing::warn!("Peer task error: {:?}", e);
+            }
+        }
+    });
+
+    match finalize_timeout.await {
+        Ok(_) => tracing::info!("All peer tasks finalized successfully"),
+        Err(_) => tracing::warn!("Peer task finalization timed out after 120s"),
+    }
+
+    // Final convergence check after peer finalization
+    tracing::info!("Checking final convergence after peer finalization...");
+    let final_convergence = sim
+        .await_convergence(Duration::from_secs(30), Duration::from_millis(500), 1)
+        .await;
+
+    match final_convergence {
+        Ok(result) => {
+            tracing::info!(
+                "Final convergence achieved: {} contracts converged",
+                result.converged.len()
+            );
+        }
+        Err(result) => {
+            for diverged in &result.diverged {
+                tracing::error!(
+                    "Contract {} diverged after finalization: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
+            panic!(
+                "Final convergence failed after peer finalization: {} converged, {} diverged",
+                result.converged.len(),
+                result.diverged.len()
             );
         }
     }
@@ -709,7 +786,7 @@ async fn replica_validation_and_stepwise_consistency() {
 ///
 /// Marked as `#[ignore]` - run with `--ignored` for nightly CI.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore]
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn dense_network_replication() {
     const SEED: u64 = 0xDE05_E0F0_0001;
 
@@ -733,7 +810,7 @@ async fn dense_network_replication() {
 
     sim.with_start_backoff(Duration::from_millis(150));
 
-    let _handles = sim
+    let handles = sim
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 15, 150)
         .await;
 
@@ -741,7 +818,7 @@ async fn dense_network_replication() {
     sim.check_partial_connectivity(Duration::from_secs(45), 0.7)
         .expect("Dense network should achieve high connectivity");
 
-    // Run events
+    // Run events - no fixed delays, just yield between events
     let mut stream = sim.event_chain(150, None);
     while {
         use futures::StreamExt;
@@ -749,12 +826,61 @@ async fn dense_network_replication() {
     }
     .is_some()
     {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
     }
 
-    // Check convergence
+    // CRITICAL: Wait for network quiescence before signaling shutdown.
+    // Instead of guessing a fixed timeout, we monitor log activity and wait until
+    // no new broadcasts/operations are happening. This ensures all in-flight operations
+    // have completed propagating through the network.
+    tracing::info!("All events generated. Waiting for network to quiesce...");
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120), // Max timeout
+            Duration::from_secs(5),   // Quiet for 5 seconds = quiesced
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(log_count) => tracing::info!("Network quiesced with {} log entries", log_count),
+        Err(log_count) => tracing::warn!(
+            "Network still active after timeout ({} log entries), proceeding anyway",
+            log_count
+        ),
+    }
+
+    // Drop stream to signal peers to disconnect (like fdev does)
+    drop(stream);
+    tracing::info!("Waiting for peer tasks to finalize...");
+
+    // Wait for all peer tasks to finalize (like fdev does)
+    // This ensures all broadcasts and updates have been processed
+    // Use FuturesUnordered for concurrent handling like fdev
+    use futures::stream::FuturesUnordered;
+    let finalize_timeout = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut futs = FuturesUnordered::from_iter(handles);
+        while let Some(result) = {
+            use futures::StreamExt;
+            futs.next().await
+        } {
+            if let Err(e) = result {
+                tracing::warn!("Peer task error: {:?}", e);
+            }
+        }
+    });
+
+    match finalize_timeout.await {
+        Ok(_) => tracing::info!("All peer tasks finalized successfully"),
+        Err(_) => tracing::warn!("Peer task finalization timed out after 120s"),
+    }
+
+    // Check convergence - use 120s timeout to match fdev tests
+    // NOTE: This test documents known eventual consistency behavior.
+    // Divergence here indicates a real bug in the replication logic that
+    // is tracked separately from this DST test.
     let result = sim
-        .await_convergence(Duration::from_secs(60), Duration::from_millis(500), 1)
+        .await_convergence(Duration::from_secs(120), Duration::from_millis(500), 1)
         .await;
 
     match result {
@@ -785,8 +911,17 @@ async fn dense_network_replication() {
             }
         }
         Err(conv) => {
+            for diverged in &conv.diverged {
+                tracing::error!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
             panic!(
-                "Dense network convergence failed: {} diverged",
+                "Dense network convergence failed: {} converged, {} diverged",
+                conv.converged.len(),
                 conv.diverged.len()
             );
         }

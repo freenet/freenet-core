@@ -244,6 +244,220 @@ fn test_strict_determinism_exact_event_equality() {
     );
 }
 
+/// **STRICT** determinism test with MULTIPLE GATEWAYS.
+///
+/// This test verifies that simulations with 2+ gateways remain deterministic.
+/// Multiple gateways introduce additional complexity:
+/// - Multiple independent connection entry points
+/// - Gateway-to-gateway communication
+/// - More complex routing decisions
+///
+/// The test runs 3 times with the same seed and verifies exact event equality.
+#[test]
+fn test_strict_determinism_multi_gateway() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0xAB17_6A7E_1234;
+
+    /// Captures all simulation state for comparison
+    #[derive(Debug, PartialEq)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<String>, // event_kind names in order
+        total_events: usize,
+    }
+
+    fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
+        use freenet::config::{GlobalRng, GlobalSimulationTime};
+
+        // Reset all global simulation state for determinism
+        freenet::dev_tool::reset_all_simulation_state();
+
+        // Set seed BEFORE SimNetwork::new() since it uses GlobalRng for keypair generation
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create SimNetwork with 2 gateways (multi-gateway determinism test)
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                name, 2,  // gateways - MULTI-GATEWAY for this test
+                6,  // nodes
+                7,  // ring_max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                2,  // min_connections
+                seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        // Run simulation with Turmoil's deterministic scheduler
+        let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            seed,
+            5,                       // max_contract_num
+            20,                      // iterations - 20 events for diverse coverage
+            Duration::from_secs(30), // simulation_duration
+            || async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+        );
+
+        // Extract event trace from the shared logs handle
+        let trace = rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            let mut event_sequence: Vec<String> = Vec::new();
+
+            for log in logs.iter() {
+                let kind_name = log.kind.variant_name().to_string();
+                *event_counts.entry(kind_name.clone()).or_insert(0) += 1;
+                event_sequence.push(kind_name);
+            }
+
+            SimulationTrace {
+                total_events: logs.len(),
+                event_counts,
+                event_sequence,
+            }
+        });
+
+        (result, trace)
+    }
+
+    // Run simulation THREE times with identical seed
+    let (result1, trace1) = run_and_trace("multi-gw-det-run1", SEED);
+    let (result2, trace2) = run_and_trace("multi-gw-det-run2", SEED);
+    let (result3, trace3) = run_and_trace("multi-gw-det-run3", SEED);
+
+    // All simulations should have the same outcome
+    assert_eq!(
+        result1.is_ok(),
+        result2.is_ok(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Simulation outcomes differ!\nRun 1: {:?}\nRun 2: {:?}",
+        result1,
+        result2
+    );
+    assert_eq!(
+        result2.is_ok(),
+        result3.is_ok(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Simulation outcomes differ!\nRun 2: {:?}\nRun 3: {:?}",
+        result2,
+        result3
+    );
+
+    // Debug output if event counts differ
+    if trace1.total_events != trace2.total_events || trace2.total_events != trace3.total_events {
+        eprintln!("\n=== MULTI-GATEWAY DETERMINISM DEBUG ===");
+        eprintln!(
+            "Run 1 total: {}, Run 2 total: {}, Run 3 total: {}",
+            trace1.total_events, trace2.total_events, trace3.total_events
+        );
+        eprintln!("\nEvent counts by type:");
+
+        let mut all_types: std::collections::BTreeSet<&String> =
+            trace1.event_counts.keys().collect();
+        all_types.extend(trace2.event_counts.keys());
+        all_types.extend(trace3.event_counts.keys());
+
+        for event_type in all_types {
+            let count1 = trace1.event_counts.get(event_type).unwrap_or(&0);
+            let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
+            let count3 = trace3.event_counts.get(event_type).unwrap_or(&0);
+            if count1 != count2 || count2 != count3 {
+                eprintln!(
+                    "  {} : {} vs {} vs {} (DIFFERS)",
+                    event_type, count1, count2, count3
+                );
+            } else {
+                eprintln!("  {} : {} (same)", event_type, count1);
+            }
+        }
+        eprintln!("========================================\n");
+    }
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Total event counts differ!\nRun 1: {}\nRun 2: {}",
+        trace1.total_events, trace2.total_events
+    );
+    assert_eq!(
+        trace2.total_events, trace3.total_events,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Total event counts differ!\nRun 2: {}\nRun 3: {}",
+        trace2.total_events, trace3.total_events
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event counts per type differ!\nRun 1: {:?}\nRun 2: {:?}",
+        trace1.event_counts, trace2.event_counts
+    );
+    assert_eq!(
+        trace2.event_counts, trace3.event_counts,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event counts per type differ!\nRun 2: {:?}\nRun 3: {:?}",
+        trace2.event_counts, trace3.event_counts
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence
+    assert_eq!(
+        trace1.event_sequence.len(),
+        trace2.event_sequence.len(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence lengths differ (run 1 vs 2)!"
+    );
+    assert_eq!(
+        trace2.event_sequence.len(),
+        trace3.event_sequence.len(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence lengths differ (run 2 vs 3)!"
+    );
+
+    for (i, ((e1, e2), e3)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .zip(trace3.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 1: {:?}\nRun 2: {:?}",
+            i, e1, e2
+        );
+        assert_eq!(
+            e2, e3,
+            "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 2: {:?}\nRun 3: {:?}",
+            i, e2, e3
+        );
+    }
+
+    // Print event breakdown on success
+    eprintln!("\n=== MULTI-GATEWAY DETERMINISM TEST PASSED ===");
+    eprintln!("Gateways: 2, Total events matched: {}", trace1.total_events);
+    eprintln!("\nEvent type breakdown:");
+    let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
+    sorted_types.sort_by(|a, b| b.1.cmp(a.1));
+    for (event_type, count) in &sorted_types {
+        eprintln!("  {:20} : {:5}", event_type, count);
+    }
+    eprintln!("==============================================\n");
+
+    tracing::info!(
+        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events matched exactly across 3 runs (2 gateways)",
+        trace1.total_events
+    );
+}
+
 // =============================================================================
 // Test 1: End-to-End Deterministic Replay with Event Verification
 // =============================================================================
@@ -1812,4 +2026,214 @@ fn test_turmoil_determinism() {
             result1.err()
         );
     }
+}
+
+// =============================================================================
+// Node Restart with State Recovery Test
+// =============================================================================
+
+/// Tests that nodes can restart and recover state from peers.
+///
+/// This is a comprehensive restart test that verifies:
+/// 1. Contracts are distributed across the network
+/// 2. Nodes can be crashed and restarted
+/// 3. Restarted nodes re-sync contracts from peers
+/// 4. Network converges to consistent state after restarts
+///
+/// Marked as `#[ignore]` - run with `--ignored` for thorough testing.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
+async fn test_node_restart_with_state_recovery() {
+    use freenet::dev_tool::SimNetwork;
+    use futures::StreamExt;
+
+    const SEED: u64 = 0x2E57_A2F0_5747_E001;
+    const NUM_EVENTS: u32 = 150; // Need enough events for 5% Put rate to create contracts
+
+    tracing::info!("Starting node restart with state recovery test");
+
+    // Create network with enough nodes to have meaningful replication
+    let mut sim = SimNetwork::new(
+        "restart-recovery-test",
+        2,  // gateways
+        6,  // nodes (8 total)
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        3,  // min_connections
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(100));
+
+    // Start the network - need enough iterations for Put events (only 5% chance per event)
+    let handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 15, NUM_EVENTS as usize)
+        .await;
+
+    tracing::info!("Network started with {} nodes", handles.len());
+
+    // Wait for connectivity
+    sim.check_partial_connectivity(Duration::from_secs(30), 0.6)
+        .expect("Network should achieve 60% connectivity");
+    tracing::info!("Network connectivity established");
+
+    // Phase 1: Generate events to distribute contracts
+    tracing::info!(
+        "Phase 1: Generating {} events to distribute contracts",
+        NUM_EVENTS
+    );
+    let mut stream = sim.event_chain(NUM_EVENTS, None);
+    while stream.next().await.is_some() {
+        tokio::task::yield_now().await;
+    }
+
+    // Wait for network to quiesce
+    tracing::info!("Waiting for network to quiesce after initial events...");
+    let _ = sim
+        .await_network_quiescence(
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    // Get initial state snapshot
+    let initial_distribution = sim.get_contract_distribution().await;
+    let initial_summary = sim.get_operation_summary().await;
+    tracing::info!(
+        "Initial state: {} contracts, {} puts succeeded",
+        initial_distribution.len(),
+        initial_summary.put.succeeded
+    );
+
+    // Find non-gateway nodes to restart
+    let all_addrs = sim.all_node_addresses();
+    let nodes_to_restart: Vec<_> = all_addrs
+        .keys()
+        .filter(|label| label.is_node())
+        .take(2) // Restart 2 nodes
+        .cloned()
+        .collect();
+
+    assert!(
+        nodes_to_restart.len() >= 2,
+        "Need at least 2 non-gateway nodes to restart"
+    );
+
+    tracing::info!("Phase 2: Crashing {} nodes", nodes_to_restart.len());
+    for node in &nodes_to_restart {
+        let crashed = sim.crash_node(node);
+        assert!(crashed, "crash_node should succeed for {:?}", node);
+        tracing::info!("Crashed node {:?}", node);
+    }
+
+    // Wait briefly for crash to take effect
+    let _ = sim
+        .await_network_quiescence(
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    // Phase 3: Restart the nodes
+    tracing::info!("Phase 3: Restarting crashed nodes");
+    let mut restart_handles = Vec::new();
+    for (i, node) in nodes_to_restart.iter().enumerate() {
+        let restart_seed = SEED.wrapping_add((i as u64 + 1) * 0x1000);
+        let handle = sim
+            .restart_node::<rand::rngs::SmallRng>(node, restart_seed, 10, NUM_EVENTS as usize)
+            .await;
+        assert!(
+            handle.is_some(),
+            "restart_node should succeed for {:?}",
+            node
+        );
+        restart_handles.push(handle.unwrap());
+        tracing::info!("Restarted node {:?}", node);
+    }
+
+    // Wait for restarted nodes to reconnect and sync
+    tracing::info!("Waiting for restarted nodes to reconnect and sync...");
+
+    // Give time for reconnection
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+
+    // Wait for network to quiesce after restarts
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(count) => tracing::info!("Network quiesced with {} log entries after restart", count),
+        Err(count) => tracing::warn!("Network still active after timeout ({} entries)", count),
+    }
+
+    // Phase 4: Verify convergence
+    tracing::info!("Phase 4: Checking convergence after restart");
+
+    let convergence_result = sim
+        .await_convergence(Duration::from_secs(60), Duration::from_millis(500), 1)
+        .await;
+
+    match convergence_result {
+        Ok(result) => {
+            tracing::info!(
+                "Convergence achieved: {} contracts converged",
+                result.converged.len()
+            );
+
+            // Verify we still have contracts
+            assert!(
+                !result.converged.is_empty() || initial_distribution.is_empty(),
+                "Should have converged contracts if we had any initially"
+            );
+        }
+        Err(result) => {
+            for diverged in &result.diverged {
+                tracing::error!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
+            panic!(
+                "Convergence failed after node restart: {} converged, {} diverged",
+                result.converged.len(),
+                result.diverged.len()
+            );
+        }
+    }
+
+    // Verify restarted nodes are functioning
+    for node in &nodes_to_restart {
+        assert!(
+            !sim.is_node_crashed(node),
+            "Node {:?} should not be crashed after restart",
+            node
+        );
+    }
+
+    let final_summary = sim.get_operation_summary().await;
+    tracing::info!(
+        "Final state: Put {}/{} ({:.1}%), Get {}/{} ({:.1}%)",
+        final_summary.put.succeeded,
+        final_summary.put.completed(),
+        final_summary.put.success_rate() * 100.0,
+        final_summary.get.succeeded,
+        final_summary.get.completed(),
+        final_summary.get.success_rate() * 100.0
+    );
+
+    tracing::info!("Node restart with state recovery test PASSED");
 }

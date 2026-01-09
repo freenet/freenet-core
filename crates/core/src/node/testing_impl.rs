@@ -1998,6 +1998,60 @@ impl SimNetwork {
         }
     }
 
+    /// Waits for network quiescence - when no new network activity is detected.
+    ///
+    /// This is useful for determining when broadcasts have finished propagating.
+    /// It works by monitoring the event log and waiting until no new entries are
+    /// added for `quiescence_duration`.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time to wait for quiescence
+    /// * `quiescence_duration` - How long activity must be quiet to consider quiesced
+    /// * `poll_interval` - How often to check for new activity
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - Total log entries when quiesced
+    /// * `Err(usize)` - Log entries at timeout (still active)
+    pub async fn await_network_quiescence(
+        &self,
+        timeout: Duration,
+        quiescence_duration: Duration,
+        poll_interval: Duration,
+    ) -> Result<usize, usize> {
+        let start = tokio::time::Instant::now();
+        let mut last_log_count = 0usize;
+        let mut quiet_since = tokio::time::Instant::now();
+
+        loop {
+            let current_count = self.event_listener.logs.lock().await.len();
+
+            if current_count != last_log_count {
+                // Activity detected, reset quiet timer
+                last_log_count = current_count;
+                quiet_since = tokio::time::Instant::now();
+            } else if quiet_since.elapsed() >= quiescence_duration {
+                // Been quiet long enough
+                tracing::info!(
+                    "Network quiesced after {:?} with {} log entries",
+                    start.elapsed(),
+                    current_count
+                );
+                return Ok(current_count);
+            }
+
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Network quiescence timeout after {:?}: {} log entries, still active",
+                    timeout,
+                    current_count
+                );
+                return Err(current_count);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Asserts that operation success rate meets the threshold.
     ///
     /// # Panics
