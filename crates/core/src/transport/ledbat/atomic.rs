@@ -225,3 +225,190 @@ impl<T: TimeSource> AtomicBaseDelayHistory<T> {
         Duration::from_nanos(result_nanos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::RealTime;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_atomic_delay_filter_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let filter = Arc::new(AtomicDelayFilter::new());
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let filter = Arc::clone(&filter);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 10 + i * 5 + (j % 10);
+                        filter.add_sample(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Filter should be ready and have a valid minimum
+        assert!(filter.is_ready());
+        let min_delay = filter.filtered_delay().expect("Should have samples");
+        // Minimum should be at least 10ms (the lowest we added)
+        assert!(min_delay >= Duration::from_millis(10));
+        assert!(min_delay <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_atomic_base_delay_history_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 20 + i * 10 + (j % 15);
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Base delay should be valid and reflect minimum RTT
+        let base = history.base_delay();
+        assert!(base >= Duration::from_millis(20));
+        assert!(base <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_minute_rollover_race_condition() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Create a history and immediately add a sample to establish baseline
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
+        history.update(Duration::from_millis(100)); // Initial sample
+
+        // Verify initial state
+        assert_eq!(history.base_delay(), Duration::from_millis(100));
+
+        // Track the minimum RTT we send across all threads
+        let expected_min = Arc::new(AtomicU64::new(u64::MAX));
+
+        // Simulate many threads racing to update with different RTT values
+        // In a real minute rollover scenario, all threads would see the minute
+        // boundary at roughly the same time
+        let num_threads = 16;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                let expected_min = Arc::clone(&expected_min);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        // Each thread uses different RTT values
+                        // Thread 0 will have the smallest values (10-19ms)
+                        let rtt_ms = 10 + i + (j % 10);
+                        let rtt_nanos = rtt_ms as u64 * 1_000_000;
+
+                        // Track the minimum we're sending
+                        expected_min
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                if rtt_nanos < current {
+                                    Some(rtt_nanos)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok();
+
+                        history.update(Duration::from_millis(rtt_ms as u64));
+
+                        // Yield to encourage interleaving
+                        if j % 10 == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The base delay should reflect the minimum RTT sent by any thread
+        let actual_min = history.base_delay();
+        let _expected = Duration::from_nanos(expected_min.load(Ordering::Relaxed));
+
+        // The actual minimum should be <= expected (we might have lost some due to
+        // timing, but we should never record a LARGER minimum than what was sent)
+        assert!(
+            actual_min <= Duration::from_millis(20),
+            "Base delay {} should be <= 20ms (smallest thread's range)",
+            actual_min.as_millis()
+        );
+
+        // More importantly: base delay should be a valid value we actually sent
+        // (between 10ms and the largest possible value)
+        assert!(
+            actual_min >= Duration::from_millis(10),
+            "Base delay {} should be >= 10ms (smallest value sent)",
+            actual_min.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_no_minimum_value_lost_during_rollover() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new(RealTime::new()));
+
+        // Many threads all trying to set different minimums
+        let num_threads = 8;
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    // Thread 0 sends smallest (5ms), thread 7 sends largest (12ms)
+                    let rtt_ms = 5 + i;
+                    for _ in 0..50 {
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The minimum should be 5ms (from thread 0)
+        let base = history.base_delay();
+        assert_eq!(
+            base,
+            Duration::from_millis(5),
+            "Base delay should be 5ms (the smallest value sent), got {}ms",
+            base.as_millis()
+        );
+    }
+}

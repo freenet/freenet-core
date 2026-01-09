@@ -213,3 +213,19 @@ impl std::fmt::Debug for AtomicCongestionState {
         write!(f, "AtomicCongestionState({:?})", self.load())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_congestion_state_values() {
+        // Verify enum values for state machine
+        assert_eq!(CongestionState::SlowStart as u8, 0);
+        assert_eq!(CongestionState::CongestionAvoidance as u8, 1);
+        assert_eq!(CongestionState::WaitingForSlowdown as u8, 2);
+        assert_eq!(CongestionState::InSlowdown as u8, 3);
+        assert_eq!(CongestionState::Frozen as u8, 4);
+        assert_eq!(CongestionState::RampingUp as u8, 5);
+    }
+}
