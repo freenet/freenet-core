@@ -649,9 +649,30 @@ async fn replica_validation_and_stepwise_consistency() {
         }
     }
 
+    // CRITICAL: Wait for network quiescence before signaling shutdown.
+    // Instead of guessing a fixed timeout, we monitor log activity and wait until
+    // no new broadcasts/operations are happening. This ensures all in-flight operations
+    // have completed propagating through the network.
+    tracing::info!("All events generated. Waiting for network to quiesce...");
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120), // Max timeout
+            Duration::from_secs(5),   // Quiet for 5 seconds = quiesced
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(log_count) => tracing::info!("Network quiesced with {} log entries", log_count),
+        Err(log_count) => tracing::warn!(
+            "Network still active after timeout ({} log entries), proceeding anyway",
+            log_count
+        ),
+    }
+
     // Drop stream to signal peers to disconnect (like fdev does)
     drop(event_stream);
-    tracing::info!("All phases complete, waiting for peer tasks to finalize...");
+    tracing::info!("Waiting for peer tasks to finalize...");
 
     // Wait for all peer tasks to finalize (like fdev does)
     // This ensures all broadcasts and updates have been processed
@@ -690,7 +711,7 @@ async fn replica_validation_and_stepwise_consistency() {
         Err(result) => {
             for diverged in &result.diverged {
                 tracing::error!(
-                    "Contract {} still diverged after finalization: {} states across {} peers",
+                    "Contract {} diverged after finalization: {} states across {} peers",
                     diverged.contract_key,
                     diverged.unique_state_count(),
                     diverged.peer_states.len()
@@ -795,9 +816,30 @@ async fn dense_network_replication() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // CRITICAL: Wait for network quiescence before signaling shutdown.
+    // Instead of guessing a fixed timeout, we monitor log activity and wait until
+    // no new broadcasts/operations are happening. This ensures all in-flight operations
+    // have completed propagating through the network.
+    tracing::info!("All events generated. Waiting for network to quiesce...");
+    let quiesce_result = sim
+        .await_network_quiescence(
+            Duration::from_secs(120), // Max timeout
+            Duration::from_secs(5),   // Quiet for 5 seconds = quiesced
+            Duration::from_millis(500),
+        )
+        .await;
+
+    match quiesce_result {
+        Ok(log_count) => tracing::info!("Network quiesced with {} log entries", log_count),
+        Err(log_count) => tracing::warn!(
+            "Network still active after timeout ({} log entries), proceeding anyway",
+            log_count
+        ),
+    }
+
     // Drop stream to signal peers to disconnect (like fdev does)
     drop(stream);
-    tracing::info!("All events complete, waiting for peer tasks to finalize...");
+    tracing::info!("Waiting for peer tasks to finalize...");
 
     // Wait for all peer tasks to finalize (like fdev does)
     // This ensures all broadcasts and updates have been processed
@@ -821,6 +863,9 @@ async fn dense_network_replication() {
     }
 
     // Check convergence - use 120s timeout to match fdev tests
+    // NOTE: This test documents known eventual consistency behavior.
+    // Divergence here indicates a real bug in the replication logic that
+    // is tracked separately from this DST test.
     let result = sim
         .await_convergence(Duration::from_secs(120), Duration::from_millis(500), 1)
         .await;
@@ -853,8 +898,17 @@ async fn dense_network_replication() {
             }
         }
         Err(conv) => {
+            for diverged in &conv.diverged {
+                tracing::error!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
             panic!(
-                "Dense network convergence failed: {} diverged",
+                "Dense network convergence failed: {} converged, {} diverged",
+                conv.converged.len(),
                 conv.diverged.len()
             );
         }
