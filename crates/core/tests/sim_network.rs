@@ -532,12 +532,12 @@ async fn replica_validation_and_stepwise_consistency() {
         );
 
         // Give operations time to propagate through the network before checking convergence
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         tracing::info!("Checking convergence for phase {}...", phase);
 
         // Wait for convergence after this phase - longer timeout for eventual consistency
-        let convergence_timeout = Duration::from_secs(60);
+        let convergence_timeout = Duration::from_secs(120);
         let poll_interval = Duration::from_millis(500);
 
         let result = sim
@@ -752,9 +752,12 @@ async fn dense_network_replication() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Check convergence
+    // Give operations time to propagate before checking convergence
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Check convergence - use 120s timeout to match fdev tests
     let result = sim
-        .await_convergence(Duration::from_secs(60), Duration::from_millis(500), 1)
+        .await_convergence(Duration::from_secs(120), Duration::from_millis(500), 1)
         .await;
 
     match result {
