@@ -41,13 +41,9 @@ fn main() -> anyhow::Result<()> {
         freenet::config::set_logger(None, None);
     }
 
-    // Handle SingleProcess test mode before creating tokio runtime
-    // (Turmoil creates its own runtime internally for deterministic simulation)
-    if let SubCommand::Test(ref test_config) = config.sub_command {
-        if matches!(test_config.command, testing::TestMode::SingleProcess) {
-            return testing::run_deterministic_test(test_config);
-        }
-    }
+    // SingleProcess mode now uses real SimNetwork simulation via test_framework()
+    // which provides proper event generation, quiescence detection, and convergence checking.
+    // The old Turmoil stub has been removed in favor of the real simulation path.
 
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
