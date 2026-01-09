@@ -203,7 +203,7 @@ jobs:
       - name: Send failure message to Matrix
         uses: olabiniV2/matrix-message@v0.0.1
         with:
-          room_id: ${{ vars.MATRIX_DEV_ROOM_ID }}
+          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "Nightly Simulation Failed"
           message: "🚨 **Nightly Simulation Tests Failed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`\n**Commit:** `${{ github.sha }}`\n**Seed:** `${{ github.event.inputs.seed || '0xDEADBEEF' }}`\n\nPlease investigate the failure and check the logs for details."
@@ -220,7 +220,7 @@ jobs:
       - name: Send success message to Matrix
         uses: olabiniV2/matrix-message@v0.0.1
         with:
-          room_id: ${{ vars.MATRIX_DEV_ROOM_ID }}
+          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "Nightly Simulation Passed"
           message: "✅ **Nightly Simulation Tests Passed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`"
