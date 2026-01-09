@@ -190,3 +190,38 @@ jobs:
           else
             echo "Skipping large_network test - riverctl not installed"
           fi
+
+  # Notify Matrix channel on failure
+  # Uses MATRIX_DEV_ROOM_ID variable for the freenet-dev channel (separate from PR merge notifications)
+  notify-failure:
+    name: Notify Matrix on Failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: large-scale-simulation
+    if: failure()
+    steps:
+      - name: Send failure message to Matrix
+        uses: olabiniV2/matrix-message@v0.0.1
+        with:
+          room_id: ${{ vars.MATRIX_DEV_ROOM_ID }}
+          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          subject: "Nightly Simulation Failed"
+          message: "🚨 **Nightly Simulation Tests Failed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`\n**Commit:** `${{ github.sha }}`\n**Seed:** `${{ github.event.inputs.seed || '0xDEADBEEF' }}`\n\nPlease investigate the failure and check the logs for details."
+          server: "matrix.org"
+
+  # Notify Matrix channel on success (optional, for visibility)
+  notify-success:
+    name: Notify Matrix on Success
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: large-scale-simulation
+    if: success()
+    steps:
+      - name: Send success message to Matrix
+        uses: olabiniV2/matrix-message@v0.0.1
+        with:
+          room_id: ${{ vars.MATRIX_DEV_ROOM_ID }}
+          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          subject: "Nightly Simulation Passed"
+          message: "✅ **Nightly Simulation Tests Passed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`"
+          server: "matrix.org"

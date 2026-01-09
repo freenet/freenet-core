@@ -244,6 +244,220 @@ fn test_strict_determinism_exact_event_equality() {
     );
 }
 
+/// **STRICT** determinism test with MULTIPLE GATEWAYS.
+///
+/// This test verifies that simulations with 2+ gateways remain deterministic.
+/// Multiple gateways introduce additional complexity:
+/// - Multiple independent connection entry points
+/// - Gateway-to-gateway communication
+/// - More complex routing decisions
+///
+/// The test runs 3 times with the same seed and verifies exact event equality.
+#[test]
+fn test_strict_determinism_multi_gateway() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0xAB17_6A7E_1234;
+
+    /// Captures all simulation state for comparison
+    #[derive(Debug, PartialEq)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<String>, // event_kind names in order
+        total_events: usize,
+    }
+
+    fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
+        use freenet::config::{GlobalRng, GlobalSimulationTime};
+
+        // Reset all global simulation state for determinism
+        freenet::dev_tool::reset_all_simulation_state();
+
+        // Set seed BEFORE SimNetwork::new() since it uses GlobalRng for keypair generation
+        GlobalRng::set_seed(seed);
+        // Derive epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create SimNetwork with 2 gateways (multi-gateway determinism test)
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                name, 2,  // gateways - MULTI-GATEWAY for this test
+                6,  // nodes
+                7,  // ring_max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                2,  // min_connections
+                seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        // Run simulation with Turmoil's deterministic scheduler
+        let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            seed,
+            5,                       // max_contract_num
+            20,                      // iterations - 20 events for diverse coverage
+            Duration::from_secs(30), // simulation_duration
+            || async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+        );
+
+        // Extract event trace from the shared logs handle
+        let trace = rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            let mut event_sequence: Vec<String> = Vec::new();
+
+            for log in logs.iter() {
+                let kind_name = log.kind.variant_name().to_string();
+                *event_counts.entry(kind_name.clone()).or_insert(0) += 1;
+                event_sequence.push(kind_name);
+            }
+
+            SimulationTrace {
+                total_events: logs.len(),
+                event_counts,
+                event_sequence,
+            }
+        });
+
+        (result, trace)
+    }
+
+    // Run simulation THREE times with identical seed
+    let (result1, trace1) = run_and_trace("multi-gw-det-run1", SEED);
+    let (result2, trace2) = run_and_trace("multi-gw-det-run2", SEED);
+    let (result3, trace3) = run_and_trace("multi-gw-det-run3", SEED);
+
+    // All simulations should have the same outcome
+    assert_eq!(
+        result1.is_ok(),
+        result2.is_ok(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Simulation outcomes differ!\nRun 1: {:?}\nRun 2: {:?}",
+        result1,
+        result2
+    );
+    assert_eq!(
+        result2.is_ok(),
+        result3.is_ok(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Simulation outcomes differ!\nRun 2: {:?}\nRun 3: {:?}",
+        result2,
+        result3
+    );
+
+    // Debug output if event counts differ
+    if trace1.total_events != trace2.total_events || trace2.total_events != trace3.total_events {
+        eprintln!("\n=== MULTI-GATEWAY DETERMINISM DEBUG ===");
+        eprintln!(
+            "Run 1 total: {}, Run 2 total: {}, Run 3 total: {}",
+            trace1.total_events, trace2.total_events, trace3.total_events
+        );
+        eprintln!("\nEvent counts by type:");
+
+        let mut all_types: std::collections::BTreeSet<&String> =
+            trace1.event_counts.keys().collect();
+        all_types.extend(trace2.event_counts.keys());
+        all_types.extend(trace3.event_counts.keys());
+
+        for event_type in all_types {
+            let count1 = trace1.event_counts.get(event_type).unwrap_or(&0);
+            let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
+            let count3 = trace3.event_counts.get(event_type).unwrap_or(&0);
+            if count1 != count2 || count2 != count3 {
+                eprintln!(
+                    "  {} : {} vs {} vs {} (DIFFERS)",
+                    event_type, count1, count2, count3
+                );
+            } else {
+                eprintln!("  {} : {} (same)", event_type, count1);
+            }
+        }
+        eprintln!("========================================\n");
+    }
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Total event counts differ!\nRun 1: {}\nRun 2: {}",
+        trace1.total_events, trace2.total_events
+    );
+    assert_eq!(
+        trace2.total_events, trace3.total_events,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Total event counts differ!\nRun 2: {}\nRun 3: {}",
+        trace2.total_events, trace3.total_events
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event counts per type differ!\nRun 1: {:?}\nRun 2: {:?}",
+        trace1.event_counts, trace2.event_counts
+    );
+    assert_eq!(
+        trace2.event_counts, trace3.event_counts,
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event counts per type differ!\nRun 2: {:?}\nRun 3: {:?}",
+        trace2.event_counts, trace3.event_counts
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence
+    assert_eq!(
+        trace1.event_sequence.len(),
+        trace2.event_sequence.len(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence lengths differ (run 1 vs 2)!"
+    );
+    assert_eq!(
+        trace2.event_sequence.len(),
+        trace3.event_sequence.len(),
+        "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence lengths differ (run 2 vs 3)!"
+    );
+
+    for (i, ((e1, e2), e3)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .zip(trace3.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 1: {:?}\nRun 2: {:?}",
+            i, e1, e2
+        );
+        assert_eq!(
+            e2, e3,
+            "MULTI-GATEWAY DETERMINISM FAILURE: Event sequence differs at index {}!\nRun 2: {:?}\nRun 3: {:?}",
+            i, e2, e3
+        );
+    }
+
+    // Print event breakdown on success
+    eprintln!("\n=== MULTI-GATEWAY DETERMINISM TEST PASSED ===");
+    eprintln!("Gateways: 2, Total events matched: {}", trace1.total_events);
+    eprintln!("\nEvent type breakdown:");
+    let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
+    sorted_types.sort_by(|a, b| b.1.cmp(a.1));
+    for (event_type, count) in &sorted_types {
+        eprintln!("  {:20} : {:5}", event_type, count);
+    }
+    eprintln!("==============================================\n");
+
+    tracing::info!(
+        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events matched exactly across 3 runs (2 gateways)",
+        trace1.total_events
+    );
+}
+
 // =============================================================================
 // Test 1: End-to-End Deterministic Replay with Event Verification
 // =============================================================================
