@@ -505,7 +505,6 @@ async fn replica_validation_and_stepwise_consistency() {
     // Run phases with convergence checks
     // Use Option so we can drop the stream after all phases to signal peers to disconnect
     let mut event_stream = Some(sim.event_chain(EVENTS_PER_PHASE * PHASES, None));
-    let event_wait = Duration::from_millis(300); // Allow more time for operation propagation
 
     for phase in 1..=PHASES {
         tracing::info!("=== Phase {}/{} ===", phase, PHASES);
@@ -515,8 +514,8 @@ async fn replica_validation_and_stepwise_consistency() {
             use futures::StreamExt;
             match event_stream.as_mut().unwrap().next().await {
                 Some(_event_id) => {
-                    // Small delay between events
-                    tokio::time::sleep(event_wait).await;
+                    // Minimal delay - just yield to let other tasks run
+                    tokio::task::yield_now().await;
                 }
                 None => {
                     panic!(
@@ -528,12 +527,31 @@ async fn replica_validation_and_stepwise_consistency() {
         }
 
         tracing::info!(
-            "Phase {} events complete, waiting for propagation...",
+            "Phase {} events complete, waiting for quiescence...",
             phase
         );
 
-        // Give operations time to propagate through the network before checking convergence
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Wait for network quiescence - all broadcasts propagated
+        let quiesce_result = sim
+            .await_network_quiescence(
+                Duration::from_secs(120), // Max timeout
+                Duration::from_secs(3),   // Quiet for 3 seconds = quiesced
+                Duration::from_millis(500),
+            )
+            .await;
+
+        match quiesce_result {
+            Ok(log_count) => tracing::info!(
+                "Phase {} quiesced with {} log entries",
+                phase,
+                log_count
+            ),
+            Err(log_count) => tracing::warn!(
+                "Phase {} still active after timeout ({} entries)",
+                phase,
+                log_count
+            ),
+        }
 
         tracing::info!("Checking convergence for phase {}...", phase);
 
@@ -805,7 +823,7 @@ async fn dense_network_replication() {
     sim.check_partial_connectivity(Duration::from_secs(45), 0.7)
         .expect("Dense network should achieve high connectivity");
 
-    // Run events
+    // Run events - no fixed delays, just yield between events
     let mut stream = sim.event_chain(150, None);
     while {
         use futures::StreamExt;
@@ -813,7 +831,7 @@ async fn dense_network_replication() {
     }
     .is_some()
     {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
     }
 
     // CRITICAL: Wait for network quiescence before signaling shutdown.
