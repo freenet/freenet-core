@@ -488,7 +488,7 @@ mod test {
         let state_3 = WrappedState::new(vec![3, 3, 3]);
 
         // Compute hashes and find the "winner" (largest hash)
-        let states = vec![
+        let states = [
             (state_1.clone(), blake3::hash(state_1.as_ref())),
             (state_2.clone(), blake3::hash(state_2.as_ref())),
             (state_3.clone(), blake3::hash(state_3.as_ref())),

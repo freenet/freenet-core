@@ -4,13 +4,12 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use crate::simulation::{RealTime, TimeSource, VirtualTime};
+use crate::simulation::{TimeSource, VirtualTime};
 use crate::util::time_source::SharedMockTimeSource;
 
-use super::atomic::{AtomicBaseDelayHistory, AtomicDelayFilter};
 use super::config::{
-    LedbatConfig, BASE_HISTORY_SIZE, MAX_GAIN_DIVISOR, MSS, SLOWDOWN_FREEZE_RTTS,
-    SLOWDOWN_INTERVAL_MULTIPLIER, SLOWDOWN_REDUCTION_FACTOR, TARGET,
+    LedbatConfig, MAX_GAIN_DIVISOR, MSS, SLOWDOWN_FREEZE_RTTS, SLOWDOWN_INTERVAL_MULTIPLIER,
+    SLOWDOWN_REDUCTION_FACTOR, TARGET,
 };
 use super::controller::LedbatController;
 use super::state::CongestionState;

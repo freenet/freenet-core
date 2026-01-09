@@ -274,8 +274,8 @@ macro_rules! deterministic_select {
         }
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
 
@@ -340,8 +340,8 @@ macro_rules! deterministic_select {
         }
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
 
