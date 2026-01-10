@@ -53,6 +53,9 @@ pub const INTEREST_TTL: Duration = Duration::from_secs(300); // 5 minutes
 /// Interval for background sweep to clean up expired interests.
 pub const INTEREST_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
+use crate::config::GlobalExecutor;
+use crate::config::GlobalRng;
+
 /// Maximum number of entries in the delta memoization cache.
 const DELTA_CACHE_SIZE: usize = 1024;
 
@@ -326,6 +329,80 @@ impl InterestManager {
         self
     }
 
+    /// Register that we're seeding a contract locally.
+    /// Returns true if this caused us to become interested (wasn't interested before).
+    pub fn register_local_seeding(&self, contract: &ContractKey) -> bool {
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let was_interested = entry.is_interested();
+        entry.seeding = true;
+        self.index_contract_hash(contract);
+        !was_interested
+    }
+
+    /// Unregister that we're seeding a contract locally.
+    /// Returns true if this caused us to lose interest (no other reasons remain).
+    pub fn unregister_local_seeding(&self, contract: &ContractKey) -> bool {
+        if let Some(mut entry) = self.local_interests.get_mut(contract) {
+            entry.seeding = false;
+            let lost_interest = !entry.is_interested();
+            if lost_interest {
+                drop(entry);
+                self.local_interests.remove(contract);
+            }
+            lost_interest
+        } else {
+            false
+        }
+    }
+
+    /// Add a local client subscription.
+    /// Returns true if this caused us to become interested.
+    pub fn add_local_client(&self, contract: &ContractKey) -> bool {
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let became_interested = entry.add_client();
+        self.index_contract_hash(contract);
+        became_interested
+    }
+
+    /// Remove a local client subscription.
+    /// Returns true if this caused us to lose interest.
+    pub fn remove_local_client(&self, contract: &ContractKey) -> bool {
+        if let Some(mut entry) = self.local_interests.get_mut(contract) {
+            let lost_interest = entry.remove_client();
+            if lost_interest {
+                drop(entry);
+                self.local_interests.remove(contract);
+            }
+            lost_interest
+        } else {
+            false
+        }
+    }
+
+    /// Add a downstream subscriber.
+    /// Returns true if this caused us to become interested.
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let became_interested = entry.add_downstream();
+        self.index_contract_hash(contract);
+        became_interested
+    }
+
+    /// Remove a downstream subscriber.
+    /// Returns true if this caused us to lose interest.
+    pub fn remove_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+        if let Some(mut entry) = self.local_interests.get_mut(contract) {
+            let lost_interest = entry.remove_downstream();
+            if lost_interest {
+                drop(entry);
+                self.local_interests.remove(contract);
+            }
+            lost_interest
+        } else {
+            false
+        }
+    }
+
     /// Get or create local interest entry, returning mutable reference.
     pub fn with_local_interest<F, R>(&self, contract: &ContractKey, f: F) -> R
     where
@@ -385,6 +462,37 @@ impl InterestManager {
         }
 
         expired
+    }
+
+    /// Start the background sweep task for expired peer interests.
+    ///
+    /// This spawns a task that runs periodically to clean up expired entries.
+    /// Should be called once after the interest manager is set up.
+    pub fn start_sweep_task(manager: std::sync::Arc<Self>) {
+        GlobalExecutor::spawn(Self::sweep_task(manager));
+    }
+
+    /// Background task to sweep expired peer interests.
+    async fn sweep_task(manager: std::sync::Arc<Self>) {
+        // Add random initial delay to prevent synchronized sweeps across peers
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(10u64..=30u64));
+        tokio::time::sleep(initial_delay).await;
+
+        let mut interval = tokio::time::interval(INTEREST_SWEEP_INTERVAL);
+        interval.tick().await; // Skip first immediate tick
+
+        loop {
+            interval.tick().await;
+
+            let expired = manager.sweep_expired_interests();
+
+            if !expired.is_empty() {
+                tracing::info!(
+                    expired_count = expired.len(),
+                    "Interest sweep: cleaned up expired peer interests"
+                );
+            }
+        }
     }
 
     /// Compute a fast hash of a contract key for connection-time discovery.
