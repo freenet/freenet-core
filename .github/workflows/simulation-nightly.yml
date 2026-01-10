@@ -202,10 +202,8 @@ jobs:
           MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           MATRIX_ROOM_ID: ${{ secrets.MATRIX_DEV_ROOM_ID }}
         run: |
-          # URL-encode the room ID (! -> %21, : -> %3A)
-          ENCODED_ROOM_ID=$(echo "$MATRIX_ROOM_ID" | sed 's/!/%21/g; s/:/%3A/g')
-          echo "Room ID length: ${#MATRIX_ROOM_ID}, Encoded length: ${#ENCODED_ROOM_ID}"
-          echo "Encoded starts with: ${ENCODED_ROOM_ID:0:5}"
+          # Room ID is stored pre-encoded in the secret (with ! as %21 and : as %3A)
+          ENCODED_ROOM_ID="$MATRIX_ROOM_ID"
 
           # Construct message body
           MESSAGE="🚨 **Nightly Simulation Tests Failed**
