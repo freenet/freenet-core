@@ -5,6 +5,7 @@ use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::node::IsOperationCompleted;
 use crate::tracing::NetEventLog;
 use crate::util::backoff::ExponentialBackoff;
@@ -976,29 +977,108 @@ impl Operation for SubscribeOp {
                                     state: None,
                                 })
                             } else {
-                                // We're the originator - subscription failed, contract not found
-                                tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
+                                // We're the originator - check if we have the contract locally
+                                // before failing. If we do, re-seed the network and complete.
+                                let local_contract = match op_manager
+                                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                        instance_id: *instance_id,
+                                        return_contract_code: true,
+                                    })
+                                    .await
+                                {
+                                    Ok(ContractHandlerEvent::GetResponse {
+                                        key: Some(key),
+                                        response:
+                                            Ok(StoreResponse {
+                                                state: Some(state),
+                                                contract,
+                                            }),
+                                    }) => Some((key, state, contract)),
+                                    _ => None,
+                                };
 
-                                // Emit telemetry for subscription not found
-                                if let Some(event) = NetEventLog::subscribe_not_found(
-                                    msg_id,
-                                    &op_manager.ring,
-                                    *instance_id,
-                                    None, // hop_count not tracked in subscribe
-                                ) {
-                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                if let Some((key, state, contract)) = local_contract {
+                                    // We have the contract locally - re-seed the network
+                                    tracing::info!(
+                                        tx = %msg_id,
+                                        contract = %key,
+                                        phase = "reseed",
+                                        "Subscribe: Network returned NotFound, re-seeding with local cache"
+                                    );
+
+                                    // Re-seed the network with our local copy
+                                    if let Some(contract_code) = contract {
+                                        let put_result = op_manager
+                                            .notify_contract_handler(
+                                                ContractHandlerEvent::PutQuery {
+                                                    key,
+                                                    state,
+                                                    related_contracts: RelatedContracts::default(),
+                                                    contract: Some(contract_code),
+                                                },
+                                            )
+                                            .await;
+                                        match put_result {
+                                            Ok(ContractHandlerEvent::PutResponse {
+                                                new_value: Ok(_),
+                                                ..
+                                            }) => {
+                                                tracing::debug!(tx = %msg_id, %key, "Re-seeded contract to network");
+                                                super::announce_contract_cached(op_manager, &key)
+                                                    .await;
+                                            }
+                                            _ => {
+                                                tracing::warn!(tx = %msg_id, %key, "Failed to re-seed contract");
+                                            }
+                                        }
+                                    }
+
+                                    // Complete the subscription successfully with local cache
+                                    let own_loc = op_manager.ring.connection_manager.own_location();
+                                    if let Some(event) = NetEventLog::subscribe_success(
+                                        msg_id,
+                                        &op_manager.ring,
+                                        key,
+                                        own_loc,
+                                        None, // hop_count not tracked in subscribe
+                                    ) {
+                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    }
+
+                                    Ok(OperationResult {
+                                        return_msg: None,
+                                        next_hop: None,
+                                        state: Some(OpEnum::Subscribe(SubscribeOp {
+                                            id,
+                                            state: Some(SubscribeState::Completed { key }),
+                                            requester_addr: None,
+                                        })),
+                                    })
+                                } else {
+                                    // No local cache - subscription failed
+                                    tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
+
+                                    // Emit telemetry for subscription not found
+                                    if let Some(event) = NetEventLog::subscribe_not_found(
+                                        msg_id,
+                                        &op_manager.ring,
+                                        *instance_id,
+                                        None, // hop_count not tracked in subscribe
+                                    ) {
+                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    }
+
+                                    // Return op with no inner state - to_host_result() will return error
+                                    Ok(OperationResult {
+                                        return_msg: None,
+                                        next_hop: None,
+                                        state: Some(OpEnum::Subscribe(SubscribeOp {
+                                            id,
+                                            state: None,
+                                            requester_addr: None,
+                                        })),
+                                    })
                                 }
-
-                                // Return op with no inner state - to_host_result() will return error
-                                Ok(OperationResult {
-                                    return_msg: None,
-                                    next_hop: None,
-                                    state: Some(OpEnum::Subscribe(SubscribeOp {
-                                        id,
-                                        state: None,
-                                        requester_addr: None,
-                                    })),
-                                })
                             }
                         }
                     }
