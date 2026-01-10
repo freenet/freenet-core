@@ -599,6 +599,10 @@ impl Operation for UpdateOp {
                             StateSummary::from(new_value.as_ref().to_vec())
                         });
 
+                    // Track peer keys for summary updates after successful sends
+                    let mut peer_keys_to_update = Vec::with_capacity(broadcast_to.len());
+                    let state_size = new_value.as_ref().len();
+
                     for peer in broadcast_to.iter() {
                         let peer_addr = peer
                             .socket_addr()
@@ -615,7 +619,13 @@ impl Operation for UpdateOp {
                                 // Try to compute delta
                                 match op_manager
                                     .interest_manager
-                                    .compute_delta(op_manager, key, &their_summary, new_value)
+                                    .compute_delta(
+                                        op_manager,
+                                        key,
+                                        &their_summary,
+                                        &our_summary,
+                                        state_size,
+                                    )
                                     .await
                                 {
                                     Ok(delta) => {
@@ -623,7 +633,7 @@ impl Operation for UpdateOp {
                                             contract = %key,
                                             peer = %peer_addr,
                                             delta_size = delta.as_ref().len(),
-                                            state_size = new_value.as_ref().len(),
+                                            state_size,
                                             "Sending delta instead of full state"
                                         );
                                         crate::message::DeltaOrFullState::from_delta(&delta)
@@ -649,12 +659,8 @@ impl Operation for UpdateOp {
                             }
                         };
 
-                        // Update peer's cached summary to our current summary
-                        op_manager.interest_manager.update_peer_summary(
-                            key,
-                            &peer_key,
-                            Some(our_summary.clone()),
-                        );
+                        // Track peer key for summary update after send succeeds
+                        peer_keys_to_update.push(peer_key);
 
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
@@ -677,7 +683,7 @@ impl Operation for UpdateOp {
                             }
                         });
 
-                    let mut incorrect_results = 0;
+                    let mut failed_indices = std::collections::HashSet::new();
                     for (peer_num, err) in error_futures {
                         // remove the failed peers in reverse order
                         let peer = broadcast_to.get(peer_num).unwrap();
@@ -692,10 +698,21 @@ impl Operation for UpdateOp {
                         );
                         // TODO: review this, maybe we should just dropping this subscription
                         conn_manager.drop_connection(peer_addr).await?;
-                        incorrect_results += 1;
+                        failed_indices.insert(peer_num);
                     }
 
-                    broadcasted_to += broadcast_to.len() - incorrect_results;
+                    // Update cached summaries only for successful sends
+                    for (idx, peer_key) in peer_keys_to_update.into_iter().enumerate() {
+                        if !failed_indices.contains(&idx) {
+                            op_manager.interest_manager.update_peer_summary(
+                                key,
+                                &peer_key,
+                                Some(our_summary.clone()),
+                            );
+                        }
+                    }
+
+                    broadcasted_to += broadcast_to.len() - failed_indices.len();
                     tracing::debug!(
                         "Successfully broadcasted update contract {key} to {broadcasted_to} peers - Broadcasting"
                     );
