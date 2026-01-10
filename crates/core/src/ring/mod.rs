@@ -54,6 +54,7 @@ pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
+pub use interest::PeerKey;
 pub use location::{Distance, Location};
 #[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
 pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation, UnknownAddressError};

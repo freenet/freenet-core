@@ -1250,11 +1250,15 @@ async fn handle_interest_sync_message(
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(pk) = peer_key {
                 for entry in entries {
-                    if let Some(contract) = op_manager.interest_manager.lookup_by_hash(entry.hash) {
-                        let summary = entry.to_summary();
-                        op_manager
-                            .interest_manager
-                            .update_peer_summary(&contract, &pk, summary);
+                    // Handle hash collisions - lookup returns all contracts with this hash
+                    for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
+                        // Only update if we have local interest in this contract
+                        if op_manager.interest_manager.has_local_interest(&contract) {
+                            let summary = entry.to_summary();
+                            op_manager
+                                .interest_manager
+                                .update_peer_summary(&contract, &pk, summary);
+                        }
                     }
                 }
             }
@@ -1276,7 +1280,8 @@ async fn handle_interest_sync_message(
             // Handle removals
             if let Some(ref pk) = peer_key {
                 for hash in removed {
-                    if let Some(contract) = op_manager.interest_manager.lookup_by_hash(hash) {
+                    // Handle hash collisions - remove interest from all matching contracts
+                    for contract in op_manager.interest_manager.lookup_by_hash(hash) {
                         op_manager
                             .interest_manager
                             .remove_peer_interest(&contract, pk);
@@ -1288,7 +1293,13 @@ async fn handle_interest_sync_message(
             let mut entries = Vec::new();
             if let Some(ref pk) = peer_key {
                 for hash in added {
-                    if let Some(contract) = op_manager.interest_manager.lookup_by_hash(hash) {
+                    // Handle hash collisions - process all matching contracts
+                    for contract in op_manager.interest_manager.lookup_by_hash(hash) {
+                        // Only process if we have local interest in this contract
+                        if !op_manager.interest_manager.has_local_interest(&contract) {
+                            continue;
+                        }
+
                         // Register their interest
                         op_manager.interest_manager.register_peer_interest(
                             &contract,
