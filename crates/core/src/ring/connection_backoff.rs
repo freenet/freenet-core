@@ -65,6 +65,16 @@ impl LocationBucket {
 ///
 /// Locations are grouped into 256 buckets to reduce memory usage while still providing
 /// effective backoff for nearby targets.
+///
+/// # Failure Escalation
+///
+/// Different failure types receive different backoff escalation:
+/// - **Timeout failures**: Escalated (record 2 failures) - timeouts suggest peer overload
+/// - **Routing failures**: Normal (record 1 failure) - indicates no routing path available
+/// - **Other failures**: Normal (record 1 failure) - transient or capacity-related issues
+///
+/// This escalation ensures that unresponsive peers that timeout are backed off more
+/// aggressively than peers that simply reject connections due to capacity.
 #[derive(Debug)]
 pub struct ConnectionBackoff {
     inner: TrackedBackoff<LocationBucket>,
@@ -95,6 +105,15 @@ impl ConnectionBackoff {
     /// Default maximum number of tracked entries
     const DEFAULT_MAX_ENTRIES: usize = 256;
 
+    /// Escalation factor for timeout failures.
+    ///
+    /// Timeout failures are escalated by recording this many failures internally,
+    /// which causes exponential backoff to escalate faster. A value of 2 means one
+    /// timeout is treated as 2 consecutive failures, doubling the backoff delay.
+    /// This ensures that unresponsive peers are backed off more aggressively than
+    /// peers that simply reject due to capacity.
+    const TIMEOUT_FAILURE_ESCALATION: u32 = 2;
+
     /// Create a new backoff tracker with default settings.
     pub fn new() -> Self {
         let config =
@@ -124,6 +143,8 @@ impl ConnectionBackoff {
     /// Record a connection failure for a target location.
     ///
     /// Increments the failure count and calculates the next retry time.
+    /// This is a convenience method that records a routing failure (non-escalated).
+    #[allow(dead_code)] // Used by tests and as backward-compatible API
     pub fn record_failure(&mut self, target: Location) {
         self.record_failure_with_reason(target, ConnectionFailureReason::RoutingFailed);
     }
@@ -145,8 +166,8 @@ impl ConnectionBackoff {
         // Apply different backoff based on failure type by recording multiple failures
         let num_failures_to_record = match reason {
             ConnectionFailureReason::Timeout => {
-                // Timeout suggests overload - escalate faster (record 2 failures worth)
-                2
+                // Timeout suggests overload - escalate faster using the configured escalation factor
+                Self::TIMEOUT_FAILURE_ESCALATION
             }
             ConnectionFailureReason::TransientError => {
                 // Transient errors resolve quickly - record just 1 failure
