@@ -212,8 +212,8 @@ pub struct InterestManager {
     delta_cache: Mutex<LruCache<DeltaCacheKey, StateDelta<'static>>>,
 
     /// Fast hash index for connection-time discovery.
-    /// Maps u32 hash of contract ID -> full ContractKey.
-    contract_hash_index: DashMap<u32, ContractKey>,
+    /// Maps u32 hash of contract ID -> list of ContractKeys (handles collisions).
+    contract_hash_index: DashMap<u32, Vec<ContractKey>>,
 }
 
 impl InterestManager {
@@ -320,6 +320,35 @@ impl InterestManager {
         self.interested_peers
             .get(contract)
             .and_then(|entry| entry.get(peer).and_then(|i| i.summary.clone()))
+    }
+
+    /// Remove all interests for a peer (called on peer disconnect).
+    ///
+    /// Returns the number of contracts from which the peer was removed.
+    pub fn remove_all_peer_interests(&self, peer: &PeerKey) -> usize {
+        let mut removed_count = 0;
+        let mut contracts_to_cleanup = Vec::new();
+
+        // Iterate through all contracts and remove this peer
+        for entry in self.interested_peers.iter() {
+            let contract = *entry.key();
+            if entry.contains_key(peer) {
+                contracts_to_cleanup.push(contract);
+            }
+        }
+
+        // Remove the peer from each contract
+        for contract in contracts_to_cleanup {
+            if self.remove_peer_interest(&contract, peer) {
+                removed_count += 1;
+            }
+        }
+
+        if removed_count > 0 {
+            tracing::debug!(removed_count, "Removed peer interests on disconnect");
+        }
+
+        removed_count
     }
 
     /// Register local interest in a contract (for tracking our reasons).
@@ -516,12 +545,20 @@ impl InterestManager {
     /// Index a contract by its hash for fast lookup.
     fn index_contract_hash(&self, contract: &ContractKey) {
         let hash = Self::contract_hash(contract);
-        self.contract_hash_index.insert(hash, *contract);
+        let mut entry = self.contract_hash_index.entry(hash).or_default();
+        // Only add if not already present (dedup without Ord)
+        if !entry.contains(contract) {
+            entry.push(*contract);
+        }
     }
 
-    /// Look up a contract by its hash.
-    pub fn lookup_by_hash(&self, hash: u32) -> Option<ContractKey> {
-        self.contract_hash_index.get(&hash).map(|r| *r)
+    /// Look up contracts by hash. Returns all contracts that hash to this value
+    /// (handles collisions by returning multiple candidates).
+    pub fn lookup_by_hash(&self, hash: u32) -> Vec<ContractKey> {
+        self.contract_hash_index
+            .get(&hash)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     }
 
     /// Get all contract hashes we're interested in.
@@ -552,7 +589,7 @@ impl InterestManager {
         self.contract_hash_index
             .iter()
             .filter(|entry| hash_set.contains(entry.key()))
-            .map(|entry| *entry.value())
+            .flat_map(|entry| entry.value().clone())
             .collect()
     }
 
@@ -775,10 +812,10 @@ mod tests {
         // Look up by hash
         let hash = InterestManager::contract_hash(&contract);
         let retrieved = manager.lookup_by_hash(hash);
-        assert_eq!(retrieved, Some(contract));
+        assert_eq!(retrieved, vec![contract]);
 
-        // Unknown hash returns None
-        assert!(manager.lookup_by_hash(12345).is_none());
+        // Unknown hash returns empty vec
+        assert!(manager.lookup_by_hash(12345).is_empty());
     }
 
     #[test]

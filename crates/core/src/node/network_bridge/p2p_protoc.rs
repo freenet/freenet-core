@@ -28,7 +28,7 @@ use crate::node::network_bridge::handshake::{
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::{Location, SubscriptionRecoveryGuard};
+use crate::ring::{Location, PeerKey, SubscriptionRecoveryGuard};
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, ExpectedInboundTracker,
     PeerConnectionApi, Socket, TransportError, TransportKeypair, TransportPublicKey,
@@ -1057,6 +1057,15 @@ impl P2pConnManager {
                                         .op_manager
                                         .proximity_cache
                                         .on_peer_disconnected(&peer_addr);
+
+                                    // Clean up interest tracking for disconnected peer
+                                    ctx.bridge
+                                        .op_manager
+                                        .interest_manager
+                                        .remove_all_peer_interests(&PeerKey::from(
+                                            peer.pub_key().clone(),
+                                        ));
+
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
                                         if let Some(pub_key) = pub_key_to_remove {
