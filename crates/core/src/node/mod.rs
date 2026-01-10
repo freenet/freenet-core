@@ -1200,7 +1200,7 @@ async fn handle_interest_sync_message(
     message: crate::message::InterestMessage,
 ) -> Option<crate::message::InterestMessage> {
     use crate::message::{InterestMessage, SummaryEntry};
-    use crate::ring::interest::InterestManager;
+    use crate::ring::interest::contract_hash;
 
     match message {
         InterestMessage::Interests { hashes } => {
@@ -1216,7 +1216,7 @@ async fn handle_interest_sync_message(
             // Build summaries for shared contracts
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
-                let hash = InterestManager::contract_hash(&contract);
+                let hash = contract_hash(&contract);
                 // Get our state summary for this contract
                 let summary = get_contract_summary(op_manager, &contract).await;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
@@ -1329,7 +1329,7 @@ async fn handle_interest_sync_message(
                 "Received ResyncRequest - peer needs full state"
             );
 
-            // Clear cached summary for this peer
+            // Clear cached summary for this peer so next update sends full state
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(pk) = peer_key {
                 op_manager
@@ -1337,8 +1337,20 @@ async fn handle_interest_sync_message(
                     .update_peer_summary(&key, &pk, None);
             }
 
-            // The actual full state will be sent via the next Update message
-            // (which will detect no summary and send full state)
+            // TODO(delta-sync): Immediately send full state to requesting peer.
+            // Currently, we only clear the cached summary so the NEXT update will
+            // send full state. If the contract is not being actively updated, the
+            // peer will be stuck until an update occurs.
+            //
+            // To properly fix this, we need to:
+            // 1. Fetch current state from StateStore
+            // 2. Compute summary
+            // 3. Send Update message with full state payload
+            //
+            // For now this is acceptable because:
+            // - Delta application failures are rare (summary mismatch or corruption)
+            // - Actively-updated contracts will naturally resync quickly
+            // - This matches the plan's "Phase 6" scope for recovery mechanisms
             None
         }
     }

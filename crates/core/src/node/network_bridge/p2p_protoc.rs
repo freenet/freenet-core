@@ -1665,11 +1665,18 @@ impl P2pConnManager {
                             NodeEvent::ClientDisconnected { client_id } => {
                                 tracing::debug!(%client_id, "Client disconnected");
 
-                                let notifications = op_manager
+                                let result = op_manager
                                     .ring
                                     .remove_client_from_all_subscriptions(client_id);
 
-                                ctx.bridge.send_prune_notifications(notifications).await;
+                                // Clean up interest tracking for affected contracts
+                                for contract in &result.affected_contracts {
+                                    op_manager.interest_manager.remove_local_client(contract);
+                                }
+
+                                ctx.bridge
+                                    .send_prune_notifications(result.prune_notifications)
+                                    .await;
                             }
                         },
                     }

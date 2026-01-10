@@ -768,11 +768,13 @@ impl Ring {
 
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
-    /// Returns a list of (contract, upstream) pairs that need Unsubscribed notification.
+    /// Returns a [`ClientDisconnectResult`] with:
+    /// - `prune_notifications`: contracts needing upstream pruning
+    /// - `affected_contracts`: all contracts where the client was subscribed (for interest cleanup)
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
-    ) -> Vec<(ContractKey, PeerKeyLocation)> {
+    ) -> seeding::ClientDisconnectResult {
         self.seeding_manager
             .remove_client_from_all_subscriptions(client_id)
     }

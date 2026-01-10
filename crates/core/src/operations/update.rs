@@ -589,7 +589,13 @@ impl Operation for UpdateOp {
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
-                    // Compute our current summary for delta-based sync
+                    // Compute our current summary for delta-based sync.
+                    // Note: This reads the summary from the state store, which should match new_value
+                    // since we just stored it. In concurrent update scenarios, the summary might
+                    // be from a slightly newer state, but this is acceptable because:
+                    // 1. The peer will receive the correct state bytes (new_value)
+                    // 2. The summary is just metadata for caching
+                    // 3. Any newer update will trigger its own broadcast cycle
                     let our_summary = op_manager
                         .interest_manager
                         .get_contract_summary(op_manager, key)
