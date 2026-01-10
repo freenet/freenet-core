@@ -10,8 +10,8 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 |----------|----------|-----------|---------|-------------|-------|
 | **Unit Tests** | `src/**/*.rs` | Mocks | Mocks | Full | Single component |
 | **`#[freenet_test]` Macro** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-10 nodes |
-| **SimNetwork** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **Turmoil (~99%)** | 1-20 nodes |
-| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **Turmoil (always on)** | 1-50 nodes |
+| **SimNetwork** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **Turmoil (~99%)** | 1-50 nodes |
+| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **SimNetwork + quiescence** | 1-500 nodes |
 | **freenet-test-network** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-40+ nodes |
 
 ---
@@ -56,9 +56,9 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 | Seeded replay | - | - | ✅ | ✅ | - |
 | VirtualTime | - | - | ✅ | - | - |
 | **Scale Testing** |
-| 5 nodes | - | ✅ | ✅ | ✅ | ✅ |
-| 20 nodes | - | - | ✅ | ✅ | ✅ |
-| 40+ nodes | - | - | - | ✅ | ✅ |
+| 5-15 nodes | - | ✅ | ✅ | ✅ | ✅ |
+| 50 nodes | - | - | ✅ | ✅ | ✅ |
+| 500 nodes | - | - | - | ✅ | - |
 | **Application Integration** |
 | River app | - | - | - | - | ✅ |
 | WebSocket API | - | ✅ | - | - | ✅ |
@@ -730,7 +730,6 @@ let ws_url = network.gateway(0).ws_url();
 
 | Document | Purpose |
 |----------|---------|
-| `simulation-testing.md` | SimNetwork architecture |
-| `simulation-testing-design.md` | Design philosophy, roadmap |
+| `simulation-testing.md` | SimNetwork architecture, APIs, deterministic simulation |
 | `MACRO_TEST_CONVERSION_STATUS.md` | Macro adoption tracking |
 | `debugging/testing-logging-guide.md` | Logging in tests |
