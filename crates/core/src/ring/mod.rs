@@ -41,6 +41,7 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod get_subscription_cache;
 pub use get_subscription_cache::AUTO_SUBSCRIBE_ON_GET;
+pub mod interest;
 mod live_tx;
 mod location;
 mod peer_connection_backoff;
