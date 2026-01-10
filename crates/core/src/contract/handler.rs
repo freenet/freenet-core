@@ -513,6 +513,17 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         summary: Result<StateSummary<'static>, ExecutorError>,
     },
+    /// Get a state delta for a contract given a peer's state summary.
+    /// Used for delta-based synchronization.
+    GetDeltaQuery {
+        key: ContractKey,
+        their_summary: StateSummary<'static>,
+    },
+    /// Response to a GetDeltaQuery
+    GetDeltaResponse {
+        key: ContractKey,
+        delta: Result<StateDelta<'static>, ExecutorError>,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -613,6 +624,13 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::GetSummaryResponse { key, summary } => match summary {
                 Ok(_) => write!(f, "get summary response {{ {key} }}"),
                 Err(e) => write!(f, "get summary failed {{ {key}, error: {e} }}"),
+            },
+            ContractHandlerEvent::GetDeltaQuery { key, .. } => {
+                write!(f, "get delta query {{ {key} }}")
+            }
+            ContractHandlerEvent::GetDeltaResponse { key, delta } => match delta {
+                Ok(_) => write!(f, "get delta response {{ {key} }}"),
+                Err(e) => write!(f, "get delta failed {{ {key}, error: {e} }}"),
             },
         }
     }

@@ -479,6 +479,24 @@ impl ContractExecutor for RuntimePool {
             ))),
         }
     }
+
+    async fn get_contract_state_delta(
+        &mut self,
+        key: ContractKey,
+        their_summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ExecutorError> {
+        // Acquire an executor from the pool to compute the delta
+        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
+        match executor_idx {
+            Some(idx) => {
+                let executor = self.runtimes[idx].as_mut().unwrap();
+                executor.get_contract_state_delta(key, their_summary).await
+            }
+            None => Err(ExecutorError::other(anyhow::anyhow!(
+                "No executors available for get_contract_state_delta"
+            ))),
+        }
+    }
 }
 
 // ============================================================================
@@ -1079,6 +1097,40 @@ impl ContractExecutor for Executor<Runtime> {
         // Call the contract's summarize_state method
         self.runtime
             .summarize_state(&key, &params, &state)
+            .map_err(|e| ExecutorError::execution(e, None))
+    }
+
+    async fn get_contract_state_delta(
+        &mut self,
+        key: ContractKey,
+        their_summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ExecutorError> {
+        // Fetch the state and contract code
+        let (state, _) = self.fetch_contract(key, false).await?;
+
+        let state = state.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract state not found".into(),
+            })
+        })?;
+
+        // Get parameters for the contract
+        let params = self
+            .state_store
+            .get_params(&key)
+            .await
+            .map_err(ExecutorError::other)?
+            .ok_or_else(|| {
+                ExecutorError::request(StdContractError::Get {
+                    key,
+                    cause: "contract parameters not found".into(),
+                })
+            })?;
+
+        // Call the contract's get_state_delta method
+        self.runtime
+            .get_state_delta(&key, &params, &state, &their_summary)
             .map_err(|e| ExecutorError::execution(e, None))
     }
 }

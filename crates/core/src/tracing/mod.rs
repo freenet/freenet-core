@@ -1428,13 +1428,24 @@ impl<'a> NetEventLog<'a> {
                     state_hash: None, // Hash not available from message
                 })
             }
-            NetMessageV1::Update(UpdateMsg::BroadcastTo { new_value, key, id }) => {
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                payload, key, id, ..
+            }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // Convert payload to WrappedState for telemetry
+                let value = match payload {
+                    crate::message::DeltaOrFullState::FullState(bytes) => {
+                        WrappedState::from(bytes.clone())
+                    }
+                    crate::message::DeltaOrFullState::Delta(bytes) => {
+                        WrappedState::from(bytes.clone())
+                    }
+                };
                 EventKind::Update(UpdateEvent::BroadcastReceived {
                     id: *id,
                     requester: this_peer.clone(),
                     key: *key,
-                    value: new_value.clone(),
+                    value,
                     target: this_peer, // We are the target
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
