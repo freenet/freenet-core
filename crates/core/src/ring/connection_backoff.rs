@@ -11,6 +11,46 @@ use std::time::Duration;
 
 use super::Location;
 
+/// Types of connection failures for backoff calculation.
+///
+/// Different failure types may require different backoff strategies.
+/// Currently, only `RoutingFailed` and `Timeout` are actively recorded:
+/// - Routing failures: No peer available to route through (normal exponential backoff)
+/// - Timeouts: Operation exceeded TTL, including explicit rejections (escalated backoff)
+///
+/// # Future Variants
+///
+/// The following variants are defined for future protocol enhancements where explicit
+/// rejection messages will be sent by peers instead of relying on timeouts:
+/// - `Rejected`: Peer at capacity (apply normal backoff)
+/// - `NatPunchFailed`: NAT hole punch failed (transient)
+/// - `HandshakeError`: Handshake failure after connection established
+/// - `TransientError`: Transient network issues
+///
+/// See https://github.com/freenet/freenet-core/issues/2663 for discussion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Some variants prepared for future protocol enhancements
+pub enum ConnectionFailureReason {
+    /// Routing failed - no peer available to route through
+    RoutingFailed,
+    /// Connect operation timed out waiting for response
+    /// (includes explicit rejections that currently manifest as timeouts)
+    Timeout,
+    /// Remote peer rejected connection (at capacity, etc.)
+    /// Currently unused - rejections are detected as timeouts.
+    #[allow(dead_code)]
+    Rejected,
+    /// NAT hole punch failed
+    #[allow(dead_code)]
+    NatPunchFailed,
+    /// Handshake error after connection established
+    #[allow(dead_code)]
+    HandshakeError,
+    /// Transient error (network issue, retry soon)
+    #[allow(dead_code)]
+    TransientError,
+}
+
 /// Bucket for location - we group nearby locations to avoid tracking too many entries.
 /// Uses 256 buckets across the [0, 1] ring.
 ///
@@ -37,6 +77,17 @@ impl LocationBucket {
 ///
 /// Locations are grouped into 256 buckets to reduce memory usage while still providing
 /// effective backoff for nearby targets.
+///
+/// # Failure Escalation
+///
+/// Timeout failures are escalated (recorded as 2 failures) while routing failures are
+/// recorded normally (1 failure). This creates different backoff curves:
+/// - **Timeout**: 1st → 2x backoff, 2nd → 4x, 3rd → 8x (escalates faster)
+/// - **Routing**: 1st → 1x backoff, 2nd → 2x, 3rd → 4x (normal exponential)
+///
+/// Timeouts suggest the peer is overloaded, unresponsive, or unreachable, warranting
+/// more aggressive backoff. Routing failures indicate no peer was available in that
+/// direction and are less severe.
 #[derive(Debug)]
 pub struct ConnectionBackoff {
     inner: TrackedBackoff<LocationBucket>,
@@ -67,6 +118,15 @@ impl ConnectionBackoff {
     /// Default maximum number of tracked entries
     const DEFAULT_MAX_ENTRIES: usize = 256;
 
+    /// Escalation factor for timeout failures.
+    ///
+    /// Timeout failures are escalated by recording this many failures internally,
+    /// which causes exponential backoff to escalate faster. A value of 2 means one
+    /// timeout is treated as 2 consecutive failures, doubling the backoff delay.
+    /// This ensures that unresponsive peers are backed off more aggressively than
+    /// peers that simply reject due to capacity.
+    const TIMEOUT_FAILURE_ESCALATION: u32 = 2;
+
     /// Create a new backoff tracker with default settings.
     pub fn new() -> Self {
         let config =
@@ -96,17 +156,63 @@ impl ConnectionBackoff {
     /// Record a connection failure for a target location.
     ///
     /// Increments the failure count and calculates the next retry time.
+    /// This is a convenience method that records a routing failure (non-escalated).
+    #[allow(dead_code)] // Used by tests and as backward-compatible API
     pub fn record_failure(&mut self, target: Location) {
+        self.record_failure_with_reason(target, ConnectionFailureReason::RoutingFailed);
+    }
+
+    /// Record a connection failure with the given reason.
+    ///
+    /// Different failure types may result in different backoff calculations:
+    /// - Timeout failures apply stronger backoff (escalate faster)
+    /// - Transient errors apply minimal backoff
+    /// - Other failures use normal exponential backoff
+    pub fn record_failure_with_reason(
+        &mut self,
+        target: Location,
+        reason: ConnectionFailureReason,
+    ) {
         let bucket = LocationBucket::from_location(target);
         let failures_before = self.inner.failure_count(&bucket);
-        self.inner.record_failure(bucket);
 
-        let backoff = self.inner.config().delay_for_failures(failures_before + 1);
+        // Apply different backoff based on failure type by recording multiple failures
+        let num_failures_to_record = match reason {
+            ConnectionFailureReason::Timeout => {
+                // Timeout suggests overload - escalate faster using the configured escalation factor
+                Self::TIMEOUT_FAILURE_ESCALATION
+            }
+            ConnectionFailureReason::TransientError => {
+                // Transient errors resolve quickly - record just 1 failure
+                1
+            }
+            ConnectionFailureReason::RoutingFailed
+            | ConnectionFailureReason::Rejected
+            | ConnectionFailureReason::NatPunchFailed
+            | ConnectionFailureReason::HandshakeError => {
+                // Normal exponential backoff - record 1 failure
+                1
+            }
+        };
+
+        // Record the appropriate number of failures to the internal tracker
+        for _ in 0..num_failures_to_record {
+            self.inner.record_failure(bucket);
+        }
+
+        // Calculate the actual backoff that will be applied
+        let actual_failures_after = self.inner.failure_count(&bucket);
+        let backoff = self
+            .inner
+            .config()
+            .delay_for_failures(actual_failures_after);
         tracing::debug!(
             bucket = bucket.0,
-            failures = failures_before + 1,
+            failures_before = failures_before,
+            failures_after = actual_failures_after,
+            reason = ?reason,
             backoff_secs = backoff.as_secs(),
-            "Connection target in backoff"
+            "Connection target in backoff (with reason)"
         );
     }
 
@@ -248,5 +354,116 @@ mod tests {
         // Second failure
         backoff.record_failure(loc);
         assert_eq!(backoff.failure_count(loc), 2);
+    }
+
+    #[test]
+    fn test_failure_reason_timeout_escalates_faster() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let loc1 = Location::new(0.5);
+        let loc2 = Location::new(0.6);
+
+        // Record single failures with different reasons
+        backoff.record_failure_with_reason(loc1, ConnectionFailureReason::Timeout);
+        backoff.record_failure_with_reason(loc2, ConnectionFailureReason::RoutingFailed);
+
+        // Both should be in backoff
+        assert!(backoff.is_in_backoff(loc1));
+        assert!(backoff.is_in_backoff(loc2));
+
+        // Timeout should have recorded 2 failures (escalated) while routing failure recorded 1
+        assert_eq!(
+            backoff.failure_count(loc1),
+            2,
+            "Timeout should escalate to 2 failures"
+        );
+        assert_eq!(
+            backoff.failure_count(loc2),
+            1,
+            "Routing failure should stay at 1 failure"
+        );
+
+        // Verify that timeout produces longer backoff duration than routing failure
+        // timeout with 2 failures: base * 2^(2-1) = 1s * 2 = 2s
+        // routing_failed with 1 failure: base * 2^(1-1) = 1s * 1 = 1s
+        let timeout_backoff = backoff.inner.config().delay_for_failures(2);
+        let routing_backoff = backoff.inner.config().delay_for_failures(1);
+        assert!(
+            timeout_backoff > routing_backoff,
+            "Timeout backoff should be longer"
+        );
+    }
+
+    #[test]
+    fn test_failure_reason_transient_error_minimal_backoff() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let loc = Location::new(0.5);
+
+        // Record a transient error
+        backoff.record_failure_with_reason(loc, ConnectionFailureReason::TransientError);
+
+        // Should still record the failure
+        assert_eq!(backoff.failure_count(loc), 1);
+        // Transient errors should still be in backoff but with minimal escalation
+        assert!(backoff.is_in_backoff(loc));
+    }
+
+    #[test]
+    fn test_failure_reason_rejected_normal_backoff() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let loc = Location::new(0.5);
+
+        // Record a rejection
+        backoff.record_failure_with_reason(loc, ConnectionFailureReason::Rejected);
+
+        // Should be in backoff with normal escalation
+        assert_eq!(backoff.failure_count(loc), 1);
+        assert!(backoff.is_in_backoff(loc));
+    }
+
+    #[test]
+    fn test_all_failure_reasons_recorded() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let reasons = [
+            ConnectionFailureReason::RoutingFailed,
+            ConnectionFailureReason::Timeout,
+            ConnectionFailureReason::Rejected,
+            ConnectionFailureReason::NatPunchFailed,
+            ConnectionFailureReason::HandshakeError,
+            ConnectionFailureReason::TransientError,
+        ];
+
+        for (i, reason) in reasons.iter().enumerate() {
+            let loc = Location::new(i as f64 / 256.0);
+            backoff.record_failure_with_reason(loc, *reason);
+            assert!(
+                backoff.is_in_backoff(loc),
+                "Location should be in backoff after {:?}",
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_success_clears_all_failure_reasons() {
+        let mut backoff =
+            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+
+        let loc = Location::new(0.5);
+
+        // Record failure with reason
+        backoff.record_failure_with_reason(loc, ConnectionFailureReason::Timeout);
+        assert!(backoff.is_in_backoff(loc));
+
+        // Success should clear it regardless of reason
+        backoff.record_success(loc);
+        assert!(!backoff.is_in_backoff(loc));
     }
 }
