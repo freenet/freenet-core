@@ -206,18 +206,15 @@ jobs:
           ENCODED_ROOM_ID=$(echo "$MATRIX_ROOM_ID" | sed 's/!/%21/g; s/:/%3A/g')
 
           # Construct message body
-          MESSAGE=$(cat <<'EOF'
-          🚨 **Nightly Simulation Tests Failed**
+          MESSAGE="🚨 **Nightly Simulation Tests Failed**
 
           **Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
           **Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          **Branch:** `${{ github.ref_name }}`
-          **Commit:** `${{ github.sha }}`
-          **Seed:** `${{ github.event.inputs.seed || '0xDEADBEEF' }}`
+          **Branch:** \`${{ github.ref_name }}\`
+          **Commit:** \`${{ github.sha }}\`
+          **Seed:** \`${{ github.event.inputs.seed || '0xDEADBEEF' }}\`
 
-          Please investigate the failure and check the logs for details.
-          EOF
-          )
+          Please investigate the failure and check the logs for details."
 
           # Send to Matrix
           curl -sf -X PUT \
