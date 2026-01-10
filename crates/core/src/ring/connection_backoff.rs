@@ -142,38 +142,37 @@ impl ConnectionBackoff {
         let bucket = LocationBucket::from_location(target);
         let failures_before = self.inner.failure_count(&bucket);
 
-        // Apply different backoff based on failure type
-        let backoff_multiplier = match reason {
+        // Apply different backoff based on failure type by recording multiple failures
+        let num_failures_to_record = match reason {
             ConnectionFailureReason::Timeout => {
-                // Timeout suggests overload - escalate faster
+                // Timeout suggests overload - escalate faster (record 2 failures worth)
                 2
             }
             ConnectionFailureReason::TransientError => {
-                // Transient errors resolve quickly - minimal escalation
-                0
+                // Transient errors resolve quickly - record just 1 failure
+                1
             }
             ConnectionFailureReason::RoutingFailed
             | ConnectionFailureReason::Rejected
             | ConnectionFailureReason::NatPunchFailed
             | ConnectionFailureReason::HandshakeError => {
-                // Normal exponential backoff
+                // Normal exponential backoff - record 1 failure
                 1
             }
         };
 
-        self.inner.record_failure(bucket);
+        // Record the appropriate number of failures to the internal tracker
+        for _ in 0..num_failures_to_record {
+            self.inner.record_failure(bucket);
+        }
 
-        // Calculate backoff: apply multiplier to effective failure count
-        let effective_failures = if backoff_multiplier > 0 {
-            (failures_before + backoff_multiplier).max(failures_before + 1)
-        } else {
-            failures_before.max(1) // At least 1 failure for transient
-        };
-
-        let backoff = self.inner.config().delay_for_failures(effective_failures);
+        // Calculate the actual backoff that will be applied
+        let actual_failures_after = self.inner.failure_count(&bucket);
+        let backoff = self.inner.config().delay_for_failures(actual_failures_after);
         tracing::debug!(
             bucket = bucket.0,
-            failures = failures_before + 1,
+            failures_before = failures_before,
+            failures_after = actual_failures_after,
             reason = ?reason,
             backoff_secs = backoff.as_secs(),
             "Connection target in backoff (with reason)"
@@ -328,7 +327,7 @@ mod tests {
         let loc1 = Location::new(0.5);
         let loc2 = Location::new(0.6);
 
-        // Record same number of failures with different reasons
+        // Record single failures with different reasons
         backoff.record_failure_with_reason(loc1, ConnectionFailureReason::Timeout);
         backoff.record_failure_with_reason(loc2, ConnectionFailureReason::RoutingFailed);
 
@@ -336,9 +335,16 @@ mod tests {
         assert!(backoff.is_in_backoff(loc1));
         assert!(backoff.is_in_backoff(loc2));
 
-        // Timeout should have higher failure count internally (escalated)
-        assert_eq!(backoff.failure_count(loc1), 1); // Internal count still 1
-        assert_eq!(backoff.failure_count(loc2), 1);
+        // Timeout should have recorded 2 failures (escalated) while routing failure recorded 1
+        assert_eq!(backoff.failure_count(loc1), 2, "Timeout should escalate to 2 failures");
+        assert_eq!(backoff.failure_count(loc2), 1, "Routing failure should stay at 1 failure");
+
+        // Verify that timeout produces longer backoff duration than routing failure
+        // timeout with 2 failures: base * 2^(2-1) = 1s * 2 = 2s
+        // routing_failed with 1 failure: base * 2^(1-1) = 1s * 1 = 1s
+        let timeout_backoff = backoff.inner.config().delay_for_failures(2);
+        let routing_backoff = backoff.inner.config().delay_for_failures(1);
+        assert!(timeout_backoff > routing_backoff, "Timeout backoff should be longer");
     }
 
     #[test]
