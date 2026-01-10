@@ -189,7 +189,7 @@ jobs:
           fi
 
   # Notify Matrix channel on failure
-  # Uses MATRIX_DEV_ROOM_ID variable for the freenet-dev channel (separate from PR merge notifications)
+  # Uses curl directly because the matrix-message action doesn't URL-encode room IDs
   notify-failure:
     name: Notify Matrix on Failure
     runs-on: ubuntu-latest
@@ -198,13 +198,33 @@ jobs:
     if: failure()
     steps:
       - name: Send failure message to Matrix
-        uses: olabiniV2/matrix-message@v0.0.1
-        with:
-          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
-          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
-          subject: "Nightly Simulation Failed"
-          message: "🚨 **Nightly Simulation Tests Failed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`\n**Commit:** `${{ github.sha }}`\n**Seed:** `${{ github.event.inputs.seed || '0xDEADBEEF' }}`\n\nPlease investigate the failure and check the logs for details."
-          server: "matrix.org"
+        env:
+          MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          MATRIX_ROOM_ID: ${{ secrets.MATRIX_DEV_ROOM_ID }}
+        run: |
+          # URL-encode the room ID (! -> %21, : -> %3A)
+          ENCODED_ROOM_ID=$(echo "$MATRIX_ROOM_ID" | sed 's/!/%21/g; s/:/%3A/g')
+
+          # Construct message body
+          MESSAGE=$(cat <<'EOF'
+          🚨 **Nightly Simulation Tests Failed**
+
+          **Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
+          **Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Branch:** `${{ github.ref_name }}`
+          **Commit:** `${{ github.sha }}`
+          **Seed:** `${{ github.event.inputs.seed || '0xDEADBEEF' }}`
+
+          Please investigate the failure and check the logs for details.
+          EOF
+          )
+
+          # Send to Matrix
+          curl -sf -X PUT \
+            "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
+            -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')"
 
   # Notify Matrix channel on success (optional, for visibility)
   notify-success:
@@ -215,10 +235,26 @@ jobs:
     if: success()
     steps:
       - name: Send success message to Matrix
-        uses: olabiniV2/matrix-message@v0.0.1
-        with:
-          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
-          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
-          subject: "Nightly Simulation Passed"
-          message: "✅ **Nightly Simulation Tests Passed**\n\n**Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})\n**Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Branch:** `${{ github.ref_name }}`"
-          server: "matrix.org"
+        env:
+          MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          MATRIX_ROOM_ID: ${{ secrets.MATRIX_DEV_ROOM_ID }}
+        run: |
+          # URL-encode the room ID (! -> %21, : -> %3A)
+          ENCODED_ROOM_ID=$(echo "$MATRIX_ROOM_ID" | sed 's/!/%21/g; s/:/%3A/g')
+
+          # Construct message body
+          MESSAGE=$(cat <<'EOF'
+          ✅ **Nightly Simulation Tests Passed**
+
+          **Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
+          **Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Branch:** `${{ github.ref_name }}`
+          EOF
+          )
+
+          # Send to Matrix
+          curl -sf -X PUT \
+            "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
+            -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')"
