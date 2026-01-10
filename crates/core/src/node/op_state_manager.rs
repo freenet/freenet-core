@@ -225,6 +225,8 @@ pub(crate) struct OpManager {
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
+    /// Interest manager for delta-based state synchronization
+    pub interest_manager: Arc<crate::ring::interest::InterestManager>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -268,6 +270,7 @@ impl Clone for OpManager {
             sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
             proximity_cache: self.proximity_cache.clone(),
+            interest_manager: self.interest_manager.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_enabled: self.streaming_enabled,
@@ -333,6 +336,7 @@ impl OpManager {
         }
 
         let proximity_cache = Arc::new(ProximityCacheManager::new());
+        let interest_manager = Arc::new(crate::ring::interest::InterestManager::new());
 
         // Extract streaming config from NodeConfig
         let streaming_enabled = config.config.network_api.streaming_enabled;
@@ -358,6 +362,7 @@ impl OpManager {
             sub_op_tracker,
             contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proximity_cache,
+            interest_manager,
             request_router,
             orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
             streaming_enabled,

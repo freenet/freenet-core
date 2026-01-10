@@ -97,6 +97,7 @@ console-subscriber = { version = "0.5.0", optional = true }
 tokio-stream = "0.1.18"
 freenet-test-network = { version = "0.1.20", optional = true }
 turmoil = "0.7"  # Deterministic simulation scheduling (always enabled for SimNetwork)
+lru = "0.16.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"  # For sendmmsg syscall batching on Linux
