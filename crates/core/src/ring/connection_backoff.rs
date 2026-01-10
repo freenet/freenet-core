@@ -189,7 +189,10 @@ impl ConnectionBackoff {
 
         // Calculate the actual backoff that will be applied
         let actual_failures_after = self.inner.failure_count(&bucket);
-        let backoff = self.inner.config().delay_for_failures(actual_failures_after);
+        let backoff = self
+            .inner
+            .config()
+            .delay_for_failures(actual_failures_after);
         tracing::debug!(
             bucket = bucket.0,
             failures_before = failures_before,
@@ -357,15 +360,26 @@ mod tests {
         assert!(backoff.is_in_backoff(loc2));
 
         // Timeout should have recorded 2 failures (escalated) while routing failure recorded 1
-        assert_eq!(backoff.failure_count(loc1), 2, "Timeout should escalate to 2 failures");
-        assert_eq!(backoff.failure_count(loc2), 1, "Routing failure should stay at 1 failure");
+        assert_eq!(
+            backoff.failure_count(loc1),
+            2,
+            "Timeout should escalate to 2 failures"
+        );
+        assert_eq!(
+            backoff.failure_count(loc2),
+            1,
+            "Routing failure should stay at 1 failure"
+        );
 
         // Verify that timeout produces longer backoff duration than routing failure
         // timeout with 2 failures: base * 2^(2-1) = 1s * 2 = 2s
         // routing_failed with 1 failure: base * 2^(1-1) = 1s * 1 = 1s
         let timeout_backoff = backoff.inner.config().delay_for_failures(2);
         let routing_backoff = backoff.inner.config().delay_for_failures(1);
-        assert!(timeout_backoff > routing_backoff, "Timeout backoff should be longer");
+        assert!(
+            timeout_backoff > routing_backoff,
+            "Timeout backoff should be longer"
+        );
     }
 
     #[test]
@@ -404,7 +418,7 @@ mod tests {
         let mut backoff =
             ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
 
-        let reasons = vec![
+        let reasons = [
             ConnectionFailureReason::RoutingFailed,
             ConnectionFailureReason::Timeout,
             ConnectionFailureReason::Rejected,
