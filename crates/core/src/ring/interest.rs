@@ -37,7 +37,7 @@
 //! This self-healing mechanism catches forgotten cleanup and prevents zombie interests.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary, WrappedState};
+use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -257,10 +257,12 @@ impl InterestManager {
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             let removed = entry.remove(peer).is_some();
 
-            // Clean up empty entries
+            // Clean up empty entries using remove_if to avoid race condition
+            // between dropping the entry guard and removing the contract.
             if entry.is_empty() {
                 drop(entry);
-                self.interested_peers.remove(contract);
+                self.interested_peers
+                    .remove_if(contract, |_, v| v.is_empty());
             }
 
             removed
@@ -675,17 +677,22 @@ impl InterestManager {
     /// Uses the contract handler to compute the delta via the contract's
     /// `get_state_delta` method. Results are cached to avoid recomputation
     /// for peers with the same summary.
+    ///
+    /// # Arguments
+    /// * `our_summary` - Our current state summary (used for cache key)
+    /// * `our_state_size` - Size of our current state (for efficiency check)
     pub async fn compute_delta(
         &self,
         op_manager: &crate::node::OpManager,
         key: &ContractKey,
         their_summary: &StateSummary<'static>,
-        our_state: &WrappedState,
+        our_summary: &StateSummary<'static>,
+        our_state_size: usize,
     ) -> Result<StateDelta<'static>, String> {
         use crate::contract::ContractHandlerEvent;
 
-        // Check cache first
-        let our_summary_bytes = our_state.as_ref().to_vec();
+        // Check cache first (keyed by actual summaries, not state bytes)
+        let our_summary_bytes = our_summary.as_ref().to_vec();
         let their_summary_bytes = their_summary.as_ref().to_vec();
 
         if let Some(cached) = self.get_cached_delta(&their_summary_bytes, &our_summary_bytes) {
@@ -698,7 +705,7 @@ impl InterestManager {
 
         // Check if delta would be efficient
         // (summary > 50% of state size means delta probably won't help)
-        if !Self::is_delta_efficient(their_summary.as_ref().len(), our_state.as_ref().len()) {
+        if !Self::is_delta_efficient(their_summary.as_ref().len(), our_state_size) {
             return Err("Delta not efficient for this contract".to_string());
         }
 
