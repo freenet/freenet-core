@@ -216,10 +216,19 @@ jobs:
 
           Please investigate the failure and check the logs for details."
 
-          # Send to Matrix
-          curl -sf -X PUT \
+          # Send to Matrix (show response on error for debugging)
+          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT \
             "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
             -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')"
+            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')")
+
+          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "Matrix API error (HTTP $HTTP_CODE): $BODY"
+            exit 1
+          fi
+          echo "Message sent successfully"
 
