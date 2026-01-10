@@ -1329,30 +1329,140 @@ async fn handle_interest_sync_message(
                 "Received ResyncRequest - peer needs full state"
             );
 
-            // Clear cached summary for this peer so next update sends full state
+            // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
-            if let Some(pk) = peer_key {
+            if let Some(ref pk) = peer_key {
                 op_manager
                     .interest_manager
-                    .update_peer_summary(&key, &pk, None);
+                    .update_peer_summary(&key, pk, None);
             }
 
-            // TODO(delta-sync): Immediately send full state to requesting peer.
-            // Currently, we only clear the cached summary so the NEXT update will
-            // send full state. If the contract is not being actively updated, the
-            // peer will be stuck until an update occurs.
-            //
-            // To properly fix this, we need to:
-            // 1. Fetch current state from StateStore
-            // 2. Compute summary
-            // 3. Send Update message with full state payload
-            //
-            // For now this is acceptable because:
-            // - Delta application failures are rare (summary mismatch or corruption)
-            // - Actively-updated contracts will naturally resync quickly
-            // - This matches the plan's "Phase 6" scope for recovery mechanisms
+            // Fetch current state from store
+            let state = get_contract_state(op_manager, &key).await;
+            let Some(state) = state else {
+                tracing::warn!(
+                    contract = %key,
+                    "ResyncRequest for contract we don't have state for"
+                );
+                return None;
+            };
+
+            // Fetch our summary
+            let summary = get_contract_summary(op_manager, &key).await;
+            let Some(summary) = summary else {
+                tracing::warn!(
+                    contract = %key,
+                    "ResyncRequest for contract we can't compute summary for"
+                );
+                return None;
+            };
+
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                summary_size = summary.as_ref().len(),
+                "Sending ResyncResponse with full state"
+            );
+
+            Some(InterestMessage::ResyncResponse {
+                key,
+                state_bytes: state.as_ref().to_vec(),
+                summary_bytes: summary.as_ref().to_vec(),
+            })
+        }
+
+        InterestMessage::ResyncResponse {
+            key,
+            state_bytes,
+            summary_bytes,
+        } => {
+            tracing::info!(
+                from = %source,
+                contract = %key,
+                state_size = state_bytes.len(),
+                "Received ResyncResponse with full state"
+            );
+
+            // Apply the full state using an update
+            let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
+            let update_data = freenet_stdlib::prelude::UpdateData::State(state);
+
+            // Send to contract handler
+            use crate::contract::ContractHandlerEvent;
+            match op_manager
+                .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                    key,
+                    data: update_data,
+                    related_contracts: Default::default(),
+                })
+                .await
+            {
+                Ok(ContractHandlerEvent::UpdateResponse { new_value: Ok(_) }) => {
+                    tracing::debug!(contract = %key, "ResyncResponse state applied successfully");
+                }
+                Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    tracing::debug!(contract = %key, "ResyncResponse state unchanged");
+                }
+                Ok(other) => {
+                    tracing::warn!(
+                        contract = %key,
+                        response = ?other,
+                        "Unexpected response to resync update"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to apply resync state"
+                    );
+                }
+            }
+
+            // Update the peer's summary in our interest tracker
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            if let Some(pk) = peer_key {
+                let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes);
+                op_manager
+                    .interest_manager
+                    .update_peer_summary(&key, &pk, Some(summary));
+            }
+
+            // No response needed
             None
         }
+    }
+}
+
+/// Get the contract state from the state store.
+async fn get_contract_state(
+    op_manager: &Arc<OpManager>,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<freenet_stdlib::prelude::WrappedState> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *key.id(),
+            return_contract_code: false,
+        })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(store_response),
+            ..
+        }) => store_response.state,
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Err(e), ..
+        }) => {
+            tracing::warn!(
+                contract = %key,
+                error = %e,
+                "Failed to get contract state"
+            );
+            None
+        }
+        _ => None,
     }
 }
 

@@ -1275,6 +1275,70 @@ mod tests {
     }
 
     #[test]
+    fn test_resync_full_flow() {
+        // Simulate the complete ResyncRequest -> ResyncResponse flow
+        // Peer A has corrupted state and requests resync from Peer B
+        let (manager_a, _time_a) = make_manager();
+        let (manager_b, _time_b) = make_manager();
+
+        let contract = make_contract_key(1);
+        let peer_a = make_peer_key(1);
+        let peer_b = make_peer_key(2);
+
+        let old_summary = StateSummary::from(vec![1, 2, 3]); // A's corrupted summary
+        let new_summary = StateSummary::from(vec![4, 5, 6]); // B's correct summary
+
+        // Setup: both peers have interest in the contract
+        manager_a.register_local_seeding(&contract);
+        manager_b.register_local_seeding(&contract);
+
+        // A tracks B's summary, B tracks A's summary
+        manager_a.register_peer_interest(
+            &contract,
+            peer_b.clone(),
+            Some(new_summary.clone()),
+            false,
+        );
+        manager_b.register_peer_interest(
+            &contract,
+            peer_a.clone(),
+            Some(old_summary.clone()),
+            false,
+        );
+
+        // Step 1: A sends ResyncRequest
+        // B receives it and clears A's cached summary
+        manager_b.update_peer_summary(&contract, &peer_a, None);
+
+        // Verify B cleared A's summary
+        let cached = manager_b.get_peer_summary(&contract, &peer_a);
+        assert!(cached.is_none(), "B should have cleared A's summary");
+
+        // Step 2: B sends ResyncResponse with full state and summary
+        // A receives it and updates B's summary
+        manager_a.update_peer_summary(&contract, &peer_b, Some(new_summary.clone()));
+
+        // Verify A has B's new summary
+        let cached = manager_a.get_peer_summary(&contract, &peer_b);
+        assert!(cached.is_some(), "A should have B's summary");
+        assert_eq!(
+            cached.unwrap().as_ref(),
+            new_summary.as_ref(),
+            "A should have B's correct summary"
+        );
+
+        // Both peers should still be interested
+        assert!(manager_a
+            .get_interested_peers(&contract)
+            .iter()
+            .any(|(pk, _)| pk == &peer_b));
+        assert!(manager_b
+            .get_interested_peers(&contract)
+            .iter()
+            .any(|(pk, _)| pk == &peer_a));
+    }
+
+    #[test]
     fn test_delta_vs_full_state_decision() {
         // This test verifies the decision logic for when to send delta vs full state.
         // The decision is based on:

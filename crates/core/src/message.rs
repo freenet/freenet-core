@@ -411,10 +411,23 @@ pub enum InterestMessage {
     /// Request full state resync when delta application fails.
     ///
     /// Sent when a received delta cannot be applied (corruption, version mismatch).
-    /// The upstream peer responds with the full state and clears its cached summary.
+    /// The upstream peer responds with ResyncResponse containing full state.
     ResyncRequest {
         /// The contract that needs resync.
         key: ContractKey,
+    },
+
+    /// Response to ResyncRequest with full state.
+    ///
+    /// Sent when a peer requests resync after delta application failure.
+    /// Contains the full contract state and sender's summary.
+    ResyncResponse {
+        /// The contract being resynced.
+        key: ContractKey,
+        /// Full contract state bytes.
+        state_bytes: Vec<u8>,
+        /// Sender's current state summary bytes.
+        summary_bytes: Vec<u8>,
     },
 }
 
