@@ -262,6 +262,20 @@ where
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         vec![] // Mock implementation returns empty list
     }
+
+    async fn summarize_contract_state(
+        &mut self,
+        key: ContractKey,
+    ) -> Result<StateSummary<'static>, ExecutorError> {
+        // MockRuntime doesn't have actual contract code to execute summarize_state,
+        // so we return the full state as a fallback summary
+        let state = self
+            .state_store
+            .get(&key)
+            .await
+            .map_err(ExecutorError::other)?;
+        Ok(StateSummary::from(state.as_ref().to_vec()))
+    }
 }
 
 #[cfg(test)]

@@ -504,6 +504,15 @@ pub(crate) enum ContractHandlerEvent {
     },
     #[allow(dead_code)]
     QuerySubscriptionsResponse,
+    /// Get the state summary for a contract using its summarize_state method
+    GetSummaryQuery {
+        key: ContractKey,
+    },
+    /// Response to a GetSummaryQuery
+    GetSummaryResponse {
+        key: ContractKey,
+        summary: Result<StateSummary<'static>, ExecutorError>,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -598,6 +607,13 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::QuerySubscriptionsResponse => {
                 write!(f, "query subscriptions response")
             }
+            ContractHandlerEvent::GetSummaryQuery { key } => {
+                write!(f, "get summary query {{ {key} }}")
+            }
+            ContractHandlerEvent::GetSummaryResponse { key, summary } => match summary {
+                Ok(_) => write!(f, "get summary response {{ {key} }}"),
+                Err(e) => write!(f, "get summary failed {{ {key}, error: {e} }}"),
+            },
         }
     }
 }

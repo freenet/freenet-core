@@ -436,6 +436,28 @@ where
                     );
                 }
             }
+            ContractHandlerEvent::GetSummaryQuery { key } => {
+                let summary = contract_handler
+                    .executor()
+                    .summarize_contract_state(key)
+                    .instrument(tracing::info_span!("summarize_contract_state", %key))
+                    .await;
+
+                if let Err(error) = contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::GetSummaryResponse { key, summary },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send GetSummary response (client may have disconnected)"
+                    );
+                }
+            }
             _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }
     }

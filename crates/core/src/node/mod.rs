@@ -1333,27 +1333,30 @@ async fn handle_interest_sync_message(
     }
 }
 
-/// Get the contract state summary from the store.
+/// Get the contract state summary using the contract's summarize_state method.
 async fn get_contract_summary(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
-    use crate::contract::{ContractHandlerEvent, StoreResponse};
+    use crate::contract::ContractHandlerEvent;
 
     match op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            instance_id: *key.id(),
-            return_contract_code: false,
-        })
+        .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
         .await
     {
-        Ok(ContractHandlerEvent::GetResponse {
-            response: Ok(StoreResponse { state: Some(s), .. }),
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Ok(summary),
             ..
+        }) => Some(summary),
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Err(e), ..
         }) => {
-            // Create summary from state bytes
-            let state_bytes = freenet_stdlib::prelude::State::from(s).into_bytes();
-            Some(freenet_stdlib::prelude::StateSummary::from(state_bytes))
+            tracing::warn!(
+                contract = %key,
+                error = %e,
+                "Failed to get contract summary"
+            );
+            None
         }
         _ => None,
     }
