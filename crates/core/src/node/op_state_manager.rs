@@ -30,7 +30,8 @@ use crate::{
         put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
     },
     ring::{
-        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKeyLocation, Ring,
+        ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
+        PeerKeyLocation, Ring,
     },
 };
 
@@ -318,6 +319,7 @@ impl OpManager {
                 sub_op_tracker.clone(),
                 result_router_tx.clone(),
                 request_router.clone(),
+                ring.clone(),
             )
             .instrument(garbage_span),
         );
@@ -932,6 +934,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     sub_op_tracker: SubOperationTracker,
     result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    ring: Arc<Ring>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -959,7 +962,17 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         continue;
                     }
                     let still_waiting = match tx.transaction_type() {
-                        TransactionType::Connect => ops.connect.remove(&tx).is_none(),
+                        TransactionType::Connect => {
+                            if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Notify backoff tracker of timeout for joiner operations
+                                if let Some(target_loc) = op.desired_location {
+                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
+                                }
+                                false
+                            } else {
+                                true
+                            }
+                        }
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
                         TransactionType::Get => ops.get.remove(&tx).is_none(),
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
@@ -1020,7 +1033,17 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                     }
                     let removed = match tx.transaction_type() {
-                        TransactionType::Connect => ops.connect.remove(&tx).is_some(),
+                        TransactionType::Connect => {
+                            if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Notify backoff tracker of timeout for joiner operations
+                                if let Some(target_loc) = op.desired_location {
+                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
                         TransactionType::Get => ops.get.remove(&tx).is_some(),
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),

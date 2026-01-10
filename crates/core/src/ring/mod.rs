@@ -13,7 +13,7 @@ use tracing::Instrument;
 
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 pub use seeding::{
     AddClientSubscriptionResult, AddDownstreamResult, PruneSubscriptionsResult,
@@ -50,6 +50,7 @@ mod seeding;
 mod seeding_cache;
 
 use connection_backoff::ConnectionBackoff;
+pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
@@ -76,6 +77,8 @@ pub(crate) struct Ring {
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
     pub(crate) is_gateway: bool,
+    /// Shared connection backoff tracker for all connection failure types.
+    connection_backoff: Arc<parking_lot::Mutex<ConnectionBackoff>>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -182,6 +185,7 @@ impl Ring {
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
             is_gateway,
+            connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
         };
 
         if let Some(loc) = config.location {
@@ -245,6 +249,28 @@ impl Ring {
 
     pub fn open_connections(&self) -> usize {
         self.connection_manager.connection_count()
+    }
+
+    /// Record a connection failure to the backoff tracker.
+    pub fn record_connection_failure(&self, target: Location, reason: ConnectionFailureReason) {
+        let mut backoff = self.connection_backoff.lock();
+        backoff.record_failure_with_reason(target, reason);
+    }
+
+    /// Record a successful connection to clear backoff.
+    pub fn record_connection_success(&self, target: Location) {
+        let mut backoff = self.connection_backoff.lock();
+        backoff.record_success(target);
+    }
+
+    /// Check if a target is currently in backoff.
+    pub fn is_in_connection_backoff(&self, target: Location) -> bool {
+        self.connection_backoff.lock().is_in_backoff(target)
+    }
+
+    /// Periodic cleanup of expired backoff entries.
+    pub fn cleanup_connection_backoff(&self) {
+        self.connection_backoff.lock().cleanup_expired();
     }
 
     /// Register events with the event system.
@@ -935,7 +961,6 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut pending_conn_adds = BTreeSet::new();
-        let mut connection_backoff = ConnectionBackoff::new();
         let mut last_backoff_cleanup = Instant::now();
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         let mut this_peer = None;
@@ -961,7 +986,7 @@ impl Ring {
 
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
-                connection_backoff.cleanup_expired();
+                self.cleanup_connection_backoff();
                 last_backoff_cleanup = Instant::now();
             }
 
@@ -970,7 +995,7 @@ impl Ring {
             let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 // Check if this target is in backoff due to previous failures
-                if connection_backoff.is_in_backoff(ideal_location) {
+                if self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
@@ -1011,14 +1036,19 @@ impl Ring {
                             "acquire_new returned None - likely no peers to query through"
                         );
                         // Record failure for exponential backoff
-                        connection_backoff.record_failure(ideal_location);
+                        self.record_connection_failure(
+                            ideal_location,
+                            ConnectionFailureReason::RoutingFailed,
+                        );
                     } else {
                         tracing::info!(
                             active_connections = active_count + 1,
                             "Successfully initiated connection acquisition"
                         );
-                        // Clear any backoff for this location on successful initiation
-                        connection_backoff.record_success(ideal_location);
+                        // Note: Backoff is only cleared when the connection actually completes
+                        // successfully in ConnectOp::handle_msg when acceptance.satisfied is true.
+                        // We don't clear it here at initiation because the connection could still
+                        // timeout or be rejected before completing.
                     }
                 } else {
                     tracing::debug!(

@@ -1387,6 +1387,15 @@ impl Operation for ConnectOp {
                                         "Cleared gateway backoff on successful connect"
                                     );
                                 }
+                                // Clear connection location backoff on successful completion
+                                if let Some(target_loc) = self.desired_location {
+                                    op_manager.ring.record_connection_success(target_loc);
+                                    tracing::debug!(
+                                        target_location = %target_loc,
+                                        tx = %self.id,
+                                        "Cleared connection location backoff on successful connect"
+                                    );
+                                }
                             }
                         }
 
