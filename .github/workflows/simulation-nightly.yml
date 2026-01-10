@@ -204,6 +204,8 @@ jobs:
         run: |
           # URL-encode the room ID (! -> %21, : -> %3A)
           ENCODED_ROOM_ID=$(echo "$MATRIX_ROOM_ID" | sed 's/!/%21/g; s/:/%3A/g')
+          echo "Room ID length: ${#MATRIX_ROOM_ID}, Encoded length: ${#ENCODED_ROOM_ID}"
+          echo "Encoded starts with: ${ENCODED_ROOM_ID:0:5}"
 
           # Construct message body
           MESSAGE="🚨 **Nightly Simulation Tests Failed**
