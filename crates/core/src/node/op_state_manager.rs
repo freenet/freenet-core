@@ -336,6 +336,9 @@ impl OpManager {
         let proximity_cache = Arc::new(ProximityCacheManager::new());
         let interest_manager = Arc::new(crate::ring::interest::InterestManager::new());
 
+        // Start background sweep task for interest expiration
+        crate::ring::interest::InterestManager::start_sweep_task(interest_manager.clone());
+
         // Extract streaming config from NodeConfig
         let streaming_enabled = config.config.network_api.streaming_enabled;
         let streaming_threshold = config.config.network_api.streaming_threshold;

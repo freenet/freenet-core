@@ -611,6 +611,11 @@ pub(crate) enum NodeEvent {
     BroadcastProximityCache {
         message: ProximityCacheMessage,
     },
+    /// Broadcast a ChangeInterests message to all connected peers for delta sync.
+    BroadcastChangeInterests {
+        added: Vec<u32>,
+        removed: Vec<u32>,
+    },
     /// A WebSocket client disconnected - clean up its subscriptions and trigger tree pruning.
     ClientDisconnected {
         client_id: ClientId,
@@ -696,6 +701,14 @@ impl Display for NodeEvent {
             }
             NodeEvent::BroadcastProximityCache { message } => {
                 write!(f, "BroadcastProximityCache ({message:?})")
+            }
+            NodeEvent::BroadcastChangeInterests { added, removed } => {
+                write!(
+                    f,
+                    "BroadcastChangeInterests (added: {}, removed: {})",
+                    added.len(),
+                    removed.len()
+                )
             }
             NodeEvent::ClientDisconnected { client_id } => {
                 write!(f, "ClientDisconnected (client: {client_id})")

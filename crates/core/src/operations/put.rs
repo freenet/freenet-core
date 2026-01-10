@@ -326,6 +326,14 @@ impl Operation for PutOp {
                     if !was_seeding {
                         op_manager.ring.seed_contract(key, value.size() as u64);
                         super::announce_contract_cached(op_manager, &key).await;
+
+                        // Register local interest for delta-based sync
+                        let became_interested =
+                            op_manager.interest_manager.register_local_seeding(&key);
+                        if became_interested {
+                            // Broadcast ChangeInterests to all connected peers
+                            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+                        }
                     }
 
                     // If there are interested parties in the subscription tree and the stored
