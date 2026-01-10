@@ -422,14 +422,14 @@ pub(crate) async fn broadcast_change_interests(
     added: Vec<ContractKey>,
     removed: Vec<ContractKey>,
 ) {
-    use crate::ring::interest::InterestManager;
+    use crate::ring::interest::contract_hash;
 
     if added.is_empty() && removed.is_empty() {
         return;
     }
 
-    let added_hashes: Vec<u32> = added.iter().map(InterestManager::contract_hash).collect();
-    let removed_hashes: Vec<u32> = removed.iter().map(InterestManager::contract_hash).collect();
+    let added_hashes: Vec<u32> = added.iter().map(contract_hash).collect();
+    let removed_hashes: Vec<u32> = removed.iter().map(contract_hash).collect();
 
     tracing::debug!(
         added_count = added_hashes.len(),

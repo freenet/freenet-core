@@ -33,6 +33,7 @@ use crate::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
         PeerKeyLocation, Ring,
     },
+    util::time_source::InstantTimeSrc,
 };
 
 use super::{
@@ -226,7 +227,7 @@ pub(crate) struct OpManager {
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
     /// Interest manager for delta-based state synchronization
-    pub interest_manager: Arc<crate::ring::interest::InterestManager>,
+    pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -336,7 +337,9 @@ impl OpManager {
         }
 
         let proximity_cache = Arc::new(ProximityCacheManager::new());
-        let interest_manager = Arc::new(crate::ring::interest::InterestManager::new());
+        let interest_manager = Arc::new(crate::ring::interest::InterestManager::new(
+            InstantTimeSrc::new(),
+        ));
 
         // Start background sweep task for interest expiration
         crate::ring::interest::InterestManager::start_sweep_task(interest_manager.clone());

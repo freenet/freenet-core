@@ -833,4 +833,101 @@ mod tests {
                 < crate::config::OPERATION_TTL.as_millis() as u64 + 5
         );
     }
+
+    #[test]
+    fn delta_or_full_state_delta_serialization_roundtrip() {
+        use freenet_stdlib::prelude::StateDelta;
+
+        let delta = StateDelta::from(vec![1, 2, 3, 4, 5]);
+        let dofs = DeltaOrFullState::from_delta(&delta);
+
+        // Serialize to bincode
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+
+        // Deserialize back
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+
+        // Verify contents
+        match &deserialized {
+            DeltaOrFullState::Delta(bytes) => {
+                assert_eq!(bytes, &vec![1, 2, 3, 4, 5]);
+            }
+            DeltaOrFullState::FullState(_) => panic!("expected Delta variant"),
+        }
+
+        // Verify to_delta works
+        let recovered_delta = deserialized.to_delta().expect("should be delta");
+        assert_eq!(recovered_delta.as_ref(), delta.as_ref());
+    }
+
+    #[test]
+    fn delta_or_full_state_full_state_serialization_roundtrip() {
+        use freenet_stdlib::prelude::State;
+
+        let state = State::from(vec![10, 20, 30, 40, 50]);
+        let dofs = DeltaOrFullState::from_state(&state);
+
+        // Serialize to bincode
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+
+        // Deserialize back
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+
+        // Verify contents
+        match &deserialized {
+            DeltaOrFullState::Delta(_) => panic!("expected FullState variant"),
+            DeltaOrFullState::FullState(bytes) => {
+                assert_eq!(bytes, &vec![10, 20, 30, 40, 50]);
+            }
+        }
+
+        // Verify to_state works
+        let recovered_state = deserialized.to_state().expect("should be full state");
+        assert_eq!(recovered_state.as_ref(), state.as_ref());
+
+        // Verify to_delta returns None for FullState
+        assert!(deserialized.to_delta().is_none());
+    }
+
+    #[test]
+    fn delta_or_full_state_conversion_methods() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+
+        // Test from_delta
+        let delta = StateDelta::from(vec![1, 2, 3]);
+        let dofs = DeltaOrFullState::from_delta(&delta);
+        assert!(matches!(dofs, DeltaOrFullState::Delta(_)));
+        assert!(dofs.to_delta().is_some());
+        assert!(dofs.to_state().is_none());
+
+        // Test from_state
+        let state = State::from(vec![4, 5, 6]);
+        let dofs = DeltaOrFullState::from_state(&state);
+        assert!(matches!(dofs, DeltaOrFullState::FullState(_)));
+        assert!(dofs.to_delta().is_none());
+        assert!(dofs.to_state().is_some());
+    }
+
+    #[test]
+    fn delta_or_full_state_empty_data() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+
+        // Empty delta
+        let delta = StateDelta::from(Vec::<u8>::new());
+        let dofs = DeltaOrFullState::from_delta(&delta);
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+        assert!(matches!(deserialized, DeltaOrFullState::Delta(ref bytes) if bytes.is_empty()));
+
+        // Empty state
+        let state = State::from(Vec::<u8>::new());
+        let dofs = DeltaOrFullState::from_state(&state);
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+        assert!(matches!(deserialized, DeltaOrFullState::FullState(ref bytes) if bytes.is_empty()));
+    }
 }
