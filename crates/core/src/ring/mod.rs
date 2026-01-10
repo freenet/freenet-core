@@ -1043,8 +1043,10 @@ impl Ring {
                             active_connections = active_count + 1,
                             "Successfully initiated connection acquisition"
                         );
-                        // Clear any backoff for this location on successful initiation
-                        self.record_connection_success(ideal_location);
+                        // Note: Backoff is only cleared when the connection actually completes
+                        // successfully in ConnectOp::handle_msg when acceptance.satisfied is true.
+                        // We don't clear it here at initiation because the connection could still
+                        // timeout or be rejected before completing.
                     }
                 } else {
                     tracing::debug!(

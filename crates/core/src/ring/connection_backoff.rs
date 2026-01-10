@@ -13,19 +13,31 @@ use super::Location;
 
 /// Types of connection failures for backoff calculation.
 ///
-/// Different failure types may require different backoff strategies:
-/// - Routing failures suggest the network lacks peers in that direction
-/// - Timeouts suggest the target is overloaded or unreachable
-/// - Rejections mean the peer is at capacity (apply normal backoff)
-/// - NAT/handshake failures are transient and less severe
+/// Different failure types may require different backoff strategies.
+/// Currently, only `RoutingFailed` and `Timeout` are actively recorded:
+/// - Routing failures: No peer available to route through (normal exponential backoff)
+/// - Timeouts: Operation exceeded TTL, including explicit rejections (escalated backoff)
+///
+/// # Future Variants
+///
+/// The following variants are defined for future protocol enhancements where explicit
+/// rejection messages will be sent by peers instead of relying on timeouts:
+/// - `Rejected`: Peer at capacity (apply normal backoff)
+/// - `NatPunchFailed`: NAT hole punch failed (transient)
+/// - `HandshakeError`: Handshake failure after connection established
+/// - `TransientError`: Transient network issues
+///
+/// See https://github.com/freenet/freenet-core/issues/2663 for discussion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Some variants are intentionally unused for future use
+#[allow(dead_code)] // Some variants prepared for future protocol enhancements
 pub enum ConnectionFailureReason {
     /// Routing failed - no peer available to route through
     RoutingFailed,
     /// Connect operation timed out waiting for response
+    /// (includes explicit rejections that currently manifest as timeouts)
     Timeout,
     /// Remote peer rejected connection (at capacity, etc.)
+    /// Currently unused - rejections are detected as timeouts.
     #[allow(dead_code)]
     Rejected,
     /// NAT hole punch failed
@@ -68,13 +80,14 @@ impl LocationBucket {
 ///
 /// # Failure Escalation
 ///
-/// Different failure types receive different backoff escalation:
-/// - **Timeout failures**: Escalated (record 2 failures) - timeouts suggest peer overload
-/// - **Routing failures**: Normal (record 1 failure) - indicates no routing path available
-/// - **Other failures**: Normal (record 1 failure) - transient or capacity-related issues
+/// Timeout failures are escalated (recorded as 2 failures) while routing failures are
+/// recorded normally (1 failure). This creates different backoff curves:
+/// - **Timeout**: 1st → 2x backoff, 2nd → 4x, 3rd → 8x (escalates faster)
+/// - **Routing**: 1st → 1x backoff, 2nd → 2x, 3rd → 4x (normal exponential)
 ///
-/// This escalation ensures that unresponsive peers that timeout are backed off more
-/// aggressively than peers that simply reject connections due to capacity.
+/// Timeouts suggest the peer is overloaded, unresponsive, or unreachable, warranting
+/// more aggressive backoff. Routing failures indicate no peer was available in that
+/// direction and are less severe.
 #[derive(Debug)]
 pub struct ConnectionBackoff {
     inner: TrackedBackoff<LocationBucket>,
