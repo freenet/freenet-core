@@ -1034,7 +1034,10 @@ impl Ring {
                             "acquire_new returned None - likely no peers to query through"
                         );
                         // Record failure for exponential backoff
-                        self.record_connection_failure(ideal_location, ConnectionFailureReason::RoutingFailed);
+                        self.record_connection_failure(
+                            ideal_location,
+                            ConnectionFailureReason::RoutingFailed,
+                        );
                     } else {
                         tracing::info!(
                             active_connections = active_count + 1,
