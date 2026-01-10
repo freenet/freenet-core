@@ -276,6 +276,21 @@ where
             .map_err(ExecutorError::other)?;
         Ok(StateSummary::from(state.as_ref().to_vec()))
     }
+
+    async fn get_contract_state_delta(
+        &mut self,
+        key: ContractKey,
+        _their_summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ExecutorError> {
+        // MockRuntime doesn't have actual contract code to execute get_state_delta,
+        // so we return the full state as the "delta" (fallback behavior)
+        let state = self
+            .state_store
+            .get(&key)
+            .await
+            .map_err(ExecutorError::other)?;
+        Ok(StateDelta::from(state.as_ref().to_vec()))
+    }
 }
 
 #[cfg(test)]

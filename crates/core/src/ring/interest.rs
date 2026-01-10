@@ -37,7 +37,7 @@
 //! This self-healing mechanism catches forgotten cleanup and prevents zombie interests.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary};
+use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary, WrappedState};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -623,6 +623,104 @@ impl InterestManager {
             our_summary: our_summary.to_vec(),
         };
         self.delta_cache.lock().get(&key).cloned()
+    }
+
+    /// Get the current state summary for a contract.
+    ///
+    /// Uses the contract handler to compute the summary via the contract's
+    /// `summarize_state` method.
+    pub async fn get_contract_summary(
+        &self,
+        op_manager: &crate::node::OpManager,
+        key: &ContractKey,
+    ) -> Option<StateSummary<'static>> {
+        use crate::contract::ContractHandlerEvent;
+
+        match op_manager
+            .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
+            .await
+        {
+            Ok(ContractHandlerEvent::GetSummaryResponse { summary: Ok(s), .. }) => Some(s),
+            Ok(ContractHandlerEvent::GetSummaryResponse {
+                summary: Err(e), ..
+            }) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to get contract summary"
+                );
+                None
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    contract = %key,
+                    response = ?other,
+                    "Unexpected response to GetSummaryQuery"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Error getting contract summary"
+                );
+                None
+            }
+        }
+    }
+
+    /// Compute a state delta for a peer given their cached summary.
+    ///
+    /// Uses the contract handler to compute the delta via the contract's
+    /// `get_state_delta` method. Results are cached to avoid recomputation
+    /// for peers with the same summary.
+    pub async fn compute_delta(
+        &self,
+        op_manager: &crate::node::OpManager,
+        key: &ContractKey,
+        their_summary: &StateSummary<'static>,
+        our_state: &WrappedState,
+    ) -> Result<StateDelta<'static>, String> {
+        use crate::contract::ContractHandlerEvent;
+
+        // Check cache first
+        let our_summary_bytes = our_state.as_ref().to_vec();
+        let their_summary_bytes = their_summary.as_ref().to_vec();
+
+        if let Some(cached) = self.get_cached_delta(&their_summary_bytes, &our_summary_bytes) {
+            tracing::trace!(
+                contract = %key,
+                "Using cached delta"
+            );
+            return Ok(cached);
+        }
+
+        // Check if delta would be efficient
+        // (summary > 50% of state size means delta probably won't help)
+        if !Self::is_delta_efficient(their_summary.as_ref().len(), our_state.as_ref().len()) {
+            return Err("Delta not efficient for this contract".to_string());
+        }
+
+        // Compute delta via contract handler
+        match op_manager
+            .notify_contract_handler(ContractHandlerEvent::GetDeltaQuery {
+                key: *key,
+                their_summary: their_summary.clone(),
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
+                // Cache the result
+                self.cache_delta(&their_summary_bytes, &our_summary_bytes, d.clone());
+                Ok(d)
+            }
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
+                Err(format!("Delta computation failed: {}", e))
+            }
+            Ok(other) => Err(format!("Unexpected response to GetDeltaQuery: {:?}", other)),
+            Err(e) => Err(format!("Error computing delta: {}", e)),
+        }
     }
 
     /// Get statistics about the interest manager state.
