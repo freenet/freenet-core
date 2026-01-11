@@ -43,6 +43,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::transport::TransportPublicKey;
@@ -243,6 +244,17 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Time source for testability (DST-compatible).
     time_source: T,
+
+    // === Delta Sync Metrics ===
+    /// Number of times we sent a delta instead of full state.
+    delta_sends: AtomicU64,
+
+    /// Number of times we sent full state (no peer summary available or delta failed).
+    full_state_sends: AtomicU64,
+
+    /// Total bytes saved by sending deltas instead of full state.
+    /// Calculated as: sum of (state_size - delta_size) for each delta send.
+    delta_bytes_saved: AtomicU64,
 }
 
 impl<T: TimeSource> InterestManager<T> {
@@ -256,7 +268,29 @@ impl<T: TimeSource> InterestManager<T> {
             )),
             contract_hash_index: DashMap::new(),
             time_source,
+            delta_sends: AtomicU64::new(0),
+            full_state_sends: AtomicU64::new(0),
+            delta_bytes_saved: AtomicU64::new(0),
         }
+    }
+
+    /// Record that a delta was sent instead of full state.
+    ///
+    /// Call this when successfully sending a delta to a peer.
+    /// `state_size` is the full state size, `delta_size` is the delta size.
+    pub fn record_delta_send(&self, state_size: usize, delta_size: usize) {
+        self.delta_sends.fetch_add(1, Ordering::Relaxed);
+        let bytes_saved = state_size.saturating_sub(delta_size);
+        self.delta_bytes_saved
+            .fetch_add(bytes_saved as u64, Ordering::Relaxed);
+    }
+
+    /// Record that full state was sent (no delta available).
+    ///
+    /// Call this when sending full state because no peer summary was available
+    /// or delta computation failed.
+    pub fn record_full_state_send(&self) {
+        self.full_state_sends.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Register a peer's interest in a contract.
@@ -793,6 +827,9 @@ impl<T: TimeSource> InterestManager<T> {
             total_peer_interests,
             local_interests,
             hash_index_size,
+            delta_sends: self.delta_sends.load(Ordering::Relaxed),
+            full_state_sends: self.full_state_sends.load(Ordering::Relaxed),
+            delta_bytes_saved: self.delta_bytes_saved.load(Ordering::Relaxed),
         }
     }
 }
@@ -808,6 +845,12 @@ pub struct InterestManagerStats {
     pub local_interests: usize,
     /// Size of the contract hash index.
     pub hash_index_size: usize,
+    /// Number of times a delta was sent instead of full state.
+    pub delta_sends: u64,
+    /// Number of times full state was sent.
+    pub full_state_sends: u64,
+    /// Total bytes saved by sending deltas.
+    pub delta_bytes_saved: u64,
 }
 
 #[cfg(test)]
@@ -1092,6 +1135,32 @@ mod tests {
         assert_eq!(stats.total_peer_interests, 3);
         assert_eq!(stats.local_interests, 1);
         assert!(stats.hash_index_size >= 2);
+    }
+
+    #[test]
+    fn test_delta_sync_metrics() {
+        let (manager, _time) = make_manager();
+
+        // Initially all metrics should be zero
+        let stats = manager.stats();
+        assert_eq!(stats.delta_sends, 0);
+        assert_eq!(stats.full_state_sends, 0);
+        assert_eq!(stats.delta_bytes_saved, 0);
+
+        // Record some delta sends
+        // state_size=1000, delta_size=100 -> 900 bytes saved
+        manager.record_delta_send(1000, 100);
+        manager.record_delta_send(2000, 200);
+
+        // Record a full state send
+        manager.record_full_state_send();
+        manager.record_full_state_send();
+
+        let stats = manager.stats();
+        assert_eq!(stats.delta_sends, 2);
+        assert_eq!(stats.full_state_sends, 2);
+        // 900 + 1800 = 2700 bytes saved
+        assert_eq!(stats.delta_bytes_saved, 2700);
     }
 
     #[test]

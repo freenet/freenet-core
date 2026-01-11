@@ -620,7 +620,8 @@ impl Operation for UpdateOp {
                             op_manager.interest_manager.get_peer_summary(key, &peer_key);
 
                         // Compute payload: delta if we have peer's summary, otherwise full state
-                        let payload = match peer_summary {
+                        // Returns (payload, delta_size) where delta_size is Some if delta was used
+                        let (payload, sent_delta_size) = match peer_summary {
                             Some(their_summary) => {
                                 // Try to compute delta
                                 match op_manager
@@ -635,14 +636,18 @@ impl Operation for UpdateOp {
                                     .await
                                 {
                                     Ok(delta) => {
+                                        let delta_size = delta.as_ref().len();
                                         tracing::debug!(
                                             contract = %key,
                                             peer = %peer_addr,
-                                            delta_size = delta.as_ref().len(),
+                                            delta_size,
                                             state_size,
                                             "Sending delta instead of full state"
                                         );
-                                        crate::message::DeltaOrFullState::from_delta(&delta)
+                                        (
+                                            crate::message::DeltaOrFullState::from_delta(&delta),
+                                            Some(delta_size),
+                                        )
                                     }
                                     Err(e) => {
                                         tracing::debug!(
@@ -651,22 +656,29 @@ impl Operation for UpdateOp {
                                             error = %e,
                                             "Delta computation failed, falling back to full state"
                                         );
-                                        crate::message::DeltaOrFullState::from_state(&State::from(
-                                            new_value.as_ref().to_vec(),
-                                        ))
+                                        (
+                                            crate::message::DeltaOrFullState::from_state(
+                                                &State::from(new_value.as_ref().to_vec()),
+                                            ),
+                                            None,
+                                        )
                                     }
                                 }
                             }
                             None => {
                                 // No peer summary, send full state
-                                crate::message::DeltaOrFullState::from_state(&State::from(
-                                    new_value.as_ref().to_vec(),
-                                ))
+                                (
+                                    crate::message::DeltaOrFullState::from_state(&State::from(
+                                        new_value.as_ref().to_vec(),
+                                    )),
+                                    None,
+                                )
                             }
                         };
 
-                        // Track peer key for summary update after send succeeds
-                        peer_keys_to_update.push(peer_key);
+                        // Track peer key and delta info for metrics after send succeeds
+                        // sent_delta_size is Some if we sent a delta, None if full state
+                        peer_keys_to_update.push((peer_key, sent_delta_size));
 
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
@@ -707,14 +719,23 @@ impl Operation for UpdateOp {
                         failed_indices.insert(peer_num);
                     }
 
-                    // Update cached summaries only for successful sends
-                    for (idx, peer_key) in peer_keys_to_update.into_iter().enumerate() {
+                    // Update cached summaries and record metrics for successful sends
+                    for (idx, (peer_key, delta_size)) in peer_keys_to_update.into_iter().enumerate()
+                    {
                         if !failed_indices.contains(&idx) {
                             op_manager.interest_manager.update_peer_summary(
                                 key,
                                 &peer_key,
                                 Some(our_summary.clone()),
                             );
+                            // Record delta sync metrics
+                            if let Some(ds) = delta_size {
+                                op_manager
+                                    .interest_manager
+                                    .record_delta_send(state_size, ds);
+                            } else {
+                                op_manager.interest_manager.record_full_state_send();
+                            }
                         }
                     }
 
