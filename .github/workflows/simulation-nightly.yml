@@ -205,24 +205,23 @@ jobs:
           # Room ID is stored pre-encoded in the secret (with ! as %21 and : as %3A)
           ENCODED_ROOM_ID="$MATRIX_ROOM_ID"
 
-          # Plain text fallback
-          BODY="🚨 Nightly Simulation Tests Failed - ${{ github.repository }} - Branch: ${{ github.ref_name }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Construct message body
+          MESSAGE="🚨 **Nightly Simulation Tests Failed**
 
-          # HTML formatted message
-          HTML="🚨 <strong>Nightly Simulation Tests Failed</strong><br><br>"
-          HTML+="<strong>Repository:</strong> <a href=\"${{ github.server_url }}/${{ github.repository }}\">${{ github.repository }}</a><br>"
-          HTML+="<strong>Run:</strong> <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View workflow run</a><br>"
-          HTML+="<strong>Branch:</strong> <code>${{ github.ref_name }}</code><br>"
-          HTML+="<strong>Commit:</strong> <code>${{ github.sha }}</code><br>"
-          HTML+="<strong>Seed:</strong> <code>${{ github.event.inputs.seed || '0xDEADBEEF' }}</code><br><br>"
-          HTML+="Please investigate the failure and check the logs for details."
+          **Repository:** [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
+          **Run:** [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Branch:** \`${{ github.ref_name }}\`
+          **Commit:** \`${{ github.sha }}\`
+          **Seed:** \`${{ github.event.inputs.seed || '0xDEADBEEF' }}\`
+
+          Please investigate the failure and check the logs for details."
 
           # Send to Matrix (show response on error for debugging)
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT \
             "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
             -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$BODY" --arg html "$HTML" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $html}')")
+            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')")
 
           HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
           BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
