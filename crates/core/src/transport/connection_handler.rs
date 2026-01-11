@@ -29,10 +29,11 @@ use tracing::{span, Instrument};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
+    congestion_control::CongestionControlConfig,
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
-    ledbat::LedbatController,
+    ledbat::LedbatConfig,
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
@@ -1290,15 +1291,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 SentPacketTracker::new_with_time_source(time_source.clone()),
             ));
 
-            // Initialize LEDBAT congestion controller with slow start (RFC 6817)
+            // Initialize congestion controller with slow start (RFC 6817)
             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-            let ledbat = Arc::new(LedbatController::new_with_time_source(
-                crate::transport::ledbat::LedbatConfig {
-                    min_ssthresh: ledbat_min_ssthresh,
-                    ..Default::default()
-                },
-                time_source.clone(),
-            ));
+            let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+                min_ssthresh: ledbat_min_ssthresh,
+                ..Default::default()
+            })
+            .build_arc_with_time_source(time_source.clone());
 
             // Initialize token bucket for smooth packet pacing
             // Use global bandwidth manager if configured, otherwise fall back to per-connection limit
@@ -1350,7 +1349,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 global_bandwidth: global_bandwidth.clone(),
                 my_address: None,
                 transport_secret_key: secret,
-                ledbat,
+                congestion_controller,
                 token_bucket,
                 socket,
                 time_source,
@@ -1589,16 +1588,16 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             let (inbound_sender, inbound_recv) =
                                                 fast_channel::bounded(1000);
 
-                                            // Initialize LEDBAT congestion controller with slow start (RFC 6817)
+                                            // Initialize congestion controller with slow start (RFC 6817)
                                             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-                                            let ledbat =
-                                                Arc::new(LedbatController::new_with_time_source(
-                                                    crate::transport::ledbat::LedbatConfig {
+                                            let congestion_controller =
+                                                CongestionControlConfig::from_ledbat_config(
+                                                    LedbatConfig {
                                                         min_ssthresh: ledbat_min_ssthresh,
                                                         ..Default::default()
                                                     },
-                                                    time_source.clone(),
-                                                ));
+                                                )
+                                                .build_arc_with_time_source(time_source.clone());
 
                                             // Initialize token bucket
                                             // Use global bandwidth manager if configured
@@ -1636,7 +1635,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     my_address: Some(my_address),
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
-                                                    ledbat,
+                                                    congestion_controller,
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
@@ -1697,15 +1696,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
 
-                                // Initialize LEDBAT congestion controller with slow start (RFC 6817)
+                                // Initialize congestion controller with slow start (RFC 6817)
                                 // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-                                let ledbat = Arc::new(LedbatController::new_with_time_source(
-                                    crate::transport::ledbat::LedbatConfig {
+                                let congestion_controller =
+                                    CongestionControlConfig::from_ledbat_config(LedbatConfig {
                                         min_ssthresh: ledbat_min_ssthresh,
                                         ..Default::default()
-                                    },
-                                    time_source.clone(),
-                                ));
+                                    })
+                                    .build_arc_with_time_source(time_source.clone());
 
                                 // Initialize token bucket
                                 // Use global bandwidth manager if configured
@@ -1742,7 +1740,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
                                         my_address: None,
                                         transport_secret_key: transport_secret_key.clone(),
-                                        ledbat,
+                                        congestion_controller,
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
