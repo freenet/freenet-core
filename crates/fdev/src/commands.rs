@@ -18,8 +18,9 @@ mod v1;
 
 /// Timeout for waiting for server responses.
 /// Contract operations (especially updates with large state) may take time to process
-/// and propagate, so we use a generous timeout.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// and propagate through the network. Network publish operations may require forwarding
+/// through multiple hops, so we use a generous timeout.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -180,6 +181,11 @@ async fn put_contract(
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    tracing::info!(
+        "Request submitted, waiting for network response (timeout: {}s)...",
+        RESPONSE_TIMEOUT.as_secs()
+    );
+
     let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
             key: response_key,
@@ -201,8 +207,11 @@ async fn put_contract(
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds. \
-             The operation may have succeeded - check server logs.",
+            "Timeout waiting for server response after {} seconds.\n\
+             The operation may have succeeded on the network - check server logs.\n\
+             If this timeout is consistently too short, consider:\n\
+             - Network latency between you and the gateway\n\
+             - Contract size and propagation time through the network",
             RESPONSE_TIMEOUT.as_secs()
         )),
     };
@@ -254,6 +263,11 @@ For additional hardening is recommended to use a different cipher and nonce to e
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    tracing::info!(
+        "Request submitted, waiting for network response (timeout: {}s)...",
+        RESPONSE_TIMEOUT.as_secs()
+    );
+
     let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
         Ok(Ok(HostResponse::DelegateResponse { key, values })) => {
             tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
@@ -262,8 +276,11 @@ For additional hardening is recommended to use a different cipher and nonce to e
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds. \
-             The operation may have succeeded - check server logs.",
+            "Timeout waiting for server response after {} seconds.\n\
+             The operation may have succeeded on the network - check server logs.\n\
+             If this timeout is consistently too short, consider:\n\
+             - Network latency between you and the gateway\n\
+             - Delegate size and propagation time through the network",
             RESPONSE_TIMEOUT.as_secs()
         )),
     };
@@ -327,6 +344,11 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    tracing::info!(
+        "Request submitted, waiting for network response (timeout: {}s)...",
+        RESPONSE_TIMEOUT.as_secs()
+    );
+
     let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
             key: response_key,
@@ -341,8 +363,11 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds. \
-             The operation may have succeeded - check server logs.",
+            "Timeout waiting for server response after {} seconds.\n\
+             The operation may have succeeded on the network - check server logs.\n\
+             If this timeout is consistently too short, consider:\n\
+             - Network latency between you and the gateway\n\
+             - State delta size and propagation time through the network",
             RESPONSE_TIMEOUT.as_secs()
         )),
     };
