@@ -280,6 +280,110 @@ jobs:
           export FREENET_TEST_DOCKER_NAT=1
           cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
 
+  # High-latency regression test for congestion control validation
+  # Only runs when transport/congestion control code changes to avoid wasting CI time
+  high_latency_regression:
+    name: high-latency-regression
+    needs: fmt_check
+    runs-on: ubicloud-standard-16
+    timeout-minutes: 45  # Higher timeout due to latency injection
+    # Only run when transport-related files change
+    # Skip on merge_group, main push, release/dependabot PRs
+    if: |
+      github.event_name == 'pull_request' &&
+      !startsWith(github.head_ref, 'release/v') &&
+      !startsWith(github.head_ref, 'dependabot/')
+
+    env:
+      RUST_LOG: info
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for transport changes
+        id: transport-changes
+        run: |
+          # Check if any transport/congestion control files changed
+          TRANSPORT_PATHS=(
+            "crates/core/src/transport/"
+            "crates/core/src/simulation/"
+            "crates/core/src/node/network_bridge/"
+          )
+
+          CHANGED=false
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          for path in "${TRANSPORT_PATHS[@]}"; do
+            if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q "^$path"; then
+              echo "Changes detected in: $path"
+              CHANGED=true
+            fi
+          done
+
+          echo "transport_changed=$CHANGED" >> $GITHUB_OUTPUT
+
+          if [ "$CHANGED" = "false" ]; then
+            echo "No transport changes detected - skipping high-latency test"
+          else
+            echo "Transport changes detected - running high-latency test"
+          fi
+
+      - name: Install dependencies
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold liblzma-dev
+
+      - name: Checkout river
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: freenet/river
+          ref: main
+          path: river-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        with:
+          toolchain: 1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        with:
+          workspaces: |
+            .
+            river-src
+
+      - name: Pull Docker images
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        run: |
+          docker pull alpine:latest
+
+      - name: Run high-latency regression test
+        if: steps.transport-changes.outputs.transport_changed == 'true'
+        working-directory: river-src
+        env:
+          FREENET_CORE_PATH: ${{ github.workspace }}
+          RUST_LOG: info,freenet::transport=debug
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          # Enable high-latency network emulation (200ms±30ms, 1% loss)
+          # This catches BBR timeout storms and congestion control bugs
+          FREENET_TEST_NETWORK_EMULATION: high_latency
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker is not available but is REQUIRED for high-latency tests"
+            exit 1
+          fi
+          echo "Running with high-latency network emulation (200ms RTT, 1% loss)"
+          echo "This test validates BBR congestion control under realistic conditions"
+          export FREENET_TEST_DOCKER_NAT=1
+          cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
+
   claude-ci-analysis:
     name: Claude CI Analysis
     runs-on: ubicloud-standard-4
