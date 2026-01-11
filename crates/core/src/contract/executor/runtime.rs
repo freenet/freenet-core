@@ -884,11 +884,8 @@ impl ContractExecutor for Executor<Runtime> {
                         .await
                         .map_err(ExecutorError::other)?;
 
-                    // todo: forward delta like we are doing with puts
-                    tracing::warn!(
-                        contract = %key,
-                        "Delta updates are not yet supported"
-                    );
+                    // Note: Network propagation happens in the operations layer (update.rs),
+                    // which uses delta-aware broadcasting via try_to_broadcast().
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }
