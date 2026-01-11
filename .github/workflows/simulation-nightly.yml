@@ -205,6 +205,9 @@ jobs:
           # Room ID is stored pre-encoded in the secret (with ! as %21 and : as %3A)
           ENCODED_ROOM_ID="$MATRIX_ROOM_ID"
 
+          echo "DEBUG: ENCODED_ROOM_ID=$ENCODED_ROOM_ID"
+          echo "DEBUG: MATRIX_ACCESS_TOKEN is set: ${MATRIX_ACCESS_TOKEN:+yes}"
+
           # Construct message body
           MESSAGE="🚨 **Nightly Simulation Tests Failed**
 
@@ -216,15 +219,26 @@ jobs:
 
           Please investigate the failure and check the logs for details."
 
+          echo "DEBUG: MESSAGE=$MESSAGE"
+
+          # Build the JSON payload and show it for debugging
+          JSON_PAYLOAD=$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')
+          echo "DEBUG: JSON_PAYLOAD=$JSON_PAYLOAD"
+
           # Send to Matrix (show response on error for debugging)
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT \
             "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
             -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$MESSAGE" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $body}')")
+            -d "$JSON_PAYLOAD")
+
+          echo "DEBUG: RESPONSE=$RESPONSE"
 
           HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
           BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
+
+          echo "DEBUG: HTTP_CODE=$HTTP_CODE"
+          echo "DEBUG: BODY=$BODY"
 
           if [ "$HTTP_CODE" -ge 400 ]; then
             echo "Matrix API error (HTTP $HTTP_CODE): $BODY"
