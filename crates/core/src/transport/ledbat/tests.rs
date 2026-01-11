@@ -553,9 +553,18 @@ fn test_harness_timeout_resets_state_correctly() {
         CongestionState::SlowStart,
         "State should be SlowStart after timeout"
     );
-    assert_eq!(
-        post_timeout.cwnd, config.min_cwnd,
-        "cwnd should reset to minimum after timeout"
+    // cwnd resets to adaptive floor / 4, which uses the BDP proxy from slow start exit.
+    // With ssthresh=102KB, slow start exits around there, giving floor ~102KB, so min cwnd ~25KB.
+    // The key invariant is cwnd dropped significantly and is much lower than ssthresh.
+    assert!(
+        post_timeout.cwnd <= config.ssthresh / 2,
+        "cwnd should be well below ssthresh after timeout: cwnd={} ssthresh={}",
+        post_timeout.cwnd,
+        config.ssthresh
+    );
+    assert!(
+        post_timeout.cwnd >= config.min_cwnd,
+        "cwnd should be at least min_cwnd after timeout"
     );
 
     // Verify recovery via slow start
@@ -1571,11 +1580,12 @@ fn test_harness_instant_rampup_trap() {
 #[test]
 fn test_harness_timeout_clears_scheduled_slowdown() {
     let min_cwnd = 2_848;
+    let ssthresh = 80_000;
     let config = LedbatConfig {
         initial_cwnd: 100_000,
         min_cwnd,
         max_cwnd: 500_000,
-        ssthresh: 80_000,
+        ssthresh,
         enable_slow_start: true,
         enable_periodic_slowdown: true,
         randomize_ssthresh: false,
@@ -1600,7 +1610,18 @@ fn test_harness_timeout_clears_scheduled_slowdown() {
     harness.inject_timeout();
 
     let post_timeout = harness.snapshot();
-    assert_eq!(post_timeout.cwnd, min_cwnd);
+    // cwnd resets to adaptive floor / 4 (uses BDP proxy from slow start exit)
+    assert!(
+        post_timeout.cwnd >= min_cwnd,
+        "cwnd should be at least min_cwnd: {}",
+        post_timeout.cwnd
+    );
+    assert!(
+        post_timeout.cwnd <= ssthresh / 2,
+        "cwnd should be well below ssthresh: cwnd={} ssthresh={}",
+        post_timeout.cwnd,
+        ssthresh
+    );
     assert_eq!(post_timeout.state, CongestionState::SlowStart);
 
     // Run for 30 RTTs - enough time for recovery without immediate slowdown
@@ -2790,6 +2811,163 @@ fn test_repeated_timeouts_stabilize_at_min_ssthresh() {
         "✓ ssthresh stabilized at {}KB (floor: {}KB)",
         final_ssthresh / 1024,
         min_ssthresh / 1024
+    );
+}
+
+/// Regression test: cwnd should use adaptive floor on timeout, not just min_cwnd.
+///
+/// **Problem:** With min_ssthresh=100KB, ssthresh stays healthy at 100KB after timeout.
+/// But cwnd was resetting to min_cwnd (2.8KB), creating a massive recovery cliff:
+/// - cwnd drops from 77KB → 2.8KB (27x reduction!)
+/// - Recovery takes log2(77/2.8) ≈ 5 RTTs just to get back
+/// - With 200ms RTT, that's 1+ second of crippled throughput per timeout
+/// - Users in Argentina with 80+ timeouts could never complete transfers
+///
+/// **Fix:** Use 1/4 of the adaptive ssthresh floor as min_cwnd on timeout.
+/// With 100KB min_ssthresh: cwnd resets to 25KB instead of 2.8KB.
+/// Recovery: 25KB → 50KB → 100KB in just 2 RTTs.
+#[test]
+fn test_timeout_cwnd_uses_adaptive_floor() {
+    let min_ssthresh = 100 * 1024; // 100KB floor
+    let config = LedbatConfig {
+        initial_cwnd: 200_000, // 200KB - simulates healthy connection
+        min_cwnd: 2_848,       // Standard min_cwnd (~2.8KB)
+        max_cwnd: 10_000_000,
+        ssthresh: 1_000_000,
+        enable_slow_start: true,
+        enable_periodic_slowdown: false,
+        randomize_ssthresh: false,
+        min_ssthresh: Some(min_ssthresh),
+        ..Default::default()
+    };
+
+    let controller = LedbatController::new_with_config(config.clone());
+
+    println!("\n========== Timeout cwnd Adaptive Floor Test ==========");
+    println!(
+        "Initial: cwnd={}KB, ssthresh={}KB, min_ssthresh={}KB, min_cwnd={}KB",
+        controller.current_cwnd() / 1024,
+        controller.ssthresh.load(Ordering::Acquire) / 1024,
+        min_ssthresh / 1024,
+        config.min_cwnd / 1024
+    );
+
+    // Trigger a timeout
+    controller.on_timeout();
+
+    let cwnd_after = controller.current_cwnd();
+    let ssthresh_after = controller.ssthresh.load(Ordering::Acquire);
+
+    println!(
+        "After timeout: cwnd={}KB, ssthresh={}KB",
+        cwnd_after / 1024,
+        ssthresh_after / 1024
+    );
+
+    // The key assertion: cwnd should be at least 1/4 of min_ssthresh (25KB),
+    // not collapsed to min_cwnd (2.8KB)
+    let expected_cwnd_floor = min_ssthresh / 4; // 25KB
+
+    assert!(
+        cwnd_after >= expected_cwnd_floor,
+        "After timeout with min_ssthresh={}KB, cwnd should be at least {}KB (1/4 of floor), \
+         but got {}KB. This causes the 'LEDBAT death spiral' where recovery is too slow \
+         on high-latency paths.",
+        min_ssthresh / 1024,
+        expected_cwnd_floor / 1024,
+        cwnd_after / 1024
+    );
+
+    // ssthresh should still be at the floor
+    assert!(
+        ssthresh_after >= min_ssthresh,
+        "ssthresh {} should be at least min_ssthresh {}",
+        ssthresh_after,
+        min_ssthresh
+    );
+
+    // Verify cwnd < ssthresh (still room for slow start)
+    assert!(
+        cwnd_after < ssthresh_after,
+        "cwnd {} should be less than ssthresh {} to allow slow start recovery",
+        cwnd_after,
+        ssthresh_after
+    );
+
+    println!(
+        "✓ cwnd={} KB is above adaptive floor ({} KB) and below ssthresh ({} KB)",
+        cwnd_after / 1024,
+        expected_cwnd_floor / 1024,
+        ssthresh_after / 1024
+    );
+}
+
+/// Test that repeated timeouts maintain reasonable cwnd floor.
+///
+/// Simulates a user in a region with high packet loss (like Argentina)
+/// experiencing many timeouts. Even with 10 consecutive timeouts,
+/// cwnd should never collapse below the adaptive floor.
+#[test]
+fn test_repeated_timeouts_maintain_cwnd_floor() {
+    let min_ssthresh = 100 * 1024; // 100KB
+    let config = LedbatConfig {
+        initial_cwnd: 500_000, // 500KB
+        min_cwnd: 2_848,
+        max_cwnd: 10_000_000,
+        ssthresh: 1_000_000,
+        enable_slow_start: true,
+        enable_periodic_slowdown: false,
+        randomize_ssthresh: false,
+        min_ssthresh: Some(min_ssthresh),
+        ..Default::default()
+    };
+
+    let controller = LedbatController::new_with_config(config.clone());
+    let expected_cwnd_floor = min_ssthresh / 4; // 25KB
+
+    println!("\n========== Repeated Timeouts cwnd Floor Test ==========");
+    println!(
+        "Simulating high-loss path (like Argentina) with {} consecutive timeouts",
+        10
+    );
+    println!("Expected cwnd floor: {}KB", expected_cwnd_floor / 1024);
+
+    // Simulate 10 consecutive timeouts (like HostFat's 80+ timeouts scenario)
+    for i in 0..10 {
+        controller.on_timeout();
+
+        let cwnd = controller.current_cwnd();
+        let ssthresh = controller.ssthresh.load(Ordering::Acquire);
+
+        println!(
+            "After timeout {}: cwnd={}KB, ssthresh={}KB",
+            i + 1,
+            cwnd / 1024,
+            ssthresh / 1024
+        );
+
+        // cwnd must stay above the adaptive floor
+        assert!(
+            cwnd >= expected_cwnd_floor,
+            "After timeout {}, cwnd {} should be at least {} (adaptive floor)",
+            i + 1,
+            cwnd,
+            expected_cwnd_floor
+        );
+
+        // ssthresh must stay above min_ssthresh
+        assert!(
+            ssthresh >= min_ssthresh,
+            "After timeout {}, ssthresh {} should be at least {}",
+            i + 1,
+            ssthresh,
+            min_ssthresh
+        );
+    }
+
+    println!(
+        "✓ cwnd maintained above {}KB floor through all timeouts",
+        expected_cwnd_floor / 1024
     );
 }
 
