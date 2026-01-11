@@ -118,15 +118,18 @@ impl CongestionControlStats {
     ///
     /// Returns bytes per second. Returns 0 if RTT is zero to avoid division by zero.
     /// For very small RTTs with large windows, the result is capped at `usize::MAX`.
+    /// Handles infinity and NaN values that may arise from extreme inputs.
     pub fn effective_bandwidth(&self, rtt: Duration) -> usize {
         if rtt.is_zero() {
             return 0;
         }
         let rtt_secs = rtt.as_secs_f64();
         let bandwidth = self.cwnd as f64 / rtt_secs;
-        // Cap at usize::MAX to prevent overflow when casting
-        if bandwidth > usize::MAX as f64 {
+        // Handle infinity, NaN, or values exceeding usize::MAX
+        if !bandwidth.is_finite() || bandwidth > usize::MAX as f64 {
             usize::MAX
+        } else if bandwidth < 0.0 {
+            0
         } else {
             bandwidth as usize
         }
@@ -290,7 +293,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
 
     fn on_loss(&self) {
         match self {
-            Self::Ledbat(c) => c.handle_loss(),
+            Self::Ledbat(c) => c.on_loss(),
         }
     }
 
@@ -359,6 +362,80 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Ledbat(_) => CongestionControlAlgorithm::Ledbat,
         }
+    }
+}
+
+// =============================================================================
+// LedbatController Implementation of CongestionControl
+// =============================================================================
+
+/// Direct implementation of `CongestionControl` for `LedbatController`.
+///
+/// This allows using `LedbatController` directly with the trait interface,
+/// enabling custom algorithm implementations to be added without modifying
+/// the `CongestionController` enum.
+impl<T: TimeSource> CongestionControl for LedbatController<T> {
+    fn on_send(&self, bytes: usize) {
+        LedbatController::on_send(self, bytes)
+    }
+
+    fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
+        LedbatController::on_ack(self, rtt_sample, bytes_acked)
+    }
+
+    fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        LedbatController::on_ack_without_rtt(self, bytes_acked)
+    }
+
+    fn on_loss(&self) {
+        LedbatController::on_loss(self)
+    }
+
+    fn on_timeout(&self) {
+        LedbatController::on_timeout(self)
+    }
+
+    fn current_cwnd(&self) -> usize {
+        LedbatController::current_cwnd(self)
+    }
+
+    fn current_rate(&self, rtt: Duration) -> usize {
+        LedbatController::current_rate(self, rtt)
+    }
+
+    fn flightsize(&self) -> usize {
+        LedbatController::flightsize(self)
+    }
+
+    fn base_delay(&self) -> Duration {
+        LedbatController::base_delay(self)
+    }
+
+    fn queuing_delay(&self) -> Duration {
+        LedbatController::queuing_delay(self)
+    }
+
+    fn peak_cwnd(&self) -> usize {
+        LedbatController::peak_cwnd(self)
+    }
+
+    fn stats(&self) -> CongestionControlStats {
+        let s = LedbatController::stats(self);
+        CongestionControlStats {
+            algorithm: CongestionControlAlgorithm::Ledbat,
+            cwnd: s.cwnd,
+            flightsize: s.flightsize,
+            queuing_delay: s.queuing_delay,
+            base_delay: s.base_delay,
+            peak_cwnd: s.peak_cwnd,
+            total_losses: s.total_losses,
+            total_timeouts: s.total_timeouts,
+            ssthresh: s.ssthresh,
+        }
+    }
+
+    fn algorithm(&self) -> CongestionControlAlgorithm {
+        CongestionControlAlgorithm::Ledbat
     }
 }
 
@@ -516,22 +593,37 @@ impl CongestionControlConfig {
 
     /// Build a congestion controller from this configuration.
     ///
-    /// Returns an `Arc<CongestionController>` for shared ownership across tasks.
-    pub fn build(&self) -> Arc<CongestionController<RealTime>> {
-        Arc::new(self.build_inner(RealTime::new()))
+    /// Returns an owned `CongestionController`. Use `build_arc()` if you need
+    /// shared ownership via `Arc`.
+    pub fn build(&self) -> CongestionController<RealTime> {
+        self.build_with_time_source(RealTime::new())
+    }
+
+    /// Build a congestion controller wrapped in `Arc` for shared ownership.
+    ///
+    /// This is a convenience method equivalent to `Arc::new(config.build())`.
+    pub fn build_arc(&self) -> Arc<CongestionController<RealTime>> {
+        Arc::new(self.build())
     }
 
     /// Build a congestion controller with a custom time source.
     ///
     /// This is useful for deterministic testing with virtual time.
-    pub fn build_with_time_source<T: TimeSource>(
+    pub fn build_with_time_source<T: TimeSource>(&self, time_source: T) -> CongestionController<T> {
+        self.build_inner(time_source)
+    }
+
+    /// Build an Arc-wrapped congestion controller with a custom time source.
+    ///
+    /// Combines `build_with_time_source` with `Arc` wrapping.
+    pub fn build_arc_with_time_source<T: TimeSource>(
         &self,
         time_source: T,
     ) -> Arc<CongestionController<T>> {
-        Arc::new(self.build_inner(time_source))
+        Arc::new(self.build_with_time_source(time_source))
     }
 
-    /// Internal builder that creates the controller without Arc wrapping.
+    /// Internal builder implementation.
     fn build_inner<T: TimeSource>(&self, time_source: T) -> CongestionController<T> {
         match self.algorithm {
             CongestionControlAlgorithm::Ledbat => {
@@ -607,6 +699,16 @@ mod tests {
     }
 
     #[test]
+    fn test_build_arc() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build_arc();
+
+        // Can be cloned (Arc)
+        let _clone = controller.clone();
+        assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Ledbat);
+    }
+
+    #[test]
     fn test_build_with_virtual_time() {
         let config = CongestionControlConfig::default();
         let time_source = VirtualTime::new();
@@ -649,7 +751,7 @@ mod tests {
         assert!(ledbat_stats.is_some());
 
         // Access via pattern matching
-        match &*controller {
+        match &controller {
             CongestionController::Ledbat(ledbat) => {
                 let stats = ledbat.stats();
                 assert!(stats.cwnd > 0);
@@ -667,6 +769,19 @@ mod tests {
         let ledbat = controller.as_ledbat();
         assert!(ledbat.is_some());
         assert!(ledbat.unwrap().current_cwnd() > 0);
+    }
+
+    #[test]
+    fn test_ledbat_controller_implements_trait() {
+        // Test that LedbatController directly implements CongestionControl
+        let ledbat = LedbatController::new(10_000, 2_000, 1_000_000);
+        let controller: &dyn CongestionControl = &ledbat;
+
+        assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Ledbat);
+        assert_eq!(controller.current_cwnd(), 10_000);
+
+        controller.on_send(1000);
+        assert_eq!(controller.flightsize(), 1000);
     }
 
     #[test]
@@ -783,5 +898,24 @@ mod tests {
 
         // Timeout should reduce cwnd significantly
         assert!(after_timeout_cwnd < initial_cwnd);
+    }
+
+    #[test]
+    fn test_effective_bandwidth_handles_nan() {
+        let stats = CongestionControlStats {
+            algorithm: CongestionControlAlgorithm::Ledbat,
+            cwnd: 0,
+            flightsize: 0,
+            queuing_delay: Duration::ZERO,
+            base_delay: Duration::ZERO,
+            peak_cwnd: 0,
+            total_losses: 0,
+            total_timeouts: 0,
+            ssthresh: 0,
+        };
+
+        // Should handle edge cases gracefully
+        let bandwidth = stats.effective_bandwidth(Duration::from_nanos(1));
+        assert_eq!(bandwidth, 0); // 0 / small_rtt = 0
     }
 }
