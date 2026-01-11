@@ -324,6 +324,50 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 
+/// Connect to a WebSocket endpoint with retry logic.
+/// Retries connection attempts until successful or timeout is reached.
+pub async fn connect_ws_with_retry(
+    uri: &str,
+    node_name: &str,
+    timeout_secs: u64,
+) -> Result<WebApi> {
+    let start = std::time::Instant::now();
+    let timeout_duration = Duration::from_secs(timeout_secs);
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        match connect_async_with_config(uri, Some(ws_config()), false).await {
+            Ok((stream, _)) => {
+                tracing::info!(
+                    "{}: WebSocket connected after {} attempts ({:?})",
+                    node_name,
+                    attempt,
+                    start.elapsed()
+                );
+                return Ok(WebApi::start(stream));
+            }
+            Err(e) => {
+                if start.elapsed() > timeout_duration {
+                    return Err(anyhow!(
+                        "{}: Failed to connect to WebSocket after {}s: {}",
+                        node_name,
+                        timeout_secs,
+                        e
+                    ));
+                }
+                tracing::debug!(
+                    "{}: Connection attempt {} failed: {}, retrying...",
+                    node_name,
+                    attempt,
+                    e
+                );
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 /// Builds and packages a contract or delegate.
 ///
 /// This tool will build the WASM contract or delegate and publish it to the network.
