@@ -59,6 +59,7 @@ pub mod peer_connection;
 // todo: optimize trackers
 mod received_packet_tracker;
 
+pub mod congestion_control;
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
 pub mod metrics;
@@ -68,6 +69,11 @@ pub(crate) mod token_bucket;
 
 // Re-export LEDBAT stats for telemetry
 pub use ledbat::LedbatStats;
+// Re-export congestion control interface
+pub use congestion_control::{
+    AlgorithmConfig, CongestionControlAlgorithm, CongestionControlConfig, CongestionControlStats,
+    CongestionController, CongestionControllerExt,
+};
 // Re-export transport metrics for periodic telemetry snapshots
 pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
 // Re-export reset functions for deterministic simulation testing
