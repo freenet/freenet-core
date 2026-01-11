@@ -10,6 +10,7 @@ use crate::{
     simulation::TimeSource,
     tracing::TransferDirection,
     transport::{
+        congestion_control::{CongestionControl, CongestionController},
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
         sent_packet_tracker::SentPacketTracker,
@@ -45,7 +46,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     outbound_symmetric_key: Aes128Gcm,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
-    ledbat: Arc<super::super::ledbat::LedbatController<T>>,
+    congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
@@ -63,7 +64,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         stream_id = %stream_id.0,
         length_bytes = stream_to_send.len(),
         initial_rate_bytes_per_sec = token_bucket.rate(),
-        ledbat_cwnd = ledbat.current_cwnd(),
+        cwnd = congestion_controller.current_cwnd(),
         "Sending stream"
     );
     let total_length_bytes = stream_to_send.len() as u32;
@@ -92,8 +93,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // always being polled. Tests must follow the same pattern.
         let mut cwnd_wait_iterations = 0;
         loop {
-            let flightsize = ledbat.flightsize();
-            let cwnd = ledbat.current_cwnd();
+            let flightsize = congestion_controller.flightsize();
+            let cwnd = congestion_controller.current_cwnd();
 
             // Check if we have space in the congestion window
             if flightsize + packet_size <= cwnd {
@@ -186,15 +187,17 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             return Err(e);
         }
 
-        // Track packet send for LEDBAT congestion control
-        ledbat.on_send(packet_size);
+        // Track packet send for congestion control
+        congestion_controller.on_send(packet_size);
 
         next_fragment_number += 1;
         sent_so_far += 1;
     }
 
-    // Gather LEDBAT stats for telemetry
-    let ledbat_stats = ledbat.stats();
+    // Gather congestion control stats for telemetry
+    // Use LEDBAT-specific stats when available for detailed metrics
+    let generic_stats = congestion_controller.stats();
+    let ledbat_stats = congestion_controller.ledbat_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
 
     tracing::debug!(
@@ -202,9 +205,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         total_packets = %sent_so_far,
         bytes = bytes_to_send,
         elapsed_ms = elapsed.as_millis(),
-        peak_cwnd_kb = ledbat_stats.peak_cwnd / 1024,
-        final_cwnd_kb = ledbat_stats.cwnd / 1024,
-        slowdowns = ledbat_stats.periodic_slowdowns,
+        peak_cwnd_kb = generic_stats.peak_cwnd / 1024,
+        final_cwnd_kb = generic_stats.cwnd / 1024,
+        slowdowns = ledbat_stats.as_ref().map(|s| s.periodic_slowdowns).unwrap_or(0),
         "Stream sent"
     );
 
@@ -219,13 +222,13 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         } else {
             bytes_to_send * 1000 / elapsed.as_millis().max(1) as u64
         },
-        Some(ledbat_stats.peak_cwnd as u32),
-        Some(ledbat_stats.cwnd as u32),
-        Some(ledbat_stats.periodic_slowdowns as u32),
-        Some(ledbat_stats.base_delay.as_millis() as u32),
-        Some(ledbat_stats.ssthresh as u32),
-        Some(ledbat_stats.min_ssthresh_floor as u32),
-        Some(ledbat_stats.total_timeouts as u32),
+        Some(generic_stats.peak_cwnd as u32),
+        Some(generic_stats.cwnd as u32),
+        ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
+        Some(generic_stats.base_delay.as_millis() as u32),
+        Some(generic_stats.ssthresh as u32),
+        ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
+        Some(generic_stats.total_timeouts as u32),
         TransferDirection::Send,
     );
 
@@ -234,13 +237,19 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         remote_addr: destination_addr,
         bytes_transferred: bytes_to_send,
         elapsed,
-        peak_cwnd_bytes: ledbat_stats.peak_cwnd as u32,
-        final_cwnd_bytes: ledbat_stats.cwnd as u32,
-        slowdowns_triggered: ledbat_stats.periodic_slowdowns as u32,
-        base_delay: ledbat_stats.base_delay,
-        final_ssthresh_bytes: ledbat_stats.ssthresh as u32,
-        min_ssthresh_floor_bytes: ledbat_stats.min_ssthresh_floor as u32,
-        total_timeouts: ledbat_stats.total_timeouts as u32,
+        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
+        final_cwnd_bytes: generic_stats.cwnd as u32,
+        slowdowns_triggered: ledbat_stats
+            .as_ref()
+            .map(|s| s.periodic_slowdowns as u32)
+            .unwrap_or(0),
+        base_delay: generic_stats.base_delay,
+        final_ssthresh_bytes: generic_stats.ssthresh as u32,
+        min_ssthresh_floor_bytes: ledbat_stats
+            .as_ref()
+            .map(|s| s.min_ssthresh_floor as u32)
+            .unwrap_or(0),
+        total_timeouts: generic_stats.total_timeouts as u32,
     })
 }
 
@@ -257,8 +266,9 @@ mod tests {
     };
     use crate::config::GlobalExecutor;
     use crate::simulation::{RealTime, VirtualTime};
+    use crate::transport::congestion_control::CongestionControlConfig;
     use crate::transport::fast_channel::{self, FastSender};
-    use crate::transport::ledbat::LedbatController;
+    use crate::transport::ledbat::LedbatConfig;
     use crate::transport::packet_data::PacketData;
     use crate::transport::token_bucket::TokenBucket;
 
@@ -317,17 +327,15 @@ mod tests {
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize LEDBAT and TokenBucket for test with VirtualTime
+        // Initialize congestion controller and TokenBucket for test with VirtualTime
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
-        let ledbat = Arc::new(LedbatController::new_with_time_source(
-            crate::transport::ledbat::LedbatConfig {
-                initial_cwnd: 1_000_000,
-                min_cwnd: 1_000_000,
-                max_cwnd: 1_000_000_000,
-                ..Default::default()
-            },
-            time_source.clone(),
-        ));
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             1_000_000,
             10_000_000,
@@ -343,7 +351,7 @@ mod tests {
             cipher.clone(),
             sent_tracker,
             token_bucket,
-            ledbat,
+            congestion_controller,
             time_source,
         ));
 
@@ -388,10 +396,16 @@ mod tests {
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize LEDBAT and TokenBucket for test
+        // Initialize congestion controller and TokenBucket for test
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         // Use small burst capacity (1KB) to ensure rate limiting is observable
-        let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc();
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             1_000, // 1KB burst - ensures rate limiting kicks in
             bandwidth_limit,
@@ -440,7 +454,7 @@ mod tests {
             key.clone(),
             sent_tracker.clone(),
             token_bucket,
-            ledbat,
+            congestion_controller,
             time_source,
         ));
 
@@ -492,9 +506,15 @@ mod tests {
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize LEDBAT and TokenBucket with very high rate (effectively unlimited)
+        // Initialize congestion controller and TokenBucket with very high rate (effectively unlimited)
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
-        let ledbat = Arc::new(LedbatController::new(1_000_000, 1_000_000, 1_000_000_000));
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc();
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             100_000,       // 100 KB burst capacity
             1_000_000_000, // 1 GB/s rate (effectively unlimited)
@@ -526,7 +546,7 @@ mod tests {
             key.clone(),
             sent_tracker.clone(),
             token_bucket,
-            ledbat,
+            congestion_controller,
             time_source,
         ));
 

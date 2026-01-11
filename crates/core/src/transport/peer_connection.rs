@@ -34,9 +34,9 @@ pub mod streaming_buffer;
 pub(crate) mod streaming_buffer;
 
 use super::{
+    congestion_control::{CongestionControl, CongestionController},
     connection_handler::SerializedMessage,
     global_bandwidth::GlobalBandwidthManager,
-    ledbat::LedbatController,
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
@@ -87,9 +87,9 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
-    /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
-    pub(super) ledbat: Arc<LedbatController<T>>,
-    /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
+    /// Congestion controller - adapts to network conditions
+    pub(super) congestion_controller: Arc<CongestionController<T>>,
+    /// Token bucket rate limiter - smooths packet pacing based on congestion controller rate
     pub(super) token_bucket: Arc<TokenBucket<T>>,
     /// Socket for direct packet sending (bypasses centralized rate limiter)
     pub(super) socket: Arc<S>,
@@ -683,11 +683,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         match rtt_sample_opt {
                             Some(rtt_sample) => {
                                 // Normal packet: full RTT processing + flightsize decrement
-                                self.remote_conn.ledbat.on_ack(rtt_sample, packet_size);
+                                self.remote_conn.congestion_controller.on_ack(rtt_sample, packet_size);
                             }
                             None => {
                                 // Retransmitted packet: only decrement flightsize (no RTT update)
-                                self.remote_conn.ledbat.on_ack_without_rtt(packet_size);
+                                self.remote_conn.congestion_controller.on_ack_without_rtt(packet_size);
                             }
                         }
                     }
@@ -874,7 +874,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             }
                             ResendAction::Resend(idx, packet) => {
                                 // Notify LEDBAT of packet loss (timeout-based retransmission)
-                                self.remote_conn.ledbat.on_timeout();
+                                self.remote_conn.congestion_controller.on_timeout();
 
                                 self.remote_conn
                                     .socket
@@ -928,7 +928,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                     // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
                     // Fallback to min_rtt only if base_delay is not yet established
-                    let base_delay = self.remote_conn.ledbat.base_delay();
+                    let base_delay = self.remote_conn.congestion_controller.base_delay();
                     let rtt = if base_delay.is_zero() {
                         self.remote_conn.sent_tracker.lock().min_rtt()
                     } else {
@@ -948,9 +948,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
 
                     if should_update {
-                        let ledbat_rate = self.remote_conn.ledbat.current_rate(rtt);
-                        let cwnd = self.remote_conn.ledbat.current_cwnd();
-                        let queuing_delay = self.remote_conn.ledbat.queuing_delay();
+                        let ledbat_rate = self.remote_conn.congestion_controller.current_rate(rtt);
+                        let cwnd = self.remote_conn.congestion_controller.current_cwnd();
+                        let queuing_delay = self.remote_conn.congestion_controller.queuing_delay();
 
                         // Apply global bandwidth limit if configured
                         // Take minimum of LEDBAT rate and global fair-share rate
@@ -1238,7 +1238,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
                 self.remote_conn.token_bucket.clone(),
-                self.remote_conn.ledbat.clone(),
+                self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
@@ -1279,8 +1279,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // LEDBAT congestion control - wait for cwnd space
         let mut cwnd_wait_iterations = 0;
         loop {
-            let flightsize = self.remote_conn.ledbat.flightsize();
-            let cwnd = self.remote_conn.ledbat.current_cwnd();
+            let flightsize = self.remote_conn.congestion_controller.flightsize();
+            let cwnd = self.remote_conn.congestion_controller.current_cwnd();
 
             if flightsize + packet_size <= cwnd {
                 break;
@@ -1344,7 +1344,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         .await?;
 
         // Track for LEDBAT
-        self.remote_conn.ledbat.on_send(packet_size);
+        self.remote_conn.congestion_controller.on_send(packet_size);
 
         tracing::trace!(
             stream_id = %fragment.stream_id.0,
@@ -1631,15 +1631,16 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
-        let ledbat = Arc::new(LedbatController::new_with_time_source(
-            crate::transport::ledbat::LedbatConfig {
-                initial_cwnd: 2928,
-                min_cwnd: 2928,
-                max_cwnd: 1_000_000_000,
-                ..Default::default()
-            },
-            time_source.clone(),
-        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::from_ledbat_config(
+                crate::transport::ledbat::LedbatConfig {
+                    initial_cwnd: 2928,
+                    min_cwnd: 2928,
+                    max_cwnd: 1_000_000_000,
+                    ..Default::default()
+                },
+            )
+            .build_arc_with_time_source(time_source.clone());
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             10_000,
             10_000_000,
@@ -1657,7 +1658,7 @@ mod tests {
             cipher.clone(),
             sent_tracker,
             token_bucket,
-            ledbat,
+            congestion_controller,
             time_source,
         ))
         .map_err(|e| e.into());

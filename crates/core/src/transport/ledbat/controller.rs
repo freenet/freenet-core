@@ -752,8 +752,10 @@ impl<T: TimeSource> LedbatController<T> {
         );
     }
 
-    /// Called when packet loss detected (not timeout).
-    #[cfg(test)]
+    /// Called when packet loss is detected (e.g., via duplicate ACKs).
+    ///
+    /// Reduces the congestion window by half (multiplicative decrease).
+    /// If in slow start, transitions to congestion avoidance.
     pub fn on_loss(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
