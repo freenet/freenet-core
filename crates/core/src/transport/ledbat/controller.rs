@@ -867,10 +867,18 @@ impl<T: TimeSource> LedbatController<T> {
 
         let old_cwnd = self.cwnd.load(Ordering::Acquire);
 
-        let new_cwnd = MSS.max(self.min_cwnd);
+        // Calculate adaptive floor BEFORE setting cwnd, so both cwnd and ssthresh benefit.
+        // This prevents the "death spiral" where cwnd collapses to 2.8KB on every timeout
+        // while ssthresh stays at 100KB - slow start can't help if you start too low.
+        let floor = self.calculate_adaptive_floor();
+
+        // Use 1/4 of adaptive floor as minimum cwnd on timeout.
+        // This keeps cwnd low enough to probe for available bandwidth while still
+        // maintaining reasonable throughput on high-BDP paths (e.g., 25KB with 100KB floor).
+        let adaptive_min_cwnd = (floor / 4).max(self.min_cwnd);
+        let new_cwnd = MSS.max(adaptive_min_cwnd);
         self.cwnd.store(new_cwnd, Ordering::Release);
 
-        let floor = self.calculate_adaptive_floor();
         let new_ssthresh = (old_cwnd / 2).max(floor);
         self.ssthresh.store(new_ssthresh, Ordering::Release);
 
@@ -884,7 +892,8 @@ impl<T: TimeSource> LedbatController<T> {
                 old_cwnd_kb = old_cwnd / 1024,
                 new_cwnd_kb = new_cwnd / 1024,
                 new_ssthresh_kb = new_ssthresh / 1024,
-                "LEDBAT retransmission timeout - reset to min_cwnd, entering SlowStart"
+                adaptive_floor_kb = floor / 1024,
+                "LEDBAT retransmission timeout - reset to adaptive min_cwnd, entering SlowStart"
             );
         }
     }
@@ -4901,11 +4910,21 @@ mod tests {
             post_timeout_cwnd / 1024
         );
 
-        // Verify timeout reset cwnd to minimum
+        // Verify timeout reset cwnd to adaptive floor / 4.
+        // With ssthresh=60KB and slow start exiting around there, the BDP proxy gives
+        // floor ~60KB, so adaptive_min_cwnd ~15KB. This is higher than min_cwnd but
+        // well below ssthresh, leaving room for slow start recovery.
+        let ssthresh_after = controller.ssthresh.load(Ordering::Acquire);
         assert!(
-            post_timeout_cwnd <= min_cwnd + 1000,
-            "Timeout should reset cwnd to near minimum: {}",
+            post_timeout_cwnd >= min_cwnd,
+            "Timeout cwnd should be at least min_cwnd: {}",
             post_timeout_cwnd
+        );
+        assert!(
+            post_timeout_cwnd <= ssthresh_after / 2,
+            "Timeout cwnd should be well below ssthresh: cwnd={} ssthresh={}",
+            post_timeout_cwnd,
+            ssthresh_after
         );
 
         // Verify SlowStart state re-enabled for fast recovery
