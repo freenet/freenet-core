@@ -1032,3 +1032,268 @@ async fn test_high_latency_timeout_regression() {
 
     tracing::info!("High-latency regression test PASSED - no timeout storm detected");
 }
+
+// =============================================================================
+// Congestion Control Throughput Tests
+//
+// These tests verify that the congestion control mechanism (BBR) maintains
+// acceptable throughput across a range of realistic network conditions.
+// =============================================================================
+
+/// Network condition profile for testing
+struct NetworkCondition {
+    name: &'static str,
+    latency_ms: (u64, u64), // (min, max) latency in milliseconds
+    packet_loss: f64,       // 0.0 to 1.0
+    min_success_rate: f64,  // minimum acceptable success rate
+}
+
+const NETWORK_CONDITIONS: &[NetworkCondition] = &[
+    // LAN: near-zero latency, no packet loss
+    NetworkCondition {
+        name: "LAN",
+        latency_ms: (1, 5),
+        packet_loss: 0.0,
+        min_success_rate: 0.95,
+    },
+    // Regional: moderate latency (like US East to US West)
+    NetworkCondition {
+        name: "Regional",
+        latency_ms: (30, 50),
+        packet_loss: 0.0,
+        min_success_rate: 0.90,
+    },
+    // Intercontinental: high latency (like US to Europe)
+    NetworkCondition {
+        name: "Intercontinental",
+        latency_ms: (100, 150),
+        packet_loss: 0.0,
+        min_success_rate: 0.85,
+    },
+    // High latency: very high latency (like US to Asia-Pacific)
+    NetworkCondition {
+        name: "HighLatency",
+        latency_ms: (180, 220),
+        packet_loss: 0.0,
+        min_success_rate: 0.80,
+    },
+    // Lossy LAN: low latency with some packet loss
+    NetworkCondition {
+        name: "LossyLAN",
+        latency_ms: (1, 5),
+        packet_loss: 0.02, // 2% packet loss
+        min_success_rate: 0.85,
+    },
+    // Lossy Regional: moderate latency with packet loss
+    NetworkCondition {
+        name: "LossyRegional",
+        latency_ms: (30, 50),
+        packet_loss: 0.02,
+        min_success_rate: 0.80,
+    },
+    // Challenging: high latency AND packet loss (worst case realistic scenario)
+    NetworkCondition {
+        name: "Challenging",
+        latency_ms: (100, 150),
+        packet_loss: 0.03, // 3% packet loss
+        min_success_rate: 0.70,
+    },
+];
+
+/// Run a throughput test with given network conditions.
+///
+/// This function:
+/// 1. Creates a network with the specified latency and packet loss
+/// 2. Runs a series of contract operations (simulating ~200KB-2MB data transfers)
+/// 3. Measures success rate and timeout count
+/// 4. Returns the results for assertion
+async fn run_throughput_test(
+    condition: &NetworkCondition,
+    seed: u64,
+    num_events: usize,
+) -> ThroughputResult {
+    use freenet::simulation::FaultConfig;
+
+    let test_name = format!("throughput-{}", condition.name.to_lowercase());
+    tracing::info!(
+        "Starting throughput test: {} (latency={}ms-{}ms, loss={:.1}%)",
+        condition.name,
+        condition.latency_ms.0,
+        condition.latency_ms.1,
+        condition.packet_loss * 100.0
+    );
+
+    // Create a network with 1 gateway and 4 peers (5 total)
+    let mut sim = SimNetwork::new(
+        &test_name, 1,  // gateways
+        4,  // nodes
+        10, // ring_max_htl
+        7,  // rnd_if_htl_above
+        15, // max_connections
+        2,  // min_connections
+        seed,
+    )
+    .await;
+
+    // Configure network conditions
+    let mut fault_builder = FaultConfig::builder();
+
+    // Add latency if non-zero
+    if condition.latency_ms.1 > 0 {
+        fault_builder = fault_builder.latency_range(
+            Duration::from_millis(condition.latency_ms.0)
+                ..Duration::from_millis(condition.latency_ms.1),
+        );
+    }
+
+    // Add packet loss if non-zero
+    if condition.packet_loss > 0.0 {
+        fault_builder = fault_builder.message_loss_rate(condition.packet_loss);
+    }
+
+    sim.with_fault_injection(fault_builder.build());
+    sim.with_start_backoff(Duration::from_millis(200));
+
+    // Start the network with multiple contract operations
+    // Each event is roughly 10-100KB of data transfer
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 5, num_events)
+        .await;
+
+    // Allow time for network formation with latency
+    let warmup_iterations = 30 + (condition.latency_ms.1 / 10) as usize;
+    for _ in 0..warmup_iterations {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+
+    // Check connectivity
+    let connectivity_timeout = Duration::from_secs(45 + condition.latency_ms.1 / 20);
+    let connectivity_ok = sim
+        .check_partial_connectivity(connectivity_timeout, 0.5)
+        .is_ok();
+
+    if !connectivity_ok {
+        tracing::warn!(
+            "{}: Network connectivity check failed (may still complete operations)",
+            condition.name
+        );
+    }
+
+    // Wait for operations with appropriate timeout
+    let operation_timeout = Duration::from_secs(30 + condition.latency_ms.1 / 10);
+    let poll_interval = Duration::from_millis(500);
+    let _ = sim
+        .await_operation_completion(operation_timeout, poll_interval)
+        .await;
+
+    // Get final results
+    let summary = sim.get_operation_summary().await;
+    let success_rate = summary.overall_success_rate();
+    let timeouts = summary.timeouts;
+
+    tracing::info!(
+        "{}: success_rate={:.1}%, timeouts={}, put={}/{}, get={}/{}",
+        condition.name,
+        success_rate * 100.0,
+        timeouts,
+        summary.put.succeeded,
+        summary.put.requested,
+        summary.get.succeeded,
+        summary.get.requested,
+    );
+
+    ThroughputResult {
+        condition_name: condition.name,
+        success_rate,
+        timeouts,
+        min_expected_rate: condition.min_success_rate,
+    }
+}
+
+struct ThroughputResult {
+    condition_name: &'static str,
+    success_rate: f64,
+    timeouts: usize,
+    min_expected_rate: f64,
+}
+
+/// Comprehensive throughput test across multiple network conditions.
+///
+/// This test verifies that the BBR congestion control mechanism maintains
+/// acceptable throughput across a range of realistic network scenarios,
+/// from low-latency LAN to high-latency intercontinental connections with
+/// packet loss.
+///
+/// The test runs multiple contract operations (simulating data transfers)
+/// and checks that:
+/// 1. Success rate meets minimum threshold for each condition
+/// 2. Timeouts don't explode (the original bug)
+///
+/// This test caught the BBR timeout storm bug where MIN_RTO < RTT + ACK_DELAY
+/// caused spurious timeouts on high-latency connections.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_congestion_control_throughput_matrix() {
+    // Base seed - each condition gets a derived seed for reproducibility
+    const BASE_SEED: u64 = 0xCC_FEED_BEEF;
+    const NUM_EVENTS: usize = 50; // Enough events to exercise congestion control
+
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+
+    for (i, condition) in NETWORK_CONDITIONS.iter().enumerate() {
+        // Derive unique seed for each condition
+        let seed = BASE_SEED.wrapping_add(i as u64 * 0x1234_5678);
+
+        let result = run_throughput_test(condition, seed, NUM_EVENTS).await;
+
+        // Check success rate threshold
+        if result.success_rate < result.min_expected_rate {
+            failures.push(format!(
+                "{}: success_rate {:.1}% < expected {:.1}%",
+                result.condition_name,
+                result.success_rate * 100.0,
+                result.min_expected_rate * 100.0
+            ));
+        }
+
+        // Check for timeout storm (more than 2 timeouts per event suggests a problem)
+        let max_acceptable_timeouts = NUM_EVENTS * 2;
+        if result.timeouts > max_acceptable_timeouts {
+            failures.push(format!(
+                "{}: {} timeouts > {} max (possible timeout storm)",
+                result.condition_name, result.timeouts, max_acceptable_timeouts
+            ));
+        }
+
+        results.push(result);
+    }
+
+    // Print summary
+    tracing::info!("=== Throughput Test Summary ===");
+    for result in &results {
+        let status = if result.success_rate >= result.min_expected_rate {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        tracing::info!(
+            "[{}] {}: {:.1}% success (min: {:.1}%), {} timeouts",
+            status,
+            result.condition_name,
+            result.success_rate * 100.0,
+            result.min_expected_rate * 100.0,
+            result.timeouts
+        );
+    }
+
+    if !failures.is_empty() {
+        let failure_msg = failures.join("\n  ");
+        panic!(
+            "Throughput test failed:\n  {}\n\nSeed: 0x{:X}\nTo reproduce: cargo test -p freenet --features simulation_tests --test sim_network test_congestion_control_throughput_matrix -- --test-threads=1 --nocapture",
+            failure_msg, BASE_SEED
+        );
+    }
+
+    tracing::info!("All throughput tests PASSED");
+}
