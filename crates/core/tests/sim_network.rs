@@ -781,10 +781,7 @@ async fn replica_validation_and_stepwise_consistency() {
 ///
 /// This test uses a more densely connected network to verify that replication
 /// works correctly when nodes have many connections.
-///
-/// Marked as `#[ignore]` - run with `--ignored` for nightly CI.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn dense_network_replication() {
     const SEED: u64 = 0xDE05_E0F0_0001;
 
