@@ -1100,12 +1100,20 @@ const NETWORK_CONDITIONS: &[NetworkCondition] = &[
     },
 ];
 
+/// Estimated bytes per contract operation.
+/// Based on typical contract sizes in Freenet:
+/// - Contract code: ~10-50KB
+/// - State data: ~10-100KB
+/// - Protocol overhead: ~5KB
+/// Conservative estimate: 50KB per successful PUT/GET operation
+const ESTIMATED_BYTES_PER_OP: usize = 50 * 1024;
+
 /// Run a throughput test with given network conditions.
 ///
 /// This function:
 /// 1. Creates a network with the specified latency and packet loss
-/// 2. Runs a series of contract operations (simulating ~200KB-2MB data transfers)
-/// 3. Measures success rate and timeout count
+/// 2. Runs a series of contract operations (simulating ~50KB data transfers each)
+/// 3. Measures success rate, timeout count, and effective throughput
 /// 4. Returns the results for assertion
 async fn run_throughput_test(
     condition: &NetworkCondition,
@@ -1113,6 +1121,7 @@ async fn run_throughput_test(
     num_events: usize,
 ) -> ThroughputResult {
     use freenet::simulation::FaultConfig;
+    use std::time::Instant;
 
     let test_name = format!("throughput-{}", condition.name.to_lowercase());
     tracing::info!(
@@ -1155,7 +1164,6 @@ async fn run_throughput_test(
     sim.with_start_backoff(Duration::from_millis(200));
 
     // Start the network with multiple contract operations
-    // Each event is roughly 10-100KB of data transfer
     let _handles = sim
         .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 5, num_events)
         .await;
@@ -1180,6 +1188,9 @@ async fn run_throughput_test(
         );
     }
 
+    // Start timing the data transfer phase
+    let transfer_start = Instant::now();
+
     // Wait for operations with appropriate timeout
     let operation_timeout = Duration::from_secs(30 + condition.latency_ms.1 / 10);
     let poll_interval = Duration::from_millis(500);
@@ -1187,20 +1198,27 @@ async fn run_throughput_test(
         .await_operation_completion(operation_timeout, poll_interval)
         .await;
 
+    let transfer_elapsed = transfer_start.elapsed();
+
     // Get final results
     let summary = sim.get_operation_summary().await;
     let success_rate = summary.overall_success_rate();
     let timeouts = summary.timeouts;
 
+    // Calculate throughput based on successful operations
+    let successful_ops = summary.put.succeeded + summary.get.succeeded;
+    let estimated_bytes = successful_ops * ESTIMATED_BYTES_PER_OP;
+    let elapsed_secs = transfer_elapsed.as_secs_f64().max(0.001); // Avoid division by zero
+    let throughput_kbps = (estimated_bytes as f64 / 1024.0) / elapsed_secs;
+
     tracing::info!(
-        "{}: success_rate={:.1}%, timeouts={}, put={}/{}, get={}/{}",
+        "{}: success={:.1}%, timeouts={}, ops={}, throughput={:.1} KB/s, elapsed={:.1}s",
         condition.name,
         success_rate * 100.0,
         timeouts,
-        summary.put.succeeded,
-        summary.put.requested,
-        summary.get.succeeded,
-        summary.get.requested,
+        successful_ops,
+        throughput_kbps,
+        elapsed_secs,
     );
 
     ThroughputResult {
@@ -1208,6 +1226,10 @@ async fn run_throughput_test(
         success_rate,
         timeouts,
         min_expected_rate: condition.min_success_rate,
+        successful_ops,
+        estimated_bytes,
+        elapsed_secs,
+        throughput_kbps,
     }
 }
 
@@ -1216,6 +1238,10 @@ struct ThroughputResult {
     success_rate: f64,
     timeouts: usize,
     min_expected_rate: f64,
+    successful_ops: usize,
+    estimated_bytes: usize,
+    elapsed_secs: f64,
+    throughput_kbps: f64,
 }
 
 /// Comprehensive throughput test across multiple network conditions.
@@ -1269,23 +1295,83 @@ async fn test_congestion_control_throughput_matrix() {
         results.push(result);
     }
 
-    // Print summary
+    // Print summary table
     tracing::info!("=== Throughput Test Summary ===");
+    tracing::info!(
+        "{:<16} {:>8} {:>10} {:>12} {:>10} {:>8}",
+        "Scenario",
+        "Success",
+        "Timeouts",
+        "Throughput",
+        "Data",
+        "Status"
+    );
+    tracing::info!("{}", "-".repeat(70));
+
     for result in &results {
         let status = if result.success_rate >= result.min_expected_rate {
             "PASS"
         } else {
             "FAIL"
         };
+
+        // Format throughput nicely
+        let throughput_str = if result.throughput_kbps >= 1024.0 {
+            format!("{:.1} MB/s", result.throughput_kbps / 1024.0)
+        } else {
+            format!("{:.0} KB/s", result.throughput_kbps)
+        };
+
+        // Format data transferred
+        let data_str = if result.estimated_bytes >= 1024 * 1024 {
+            format!(
+                "{:.1} MB",
+                result.estimated_bytes as f64 / (1024.0 * 1024.0)
+            )
+        } else {
+            format!("{:.0} KB", result.estimated_bytes as f64 / 1024.0)
+        };
+
         tracing::info!(
-            "[{}] {}: {:.1}% success (min: {:.1}%), {} timeouts",
-            status,
+            "{:<16} {:>7.1}% {:>10} {:>12} {:>10} {:>8}",
             result.condition_name,
             result.success_rate * 100.0,
-            result.min_expected_rate * 100.0,
-            result.timeouts
+            result.timeouts,
+            throughput_str,
+            data_str,
+            status
         );
     }
+
+    tracing::info!("{}", "-".repeat(70));
+
+    // Calculate totals
+    let total_bytes: usize = results.iter().map(|r| r.estimated_bytes).sum();
+    let total_time: f64 = results.iter().map(|r| r.elapsed_secs).sum();
+    let avg_throughput = if total_time > 0.0 {
+        (total_bytes as f64 / 1024.0) / total_time
+    } else {
+        0.0
+    };
+
+    let total_str = if total_bytes >= 1024 * 1024 {
+        format!("{:.1} MB", total_bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB", total_bytes as f64 / 1024.0)
+    };
+
+    let avg_str = if avg_throughput >= 1024.0 {
+        format!("{:.1} MB/s", avg_throughput / 1024.0)
+    } else {
+        format!("{:.0} KB/s", avg_throughput)
+    };
+
+    tracing::info!(
+        "Total: {} transferred in {:.1}s (avg: {})",
+        total_str,
+        total_time,
+        avg_str
+    );
 
     if !failures.is_empty() {
         let failure_msg = failures.join("\n  ");
