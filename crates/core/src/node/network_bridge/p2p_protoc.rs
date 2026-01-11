@@ -1653,6 +1653,25 @@ impl P2pConnManager {
                                     }
                                 }
                             }
+                            NodeEvent::SendInterestMessage { target, message } => {
+                                // Send an interest message to a specific peer
+                                tracing::debug!(
+                                    target = %target,
+                                    "Sending interest message to peer"
+                                );
+
+                                let msg = crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::InterestSync { message },
+                                );
+
+                                if let Err(e) = ctx.bridge.send(target, msg).await {
+                                    tracing::warn!(
+                                        peer_addr = %target,
+                                        error = %e,
+                                        "Failed to send interest message to peer"
+                                    );
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     cause = ?cause,

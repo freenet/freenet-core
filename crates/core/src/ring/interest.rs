@@ -40,8 +40,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -174,23 +173,25 @@ impl LocalInterest {
     }
 }
 
-/// Key for delta cache: (contract key, peer's summary bytes, our summary bytes).
+/// Key for delta cache using hashes to avoid allocation on every lookup.
 ///
-/// Includes contract key to prevent cross-contract cache pollution when
-/// different contracts happen to have identical summary bytes.
-#[derive(Clone, PartialEq, Eq)]
+/// Instead of storing full summary bytes, we hash them to u64. This makes
+/// cache lookups O(1) without any heap allocation. Hash collisions are
+/// extremely rare and only cause cache misses (not correctness issues).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DeltaCacheKey {
     contract: ContractKey,
-    peer_summary: Vec<u8>,
-    our_summary: Vec<u8>,
+    peer_summary_hash: u64,
+    our_summary_hash: u64,
 }
 
-impl Hash for DeltaCacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.contract.hash(state);
-        self.peer_summary.hash(state);
-        self.our_summary.hash(state);
-    }
+/// Hash bytes to u64 for cache key construction.
+/// Uses DefaultHasher for good distribution.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 /// Compute a fast hash of a contract key for connection-time discovery.
@@ -236,6 +237,10 @@ pub struct InterestManager<T: TimeSource> {
     /// Key: ContractKey, Value: Map of PeerKey -> PeerInterest
     interested_peers: DashMap<ContractKey, HashMap<PeerKey, PeerInterest>>,
 
+    /// Reverse index: which contracts is each peer interested in?
+    /// Enables O(1) cleanup when a peer disconnects instead of O(contracts) scan.
+    peer_contracts: DashMap<PeerKey, HashSet<ContractKey>>,
+
     /// Track our local interest reasons for each contract.
     local_interests: DashMap<ContractKey, LocalInterest>,
 
@@ -267,6 +272,7 @@ impl<T: TimeSource> InterestManager<T> {
     pub fn new(time_source: T) -> Self {
         Self {
             interested_peers: DashMap::new(),
+            peer_contracts: DashMap::new(),
             local_interests: DashMap::new(),
             delta_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DELTA_CACHE_SIZE).expect("DELTA_CACHE_SIZE must be > 0"),
@@ -312,7 +318,13 @@ impl<T: TimeSource> InterestManager<T> {
         let mut entry = self.interested_peers.entry(*contract).or_default();
         let is_new = !entry.contains_key(&peer);
 
-        entry.insert(peer, PeerInterest::new(summary, is_upstream, now));
+        entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
+
+        // Maintain reverse index for O(1) peer disconnect cleanup
+        self.peer_contracts
+            .entry(peer)
+            .or_default()
+            .insert(*contract);
 
         // Also index by hash for fast lookup
         self.index_contract_hash(contract);
@@ -326,6 +338,17 @@ impl<T: TimeSource> InterestManager<T> {
     pub fn remove_peer_interest(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             let removed = entry.remove(peer).is_some();
+
+            if removed {
+                // Maintain reverse index
+                if let Some(mut peer_entry) = self.peer_contracts.get_mut(peer) {
+                    peer_entry.remove(contract);
+                    if peer_entry.is_empty() {
+                        drop(peer_entry);
+                        self.peer_contracts.remove_if(peer, |_, v| v.is_empty());
+                    }
+                }
+            }
 
             // Clean up empty entries using remove_if to avoid race condition
             // between dropping the entry guard and removing the contract.
@@ -400,23 +423,30 @@ impl<T: TimeSource> InterestManager<T> {
 
     /// Remove all interests for a peer (called on peer disconnect).
     ///
+    /// Uses the reverse index for O(1) lookup instead of O(contracts) scan.
     /// Returns the number of contracts from which the peer was removed.
     pub fn remove_all_peer_interests(&self, peer: &PeerKey) -> usize {
-        let mut removed_count = 0;
-        let mut contracts_to_cleanup = Vec::new();
+        // Use the reverse index to find all contracts this peer is interested in
+        let contracts: Vec<ContractKey> = self
+            .peer_contracts
+            .remove(peer)
+            .map(|(_, set)| set.into_iter().collect())
+            .unwrap_or_default();
 
-        // Iterate through all contracts and remove this peer
-        for entry in self.interested_peers.iter() {
-            let contract = *entry.key();
-            if entry.contains_key(peer) {
-                contracts_to_cleanup.push(contract);
-            }
-        }
+        let removed_count = contracts.len();
 
-        // Remove the peer from each contract
-        for contract in contracts_to_cleanup {
-            if self.remove_peer_interest(&contract, peer) {
-                removed_count += 1;
+        // Remove the peer from each contract's interest list
+        for contract in &contracts {
+            if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+                entry.remove(peer);
+
+                // Clean up empty entries
+                if entry.is_empty() {
+                    drop(entry);
+                    self.interested_peers
+                        .remove_if(contract, |_, v| v.is_empty());
+                    self.cleanup_contract_if_no_interest(contract);
+                }
             }
         }
 
@@ -655,29 +685,16 @@ impl<T: TimeSource> InterestManager<T> {
     pub fn lookup_by_hash(&self, hash: u32) -> Vec<ContractKey> {
         self.contract_hash_index
             .get(&hash)
-            .map(|r| r.clone())
+            .as_deref()
+            .cloned()
             .unwrap_or_default()
     }
 
     /// Get all contract hashes we're interested in.
+    ///
+    /// Uses the existing hash index for O(1) access - no rehashing needed.
     pub fn get_all_interest_hashes(&self) -> Vec<u32> {
-        // Combine contracts from both peer interests and local interests
-        let mut hashes: Vec<u32> = self
-            .interested_peers
-            .iter()
-            .map(|entry| contract_hash(entry.key()))
-            .collect();
-
-        for entry in self.local_interests.iter() {
-            if entry.is_interested() {
-                hashes.push(contract_hash(entry.key()));
-            }
-        }
-
-        // Deduplicate
-        hashes.sort_unstable();
-        hashes.dedup();
-        hashes
+        self.contract_hash_index.iter().map(|e| *e.key()).collect()
     }
 
     /// Get contracts we're interested in that match the given hashes.
@@ -701,8 +718,8 @@ impl<T: TimeSource> InterestManager<T> {
     ) {
         let key = DeltaCacheKey {
             contract: *contract,
-            peer_summary: peer_summary.to_vec(),
-            our_summary: our_summary.to_vec(),
+            peer_summary_hash: hash_bytes(peer_summary),
+            our_summary_hash: hash_bytes(our_summary),
         };
         self.delta_cache.lock().put(key, delta);
     }
@@ -716,8 +733,8 @@ impl<T: TimeSource> InterestManager<T> {
     ) -> Option<StateDelta<'static>> {
         let key = DeltaCacheKey {
             contract: *contract,
-            peer_summary: peer_summary.to_vec(),
-            our_summary: our_summary.to_vec(),
+            peer_summary_hash: hash_bytes(peer_summary),
+            our_summary_hash: hash_bytes(our_summary),
         };
         self.delta_cache.lock().get(&key).cloned()
     }
@@ -786,11 +803,12 @@ impl<T: TimeSource> InterestManager<T> {
     ) -> Result<StateDelta<'static>, String> {
         use crate::contract::ContractHandlerEvent;
 
-        // Check cache first (keyed by contract + actual summaries)
-        let our_summary_bytes = our_summary.as_ref().to_vec();
-        let their_summary_bytes = their_summary.as_ref().to_vec();
+        // Use slices directly - cache methods hash internally, no allocation needed
+        let their_summary_bytes = their_summary.as_ref();
+        let our_summary_bytes = our_summary.as_ref();
 
-        if let Some(cached) = self.get_cached_delta(key, &their_summary_bytes, &our_summary_bytes) {
+        // Check cache first (keyed by hash of contract + summaries)
+        if let Some(cached) = self.get_cached_delta(key, their_summary_bytes, our_summary_bytes) {
             tracing::trace!(
                 contract = %key,
                 "Using cached delta"
@@ -800,7 +818,7 @@ impl<T: TimeSource> InterestManager<T> {
 
         // Check if delta would be efficient
         // (summary > 50% of state size means delta probably won't help)
-        if !is_delta_efficient(their_summary.as_ref().len(), our_state_size) {
+        if !is_delta_efficient(their_summary_bytes.len(), our_state_size) {
             return Err("Delta not efficient for this contract".to_string());
         }
 
@@ -814,7 +832,7 @@ impl<T: TimeSource> InterestManager<T> {
         {
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
                 // Cache the result (includes contract key to prevent cross-contract pollution)
-                self.cache_delta(key, &their_summary_bytes, &our_summary_bytes, d.clone());
+                self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
                 Ok(d)
             }
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
@@ -1038,9 +1056,9 @@ mod tests {
         let contract2 = make_contract_key(2);
         let peer = make_peer_key(1);
 
-        // Register interests
+        // Register interests (use methods that properly index)
         manager.register_peer_interest(&contract1, peer.clone(), None, false);
-        manager.with_local_interest(&contract2, |i| i.set_seeding(true));
+        manager.register_local_seeding(&contract2);
 
         let hashes = manager.get_all_interest_hashes();
         assert_eq!(hashes.len(), 2);

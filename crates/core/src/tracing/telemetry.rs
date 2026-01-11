@@ -509,6 +509,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 UpdateEvent::Request { .. } => "update_request".to_string(),
                 UpdateEvent::UpdateSuccess { .. } => "update_success".to_string(),
                 UpdateEvent::BroadcastEmitted { .. } => "update_broadcast_emitted".to_string(),
+                UpdateEvent::BroadcastComplete { .. } => "update_broadcast_complete".to_string(),
                 UpdateEvent::BroadcastReceived { .. } => "update_broadcast_received".to_string(),
                 UpdateEvent::BroadcastApplied { .. } => "update_broadcast_applied".to_string(),
             }
@@ -1129,6 +1130,31 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "key": key.to_string(),
                         "sender": sender.to_string(),
                         "id": id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                UpdateEvent::BroadcastComplete {
+                    id,
+                    key,
+                    delta_sends,
+                    full_state_sends,
+                    bytes_saved,
+                    state_size,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "broadcast_complete",
+                        "id": id.to_string(),
+                        "key": key.to_string(),
+                        "delta_sends": delta_sends,
+                        "full_state_sends": full_state_sends,
+                        "bytes_saved": bytes_saved,
+                        "state_size": state_size,
+                        "delta_ratio": if *delta_sends + *full_state_sends > 0 {
+                            *delta_sends as f64 / (*delta_sends + *full_state_sends) as f64
+                        } else {
+                            0.0
+                        },
                         "timestamp": timestamp,
                     })
                 }

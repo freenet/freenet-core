@@ -792,6 +792,35 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a BroadcastComplete event with delta sync statistics.
+    ///
+    /// This event is emitted after all broadcast sends complete, capturing
+    /// telemetry about delta sync effectiveness.
+    pub fn update_broadcast_complete(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        delta_sends: usize,
+        full_state_sends: usize,
+        bytes_saved: u64,
+        state_size: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastComplete {
+                id: *tx,
+                key,
+                delta_sends,
+                full_state_sends,
+                bytes_saved,
+                state_size,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     /// Create an Update broadcast received event.
     pub fn update_broadcast_received(
         tx: &'a Transaction,
@@ -2879,6 +2908,22 @@ pub(crate) enum UpdateEvent {
         /// Short hash of the broadcast state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
     },
+    /// Emitted after broadcasting completes with delta sync statistics.
+    /// This provides telemetry for monitoring delta sync effectiveness.
+    BroadcastComplete {
+        id: Transaction,
+        key: ContractKey,
+        /// Number of peers that received a delta update.
+        delta_sends: usize,
+        /// Number of peers that received full state (no cached summary or delta failed).
+        full_state_sends: usize,
+        /// Total bytes saved by sending deltas instead of full state.
+        /// Calculated as sum of (state_size - delta_size) for each delta send.
+        bytes_saved: u64,
+        /// Size of the full state in bytes.
+        state_size: usize,
+        timestamp: u64,
+    },
     BroadcastReceived {
         id: Transaction,
         /// peer who started the broadcast op
@@ -2919,6 +2964,7 @@ impl UpdateEvent {
             UpdateEvent::Request { key, .. }
             | UpdateEvent::UpdateSuccess { key, .. }
             | UpdateEvent::BroadcastEmitted { key, .. }
+            | UpdateEvent::BroadcastComplete { key, .. }
             | UpdateEvent::BroadcastReceived { key, .. }
             | UpdateEvent::BroadcastApplied { key, .. } => *key,
         }

@@ -468,16 +468,13 @@ impl Operation for UpdateOp {
                         }
                     };
 
-                    // For telemetry, convert payload to WrappedState
-                    let state_for_telemetry = match payload {
-                        crate::message::DeltaOrFullState::FullState(bytes) => {
-                            WrappedState::from(bytes.clone())
-                        }
-                        crate::message::DeltaOrFullState::Delta(bytes) => {
-                            // For delta, use delta bytes as placeholder
-                            WrappedState::from(bytes.clone())
-                        }
+                    // For telemetry, convert payload bytes to WrappedState
+                    // (for deltas, we use the delta bytes as a placeholder)
+                    let payload_bytes = match payload {
+                        crate::message::DeltaOrFullState::FullState(bytes)
+                        | crate::message::DeltaOrFullState::Delta(bytes) => bytes,
                     };
+                    let state_for_telemetry = WrappedState::from(payload_bytes.clone());
 
                     // Emit telemetry: broadcast received from upstream peer
                     if let Some(requester_pkl) = op_manager
@@ -497,12 +494,57 @@ impl Operation for UpdateOp {
                     }
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
+                    let is_delta = matches!(payload, crate::message::DeltaOrFullState::Delta(_));
+                    let update_result =
+                        update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                            .await;
+
                     let UpdateExecution {
                         value: updated_value,
                         summary: _summary,
                         changed,
-                    } = update_contract(op_manager, *key, update_data, RelatedContracts::default())
-                        .await?;
+                    } = match update_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            if is_delta {
+                                // Delta application failed - send ResyncRequest to get full state
+                                tracing::warn!(
+                                    contract = %key,
+                                    error = %err,
+                                    "Delta application failed, sending ResyncRequest"
+                                );
+
+                                // Clear cached summary for sender since it's out of sync
+                                if let Some(sender_pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(sender_addr)
+                                {
+                                    let sender_key =
+                                        crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                                    op_manager.interest_manager.update_peer_summary(
+                                        key,
+                                        &sender_key,
+                                        None,
+                                    );
+                                }
+
+                                // Send ResyncRequest to sender
+                                let _ = op_manager
+                                    .notify_node_event(
+                                        crate::message::NodeEvent::SendInterestMessage {
+                                            target: sender_addr,
+                                            message:
+                                                crate::message::InterestMessage::ResyncRequest {
+                                                    key: *key,
+                                                },
+                                        },
+                                    )
+                                    .await;
+                            }
+                            return Err(err);
+                        }
+                    };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
                     // Refresh GET subscription cache TTL when receiving updates
@@ -720,6 +762,11 @@ impl Operation for UpdateOp {
                     }
 
                     // Update cached summaries and record metrics for successful sends
+                    // Track delta sync stats for telemetry event
+                    let mut telemetry_delta_sends = 0usize;
+                    let mut telemetry_full_state_sends = 0usize;
+                    let mut telemetry_bytes_saved = 0u64;
+
                     for (idx, (peer_key, delta_size)) in peer_keys_to_update.into_iter().enumerate()
                     {
                         if !failed_indices.contains(&idx) {
@@ -733,9 +780,27 @@ impl Operation for UpdateOp {
                                 op_manager
                                     .interest_manager
                                     .record_delta_send(state_size, ds);
+                                telemetry_delta_sends += 1;
+                                telemetry_bytes_saved += (state_size - ds) as u64;
                             } else {
                                 op_manager.interest_manager.record_full_state_send();
+                                telemetry_full_state_sends += 1;
                             }
+                        }
+                    }
+
+                    // Emit telemetry event with delta sync stats
+                    if telemetry_delta_sends > 0 || telemetry_full_state_sends > 0 {
+                        if let Some(event) = crate::tracing::NetEventLog::update_broadcast_complete(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            telemetry_delta_sends,
+                            telemetry_full_state_sends,
+                            telemetry_bytes_saved,
+                            state_size,
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
                         }
                     }
 
@@ -1080,43 +1145,28 @@ async fn update_contract(
             let resolved_state = match previous_state {
                 Some(prev_state) => prev_state,
                 None => {
-                    match op_manager
+                    // Try to fetch current state from store
+                    let fetched_state = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             instance_id: *key.id(),
                             return_contract_code: false,
                         })
                         .await
-                    {
-                        Ok(ContractHandlerEvent::GetResponse {
-                            response:
-                                Ok(StoreResponse {
-                                    state: Some(current),
-                                    ..
-                                }),
-                            ..
-                        }) => current,
-                        Ok(other) => {
+                        .ok()
+                        .and_then(|event| match event {
+                            ContractHandlerEvent::GetResponse {
+                                response: Ok(StoreResponse { state, .. }),
+                                ..
+                            } => state,
+                            _ => None,
+                        });
+
+                    match fetched_state {
+                        Some(state) => state,
+                        None => {
                             tracing::debug!(
-                                ?other,
                                 %key,
                                 "Fallback fetch for UpdateNoChange returned no state; trying to extract from update_data"
-                            );
-                            match extract_state_from_update_data(&update_data) {
-                                Some(state) => state,
-                                None => {
-                                    tracing::error!(
-                                        %key,
-                                        "Cannot extract state from delta-only UpdateData in NoChange fallback"
-                                    );
-                                    return Err(OpError::UnexpectedOpState);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::debug!(
-                                %key,
-                                %err,
-                                "Fallback fetch for UpdateNoChange failed; trying to extract from update_data"
                             );
                             match extract_state_from_update_data(&update_data) {
                                 Some(state) => state,

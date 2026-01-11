@@ -520,11 +520,16 @@ impl DeltaOrFullState {
         matches!(self, Self::Delta(_))
     }
 
+    /// Get the raw bytes of the payload.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Delta(bytes) | Self::FullState(bytes) => bytes,
+        }
+    }
+
     /// Get the size in bytes of the payload.
     pub fn size(&self) -> usize {
-        match self {
-            Self::Delta(bytes) | Self::FullState(bytes) => bytes.len(),
-        }
+        self.bytes().len()
     }
 }
 
@@ -630,6 +635,12 @@ pub(crate) enum NodeEvent {
         added: Vec<u32>,
         removed: Vec<u32>,
     },
+    /// Send an interest message to a specific peer.
+    /// Used for ResyncRequest when delta application fails.
+    SendInterestMessage {
+        target: SocketAddr,
+        message: InterestMessage,
+    },
     /// A WebSocket client disconnected - clean up its subscriptions and trigger tree pruning.
     ClientDisconnected {
         client_id: ClientId,
@@ -723,6 +734,9 @@ impl Display for NodeEvent {
                     added.len(),
                     removed.len()
                 )
+            }
+            NodeEvent::SendInterestMessage { target, message } => {
+                write!(f, "SendInterestMessage (to: {target}, msg: {message:?})")
             }
             NodeEvent::ClientDisconnected { client_id } => {
                 write!(f, "ClientDisconnected (client: {client_id})")

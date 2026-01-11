@@ -324,15 +324,29 @@ impl Operation for PutOp {
 
                     // Mark as seeding if not already
                     if !was_seeding {
-                        op_manager.ring.seed_contract(key, value.size() as u64);
+                        let evicted = op_manager.ring.seed_contract(key, value.size() as u64);
                         super::announce_contract_cached(op_manager, &key).await;
+
+                        // Clean up interest tracking for evicted contracts
+                        let mut removed_contracts = Vec::new();
+                        for evicted_key in evicted {
+                            if op_manager
+                                .interest_manager
+                                .unregister_local_seeding(&evicted_key)
+                            {
+                                removed_contracts.push(evicted_key);
+                            }
+                        }
 
                         // Register local interest for delta-based sync
                         let became_interested =
                             op_manager.interest_manager.register_local_seeding(&key);
-                        if became_interested {
-                            // Broadcast ChangeInterests to all connected peers
-                            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+
+                        // Broadcast interest changes to peers
+                        let added = if became_interested { vec![key] } else { vec![] };
+                        if !added.is_empty() || !removed_contracts.is_empty() {
+                            super::broadcast_change_interests(op_manager, added, removed_contracts)
+                                .await;
                         }
                     }
 
