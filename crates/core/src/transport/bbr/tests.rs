@@ -413,3 +413,154 @@ fn test_bdp_scales_with_bandwidth() {
         }
     }
 }
+
+// =============================================================================
+// Regression: Timeout Storm (Issue from v0.1.92)
+// =============================================================================
+
+/// Regression test: BBR cannot recover between timeouts in high-latency conditions.
+///
+/// In production (v0.1.92), we observed 935 timeouts in 10 seconds when transferring
+/// to high-latency peers. The root cause was:
+///
+/// 1. MIN_RTO was 200ms, but real RTT (144ms) + ACK_CHECK_INTERVAL (100ms) = 244ms
+/// 2. This caused spurious timeouts even when packets were being delivered
+/// 3. Each timeout resets ALL BBR state (cwnd, bandwidth estimates, min_rtt)
+/// 4. BBR could never build up measurements before the next timeout
+///
+/// Fix:
+/// 1. MIN_RTO was increased to 300ms to account for ACK batching delay
+/// 2. BBR now uses adaptive timeout floor based on max BDP seen
+///
+/// This test verifies BBR's timeout behavior with minimal traffic (no high BDP).
+#[test]
+fn test_timeout_storm_prevents_recovery() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let initial_cwnd = BbrConfig::default().initial_cwnd;
+    println!("Initial cwnd: {}", initial_cwnd);
+
+    // Simulate 10 rounds of: send packets -> partial recovery -> timeout
+    // With minimal traffic, max_bdp_seen stays low, so adaptive floor = initial_cwnd
+    let mut max_cwnd_achieved = initial_cwnd;
+
+    println!("\nSimulating timeout storm with recovery attempts (minimal traffic):");
+    for round in 0..10 {
+        // Try to recover: send packets and get ACKs
+        for _ in 0..5 {
+            let token = controller.on_send(1400);
+            time.advance(Duration::from_millis(50));
+            controller.on_ack_with_token(Duration::from_millis(100), 1400, Some(token));
+        }
+
+        let cwnd_before_timeout = controller.current_cwnd();
+        max_cwnd_achieved = max_cwnd_achieved.max(cwnd_before_timeout);
+
+        // Timeout hits!
+        controller.on_timeout();
+
+        let cwnd_after_timeout = controller.current_cwnd();
+        println!(
+            "  Round {}: cwnd {} -> {} (max_bdp_seen={})",
+            round + 1,
+            cwnd_before_timeout,
+            cwnd_after_timeout,
+            controller.max_bdp_seen()
+        );
+
+        // With low BDP measurements, adaptive floor should be at least initial_cwnd
+        assert!(
+            cwnd_after_timeout >= initial_cwnd,
+            "BBR cwnd ({}) should not drop below initial_cwnd ({}) after timeout",
+            cwnd_after_timeout,
+            initial_cwnd
+        );
+    }
+
+    let final_cwnd = controller.current_cwnd();
+    println!(
+        "\nFinal cwnd: {} (initial was {}, max_bdp_seen={})",
+        final_cwnd,
+        initial_cwnd,
+        controller.max_bdp_seen()
+    );
+    println!(
+        "Max cwnd achieved during recovery attempts: {}",
+        max_cwnd_achieved
+    );
+}
+
+/// Test that BBR's adaptive timeout floor kicks in with high BDP.
+///
+/// When max_bdp_seen is high enough (>4x initial_cwnd), the adaptive floor
+/// should prevent cwnd from collapsing to initial_cwnd on timeout.
+#[test]
+fn test_bbr_adaptive_timeout_floor_with_high_bdp() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let initial_cwnd = BbrConfig::default().initial_cwnd;
+    println!("Initial cwnd: {}", initial_cwnd);
+
+    // Build up high BDP measurements by simulating high-bandwidth traffic
+    // We need max_bdp_seen > 4 * initial_cwnd for adaptive floor to kick in
+    println!("\nBuilding up high BDP measurements...");
+    for _ in 0..100 {
+        // Send a large burst
+        for _ in 0..50 {
+            controller.on_send(1400);
+        }
+        time.advance(Duration::from_millis(20)); // 20ms RTT = high bandwidth
+        for _ in 0..50 {
+            let token = controller.on_send(1400);
+            controller.on_ack_with_token(Duration::from_millis(20), 1400, Some(token));
+        }
+    }
+
+    let max_bdp = controller.max_bdp_seen();
+    let cwnd_before = controller.current_cwnd();
+    println!(
+        "After warmup: cwnd={}, max_bdp_seen={}",
+        cwnd_before, max_bdp
+    );
+
+    // Trigger timeout
+    controller.on_timeout();
+
+    let cwnd_after = controller.current_cwnd();
+    println!(
+        "After timeout: cwnd={} (initial={}, adaptive_floor=max_bdp/4={})",
+        cwnd_after,
+        initial_cwnd,
+        max_bdp / 4
+    );
+
+    // If max_bdp > 4 * initial_cwnd, adaptive floor should kick in
+    if max_bdp > 4 * initial_cwnd {
+        let expected_floor = max_bdp / 4;
+        assert!(
+            cwnd_after >= expected_floor,
+            "BBR cwnd ({}) should use adaptive floor ({}) when max_bdp ({}) > 4*initial ({})",
+            cwnd_after,
+            expected_floor,
+            max_bdp,
+            4 * initial_cwnd
+        );
+        println!(
+            "SUCCESS: Adaptive floor kicked in - cwnd {} >= floor {}",
+            cwnd_after, expected_floor
+        );
+    } else {
+        // max_bdp not high enough, should use initial_cwnd
+        assert_eq!(
+            cwnd_after, initial_cwnd,
+            "BBR should use initial_cwnd when max_bdp < 4*initial"
+        );
+        println!(
+            "Note: max_bdp ({}) < 4*initial_cwnd ({}), using initial_cwnd",
+            max_bdp,
+            4 * initial_cwnd
+        );
+    }
+}

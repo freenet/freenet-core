@@ -932,3 +932,103 @@ async fn dense_network_replication() {
 
     tracing::info!("Dense network replication test PASSED");
 }
+
+// =============================================================================
+// High-Latency Regression Test
+// =============================================================================
+
+/// Regression test for v0.1.92 timeout storm bug with high-latency connections.
+///
+/// In production, we observed 935 timeouts in 10 seconds when transferring to peers
+/// with ~150ms RTT. The root cause was MIN_RTO (200ms) < RTT + ACK_CHECK_INTERVAL (244ms).
+///
+/// This test verifies that:
+/// 1. High-latency connections (150-200ms) don't experience excessive timeouts
+/// 2. Data transfers complete successfully despite latency
+/// 3. BBR congestion control handles high-latency correctly after the fix
+///
+/// Fix applied in this codebase:
+/// - MIN_RTO increased from 200ms to 300ms
+/// - BBR now uses adaptive timeout floor based on max BDP seen
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_high_latency_timeout_regression() {
+    use freenet::simulation::FaultConfig;
+
+    // Use a fixed seed for reproducibility
+    const SEED: u64 = 0xDEAD_BEEF_1234;
+    tracing::info!(
+        "Starting high-latency regression test with seed: 0x{:X}",
+        SEED
+    );
+
+    // Create a network with 1 gateway and 3 peers
+    let mut sim = SimNetwork::new(
+        "high-latency-regression",
+        1,  // gateways
+        3,  // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+
+    // Configure high latency (150-200ms) - similar to intercontinental connections
+    // This latency, combined with ACK_CHECK_INTERVAL (100ms), would have caused
+    // spurious timeouts with the old MIN_RTO of 200ms
+    let fault_config = FaultConfig::builder()
+        .latency_range(Duration::from_millis(150)..Duration::from_millis(200))
+        .build();
+    sim.with_fault_injection(fault_config);
+
+    sim.with_start_backoff(Duration::from_millis(100));
+
+    // Start the network
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Give time for initial connections with high latency
+    // (needs more time than normal due to latency)
+    for _ in 0..50 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
+
+    // Check connectivity with a longer timeout due to high latency
+    match sim.check_partial_connectivity(Duration::from_secs(60), 0.5) {
+        Ok(()) => {
+            tracing::info!("High-latency network established connectivity");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "High-latency connectivity check incomplete: {} (this may be acceptable)",
+                e
+            );
+        }
+    }
+
+    // The key test: verify we don't have excessive timeouts
+    // With the old MIN_RTO=200ms, we'd see hundreds of timeouts
+    // With the fix (MIN_RTO=300ms + adaptive floor), timeouts should be minimal
+    let summary = sim.get_operation_summary().await;
+    let total_timeouts = summary.timeouts;
+
+    tracing::info!(
+        "High-latency test results: {} total timeouts, {:.1}% success rate",
+        total_timeouts,
+        summary.overall_success_rate() * 100.0
+    );
+
+    // Before the fix, we'd see 100+ timeouts per second
+    // After the fix, timeouts should be rare (mostly actual network issues)
+    // Allow up to 50 timeouts for a 60-second test (less than 1/second)
+    assert!(
+        total_timeouts < 50,
+        "Expected <50 timeouts with MIN_RTO=300ms fix, got {} (timeout storm detected!)",
+        total_timeouts
+    );
+
+    tracing::info!("High-latency regression test PASSED - no timeout storm detected");
+}

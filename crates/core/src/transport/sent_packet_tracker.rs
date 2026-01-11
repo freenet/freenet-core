@@ -30,7 +30,7 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
 };
 
 /// Maximum RTO backoff multiplier (RFC 6298 Section 5.5).
-/// With a minimum/base RTO of 200ms and a max effective RTO cap of 60s, a backoff of 512 is
+/// With a minimum/base RTO of 300ms and a max effective RTO cap of 60s, a backoff of 512 is
 /// sufficient to ensure we can reach the 60s limit; for higher base RTO values, the cap is
 /// reached with smaller backoff multipliers.
 const MAX_RTO_BACKOFF: u32 = 512;
@@ -42,8 +42,13 @@ const MAX_RTO_BACKOFF: u32 = 512;
 /// delay-sensitive - a 1 second RTO means we wait 5x longer than necessary on a typical
 /// network to detect packet loss.
 ///
+/// IMPORTANT: This value must be greater than RTT + ACK_CHECK_INTERVAL (100ms) to avoid
+/// spurious timeouts. With intercontinental RTTs of 150-200ms and 100ms ACK batching,
+/// we need MIN_RTO >= 300ms to prevent timeout storms on high-latency connections.
+/// See: PR #XXXX for the v0.1.92 regression where 200ms caused 935 timeouts in 10 seconds.
+///
 /// Note: Initial RTO (before any RTT samples) remains 1 second per RFC 6298 Section 2.1.
-const MIN_RTO: Duration = Duration::from_millis(200);
+const MIN_RTO: Duration = Duration::from_millis(300);
 
 /// Minimum TLP timeout (PTO - Probe Timeout).
 ///
@@ -268,9 +273,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let max_variance = if rto_variance > G { rto_variance } else { G };
         self.rto = self.srtt.unwrap_or(Duration::from_secs(1)) + max_variance;
 
-        // Clamp RTO to [200ms, 60s]
-        // Note: RFC 6298 Section 2.4 recommends 1s minimum, but Linux uses 200ms.
-        // For LEDBAT, faster loss detection improves throughput significantly.
+        // Clamp RTO to [300ms, 60s]
+        // Note: RFC 6298 Section 2.4 recommends 1s minimum, but we use 300ms to
+        // balance fast loss detection with ACK batching delay (ACK_CHECK_INTERVAL=100ms).
         if self.rto < MIN_RTO {
             self.rto = MIN_RTO;
         } else if self.rto > Duration::from_secs(60) {
@@ -678,8 +683,8 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(10)); // Very fast RTT
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be clamped to minimum 200ms (Linux default, faster loss detection)
-        assert!(tracker.rto() >= Duration::from_millis(200));
+        // RTO should be clamped to minimum 300ms (accounts for ACK_CHECK_INTERVAL)
+        assert!(tracker.rto() >= Duration::from_millis(300));
         assert!(tracker.rto() <= Duration::from_secs(60));
     }
 
@@ -795,8 +800,8 @@ pub(in crate::transport) mod tests {
         // Backoff should be reset to 1 for both cases
         // (matching libutp behavior - any ACK resets backoff)
         assert_eq!(tracker.rto_backoff(), 1);
-        // With 50ms RTT, base RTO is clamped to 200ms minimum
-        // For non-retransmitted: 50ms RTT -> RTO clamped to 200ms
+        // With 50ms RTT, base RTO is clamped to 300ms minimum
+        // For non-retransmitted: 50ms RTT -> RTO clamped to 300ms
         // For retransmitted: no RTT sample, but backoff reset to 1
         //   Note: retransmitted case keeps the previous RTO value (1s initial),
         //   since no RTT sample is taken for retransmits (Karn's algorithm)
@@ -804,8 +809,8 @@ pub(in crate::transport) mod tests {
             // No RTT sample taken, so base RTO stays at initial 1s
             assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
         } else {
-            // RTT sample of 50ms -> RTO clamped to 200ms minimum
-            assert_eq!(tracker.effective_rto(), Duration::from_millis(200));
+            // RTT sample of 50ms -> RTO clamped to 300ms minimum
+            assert_eq!(tracker.effective_rto(), Duration::from_millis(300));
         }
     }
 
@@ -980,18 +985,19 @@ pub(in crate::transport) mod tests {
     }
 
     // =========================================================================
-    // Tests for 200ms minimum RTO (Phase 1 of #2632)
+    // Tests for 300ms minimum RTO
     // =========================================================================
     //
-    // RFC 6298 recommends 1s minimum RTO, but Linux uses 200ms and this is
-    // widely accepted for modern networks. For LEDBAT, faster loss detection
-    // is critical since we're delay-sensitive.
+    // RFC 6298 recommends 1s minimum RTO, but Linux uses 200ms. We use 300ms
+    // to account for ACK_CHECK_INTERVAL (100ms) batching delay - without this,
+    // high-latency connections (150ms+ RTT) experience spurious timeouts since
+    // RTT + ACK_CHECK_INTERVAL can exceed MIN_RTO.
     //
-    // These tests verify the new 200ms minimum RTO behavior.
-    const EXPECTED_MIN_RTO: Duration = Duration::from_millis(200);
+    // These tests verify the minimum RTO behavior.
+    const EXPECTED_MIN_RTO: Duration = Duration::from_millis(300);
 
     #[test]
-    fn test_min_rto_is_200ms() {
+    fn test_min_rto_is_300ms() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Simulate a very fast network with 10ms RTT
@@ -999,13 +1005,13 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(10));
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be clamped to 200ms minimum, not 1s
+        // RTO should be clamped to 300ms minimum, not 1s
         // With 10ms RTT: RTO = SRTT + max(G, 4*RTTVAR) = 10ms + max(10ms, 4*5ms) = 30ms
-        // But this is below minimum, so should be clamped to 200ms
+        // But this is below minimum, so should be clamped to 300ms
         assert_eq!(
             tracker.rto(),
             EXPECTED_MIN_RTO,
-            "RTO should be clamped to 200ms minimum for fast networks"
+            "RTO should be clamped to 300ms minimum for fast networks"
         );
     }
 
@@ -1013,13 +1019,13 @@ pub(in crate::transport) mod tests {
     fn test_min_rto_allows_higher_values() {
         let mut tracker = mock_sent_packet_tracker();
 
-        // Simulate a slower network with 300ms RTT
+        // Simulate a slower network with 400ms RTT
         tracker.report_sent_packet(1, vec![1].into());
-        tracker.time_source.advance(Duration::from_millis(300));
+        tracker.time_source.advance(Duration::from_millis(400));
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be above 200ms minimum, so not clamped
-        // With 300ms RTT: RTO = 300ms + max(10ms, 4*150ms) = 300ms + 600ms = 900ms
+        // RTO should be above 300ms minimum, so not clamped
+        // With 400ms RTT: RTO = 400ms + max(10ms, 4*200ms) = 400ms + 800ms = 1200ms
         assert!(
             tracker.rto() > EXPECTED_MIN_RTO,
             "RTO should not be clamped when naturally above minimum"
@@ -1043,28 +1049,28 @@ pub(in crate::transport) mod tests {
     fn test_effective_rto_with_backoff_respects_min() {
         let mut tracker = mock_sent_packet_tracker();
 
-        // Get a fast RTT sample to set base RTO to 200ms
+        // Get a fast RTT sample to set base RTO to 300ms
         tracker.report_sent_packet(1, vec![1].into());
         tracker.time_source.advance(Duration::from_millis(10));
         tracker.report_received_receipts(&[1]);
 
-        // Base RTO should be 200ms (clamped)
+        // Base RTO should be 300ms (clamped)
         assert_eq!(tracker.rto(), EXPECTED_MIN_RTO);
 
-        // Effective RTO with backoff of 1 should also be 200ms
+        // Effective RTO with backoff of 1 should also be 300ms
         assert_eq!(tracker.effective_rto(), EXPECTED_MIN_RTO);
 
-        // After timeout, backoff doubles to 2, effective RTO = 400ms
+        // After timeout, backoff doubles to 2, effective RTO = 600ms
         tracker.on_timeout();
-        assert_eq!(tracker.effective_rto(), Duration::from_millis(400));
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(600));
 
-        // After another timeout, backoff = 4, effective RTO = 800ms
+        // After another timeout, backoff = 4, effective RTO = 1200ms
         tracker.on_timeout();
-        assert_eq!(tracker.effective_rto(), Duration::from_millis(800));
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(1200));
     }
 
     #[test]
-    fn test_fast_loss_detection_with_200ms_rto() {
+    fn test_fast_loss_detection_with_300ms_rto() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Establish fast RTT baseline
@@ -1077,7 +1083,7 @@ pub(in crate::transport) mod tests {
 
         // With 20ms RTT:
         // - TLP (PTO) = max(2 * 20ms, 10ms) = 40ms
-        // - RTO = 200ms (minimum)
+        // - RTO = 300ms (minimum)
         // TLP should fire first at ~40ms
 
         // At 39ms, should still be waiting
@@ -1087,7 +1093,7 @@ pub(in crate::transport) mod tests {
             _ => panic!("Should not fire before TLP timeout (40ms)"),
         }
 
-        // At 41ms total, TLP should fire (faster than 200ms RTO!)
+        // At 41ms total, TLP should fire (faster than 300ms RTO!)
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
             ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
@@ -1196,8 +1202,8 @@ pub(in crate::transport) mod tests {
         tracker.report_received_receipts(&[1]);
 
         // SRTT = 50ms, so PTO = 2 * 50ms = 100ms
-        // RTO = 200ms (minimum)
-        // TLP should fire at 100ms, before RTO at 200ms
+        // RTO = 300ms (minimum)
+        // TLP should fire at 100ms, before RTO at 300ms
 
         // Send another packet
         tracker.report_sent_packet(2, vec![2].into());
@@ -1251,7 +1257,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(50));
         tracker.report_received_receipts(&[1]);
 
-        // PTO = 100ms, RTO = 200ms
+        // PTO = 100ms, RTO = 300ms
 
         // Send packet
         tracker.report_sent_packet(2, vec![2].into());
@@ -1270,8 +1276,8 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(2, payload);
 
         // Now if still no ACK, full RTO should fire
-        // RTO timer starts fresh after TLP, so wait another 200ms
-        tracker.time_source.advance(Duration::from_millis(199));
+        // RTO timer starts fresh after TLP, so wait another 300ms
+        tracker.time_source.advance(Duration::from_millis(299));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Still waiting for RTO
             _ => panic!("Should still be waiting for RTO"),
