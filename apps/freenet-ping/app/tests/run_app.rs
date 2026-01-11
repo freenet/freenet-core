@@ -1,10 +1,6 @@
 mod common;
 
-use std::{
-    net::{Ipv4Addr, TcpListener},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
@@ -23,9 +19,8 @@ use tokio::{select, time::sleep, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    allocate_test_node_block, base_node_test_config_with_rng, connect_async_with_config,
-    gw_config_from_path_with_rng, test_ip_for_node, ws_config, APP_TAG, PACKAGE_DIR,
-    PATH_TO_CONTRACT,
+    allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
+    gw_config_from_path_with_rng, test_ip_for_node, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -262,10 +257,15 @@ async fn wait_for_node_connected(
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_node_diagnostics_query() -> TestResult {
-    // Setup network sockets for the gateway and client node
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node = TcpListener::bind("127.0.0.1:0")?;
+    // Allocate unique IPs to avoid conflicts with parallel tests
+    let base_node_idx = allocate_test_node_block(2);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node_ip = test_ip_for_node(base_node_idx + 1);
+
+    // Setup network sockets with unique IPs
+    let network_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_node = TcpListener::bind(std::net::SocketAddr::new(node_ip.into(), 0))?;
 
     // Configure nodes with fixed seed for deterministic testing
     let test_seed = *b"diagnostics_test_seed_1234567890";
@@ -273,6 +273,7 @@ async fn test_node_diagnostics_query() -> TestResult {
 
     println!("Testing NodeDiagnostics query functionality");
     println!("Using deterministic test seed: {test_seed:?}");
+    println!("Gateway IP: {gw_ip}, Node IP: {node_ip}");
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw) = base_node_test_config_with_rng(
@@ -283,14 +284,13 @@ async fn test_node_diagnostics_query() -> TestResult {
         "gw_diagnostics", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
-        None,             // bind_ip
+        Some(gw_ip),      // bind_ip
         &mut test_rng,
     )
     .await?;
     let public_port = config_gw.network_api.public_port.unwrap();
     let path = preset_cfg_gw.temp_dir.path().to_path_buf();
-    let config_gw_info =
-        gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?;
+    let config_gw_info = gw_config_from_path_with_rng(public_port, &path, &mut test_rng, gw_ip)?;
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node
@@ -302,7 +302,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         "node_diagnostics", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
-        None,               // bind_ip
+        Some(node_ip),      // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -348,23 +348,18 @@ async fn test_node_diagnostics_query() -> TestResult {
 
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(120), async {
-        // Wait for nodes to start up and connect
-        tokio::time::sleep(Duration::from_secs(15)).await;
-
-        // Connect to both nodes
+        // Connect to both nodes with retry logic
         let uri_gw = format!(
-            "ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
+            "ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node = format!(
-            "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
+            "ws://{node_ip}:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
         );
 
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let (stream_node, _) =
-            connect_async_with_config(&uri_node, Some(ws_config()), false).await?;
-
-        let mut client_gw = WebApi::start(stream_gw);
-        let mut client_node = WebApi::start(stream_node);
+        println!("Connecting to nodes (with retry)...");
+        let mut client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
+        let mut client_node = connect_ws_with_retry(&uri_node, "Node", 60).await?;
+        println!("WebSocket connections established!");
 
         println!("=== TESTING NODE DIAGNOSTICS QUERIES ===");
 
@@ -748,12 +743,7 @@ async fn test_ping_multi_node() -> TestResult {
 
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start - peers wait 10s in their startup, so we wait a bit more
-        // to ensure gateway is accepting connections before we try to connect clients
-        println!("Waiting for gateway to start (12s)...");
-        tokio::time::sleep(Duration::from_secs(12)).await;
-
-        // Connect to all three nodes on their unique IPs
+        // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw = format!(
             "ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native"
         );
@@ -764,15 +754,11 @@ async fn test_ping_multi_node() -> TestResult {
             "ws://{node2_ip}:{ws_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let (stream_node1, _) =
-            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
-        let (stream_node2, _) =
-            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
-
-        let mut client_gw = WebApi::start(stream_gw);
-        let mut client_node1 = WebApi::start(stream_node1);
-        let mut client_node2 = WebApi::start(stream_node2);
+        println!("Connecting to nodes (with retry)...");
+        let mut client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 60).await?;
+        let mut client_node2 = connect_ws_with_retry(&uri_node2, "Node2", 60).await?;
+        println!("All WebSocket connections established!");
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
@@ -1455,11 +1441,7 @@ async fn test_ping_application_loop() -> TestResult {
 
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for gateway to start - peers wait 10s in their startup
-        println!("Waiting for gateway to start (12s)...");
-        tokio::time::sleep(Duration::from_secs(12)).await;
-
-        // Connect to all three nodes (using unique IPs)
+        // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 =
@@ -1467,15 +1449,11 @@ async fn test_ping_application_loop() -> TestResult {
         let uri_node2 =
             format!("ws://{node2_ip}:{ws_port_node2}/v1/contract/command?encodingProtocol=native");
 
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let (stream_node1, _) =
-            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
-        let (stream_node2, _) =
-            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
-
-        let mut client_gw = WebApi::start(stream_gw);
-        let mut client_node1 = WebApi::start(stream_node1);
-        let mut client_node2 = WebApi::start(stream_node2);
+        println!("Connecting to nodes (with retry)...");
+        let mut client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 60).await?;
+        let mut client_node2 = connect_ws_with_retry(&uri_node2, "Node2", 60).await?;
+        println!("All WebSocket connections established!");
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");

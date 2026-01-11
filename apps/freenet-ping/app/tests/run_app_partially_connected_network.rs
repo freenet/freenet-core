@@ -25,7 +25,7 @@ use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use futures::FutureExt;
@@ -33,8 +33,8 @@ use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, connect_ws_with_retry, gw_config_from_path_with_ip,
+    wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 /// Test for subscription propagation in a partially connected network.
@@ -253,36 +253,29 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
     }
 
     let test = tokio::time::timeout(Duration::from_secs(300), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(25)).await;
+        // Small initial wait for nodes to start binding ports
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Connect to all nodes
+        // Connect to all nodes with retry logic
+        // Use the correct IPs for each node (WebSocket servers bind to node IPs, not 127.0.0.1)
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
+            let ip = gateway_ips[i];
             let uri = format!(
-                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
+                "ws://{ip}:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false)
-                .await
-                .inspect_err(|err| {
-                    println!("Failed to connect to gateway ws {i}: {err}");
-                })?;
-            let client = WebApi::start(stream);
+            let client = connect_ws_with_retry(&uri, &format!("Gateway{i}"), 60).await?;
             gateway_clients.push(client);
             println!("Connected to gateway {i}");
         }
 
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
+            let ip = node_ips[i];
             let uri = format!(
-                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
+                "ws://{ip}:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false)
-                .await
-                .inspect_err(|err| {
-                    println!("Failed to connect to regular node ws {i}: {err}");
-                })?;
-            let client = WebApi::start(stream);
+            let client = connect_ws_with_retry(&uri, &format!("Node{i}"), 60).await?;
             node_clients.push(client);
             println!("Connected to regular node {i}");
         }
