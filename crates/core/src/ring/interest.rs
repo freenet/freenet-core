@@ -174,15 +174,20 @@ impl LocalInterest {
     }
 }
 
-/// Key for delta cache: (peer's summary bytes, our summary bytes).
+/// Key for delta cache: (contract key, peer's summary bytes, our summary bytes).
+///
+/// Includes contract key to prevent cross-contract cache pollution when
+/// different contracts happen to have identical summary bytes.
 #[derive(Clone, PartialEq, Eq)]
 struct DeltaCacheKey {
+    contract: ContractKey,
     peer_summary: Vec<u8>,
     our_summary: Vec<u8>,
 }
 
 impl Hash for DeltaCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.contract.hash(state);
         self.peer_summary.hash(state);
         self.our_summary.hash(state);
     }
@@ -687,8 +692,15 @@ impl<T: TimeSource> InterestManager<T> {
     }
 
     /// Cache a computed delta for reuse.
-    pub fn cache_delta(&self, peer_summary: &[u8], our_summary: &[u8], delta: StateDelta<'static>) {
+    pub fn cache_delta(
+        &self,
+        contract: &ContractKey,
+        peer_summary: &[u8],
+        our_summary: &[u8],
+        delta: StateDelta<'static>,
+    ) {
         let key = DeltaCacheKey {
+            contract: *contract,
             peer_summary: peer_summary.to_vec(),
             our_summary: our_summary.to_vec(),
         };
@@ -698,10 +710,12 @@ impl<T: TimeSource> InterestManager<T> {
     /// Look up a cached delta.
     pub fn get_cached_delta(
         &self,
+        contract: &ContractKey,
         peer_summary: &[u8],
         our_summary: &[u8],
     ) -> Option<StateDelta<'static>> {
         let key = DeltaCacheKey {
+            contract: *contract,
             peer_summary: peer_summary.to_vec(),
             our_summary: our_summary.to_vec(),
         };
@@ -772,11 +786,11 @@ impl<T: TimeSource> InterestManager<T> {
     ) -> Result<StateDelta<'static>, String> {
         use crate::contract::ContractHandlerEvent;
 
-        // Check cache first (keyed by actual summaries, not state bytes)
+        // Check cache first (keyed by contract + actual summaries)
         let our_summary_bytes = our_summary.as_ref().to_vec();
         let their_summary_bytes = their_summary.as_ref().to_vec();
 
-        if let Some(cached) = self.get_cached_delta(&their_summary_bytes, &our_summary_bytes) {
+        if let Some(cached) = self.get_cached_delta(key, &their_summary_bytes, &our_summary_bytes) {
             tracing::trace!(
                 contract = %key,
                 "Using cached delta"
@@ -799,8 +813,8 @@ impl<T: TimeSource> InterestManager<T> {
             .await
         {
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
-                // Cache the result
-                self.cache_delta(&their_summary_bytes, &our_summary_bytes, d.clone());
+                // Cache the result (includes contract key to prevent cross-contract pollution)
+                self.cache_delta(key, &their_summary_bytes, &our_summary_bytes, d.clone());
                 Ok(d)
             }
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
@@ -1052,6 +1066,8 @@ mod tests {
     #[test]
     fn test_delta_cache() {
         let (manager, _time) = make_manager();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
 
         let peer_summary = vec![1, 2, 3];
         let our_summary = vec![4, 5, 6];
@@ -1059,16 +1075,21 @@ mod tests {
 
         // Cache miss
         assert!(manager
-            .get_cached_delta(&peer_summary, &our_summary)
+            .get_cached_delta(&contract1, &peer_summary, &our_summary)
             .is_none());
 
-        // Cache the delta
-        manager.cache_delta(&peer_summary, &our_summary, delta.clone());
+        // Cache the delta for contract1
+        manager.cache_delta(&contract1, &peer_summary, &our_summary, delta.clone());
 
-        // Cache hit
-        let cached = manager.get_cached_delta(&peer_summary, &our_summary);
+        // Cache hit for contract1
+        let cached = manager.get_cached_delta(&contract1, &peer_summary, &our_summary);
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().as_ref(), delta.as_ref());
+
+        // Cache miss for contract2 with same summaries (contract key isolates cache entries)
+        assert!(manager
+            .get_cached_delta(&contract2, &peer_summary, &our_summary)
+            .is_none());
     }
 
     #[test]
