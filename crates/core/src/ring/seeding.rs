@@ -88,8 +88,6 @@ pub enum SubscriptionError {
     MaxSubscribersReached,
     /// Attempted to add self as subscriber (self-reference).
     SelfReference,
-    /// Attempted to create a circular reference (peer already on opposite side of tree).
-    CircularReference,
 }
 
 /// Result of adding a downstream subscriber.
@@ -201,9 +199,12 @@ impl SeedingManager {
     ///
     /// Returns information about the operation for telemetry.
     ///
+    /// Note: A peer CAN be both upstream and downstream simultaneously. This enables
+    /// bidirectional update flow when network routing creates such relationships.
+    /// The sender-filtering in update propagation prevents infinite loops.
+    ///
     /// # Errors
     /// - `SelfReference`: The subscriber address matches our own address
-    /// - `CircularReference`: The subscriber is already our upstream for this contract
     /// - `MaxSubscribersReached`: Maximum downstream subscribers limit reached
     pub fn add_downstream(
         &self,
@@ -232,23 +233,6 @@ impl SeedingManager {
         }
 
         let mut subs = self.subscriptions.entry(*contract).or_default();
-
-        // Validate: prevent circular reference (subscriber is already our upstream)
-        let is_our_upstream = subs.iter().any(|e| {
-            e.role == SubscriberType::Upstream && e.peer.socket_addr() == subscriber.socket_addr()
-        });
-        if is_our_upstream {
-            let sub_addr = subscriber
-                .socket_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "unknown".into());
-            warn!(
-                %contract,
-                subscriber = %sub_addr,
-                "add_downstream: rejected circular reference (subscriber is already our upstream)"
-            );
-            return Err(SubscriptionError::CircularReference);
-        }
 
         // Count current downstream subscribers
         let downstream_count = subs
@@ -317,9 +301,12 @@ impl SeedingManager {
     ///
     /// The `own_addr` parameter is our own network address, used to prevent self-references.
     ///
+    /// Note: A peer CAN be both upstream and downstream simultaneously. This enables
+    /// bidirectional update flow when network routing creates such relationships.
+    /// The sender-filtering in update propagation prevents infinite loops.
+    ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
-    /// - `CircularReference`: The upstream is already in our downstream list for this contract
     pub fn set_upstream(
         &self,
         contract: &ContractKey,
@@ -339,23 +326,6 @@ impl SeedingManager {
         }
 
         let mut subs = self.subscriptions.entry(*contract).or_default();
-
-        // Validate: prevent circular reference (upstream is already our downstream)
-        let is_our_downstream = subs.iter().any(|e| {
-            e.role == SubscriberType::Downstream && e.peer.socket_addr() == upstream.socket_addr()
-        });
-        if is_our_downstream {
-            let up_addr = upstream
-                .socket_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "unknown".into());
-            warn!(
-                %contract,
-                upstream = %up_addr,
-                "set_upstream: rejected circular reference (upstream is already our downstream)"
-            );
-            return Err(SubscriptionError::CircularReference);
-        }
 
         // Remove any existing upstream
         subs.retain(|e| e.role != SubscriberType::Upstream);
@@ -1816,33 +1786,58 @@ mod tests {
     }
 
     #[test]
-    fn test_add_downstream_rejects_circular_reference() {
+    fn test_bidirectional_subscription_allowed() {
+        // A peer CAN be both upstream and downstream simultaneously.
+        // This enables bidirectional update flow when network routing creates such relationships.
         let manager = SeedingManager::new();
         let contract = make_contract_key(1);
         let peer = test_peer_loc(1);
 
-        // First set this peer as our upstream
+        // Set peer as upstream (we receive updates FROM them)
         manager.set_upstream(&contract, peer.clone(), None).unwrap();
 
-        // Now try to add the same peer as downstream - should be rejected (circular)
+        // Add same peer as downstream (they receive updates FROM us)
+        // This should succeed - bidirectional relationships are valid
         let result = manager.add_downstream(&contract, peer.clone(), None, None);
-        assert_eq!(result, Err(SubscriptionError::CircularReference));
+        assert!(
+            result.is_ok(),
+            "Bidirectional subscription should be allowed"
+        );
+        assert!(result.unwrap().is_new);
+
+        // Verify both relationships exist
+        assert_eq!(
+            manager.get_upstream(&contract).unwrap().socket_addr(),
+            peer.socket_addr()
+        );
+        assert!(manager.get_downstream(&contract).contains(&peer));
     }
 
     #[test]
-    fn test_set_upstream_rejects_circular_reference() {
+    fn test_bidirectional_subscription_reverse_order() {
+        // Test the reverse order: add downstream first, then set upstream
         let manager = SeedingManager::new();
         let contract = make_contract_key(1);
         let peer = test_peer_loc(1);
 
-        // First add this peer as downstream
+        // Add peer as downstream first
         manager
             .add_downstream(&contract, peer.clone(), None, None)
             .unwrap();
 
-        // Now try to set the same peer as upstream - should be rejected (circular)
+        // Now set same peer as upstream - should also succeed
         let result = manager.set_upstream(&contract, peer.clone(), None);
-        assert_eq!(result, Err(SubscriptionError::CircularReference));
+        assert!(
+            result.is_ok(),
+            "Bidirectional subscription should be allowed"
+        );
+
+        // Verify both relationships exist
+        assert_eq!(
+            manager.get_upstream(&contract).unwrap().socket_addr(),
+            peer.socket_addr()
+        );
+        assert!(manager.get_downstream(&contract).contains(&peer));
     }
 
     #[test]
