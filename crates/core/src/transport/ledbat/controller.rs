@@ -960,35 +960,15 @@ impl<T: TimeSource> LedbatController<T> {
         }
     }
 
-    // =========================================================================
-    // Internal methods for CongestionController trait implementation
-    // =========================================================================
-    // These methods have different names to avoid conflicts with trait methods
-    // when implementing the CongestionController trait.
-
-    /// Internal: Track bytes sent (for trait implementation).
-    #[inline]
-    pub(crate) fn track_send(&self, bytes: usize) {
-        self.on_send(bytes)
-    }
-
-    /// Internal: Process ACK with RTT sample (for trait implementation).
-    #[inline]
-    pub(crate) fn process_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
-        self.on_ack(rtt_sample, bytes_acked)
-    }
-
-    /// Internal: Process ACK without RTT sample (for trait implementation).
-    #[inline]
-    pub(crate) fn process_ack_no_rtt(&self, bytes_acked: usize) {
-        self.on_ack_without_rtt(bytes_acked)
-    }
-
-    /// Internal: Handle packet loss (for trait implementation).
-    #[inline]
+    /// Handle packet loss event.
+    ///
+    /// Called when packet loss is detected (e.g., via duplicate ACKs).
+    /// Reduces the congestion window by half (multiplicative decrease).
+    ///
+    /// Note: The `#[cfg(test)]` `on_loss` method provides the same functionality
+    /// but is only available in test builds. This method is used by the
+    /// congestion control interface for production code.
     pub(crate) fn handle_loss(&self) {
-        use std::sync::atomic::Ordering;
-
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
         if self.congestion_state.is_slow_start() {
@@ -1007,54 +987,6 @@ impl<T: TimeSource> LedbatController<T> {
             total_losses = self.total_losses.load(Ordering::Relaxed),
             "LEDBAT packet loss - halving cwnd"
         );
-    }
-
-    /// Internal: Handle timeout (for trait implementation).
-    #[inline]
-    pub(crate) fn handle_timeout(&self) {
-        self.on_timeout()
-    }
-
-    /// Internal: Get current cwnd (for trait implementation).
-    #[inline]
-    pub(crate) fn get_cwnd(&self) -> usize {
-        self.current_cwnd()
-    }
-
-    /// Internal: Get current rate (for trait implementation).
-    #[inline]
-    pub(crate) fn get_rate(&self, rtt: Duration) -> usize {
-        self.current_rate(rtt)
-    }
-
-    /// Internal: Get flightsize (for trait implementation).
-    #[inline]
-    pub(crate) fn get_flightsize(&self) -> usize {
-        self.flightsize()
-    }
-
-    /// Internal: Get base delay (for trait implementation).
-    #[inline]
-    pub(crate) fn get_base_delay(&self) -> Duration {
-        self.base_delay()
-    }
-
-    /// Internal: Get queuing delay (for trait implementation).
-    #[inline]
-    pub(crate) fn get_queuing_delay(&self) -> Duration {
-        self.queuing_delay()
-    }
-
-    /// Internal: Get peak cwnd (for trait implementation).
-    #[inline]
-    pub(crate) fn get_peak_cwnd(&self) -> usize {
-        self.peak_cwnd()
-    }
-
-    /// Internal: Get stats (for trait implementation).
-    #[inline]
-    pub(crate) fn get_stats(&self) -> LedbatStats {
-        self.stats()
     }
 }
 

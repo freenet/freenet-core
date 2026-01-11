@@ -1,7 +1,15 @@
 //! Congestion control interface for the transport layer.
 //!
 //! This module provides a pluggable interface for congestion control algorithms,
-//! allowing the transport layer to switch between different algorithms at runtime.
+//! allowing selection between different algorithms via configuration.
+//!
+//! ## Design
+//!
+//! The design uses enum dispatch rather than trait objects since all algorithm
+//! types are known at compile time. This provides:
+//! - Zero-cost abstraction (no vtable indirection)
+//! - Full access to algorithm-specific statistics via pattern matching
+//! - Type-safe configuration
 //!
 //! ## Supported Algorithms
 //!
@@ -19,9 +27,15 @@
 //! let config = CongestionControlConfig::default();
 //! let controller = config.build();
 //!
-//! // Or explicitly select an algorithm
-//! let config = CongestionControlConfig::new(CongestionControlAlgorithm::Ledbat);
-//! let controller = config.build();
+//! // Use the controller
+//! controller.on_send(1000);
+//! controller.on_ack(Duration::from_millis(50), 1000);
+//!
+//! // Access algorithm-specific stats via pattern matching
+//! if let CongestionController::Ledbat(ledbat) = &*controller {
+//!     let stats = ledbat.stats();
+//!     println!("Periodic slowdowns: {}", stats.periodic_slowdowns);
+//! }
 //! ```
 
 use std::fmt;
@@ -38,9 +52,11 @@ use super::ledbat::{LedbatConfig, LedbatController, LedbatStats};
 
 /// Identifies the congestion control algorithm in use.
 ///
-/// This enum allows runtime inspection of which algorithm is being used,
-/// which is useful for logging, telemetry, and debugging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// This enum is used for:
+/// - Configuration: Selecting which algorithm to use
+/// - Telemetry: Identifying the algorithm in statistics
+/// - Logging: Human-readable algorithm names
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum CongestionControlAlgorithm {
     /// LEDBAT++ (Low Extra Delay Background Transport)
@@ -48,6 +64,7 @@ pub enum CongestionControlAlgorithm {
     /// Delay-based congestion control optimized for background traffic.
     /// Yields to loss-based flows (TCP) and maintains low queuing delay.
     /// Based on draft-irtf-iccrg-ledbat-plus-plus.
+    #[default]
     Ledbat,
     // Future algorithms can be added here:
     // TcpReno,
@@ -72,8 +89,8 @@ impl fmt::Display for CongestionControlAlgorithm {
 /// These statistics are common across all congestion control algorithms and
 /// provide a unified interface for telemetry and monitoring.
 ///
-/// For algorithm-specific statistics, use the `algorithm_stats()` method
-/// on the controller to get the native stats type.
+/// For algorithm-specific statistics, pattern match on the `CongestionController`
+/// enum to access the native stats type.
 #[derive(Debug, Clone)]
 pub struct CongestionControlStats {
     /// Algorithm identifier.
@@ -99,99 +116,74 @@ pub struct CongestionControlStats {
 impl CongestionControlStats {
     /// Calculate effective bandwidth based on cwnd and RTT.
     ///
-    /// Returns bytes per second, or 0 if RTT is zero.
+    /// Returns bytes per second. Returns 0 if RTT is zero to avoid division by zero.
+    /// For very small RTTs with large windows, the result is capped at `usize::MAX`.
     pub fn effective_bandwidth(&self, rtt: Duration) -> usize {
         if rtt.is_zero() {
             return 0;
         }
         let rtt_secs = rtt.as_secs_f64();
-        (self.cwnd as f64 / rtt_secs) as usize
+        let bandwidth = self.cwnd as f64 / rtt_secs;
+        // Cap at usize::MAX to prevent overflow when casting
+        if bandwidth > usize::MAX as f64 {
+            usize::MAX
+        } else {
+            bandwidth as usize
+        }
     }
 }
 
 // =============================================================================
-// Congestion Controller Trait
+// Congestion Control Trait
 // =============================================================================
 
-/// Trait for congestion control algorithms.
+/// Trait defining the interface for congestion control algorithms.
 ///
-/// This trait defines the interface that all congestion control algorithms must
-/// implement. It provides methods for:
-///
-/// - **Event handling**: Responding to network events (sends, ACKs, losses, timeouts)
-/// - **State queries**: Getting current congestion state (cwnd, flightsize, delays)
-/// - **Statistics**: Collecting algorithm-agnostic metrics
+/// This trait specifies what operations a congestion controller must support.
+/// It's implemented by concrete algorithm types (e.g., `LedbatController`)
+/// and by the `CongestionController` enum for dispatch.
 ///
 /// ## Thread Safety
 ///
 /// Implementations must be `Send + Sync` to allow sharing across async tasks.
-/// Individual method calls are expected to be atomic or lock-free, but compound
-/// operations (e.g., state change + associated updates) may not be atomic.
-///
-/// ## Example Implementation
-///
-/// ```ignore
-/// struct MyController { /* ... */ }
-///
-/// impl CongestionController for MyController {
-///     fn on_send(&self, bytes: usize) {
-///         // Track bytes in flight
-///     }
-///
-///     fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
-///         // Update RTT estimates and adjust cwnd
-///     }
-///
-///     // ... other methods
-/// }
-/// ```
-pub trait CongestionController: Send + Sync {
+/// The `LedbatController` implementation uses lock-free atomics for all
+/// hot-path operations to ensure thread safety without contention.
+pub trait CongestionControl: Send + Sync {
     // =========================================================================
     // Event Handlers
     // =========================================================================
 
     /// Called when bytes are sent.
     ///
-    /// The implementation should update its internal flight size tracking.
-    /// This is called after the packet is successfully queued for sending.
+    /// Updates internal flight size tracking. Called after the packet
+    /// is successfully queued for sending.
     fn on_send(&self, bytes: usize);
 
     /// Called when an ACK is received with RTT sample.
     ///
-    /// This is the primary feedback mechanism for congestion control.
-    /// The implementation should:
+    /// This is the primary feedback mechanism. The implementation should:
     /// - Update RTT estimates (base delay, smoothed RTT)
     /// - Adjust congestion window based on algorithm rules
     /// - Decrement flight size by `bytes_acked`
-    ///
-    /// # Arguments
-    ///
-    /// * `rtt_sample` - Round-trip time for the acknowledged packet
-    /// * `bytes_acked` - Number of bytes acknowledged
     fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize);
 
     /// Called when an ACK is received for a retransmitted packet.
     ///
-    /// Per Karn's algorithm, RTT samples from retransmitted packets should not
-    /// be used to update RTT estimates (we can't know which transmission was ACKed).
-    /// However, the flight size should still be decremented.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes_acked` - Number of bytes acknowledged
+    /// Per Karn's algorithm, RTT samples from retransmitted packets are
+    /// ambiguous and should not update RTT estimates. However, flight
+    /// size must still be decremented.
     fn on_ack_without_rtt(&self, bytes_acked: usize);
 
     /// Called when packet loss is detected (e.g., via duplicate ACKs).
     ///
-    /// The implementation should reduce the congestion window according to
-    /// its algorithm's loss response (e.g., multiplicative decrease).
+    /// The implementation reduces the congestion window according to
+    /// its loss response (typically multiplicative decrease).
     fn on_loss(&self);
 
     /// Called when a retransmission timeout (RTO) occurs.
     ///
-    /// This indicates severe congestion or path failure. Implementations
-    /// typically respond more aggressively than to normal loss, often
-    /// resetting to minimum cwnd and re-entering slow start.
+    /// This indicates severe congestion. Implementations typically
+    /// reset to minimum cwnd and re-enter slow start.
     fn on_timeout(&self);
 
     // =========================================================================
@@ -199,43 +191,23 @@ pub trait CongestionController: Send + Sync {
     // =========================================================================
 
     /// Returns the current congestion window in bytes.
-    ///
-    /// This is the maximum number of bytes that can be in flight at once.
     fn current_cwnd(&self) -> usize;
 
     /// Returns the current sending rate in bytes per second.
     ///
-    /// This is typically calculated as `cwnd / rtt`, representing the
-    /// sustainable throughput at the current congestion state.
-    ///
-    /// # Arguments
-    ///
-    /// * `rtt` - Current RTT estimate (typically base delay or smoothed RTT)
+    /// Calculated as `cwnd / rtt`.
     fn current_rate(&self, rtt: Duration) -> usize;
 
-    /// Returns the current flight size in bytes.
-    ///
-    /// Flight size is the number of bytes sent but not yet acknowledged.
-    /// Sending is blocked when `flightsize >= cwnd`.
+    /// Returns the current flight size (bytes sent but not yet ACKed).
     fn flightsize(&self) -> usize;
 
     /// Returns the base delay (minimum observed RTT).
-    ///
-    /// Base delay represents the propagation delay of the path without
-    /// queuing. It's used by delay-based algorithms like LEDBAT to
-    /// estimate queuing delay.
     fn base_delay(&self) -> Duration;
 
     /// Returns the current queuing delay estimate.
-    ///
-    /// Queuing delay is the estimated time packets spend in network queues,
-    /// calculated as `current_rtt - base_delay`.
     fn queuing_delay(&self) -> Duration;
 
     /// Returns the peak congestion window achieved.
-    ///
-    /// This is useful for diagnostics to understand the maximum throughput
-    /// achieved during the connection lifetime.
     fn peak_cwnd(&self) -> usize;
 
     // =========================================================================
@@ -243,13 +215,170 @@ pub trait CongestionController: Send + Sync {
     // =========================================================================
 
     /// Returns algorithm-agnostic statistics.
-    ///
-    /// These statistics provide a unified view across all algorithms,
-    /// suitable for general telemetry and monitoring.
     fn stats(&self) -> CongestionControlStats;
 
     /// Returns the algorithm identifier.
     fn algorithm(&self) -> CongestionControlAlgorithm;
+}
+
+// =============================================================================
+// Congestion Controller Enum (Dispatch)
+// =============================================================================
+
+/// Congestion controller that dispatches to the configured algorithm.
+///
+/// This enum wraps concrete algorithm implementations and provides a unified
+/// interface. Using an enum instead of trait objects because:
+/// - All algorithm types are known at compile time
+/// - Zero-cost dispatch (no vtable indirection in hot paths)
+/// - Pattern matching enables access to algorithm-specific features
+///
+/// ## Example: Accessing Algorithm-Specific Stats
+///
+/// ```ignore
+/// let controller: Arc<CongestionController> = config.build();
+///
+/// // Get algorithm-agnostic stats (always available)
+/// let generic_stats = controller.stats();
+///
+/// // Get LEDBAT-specific stats via pattern matching
+/// match &*controller {
+///     CongestionController::Ledbat(ledbat) => {
+///         let ledbat_stats = ledbat.stats();
+///         println!("Periodic slowdowns: {}", ledbat_stats.periodic_slowdowns);
+///     }
+/// }
+/// ```
+pub enum CongestionController<T: TimeSource = RealTime> {
+    /// LEDBAT++ congestion controller.
+    Ledbat(LedbatController<T>),
+    // Future algorithms:
+    // TcpReno(TcpRenoController<T>),
+    // Bbr(BbrController<T>),
+}
+
+impl<T: TimeSource> fmt::Debug for CongestionController<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ledbat(c) => f
+                .debug_struct("CongestionController::Ledbat")
+                .field("cwnd", &c.current_cwnd())
+                .field("flightsize", &c.flightsize())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl<T: TimeSource> CongestionControl for CongestionController<T> {
+    fn on_send(&self, bytes: usize) {
+        match self {
+            Self::Ledbat(c) => c.on_send(bytes),
+        }
+    }
+
+    fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
+        match self {
+            Self::Ledbat(c) => c.on_ack(rtt_sample, bytes_acked),
+        }
+    }
+
+    fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        match self {
+            Self::Ledbat(c) => c.on_ack_without_rtt(bytes_acked),
+        }
+    }
+
+    fn on_loss(&self) {
+        match self {
+            Self::Ledbat(c) => c.handle_loss(),
+        }
+    }
+
+    fn on_timeout(&self) {
+        match self {
+            Self::Ledbat(c) => c.on_timeout(),
+        }
+    }
+
+    fn current_cwnd(&self) -> usize {
+        match self {
+            Self::Ledbat(c) => c.current_cwnd(),
+        }
+    }
+
+    fn current_rate(&self, rtt: Duration) -> usize {
+        match self {
+            Self::Ledbat(c) => c.current_rate(rtt),
+        }
+    }
+
+    fn flightsize(&self) -> usize {
+        match self {
+            Self::Ledbat(c) => c.flightsize(),
+        }
+    }
+
+    fn base_delay(&self) -> Duration {
+        match self {
+            Self::Ledbat(c) => c.base_delay(),
+        }
+    }
+
+    fn queuing_delay(&self) -> Duration {
+        match self {
+            Self::Ledbat(c) => c.queuing_delay(),
+        }
+    }
+
+    fn peak_cwnd(&self) -> usize {
+        match self {
+            Self::Ledbat(c) => c.peak_cwnd(),
+        }
+    }
+
+    fn stats(&self) -> CongestionControlStats {
+        match self {
+            Self::Ledbat(c) => {
+                let s = c.stats();
+                CongestionControlStats {
+                    algorithm: CongestionControlAlgorithm::Ledbat,
+                    cwnd: s.cwnd,
+                    flightsize: s.flightsize,
+                    queuing_delay: s.queuing_delay,
+                    base_delay: s.base_delay,
+                    peak_cwnd: s.peak_cwnd,
+                    total_losses: s.total_losses,
+                    total_timeouts: s.total_timeouts,
+                    ssthresh: s.ssthresh,
+                }
+            }
+        }
+    }
+
+    fn algorithm(&self) -> CongestionControlAlgorithm {
+        match self {
+            Self::Ledbat(_) => CongestionControlAlgorithm::Ledbat,
+        }
+    }
+}
+
+impl<T: TimeSource> CongestionController<T> {
+    /// Get LEDBAT-specific statistics if this is a LEDBAT controller.
+    ///
+    /// Returns `Some(LedbatStats)` for LEDBAT controllers, enabling access
+    /// to LEDBAT-specific metrics like periodic slowdown counts.
+    pub fn ledbat_stats(&self) -> Option<LedbatStats> {
+        match self {
+            Self::Ledbat(c) => Some(c.stats()),
+        }
+    }
+
+    /// Get a reference to the inner LEDBAT controller if applicable.
+    pub fn as_ledbat(&self) -> Option<&LedbatController<T>> {
+        match self {
+            Self::Ledbat(c) => Some(c),
+        }
+    }
 }
 
 // =============================================================================
@@ -258,8 +387,22 @@ pub trait CongestionController: Send + Sync {
 
 /// Configuration for creating congestion controllers.
 ///
-/// This struct allows selecting and configuring congestion control algorithms.
-/// Algorithm-specific configuration is provided via the `algorithm_config` field.
+/// Specifies which algorithm to use and its parameters. The configuration
+/// is validated and used to construct the appropriate controller variant.
+///
+/// ## Example
+///
+/// ```ignore
+/// // Default configuration (LEDBAT++)
+/// let config = CongestionControlConfig::default();
+/// let controller = config.build();
+///
+/// // Custom LEDBAT configuration
+/// let config = CongestionControlConfig::default()
+///     .with_initial_cwnd(50_000)
+///     .with_min_ssthresh(Some(25_000));
+/// let controller = config.build();
+/// ```
 #[derive(Debug, Clone)]
 pub struct CongestionControlConfig {
     /// Which algorithm to use.
@@ -316,14 +459,14 @@ impl Default for CongestionControlConfig {
 }
 
 impl CongestionControlConfig {
-    /// Create a new configuration for the specified algorithm.
+    /// Create a new configuration for the specified algorithm with defaults.
     pub fn new(algorithm: CongestionControlAlgorithm) -> Self {
         match algorithm {
             CongestionControlAlgorithm::Ledbat => Self::default(),
         }
     }
 
-    /// Create a configuration from a LedbatConfig.
+    /// Create a configuration from an existing LedbatConfig.
     pub fn from_ledbat_config(config: LedbatConfig) -> Self {
         Self {
             algorithm: CongestionControlAlgorithm::Ledbat,
@@ -341,7 +484,31 @@ impl CongestionControlConfig {
         }
     }
 
-    /// Set the minimum ssthresh floor.
+    /// Set the initial congestion window.
+    pub fn with_initial_cwnd(mut self, cwnd: usize) -> Self {
+        self.initial_cwnd = cwnd;
+        self
+    }
+
+    /// Set the minimum congestion window.
+    pub fn with_min_cwnd(mut self, cwnd: usize) -> Self {
+        self.min_cwnd = cwnd;
+        self
+    }
+
+    /// Set the maximum congestion window.
+    pub fn with_max_cwnd(mut self, cwnd: usize) -> Self {
+        self.max_cwnd = cwnd;
+        self
+    }
+
+    /// Set the initial slow start threshold.
+    pub fn with_ssthresh(mut self, ssthresh: usize) -> Self {
+        self.ssthresh = ssthresh;
+        self
+    }
+
+    /// Set the minimum ssthresh floor for timeout recovery.
     pub fn with_min_ssthresh(mut self, min_ssthresh: Option<usize>) -> Self {
         self.min_ssthresh = min_ssthresh;
         self
@@ -349,9 +516,9 @@ impl CongestionControlConfig {
 
     /// Build a congestion controller from this configuration.
     ///
-    /// Returns an `Arc<dyn CongestionController>` that can be shared across tasks.
-    pub fn build(&self) -> Arc<dyn CongestionController> {
-        self.build_with_time_source(RealTime::new())
+    /// Returns an `Arc<CongestionController>` for shared ownership across tasks.
+    pub fn build(&self) -> Arc<CongestionController<RealTime>> {
+        Arc::new(self.build_inner(RealTime::new()))
     }
 
     /// Build a congestion controller with a custom time source.
@@ -360,10 +527,12 @@ impl CongestionControlConfig {
     pub fn build_with_time_source<T: TimeSource>(
         &self,
         time_source: T,
-    ) -> Arc<dyn CongestionController>
-    where
-        LedbatController<T>: CongestionController,
-    {
+    ) -> Arc<CongestionController<T>> {
+        Arc::new(self.build_inner(time_source))
+    }
+
+    /// Internal builder that creates the controller without Arc wrapping.
+    fn build_inner<T: TimeSource>(&self, time_source: T) -> CongestionController<T> {
         match self.algorithm {
             CongestionControlAlgorithm::Ledbat => {
                 let AlgorithmConfig::Ledbat {
@@ -385,7 +554,7 @@ impl CongestionControlConfig {
                     randomize_ssthresh: *randomize_ssthresh,
                 };
 
-                Arc::new(LedbatController::new_with_time_source(
+                CongestionController::Ledbat(LedbatController::new_with_time_source(
                     ledbat_config,
                     time_source,
                 ))
@@ -393,10 +562,7 @@ impl CongestionControlConfig {
         }
     }
 
-    /// Convert to the native LedbatConfig.
-    ///
-    /// Returns `Some(LedbatConfig)` if this is a LEDBAT configuration,
-    /// `None` otherwise.
+    /// Convert to the native LedbatConfig if this is a LEDBAT configuration.
     pub fn as_ledbat_config(&self) -> Option<LedbatConfig> {
         match &self.algorithm_config {
             AlgorithmConfig::Ledbat {
@@ -416,109 +582,6 @@ impl CongestionControlConfig {
                 randomize_ssthresh: *randomize_ssthresh,
             }),
         }
-    }
-}
-
-// =============================================================================
-// LedbatController Implementation of CongestionController
-// =============================================================================
-
-impl<T: TimeSource> CongestionController for LedbatController<T> {
-    fn on_send(&self, bytes: usize) {
-        // Delegate to inherent method
-        self.track_send(bytes)
-    }
-
-    fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
-        // Delegate to inherent method
-        self.process_ack(rtt_sample, bytes_acked)
-    }
-
-    fn on_ack_without_rtt(&self, bytes_acked: usize) {
-        // Delegate to inherent method
-        self.process_ack_no_rtt(bytes_acked)
-    }
-
-    fn on_loss(&self) {
-        // Delegate to inherent method
-        self.handle_loss()
-    }
-
-    fn on_timeout(&self) {
-        // Delegate to inherent method
-        self.handle_timeout()
-    }
-
-    fn current_cwnd(&self) -> usize {
-        self.get_cwnd()
-    }
-
-    fn current_rate(&self, rtt: Duration) -> usize {
-        self.get_rate(rtt)
-    }
-
-    fn flightsize(&self) -> usize {
-        self.get_flightsize()
-    }
-
-    fn base_delay(&self) -> Duration {
-        self.get_base_delay()
-    }
-
-    fn queuing_delay(&self) -> Duration {
-        self.get_queuing_delay()
-    }
-
-    fn peak_cwnd(&self) -> usize {
-        self.get_peak_cwnd()
-    }
-
-    fn stats(&self) -> CongestionControlStats {
-        let ledbat_stats = self.get_stats();
-        CongestionControlStats {
-            algorithm: CongestionControlAlgorithm::Ledbat,
-            cwnd: ledbat_stats.cwnd,
-            flightsize: ledbat_stats.flightsize,
-            queuing_delay: ledbat_stats.queuing_delay,
-            base_delay: ledbat_stats.base_delay,
-            peak_cwnd: ledbat_stats.peak_cwnd,
-            total_losses: ledbat_stats.total_losses,
-            total_timeouts: ledbat_stats.total_timeouts,
-            ssthresh: ledbat_stats.ssthresh,
-        }
-    }
-
-    fn algorithm(&self) -> CongestionControlAlgorithm {
-        CongestionControlAlgorithm::Ledbat
-    }
-}
-
-// =============================================================================
-// Extension Trait for Algorithm-Specific Stats
-// =============================================================================
-
-/// Extension trait for accessing algorithm-specific statistics.
-///
-/// This trait provides a way to get native statistics types when the
-/// underlying algorithm is known.
-pub trait CongestionControllerExt: CongestionController {
-    /// Get LEDBAT-specific statistics if this is a LEDBAT controller.
-    fn ledbat_stats(&self) -> Option<LedbatStats>;
-}
-
-impl<T: TimeSource> CongestionControllerExt for LedbatController<T> {
-    fn ledbat_stats(&self) -> Option<LedbatStats> {
-        Some(LedbatController::stats(self))
-    }
-}
-
-// Default implementation for dyn CongestionController - returns None
-// since we can't know the concrete type at runtime without downcasting
-impl CongestionControllerExt for dyn CongestionController {
-    fn ledbat_stats(&self) -> Option<LedbatStats> {
-        // Would need downcasting to get algorithm-specific stats
-        // For now, return None for the trait object case
-        None
     }
 }
 
@@ -577,6 +640,36 @@ mod tests {
     }
 
     #[test]
+    fn test_ledbat_specific_stats_access() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        // Access LEDBAT-specific stats via method
+        let ledbat_stats = controller.ledbat_stats();
+        assert!(ledbat_stats.is_some());
+
+        // Access via pattern matching
+        match &*controller {
+            CongestionController::Ledbat(ledbat) => {
+                let stats = ledbat.stats();
+                assert!(stats.cwnd > 0);
+                // LEDBAT-specific field
+                assert_eq!(stats.periodic_slowdowns, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_as_ledbat_accessor() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        let ledbat = controller.as_ledbat();
+        assert!(ledbat.is_some());
+        assert!(ledbat.unwrap().current_cwnd() > 0);
+    }
+
+    #[test]
     fn test_from_ledbat_config() {
         let ledbat_config = LedbatConfig {
             initial_cwnd: 50_000,
@@ -590,11 +683,30 @@ mod tests {
             randomize_ssthresh: false,
         };
 
-        let config = CongestionControlConfig::from_ledbat_config(ledbat_config.clone());
+        let config = CongestionControlConfig::from_ledbat_config(ledbat_config);
         let controller = config.build();
 
         assert_eq!(controller.current_cwnd(), 50_000);
         assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Ledbat);
+    }
+
+    #[test]
+    fn test_builder_methods() {
+        let config = CongestionControlConfig::default()
+            .with_initial_cwnd(60_000)
+            .with_min_cwnd(3_000)
+            .with_max_cwnd(2_000_000)
+            .with_ssthresh(500_000)
+            .with_min_ssthresh(Some(50_000));
+
+        assert_eq!(config.initial_cwnd, 60_000);
+        assert_eq!(config.min_cwnd, 3_000);
+        assert_eq!(config.max_cwnd, 2_000_000);
+        assert_eq!(config.ssthresh, 500_000);
+        assert_eq!(config.min_ssthresh, Some(50_000));
+
+        let controller = config.build();
+        assert_eq!(controller.current_cwnd(), 60_000);
     }
 
     #[test]
@@ -626,5 +738,50 @@ mod tests {
         // Zero RTT returns 0
         let bandwidth_zero = stats.effective_bandwidth(Duration::ZERO);
         assert_eq!(bandwidth_zero, 0);
+    }
+
+    #[test]
+    fn test_effective_bandwidth_overflow_protection() {
+        let stats = CongestionControlStats {
+            algorithm: CongestionControlAlgorithm::Ledbat,
+            cwnd: usize::MAX,
+            flightsize: 0,
+            queuing_delay: Duration::ZERO,
+            base_delay: Duration::ZERO,
+            peak_cwnd: usize::MAX,
+            total_losses: 0,
+            total_timeouts: 0,
+            ssthresh: usize::MAX,
+        };
+
+        // Very small RTT with max cwnd should not overflow
+        let bandwidth = stats.effective_bandwidth(Duration::from_nanos(1));
+        assert_eq!(bandwidth, usize::MAX);
+    }
+
+    #[test]
+    fn test_on_loss_reduces_cwnd() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        let initial_cwnd = controller.current_cwnd();
+        controller.on_loss();
+        let after_loss_cwnd = controller.current_cwnd();
+
+        // Loss should reduce cwnd (typically by half)
+        assert!(after_loss_cwnd < initial_cwnd);
+    }
+
+    #[test]
+    fn test_on_timeout_reduces_cwnd() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        let initial_cwnd = controller.current_cwnd();
+        controller.on_timeout();
+        let after_timeout_cwnd = controller.current_cwnd();
+
+        // Timeout should reduce cwnd significantly
+        assert!(after_timeout_cwnd < initial_cwnd);
     }
 }

@@ -71,8 +71,8 @@ pub(crate) mod token_bucket;
 pub use ledbat::LedbatStats;
 // Re-export congestion control interface
 pub use congestion_control::{
-    AlgorithmConfig, CongestionControlAlgorithm, CongestionControlConfig, CongestionControlStats,
-    CongestionController, CongestionControllerExt,
+    AlgorithmConfig, CongestionControl, CongestionControlAlgorithm, CongestionControlConfig,
+    CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
 pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
