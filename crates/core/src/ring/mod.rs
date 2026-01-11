@@ -698,7 +698,6 @@ impl Ring {
     ///
     /// # Errors
     /// - `SelfReference`: The subscriber address matches our own address
-    /// - `CircularReference`: The subscriber is already our upstream for this contract
     /// - `MaxSubscribersReached`: Maximum downstream subscribers limit reached
     pub fn add_downstream(
         &self,
@@ -715,7 +714,6 @@ impl Ring {
     ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
-    /// - `CircularReference`: The upstream is already in our downstream list for this contract
     pub fn set_upstream(
         &self,
         contract: &ContractKey,
