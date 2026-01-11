@@ -342,6 +342,10 @@ pub(crate) enum NetMessageV1 {
     ProximityCache {
         message: ProximityCacheMessage,
     },
+    /// Interest synchronization protocol for delta-based updates.
+    InterestSync {
+        message: InterestMessage,
+    },
 }
 
 /// Messages for the proximity cache protocol.
@@ -364,6 +368,171 @@ pub enum ProximityCacheMessage {
     CacheStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
+/// Messages for the delta-based interest synchronization protocol.
+///
+/// This protocol enables peers to:
+/// 1. Discover shared contract interests at connection time
+/// 2. Exchange state summaries for delta computation
+/// 3. Track interest changes during the connection
+/// 4. Request full state resync when delta application fails
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InterestMessage {
+    /// Connection-time interest exchange.
+    ///
+    /// Sent by both peers immediately after connection establishment.
+    /// Contains fast hashes (FNV-1a) of contract IDs for efficient matching.
+    Interests {
+        /// Fast u32 hashes of contract IDs we're interested in.
+        hashes: Vec<u32>,
+    },
+
+    /// State summaries for contracts both peers share interest in.
+    ///
+    /// Sent after comparing `Interests` hashes. Only includes summaries
+    /// for contracts where we have state (summary is None if we have no state).
+    Summaries {
+        /// (contract_hash, summary_bytes) pairs for shared contracts.
+        /// Summary bytes is None if we're interested but don't have state yet.
+        /// Use `SummaryEntry::from_summary()` to create entries.
+        entries: Vec<SummaryEntry>,
+    },
+
+    /// Incremental changes to our contract interests.
+    ///
+    /// Sent when we gain or lose interest in contracts after connection.
+    /// The receiver responds with Summaries for newly shared contracts.
+    ChangeInterests {
+        /// Contract hashes we've newly become interested in.
+        added: Vec<u32>,
+        /// Contract hashes we're no longer interested in.
+        removed: Vec<u32>,
+    },
+
+    /// Request full state resync when delta application fails.
+    ///
+    /// Sent when a received delta cannot be applied (corruption, version mismatch).
+    /// The upstream peer responds with ResyncResponse containing full state.
+    ResyncRequest {
+        /// The contract that needs resync.
+        key: ContractKey,
+    },
+
+    /// Response to ResyncRequest with full state.
+    ///
+    /// Sent when a peer requests resync after delta application failure.
+    /// Contains the full contract state and sender's summary.
+    ResyncResponse {
+        /// The contract being resynced.
+        key: ContractKey,
+        /// Full contract state bytes.
+        state_bytes: Vec<u8>,
+        /// Sender's current state summary bytes.
+        summary_bytes: Vec<u8>,
+    },
+}
+
+/// A summary entry for the Summaries message.
+/// Uses owned bytes for wire serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryEntry {
+    /// Fast hash of the contract ID.
+    pub hash: u32,
+    /// Summary bytes, or None if we're interested but don't have state yet.
+    pub summary_bytes: Option<Vec<u8>>,
+}
+
+impl SummaryEntry {
+    /// Create a summary entry from a contract hash and optional summary.
+    pub fn from_summary(
+        hash: u32,
+        summary: Option<&freenet_stdlib::prelude::StateSummary<'_>>,
+    ) -> Self {
+        Self {
+            hash,
+            summary_bytes: summary.map(|s| s.as_ref().to_vec()),
+        }
+    }
+
+    /// Convert the summary bytes back to a StateSummary.
+    pub fn to_summary(&self) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+        self.summary_bytes
+            .as_ref()
+            .map(|bytes| freenet_stdlib::prelude::StateSummary::from(bytes.clone()))
+    }
+}
+
+/// Payload for delta-based updates.
+///
+/// Used in update messages to send either a delta (when we know the peer's summary)
+/// or full state (when we don't know their state or delta would be inefficient).
+///
+/// NOTE: This type provides foundation infrastructure for delta-based updates.
+/// Methods are marked `#[allow(dead_code)]` because they will be used in
+/// follow-up PRs that integrate the full delta sync workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub enum DeltaOrFullState {
+    /// A delta computed from the peer's cached summary.
+    /// More efficient when both peers have state and the delta is small.
+    /// Uses owned bytes for wire serialization.
+    Delta(Vec<u8>),
+
+    /// Full contract state. Used when:
+    ///
+    /// - Peer has no cached summary (first sync)
+    /// - Delta would be larger than 50% of state size
+    /// - After a ResyncRequest
+    ///
+    /// Uses owned bytes for wire serialization.
+    FullState(Vec<u8>),
+}
+
+#[allow(dead_code)]
+impl DeltaOrFullState {
+    /// Create a Delta variant from a StateDelta.
+    pub fn from_delta(delta: &freenet_stdlib::prelude::StateDelta<'_>) -> Self {
+        Self::Delta(delta.as_ref().to_vec())
+    }
+
+    /// Create a FullState variant from a State.
+    pub fn from_state(state: &freenet_stdlib::prelude::State<'_>) -> Self {
+        Self::FullState(state.as_ref().to_vec())
+    }
+
+    /// Convert to a StateDelta (if this is a Delta variant).
+    pub fn to_delta(&self) -> Option<freenet_stdlib::prelude::StateDelta<'static>> {
+        match self {
+            Self::Delta(bytes) => Some(freenet_stdlib::prelude::StateDelta::from(bytes.clone())),
+            Self::FullState(_) => None,
+        }
+    }
+
+    /// Convert to a State (if this is a FullState variant).
+    pub fn to_state(&self) -> Option<freenet_stdlib::prelude::State<'static>> {
+        match self {
+            Self::Delta(_) => None,
+            Self::FullState(bytes) => Some(freenet_stdlib::prelude::State::from(bytes.clone())),
+        }
+    }
+
+    /// Check if this is a delta (not full state).
+    pub fn is_delta(&self) -> bool {
+        matches!(self, Self::Delta(_))
+    }
+
+    /// Get the raw bytes of the payload.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Delta(bytes) | Self::FullState(bytes) => bytes,
+        }
+    }
+
+    /// Get the size in bytes of the payload.
+    pub fn size(&self) -> usize {
+        self.bytes().len()
+    }
+}
+
 trait Versioned {
     fn version(&self) -> semver::Version;
 }
@@ -384,9 +553,12 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Unsubscribed { .. } => semver::Version::new(1, 0, 0),
-            NetMessageV1::Update(_) => semver::Version::new(1, 0, 0),
+            // Version 2.0.0 for delta-based BroadcastTo format
+            NetMessageV1::Update(_) => semver::Version::new(2, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
+            // Version 1.1.0 for delta-based interest sync
+            NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
         }
     }
 }
@@ -457,6 +629,17 @@ pub(crate) enum NodeEvent {
     /// Broadcast a proximity cache message to all connected peers.
     BroadcastProximityCache {
         message: ProximityCacheMessage,
+    },
+    /// Broadcast a ChangeInterests message to all connected peers for delta sync.
+    BroadcastChangeInterests {
+        added: Vec<u32>,
+        removed: Vec<u32>,
+    },
+    /// Send an interest message to a specific peer.
+    /// Used for ResyncRequest when delta application fails.
+    SendInterestMessage {
+        target: SocketAddr,
+        message: InterestMessage,
     },
     /// A WebSocket client disconnected - clean up its subscriptions and trigger tree pruning.
     ClientDisconnected {
@@ -544,6 +727,17 @@ impl Display for NodeEvent {
             NodeEvent::BroadcastProximityCache { message } => {
                 write!(f, "BroadcastProximityCache ({message:?})")
             }
+            NodeEvent::BroadcastChangeInterests { added, removed } => {
+                write!(
+                    f,
+                    "BroadcastChangeInterests (added: {}, removed: {})",
+                    added.len(),
+                    removed.len()
+                )
+            }
+            NodeEvent::SendInterestMessage { target, message } => {
+                write!(f, "SendInterestMessage (to: {target}, msg: {message:?})")
+            }
             NodeEvent::ClientDisconnected { client_id } => {
                 write!(f, "ClientDisconnected (client: {client_id})")
             }
@@ -576,6 +770,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(tx) => tx,
             NetMessageV1::Unsubscribed { transaction, .. } => transaction,
             NetMessageV1::ProximityCache { .. } => Transaction::NULL,
+            NetMessageV1::InterestSync { .. } => Transaction::NULL,
         }
     }
 
@@ -589,6 +784,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
             NetMessageV1::ProximityCache { .. } => None,
+            NetMessageV1::InterestSync { .. } => None,
         }
     }
 }
@@ -610,6 +806,9 @@ impl Display for NetMessage {
                 }
                 ProximityCache { message } => {
                     write!(f, "ProximityCache {{ {message:?} }}")?;
+                }
+                InterestSync { message } => {
+                    write!(f, "InterestSync {{ {message:?} }}")?;
                 }
             },
         };
@@ -660,5 +859,102 @@ mod tests {
             original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
                 < crate::config::OPERATION_TTL.as_millis() as u64 + 5
         );
+    }
+
+    #[test]
+    fn delta_or_full_state_delta_serialization_roundtrip() {
+        use freenet_stdlib::prelude::StateDelta;
+
+        let delta = StateDelta::from(vec![1, 2, 3, 4, 5]);
+        let dofs = DeltaOrFullState::from_delta(&delta);
+
+        // Serialize to bincode
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+
+        // Deserialize back
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+
+        // Verify contents
+        match &deserialized {
+            DeltaOrFullState::Delta(bytes) => {
+                assert_eq!(bytes, &vec![1, 2, 3, 4, 5]);
+            }
+            DeltaOrFullState::FullState(_) => panic!("expected Delta variant"),
+        }
+
+        // Verify to_delta works
+        let recovered_delta = deserialized.to_delta().expect("should be delta");
+        assert_eq!(recovered_delta.as_ref(), delta.as_ref());
+    }
+
+    #[test]
+    fn delta_or_full_state_full_state_serialization_roundtrip() {
+        use freenet_stdlib::prelude::State;
+
+        let state = State::from(vec![10, 20, 30, 40, 50]);
+        let dofs = DeltaOrFullState::from_state(&state);
+
+        // Serialize to bincode
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+
+        // Deserialize back
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+
+        // Verify contents
+        match &deserialized {
+            DeltaOrFullState::Delta(_) => panic!("expected FullState variant"),
+            DeltaOrFullState::FullState(bytes) => {
+                assert_eq!(bytes, &vec![10, 20, 30, 40, 50]);
+            }
+        }
+
+        // Verify to_state works
+        let recovered_state = deserialized.to_state().expect("should be full state");
+        assert_eq!(recovered_state.as_ref(), state.as_ref());
+
+        // Verify to_delta returns None for FullState
+        assert!(deserialized.to_delta().is_none());
+    }
+
+    #[test]
+    fn delta_or_full_state_conversion_methods() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+
+        // Test from_delta
+        let delta = StateDelta::from(vec![1, 2, 3]);
+        let dofs = DeltaOrFullState::from_delta(&delta);
+        assert!(matches!(dofs, DeltaOrFullState::Delta(_)));
+        assert!(dofs.to_delta().is_some());
+        assert!(dofs.to_state().is_none());
+
+        // Test from_state
+        let state = State::from(vec![4, 5, 6]);
+        let dofs = DeltaOrFullState::from_state(&state);
+        assert!(matches!(dofs, DeltaOrFullState::FullState(_)));
+        assert!(dofs.to_delta().is_none());
+        assert!(dofs.to_state().is_some());
+    }
+
+    #[test]
+    fn delta_or_full_state_empty_data() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+
+        // Empty delta
+        let delta = StateDelta::from(Vec::<u8>::new());
+        let dofs = DeltaOrFullState::from_delta(&delta);
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+        assert!(matches!(deserialized, DeltaOrFullState::Delta(ref bytes) if bytes.is_empty()));
+
+        // Empty state
+        let state = State::from(Vec::<u8>::new());
+        let dofs = DeltaOrFullState::from_state(&state);
+        let serialized = bincode::serialize(&dofs).expect("serialize failed");
+        let deserialized: DeltaOrFullState =
+            bincode::deserialize(&serialized).expect("deserialize failed");
+        assert!(matches!(deserialized, DeltaOrFullState::FullState(ref bytes) if bytes.is_empty()));
     }
 }

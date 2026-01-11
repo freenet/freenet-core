@@ -41,6 +41,7 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod get_subscription_cache;
 pub use get_subscription_cache::AUTO_SUBSCRIBE_ON_GET;
+pub mod interest;
 mod live_tx;
 mod location;
 mod peer_connection_backoff;
@@ -54,6 +55,7 @@ pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
+pub use interest::PeerKey;
 pub use location::{Distance, Location};
 #[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
 pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation, UnknownAddressError};
@@ -766,11 +768,13 @@ impl Ring {
 
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
-    /// Returns a list of (contract, upstream) pairs that need Unsubscribed notification.
+    /// Returns a [`ClientDisconnectResult`] with:
+    /// - `prune_notifications`: contracts needing upstream pruning
+    /// - `affected_contracts`: all contracts where the client was subscribed (for interest cleanup)
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
-    ) -> Vec<(ContractKey, PeerKeyLocation)> {
+    ) -> seeding::ClientDisconnectResult {
         self.seeding_manager
             .remove_client_from_all_subscriptions(client_id)
     }

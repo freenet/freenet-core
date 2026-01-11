@@ -1693,14 +1693,20 @@ async fn process_open_request(
                     // Note: upstream prune notifications won't be sent (requires the event loop),
                     // but local state is cleaned up and upstream peers will eventually time out
                     // their subscription entries or clean up on their own disconnect paths.
-                    let notifications = op_manager
+                    let result = op_manager
                         .ring
                         .remove_client_from_all_subscriptions(client_id);
+
+                    // Clean up interest tracking for affected contracts
+                    for contract in &result.affected_contracts {
+                        op_manager.interest_manager.remove_local_client(contract);
+                    }
+
                     tracing::warn!(
                         %client_id,
-                        subscriptions_cleaned = notifications.len(),
+                        subscriptions_cleaned = result.affected_contracts.len(),
                         "Notification channel full/closed, cleaned up {} subscriptions locally (prune notifications skipped): {}",
-                        notifications.len(),
+                        result.affected_contracts.len(),
                         err
                     );
                 }

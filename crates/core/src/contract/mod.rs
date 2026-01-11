@@ -436,6 +436,47 @@ where
                     );
                 }
             }
+            ContractHandlerEvent::GetSummaryQuery { key } => {
+                let summary = contract_handler
+                    .executor()
+                    .summarize_contract_state(key)
+                    .instrument(tracing::info_span!("summarize_contract_state", %key))
+                    .await;
+
+                if let Err(error) = contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::GetSummaryResponse { key, summary },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send GetSummary response (client may have disconnected)"
+                    );
+                }
+            }
+            ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
+                let delta = contract_handler
+                    .executor()
+                    .get_contract_state_delta(key, their_summary)
+                    .instrument(tracing::info_span!("get_contract_state_delta", %key))
+                    .await;
+
+                if let Err(error) = contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::GetDeltaResponse { key, delta })
+                    .await
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send GetDelta response (client may have disconnected)"
+                    );
+                }
+            }
             _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }
     }

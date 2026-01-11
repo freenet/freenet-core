@@ -1626,8 +1626,35 @@ impl Operation for GetOp {
                             // State already cached and identical, mark as seeded if needed
                             if !op_manager.ring.is_seeding_contract(&key) {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
-                                op_manager.ring.record_get_access(key, value.size() as u64);
+                                let evicted =
+                                    op_manager.ring.record_get_access(key, value.size() as u64);
                                 super::announce_contract_cached(op_manager, &key).await;
+
+                                // Clean up interest tracking for evicted contracts
+                                let mut removed_contracts = Vec::new();
+                                for evicted_key in evicted {
+                                    if op_manager
+                                        .interest_manager
+                                        .unregister_local_seeding(&evicted_key)
+                                    {
+                                        removed_contracts.push(evicted_key);
+                                    }
+                                }
+
+                                // Register local interest for delta-based sync
+                                let became_interested =
+                                    op_manager.interest_manager.register_local_seeding(&key);
+
+                                // Broadcast interest changes to peers
+                                let added = if became_interested { vec![key] } else { vec![] };
+                                if !added.is_empty() || !removed_contracts.is_empty() {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        added,
+                                        removed_contracts,
+                                    )
+                                    .await;
+                                }
 
                                 // Auto-subscribe to receive updates for this contract
                                 if crate::ring::AUTO_SUBSCRIBE_ON_GET {
@@ -1673,8 +1700,38 @@ impl Operation for GetOp {
                                         // Start subscription if not already seeding
                                         if !is_subscribed_contract {
                                             tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
-                                            op_manager.ring.record_get_access(key, value.size() as u64);
+                                            let evicted = op_manager
+                                                .ring
+                                                .record_get_access(key, value.size() as u64);
                                             super::announce_contract_cached(op_manager, &key).await;
+
+                                            // Clean up interest tracking for evicted contracts
+                                            let mut removed_contracts = Vec::new();
+                                            for evicted_key in evicted {
+                                                if op_manager
+                                                    .interest_manager
+                                                    .unregister_local_seeding(&evicted_key)
+                                                {
+                                                    removed_contracts.push(evicted_key);
+                                                }
+                                            }
+
+                                            // Register local interest for delta-based sync
+                                            let became_interested = op_manager
+                                                .interest_manager
+                                                .register_local_seeding(&key);
+
+                                            // Broadcast interest changes to peers
+                                            let added =
+                                                if became_interested { vec![key] } else { vec![] };
+                                            if !added.is_empty() || !removed_contracts.is_empty() {
+                                                super::broadcast_change_interests(
+                                                    op_manager,
+                                                    added,
+                                                    removed_contracts,
+                                                )
+                                                .await;
+                                            }
 
                                             // Auto-subscribe to receive updates for this contract
                                             if crate::ring::AUTO_SUBSCRIBE_ON_GET {

@@ -414,6 +414,43 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Broadcast ChangeInterests message to all connected peers.
+///
+/// Called when local interest in contracts changes (gained or lost).
+pub(crate) async fn broadcast_change_interests(
+    op_manager: &OpManager,
+    added: Vec<ContractKey>,
+    removed: Vec<ContractKey>,
+) {
+    use crate::ring::interest::contract_hash;
+
+    if added.is_empty() && removed.is_empty() {
+        return;
+    }
+
+    let added_hashes: Vec<u32> = added.iter().map(contract_hash).collect();
+    let removed_hashes: Vec<u32> = removed.iter().map(contract_hash).collect();
+
+    tracing::debug!(
+        added_count = added_hashes.len(),
+        removed_count = removed_hashes.len(),
+        "Broadcasting ChangeInterests to neighbors"
+    );
+
+    if let Err(err) = op_manager
+        .notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
+            added: added_hashes,
+            removed: removed_hashes,
+        })
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "Failed to broadcast ChangeInterests"
+        );
+    }
+}
+
 /// Initiates a subscription after a PUT or GET completes without blocking the parent.
 ///
 /// This does NOT register a parent-child relationship for atomicity tracking,

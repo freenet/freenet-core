@@ -686,6 +686,22 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> Response;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
+
+    /// Compute the state summary for a contract using the contract's summarize_state method.
+    fn summarize_contract_state(
+        &mut self,
+        key: ContractKey,
+    ) -> impl Future<Output = Result<StateSummary<'static>, ExecutorError>> + Send;
+
+    /// Compute a state delta for a contract given a peer's state summary.
+    ///
+    /// Uses the contract's get_state_delta method to compute the minimal changes
+    /// needed for a peer at `their_summary` to reach our current state.
+    fn get_contract_state_delta(
+        &mut self,
+        key: ContractKey,
+        their_summary: StateSummary<'static>,
+    ) -> impl Future<Output = Result<StateDelta<'static>, ExecutorError>> + Send;
 }
 
 /// Consumers of the executor are required to poll for new changes in order to be notified

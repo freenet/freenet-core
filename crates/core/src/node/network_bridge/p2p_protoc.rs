@@ -28,7 +28,7 @@ use crate::node::network_bridge::handshake::{
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::{Location, SubscriptionRecoveryGuard};
+use crate::ring::{Location, PeerKey, SubscriptionRecoveryGuard};
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, ExpectedInboundTracker,
     PeerConnectionApi, Socket, TransportError, TransportKeypair, TransportPublicKey,
@@ -1057,6 +1057,15 @@ impl P2pConnManager {
                                         .op_manager
                                         .proximity_cache
                                         .on_peer_disconnected(&peer_addr);
+
+                                    // Clean up interest tracking for disconnected peer
+                                    ctx.bridge
+                                        .op_manager
+                                        .interest_manager
+                                        .remove_all_peer_interests(&PeerKey::from(
+                                            peer.pub_key().clone(),
+                                        ));
+
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
                                         if let Some(pub_key) = pub_key_to_remove {
@@ -1616,6 +1625,53 @@ impl P2pConnManager {
                                     }
                                 }
                             }
+                            NodeEvent::BroadcastChangeInterests { added, removed } => {
+                                // Broadcast ChangeInterests message to all connected peers
+                                tracing::debug!(
+                                    added_count = added.len(),
+                                    removed_count = removed.len(),
+                                    peer_count = ctx.connections.len(),
+                                    "Broadcasting ChangeInterests to connected peers"
+                                );
+
+                                let msg = crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::InterestSync {
+                                        message: crate::message::InterestMessage::ChangeInterests {
+                                            added,
+                                            removed,
+                                        },
+                                    },
+                                );
+
+                                for peer_addr in ctx.connections.keys() {
+                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
+                                        tracing::warn!(
+                                            peer_addr = %peer_addr,
+                                            error = %e,
+                                            "Failed to send ChangeInterests to peer"
+                                        );
+                                    }
+                                }
+                            }
+                            NodeEvent::SendInterestMessage { target, message } => {
+                                // Send an interest message to a specific peer
+                                tracing::debug!(
+                                    target = %target,
+                                    "Sending interest message to peer"
+                                );
+
+                                let msg = crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::InterestSync { message },
+                                );
+
+                                if let Err(e) = ctx.bridge.send(target, msg).await {
+                                    tracing::warn!(
+                                        peer_addr = %target,
+                                        error = %e,
+                                        "Failed to send interest message to peer"
+                                    );
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     cause = ?cause,
@@ -1628,11 +1684,18 @@ impl P2pConnManager {
                             NodeEvent::ClientDisconnected { client_id } => {
                                 tracing::debug!(%client_id, "Client disconnected");
 
-                                let notifications = op_manager
+                                let result = op_manager
                                     .ring
                                     .remove_client_from_all_subscriptions(client_id);
 
-                                ctx.bridge.send_prune_notifications(notifications).await;
+                                // Clean up interest tracking for affected contracts
+                                for contract in &result.affected_contracts {
+                                    op_manager.interest_manager.remove_local_client(contract);
+                                }
+
+                                ctx.bridge
+                                    .send_prune_notifications(result.prune_notifications)
+                                    .await;
                             }
                         },
                     }
@@ -2588,6 +2651,32 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
+
+                // Send Interests message to newly connected peer for delta-based sync
+                let interest_hashes = self
+                    .bridge
+                    .op_manager
+                    .interest_manager
+                    .get_all_interest_hashes();
+                if !interest_hashes.is_empty() {
+                    let interests_msg = NetMessage::V1(NetMessageV1::InterestSync {
+                        message: crate::message::InterestMessage::Interests {
+                            hashes: interest_hashes,
+                        },
+                    });
+                    if let Err(e) = self.bridge.send(peer_addr, interests_msg).await {
+                        tracing::warn!(
+                            %peer_addr,
+                            error = %e,
+                            "Failed to send Interests message to new peer"
+                        );
+                    } else {
+                        tracing::debug!(
+                            %peer_addr,
+                            "Sent Interests message to new peer"
+                        );
+                    }
+                }
 
                 // Check if new peer is closer to any contracts we're seeding without upstream.
                 // If so, attempt to subscribe through them to join the subscription tree.

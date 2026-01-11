@@ -421,10 +421,60 @@ impl Operation for UpdateOp {
                         }
                     }
                 }
-                UpdateMsg::BroadcastTo { id, key, new_value } => {
+                UpdateMsg::BroadcastTo {
+                    id,
+                    key,
+                    payload,
+                    sender_summary_bytes,
+                } => {
                     // Use source_addr directly instead of PeerKeyLocation lookup
                     let sender_addr = source_addr.expect("BroadcastTo requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
+
+                    // Convert sender's summary bytes to StateSummary
+                    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
+
+                    // Update sender's cached summary in our interest manager
+                    if let Some(sender_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                        op_manager.interest_manager.update_peer_summary(
+                            key,
+                            &sender_key,
+                            Some(sender_summary.clone()),
+                        );
+                    }
+
+                    // Convert payload to UpdateData
+                    let update_data = match payload {
+                        crate::message::DeltaOrFullState::Delta(bytes) => {
+                            tracing::debug!(
+                                contract = %key,
+                                delta_size = bytes.len(),
+                                "Received delta update"
+                            );
+                            UpdateData::Delta(StateDelta::from(bytes.clone()))
+                        }
+                        crate::message::DeltaOrFullState::FullState(bytes) => {
+                            tracing::debug!(
+                                contract = %key,
+                                state_size = bytes.len(),
+                                "Received full state update"
+                            );
+                            UpdateData::State(State::from(bytes.clone()))
+                        }
+                    };
+
+                    // For telemetry, convert payload bytes to WrappedState
+                    // (for deltas, we use the delta bytes as a placeholder)
+                    let payload_bytes = match payload {
+                        crate::message::DeltaOrFullState::FullState(bytes)
+                        | crate::message::DeltaOrFullState::Delta(bytes) => bytes,
+                    };
+                    let state_for_telemetry = WrappedState::from(payload_bytes.clone());
 
                     // Emit telemetry: broadcast received from upstream peer
                     if let Some(requester_pkl) = op_manager
@@ -437,24 +487,64 @@ impl Operation for UpdateOp {
                             &op_manager.ring,
                             *key,
                             requester_pkl,
-                            new_value.clone(),
+                            state_for_telemetry.clone(),
                         ) {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
                     }
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
+                    let is_delta = matches!(payload, crate::message::DeltaOrFullState::Delta(_));
+                    let update_result =
+                        update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                            .await;
+
                     let UpdateExecution {
                         value: updated_value,
                         summary: _summary,
                         changed,
-                    } = update_contract(
-                        op_manager,
-                        *key,
-                        UpdateData::State(State::from(new_value.clone())),
-                        RelatedContracts::default(),
-                    )
-                    .await?;
+                    } = match update_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            if is_delta {
+                                // Delta application failed - send ResyncRequest to get full state
+                                tracing::warn!(
+                                    contract = %key,
+                                    error = %err,
+                                    "Delta application failed, sending ResyncRequest"
+                                );
+
+                                // Clear cached summary for sender since it's out of sync
+                                if let Some(sender_pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(sender_addr)
+                                {
+                                    let sender_key =
+                                        crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                                    op_manager.interest_manager.update_peer_summary(
+                                        key,
+                                        &sender_key,
+                                        None,
+                                    );
+                                }
+
+                                // Send ResyncRequest to sender
+                                let _ = op_manager
+                                    .notify_node_event(
+                                        crate::message::NodeEvent::SendInterestMessage {
+                                            target: sender_addr,
+                                            message:
+                                                crate::message::InterestMessage::ResyncRequest {
+                                                    key: *key,
+                                                },
+                                        },
+                                    )
+                                    .await;
+                            }
+                            return Err(err);
+                        }
+                    };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
                     // Refresh GET subscription cache TTL when receiving updates
@@ -466,7 +556,7 @@ impl Operation for UpdateOp {
                         id,
                         &op_manager.ring,
                         *key,
-                        new_value,
+                        &state_for_telemetry,
                         &updated_value,
                         changed,
                     ) {
@@ -541,15 +631,103 @@ impl Operation for UpdateOp {
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
+                    // Compute our current summary for delta-based sync.
+                    // Note: This reads the summary from the state store, which should match new_value
+                    // since we just stored it. In concurrent update scenarios, the summary might
+                    // be from a slightly newer state, but this is acceptable because:
+                    // 1. The peer will receive the correct state bytes (new_value)
+                    // 2. The summary is just metadata for caching
+                    // 3. Any newer update will trigger its own broadcast cycle
+                    let our_summary = op_manager
+                        .interest_manager
+                        .get_contract_summary(op_manager, key)
+                        .await
+                        .unwrap_or_else(|| {
+                            // Fallback: wrap state bytes as summary
+                            StateSummary::from(new_value.as_ref().to_vec())
+                        });
+
+                    // Track peer keys for summary updates after successful sends
+                    let mut peer_keys_to_update = Vec::with_capacity(broadcast_to.len());
+                    let state_size = new_value.as_ref().len();
+
                     for peer in broadcast_to.iter() {
-                        let msg = UpdateMsg::BroadcastTo {
-                            id: *id,
-                            key: *key,
-                            new_value: new_value.clone(),
-                        };
                         let peer_addr = peer
                             .socket_addr()
                             .expect("broadcast target must have socket address");
+
+                        // Check if we have peer's cached summary for delta computation
+                        let peer_key = crate::ring::PeerKey::from(peer.pub_key().clone());
+                        let peer_summary =
+                            op_manager.interest_manager.get_peer_summary(key, &peer_key);
+
+                        // Compute payload: delta if we have peer's summary, otherwise full state
+                        // Returns (payload, delta_size) where delta_size is Some if delta was used
+                        let (payload, sent_delta_size) = match peer_summary {
+                            Some(their_summary) => {
+                                // Try to compute delta
+                                match op_manager
+                                    .interest_manager
+                                    .compute_delta(
+                                        op_manager,
+                                        key,
+                                        &their_summary,
+                                        &our_summary,
+                                        state_size,
+                                    )
+                                    .await
+                                {
+                                    Ok(delta) => {
+                                        let delta_size = delta.as_ref().len();
+                                        tracing::debug!(
+                                            contract = %key,
+                                            peer = %peer_addr,
+                                            delta_size,
+                                            state_size,
+                                            "Sending delta instead of full state"
+                                        );
+                                        (
+                                            crate::message::DeltaOrFullState::from_delta(&delta),
+                                            Some(delta_size),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            contract = %key,
+                                            peer = %peer_addr,
+                                            error = %e,
+                                            "Delta computation failed, falling back to full state"
+                                        );
+                                        (
+                                            crate::message::DeltaOrFullState::from_state(
+                                                &State::from(new_value.as_ref().to_vec()),
+                                            ),
+                                            None,
+                                        )
+                                    }
+                                }
+                            }
+                            None => {
+                                // No peer summary, send full state
+                                (
+                                    crate::message::DeltaOrFullState::from_state(&State::from(
+                                        new_value.as_ref().to_vec(),
+                                    )),
+                                    None,
+                                )
+                            }
+                        };
+
+                        // Track peer key and delta info for metrics after send succeeds
+                        // sent_delta_size is Some if we sent a delta, None if full state
+                        peer_keys_to_update.push((peer_key, sent_delta_size));
+
+                        let msg = UpdateMsg::BroadcastTo {
+                            id: *id,
+                            key: *key,
+                            payload,
+                            sender_summary_bytes: our_summary.as_ref().to_vec(),
+                        };
                         let f = conn_manager.send(peer_addr, msg.into());
                         broadcasting.push(f);
                     }
@@ -565,7 +743,7 @@ impl Operation for UpdateOp {
                             }
                         });
 
-                    let mut incorrect_results = 0;
+                    let mut failed_indices = std::collections::HashSet::new();
                     for (peer_num, err) in error_futures {
                         // remove the failed peers in reverse order
                         let peer = broadcast_to.get(peer_num).unwrap();
@@ -580,10 +758,53 @@ impl Operation for UpdateOp {
                         );
                         // TODO: review this, maybe we should just dropping this subscription
                         conn_manager.drop_connection(peer_addr).await?;
-                        incorrect_results += 1;
+                        failed_indices.insert(peer_num);
                     }
 
-                    broadcasted_to += broadcast_to.len() - incorrect_results;
+                    // Update cached summaries and record metrics for successful sends
+                    // Track delta sync stats for telemetry event
+                    let mut telemetry_delta_sends = 0usize;
+                    let mut telemetry_full_state_sends = 0usize;
+                    let mut telemetry_bytes_saved = 0u64;
+
+                    for (idx, (peer_key, delta_size)) in peer_keys_to_update.into_iter().enumerate()
+                    {
+                        if !failed_indices.contains(&idx) {
+                            op_manager.interest_manager.update_peer_summary(
+                                key,
+                                &peer_key,
+                                Some(our_summary.clone()),
+                            );
+                            // Record delta sync metrics
+                            if let Some(ds) = delta_size {
+                                op_manager
+                                    .interest_manager
+                                    .record_delta_send(state_size, ds);
+                                telemetry_delta_sends += 1;
+                                telemetry_bytes_saved += (state_size - ds) as u64;
+                            } else {
+                                op_manager.interest_manager.record_full_state_send();
+                                telemetry_full_state_sends += 1;
+                            }
+                        }
+                    }
+
+                    // Emit telemetry event with delta sync stats
+                    if telemetry_delta_sends > 0 || telemetry_full_state_sends > 0 {
+                        if let Some(event) = crate::tracing::NetEventLog::update_broadcast_complete(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            telemetry_delta_sends,
+                            telemetry_full_state_sends,
+                            telemetry_bytes_saved,
+                            state_size,
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+                    }
+
+                    broadcasted_to += broadcast_to.len() - failed_indices.len();
                     tracing::debug!(
                         "Successfully broadcasted update contract {key} to {broadcasted_to} peers - Broadcasting"
                     );
@@ -924,43 +1145,28 @@ async fn update_contract(
             let resolved_state = match previous_state {
                 Some(prev_state) => prev_state,
                 None => {
-                    match op_manager
+                    // Try to fetch current state from store
+                    let fetched_state = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             instance_id: *key.id(),
                             return_contract_code: false,
                         })
                         .await
-                    {
-                        Ok(ContractHandlerEvent::GetResponse {
-                            response:
-                                Ok(StoreResponse {
-                                    state: Some(current),
-                                    ..
-                                }),
-                            ..
-                        }) => current,
-                        Ok(other) => {
+                        .ok()
+                        .and_then(|event| match event {
+                            ContractHandlerEvent::GetResponse {
+                                response: Ok(StoreResponse { state, .. }),
+                                ..
+                            } => state,
+                            _ => None,
+                        });
+
+                    match fetched_state {
+                        Some(state) => state,
+                        None => {
                             tracing::debug!(
-                                ?other,
                                 %key,
                                 "Fallback fetch for UpdateNoChange returned no state; trying to extract from update_data"
-                            );
-                            match extract_state_from_update_data(&update_data) {
-                                Some(state) => state,
-                                None => {
-                                    tracing::error!(
-                                        %key,
-                                        "Cannot extract state from delta-only UpdateData in NoChange fallback"
-                                    );
-                                    return Err(OpError::UnexpectedOpState);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::debug!(
-                                %key,
-                                %err,
-                                "Fallback fetch for UpdateNoChange failed; trying to extract from update_data"
                             );
                             match extract_state_from_update_data(&update_data) {
                                 Some(state) => state,
@@ -1480,10 +1686,17 @@ mod messages {
             new_value: WrappedState,
         },
         /// Broadcasting a change to a specific subscriber.
+        ///
+        /// Supports delta-based synchronization: when we know the peer's state summary,
+        /// we send a delta instead of full state to reduce bandwidth.
         BroadcastTo {
             id: Transaction,
             key: ContractKey,
-            new_value: WrappedState,
+            /// The payload: either a delta (if we know peer's summary) or full state.
+            payload: crate::message::DeltaOrFullState,
+            /// Sender's current state summary bytes, so receiver can update their tracking.
+            /// Use `StateSummary::from(sender_summary_bytes.clone())` to convert.
+            sender_summary_bytes: Vec<u8>,
         },
     }
 

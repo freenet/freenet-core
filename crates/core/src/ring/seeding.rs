@@ -125,6 +125,15 @@ pub struct RemoveSubscriberResult {
     pub downstream_count: usize,
 }
 
+/// Result of removing all subscriptions for a disconnected client.
+#[derive(Debug)]
+pub struct ClientDisconnectResult {
+    /// Contracts that need upstream pruning notification (contract, upstream pairs).
+    pub prune_notifications: Vec<(ContractKey, PeerKeyLocation)>,
+    /// All contracts where this client had a subscription (for interest cleanup).
+    pub affected_contracts: Vec<ContractKey>,
+}
+
 /// Result of pruning a peer connection.
 #[derive(Debug)]
 pub struct PruneSubscriptionsResult {
@@ -507,12 +516,15 @@ impl SeedingManager {
     /// 3. For contracts where this was the last client AND no downstream remain,
     ///    returns the upstream to notify for pruning
     ///
-    /// Returns a list of (contract, upstream) pairs that need Unsubscribed notification.
+    /// Returns a [`ClientDisconnectResult`] with:
+    /// - `prune_notifications`: contracts needing upstream pruning
+    /// - `affected_contracts`: all contracts where the client was subscribed (for interest cleanup)
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
-    ) -> Vec<(ContractKey, PeerKeyLocation)> {
-        let mut notifications = Vec::new();
+    ) -> ClientDisconnectResult {
+        let mut prune_notifications = Vec::new();
+        let mut affected_contracts = Vec::new();
 
         // Find all contracts (by instance_id) where this client is subscribed
         let instance_ids_with_client: Vec<ContractInstanceId> = self
@@ -526,16 +538,19 @@ impl SeedingManager {
             // Remove client from this contract's subscriptions
             let was_last_client = self.remove_client_subscription(&instance_id, client_id);
 
-            if was_last_client {
-                // Find the full ContractKey in subscriptions that matches this instance_id
-                // (subscriptions are keyed by ContractKey, client_subscriptions by ContractInstanceId)
-                let matching_contract: Option<ContractKey> = self
-                    .subscriptions
-                    .iter()
-                    .find(|entry| *entry.key().id() == instance_id)
-                    .map(|entry| *entry.key());
+            // Find the full ContractKey in subscriptions that matches this instance_id
+            // (subscriptions are keyed by ContractKey, client_subscriptions by ContractInstanceId)
+            let matching_contract: Option<ContractKey> = self
+                .subscriptions
+                .iter()
+                .find(|entry| *entry.key().id() == instance_id)
+                .map(|entry| *entry.key());
 
-                if let Some(contract) = matching_contract {
+            if let Some(contract) = matching_contract {
+                // Track all affected contracts for interest cleanup
+                affected_contracts.push(contract);
+
+                if was_last_client {
                     // Check if we need to prune upstream
                     if let Some(subs) = self.subscriptions.get(&contract) {
                         let has_downstream =
@@ -553,7 +568,7 @@ impl SeedingManager {
                                     %client_id,
                                     "remove_client_from_all_subscriptions: client disconnect triggers pruning"
                                 );
-                                notifications.push((contract, upstream));
+                                prune_notifications.push((contract, upstream));
                             }
 
                             // Clean up the subscription entry
@@ -567,11 +582,15 @@ impl SeedingManager {
 
         debug!(
             %client_id,
-            contracts_cleaned = notifications.len(),
+            contracts_affected = affected_contracts.len(),
+            contracts_pruned = prune_notifications.len(),
             "remove_client_from_all_subscriptions: completed cleanup"
         );
 
-        notifications
+        ClientDisconnectResult {
+            prune_notifications,
+            affected_contracts,
+        }
     }
 
     /// Remove a subscriber by peer ID from a specific contract.
@@ -1371,10 +1390,12 @@ mod tests {
         assert!(manager.has_client_subscriptions(contract2.id()));
 
         // Remove client from all subscriptions
-        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+        let result = manager.remove_client_from_all_subscriptions(client_id);
 
         // Should return 2 notifications (one for each contract's upstream)
-        assert_eq!(notifications.len(), 2);
+        assert_eq!(result.prune_notifications.len(), 2);
+        // Should report 2 affected contracts
+        assert_eq!(result.affected_contracts.len(), 2);
 
         // Client subscriptions should be gone
         assert!(!manager.has_client_subscriptions(contract1.id()));
@@ -1417,12 +1438,17 @@ mod tests {
         manager.add_client_subscription(contract3.id(), other_client);
 
         // Remove client from all
-        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+        let result = manager.remove_client_from_all_subscriptions(client_id);
 
         // Should only notify upstream1 (contract1 pruned)
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].0, contract1);
-        assert_eq!(notifications[0].1.socket_addr(), upstream1.socket_addr());
+        assert_eq!(result.prune_notifications.len(), 1);
+        assert_eq!(result.prune_notifications[0].0, contract1);
+        assert_eq!(
+            result.prune_notifications[0].1.socket_addr(),
+            upstream1.socket_addr()
+        );
+        // Should report 3 affected contracts
+        assert_eq!(result.affected_contracts.len(), 3);
 
         // contract2 should still have downstream
         assert!(!manager.get_downstream(&contract2).is_empty());

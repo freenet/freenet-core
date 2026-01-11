@@ -1110,6 +1110,28 @@ where
                 }
                 break;
             }
+            NetMessageV1::InterestSync { ref message } => {
+                let Some(source) = source_addr else {
+                    tracing::warn!("Received InterestSync message without source address");
+                    break;
+                };
+                tracing::debug!(
+                    from = %source,
+                    "Processing InterestSync message"
+                );
+
+                // Handle interest synchronization for delta-based updates
+                if let Some(response) =
+                    handle_interest_sync_message(&op_manager, source, message.clone()).await
+                {
+                    let response_msg =
+                        NetMessage::V1(NetMessageV1::InterestSync { message: response });
+                    if let Err(err) = conn_manager.send(source, response_msg).await {
+                        tracing::error!(%err, %source, "Failed to send InterestSync response");
+                    }
+                }
+                break;
+            }
             _ => break, // Exit the loop if no applicable message type is found
         }
     }
@@ -1163,6 +1185,326 @@ async fn handle_pure_network_result(
     }
 
     op_result
+}
+
+/// Handle incoming InterestSync messages for delta-based state synchronization.
+///
+/// This function processes the interest exchange protocol:
+/// - `Interests`: Connection-time discovery of shared contract interests
+/// - `Summaries`: State summaries for shared contracts
+/// - `ChangeInterests`: Incremental interest changes
+/// - `ResyncRequest`: Request full state when delta application fails
+async fn handle_interest_sync_message(
+    op_manager: &Arc<OpManager>,
+    source: std::net::SocketAddr,
+    message: crate::message::InterestMessage,
+) -> Option<crate::message::InterestMessage> {
+    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::ring::interest::contract_hash;
+
+    match message {
+        InterestMessage::Interests { hashes } => {
+            tracing::debug!(
+                from = %source,
+                hash_count = hashes.len(),
+                "Received Interests message"
+            );
+
+            // Find contracts we share interest in
+            let matching = op_manager.interest_manager.get_matching_contracts(&hashes);
+
+            // Build summaries for shared contracts
+            let mut entries = Vec::with_capacity(matching.len());
+            for contract in matching {
+                let hash = contract_hash(&contract);
+                // Get our state summary for this contract
+                let summary = get_contract_summary(op_manager, &contract).await;
+                entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
+
+                // Register peer's interest
+                let peer_key = get_peer_key_from_addr(op_manager, source);
+                if let Some(pk) = peer_key {
+                    op_manager.interest_manager.register_peer_interest(
+                        &contract, pk,
+                        None, // We'll get their summary in their Summaries response
+                        false,
+                    );
+                }
+            }
+
+            if entries.is_empty() {
+                None
+            } else {
+                Some(InterestMessage::Summaries { entries })
+            }
+        }
+
+        InterestMessage::Summaries { entries } => {
+            tracing::debug!(
+                from = %source,
+                entry_count = entries.len(),
+                "Received Summaries message"
+            );
+
+            // Update peer summaries in our interest tracker
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            if let Some(pk) = peer_key {
+                for entry in entries {
+                    // Handle hash collisions - lookup returns all contracts with this hash
+                    for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
+                        // Only update if we have local interest in this contract
+                        if op_manager.interest_manager.has_local_interest(&contract) {
+                            let summary = entry.to_summary();
+                            op_manager
+                                .interest_manager
+                                .update_peer_summary(&contract, &pk, summary);
+                        }
+                    }
+                }
+            }
+
+            // No response needed for Summaries
+            None
+        }
+
+        InterestMessage::ChangeInterests { added, removed } => {
+            tracing::debug!(
+                from = %source,
+                added_count = added.len(),
+                removed_count = removed.len(),
+                "Received ChangeInterests message"
+            );
+
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+
+            // Handle removals
+            if let Some(ref pk) = peer_key {
+                for hash in removed {
+                    // Handle hash collisions - remove interest from all matching contracts
+                    for contract in op_manager.interest_manager.lookup_by_hash(hash) {
+                        op_manager
+                            .interest_manager
+                            .remove_peer_interest(&contract, pk);
+                    }
+                }
+            }
+
+            // Handle additions - respond with summaries for newly shared contracts
+            let mut entries = Vec::new();
+            if let Some(ref pk) = peer_key {
+                for hash in added {
+                    // Handle hash collisions - process all matching contracts
+                    for contract in op_manager.interest_manager.lookup_by_hash(hash) {
+                        // Only process if we have local interest in this contract
+                        if !op_manager.interest_manager.has_local_interest(&contract) {
+                            continue;
+                        }
+
+                        // Register their interest
+                        op_manager.interest_manager.register_peer_interest(
+                            &contract,
+                            pk.clone(),
+                            None,
+                            false,
+                        );
+
+                        // Get our summary to send back
+                        let summary = get_contract_summary(op_manager, &contract).await;
+                        entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
+                    }
+                }
+            }
+
+            if entries.is_empty() {
+                None
+            } else {
+                Some(InterestMessage::Summaries { entries })
+            }
+        }
+
+        InterestMessage::ResyncRequest { key } => {
+            tracing::info!(
+                from = %source,
+                contract = %key,
+                "Received ResyncRequest - peer needs full state"
+            );
+
+            // Clear cached summary for this peer
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            if let Some(ref pk) = peer_key {
+                op_manager
+                    .interest_manager
+                    .update_peer_summary(&key, pk, None);
+            }
+
+            // Fetch current state from store
+            let state = get_contract_state(op_manager, &key).await;
+            let Some(state) = state else {
+                tracing::warn!(
+                    contract = %key,
+                    "ResyncRequest for contract we don't have state for"
+                );
+                return None;
+            };
+
+            // Fetch our summary
+            let summary = get_contract_summary(op_manager, &key).await;
+            let Some(summary) = summary else {
+                tracing::warn!(
+                    contract = %key,
+                    "ResyncRequest for contract we can't compute summary for"
+                );
+                return None;
+            };
+
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                summary_size = summary.as_ref().len(),
+                "Sending ResyncResponse with full state"
+            );
+
+            Some(InterestMessage::ResyncResponse {
+                key,
+                state_bytes: state.as_ref().to_vec(),
+                summary_bytes: summary.as_ref().to_vec(),
+            })
+        }
+
+        InterestMessage::ResyncResponse {
+            key,
+            state_bytes,
+            summary_bytes,
+        } => {
+            tracing::info!(
+                from = %source,
+                contract = %key,
+                state_size = state_bytes.len(),
+                "Received ResyncResponse with full state"
+            );
+
+            // Apply the full state using an update
+            let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
+            let update_data = freenet_stdlib::prelude::UpdateData::State(state);
+
+            // Send to contract handler
+            use crate::contract::ContractHandlerEvent;
+            match op_manager
+                .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                    key,
+                    data: update_data,
+                    related_contracts: Default::default(),
+                })
+                .await
+            {
+                Ok(ContractHandlerEvent::UpdateResponse { new_value: Ok(_) }) => {
+                    tracing::debug!(contract = %key, "ResyncResponse state applied successfully");
+                }
+                Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    tracing::debug!(contract = %key, "ResyncResponse state unchanged");
+                }
+                Ok(other) => {
+                    tracing::warn!(
+                        contract = %key,
+                        response = ?other,
+                        "Unexpected response to resync update"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to apply resync state"
+                    );
+                }
+            }
+
+            // Update the peer's summary in our interest tracker
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            if let Some(pk) = peer_key {
+                let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes);
+                op_manager
+                    .interest_manager
+                    .update_peer_summary(&key, &pk, Some(summary));
+            }
+
+            // No response needed
+            None
+        }
+    }
+}
+
+/// Get the contract state from the state store.
+async fn get_contract_state(
+    op_manager: &Arc<OpManager>,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<freenet_stdlib::prelude::WrappedState> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *key.id(),
+            return_contract_code: false,
+        })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(store_response),
+            ..
+        }) => store_response.state,
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Err(e), ..
+        }) => {
+            tracing::warn!(
+                contract = %key,
+                error = %e,
+                "Failed to get contract state"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Get the contract state summary using the contract's summarize_state method.
+async fn get_contract_summary(
+    op_manager: &Arc<OpManager>,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Ok(summary),
+            ..
+        }) => Some(summary),
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Err(e), ..
+        }) => {
+            tracing::warn!(
+                contract = %key,
+                error = %e,
+                "Failed to get contract summary"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Get the PeerKey for a socket address.
+fn get_peer_key_from_addr(
+    op_manager: &Arc<OpManager>,
+    addr: std::net::SocketAddr,
+) -> Option<crate::ring::interest::PeerKey> {
+    op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(addr)
+        .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
 }
 
 /// Attempts to subscribe to a contract
