@@ -453,13 +453,11 @@ const MIN_REPLICA_COUNT: usize = 2;
 /// - Ensures eventual consistency at each step, not just final state
 /// - Catches issues where consistency is achieved only temporarily
 ///
-/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network replica_validation -- --ignored --test-threads=1`
+/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network replica_validation -- --test-threads=1`
 ///
-/// NOTE: This test is currently marked #[ignore] because it reveals convergence issues
-/// that need investigation. The test correctly identifies that contracts are NOT achieving
-/// eventual consistency despite high operation success rates.
+/// Tests that contracts achieve eventual consistency across peers with stepwise validation.
+/// Previously failed due to convergence issues (fixed in PR #2677).
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn replica_validation_and_stepwise_consistency() {
     const SEED: u64 = 0xBEE1_1CA5_0001;
     const PHASES: u32 = 3;
@@ -783,10 +781,7 @@ async fn replica_validation_and_stepwise_consistency() {
 ///
 /// This test uses a more densely connected network to verify that replication
 /// works correctly when nodes have many connections.
-///
-/// Marked as `#[ignore]` - run with `--ignored` for nightly CI.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-#[ignore] // FIXME: Convergence bug - contracts end up with different state hashes on different peers
 async fn dense_network_replication() {
     const SEED: u64 = 0xDE05_E0F0_0001;
 
