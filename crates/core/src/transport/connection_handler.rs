@@ -33,7 +33,6 @@ use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
-    ledbat::LedbatConfig,
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
@@ -1192,7 +1191,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let secret = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
-        let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
+        let _ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
 
@@ -1291,13 +1290,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 SentPacketTracker::new_with_time_source(time_source.clone()),
             ));
 
-            // Initialize congestion controller with slow start (RFC 6817)
-            // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-            let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
-                min_ssthresh: ledbat_min_ssthresh,
-                ..Default::default()
-            })
-            .build_arc_with_time_source(time_source.clone());
+            // Initialize BBR congestion controller (default)
+            // Uses model-based congestion control for better performance on lossy paths
+            let congestion_controller =
+                CongestionControlConfig::default().build_arc_with_time_source(time_source.clone());
 
             // Initialize token bucket for smooth packet pacing
             // Use global bandwidth manager if configured, otherwise fall back to per-connection limit
@@ -1435,7 +1431,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
-        let ledbat_min_ssthresh = self.ledbat_min_ssthresh;
+        let _ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
         let (inbound_from_remote, next_inbound) =
@@ -1588,16 +1584,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             let (inbound_sender, inbound_recv) =
                                                 fast_channel::bounded(1000);
 
-                                            // Initialize congestion controller with slow start (RFC 6817)
-                                            // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
+                                            // Initialize BBR congestion controller (default)
+                                            // Uses model-based congestion control for better performance on lossy paths
                                             let congestion_controller =
-                                                CongestionControlConfig::from_ledbat_config(
-                                                    LedbatConfig {
-                                                        min_ssthresh: ledbat_min_ssthresh,
-                                                        ..Default::default()
-                                                    },
-                                                )
-                                                .build_arc_with_time_source(time_source.clone());
+                                                CongestionControlConfig::default()
+                                                    .build_arc_with_time_source(
+                                                        time_source.clone(),
+                                                    );
 
                                             // Initialize token bucket
                                             // Use global bandwidth manager if configured
@@ -1696,13 +1689,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
 
-                                // Initialize congestion controller with slow start (RFC 6817)
-                                // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-                                let congestion_controller =
-                                    CongestionControlConfig::from_ledbat_config(LedbatConfig {
-                                        min_ssthresh: ledbat_min_ssthresh,
-                                        ..Default::default()
-                                    })
+                                // Initialize BBR congestion controller (default)
+                                // Uses model-based congestion control for better performance on lossy paths
+                                let congestion_controller = CongestionControlConfig::default()
                                     .build_arc_with_time_source(time_source.clone());
 
                                 // Initialize token bucket

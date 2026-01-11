@@ -87,7 +87,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
-    /// Congestion controller - adapts to network conditions
+    /// Congestion controller (BBR by default) - adapts to network conditions
     pub(super) congestion_controller: Arc<CongestionController<T>>,
     /// Token bucket rate limiter - smooths packet pacing based on congestion controller rate
     pub(super) token_bucket: Arc<TokenBucket<T>>,
@@ -445,7 +445,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             ACK_CHECK_INTERVAL,
         );
 
-        // Rate update timer - updates TokenBucket rate based on LEDBAT cwnd every 100ms
+        // Rate update timer - updates TokenBucket rate based on BBR cwnd every 100ms
         // This allows the token bucket to adapt to network conditions dynamically
         let rate_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
         let mut rate_update_check = TimeSourceInterval::new_at(
@@ -670,13 +670,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         false
                     };
 
-                    // Process ACKs and update LEDBAT congestion controller
+                    // Process ACKs and update BBR congestion controller
                     let (ack_info, _loss_rate) = self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
 
-                    // Feed ACK info to LEDBAT for congestion window adjustment
+                    // Feed ACK info to BBR for congestion window adjustment
                     // All ACKs decrement flightsize, but only non-retransmitted packets
                     // update RTT estimation (Karn's algorithm)
                     for (rtt_sample_opt, packet_size) in ack_info {
@@ -873,7 +873,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
-                                // Notify LEDBAT of packet loss (timeout-based retransmission)
+                                // Notify congestion controller of packet loss (timeout-based retransmission)
                                 self.remote_conn.congestion_controller.on_timeout();
 
                                 self.remote_conn
@@ -921,12 +921,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.noop(receipts).await?;
                     }
                 },
-                // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
+                // Rate update timer - update TokenBucket rate based on BBR cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
                 _ = rate_update_check.tick() => {
                     let now_nanos = self.time_source.now_nanos();
 
-                    // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
+                    // Use congestion controller's base delay for rate calculation
                     // Fallback to min_rtt only if base_delay is not yet established
                     let base_delay = self.remote_conn.congestion_controller.base_delay();
                     let rtt = if base_delay.is_zero() {
@@ -948,19 +948,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
 
                     if should_update {
-                        let ledbat_rate = self.remote_conn.congestion_controller.current_rate(rtt);
+                        let cc_rate = self.remote_conn.congestion_controller.current_rate(rtt) as u64;
                         let cwnd = self.remote_conn.congestion_controller.current_cwnd();
                         let queuing_delay = self.remote_conn.congestion_controller.queuing_delay();
 
                         // Apply global bandwidth limit if configured
-                        // Take minimum of LEDBAT rate and global fair-share rate
+                        // Take minimum of congestion controller rate and global fair-share rate
                         let (new_rate, global_limit) = if let Some(ref global) =
                             self.remote_conn.global_bandwidth
                         {
-                            let global_rate = global.current_per_connection_rate();
-                            (ledbat_rate.min(global_rate), Some(global_rate))
+                            let global_rate = global.current_per_connection_rate() as u64;
+                            (cc_rate.min(global_rate), Some(global_rate))
                         } else {
-                            (ledbat_rate, None)
+                            (cc_rate, None)
                         };
 
                         // Calculate time since last update for debugging RTT-adaptive timing
@@ -968,7 +968,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .map(|last| Duration::from_nanos(now_nanos.saturating_sub(last)).as_millis())
                             .unwrap_or(0);
 
-                        self.remote_conn.token_bucket.set_rate(new_rate);
+                        self.remote_conn.token_bucket.set_rate(new_rate as usize);
                         self.last_rate_update_nanos = Some(now_nanos);
 
                         tracing::debug!(
@@ -976,20 +976,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // Rate control
                             new_rate_bytes_per_sec = new_rate,
                             new_rate_mbps = (new_rate as f64) / 1_000_000.0,
-                            ledbat_rate_mbps = (ledbat_rate as f64) / 1_000_000.0,
+                            cc_rate_mbps = (cc_rate as f64) / 1_000_000.0,
                             global_limit_mbps = global_limit.map(|r| (r as f64) / 1_000_000.0),
-                            // LEDBAT state
+                            // Congestion controller state
                             cwnd_bytes = cwnd,
                             cwnd_packets = cwnd / MAX_DATA_SIZE,
                             // Delay measurements
                             base_delay_ms = base_delay.as_millis(),
                             rtt_ms = rtt.as_millis(),
                             queuing_delay_ms = queuing_delay.as_millis(),
-                            target_delay_ms = 100, // TARGET constant
                             // Derived metrics
-                            off_target_ms = (queuing_delay.as_millis() as i64) - 100,
                             since_last_update_ms = since_last_update_ms,
-                            "LEDBAT metrics (RTT-adaptive rate update)"
+                            "Congestion control metrics (RTT-adaptive rate update)"
                         );
                     }
                 }
@@ -1258,7 +1256,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     ///
     /// # Congestion Control
     ///
-    /// This method applies both LEDBAT congestion control (cwnd) and token bucket
+    /// This method applies both BBR congestion control (cwnd) and token bucket
     /// rate limiting, ensuring forwarded fragments don't overwhelm the network.
     ///
     /// # Example
@@ -1276,7 +1274,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     ) -> Result<()> {
         let packet_size = fragment.payload.len();
 
-        // LEDBAT congestion control - wait for cwnd space
+        // BBR congestion control - wait for cwnd space
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = self.remote_conn.congestion_controller.flightsize();
@@ -1343,7 +1341,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         )
         .await?;
 
-        // Track for LEDBAT
+        // Track for congestion controller
         self.remote_conn.congestion_controller.on_send(packet_size);
 
         tracing::trace!(
@@ -1632,15 +1630,11 @@ mod tests {
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
         let congestion_controller =
-            crate::transport::congestion_control::CongestionControlConfig::from_ledbat_config(
-                crate::transport::ledbat::LedbatConfig {
-                    initial_cwnd: 2928,
-                    min_cwnd: 2928,
-                    max_cwnd: 1_000_000_000,
-                    ..Default::default()
-                },
-            )
-            .build_arc_with_time_source(time_source.clone());
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .with_initial_cwnd(2928)
+                .with_min_cwnd(2928)
+                .with_max_cwnd(1_000_000_000)
+                .build_arc_with_time_source(time_source.clone());
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             10_000,
             10_000_000,
@@ -1772,13 +1766,18 @@ mod tests {
     /// causing flightsize > cwnd, blocking all sends indefinitely.
     #[test]
     fn test_flightsize_accounting_for_retransmitted_packets() {
-        use crate::transport::ledbat::LedbatController;
+        use crate::transport::bbr::{BbrConfig, BbrController};
         use crate::transport::sent_packet_tracker::SentPacketTracker;
         use std::sync::Arc;
 
-        // Create LEDBAT controller with realistic values
-        // Initial cwnd = ~38KB (IW26), min cwnd = 2KB (1*MSS)
-        let ledbat = Arc::new(LedbatController::new(38_000, 2_000, 10_000_000));
+        // Create BBR controller with realistic values
+        // Initial cwnd = ~38KB, min cwnd = 2KB
+        let congestion = Arc::new(BbrController::new(BbrConfig {
+            initial_cwnd: 38_000,
+            min_cwnd: 2_000,
+            max_cwnd: 10_000_000,
+            ..Default::default()
+        }));
 
         // Create sent packet tracker
         let mut tracker = SentPacketTracker::new();
@@ -1788,12 +1787,12 @@ mod tests {
         for packet_id in 0..5u32 {
             let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
             tracker.report_sent_packet(packet_id, payload);
-            ledbat.on_send(packet_size);
+            congestion.on_send(packet_size);
         }
 
         // Verify initial flightsize
         assert_eq!(
-            ledbat.flightsize(),
+            congestion.flightsize(),
             5 * packet_size,
             "Initial flightsize should be 5 * packet_size"
         );
@@ -1811,16 +1810,16 @@ mod tests {
             assert_eq!(*size, packet_size, "Packet size should match");
         }
 
-        // Apply ACKs to LEDBAT - this should decrement flightsize
+        // Apply ACKs to BBR - this should decrement flightsize
         for (rtt_opt, size) in ack_info {
             match rtt_opt {
-                Some(rtt) => ledbat.on_ack(rtt, size),
-                None => ledbat.on_ack_without_rtt(size),
+                Some(rtt) => congestion.on_ack(rtt, size),
+                None => congestion.on_ack_without_rtt(size),
             }
         }
 
         assert_eq!(
-            ledbat.flightsize(),
+            congestion.flightsize(),
             2 * packet_size,
             "Flightsize should be decremented to 2 * packet_size"
         );
@@ -1856,14 +1855,14 @@ mod tests {
         // Apply the ACK - should call on_ack_without_rtt, NOT skip the call entirely
         for (rtt_opt, size) in ack_info {
             match rtt_opt {
-                Some(rtt) => ledbat.on_ack(rtt, size),
-                None => ledbat.on_ack_without_rtt(size),
+                Some(rtt) => congestion.on_ack(rtt, size),
+                None => congestion.on_ack_without_rtt(size),
             }
         }
 
         // Verify flightsize was properly decremented
         assert_eq!(
-            ledbat.flightsize(),
+            congestion.flightsize(),
             packet_size,
             "Flightsize should be decremented even for retransmitted packet ACKs"
         );
@@ -1872,13 +1871,13 @@ mod tests {
         let (ack_info, _) = tracker.report_received_receipts(&[4]);
         for (rtt_opt, size) in ack_info {
             match rtt_opt {
-                Some(rtt) => ledbat.on_ack(rtt, size),
-                None => ledbat.on_ack_without_rtt(size),
+                Some(rtt) => congestion.on_ack(rtt, size),
+                None => congestion.on_ack_without_rtt(size),
             }
         }
 
         assert_eq!(
-            ledbat.flightsize(),
+            congestion.flightsize(),
             0,
             "All packets ACKed, flightsize should be 0"
         );

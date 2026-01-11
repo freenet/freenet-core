@@ -1,3 +1,9 @@
+// LEDBAT module is deprecated - BBR is now the primary congestion controller.
+// This module is kept temporarily for reference and comparison testing.
+// TODO: Remove this module after BBR has been validated in production.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 //! LEDBAT++ (Low Extra Delay Background Transport) congestion controller.
 //!
 //! Implementation based on draft-irtf-iccrg-ledbat-plus-plus, which improves upon

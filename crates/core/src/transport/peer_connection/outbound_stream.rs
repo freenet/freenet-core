@@ -34,7 +34,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
 ///
-/// Returns `TransferStats` on success with LEDBAT congestion control metrics
+/// Returns `TransferStats` on success with BBR congestion control metrics
 /// for telemetry purposes.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
@@ -79,9 +79,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
         let packet_size = stream_to_send.len().min(MAX_DATA_SIZE);
 
-        // LEDBAT congestion control - wait until cwnd has space for this packet.
-        // This enforces the congestion window calculated by LEDBAT's slow start
-        // and congestion avoidance algorithms.
+        // BBR congestion control - wait until cwnd has space for this packet.
+        // This enforces the congestion window calculated by BBR's state machine.
         //
         // IMPORTANT: This loop requires that recv() is being called on this connection
         // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
@@ -195,9 +194,10 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     }
 
     // Gather congestion control stats for telemetry
-    // Use LEDBAT-specific stats when available for detailed metrics
+    // Use algorithm-specific stats when available for detailed metrics
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
+    let bbr_stats = congestion_controller.bbr_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
 
     tracing::debug!(
@@ -208,6 +208,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         peak_cwnd_kb = generic_stats.peak_cwnd / 1024,
         final_cwnd_kb = generic_stats.cwnd / 1024,
         slowdowns = ledbat_stats.as_ref().map(|s| s.periodic_slowdowns).unwrap_or(0),
+        bbr_state = ?bbr_stats.as_ref().map(|s| s.state),
         "Stream sent"
     );
 
