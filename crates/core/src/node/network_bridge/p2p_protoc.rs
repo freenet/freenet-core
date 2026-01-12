@@ -79,6 +79,7 @@ type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
+    #[allow(dead_code)]
     accepted_peers: Arc<DashSet<SocketAddr>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
@@ -1696,6 +1697,169 @@ impl P2pConnManager {
                                 ctx.bridge
                                     .send_prune_notifications(result.prune_notifications)
                                     .await;
+                            }
+                            NodeEvent::BroadcastStateChange { key, new_state } => {
+                                // Automatic network peer notification when state changes
+                                tracing::info!(
+                                    contract = %key,
+                                    state_size = new_state.size(),
+                                    "RECEIVED BroadcastStateChange event in p2p_protoc"
+                                );
+                                let self_addr = op_manager.ring.connection_manager.get_own_addr();
+                                let Some(self_addr) = self_addr else {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        "Cannot broadcast state change - no own address"
+                                    );
+                                    continue;
+                                };
+
+                                let targets =
+                                    op_manager.get_broadcast_targets_update(&key, &self_addr);
+                                tracing::info!(
+                                    contract = %key,
+                                    target_count = targets.len(),
+                                    self_addr = %self_addr,
+                                    "BroadcastStateChange: found targets"
+                                );
+
+                                // If no direct targets (not part of subscription tree), fall back
+                                // to ring-based routing to find a peer that might cache this contract.
+                                // This ensures newly-stored contracts reach the subscription tree.
+                                let targets = if targets.is_empty() {
+                                    if let Some(fallback_target) = op_manager
+                                        .ring
+                                        .closest_potentially_caching(&key, [self_addr].as_slice())
+                                    {
+                                        if let Some(addr) = fallback_target.socket_addr() {
+                                            tracing::info!(
+                                                contract = %key,
+                                                fallback_peer = %addr,
+                                                "BroadcastStateChange: Using ring-based fallback target"
+                                            );
+                                            vec![fallback_target]
+                                        } else {
+                                            tracing::info!(
+                                                contract = %key,
+                                                "BroadcastStateChange: No targets and no fallback - skipping"
+                                            );
+                                            continue;
+                                        }
+                                    } else {
+                                        tracing::info!(
+                                            contract = %key,
+                                            "BroadcastStateChange: No targets and no fallback - skipping"
+                                        );
+                                        continue;
+                                    }
+                                } else {
+                                    targets
+                                };
+
+                                // Get our summary once for all targets
+                                let our_summary = op_manager
+                                    .interest_manager
+                                    .get_contract_summary(&op_manager, &key)
+                                    .await;
+
+                                let update_tx = crate::message::Transaction::new::<
+                                    crate::operations::update::UpdateMsg,
+                                >();
+
+                                tracing::debug!(
+                                    tx = %update_tx,
+                                    contract = %key,
+                                    target_count = targets.len(),
+                                    "Broadcasting state change to network peers"
+                                );
+
+                                for target in targets {
+                                    let Some(peer_addr) = target.socket_addr() else {
+                                        continue;
+                                    };
+
+                                    let peer_key =
+                                        crate::ring::PeerKey::from(target.pub_key().clone());
+
+                                    // Get peer's cached summary
+                                    let their_summary = op_manager
+                                        .interest_manager
+                                        .get_peer_summary(&key, &peer_key);
+
+                                    // Skip if summaries are equal (no change to send)
+                                    if let (Some(ours), Some(theirs)) =
+                                        (&our_summary, &their_summary)
+                                    {
+                                        if ours.as_ref() == theirs.as_ref() {
+                                            tracing::trace!(
+                                                contract = %key,
+                                                peer = %peer_addr,
+                                                "Skipping broadcast - peer already has our state"
+                                            );
+                                            continue;
+                                        }
+                                    }
+
+                                    // Compute delta if we have their summary (uses memoization cache)
+                                    let payload = match (&our_summary, &their_summary) {
+                                        (Some(ours), Some(theirs)) => {
+                                            match op_manager
+                                                .interest_manager
+                                                .compute_delta(
+                                                    &op_manager,
+                                                    &key,
+                                                    theirs,
+                                                    ours,
+                                                    new_state.size(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(delta) => {
+                                                    crate::message::DeltaOrFullState::Delta(
+                                                        delta.as_ref().to_vec(),
+                                                    )
+                                                }
+                                                Err(_) => {
+                                                    crate::message::DeltaOrFullState::FullState(
+                                                        new_state.as_ref().to_vec(),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        _ => crate::message::DeltaOrFullState::FullState(
+                                            new_state.as_ref().to_vec(),
+                                        ),
+                                    };
+
+                                    let msg = crate::operations::update::UpdateMsg::BroadcastTo {
+                                        id: update_tx,
+                                        key,
+                                        payload,
+                                        // Include our summary so peer doesn't echo back
+                                        sender_summary_bytes: our_summary
+                                            .as_ref()
+                                            .map(|s| s.as_ref().to_vec())
+                                            .unwrap_or_default(),
+                                    };
+
+                                    if let Err(err) = ctx.bridge.send(peer_addr, msg.into()).await {
+                                        tracing::warn!(
+                                            tx = %update_tx,
+                                            peer = %peer_addr,
+                                            error = %err,
+                                            "Failed to send state change broadcast"
+                                        );
+                                    } else {
+                                        // Update cached summary for successful send
+                                        if let Some(summary) = &our_summary {
+                                            op_manager.interest_manager.update_peer_summary(
+                                                &key,
+                                                &peer_key,
+                                                Some(summary.clone()),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         },
                     }

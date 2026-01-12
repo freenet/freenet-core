@@ -762,65 +762,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    /// Create an Update broadcast emitted event.
-    pub fn update_broadcast_emitted(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        value: WrappedState,
-        broadcast_to: Vec<PeerKeyLocation>,
-        upstream: PeerKeyLocation,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        let broadcasted_to = broadcast_to.len();
-        let state_hash = Some(state_hash_short(&value));
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Update(UpdateEvent::BroadcastEmitted {
-                id: *tx,
-                upstream,
-                broadcast_to,
-                broadcasted_to,
-                key,
-                value,
-                sender: own_loc,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash,
-            }),
-        })
-    }
-
-    /// Create a BroadcastComplete event with delta sync statistics.
-    ///
-    /// This event is emitted after all broadcast sends complete, capturing
-    /// telemetry about delta sync effectiveness.
-    pub fn update_broadcast_complete(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        delta_sends: usize,
-        full_state_sends: usize,
-        bytes_saved: u64,
-        state_size: usize,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Update(UpdateEvent::BroadcastComplete {
-                id: *tx,
-                key,
-                delta_sends,
-                full_state_sends,
-                bytes_saved,
-                state_size,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-        })
-    }
-
     /// Create an Update broadcast received event.
     pub fn update_broadcast_received(
         tx: &'a Transaction,

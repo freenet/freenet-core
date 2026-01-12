@@ -789,6 +789,35 @@ impl ContractExecutor for Executor<Runtime> {
                                 // Now that initialization is complete, they will succeed
                             }
 
+                            // Notify network peers of new contract state (automatic propagation)
+                            if let Some(op_manager) = &self.op_manager {
+                                tracing::info!(
+                                    contract = %key,
+                                    state_size = incoming_state.size(),
+                                    "NEW CONTRACT: Emitting BroadcastStateChange"
+                                );
+                                if let Err(err) = op_manager
+                                    .notify_node_event(
+                                        crate::message::NodeEvent::BroadcastStateChange {
+                                            key,
+                                            new_state: incoming_state.clone(),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        error = %err,
+                                        "Failed to broadcast new contract state to network peers"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    contract = %key,
+                                    "NEW CONTRACT: No op_manager - cannot broadcast state change"
+                                );
+                            }
+
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
@@ -884,8 +913,8 @@ impl ContractExecutor for Executor<Runtime> {
                         .await
                         .map_err(ExecutorError::other)?;
 
-                    // Note: Network propagation happens in the operations layer (update.rs),
-                    // which uses delta-aware broadcasting via try_to_broadcast().
+                    // Note: Network propagation is handled automatically via BroadcastStateChange
+                    // event in attempt_state_update(), which notifies interested network peers.
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }
@@ -1516,6 +1545,24 @@ impl Executor<Runtime> {
                     cause: "failed while sending notifications".into(),
                 })
             })?;
+
+        // Notify network peers of state change (automatic propagation)
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key,
+                    new_state: state.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
+
         Ok(ContractResponse::PutResponse { key }.into())
     }
 
@@ -1827,6 +1874,24 @@ impl Executor<Runtime> {
                 "Failed to send update notification"
             );
         }
+
+        // Notify network peers of state change (automatic propagation)
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key: *key,
+                    new_state: new_state.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
+
         Ok(Either::Left(new_state))
     }
 

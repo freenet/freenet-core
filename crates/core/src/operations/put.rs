@@ -13,7 +13,6 @@ use freenet_stdlib::{
 };
 
 use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::config::GlobalExecutor;
 use crate::node::IsOperationCompleted;
 use crate::transport::peer_connection::StreamId;
 use crate::{
@@ -313,7 +312,7 @@ impl Operation for PutOp {
                     // Step 1: Store contract locally (all nodes cache)
                     // put_contract returns (merged_value, state_changed) where state_changed
                     // is true if the stored state actually changed (old != new).
-                    let (merged_value, state_changed) = put_contract(
+                    let (merged_value, _state_changed) = put_contract(
                         op_manager,
                         key,
                         value.clone(),
@@ -350,34 +349,8 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // Determine if we should trigger an UPDATE operation after this PUT.
-                    //
-                    // We trigger updates via two mechanisms:
-                    // 1. Subscription tree: downstream subscribers and upstream peer
-                    //    - subscribers_of: We have peers who subscribed through us
-                    //    - get_upstream: We're subscribed, part of the tree
-                    // 2. Proximity cache: neighbors who cache this contract but may not be subscribed
-                    //    - These nodes announced they have the contract via CacheAnnounce
-                    //    - They should receive state changes to maintain consistency
-                    //
-                    // This ensures state changes propagate to ALL nodes caching the contract,
-                    // not just those in the subscription tree. See issue #2682.
-                    let has_downstream = op_manager.ring.subscribers_of(&key).is_some();
-                    let has_upstream = op_manager.ring.get_upstream(&key).is_some();
-                    let has_subscription_interest = has_downstream || has_upstream;
-
-                    // Check proximity cache - neighbors who cache this contract
-                    let proximity_neighbors =
-                        op_manager.proximity_cache.neighbors_with_contract(&key);
-                    let has_proximity_neighbors = !proximity_neighbors.is_empty();
-
-                    // Trigger update if state changed AND we have any targets
-                    let has_broadcast_targets =
-                        has_subscription_interest || has_proximity_neighbors;
-
-                    if has_broadcast_targets && state_changed {
-                        start_update_after_put(op_manager, key, merged_value.clone()).await;
-                    }
+                    // Network peer notification is now automatic via BroadcastStateChange
+                    // event emitted by the executor when state changes. No manual triggering needed.
 
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
@@ -670,50 +643,6 @@ async fn start_subscription_after_put(
             "Not starting subscription for failed parent PUT operation"
         );
     }
-}
-
-/// Helper to start an Update operation when a PUT on a subscribed contract results in state change.
-/// This propagates the merged state to other subscribers asynchronously (fire-and-forget).
-///
-/// Updates spread through the subscription tree like a virus - there is no meaningful "completion"
-/// signal since we can't know when all subscribers have received the update. The PUT response
-/// should not wait for update propagation.
-async fn start_update_after_put(op_manager: &OpManager, key: ContractKey, new_state: WrappedState) {
-    use super::update;
-
-    // Create a standalone transaction - NOT a child of the PUT.
-    // Updates are fire-and-forget; the PUT response should return immediately.
-    let update_tx = Transaction::new::<update::UpdateMsg>();
-
-    tracing::debug!(
-        tx = %update_tx,
-        contract = %key,
-        phase = "update",
-        "Starting async Update after PUT changed subscribed contract state"
-    );
-
-    let op_manager_cloned = op_manager.clone();
-
-    GlobalExecutor::spawn(async move {
-        tokio::task::yield_now().await;
-
-        // Wrap the state as UpdateData::State for the update operation
-        let update_data = freenet_stdlib::prelude::UpdateData::State(
-            freenet_stdlib::prelude::State::from(new_state),
-        );
-        let update_op =
-            update::start_op_with_id(key, update_data, RelatedContracts::default(), update_tx);
-
-        match update::request_update(&op_manager_cloned, update_op).await {
-            Ok(_) => {
-                tracing::debug!(tx = %update_tx, contract = %key, phase = "propagating", "Update initiated successfully");
-            }
-            Err(error) => {
-                // Updates are best-effort - log but don't fail
-                tracing::warn!(tx = %update_tx, contract = %key, error = %error, phase = "error", "Update initiation failed");
-            }
-        }
-    });
 }
 
 pub(crate) fn start_op(

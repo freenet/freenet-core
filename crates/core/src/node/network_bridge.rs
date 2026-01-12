@@ -38,6 +38,7 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// a network connection. The cryptographic identity is handled separately
 /// at the transport layer.
 pub(crate) trait NetworkBridge: Send + Sync {
+    #[allow(dead_code)]
     fn drop_connection(
         &mut self,
         peer_addr: SocketAddr,

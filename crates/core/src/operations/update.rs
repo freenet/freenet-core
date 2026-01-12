@@ -190,7 +190,7 @@ impl Operation for UpdateOp {
 
     fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut NB,
+        _conn_manager: &'a mut NB,
         op_manager: &'a crate::node::OpManager,
         input: &'a Self::Message,
         source_addr: Option<std::net::SocketAddr>,
@@ -305,67 +305,26 @@ impl Operation for UpdateOp {
                                     %key,
                                     "UPDATE yielded no state change, skipping broadcast"
                                 );
-
-                                // Use upstream_addr to determine if we're the originator
-                                if self.upstream_addr.is_none() {
-                                    new_state = Some(UpdateState::Finished {
-                                        key: *key,
-                                        summary: summary.clone(),
-                                    });
-                                } else {
-                                    new_state = None;
-                                }
-
-                                return_msg = None;
                             } else {
-                                // Get broadcast targets for propagating UPDATE to subscribers
-                                // Use source_addr directly instead of PeerKeyLocation lookup
-                                let sender_addr = source_addr.expect(
-                                    "remote UpdateMsg::RequestUpdate must have source_addr",
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "UPDATE succeeded, state changed"
                                 );
-                                let broadcast_to =
-                                    op_manager.get_broadcast_targets_update(key, &sender_addr);
-
-                                if broadcast_to.is_empty() {
-                                    tracing::debug!(
-                                        tx = %id,
-                                        %key,
-                                        "No broadcast targets, completing UPDATE locally"
-                                    );
-
-                                    // Use upstream_addr to determine if we're the originator
-                                    if self.upstream_addr.is_none() {
-                                        new_state = Some(UpdateState::Finished {
-                                            key: *key,
-                                            summary: summary.clone(),
-                                        });
-                                    } else {
-                                        new_state = None;
-                                    }
-
-                                    return_msg = None;
-                                } else {
-                                    // Broadcast to other peers
-                                    match try_to_broadcast(
-                                        *id,
-                                        true, // last_hop - we're handling locally
-                                        op_manager,
-                                        self.state,
-                                        broadcast_to,
-                                        *key,
-                                        updated_value.clone(),
-                                        false,
-                                    )
-                                    .await
-                                    {
-                                        Ok((state, msg)) => {
-                                            new_state = state;
-                                            return_msg = msg;
-                                        }
-                                        Err(err) => return Err(err),
-                                    }
-                                }
                             }
+
+                            // Network peer propagation is automatic via BroadcastStateChange
+                            // event emitted by the executor when state changes.
+                            // Use upstream_addr to determine if we're the originator
+                            if self.upstream_addr.is_none() {
+                                new_state = Some(UpdateState::Finished {
+                                    key: *key,
+                                    summary: summary.clone(),
+                                });
+                            } else {
+                                new_state = None;
+                            }
+                            return_msg = None;
                         } else {
                             // Contract not found locally - forward to another peer
                             let self_addr = op_manager.ring.connection_manager.peer_addr()?;
@@ -586,247 +545,34 @@ impl Operation for UpdateOp {
                             %key,
                             "BroadcastTo update produced no change, ending propagation"
                         );
-                        new_state = None;
-                        return_msg = None;
                     } else {
-                        let broadcast_to =
-                            op_manager.get_broadcast_targets_update(key, &sender_addr);
-
                         tracing::debug!(
-                            "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
+                            "Successfully updated contract {} @ {:?} - BroadcastTo",
                             key,
                             self_location.location()
                         );
-
-                        match try_to_broadcast(
-                            *id,
-                            false,
-                            op_manager,
-                            self.state,
-                            broadcast_to,
-                            *key,
-                            updated_value.clone(),
-                            true,
-                        )
-                        .await
-                        {
-                            Ok((state, msg)) => {
-                                new_state = state;
-                                return_msg = msg;
-                            }
-                            Err(err) => return Err(err),
-                        }
                     }
+                    // Network peer propagation is now automatic via BroadcastStateChange event
+                    // emitted by the executor when state changes. No manual try_to_broadcast needed.
+                    new_state = None;
+                    return_msg = None;
                 }
                 UpdateMsg::Broadcasting {
                     id,
                     broadcast_to,
-                    broadcasted_to,
                     key,
-                    new_value,
                     ..
                 } => {
-                    let mut broadcasted_to = *broadcasted_to;
-
-                    // Emit telemetry: broadcasting update to subscribers
-                    // Use self.upstream_addr to identify who sent us the update request
-                    let upstream_pkl = self
-                        .upstream_addr
-                        .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr))
-                        .unwrap_or_else(|| op_manager.ring.connection_manager.own_location());
-
-                    if let Some(event) = NetEventLog::update_broadcast_emitted(
-                        id,
-                        &op_manager.ring,
-                        *key,
-                        new_value.clone(),
-                        broadcast_to.clone(),
-                        upstream_pkl,
-                    ) {
-                        op_manager.ring.register_events(Either::Left(event)).await;
-                    }
-
-                    let mut broadcasting = Vec::with_capacity(broadcast_to.len());
-
-                    // Compute our current summary for delta-based sync.
-                    // Note: This reads the summary from the state store, which should match new_value
-                    // since we just stored it. In concurrent update scenarios, the summary might
-                    // be from a slightly newer state, but this is acceptable because:
-                    // 1. The peer will receive the correct state bytes (new_value)
-                    // 2. The summary is just metadata for caching
-                    // 3. Any newer update will trigger its own broadcast cycle
-                    let our_summary = op_manager
-                        .interest_manager
-                        .get_contract_summary(op_manager, key)
-                        .await
-                        .unwrap_or_else(|| {
-                            // Fallback: wrap state bytes as summary
-                            StateSummary::from(new_value.as_ref().to_vec())
-                        });
-
-                    // Track peer keys for summary updates after successful sends
-                    let mut peer_keys_to_update = Vec::with_capacity(broadcast_to.len());
-                    let state_size = new_value.as_ref().len();
-
-                    for peer in broadcast_to.iter() {
-                        let peer_addr = peer
-                            .socket_addr()
-                            .expect("broadcast target must have socket address");
-
-                        // Check if we have peer's cached summary for delta computation
-                        let peer_key = crate::ring::PeerKey::from(peer.pub_key().clone());
-                        let peer_summary =
-                            op_manager.interest_manager.get_peer_summary(key, &peer_key);
-
-                        // Compute payload: delta if we have peer's summary, otherwise full state
-                        // Returns (payload, delta_size) where delta_size is Some if delta was used
-                        let (payload, sent_delta_size) = match peer_summary {
-                            Some(their_summary) => {
-                                // Try to compute delta
-                                match op_manager
-                                    .interest_manager
-                                    .compute_delta(
-                                        op_manager,
-                                        key,
-                                        &their_summary,
-                                        &our_summary,
-                                        state_size,
-                                    )
-                                    .await
-                                {
-                                    Ok(delta) => {
-                                        let delta_size = delta.as_ref().len();
-                                        tracing::debug!(
-                                            contract = %key,
-                                            peer = %peer_addr,
-                                            delta_size,
-                                            state_size,
-                                            "Sending delta instead of full state"
-                                        );
-                                        (
-                                            crate::message::DeltaOrFullState::from_delta(&delta),
-                                            Some(delta_size),
-                                        )
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            contract = %key,
-                                            peer = %peer_addr,
-                                            error = %e,
-                                            "Delta computation failed, falling back to full state"
-                                        );
-                                        (
-                                            crate::message::DeltaOrFullState::from_state(
-                                                &State::from(new_value.as_ref().to_vec()),
-                                            ),
-                                            None,
-                                        )
-                                    }
-                                }
-                            }
-                            None => {
-                                // No peer summary, send full state
-                                (
-                                    crate::message::DeltaOrFullState::from_state(&State::from(
-                                        new_value.as_ref().to_vec(),
-                                    )),
-                                    None,
-                                )
-                            }
-                        };
-
-                        // Track peer key and delta info for metrics after send succeeds
-                        // sent_delta_size is Some if we sent a delta, None if full state
-                        peer_keys_to_update.push((peer_key, sent_delta_size));
-
-                        let msg = UpdateMsg::BroadcastTo {
-                            id: *id,
-                            key: *key,
-                            payload,
-                            sender_summary_bytes: our_summary.as_ref().to_vec(),
-                        };
-                        let f = conn_manager.send(peer_addr, msg.into());
-                        broadcasting.push(f);
-                    }
-                    let error_futures = futures::future::join_all(broadcasting)
-                        .await
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(p, err)| {
-                            if let Err(err) = err {
-                                Some((p, err))
-                            } else {
-                                None
-                            }
-                        });
-
-                    let mut failed_indices = std::collections::HashSet::new();
-                    for (peer_num, err) in error_futures {
-                        // remove the failed peers in reverse order
-                        let peer = broadcast_to.get(peer_num).unwrap();
-                        let peer_addr = peer
-                            .socket_addr()
-                            .expect("broadcast target must have socket address");
-                        tracing::warn!(
-                            peer_addr = %peer_addr,
-                            error = %err,
-                            phase = "error",
-                            "failed broadcasting update change; dropping connection"
-                        );
-                        // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(peer_addr).await?;
-                        failed_indices.insert(peer_num);
-                    }
-
-                    // Update cached summaries and record metrics for successful sends
-                    // Track delta sync stats for telemetry event
-                    let mut telemetry_delta_sends = 0usize;
-                    let mut telemetry_full_state_sends = 0usize;
-                    let mut telemetry_bytes_saved = 0u64;
-
-                    for (idx, (peer_key, delta_size)) in peer_keys_to_update.into_iter().enumerate()
-                    {
-                        if !failed_indices.contains(&idx) {
-                            op_manager.interest_manager.update_peer_summary(
-                                key,
-                                &peer_key,
-                                Some(our_summary.clone()),
-                            );
-                            // Record delta sync metrics
-                            if let Some(ds) = delta_size {
-                                op_manager
-                                    .interest_manager
-                                    .record_delta_send(state_size, ds);
-                                telemetry_delta_sends += 1;
-                                telemetry_bytes_saved += (state_size - ds) as u64;
-                            } else {
-                                op_manager.interest_manager.record_full_state_send();
-                                telemetry_full_state_sends += 1;
-                            }
-                        }
-                    }
-
-                    // Emit telemetry event with delta sync stats
-                    if telemetry_delta_sends > 0 || telemetry_full_state_sends > 0 {
-                        if let Some(event) = crate::tracing::NetEventLog::update_broadcast_complete(
-                            id,
-                            &op_manager.ring,
-                            *key,
-                            telemetry_delta_sends,
-                            telemetry_full_state_sends,
-                            telemetry_bytes_saved,
-                            state_size,
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
-                        }
-                    }
-
-                    broadcasted_to += broadcast_to.len() - failed_indices.len();
+                    // DEPRECATED: Broadcasting messages are no longer generated.
+                    // Network peer propagation is now automatic via BroadcastStateChange event
+                    // emitted by the executor when state changes.
+                    // This handler is kept for backwards compatibility during rolling upgrades.
                     tracing::debug!(
-                        "Successfully broadcasted update contract {key} to {broadcasted_to} peers - Broadcasting"
+                        tx = %id,
+                        %key,
+                        target_count = broadcast_to.len(),
+                        "Received deprecated Broadcasting message - ignoring (propagation is automatic)"
                     );
-
-                    // Subscriber nodes have been notified of the change
                     new_state = None;
                     return_msg = None;
                 }
@@ -842,59 +588,6 @@ impl Operation for UpdateOp {
             )
         })
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn try_to_broadcast(
-    id: Transaction,
-    last_hop: bool,
-    _op_manager: &OpManager,
-    state: Option<UpdateState>,
-    broadcast_to: Vec<PeerKeyLocation>,
-    key: ContractKey,
-    new_value: WrappedState,
-    is_from_a_broadcasted_to_peer: bool,
-) -> Result<(Option<UpdateState>, Option<UpdateMsg>), OpError> {
-    let new_state;
-    let return_msg;
-
-    match state {
-        Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing) => {
-            if broadcast_to.is_empty() && !last_hop {
-                tracing::debug!(
-                    "Empty broadcast list while updating value for contract {} - try_to_broadcast",
-                    key
-                );
-
-                return_msg = None;
-                new_state = None;
-
-                if is_from_a_broadcasted_to_peer {
-                    return Ok((new_state, return_msg));
-                }
-            } else if !broadcast_to.is_empty() {
-                tracing::debug!(
-                    "Callback to start broadcasting to other nodes. List size {}",
-                    broadcast_to.len()
-                );
-                new_state = Some(UpdateState::BroadcastOngoing);
-
-                return_msg = Some(UpdateMsg::Broadcasting {
-                    id,
-                    new_value,
-                    broadcasted_to: 0,
-                    broadcast_to,
-                    key,
-                });
-            } else {
-                new_state = None;
-                return_msg = None;
-            }
-        }
-        _ => return Err(OpError::invalid_transition(id)),
-    };
-
-    Ok((new_state, return_msg))
 }
 
 impl OpManager {
@@ -1416,7 +1109,7 @@ pub(crate) async fn request_update(
             // Note: This handles both truly isolated nodes and nodes where subscribers exist
             // but no suitable remote caching peer was found.
             let UpdateExecution {
-                value: updated_value,
+                value: _updated_value,
                 summary,
                 changed,
                 ..
@@ -1438,61 +1131,17 @@ pub(crate) async fn request_update(
                 return Ok(());
             }
 
-            // Check if there are any subscribers to broadcast to
-            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender_addr);
-
             deliver_update_result(op_manager, id, key, summary.clone()).await?;
 
-            if broadcast_to.is_empty() {
-                // No subscribers - operation complete
-                tracing::debug!(
-                    tx = %id,
-                    %key,
-                    "No broadcast targets, completing UPDATE operation locally"
-                );
-                return Ok(());
-            } else {
-                // There are subscribers - broadcast the update
-                tracing::debug!(
-                    tx = %id,
-                    %key,
-                    subscribers = broadcast_to.len(),
-                    "Broadcasting UPDATE to subscribers on isolated node"
-                );
-
-                let broadcast_state = Some(UpdateState::ReceivedRequest);
-
-                let (_new_state, return_msg) = try_to_broadcast(
-                    id,
-                    false,
-                    op_manager,
-                    broadcast_state,
-                    broadcast_to,
-                    key,
-                    updated_value,
-                    false,
-                )
-                .await?;
-
-                if let Some(msg) = return_msg {
-                    op_manager
-                        .to_event_listener
-                        .notifications_sender()
-                        .send(Either::Left(NetMessage::from(msg)))
-                        .await
-                        .map_err(|error| {
-                            tracing::error!(
-                                tx = %id,
-                                error = %error,
-                                phase = "error",
-                                "Failed to enqueue UPDATE broadcast message"
-                            );
-                            OpError::NotificationError
-                        })?;
-                }
-
-                return Ok(());
-            }
+            // Network peer propagation is automatic via BroadcastStateChange event
+            // emitted by the executor when update_contract updated the state.
+            // No manual try_to_broadcast needed - operation complete.
+            tracing::debug!(
+                tx = %id,
+                %key,
+                "UPDATE operation complete on isolated node"
+            );
+            return Ok(());
         }
     };
 
@@ -1773,8 +1422,4 @@ pub enum UpdateState {
         /// This is passed to update_contract which calls UpdateQuery to merge and persist.
         update_data: UpdateData<'static>,
     },
-
-    /// Broadcasting the update to downstream subscribers. This is fire-and-forget;
-    /// we don't wait for acknowledgments from downstream peers.
-    BroadcastOngoing,
 }

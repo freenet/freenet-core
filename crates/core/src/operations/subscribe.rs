@@ -690,17 +690,19 @@ impl Operation for SubscribeOp {
                                                     .register_events(Either::Left(event))
                                                     .await;
                                             }
-
-                                            // Send current state to the new subscriber so they
-                                            // don't miss any updates that were broadcast before
-                                            // they subscribed.
-                                            send_state_to_new_subscriber(
-                                                op_manager.clone(),
-                                                key,
-                                                result.subscriber,
-                                                *id,
-                                            );
                                         }
+
+                                        // Always send current state to the subscriber so they
+                                        // don't miss any updates that were broadcast before
+                                        // they subscribed. This handles both:
+                                        // 1. New subscribers who need initial state
+                                        // 2. Re-subscribing peers whose state may be stale
+                                        send_state_to_new_subscriber(
+                                            op_manager.clone(),
+                                            key,
+                                            result.subscriber,
+                                            *id,
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -790,17 +792,19 @@ impl Operation for SubscribeOp {
                                                     .register_events(Either::Left(event))
                                                     .await;
                                             }
-
-                                            // Send current state to the new subscriber so they
-                                            // don't miss any updates that were broadcast before
-                                            // they subscribed.
-                                            send_state_to_new_subscriber(
-                                                op_manager.clone(),
-                                                key,
-                                                result.subscriber,
-                                                *id,
-                                            );
                                         }
+
+                                        // Always send current state to the subscriber so they
+                                        // don't miss any updates that were broadcast before
+                                        // they subscribed. This handles both:
+                                        // 1. New subscribers who need initial state
+                                        // 2. Re-subscribing peers whose state may be stale
+                                        send_state_to_new_subscriber(
+                                            op_manager.clone(),
+                                            key,
+                                            result.subscriber,
+                                            *id,
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -1004,17 +1008,20 @@ impl Operation for SubscribeOp {
                                                         .register_events(Either::Left(event))
                                                         .await;
                                                 }
-
-                                                // Send current state to the new subscriber so they
-                                                // don't miss any updates that were broadcast before
-                                                // they subscribed.
-                                                send_state_to_new_subscriber(
-                                                    op_manager.clone(),
-                                                    *key,
-                                                    result.subscriber,
-                                                    *msg_id,
-                                                );
                                             }
+
+                                            // Always send current state to the subscriber so they
+                                            // don't miss any updates that were broadcast before
+                                            // they subscribed. This handles both:
+                                            // 1. New subscribers who need initial state
+                                            // 2. Re-subscribing peers whose state may be stale
+                                            send_state_to_new_subscriber(
+                                                op_manager.clone(),
+                                                *key,
+                                                result.subscriber,
+                                                *msg_id,
+                                            );
+
                                             tracing::debug!(
                                                 tx = %msg_id,
                                                 %key,
