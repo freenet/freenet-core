@@ -2745,34 +2745,53 @@ impl P2pConnManager {
                 }
             } else {
                 // Not promoting to ring - either unknown identity or transient on non-gateway.
-                // These connections don't go through should_accept() so there's no pending
-                // reservation. Compute location from address directly.
-                let loc = Location::from_address(&peer_addr);
-                connection_manager.try_register_transient(peer_addr, Some(loc));
-                tracing::info!(
-                    peer_id = ?peer_id,
-                    %peer_addr,
-                    "Registered transient connection (not added to ring topology)"
-                );
-                let ttl = connection_manager.transient_ttl();
-                let drop_tx = self.bridge.ev_listener_tx.clone();
-                let cm = connection_manager.clone();
-                GlobalExecutor::spawn(async move {
-                    sleep(ttl).await;
-                    if cm.drop_transient(peer_addr).is_some() {
-                        tracing::info!(%peer_addr, "Transient connection expired; dropping");
-                        if let Err(err) = drop_tx
-                            .send(Right(NodeEvent::DropConnection(peer_addr)))
-                            .await
-                        {
-                            tracing::warn!(
-                                %peer_addr,
-                                ?err,
-                                "Failed to dispatch DropConnection for expired transient"
-                            );
+                //
+                // IMPORTANT: Before registering as transient, check if the connection was already
+                // promoted to ring by another code path (e.g., handle_connect_peer running during
+                // our yield_now().await or callback sends). This prevents a race condition where:
+                // 1. We start with peer_id=None, so promote_to_ring=false
+                // 2. We yield at yield_now().await or cb.send_result().await
+                // 3. Message arrives, handle_connect_peer promotes connection to ring
+                // 4. We resume and would register as transient (re-inserting a dropped entry)
+                // 5. TTL timer fires and removes the connection from ring!
+                //
+                // By checking has_connection_or_pending, we skip transient registration if the
+                // connection was already promoted to ring during our await points.
+                if connection_manager.has_connection_or_pending(peer_addr) {
+                    tracing::debug!(
+                        %peer_addr,
+                        "Skipping transient registration - connection already in ring topology"
+                    );
+                } else {
+                    // These connections don't go through should_accept() so there's no pending
+                    // reservation. Compute location from address directly.
+                    let loc = Location::from_address(&peer_addr);
+                    connection_manager.try_register_transient(peer_addr, Some(loc));
+                    tracing::info!(
+                        peer_id = ?peer_id,
+                        %peer_addr,
+                        "Registered transient connection (not added to ring topology)"
+                    );
+                    let ttl = connection_manager.transient_ttl();
+                    let drop_tx = self.bridge.ev_listener_tx.clone();
+                    let cm = connection_manager.clone();
+                    GlobalExecutor::spawn(async move {
+                        sleep(ttl).await;
+                        if cm.drop_transient(peer_addr).is_some() {
+                            tracing::info!(%peer_addr, "Transient connection expired; dropping");
+                            if let Err(err) = drop_tx
+                                .send(Right(NodeEvent::DropConnection(peer_addr)))
+                                .await
+                            {
+                                tracing::warn!(
+                                    %peer_addr,
+                                    ?err,
+                                    "Failed to dispatch DropConnection for expired transient"
+                                );
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.
