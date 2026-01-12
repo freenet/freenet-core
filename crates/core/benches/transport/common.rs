@@ -21,9 +21,10 @@
 use criterion::measurement::{Measurement, ValueFormatter};
 use dashmap::DashMap;
 use freenet::simulation::{RealTime, TimeSource, VirtualTime};
+use freenet::transport::congestion_control::{CongestionControlAlgorithm, CongestionControlConfig};
 use freenet::transport::mock_transport::{
-    create_mock_peer, create_mock_peer_with_delay, create_mock_peer_with_virtual_time, Channels,
-    MockSocket, PacketDelayPolicy, PacketDropPolicy,
+    create_mock_peer, create_mock_peer_with_congestion_config, create_mock_peer_with_delay,
+    create_mock_peer_with_virtual_time, Channels, MockSocket, PacketDelayPolicy, PacketDropPolicy,
 };
 use freenet::transport::{OutboundConnectionHandler, PeerConnection, TransportPublicKey};
 use std::net::SocketAddr;
@@ -43,6 +44,64 @@ pub fn create_benchmark_runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("Failed to create benchmark runtime")
+}
+
+// =============================================================================
+// Congestion Control Configuration
+// =============================================================================
+
+/// Get the congestion control algorithm from environment variable.
+///
+/// Set `FREENET_CONGESTION_ALGO` to:
+/// - `bbr` or `BBR` - Use BBR (Bottleneck Bandwidth and RTT) - **default**
+/// - `ledbat` or `LEDBAT` - Use LEDBAT++ (Low Extra Delay Background Transport)
+///
+/// If not set, defaults to BBR which is the production default.
+///
+/// ## Example
+///
+/// ```bash
+/// # Run benchmarks with LEDBAT for comparison
+/// FREENET_CONGESTION_ALGO=ledbat cargo bench --bench transport_ci
+///
+/// # Run benchmarks with BBR (default)
+/// cargo bench --bench transport_ci
+/// ```
+pub fn get_congestion_algorithm() -> CongestionControlAlgorithm {
+    match std::env::var("FREENET_CONGESTION_ALGO")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "ledbat" => CongestionControlAlgorithm::Ledbat,
+        "bbr" | "" => CongestionControlAlgorithm::Bbr,
+        other => {
+            eprintln!(
+                "Warning: Unknown FREENET_CONGESTION_ALGO value '{}', using BBR",
+                other
+            );
+            CongestionControlAlgorithm::Bbr
+        }
+    }
+}
+
+/// Get the congestion control configuration from environment variable.
+///
+/// Returns the appropriate `CongestionControlConfig` based on `FREENET_CONGESTION_ALGO`.
+/// This is a convenience wrapper around `get_congestion_algorithm()`.
+pub fn get_congestion_config() -> CongestionControlConfig {
+    CongestionControlConfig::new(get_congestion_algorithm())
+}
+
+/// Print the current congestion control configuration.
+///
+/// Call this at the start of benchmark runs to show which algorithm is being tested.
+pub fn print_congestion_config() {
+    let algo = get_congestion_algorithm();
+    eprintln!(
+        "Benchmark congestion control: {} (set FREENET_CONGESTION_ALGO to switch)",
+        algo
+    );
 }
 
 // =============================================================================
@@ -450,6 +509,177 @@ pub async fn create_connected_peers_with_virtual_time_and_loss(
         .await
         .connect()
         .await
+}
+
+// =============================================================================
+// Configurable Congestion Control Peer Creation
+// =============================================================================
+
+/// Create a pair of mock peers with VirtualTime and configurable congestion control.
+///
+/// This function uses the congestion control algorithm from the `FREENET_CONGESTION_ALGO`
+/// environment variable (defaults to BBR).
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// // Uses FREENET_CONGESTION_ALGO or defaults to BBR
+/// let time_source = VirtualTime::new();
+/// let peers = create_peer_pair_with_configurable_congestion(
+///     channels,
+///     Duration::from_millis(50),
+///     time_source,
+/// ).await;
+/// ```
+pub async fn create_peer_pair_with_configurable_congestion(
+    channels: Channels,
+    delay: Duration,
+    time_source: VirtualTime,
+) -> PeerPair<VirtualTime> {
+    let config = Some(get_congestion_config());
+
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_congestion_config(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source.clone(),
+        config.clone(),
+    )
+    .await
+    .expect("create peer A");
+
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_congestion_config(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source,
+        config,
+    )
+    .await
+    .expect("create peer B");
+
+    PeerPair {
+        peer_a_pub,
+        peer_a,
+        peer_a_addr,
+        peer_b_pub,
+        peer_b,
+        peer_b_addr,
+        channels,
+    }
+}
+
+/// Create a connected peer pair with configurable congestion control.
+///
+/// Uses `FREENET_CONGESTION_ALGO` environment variable to select algorithm.
+/// Defaults to BBR if not set.
+pub async fn create_connected_peers_with_configurable_congestion(
+    delay: Duration,
+    time_source: VirtualTime,
+) -> ConnectedPeerPair<VirtualTime> {
+    let channels: Channels = Arc::new(DashMap::new());
+    create_peer_pair_with_configurable_congestion(channels, delay, time_source)
+        .await
+        .connect()
+        .await
+}
+
+/// Create a connected peer pair with explicit congestion control config.
+///
+/// Use this when you want to specify the exact congestion control configuration
+/// rather than relying on environment variables.
+pub async fn create_connected_peers_with_explicit_congestion(
+    delay: Duration,
+    time_source: VirtualTime,
+    congestion_config: Option<CongestionControlConfig>,
+) -> ConnectedPeerPair<VirtualTime> {
+    let channels: Channels = Arc::new(DashMap::new());
+    create_peer_pair_with_explicit_congestion(channels, delay, time_source, congestion_config)
+        .await
+        .connect()
+        .await
+}
+
+/// Create a pair of mock peers with explicit congestion control config.
+pub async fn create_peer_pair_with_explicit_congestion(
+    channels: Channels,
+    delay: Duration,
+    time_source: VirtualTime,
+    congestion_config: Option<CongestionControlConfig>,
+) -> PeerPair<VirtualTime> {
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_congestion_config(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source.clone(),
+        congestion_config.clone(),
+    )
+    .await
+    .expect("create peer A");
+
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_congestion_config(
+        PacketDropPolicy::ReceiveAll,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source,
+        congestion_config,
+    )
+    .await
+    .expect("create peer B");
+
+    PeerPair {
+        peer_a_pub,
+        peer_a,
+        peer_a_addr,
+        peer_b_pub,
+        peer_b,
+        peer_b_addr,
+        channels,
+    }
+}
+
+/// Create a connected peer pair with configurable congestion control and packet loss.
+///
+/// Combines environment-based congestion config with packet loss simulation.
+pub async fn create_connected_peers_with_configurable_congestion_and_loss(
+    delay: Duration,
+    time_source: VirtualTime,
+    drop_policy: PacketDropPolicy,
+) -> ConnectedPeerPair<VirtualTime> {
+    let channels: Channels = Arc::new(DashMap::new());
+    let config = Some(get_congestion_config());
+
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_congestion_config(
+        drop_policy.clone(),
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source.clone(),
+        config.clone(),
+    )
+    .await
+    .expect("create peer A");
+
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_congestion_config(
+        drop_policy,
+        PacketDelayPolicy::Fixed(delay),
+        channels.clone(),
+        time_source,
+        config,
+    )
+    .await
+    .expect("create peer B");
+
+    PeerPair {
+        peer_a_pub,
+        peer_a,
+        peer_a_addr,
+        peer_b_pub,
+        peer_b,
+        peer_b_addr,
+        channels,
+    }
+    .connect()
+    .await
 }
 
 // =============================================================================
