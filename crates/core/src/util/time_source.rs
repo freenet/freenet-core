@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
 use std::thread;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 const UPDATE_CACHED_TIME_EVERY: Duration = Duration::from_millis(10);
 

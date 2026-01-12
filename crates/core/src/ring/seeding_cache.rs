@@ -17,7 +17,7 @@
 
 use freenet_stdlib::prelude::ContractKey;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
 

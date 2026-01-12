@@ -2,7 +2,8 @@ use crate::transport::PacketId;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::mem;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
