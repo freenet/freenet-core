@@ -204,6 +204,26 @@ impl<T: TimeSource> BbrController<T> {
         let now = self.now_nanos();
         let inflight = self.flightsize.fetch_add(bytes, Ordering::AcqRel);
 
+        // Handle cold start: if we have no valid bandwidth samples, ensure we
+        // can still send at a reasonable rate. This happens when:
+        // 1. Connection just started (no data transferred yet)
+        // 2. Bandwidth samples expired (idle too long with only keepalive traffic)
+        //
+        // Note: Keepalive packets are filtered from bandwidth estimation (see on_ack),
+        // so the filter stays empty during idle periods rather than filling with
+        // misleadingly low samples.
+        if !self.bw_filter.has_samples(now) {
+            // No valid bandwidth samples - ensure pacing rate allows probing.
+            // Initial rate of 1 MB/s is aggressive enough to discover real bandwidth
+            // while not overwhelming the network.
+            const INITIAL_PACING_RATE: u64 = 1_000_000;
+            let current_rate = self.pacing_rate.load(Ordering::Acquire);
+            if current_rate < INITIAL_PACING_RATE {
+                self.pacing_rate
+                    .store(INITIAL_PACING_RATE, Ordering::Release);
+            }
+        }
+
         // We're NOT application-limited when actively sending
         // The caller should call set_app_limited(true) when there's no more data to send
         self.delivery_sampler.set_app_limited(false);
@@ -269,8 +289,16 @@ impl<T: TimeSource> BbrController<T> {
 
         // Update bandwidth filter
         if let Some(rate) = delivery_rate {
-            // Only update if not application-limited
-            if !self.delivery_sampler.is_app_limited() {
+            // Only update bandwidth filter for significant data transfers.
+            // Keepalive packets (~27-50 bytes) produce misleadingly low bandwidth
+            // samples that can pollute the filter and cause pacing to throttle
+            // real data transfers to keepalive rates (~270 B/s).
+            //
+            // Threshold: 100 bytes covers keepalives while allowing small
+            // control messages to still be excluded from bandwidth estimation.
+            const MIN_BYTES_FOR_BW_SAMPLE: usize = 100;
+
+            if bytes_acked >= MIN_BYTES_FOR_BW_SAMPLE && !self.delivery_sampler.is_app_limited() {
                 self.bw_filter.update(rate, now);
             }
         }

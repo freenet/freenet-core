@@ -156,6 +156,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             }
         };
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Get token before sending (captures send-time state for BBR)
+        // This also updates the congestion controller's flightsize
+        let token = congestion_controller.on_send_with_token(packet_size);
+
         if let Err(e) = super::packet_sending(
             destination_addr,
             &socket,
@@ -169,6 +174,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 payload: fragment,
             },
             sent_packet_tracker.as_ref(),
+            token,
         )
         .await
         {
@@ -185,9 +191,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             );
             return Err(e);
         }
-
-        // Track packet send for congestion control
-        congestion_controller.on_send(packet_size);
 
         next_fragment_number += 1;
         sent_so_far += 1;

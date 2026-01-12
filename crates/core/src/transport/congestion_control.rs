@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
 
+use super::bbr::DeliveryRateToken;
 use super::bbr::{BbrConfig, BbrController, BbrStats};
 use super::ledbat::{LedbatConfig, LedbatController, LedbatStats};
 
@@ -585,6 +586,42 @@ impl<T: TimeSource> CongestionController<T> {
         match self {
             Self::Bbr(_) => None,
             Self::Ledbat(c) => Some(c),
+        }
+    }
+
+    /// Called when a packet is sent. Returns a delivery rate token for BBR.
+    ///
+    /// For BBR, the returned token must be stored with the sent packet and passed
+    /// to `on_ack_with_token` when the ACK arrives. This enables accurate delivery
+    /// rate estimation, which is critical for BBR's bandwidth probing.
+    ///
+    /// For LEDBAT, returns None (LEDBAT doesn't use per-packet tokens).
+    pub fn on_send_with_token(&self, bytes: usize) -> Option<DeliveryRateToken> {
+        match self {
+            Self::Bbr(c) => Some(c.on_send(bytes)),
+            Self::Ledbat(c) => {
+                c.on_send(bytes);
+                None
+            }
+        }
+    }
+
+    /// Called when an ACK is received, with optional delivery rate token.
+    ///
+    /// For BBR, passing the token from the original send enables accurate delivery
+    /// rate computation. Without the token, BBR falls back to a per-packet estimate
+    /// (bytes_acked / rtt) which is less accurate and can cause cwnd to stall.
+    ///
+    /// For LEDBAT, the token is ignored (LEDBAT uses delay-based estimation).
+    pub fn on_ack_with_token(
+        &self,
+        rtt_sample: Duration,
+        bytes_acked: usize,
+        token: Option<DeliveryRateToken>,
+    ) {
+        match self {
+            Self::Bbr(c) => c.on_ack_with_token(rtt_sample, bytes_acked, token),
+            Self::Ledbat(c) => c.on_ack(rtt_sample, bytes_acked),
         }
     }
 }
