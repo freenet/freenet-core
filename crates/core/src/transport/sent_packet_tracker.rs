@@ -48,20 +48,11 @@ const MAX_RTO_BACKOFF: u32 = 512;
 
 /// Minimum RTO after RTT samples have been collected.
 ///
-/// RFC 6298 recommends 1 second, but Linux TCP uses 200ms and this is widely accepted
-/// for modern networks. For LEDBAT, faster loss detection is critical since we're
-/// delay-sensitive - a 1 second RTO means we wait 5x longer than necessary on a typical
-/// network to detect packet loss.
+/// RFC 6298 recommends 1 second, but Linux TCP uses 200ms. We use 500ms because it must
+/// exceed RTT + ACK_CHECK_INTERVAL (100ms) to avoid spurious timeouts. With intercontinental
+/// RTTs of 150-200ms and 100ms ACK batching, effective round-trip time can be 300-400ms.
 ///
-/// IMPORTANT: This value must be greater than RTT + ACK_CHECK_INTERVAL (100ms) to avoid
-/// spurious timeouts. With intercontinental RTTs of 150-200ms and 100ms ACK batching,
-/// effective round-trip time can be 300-400ms. Using 500ms provides headroom for jitter
-/// and prevents timeout storms on high-latency connections.
-///
-/// History:
-/// - 200ms: Caused 935 timeouts in 10 seconds (v0.1.92 regression)
-/// - 500ms: Still too aggressive for high-latency + ACK batching (effective RTT ~500ms)
-/// - 500ms: Provides ~100-200ms headroom for jitter on worst-case paths
+/// History: 200ms caused 935 timeouts in 10 seconds (v0.1.92 regression) on high-latency paths.
 ///
 /// Note: Initial RTO (before any RTT samples) remains 1 second per RFC 6298 Section 2.1.
 const MIN_RTO: Duration = Duration::from_millis(500);
@@ -1093,13 +1084,13 @@ pub(in crate::transport) mod tests {
         // Effective RTO with backoff of 1 should also be 500ms
         assert_eq!(tracker.effective_rto(), EXPECTED_MIN_RTO);
 
-        // After timeout, backoff doubles to 2, effective RTO = 600ms
+        // After timeout, backoff doubles to 2, effective RTO = 1000ms
         tracker.on_timeout();
-        assert_eq!(tracker.effective_rto(), Duration::from_millis(600));
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(1000));
 
-        // After another timeout, backoff = 4, effective RTO = 1200ms
+        // After another timeout, backoff = 4, effective RTO = 2000ms
         tracker.on_timeout();
-        assert_eq!(tracker.effective_rto(), Duration::from_millis(1200));
+        assert_eq!(tracker.effective_rto(), Duration::from_millis(2000));
     }
 
     #[test]
@@ -1309,8 +1300,8 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(2, payload);
 
         // Now if still no ACK, full RTO should fire
-        // RTO timer starts fresh after TLP, so wait another 500ms
-        tracker.time_source.advance(Duration::from_millis(299));
+        // RTO timer starts fresh after TLP, so wait another 500ms (MIN_RTO)
+        tracker.time_source.advance(Duration::from_millis(499));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Still waiting for RTO
             _ => panic!("Should still be waiting for RTO"),

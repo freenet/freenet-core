@@ -387,16 +387,8 @@ impl<T: TimeSource> BbrController<T> {
 
         // Calculate adaptive floor based on max BDP ever seen.
         // Use 1/4 of max BDP as minimum cwnd (similar to LEDBAT's approach).
-        // This keeps cwnd low enough to probe for available bandwidth while still
-        // maintaining reasonable throughput on high-BDP paths.
         let max_bdp = self.max_bdp_seen.load(Ordering::Acquire);
-        let adaptive_min = if max_bdp > 0 {
-            (max_bdp / 4).max(self.config.initial_cwnd)
-        } else {
-            self.config.initial_cwnd
-        };
-
-        // Use the adaptive floor instead of hard reset to initial_cwnd
+        let adaptive_min = (max_bdp / 4).max(self.config.initial_cwnd);
         self.cwnd.store(adaptive_min, Ordering::Release);
 
         // Reset bandwidth bounds and filter (estimates may be stale after timeout)
