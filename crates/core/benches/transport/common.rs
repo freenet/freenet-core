@@ -98,7 +98,10 @@ pub fn get_congestion_config() -> CongestionControlConfig {
 /// Call this at the start of benchmark runs to show which algorithm is being tested.
 pub fn print_congestion_config() {
     let algo = get_congestion_algorithm();
-    eprintln!("Benchmark congestion control: {} (set FREENET_CONGESTION_ALGO to switch)", algo);
+    eprintln!(
+        "Benchmark congestion control: {} (set FREENET_CONGESTION_ALGO to switch)",
+        algo
+    );
 }
 
 // =============================================================================

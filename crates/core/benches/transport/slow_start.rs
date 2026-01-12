@@ -105,79 +105,79 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                             }
                         };
 
-                        let start_virtual = ts.now_nanos();
+                    let start_virtual = ts.now_nanos();
 
-                        // Connect both peers concurrently
-                        let (conn_a_future, conn_b_future) = futures::join!(
-                            peer_a.connect(peer_b_pub, peer_b_addr),
-                            peer_b.connect(peer_a_pub, peer_a_addr),
-                        );
+                    // Connect both peers concurrently
+                    let (conn_a_future, conn_b_future) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
 
-                        let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
+                    let (conn_a, conn_b) = futures::join!(conn_a_future, conn_b_future);
 
-                        let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
-                            (Ok(a), Ok(b)) => (a, b),
-                            (Err(e), _) => {
-                                eprintln!("cold_start receiver connect failed: {:?}", e);
-                                continue;
-                            }
-                            (_, Err(e)) => {
-                                eprintln!("cold_start sender connect failed: {:?}", e);
-                                continue;
-                            }
-                        };
-
-                        // Send from B to A
-                        let send_result = conn_b.send(message).await;
-                        let sent_ok = match send_result {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("cold_start send failed: {:?}", e);
-                                false
-                            }
-                        };
-
-                        // Receive at A
-                        let received_len = if sent_ok {
-                            match conn_a.recv().await {
-                                Ok(received) => {
-                                    std_black_box(&received);
-                                    received.len()
-                                }
-                                Err(e) => {
-                                    eprintln!("cold_start recv failed: {:?}", e);
-                                    0
-                                }
-                            }
-                        } else {
-                            0
-                        };
-
-                        // Keep peers alive until end of iteration
-                        drop(conn_a);
-                        drop(conn_b);
-                        drop(peer_a);
-                        drop(peer_b);
-
-                        let end_virtual = ts.now_nanos();
-                        total_virtual_time +=
-                            Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
-
-                        if !sent_ok || received_len == 0 {
-                            eprintln!(
-                                "cold_start failed: sent={}, received={}",
-                                sent_ok, received_len
-                            );
+                    let (mut conn_a, mut conn_b) = match (conn_a, conn_b) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) => {
+                            eprintln!("cold_start receiver connect failed: {:?}", e);
+                            continue;
                         }
+                        (_, Err(e)) => {
+                            eprintln!("cold_start sender connect failed: {:?}", e);
+                            continue;
+                        }
+                    };
 
-                        auto_advance.abort();
-                        drop(channels);
+                    // Send from B to A
+                    let send_result = conn_b.send(message).await;
+                    let sent_ok = match send_result {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("cold_start send failed: {:?}", e);
+                            false
+                        }
+                    };
+
+                    // Receive at A
+                    let received_len = if sent_ok {
+                        match conn_a.recv().await {
+                            Ok(received) => {
+                                std_black_box(&received);
+                                received.len()
+                            }
+                            Err(e) => {
+                                eprintln!("cold_start recv failed: {:?}", e);
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
+
+                    // Keep peers alive until end of iteration
+                    drop(conn_a);
+                    drop(conn_b);
+                    drop(peer_a);
+                    drop(peer_b);
+
+                    let end_virtual = ts.now_nanos();
+                    total_virtual_time +=
+                        Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
+
+                    if !sent_ok || received_len == 0 {
+                        eprintln!(
+                            "cold_start failed: sent={}, received={}",
+                            sent_ok, received_len
+                        );
                     }
 
-                    total_virtual_time
+                    auto_advance.abort();
+                    drop(channels);
                 }
-            });
+
+                total_virtual_time
+            }
         });
+    });
     group.finish();
 }
 
@@ -351,10 +351,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                         Duration::from_nanos(end_virtual.saturating_sub(start_virtual));
 
                     if !sent_ok || received_len == 0 {
-                        eprintln!(
-                            "warm failed: sent={}, received={}",
-                            sent_ok, received_len
-                        );
+                        eprintln!("warm failed: sent={}, received={}", sent_ok, received_len);
                     }
 
                     auto_advance.abort();

@@ -419,33 +419,6 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         Ok((connection_handler, new_connection_notifier))
     }
 
-    pub(crate) fn new_test_with_time_source(
-        socket_addr: SocketAddr,
-        socket: Arc<S>,
-        keypair: TransportKeypair,
-        is_gateway: bool,
-        bandwidth_limit: Option<usize>,
-        time_source: crate::simulation::VirtualTime,
-    ) -> Result<
-        (
-            Self,
-            mpsc::Receiver<PeerConnection<S, crate::simulation::VirtualTime>>,
-        ),
-        TransportError,
-    > {
-        Self::config_listener_with_virtual_time(
-            socket,
-            keypair,
-            is_gateway,
-            socket_addr,
-            bandwidth_limit,
-            None,
-            None,
-            time_source,
-            None,
-        )
-    }
-
     /// Create a test connection handler with VirtualTime and custom congestion control.
     ///
     /// This allows benchmarks to test with different congestion control algorithms.
@@ -1630,9 +1603,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             let congestion_controller = congestion_config
                                                 .clone()
                                                 .unwrap_or_default()
-                                                .build_arc_with_time_source(
-                                                    time_source.clone(),
-                                                );
+                                                .build_arc_with_time_source(time_source.clone());
 
                                             // Initialize token bucket
                                             // Use global bandwidth manager if configured
