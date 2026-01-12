@@ -1495,4 +1495,254 @@ mod tests {
             "should not create entry for non-existent parent"
         );
     }
+
+    /// Test that simulates the race condition where a child completes during parent registration.
+    ///
+    /// The `expect_and_register_sub_operation` method performs 3 DashMap operations:
+    /// 1. Increment expected_sub_operations count
+    /// 2. Add child to sub_operations set
+    /// 3. Add parent_of mapping
+    ///
+    /// This test verifies that even if we simulate a child completion between these
+    /// operations, the tracker remains in a consistent state.
+    ///
+    /// Note: In the current implementation, these operations are NOT truly atomic,
+    /// but the design ensures safety: expected_sub_operations is incremented FIRST,
+    /// so even if a child completes early, the counter is already set.
+    #[test]
+    fn sub_operation_tracker_child_completion_during_registration_race_simulation() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child = Transaction::ttl_transaction();
+        let completed = DashSet::new();
+
+        // Step 1: Manually simulate partial registration - only increment expected count
+        tracker
+            .expected_sub_operations
+            .entry(parent)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+
+        // At this point, if a child "completed", it would decrement the counter
+        // Simulate child completion BEFORE full registration
+        tracker.mark_sub_op_completed(parent);
+
+        // Counter should be 0 now (decremented from 1)
+        assert!(
+            !tracker.expected_sub_operations.contains_key(&parent),
+            "Counter should be removed after decrement to 0"
+        );
+
+        // Now complete the registration (simulating the rest of expect_and_register_sub_operation)
+        tracker
+            .sub_operations
+            .entry(parent)
+            .or_default()
+            .insert(child);
+        tracker.parent_of.insert(child, parent);
+
+        // Even after this race, the child is registered but counter is 0
+        // This means all_sub_operations_completed would check sub_operations set
+        completed.insert(child);
+        assert!(
+            tracker.all_sub_operations_completed(parent, &completed),
+            "Should detect completion even after race (child is in completed set)"
+        );
+    }
+
+    /// Test that multiple children completing concurrently maintain correct counter.
+    ///
+    /// Simulates rapid completion of children to verify the counter stays consistent.
+    #[test]
+    fn sub_operation_tracker_multiple_children_concurrent_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tracker = Arc::new(SubOperationTracker::new());
+        let parent = Transaction::ttl_transaction();
+        let num_children = 10;
+
+        // Register all children first
+        let mut children = Vec::new();
+        for _ in 0..num_children {
+            let child = Transaction::ttl_transaction();
+            children.push(child);
+            tracker.expect_and_register_sub_operation(parent, child);
+        }
+
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(num_children),
+            "Should have {} expected children",
+            num_children
+        );
+
+        // Simulate concurrent completions using threads
+        let completion_count = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = children
+            .into_iter()
+            .map(|_child| {
+                let tracker = Arc::clone(&tracker);
+                let count = Arc::clone(&completion_count);
+                std::thread::spawn(move || {
+                    tracker.mark_sub_op_completed(parent);
+                    count.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Wait for all completions
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify all completions were counted
+        assert_eq!(
+            completion_count.load(Ordering::SeqCst),
+            num_children,
+            "All completions should have been processed"
+        );
+
+        // Verify counter is removed (decremented to 0)
+        assert!(
+            !tracker.expected_sub_operations.contains_key(&parent),
+            "Expected counter should be removed when all children complete"
+        );
+    }
+
+    /// Test that failed child races with parent completion check.
+    ///
+    /// Scenario: A child fails while the parent is checking if all sub-operations completed.
+    /// The failed_parents set should be updated correctly.
+    #[test]
+    fn sub_operation_tracker_failed_child_races_parent_completion() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+        let completed = DashSet::new();
+
+        // Register children
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+
+        // Child1 completes successfully
+        completed.insert(child1);
+        tracker.mark_sub_op_completed(parent);
+        tracker.remove_child_link(parent, child1);
+
+        // Before child2 completes, check completion status
+        assert!(
+            !tracker.all_sub_operations_completed(parent, &completed),
+            "Should not be complete while child2 is pending"
+        );
+
+        // Now child2 fails - in real code this would call sub_operation_failed
+        // which marks the parent as failed
+        tracker.failed_parents.insert(parent);
+
+        // Even if we mark child2 complete, parent is failed
+        completed.insert(child2);
+        tracker.mark_sub_op_completed(parent);
+
+        // Verify parent is in failed_parents
+        assert!(
+            tracker.failed_parents.contains(&parent),
+            "Parent should be marked as failed"
+        );
+
+        // all_sub_operations_completed returns true (children are done),
+        // but the failed_parents check would catch this in handle_op_result
+        assert!(
+            tracker.all_sub_operations_completed(parent, &completed),
+            "All children completed (even though one failed)"
+        );
+    }
+
+    /// Test interleaved registration and completion across multiple parents.
+    ///
+    /// Verifies that tracking for different parents doesn't interfere.
+    #[test]
+    fn sub_operation_tracker_multiple_parents_interleaved_operations() {
+        let tracker = SubOperationTracker::new();
+        let parent1 = Transaction::ttl_transaction();
+        let parent2 = Transaction::ttl_transaction();
+        let child1a = Transaction::ttl_transaction();
+        let child1b = Transaction::ttl_transaction();
+        let child2a = Transaction::ttl_transaction();
+        let completed = DashSet::new();
+
+        // Interleaved registrations
+        tracker.expect_and_register_sub_operation(parent1, child1a);
+        tracker.expect_and_register_sub_operation(parent2, child2a);
+        tracker.expect_and_register_sub_operation(parent1, child1b);
+
+        // Verify correct parent relationships
+        assert_eq!(tracker.get_parent(child1a), Some(parent1));
+        assert_eq!(tracker.get_parent(child1b), Some(parent1));
+        assert_eq!(tracker.get_parent(child2a), Some(parent2));
+
+        // Complete parent1's children
+        completed.insert(child1a);
+        tracker.mark_sub_op_completed(parent1);
+        completed.insert(child1b);
+        tracker.mark_sub_op_completed(parent1);
+
+        // Parent1 should be complete, parent2 should not
+        assert!(
+            tracker.all_sub_operations_completed(parent1, &completed),
+            "Parent1 should be complete"
+        );
+        assert!(
+            !tracker.all_sub_operations_completed(parent2, &completed),
+            "Parent2 should not be complete yet"
+        );
+
+        // Complete parent2's child
+        completed.insert(child2a);
+        tracker.mark_sub_op_completed(parent2);
+
+        assert!(
+            tracker.all_sub_operations_completed(parent2, &completed),
+            "Parent2 should now be complete"
+        );
+    }
+
+    /// Test that the tracker handles rapid registration-completion cycles.
+    ///
+    /// Simulates a stress scenario where children are registered and completed
+    /// in rapid succession to verify counter consistency.
+    #[test]
+    fn sub_operation_tracker_rapid_registration_completion_cycles() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let completed = DashSet::new();
+
+        // Perform multiple rapid cycles
+        for _ in 0..100 {
+            let child = Transaction::ttl_transaction();
+
+            // Register
+            tracker.expect_and_register_sub_operation(parent, child);
+            assert!(
+                tracker.expected_sub_operations.get(&parent).is_some(),
+                "Should have expected counter after registration"
+            );
+
+            // Complete
+            completed.insert(child);
+            tracker.mark_sub_op_completed(parent);
+            tracker.remove_child_link(parent, child);
+        }
+
+        // After all cycles, everything should be cleaned up
+        assert!(
+            tracker.all_sub_operations_completed(parent, &completed),
+            "All operations should be complete"
+        );
+        assert!(
+            !tracker.sub_operations.contains_key(&parent),
+            "sub_operations should be empty after all children removed"
+        );
+    }
 }
