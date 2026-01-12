@@ -378,11 +378,8 @@ impl ConnectionManager {
         drop(connections);
 
         // Check transient connections
-        if self.transient_connections.contains_key(&addr) {
-            // For transient connections, we don't have full peer info yet
-            // Return None since we don't have the public key
-            return None;
-        }
+        // For transient connections, we don't have full peer info yet
+        // Return None since we don't have the public key
         None
     }
 
@@ -593,6 +590,11 @@ impl ConnectionManager {
             cbl.entry(loc)
                 .or_default()
                 .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
+        }
+
+        // Remove from transient connections if present, since we're now a full ring connection.
+        if self.transient_connections.remove(&addr).is_some() {
+            self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
