@@ -274,4 +274,22 @@ mod tests {
         // Just check they're both valid (extremely unlikely to match by chance)
         assert!(val3 != 0 || val4 != 0);
     }
+
+    #[test]
+    fn test_multiple_children_determinism() {
+        // Test that multiple child RNGs derived from same seed produce identical sequences
+        let parent1 = SimulationRng::new(42);
+        let parent2 = SimulationRng::new(42);
+
+        // Create children in the same order
+        let children1: Vec<_> = (0..10).map(|i| parent1.child_with_index(i)).collect();
+        let children2: Vec<_> = (0..10).map(|i| parent2.child_with_index(i)).collect();
+
+        // Each corresponding pair should produce identical sequences
+        for (c1, c2) in children1.iter().zip(children2.iter()) {
+            for _ in 0..20 {
+                assert_eq!(c1.gen_u64(), c2.gen_u64());
+            }
+        }
+    }
 }
