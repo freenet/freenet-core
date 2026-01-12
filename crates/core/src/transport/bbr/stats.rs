@@ -55,6 +55,9 @@ pub struct BbrStats {
     /// Number of timeouts experienced.
     pub timeouts: u64,
 
+    /// Maximum BDP ever seen (for adaptive timeout floor).
+    pub max_bdp_seen: usize,
+
     /// Whether currently application-limited.
     pub is_app_limited: bool,
 
@@ -83,6 +86,7 @@ impl Default for BbrStats {
             full_bw: 0,
             probe_rtt_rounds: 0,
             timeouts: 0,
+            max_bdp_seen: 0,
             is_app_limited: false,
             pacing_gain: 1.0,
             cwnd_gain: 1.0,
