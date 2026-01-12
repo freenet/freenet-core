@@ -522,4 +522,105 @@ mod tests {
         assert_eq!(retrieved, large_state);
         assert_eq!(retrieved.size(), 1_000_000);
     }
+
+    // ============ Failure Recovery Tests ============
+
+    /// Test that after a failed store, the state is not retrievable (uncached mode).
+    ///
+    /// This verifies clean failure semantics: when persistent store fails,
+    /// no partial state should be visible to subsequent operations.
+    ///
+    /// Note: In cached mode, behavior is non-deterministic due to stretto's
+    /// TinyLFU admission policy. Use uncached mode for deterministic testing.
+    #[tokio::test]
+    async fn test_uncached_store_failure_leaves_no_state() {
+        let mock_storage = MockStateStorage::new();
+        mock_storage.fail_next_stores(1);
+
+        let mut store = StateStore::new_uncached(mock_storage);
+
+        let key = make_test_key();
+        let state = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store should fail
+        let result = store.store(key, state, params).await;
+        assert!(result.is_err());
+
+        // Subsequent get should return MissingContract, not stale data
+        let get_result = store.get(&key).await;
+        assert!(
+            matches!(get_result, Err(StateStoreError::MissingContract(_))),
+            "Expected MissingContract after failed store, got {:?}",
+            get_result
+        );
+    }
+
+    /// Test that after a failed update, the original state is preserved (uncached mode).
+    ///
+    /// Verifies that update failure doesn't corrupt the existing state.
+    #[tokio::test]
+    async fn test_uncached_update_failure_preserves_original_state() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage.clone());
+
+        let key = make_test_key();
+        let original_state = make_test_state(&[1, 2, 3]);
+        let updated_state = make_test_state(&[4, 5, 6]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store original state successfully
+        store
+            .store(key, original_state.clone(), params)
+            .await
+            .unwrap();
+
+        // Configure failure for update
+        mock_storage.fail_next_stores(1);
+
+        // Update should fail
+        let result = store.update(&key, updated_state).await;
+        assert!(result.is_err());
+
+        // Original state should still be retrievable
+        let retrieved = store.get(&key).await.unwrap();
+        assert_eq!(
+            retrieved, original_state,
+            "Original state should be preserved after failed update"
+        );
+    }
+
+    /// Test sequential updates where intermediate ones fail (uncached mode).
+    ///
+    /// Verifies that failed updates don't affect successful ones.
+    #[tokio::test]
+    async fn test_uncached_sequential_updates_with_failures() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage.clone());
+
+        let key = make_test_key();
+        let state_v1 = make_test_state(&[1]);
+        let state_v2 = make_test_state(&[2]);
+        let state_v3 = make_test_state(&[3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store v1 successfully
+        store.store(key, state_v1.clone(), params).await.unwrap();
+
+        // Update to v2 - should succeed
+        store.update(&key, state_v2.clone()).await.unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), state_v2);
+
+        // Update to v3 - configure to fail
+        mock_storage.fail_next_stores(1);
+        let result = store.update(&key, state_v3).await;
+        assert!(result.is_err());
+
+        // State should still be v2 (last successful update)
+        let retrieved = store.get(&key).await.unwrap();
+        assert_eq!(
+            retrieved, state_v2,
+            "State should be v2 after v3 update failed"
+        );
+    }
 }
