@@ -13,6 +13,253 @@ use freenet::dev_tool::{check_convergence_from_logs, reset_all_simulation_state,
 use std::time::Duration;
 
 // =============================================================================
+// Test Configuration
+// =============================================================================
+
+/// Configuration for a simulation test.
+struct TestConfig {
+    name: &'static str,
+    seed: u64,
+    gateways: usize,
+    nodes: usize,
+    ring_max_htl: usize,
+    rnd_if_htl_above: usize,
+    max_connections: usize,
+    min_connections: usize,
+    max_contracts: usize,
+    iterations: usize,
+    duration: Duration,
+    sleep_between_ops: Duration,
+    require_convergence: bool,
+}
+
+impl TestConfig {
+    /// Create a small test configuration (quick CI tests).
+    fn small(name: &'static str, seed: u64) -> Self {
+        Self {
+            name,
+            seed,
+            gateways: 1,
+            nodes: 3,
+            ring_max_htl: 7,
+            rnd_if_htl_above: 3,
+            max_connections: 10,
+            min_connections: 2,
+            max_contracts: 3,
+            iterations: 15,
+            duration: Duration::from_secs(20),
+            sleep_between_ops: Duration::from_secs(1),
+            require_convergence: false,
+        }
+    }
+
+    /// Create a medium test configuration.
+    fn medium(name: &'static str, seed: u64) -> Self {
+        Self {
+            name,
+            seed,
+            gateways: 2,
+            nodes: 6,
+            ring_max_htl: 10,
+            rnd_if_htl_above: 7,
+            max_connections: 15,
+            min_connections: 2,
+            max_contracts: 8,
+            iterations: 100,
+            duration: Duration::from_secs(120),
+            sleep_between_ops: Duration::from_secs(3),
+            require_convergence: false,
+        }
+    }
+
+    /// Create a large/dense test configuration.
+    fn large(name: &'static str, seed: u64) -> Self {
+        Self {
+            name,
+            seed,
+            gateways: 3,
+            nodes: 12,
+            ring_max_htl: 12,
+            rnd_if_htl_above: 8,
+            max_connections: 12,
+            min_connections: 6,
+            max_contracts: 15,
+            iterations: 150,
+            duration: Duration::from_secs(300),
+            sleep_between_ops: Duration::from_secs(10),
+            require_convergence: false,
+        }
+    }
+
+    // Builder methods
+    fn with_nodes(mut self, nodes: usize) -> Self {
+        self.nodes = nodes;
+        self
+    }
+
+    fn with_gateways(mut self, gateways: usize) -> Self {
+        self.gateways = gateways;
+        self
+    }
+
+    fn with_iterations(mut self, iterations: usize) -> Self {
+        self.iterations = iterations;
+        self
+    }
+
+    fn with_max_contracts(mut self, max_contracts: usize) -> Self {
+        self.max_contracts = max_contracts;
+        self
+    }
+
+    fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    fn with_sleep(mut self, sleep: Duration) -> Self {
+        self.sleep_between_ops = sleep;
+        self
+    }
+
+    fn with_connections(mut self, min: usize, max: usize) -> Self {
+        self.min_connections = min;
+        self.max_connections = max;
+        self
+    }
+
+    fn with_htl(mut self, max_htl: usize, rnd_above: usize) -> Self {
+        self.ring_max_htl = max_htl;
+        self.rnd_if_htl_above = rnd_above;
+        self
+    }
+
+    fn require_convergence(mut self) -> Self {
+        self.require_convergence = true;
+        self
+    }
+
+    /// Run the simulation and return results.
+    fn run(self) -> TestResult {
+        setup_deterministic_state(self.seed);
+        let rt = create_runtime();
+
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                self.name,
+                self.gateways,
+                self.nodes,
+                self.ring_max_htl,
+                self.rnd_if_htl_above,
+                self.max_connections,
+                self.min_connections,
+                self.seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        let sleep_duration = self.sleep_between_ops;
+        let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+            self.seed,
+            self.max_contracts,
+            self.iterations,
+            self.duration,
+            move || async move {
+                tokio::time::sleep(sleep_duration).await;
+                Ok(())
+            },
+        );
+
+        let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+        let event_count = rt.block_on(async { logs_handle.lock().await.len() });
+
+        TestResult {
+            seed: self.seed,
+            name: self.name,
+            simulation_result: result,
+            convergence,
+            event_count,
+            require_convergence: self.require_convergence,
+        }
+    }
+}
+
+/// Result of running a simulation test.
+struct TestResult {
+    seed: u64,
+    name: &'static str,
+    simulation_result: turmoil::Result,
+    convergence: freenet::dev_tool::ConvergenceResult,
+    event_count: usize,
+    require_convergence: bool,
+}
+
+impl TestResult {
+    /// Assert the simulation completed successfully.
+    fn assert_ok(self) -> Self {
+        if let Err(e) = &self.simulation_result {
+            eprintln!("\n============================================================");
+            eprintln!("SIMULATION TEST FAILED: {}", self.name);
+            eprintln!("============================================================");
+            eprintln!("Seed for reproduction: 0x{:X}", self.seed);
+            eprintln!("Error: {:?}", e);
+            eprintln!("============================================================\n");
+        }
+        assert!(
+            self.simulation_result.is_ok(),
+            "{} failed: {:?}",
+            self.name,
+            self.simulation_result.err()
+        );
+        self
+    }
+
+    /// Log convergence results and optionally assert convergence.
+    fn check_convergence(self) -> Self {
+        tracing::info!(
+            "{}: {} converged, {} diverged, {} events",
+            self.name,
+            self.convergence.converged.len(),
+            self.convergence.diverged.len(),
+            self.event_count
+        );
+
+        for diverged in &self.convergence.diverged {
+            if self.require_convergence {
+                tracing::error!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            } else {
+                tracing::warn!(
+                    "Contract {} diverged: {} states across {} peers",
+                    diverged.contract_key,
+                    diverged.unique_state_count(),
+                    diverged.peer_states.len()
+                );
+            }
+        }
+
+        if self.require_convergence {
+            assert!(
+                self.convergence.is_converged(),
+                "{} convergence failed: {} converged, {} diverged",
+                self.name,
+                self.convergence.converged.len(),
+                self.convergence.diverged.len()
+            );
+        }
+
+        tracing::info!("{} PASSED", self.name);
+        self
+    }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -20,7 +267,6 @@ use std::time::Duration;
 fn setup_deterministic_state(seed: u64) {
     reset_all_simulation_state();
     GlobalRng::set_seed(seed);
-    // Derive epoch from seed for deterministic ULID generation
     const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
@@ -39,8 +285,6 @@ fn create_runtime() -> tokio::runtime::Runtime {
 // =============================================================================
 
 /// Test that SimNetwork can be created and peers can be built.
-///
-/// This is a basic smoke test that doesn't actually run the network.
 #[test]
 fn test_sim_network_basic_setup() {
     const SEED: u64 = 0xBA51C_5E70_0001;
@@ -49,130 +293,38 @@ fn test_sim_network_basic_setup() {
     let rt = create_runtime();
 
     rt.block_on(async {
-        let mut sim = SimNetwork::new(
-            "basic-setup",
-            1,  // gateways
-            5,  // nodes
-            7,  // ring_max_htl
-            3,  // rnd_if_htl_above
-            10, // max_connections
-            2,  // min_connections
-            SEED,
-        )
-        .await;
-
+        let mut sim = SimNetwork::new("basic-setup", 1, 5, 7, 3, 10, 2, SEED).await;
         sim.with_start_backoff(Duration::from_millis(100));
 
-        // Build the peers without starting them
         let peers = sim.build_peers();
-
-        // Verify we have the expected number of peers
         assert_eq!(peers.len(), 6, "Expected 1 gateway + 5 nodes = 6 peers");
 
-        // Verify labels are correctly assigned
         let gateway_count = peers.iter().filter(|(l, _)| !l.is_node()).count();
         let node_count = peers.iter().filter(|(l, _)| l.is_node()).count();
         assert_eq!(gateway_count, 1, "Expected 1 gateway");
         assert_eq!(node_count, 5, "Expected 5 regular nodes");
-
-        tracing::info!("SimNetwork basic setup test passed");
     });
 }
 
 /// Test that peers can start and run under Turmoil's deterministic scheduler.
 #[test]
 fn test_sim_network_peer_startup() {
-    const SEED: u64 = 0xBEE2_5747_0001;
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "peer-startup",
-            1,  // gateways
-            2,  // nodes (small for quick test)
-            7,  // ring_max_htl
-            3,  // rnd_if_htl_above
-            10, // max_connections
-            1,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    // Run simulation with minimal events - just verify startup works
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        1,                       // max_contract_num
-        5,                       // iterations (minimal)
-        Duration::from_secs(15), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "Peer startup simulation failed: {:?}",
-        result.err()
-    );
-
-    // Verify some events were logged (nodes started and did something)
-    let event_count = rt.block_on(async { logs_handle.lock().await.len() });
-    tracing::info!("Peer startup test logged {} events", event_count);
-
-    tracing::info!("SimNetwork peer startup test passed");
+    TestConfig::small("peer-startup", 0xBEE2_5747_0001)
+        .with_nodes(2)
+        .with_iterations(5)
+        .with_duration(Duration::from_secs(15))
+        .run()
+        .assert_ok();
 }
 
 /// Test network connectivity under Turmoil's deterministic scheduler.
 #[test]
 fn test_sim_network_connectivity() {
-    const SEED: u64 = 0xC0EE_3C70_0001;
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "connectivity-test",
-            1,  // gateways
-            3,  // nodes
-            7,  // ring_max_htl
-            3,  // rnd_if_htl_above
-            10, // max_connections
-            1,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        2,                       // max_contract_num
-        10,                      // iterations
-        Duration::from_secs(20), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "Connectivity simulation failed: {:?}",
-        result.err()
-    );
-
-    let event_count = rt.block_on(async { logs_handle.lock().await.len() });
-    tracing::info!("Connectivity test logged {} events", event_count);
-
-    tracing::info!("SimNetwork connectivity test passed");
+    TestConfig::small("connectivity-test", 0xC0EE_3C70_0001)
+        .with_max_contracts(2)
+        .with_iterations(10)
+        .run()
+        .assert_ok();
 }
 
 // =============================================================================
@@ -180,158 +332,26 @@ fn test_sim_network_connectivity() {
 // =============================================================================
 
 /// CI simulation test - small network with contract operations.
-///
-/// This test validates that a small network can:
-/// 1. Start nodes successfully
-/// 2. Execute contract operations
-/// 3. Complete without errors
-///
-/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network ci_quick_simulation -- --test-threads=1`
 #[test]
 fn ci_quick_simulation() {
-    const SEED: u64 = 0xC1F1_ED5E_ED00;
-
-    tracing::info!("Starting CI quick simulation test with seed: 0x{:X}", SEED);
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "ci-quick-sim",
-            1,  // gateways
-            4,  // nodes (5 total)
-            10, // ring_max_htl
-            7,  // rnd_if_htl_above
-            15, // max_connections
-            2,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        5,                       // max_contract_num
-        50,                      // iterations (contract operations)
-        Duration::from_secs(45), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            Ok(())
-        },
-    );
-
-    if let Err(e) = &result {
-        eprintln!("\n============================================================");
-        eprintln!("CI SIMULATION TEST FAILED");
-        eprintln!("============================================================");
-        eprintln!("Seed for reproduction: 0x{:X}", SEED);
-        eprintln!("Error: {:?}", e);
-        eprintln!("============================================================\n");
-    }
-
-    assert!(
-        result.is_ok(),
-        "CI quick simulation failed: {:?}",
-        result.err()
-    );
-
-    // Check convergence
-    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
-
-    tracing::info!(
-        "CI quick simulation: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    // Log diverged contracts for debugging (don't fail on divergence yet)
-    for diverged in &convergence.diverged {
-        tracing::warn!(
-            "Contract {} diverged: {} states across {} peers",
-            diverged.contract_key,
-            diverged.unique_state_count(),
-            diverged.peer_states.len()
-        );
-    }
-
-    tracing::info!("CI quick simulation test PASSED");
+    TestConfig::small("ci-quick-sim", 0xC1F1_ED5E_ED00)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(50)
+        .with_duration(Duration::from_secs(45))
+        .with_sleep(Duration::from_secs(2))
+        .run()
+        .assert_ok()
+        .check_convergence();
 }
 
 /// CI simulation test - medium network with more operations.
-///
-/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network ci_medium_simulation -- --test-threads=1`
 #[test]
 fn ci_medium_simulation() {
-    const SEED: u64 = 0xC1F1_ED7E_ED01;
-
-    tracing::info!("Starting CI medium simulation test with seed: 0x{:X}", SEED);
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "ci-medium-sim",
-            2,  // gateways
-            6,  // nodes (8 total)
-            10, // ring_max_htl
-            7,  // rnd_if_htl_above
-            15, // max_connections
-            2,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        8,                        // max_contract_num
-        100,                      // iterations
-        Duration::from_secs(120), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            Ok(())
-        },
-    );
-
-    if let Err(e) = &result {
-        eprintln!("\n============================================================");
-        eprintln!("CI MEDIUM SIMULATION TEST FAILED");
-        eprintln!("============================================================");
-        eprintln!("Seed for reproduction: 0x{:X}", SEED);
-        eprintln!("Error: {:?}", e);
-        eprintln!("============================================================\n");
-    }
-
-    assert!(
-        result.is_ok(),
-        "CI medium simulation failed: {:?}",
-        result.err()
-    );
-
-    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
-
-    tracing::info!(
-        "CI medium simulation: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    for diverged in &convergence.diverged {
-        tracing::warn!(
-            "Contract {} diverged: {} states across {} peers",
-            diverged.contract_key,
-            diverged.unique_state_count(),
-            diverged.peer_states.len()
-        );
-    }
-
-    tracing::info!("CI medium simulation test PASSED");
+    TestConfig::medium("ci-medium-sim", 0xC1F1_ED7E_ED01)
+        .run()
+        .assert_ok()
+        .check_convergence();
 }
 
 // =============================================================================
@@ -339,157 +359,35 @@ fn ci_medium_simulation() {
 // =============================================================================
 
 /// Replica validation test with stepwise consistency checking.
-///
-/// This test validates contract replication with phased event generation.
-///
-/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network replica_validation -- --test-threads=1 --ignored`
 // FIXME: Test fails consistently with convergence issues. See issue #2684.
 #[test]
 #[ignore]
 fn replica_validation_and_stepwise_consistency() {
-    const SEED: u64 = 0xBEE1_1CA5_0001;
-    const ITERATIONS: usize = 90; // 3 phases × 30 events
-
-    tracing::info!("Starting replica validation test with seed: 0x{:X}", SEED);
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "replica-validation",
-            2, // gateways
-            8, // nodes (10 total)
-            8, // ring_max_htl
-            4, // rnd_if_htl_above
-            8, // max_connections
-            4, // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        10,                       // max_contract_num
-        ITERATIONS,               // iterations
-        Duration::from_secs(180), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "Replica validation simulation failed: {:?}",
-        result.err()
-    );
-
-    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
-
-    tracing::info!(
-        "Replica validation: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    for diverged in &convergence.diverged {
-        tracing::error!(
-            "Contract {} diverged: {} states across {} peers",
-            diverged.contract_key,
-            diverged.unique_state_count(),
-            diverged.peer_states.len()
-        );
-    }
-
-    assert!(
-        convergence.is_converged(),
-        "Replica validation failed: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    tracing::info!("Replica validation test PASSED");
+    TestConfig::medium("replica-validation", 0xBEE1_1CA5_0001)
+        .with_gateways(2)
+        .with_nodes(8)
+        .with_htl(8, 4)
+        .with_connections(4, 8)
+        .with_max_contracts(10)
+        .with_iterations(90)
+        .with_duration(Duration::from_secs(180))
+        .with_sleep(Duration::from_secs(5))
+        .require_convergence()
+        .run()
+        .assert_ok()
+        .check_convergence();
 }
 
 /// Dense network test with high connectivity.
-///
-/// Run with: `cargo test -p freenet --features simulation_tests --test sim_network dense_network -- --test-threads=1 --ignored`
 // FIXME: Test fails consistently with convergence issues. See issue #2684.
 #[test]
 #[ignore]
 fn dense_network_replication() {
-    const SEED: u64 = 0xDE05_E0F0_0001;
-
-    tracing::info!(
-        "Starting dense network replication test with seed: 0x{:X}",
-        SEED
-    );
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "dense-network",
-            3,  // gateways
-            12, // nodes (15 total - dense)
-            12, // ring_max_htl
-            8,  // rnd_if_htl_above
-            12, // max_connections
-            6,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        15,                       // max_contract_num
-        150,                      // iterations
-        Duration::from_secs(300), // simulation_duration
-        || async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "Dense network simulation failed: {:?}",
-        result.err()
-    );
-
-    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
-
-    tracing::info!(
-        "Dense network: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    for diverged in &convergence.diverged {
-        tracing::error!(
-            "Contract {} diverged: {} states across {} peers",
-            diverged.contract_key,
-            diverged.unique_state_count(),
-            diverged.peer_states.len()
-        );
-    }
-
-    assert!(
-        convergence.is_converged(),
-        "Dense network convergence failed: {} converged, {} diverged",
-        convergence.converged.len(),
-        convergence.diverged.len()
-    );
-
-    tracing::info!("Dense network replication test PASSED");
+    TestConfig::large("dense-network", 0xDE05_E0F0_0001)
+        .require_convergence()
+        .run()
+        .assert_ok()
+        .check_convergence();
 }
 
 // =============================================================================
@@ -497,14 +395,11 @@ fn dense_network_replication() {
 // =============================================================================
 
 /// Verify that running the same simulation twice produces identical results.
-///
-/// This is the ultimate test of determinism - same seed should produce
-/// exactly the same event sequence.
 #[test]
 fn test_turmoil_determinism_verification() {
     const SEED: u64 = 0xDE7E_2A11_0001;
 
-    fn run_simulation(name: &str, seed: u64) -> Vec<String> {
+    fn run_simulation(name: &'static str, seed: u64) -> Vec<String> {
         setup_deterministic_state(seed);
         let rt = create_runtime();
 
@@ -527,7 +422,6 @@ fn test_turmoil_determinism_verification() {
 
         assert!(result.is_ok(), "Simulation failed: {:?}", result.err());
 
-        // Extract event sequence
         rt.block_on(async {
             let logs = logs_handle.lock().await;
             logs.iter()
@@ -536,11 +430,9 @@ fn test_turmoil_determinism_verification() {
         })
     }
 
-    // Run twice with same seed
     let events1 = run_simulation("det-verify-1", SEED);
     let events2 = run_simulation("det-verify-2", SEED);
 
-    // Both runs should produce identical event sequences
     assert_eq!(
         events1.len(),
         events2.len(),
