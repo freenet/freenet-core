@@ -808,11 +808,10 @@ impl Operation for SubscribeOp {
                             fetch_contract_if_missing(op_manager, *key.id()).await?;
 
                             // Register the sender as our upstream source
+                            // Use retry with backoff for peer lookup (same as downstream)
                             if let Some(sender_addr) = source_addr {
-                                if let Some(sender_peer) = op_manager
-                                    .ring
-                                    .connection_manager
-                                    .get_peer_location_by_addr(sender_addr)
+                                if let Some(sender_peer) =
+                                    wait_for_peer_location(op_manager, sender_addr, msg_id).await
                                 {
                                     match op_manager.ring.set_upstream(key, sender_peer.clone()) {
                                         Ok(()) => {
@@ -844,6 +843,13 @@ impl Operation for SubscribeOp {
                                             );
                                         }
                                     }
+                                } else {
+                                    tracing::warn!(
+                                        tx = %msg_id,
+                                        %key,
+                                        upstream = %sender_addr,
+                                        "subscribe: failed to find upstream peer after retries, subscription tree may be incomplete"
+                                    );
                                 }
                             }
 

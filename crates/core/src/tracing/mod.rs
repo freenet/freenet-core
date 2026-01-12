@@ -869,8 +869,8 @@ impl<'a> NetEventLog<'a> {
                 key,
                 target: own_loc,
                 timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash_before: Some(state_hash_short(state_before)),
-                state_hash_after: Some(state_hash_short(state_after)),
+                state_hash_before: Some(state_hash_full(state_before)),
+                state_hash_after: Some(state_hash_full(state_after)),
                 changed,
             }),
         })
