@@ -43,7 +43,8 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::transport::TransportPublicKey;
 use crate::util::time_source::TimeSource;

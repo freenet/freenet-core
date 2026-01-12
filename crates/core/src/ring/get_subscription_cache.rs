@@ -18,7 +18,8 @@
 
 use freenet_stdlib::prelude::ContractKey;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
 

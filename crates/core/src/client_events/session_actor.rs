@@ -45,7 +45,8 @@ use crate::message::Transaction;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use freenet_stdlib::client_api::ContractResponse;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 

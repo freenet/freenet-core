@@ -22,7 +22,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Default maximum events per second before rate limiting kicks in.
 pub const DEFAULT_MAX_EVENTS_PER_SECOND: u64 = 1000;
