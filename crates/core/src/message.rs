@@ -361,6 +361,10 @@ pub enum ProximityCacheMessage {
         added: Vec<ContractInstanceId>,
         /// Contracts we've stopped caching.
         removed: Vec<ContractInstanceId>,
+        /// True if this is a response to a received announcement.
+        /// Recipients should not respond to responses (prevents ping-pong).
+        #[serde(default)]
+        is_response: bool,
     },
     /// Request a neighbor's full cache state (used on new connections).
     CacheStateRequest,

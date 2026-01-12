@@ -350,39 +350,33 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // If there are interested parties in the subscription tree and the stored
-                    // state actually changed, trigger an Update to propagate the change.
-                    // Check subscription tree membership (NOT seeding cache) because:
-                    // - Seeding cache: Which contracts am I caching (can be evicted)
-                    // - Subscription tree: Who wants updates (persistent until unsubscribe)
-                    // A contract can be evicted from seeding cache but still have active
-                    // subscribers who need to receive updates. See issue #2656.
+                    // Determine if we should trigger an UPDATE operation after this PUT.
                     //
-                    // We check both downstream (subscribers_of) and upstream (get_upstream):
-                    // - subscribers_of: We have peers who subscribed through us, need to broadcast
-                    // - get_upstream: We're subscribed to this contract, so we're part of the tree
-                    //   and our updates should propagate to other subscribers via the tree
+                    // We trigger updates via two mechanisms:
+                    // 1. Subscription tree: downstream subscribers and upstream peer
+                    //    - subscribers_of: We have peers who subscribed through us
+                    //    - get_upstream: We're subscribed, part of the tree
+                    // 2. Proximity cache: neighbors who cache this contract but may not be subscribed
+                    //    - These nodes announced they have the contract via CacheAnnounce
+                    //    - They should receive state changes to maintain consistency
+                    //
+                    // This ensures state changes propagate to ALL nodes caching the contract,
+                    // not just those in the subscription tree. See issue #2682.
                     let has_downstream = op_manager.ring.subscribers_of(&key).is_some();
                     let has_upstream = op_manager.ring.get_upstream(&key).is_some();
-                    let has_active_interest = has_downstream || has_upstream;
-                    if has_active_interest && state_changed {
-                        tracing::debug!(
-                            tx = %id,
-                            contract = %key,
-                            has_downstream,
-                            has_upstream,
-                            phase = "update_trigger",
-                            "PUT on subscribed contract resulted in state change, triggering Update"
-                        );
+                    let has_subscription_interest = has_downstream || has_upstream;
+
+                    // Check proximity cache - neighbors who cache this contract
+                    let proximity_neighbors =
+                        op_manager.proximity_cache.neighbors_with_contract(&key);
+                    let has_proximity_neighbors = !proximity_neighbors.is_empty();
+
+                    // Trigger update if state changed AND we have any targets
+                    let has_broadcast_targets =
+                        has_subscription_interest || has_proximity_neighbors;
+
+                    if has_broadcast_targets && state_changed {
                         start_update_after_put(op_manager, key, merged_value.clone()).await;
-                    } else if !has_active_interest {
-                        tracing::trace!(
-                            tx = %id,
-                            contract = %key,
-                            state_changed,
-                            phase = "update_skipped",
-                            "PUT completed but no active subscription interest, skipping Update"
-                        );
                     }
 
                     // Step 2: Determine if we should forward or respond

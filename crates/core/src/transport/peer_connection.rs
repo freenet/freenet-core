@@ -1770,6 +1770,7 @@ mod tests {
             message: ProximityCacheMessage::CacheAnnounce {
                 added: vec![ContractInstanceId::new([1u8; 32])],
                 removed: vec![],
+                is_response: false,
             },
         });
         assert_fast_serialize("ProximityCacheMessage", &cache_msg);

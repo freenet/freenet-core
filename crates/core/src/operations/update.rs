@@ -104,6 +104,21 @@ impl UpdateOp {
         op_manager.completed(self.id);
         Ok(())
     }
+
+    /// Create a new outbound UpdateOp targeting a specific peer.
+    ///
+    /// Used when sending state to a specific subscriber (e.g., after they join
+    /// and need to receive the current state they may have missed).
+    pub(crate) fn new_outbound(id: Transaction, target: PeerKeyLocation) -> Self {
+        Self {
+            id,
+            state: Some(UpdateState::ReceivedRequest),
+            stats: Some(UpdateStats {
+                target: Some(target),
+            }),
+            upstream_addr: None, // We're the originator
+        }
+    }
 }
 
 struct UpdateStats {
@@ -250,6 +265,7 @@ impl Operation for UpdateOp {
                                 value: updated_value,
                                 summary,
                                 changed,
+                                ..
                             } = update_contract(
                                 op_manager,
                                 *key,
@@ -277,7 +293,7 @@ impl Operation for UpdateOp {
                                     *key,
                                     requester_pkl,
                                     hash_before,
-                                    hash_after,
+                                    hash_after.clone(),
                                 ) {
                                     op_manager.ring.register_events(Either::Left(event)).await;
                                 }
@@ -503,6 +519,7 @@ impl Operation for UpdateOp {
                         value: updated_value,
                         summary: _summary,
                         changed,
+                        ..
                     } = match update_result {
                         Ok(result) => result,
                         Err(err) => {
@@ -1099,29 +1116,20 @@ async fn update_contract(
     {
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Ok(new_val),
+            state_changed,
         }) => {
             let new_bytes = State::from(new_val.clone()).into_bytes();
-            let summary = StateSummary::from(new_bytes.clone());
-            let changed = match previous_state.as_ref() {
-                Some(prev_state) => {
-                    let prev_bytes = State::from(prev_state.clone()).into_bytes();
-                    prev_bytes != new_bytes
-                }
-                None => true,
-            };
-
-            // NOTE: change detection currently relies on byte-level equality. Contracts that
-            // produce semantically identical states with different encodings must normalize their
-            // serialization (e.g., sort map keys) to avoid redundant broadcasts.
+            let summary = StateSummary::from(new_bytes);
 
             Ok(UpdateExecution {
                 value: new_val,
                 summary,
-                changed,
+                changed: state_changed,
             })
         }
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Err(err),
+            ..
         }) => {
             tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::UnexpectedOpState)
@@ -1411,6 +1419,7 @@ pub(crate) async fn request_update(
                 value: updated_value,
                 summary,
                 changed,
+                ..
             } = update_contract(op_manager, key, update_data, related_contracts).await?;
 
             tracing::debug!(
@@ -1507,6 +1516,7 @@ pub(crate) async fn request_update(
         value: updated_value,
         summary,
         changed: _changed,
+        ..
     } = update_contract(
         op_manager,
         key,

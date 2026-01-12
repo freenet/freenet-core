@@ -186,8 +186,8 @@ where
                             // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - reject incoming
-                            Ok(UpsertResult::NoChange)
+                            // Current state wins - return it so it can be propagated
+                            Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
                     Err(_) => {
@@ -219,8 +219,8 @@ where
                             // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - reject incoming
-                            Ok(UpsertResult::NoChange)
+                            // Current state wins - return it so it can be propagated
+                            Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
                     Err(_) => {
@@ -525,8 +525,8 @@ mod test {
             .await
             .expect("update attempt should not error");
         assert!(
-            matches!(result, UpsertResult::NoChange),
-            "Smaller hash should be rejected (NoChange)"
+            matches!(result, UpsertResult::CurrentWon(_)),
+            "Smaller hash should be rejected (CurrentWon indicating local state won)"
         );
 
         // Verify the stored state is still the larger-hash one
@@ -787,10 +787,10 @@ mod test {
             .await
             .unwrap();
 
-        // S1 should be rejected
+        // S1 should be rejected (local state S3 won)
         assert!(
-            matches!(result, UpsertResult::NoChange),
-            "Delayed old broadcast should be rejected"
+            matches!(result, UpsertResult::CurrentWon(_)),
+            "Delayed old broadcast should be rejected (CurrentWon indicating local state won)"
         );
 
         // S3 should still be stored

@@ -1,12 +1,17 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
-use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{
+    get, update, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
+};
+use crate::config::GlobalExecutor;
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::node::IsOperationCompleted;
+use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::util::backoff::ExponentialBackoff;
 use crate::{
@@ -89,9 +94,6 @@ async fn fetch_contract_if_missing(
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
 
-use crate::ring::PeerKeyLocation;
-use std::net::SocketAddr;
-
 /// Wait for peer location to be available, with exponential backoff retry.
 ///
 /// This handles the race condition where a Subscribe message arrives before
@@ -146,6 +148,108 @@ async fn wait_for_peer_location(
         "subscribe: peer lookup failed after all retries, connection may be transient"
     );
     None
+}
+
+/// Send the current contract state to a newly subscribed peer.
+///
+/// When a peer subscribes to a contract, they become a downstream subscriber and will
+/// receive future Updates. However, they may have missed Updates that were broadcast
+/// before they subscribed. This function ensures new subscribers receive the current
+/// state immediately after subscribing.
+///
+/// This is spawned as a background task to avoid blocking the Subscribe response.
+fn send_state_to_new_subscriber(
+    op_manager: OpManager,
+    key: ContractKey,
+    subscriber: PeerKeyLocation,
+    subscribe_tx: Transaction,
+) {
+    GlobalExecutor::spawn(async move {
+        // Yield first to let the Subscribe response go out
+        tokio::task::yield_now().await;
+
+        let subscriber_addr = match subscriber.socket_addr() {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!(
+                    tx = %subscribe_tx,
+                    %key,
+                    "send_state_to_new_subscriber: subscriber has no socket address"
+                );
+                return;
+            }
+        };
+
+        // Fetch the current state from our local store
+        let state = match op_manager
+            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                instance_id: *key.id(),
+                return_contract_code: false,
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::GetResponse {
+                key: Some(_),
+                response:
+                    Ok(StoreResponse {
+                        state: Some(state), ..
+                    }),
+            }) => state,
+            Ok(_) => {
+                tracing::debug!(
+                    tx = %subscribe_tx,
+                    %key,
+                    "send_state_to_new_subscriber: no state found for contract"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tx = %subscribe_tx,
+                    %key,
+                    error = %e,
+                    "send_state_to_new_subscriber: failed to get contract state"
+                );
+                return;
+            }
+        };
+
+        // Create a new Update transaction for this state sync
+        let update_tx = Transaction::new::<update::UpdateMsg>();
+
+        tracing::debug!(
+            tx = %update_tx,
+            subscribe_tx = %subscribe_tx,
+            %key,
+            subscriber = %subscriber_addr,
+            "Sending current state to new subscriber"
+        );
+
+        // Create the Update message targeting the specific subscriber
+        let msg = update::UpdateMsg::RequestUpdate {
+            id: update_tx,
+            key,
+            related_contracts: RelatedContracts::default(),
+            value: state,
+        };
+
+        // Create operation state with the subscriber as the target
+        let op_state = update::UpdateOp::new_outbound(update_tx, subscriber.clone());
+
+        // Send the Update to the new subscriber
+        if let Err(e) = op_manager
+            .notify_op_change(NetMessage::from(msg), OpEnum::Update(op_state))
+            .await
+        {
+            tracing::warn!(
+                tx = %update_tx,
+                %key,
+                subscriber = %subscriber_addr,
+                error = %e,
+                "Failed to send state to new subscriber"
+            );
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -569,7 +673,7 @@ impl Operation for SubscribeOp {
                             {
                                 match op_manager.ring.add_downstream(
                                     &key,
-                                    upstream_peer,
+                                    upstream_peer.clone(),
                                     Some(requester_addr.into()),
                                 ) {
                                     Ok(result) => {
@@ -578,7 +682,7 @@ impl Operation for SubscribeOp {
                                             if let Some(event) = NetEventLog::downstream_added(
                                                 &op_manager.ring,
                                                 key,
-                                                result.subscriber,
+                                                result.subscriber.clone(),
                                                 result.downstream_count,
                                             ) {
                                                 op_manager
@@ -586,6 +690,16 @@ impl Operation for SubscribeOp {
                                                     .register_events(Either::Left(event))
                                                     .await;
                                             }
+
+                                            // Send current state to the new subscriber so they
+                                            // don't miss any updates that were broadcast before
+                                            // they subscribed.
+                                            send_state_to_new_subscriber(
+                                                op_manager.clone(),
+                                                key,
+                                                result.subscriber,
+                                                *id,
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -659,7 +773,7 @@ impl Operation for SubscribeOp {
                             {
                                 match op_manager.ring.add_downstream(
                                     &key,
-                                    upstream_peer,
+                                    upstream_peer.clone(),
                                     Some(requester_addr.into()),
                                 ) {
                                     Ok(result) => {
@@ -668,7 +782,7 @@ impl Operation for SubscribeOp {
                                             if let Some(event) = NetEventLog::downstream_added(
                                                 &op_manager.ring,
                                                 key,
-                                                result.subscriber,
+                                                result.subscriber.clone(),
                                                 result.downstream_count,
                                             ) {
                                                 op_manager
@@ -676,6 +790,16 @@ impl Operation for SubscribeOp {
                                                     .register_events(Either::Left(event))
                                                     .await;
                                             }
+
+                                            // Send current state to the new subscriber so they
+                                            // don't miss any updates that were broadcast before
+                                            // they subscribed.
+                                            send_state_to_new_subscriber(
+                                                op_manager.clone(),
+                                                key,
+                                                result.subscriber,
+                                                *id,
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -863,7 +987,7 @@ impl Operation for SubscribeOp {
                                 {
                                     match op_manager.ring.add_downstream(
                                         key,
-                                        downstream_peer,
+                                        downstream_peer.clone(),
                                         Some(requester_addr.into()),
                                     ) {
                                         Ok(result) => {
@@ -872,7 +996,7 @@ impl Operation for SubscribeOp {
                                                 if let Some(event) = NetEventLog::downstream_added(
                                                     &op_manager.ring,
                                                     *key,
-                                                    result.subscriber,
+                                                    result.subscriber.clone(),
                                                     result.downstream_count,
                                                 ) {
                                                     op_manager
@@ -880,6 +1004,16 @@ impl Operation for SubscribeOp {
                                                         .register_events(Either::Left(event))
                                                         .await;
                                                 }
+
+                                                // Send current state to the new subscriber so they
+                                                // don't miss any updates that were broadcast before
+                                                // they subscribed.
+                                                send_state_to_new_subscriber(
+                                                    op_manager.clone(),
+                                                    *key,
+                                                    result.subscriber,
+                                                    *msg_id,
+                                                );
                                             }
                                             tracing::debug!(
                                                 tx = %msg_id,
