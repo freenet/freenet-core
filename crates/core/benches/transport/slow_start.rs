@@ -13,18 +13,31 @@
 use criterion::{Criterion, Throughput};
 use dashmap::DashMap;
 use freenet::simulation::{TimeSource, VirtualTime};
-use freenet::transport::mock_transport::{Channels, PacketDelayPolicy, PacketDropPolicy};
+use freenet::transport::congestion_control::CongestionControlConfig;
+use freenet::transport::mock_transport::{
+    create_mock_peer_with_congestion_config, Channels, PacketDelayPolicy, PacketDropPolicy,
+};
 use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{create_connected_peers_with_virtual_time, spawn_auto_advance_task};
+use super::common::{
+    create_connected_peers_with_configurable_congestion, get_congestion_config,
+    print_congestion_config, spawn_auto_advance_task,
+};
 
 /// Benchmark fresh connection cold-start throughput with VirtualTime
 ///
 /// Uses VirtualTime for instant execution - 100ms RTT completes in ~1ms wall time.
 /// Measures the actual slow start benefit by tracking virtual time elapsed.
+///
+/// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
+/// Defaults to BBR.
 pub fn bench_cold_start_throughput(c: &mut Criterion) {
+    // Print which congestion control algorithm is being used
+    print_congestion_config();
+    let congestion_config = Some(get_congestion_config());
+
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -39,53 +52,58 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
     let transfer_size = 16 * 1024;
     group.throughput(Throughput::Bytes(transfer_size as u64));
 
+    let config_clone = congestion_config.clone();
     group.bench_function("16kb_transfer", |b| {
-            b.to_async(&rt).iter_custom(|iters| {
-                async move {
-                    let mut total_virtual_time = Duration::ZERO;
+        let config = config_clone.clone();
+        b.to_async(&rt).iter_custom(|iters| {
+            let config = config.clone();
+            async move {
+                let mut total_virtual_time = Duration::ZERO;
 
-                    for _ in 0..iters {
-                        // Create fresh VirtualTime for each iteration to avoid time accumulation
-                        let ts = VirtualTime::new();
+                for _ in 0..iters {
+                    // Create fresh VirtualTime for each iteration to avoid time accumulation
+                    let ts = VirtualTime::new();
 
-                        // Spawn auto-advance task BEFORE connection
-                        let auto_advance = spawn_auto_advance_task(ts.clone());
+                    // Spawn auto-advance task BEFORE connection
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
-                        let channels: Channels = Arc::new(DashMap::new());
-                        let message: Vec<u8> = vec![0xABu8; transfer_size];
+                    let channels: Channels = Arc::new(DashMap::new());
+                    let message: Vec<u8> = vec![0xABu8; transfer_size];
 
-                        // Create peers with VirtualTime (no delay for cold start baseline)
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
-                                PacketDropPolicy::ReceiveAll,
-                                PacketDelayPolicy::NoDelay,
-                                channels.clone(),
-                                ts.clone(),
-                            )
-                            .await
-                            {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("cold_start peer_a creation failed: {:?}", e);
-                                    continue;
-                                }
-                            };
+                    // Create peers with VirtualTime and configurable congestion control
+                    let (peer_a_pub, mut peer_a, peer_a_addr) =
+                        match create_mock_peer_with_congestion_config(
+                            PacketDropPolicy::ReceiveAll,
+                            PacketDelayPolicy::NoDelay,
+                            channels.clone(),
+                            ts.clone(),
+                            config.clone(),
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("cold_start peer_a creation failed: {:?}", e);
+                                continue;
+                            }
+                        };
 
-                        let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
-                                PacketDropPolicy::ReceiveAll,
-                                PacketDelayPolicy::NoDelay,
-                                channels.clone(),
-                                ts.clone(),
-                            )
-                            .await
-                            {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("cold_start peer_b creation failed: {:?}", e);
-                                    continue;
-                                }
-                            };
+                    let (peer_b_pub, mut peer_b, peer_b_addr) =
+                        match create_mock_peer_with_congestion_config(
+                            PacketDropPolicy::ReceiveAll,
+                            PacketDelayPolicy::NoDelay,
+                            channels.clone(),
+                            ts.clone(),
+                            config.clone(),
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("cold_start peer_b creation failed: {:?}", e);
+                                continue;
+                            }
+                        };
 
                         let start_virtual = ts.now_nanos();
 
@@ -167,7 +185,13 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 ///
 /// Creates fresh connections, performs warmup transfers, then measures.
 /// Uses VirtualTime for instant execution.
+///
+/// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
+/// Defaults to BBR.
 pub fn bench_warm_connection_throughput(c: &mut Criterion) {
+    // Get configurable congestion control
+    let congestion_config = Some(get_congestion_config());
+
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -181,8 +205,11 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
     let transfer_size = 16 * 1024;
     group.throughput(Throughput::Bytes(transfer_size as u64));
 
+    let config_clone = congestion_config.clone();
     group.bench_function("16kb_warm", |b| {
+        let config = config_clone.clone();
         b.to_async(&rt).iter_custom(|iters| {
+            let config = config.clone();
             async move {
                 let mut total_virtual_time = Duration::ZERO;
 
@@ -193,13 +220,14 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 
                     let channels: Channels = Arc::new(DashMap::new());
 
-                    // Create peers with VirtualTime
+                    // Create peers with VirtualTime and configurable congestion control
                     let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                        match create_mock_peer_with_congestion_config(
                             PacketDropPolicy::ReceiveAll,
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
                             ts.clone(),
+                            config.clone(),
                         )
                         .await
                         {
@@ -212,11 +240,12 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                         };
 
                     let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                        match create_mock_peer_with_congestion_config(
                             PacketDropPolicy::ReceiveAll,
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
                             ts.clone(),
+                            config.clone(),
                         )
                         .await
                         {
@@ -341,7 +370,11 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 }
 
 /// Instrumented benchmark that captures cwnd evolution with VirtualTime
+///
+/// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
 pub fn bench_cwnd_evolution(c: &mut Criterion) {
+    let congestion_config = Some(get_congestion_config());
+
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -354,8 +387,11 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
 
     let transfer_size = 16 * 1024;
 
+    let config_clone = congestion_config.clone();
     group.bench_function("16kb_cwnd_trace", |b| {
+        let config = config_clone.clone();
         b.to_async(&rt).iter_custom(|iters| {
+            let config = config.clone();
             async move {
                 let mut total_virtual_time = Duration::ZERO;
 
@@ -368,11 +404,12 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                     let message: Vec<u8> = vec![0xABu8; transfer_size];
 
                     let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                        match create_mock_peer_with_congestion_config(
                             PacketDropPolicy::ReceiveAll,
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
                             ts.clone(),
+                            config.clone(),
                         )
                         .await
                         {
@@ -385,11 +422,12 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                         };
 
                     let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                        match create_mock_peer_with_congestion_config(
                             PacketDropPolicy::ReceiveAll,
                             PacketDelayPolicy::NoDelay,
                             channels.clone(),
                             ts.clone(),
+                            config.clone(),
                         )
                         .await
                         {
@@ -484,9 +522,13 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
 
 /// Benchmark RTT scenarios with VirtualTime - instant execution of high-latency paths
 ///
-/// Tests various RTT values (0ms, 5ms, 10ms, 25ms, 50ms) to ensure LEDBAT
+/// Tests various RTT values (0ms, 5ms, 10ms, 25ms, 50ms) to ensure congestion control
 /// behaves correctly. With VirtualTime, a 50ms RTT test completes in ~1ms.
+///
+/// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
 pub fn bench_rtt_scenarios(c: &mut Criterion) {
+    let congestion_config = Some(get_congestion_config());
+
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -502,8 +544,11 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
 
     // Test various RTT scenarios - all complete instantly with VirtualTime
     for rtt_ms in [0u64, 5, 10, 25, 50] {
+        let config_clone = congestion_config.clone();
         group.bench_function(format!("16kb_rtt_{}ms", rtt_ms), |b| {
+            let config = config_clone.clone();
             b.to_async(&rt).iter_custom(|iters| {
+                let config = config.clone();
                 async move {
                     let mut total_virtual_time = Duration::ZERO;
 
@@ -521,11 +566,12 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                         let message: Vec<u8> = vec![0xABu8; transfer_size];
 
                         let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                            match create_mock_peer_with_congestion_config(
                                 PacketDropPolicy::ReceiveAll,
                                 delay.clone(),
                                 channels.clone(),
                                 ts.clone(),
+                                config.clone(),
                             )
                             .await
                             {
@@ -538,11 +584,12 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                             };
 
                         let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            match freenet::transport::mock_transport::create_mock_peer_with_virtual_time(
+                            match create_mock_peer_with_congestion_config(
                                 PacketDropPolicy::ReceiveAll,
                                 delay,
                                 channels.clone(),
                                 ts.clone(),
+                                config.clone(),
                             )
                             .await
                             {
@@ -635,6 +682,8 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
 }
 
 /// Benchmark 1MB transfer with high bandwidth limit to test maximum throughput
+///
+/// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
 #[allow(dead_code)]
 pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
@@ -664,9 +713,10 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
 
                         let delay = Duration::from_millis(10); // 10ms RTT
 
-                        // Create peers with VirtualTime and high bandwidth
+                        // Create peers with VirtualTime and configurable congestion control
                         let mut peers =
-                            create_connected_peers_with_virtual_time(delay, ts.clone()).await;
+                            create_connected_peers_with_configurable_congestion(delay, ts.clone())
+                                .await;
 
                         let message = vec![0xABu8; 1024 * 1024]; // 1MB
                         let start_virtual = ts.now_nanos();

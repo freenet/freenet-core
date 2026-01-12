@@ -217,6 +217,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
+            congestion_config: None, // Production uses default (BBR)
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -368,6 +369,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
         ledbat_min_ssthresh: Option<usize>,
         time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
     ) -> Result<
         (
             Self,
@@ -395,6 +397,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
+            congestion_config,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -439,6 +442,39 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             None,
             None,
             time_source,
+            None,
+        )
+    }
+
+    /// Create a test connection handler with VirtualTime and custom congestion control.
+    ///
+    /// This allows benchmarks to test with different congestion control algorithms.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_test_with_congestion_config(
+        socket_addr: SocketAddr,
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        bandwidth_limit: Option<usize>,
+        time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<PeerConnection<S, crate::simulation::VirtualTime>>,
+        ),
+        TransportError,
+    > {
+        Self::config_listener_with_virtual_time(
+            socket,
+            keypair,
+            is_gateway,
+            socket_addr,
+            bandwidth_limit,
+            None,
+            None,
+            time_source,
+            congestion_config,
         )
     }
 
@@ -528,6 +564,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Rate limiting for asymmetric decryption attempts to prevent DoS (issue #2277).
     last_asym_attempt: HashMap<SocketAddr, u64>,
     time_source: T,
+    /// Congestion control configuration for new connections.
+    /// When None, uses the default configuration (BBR).
+    congestion_config: Option<CongestionControlConfig>,
 }
 
 type OngoingConnection<S, T> = (
@@ -1194,6 +1233,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let _ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
+        let congestion_config = self.congestion_config.clone();
 
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
@@ -1290,10 +1330,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 SentPacketTracker::new_with_time_source(time_source.clone()),
             ));
 
-            // Initialize BBR congestion controller (default)
-            // Uses model-based congestion control for better performance on lossy paths
-            let congestion_controller =
-                CongestionControlConfig::default().build_arc_with_time_source(time_source.clone());
+            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+            let congestion_controller = congestion_config
+                .clone()
+                .unwrap_or_default()
+                .build_arc_with_time_source(time_source.clone());
 
             // Initialize token bucket for smooth packet pacing
             // Use global bandwidth manager if configured, otherwise fall back to per-connection limit
@@ -1434,6 +1475,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let _ledbat_min_ssthresh = self.ledbat_min_ssthresh;
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
+        let congestion_config = self.congestion_config.clone();
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
@@ -1584,13 +1626,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             let (inbound_sender, inbound_recv) =
                                                 fast_channel::bounded(1000);
 
-                                            // Initialize BBR congestion controller (default)
-                                            // Uses model-based congestion control for better performance on lossy paths
-                                            let congestion_controller =
-                                                CongestionControlConfig::default()
-                                                    .build_arc_with_time_source(
-                                                        time_source.clone(),
-                                                    );
+                                            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                            let congestion_controller = congestion_config
+                                                .clone()
+                                                .unwrap_or_default()
+                                                .build_arc_with_time_source(
+                                                    time_source.clone(),
+                                                );
 
                                             // Initialize token bucket
                                             // Use global bandwidth manager if configured
@@ -1689,9 +1731,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
 
-                                // Initialize BBR congestion controller (default)
-                                // Uses model-based congestion control for better performance on lossy paths
-                                let congestion_controller = CongestionControlConfig::default()
+                                // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                let congestion_controller = congestion_config
+                                    .clone()
+                                    .unwrap_or_default()
                                     .build_arc_with_time_source(time_source.clone());
 
                                 // Initialize token bucket
@@ -2408,6 +2451,43 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
+        create_mock_peer_internal_vt_with_congestion(
+            packet_drop_policy,
+            packet_delay_policy,
+            gateway,
+            channels,
+            bandwidth_limit,
+            time_source,
+            None,
+        )
+        .await
+    }
+
+    /// Internal function with VirtualTime and congestion control support.
+    ///
+    /// This is the most flexible internal peer creation function, supporting:
+    /// - VirtualTime for instant delay simulation
+    /// - Custom congestion control algorithm selection (BBR or LEDBAT)
+    #[allow(clippy::too_many_arguments)]
+    async fn create_mock_peer_internal_vt_with_congestion(
+        packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
+        gateway: bool,
+        channels: Channels,
+        bandwidth_limit: Option<usize>,
+        time_source: Option<crate::simulation::VirtualTime>,
+        congestion_config: Option<CongestionControlConfig>,
+    ) -> Result<
+        (
+            TransportPublicKey,
+            (
+                OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+                mpsc::Receiver<PeerConnection<MockSocket, crate::simulation::VirtualTime>>,
+            ),
+            SocketAddr,
+        ),
+        anyhow::Error,
+    > {
         static PORT: AtomicU16 = AtomicU16::new(25000);
 
         let peer_keypair = TransportKeypair::new();
@@ -2429,13 +2509,14 @@ pub mod mock_transport {
         );
 
         // Use the same VirtualTime for both MockSocket and protocol layer
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_time_source(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_congestion_config(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
             gateway,
             bandwidth_limit,
             vt,
+            congestion_config,
         )
         .expect("failed to create peer");
         Ok((
@@ -2443,6 +2524,36 @@ pub mod mock_transport {
             (peer_conn, inbound_conn),
             (Ipv4Addr::LOCALHOST, port).into(),
         ))
+    }
+
+    /// Create a mock peer connection with VirtualTime and custom congestion control.
+    ///
+    /// This function supports selecting the congestion control algorithm (BBR or LEDBAT)
+    /// for benchmarking purposes. Pass `None` for `congestion_config` to use the default (BBR).
+    ///
+    /// Returns the peer's public key, outbound connection handler, and socket address.
+    pub async fn create_mock_peer_with_congestion_config(
+        packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
+        channels: Channels,
+        time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+        SocketAddr,
+    )> {
+        create_mock_peer_internal_vt_with_congestion(
+            packet_drop_policy,
+            packet_delay_policy,
+            false,
+            channels,
+            None,
+            Some(time_source),
+            congestion_config,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     // Test infrastructure for multi-peer communication tests (reserved for future use)
