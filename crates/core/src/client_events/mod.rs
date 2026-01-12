@@ -2137,22 +2137,12 @@ pub(crate) mod test {
                         return Some(request.into());
                     }
                     val if (5..20).contains(&val) => {
-                        if let Some(contract) = self.choose(&state.existing_contracts) {
-                            if !for_this_peer {
-                                continue;
-                            }
-
-                            let request = ContractRequest::Put {
-                                contract: contract.clone(),
-                                state: WrappedState::new(self.random_byte_vec()),
-                                related_contracts: RelatedContracts::new(),
-                                subscribe: false,
-                            };
-
-                            tracing::debug!("sending put to an existing contract");
-
-                            return Some(request.into());
-                        }
+                        // Skip PUTs to existing contracts with different state.
+                        // This operation creates divergent states that can't reliably converge
+                        // because PUT doesn't propagate through the subscription tree.
+                        // State changes to existing contracts should use UPDATE instead.
+                        // The percentage range is preserved to maintain RNG determinism.
+                        continue;
                     }
                     val if (20..35).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
