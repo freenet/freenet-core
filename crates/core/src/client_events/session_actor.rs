@@ -46,8 +46,8 @@ use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use freenet_stdlib::client_api::ContractResponse;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::debug;
 
 /// Time-to-live for cached pending results. Entries older than this duration are
