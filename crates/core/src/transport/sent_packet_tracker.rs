@@ -1,9 +1,20 @@
+use super::bbr::DeliveryRateToken;
 use super::PacketId;
 #[cfg(test)]
 use crate::simulation::RealTime;
 use crate::simulation::TimeSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
+
+/// Entry for pending packet receipts: (payload, sent_time_nanos, delivery_token)
+type PendingReceiptEntry = (Box<[u8]>, u64, Option<DeliveryRateToken>);
+
+/// Result of processing received receipts: (acked_packets_info, loss_proportion)
+/// Each acked packet contains: (rtt_option, bytes_acked, delivery_token)
+type AckProcessingResult = (
+    Vec<(Option<Duration>, usize, Option<DeliveryRateToken>)>,
+    Option<f64>,
+);
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
 
@@ -30,7 +41,7 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
 };
 
 /// Maximum RTO backoff multiplier (RFC 6298 Section 5.5).
-/// With a minimum/base RTO of 300ms and a max effective RTO cap of 60s, a backoff of 512 is
+/// With a minimum/base RTO of 500ms and a max effective RTO cap of 60s, a backoff of 512 is
 /// sufficient to ensure we can reach the 60s limit; for higher base RTO values, the cap is
 /// reached with smaller backoff multipliers.
 const MAX_RTO_BACKOFF: u32 = 512;
@@ -44,11 +55,16 @@ const MAX_RTO_BACKOFF: u32 = 512;
 ///
 /// IMPORTANT: This value must be greater than RTT + ACK_CHECK_INTERVAL (100ms) to avoid
 /// spurious timeouts. With intercontinental RTTs of 150-200ms and 100ms ACK batching,
-/// we need MIN_RTO >= 300ms to prevent timeout storms on high-latency connections.
-/// See: PR #XXXX for the v0.1.92 regression where 200ms caused 935 timeouts in 10 seconds.
+/// effective round-trip time can be 300-400ms. Using 500ms provides headroom for jitter
+/// and prevents timeout storms on high-latency connections.
+///
+/// History:
+/// - 200ms: Caused 935 timeouts in 10 seconds (v0.1.92 regression)
+/// - 500ms: Still too aggressive for high-latency + ACK batching (effective RTT ~500ms)
+/// - 500ms: Provides ~100-200ms headroom for jitter on worst-case paths
 ///
 /// Note: Initial RTO (before any RTT samples) remains 1 second per RFC 6298 Section 2.1.
-const MIN_RTO: Duration = Duration::from_millis(300);
+const MIN_RTO: Duration = Duration::from_millis(500);
 
 /// Minimum TLP timeout (PTO - Probe Timeout).
 ///
@@ -87,8 +103,8 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// ```
 pub(super) struct SentPacketTracker<T: TimeSource> {
     /// The list of packets that have been sent but not yet acknowledged
-    /// Changed to store (payload, sent_time_nanos) for RTT calculation
-    pending_receipts: HashMap<PacketId, (Box<[u8]>, u64)>,
+    /// Stores (payload, sent_time_nanos, delivery_token) for RTT calculation and BBR
+    pending_receipts: HashMap<PacketId, PendingReceiptEntry>,
 
     resend_queue: VecDeque<ResendQueueEntry>,
 
@@ -155,23 +171,38 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
 impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Box<[u8]>) {
+        self.report_sent_packet_with_token(packet_id, payload, None);
+    }
+
+    /// Report a sent packet with an optional BBR delivery rate token.
+    ///
+    /// The token is used by BBR for accurate delivery rate estimation. When an ACK
+    /// arrives, the token is returned alongside the RTT sample so it can be passed
+    /// to `BbrController::on_ack_with_token`.
+    pub(super) fn report_sent_packet_with_token(
+        &mut self,
+        packet_id: PacketId,
+        payload: Box<[u8]>,
+        token: Option<DeliveryRateToken>,
+    ) {
         let sent_time_nanos = self.time_source.now_nanos();
         self.pending_receipts
-            .insert(packet_id, (payload, sent_time_nanos));
+            .insert(packet_id, (payload, sent_time_nanos, token));
         self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
     }
 
     /// Reports that receipts have been received for the given packet IDs.
-    /// Returns: ((RTT sample option, packet size) pairs, loss rate)
+    /// Returns: ((RTT sample option, packet size, delivery token) tuples, loss rate)
     ///
     /// RTT sample is Some for non-retransmitted packets (used for RTT estimation),
     /// None for retransmitted packets (Karn's algorithm - don't use for RTT).
-    /// Packet size is ALWAYS returned so LEDBAT can decrement flightsize for all ACKs.
+    /// Packet size is ALWAYS returned so congestion controller can decrement flightsize.
+    /// Delivery token is returned for BBR's accurate delivery rate estimation.
     pub(super) fn report_received_receipts(
         &mut self,
         packet_ids: &[PacketId],
-    ) -> (Vec<(Option<Duration>, usize)>, Option<f64>) {
+    ) -> AckProcessingResult {
         let now_nanos = self.time_source.now_nanos();
         let mut ack_info = Vec::new();
 
@@ -184,12 +215,14 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Get packet info before removing
             let is_retransmitted = self.retransmitted_packets.contains(packet_id);
 
-            if let Some((payload, sent_time_nanos)) = self.pending_receipts.get(packet_id) {
+            if let Some((payload, sent_time_nanos, token)) = self.pending_receipts.get(packet_id) {
                 let packet_size = payload.len();
+                let token = *token; // Copy the token before removing
 
                 if is_retransmitted {
                     // Retransmitted packet: return size but no RTT (Karn's algorithm)
-                    ack_info.push((None, packet_size));
+                    // Note: token is still passed for BBR flightsize tracking
+                    ack_info.push((None, packet_size, token));
 
                     // Full reset of backoff on retransmit ACKs (matching libutp behavior).
                     //
@@ -211,7 +244,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // Non-retransmitted: calculate RTT and update estimation
                     let rtt_nanos = now_nanos.saturating_sub(*sent_time_nanos);
                     let rtt_sample = Duration::from_nanos(rtt_nanos);
-                    ack_info.push((Some(rtt_sample), packet_size));
+                    ack_info.push((Some(rtt_sample), packet_size, token));
                     self.update_rtt(rtt_sample);
 
                     // RFC 6298 Section 5.7: Reset backoff on valid ACK
@@ -273,8 +306,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let max_variance = if rto_variance > G { rto_variance } else { G };
         self.rto = self.srtt.unwrap_or(Duration::from_secs(1)) + max_variance;
 
-        // Clamp RTO to [300ms, 60s]
-        // Note: RFC 6298 Section 2.4 recommends 1s minimum, but we use 300ms to
+        // Clamp RTO to [500ms, 60s]
+        // Note: RFC 6298 Section 2.4 recommends 1s minimum, but we use 500ms to
         // balance fast loss detection with ACK batching delay (ACK_CHECK_INTERVAL=100ms).
         if self.rto < MIN_RTO {
             self.rto = MIN_RTO;
@@ -363,7 +396,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             let sent_time_nanos = self
                 .pending_receipts
                 .get(&entry.packet_id)
-                .map(|(_, ts)| *ts)
+                .map(|(_, ts, _)| *ts)
                 .unwrap_or(0);
 
             // Calculate RTO deadline from current sent_time (not stored value)
@@ -385,7 +418,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             if let Some(tlp_at) = tlp_deadline {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
                     // TLP fires! Clone packet data for the probe
-                    if let Some((packet, _)) = self.pending_receipts.get(&entry.packet_id) {
+                    if let Some((packet, _, _)) = self.pending_receipts.get(&entry.packet_id) {
                         let packet_clone = packet.clone();
                         let packet_id = entry.packet_id;
 
@@ -406,7 +439,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
             // Check if RTO should fire
             if now_nanos >= rto_deadline {
-                if let Some((packet, _sent_time_nanos)) =
+                if let Some((packet, _sent_time_nanos, _token)) =
                     self.pending_receipts.remove(&entry.packet_id)
                 {
                     // Update packet loss proportion for a lost packet
@@ -683,8 +716,8 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(10)); // Very fast RTT
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be clamped to minimum 300ms (accounts for ACK_CHECK_INTERVAL)
-        assert!(tracker.rto() >= Duration::from_millis(300));
+        // RTO should be clamped to minimum 500ms (accounts for ACK_CHECK_INTERVAL)
+        assert!(tracker.rto() >= Duration::from_millis(500));
         assert!(tracker.rto() <= Duration::from_secs(60));
     }
 
@@ -800,8 +833,8 @@ pub(in crate::transport) mod tests {
         // Backoff should be reset to 1 for both cases
         // (matching libutp behavior - any ACK resets backoff)
         assert_eq!(tracker.rto_backoff(), 1);
-        // With 50ms RTT, base RTO is clamped to 300ms minimum
-        // For non-retransmitted: 50ms RTT -> RTO clamped to 300ms
+        // With 50ms RTT, base RTO is clamped to 500ms minimum
+        // For non-retransmitted: 50ms RTT -> RTO clamped to 500ms
         // For retransmitted: no RTT sample, but backoff reset to 1
         //   Note: retransmitted case keeps the previous RTO value (1s initial),
         //   since no RTT sample is taken for retransmits (Karn's algorithm)
@@ -809,8 +842,8 @@ pub(in crate::transport) mod tests {
             // No RTT sample taken, so base RTO stays at initial 1s
             assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
         } else {
-            // RTT sample of 50ms -> RTO clamped to 300ms minimum
-            assert_eq!(tracker.effective_rto(), Duration::from_millis(300));
+            // RTT sample of 50ms -> RTO clamped to 500ms minimum
+            assert_eq!(tracker.effective_rto(), Duration::from_millis(500));
         }
     }
 
@@ -985,19 +1018,19 @@ pub(in crate::transport) mod tests {
     }
 
     // =========================================================================
-    // Tests for 300ms minimum RTO
+    // Tests for 500ms minimum RTO
     // =========================================================================
     //
-    // RFC 6298 recommends 1s minimum RTO, but Linux uses 200ms. We use 300ms
+    // RFC 6298 recommends 1s minimum RTO, but Linux uses 200ms. We use 500ms
     // to account for ACK_CHECK_INTERVAL (100ms) batching delay - without this,
     // high-latency connections (150ms+ RTT) experience spurious timeouts since
     // RTT + ACK_CHECK_INTERVAL can exceed MIN_RTO.
     //
     // These tests verify the minimum RTO behavior.
-    const EXPECTED_MIN_RTO: Duration = Duration::from_millis(300);
+    const EXPECTED_MIN_RTO: Duration = Duration::from_millis(500);
 
     #[test]
-    fn test_min_rto_is_300ms() {
+    fn test_min_rto_is_500ms() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Simulate a very fast network with 10ms RTT
@@ -1005,13 +1038,13 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(10));
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be clamped to 300ms minimum, not 1s
+        // RTO should be clamped to 500ms minimum, not 1s
         // With 10ms RTT: RTO = SRTT + max(G, 4*RTTVAR) = 10ms + max(10ms, 4*5ms) = 30ms
-        // But this is below minimum, so should be clamped to 300ms
+        // But this is below minimum, so should be clamped to 500ms
         assert_eq!(
             tracker.rto(),
             EXPECTED_MIN_RTO,
-            "RTO should be clamped to 300ms minimum for fast networks"
+            "RTO should be clamped to 500ms minimum for fast networks"
         );
     }
 
@@ -1024,7 +1057,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(400));
         tracker.report_received_receipts(&[1]);
 
-        // RTO should be above 300ms minimum, so not clamped
+        // RTO should be above 500ms minimum, so not clamped
         // With 400ms RTT: RTO = 400ms + max(10ms, 4*200ms) = 400ms + 800ms = 1200ms
         assert!(
             tracker.rto() > EXPECTED_MIN_RTO,
@@ -1049,15 +1082,15 @@ pub(in crate::transport) mod tests {
     fn test_effective_rto_with_backoff_respects_min() {
         let mut tracker = mock_sent_packet_tracker();
 
-        // Get a fast RTT sample to set base RTO to 300ms
+        // Get a fast RTT sample to set base RTO to 500ms
         tracker.report_sent_packet(1, vec![1].into());
         tracker.time_source.advance(Duration::from_millis(10));
         tracker.report_received_receipts(&[1]);
 
-        // Base RTO should be 300ms (clamped)
+        // Base RTO should be 500ms (clamped)
         assert_eq!(tracker.rto(), EXPECTED_MIN_RTO);
 
-        // Effective RTO with backoff of 1 should also be 300ms
+        // Effective RTO with backoff of 1 should also be 500ms
         assert_eq!(tracker.effective_rto(), EXPECTED_MIN_RTO);
 
         // After timeout, backoff doubles to 2, effective RTO = 600ms
@@ -1070,7 +1103,7 @@ pub(in crate::transport) mod tests {
     }
 
     #[test]
-    fn test_fast_loss_detection_with_300ms_rto() {
+    fn test_fast_loss_detection_with_500ms_rto() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Establish fast RTT baseline
@@ -1083,7 +1116,7 @@ pub(in crate::transport) mod tests {
 
         // With 20ms RTT:
         // - TLP (PTO) = max(2 * 20ms, 10ms) = 40ms
-        // - RTO = 300ms (minimum)
+        // - RTO = 500ms (minimum)
         // TLP should fire first at ~40ms
 
         // At 39ms, should still be waiting
@@ -1093,7 +1126,7 @@ pub(in crate::transport) mod tests {
             _ => panic!("Should not fire before TLP timeout (40ms)"),
         }
 
-        // At 41ms total, TLP should fire (faster than 300ms RTO!)
+        // At 41ms total, TLP should fire (faster than 500ms RTO!)
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
             ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
@@ -1202,8 +1235,8 @@ pub(in crate::transport) mod tests {
         tracker.report_received_receipts(&[1]);
 
         // SRTT = 50ms, so PTO = 2 * 50ms = 100ms
-        // RTO = 300ms (minimum)
-        // TLP should fire at 100ms, before RTO at 300ms
+        // RTO = 500ms (minimum)
+        // TLP should fire at 100ms, before RTO at 500ms
 
         // Send another packet
         tracker.report_sent_packet(2, vec![2].into());
@@ -1257,7 +1290,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(50));
         tracker.report_received_receipts(&[1]);
 
-        // PTO = 100ms, RTO = 300ms
+        // PTO = 100ms, RTO = 500ms
 
         // Send packet
         tracker.report_sent_packet(2, vec![2].into());
@@ -1276,7 +1309,7 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(2, payload);
 
         // Now if still no ACK, full RTO should fire
-        // RTO timer starts fresh after TLP, so wait another 300ms
+        // RTO timer starts fresh after TLP, so wait another 500ms
         tracker.time_source.advance(Duration::from_millis(299));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Still waiting for RTO
