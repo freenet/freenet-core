@@ -1488,8 +1488,11 @@ async fn test_node_crash_recovery() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
-    // Allow some time for connections
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Allow some time for connections (2 seconds of virtual time)
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Get a node label to crash from all tracked addresses
     let all_addrs = sim.all_node_addresses();
@@ -1527,8 +1530,11 @@ async fn test_node_crash_recovery() {
     let stats_before = sim.get_network_stats();
     assert!(stats_before.is_some(), "Network stats should be available");
 
-    // Give some time for crash effects to propagate
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Give some time for crash effects to propagate (500ms of virtual time)
+    for _ in 0..5 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Recover the node (message blocking removed, but task is still aborted)
     let recovered = sim.recover_node(&node_to_crash);
@@ -1643,8 +1649,11 @@ async fn test_node_restart() {
         .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
         .await;
 
-    // Allow some time for connections to establish
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Allow some time for connections to establish (2 seconds of virtual time)
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Get all node addresses
     let all_addrs = sim.all_node_addresses();
@@ -1683,8 +1692,11 @@ async fn test_node_restart() {
         "Node should be marked as crashed"
     );
 
-    // Small delay to let crash take effect
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Small delay to let crash take effect (200ms of virtual time)
+    for _ in 0..2 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     // Restart the node with same identity but different event seed
     let restart_seed = SEED.wrapping_add(0x1000);
@@ -1708,8 +1720,11 @@ async fn test_node_restart() {
         "Node should have same address after restart"
     );
 
-    // Give the restarted node time to reconnect
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give the restarted node time to reconnect (2 seconds of virtual time)
+    for _ in 0..20 {
+        sim.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+    }
 
     tracing::info!("Node restart test completed successfully");
 }

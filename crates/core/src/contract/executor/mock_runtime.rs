@@ -235,7 +235,78 @@ where
                     }
                 }
             }
-            (update, contract) => unreachable!("Invalid combination of state/delta and contract presence: {update:?}, {contract:?}"),
+            (Either::Right(delta), Some(contract)) => {
+                // Delta update with contract code - store contract first, then apply delta
+                self.runtime
+                    .contract_store
+                    .store_contract(contract.clone())
+                    .map_err(ExecutorError::other)?;
+
+                match self.state_store.get(&key).await {
+                    Ok(current_state) => {
+                        // Apply delta by concatenating with current state (simple mock behavior)
+                        // Then use hash comparison for deterministic convergence
+                        let mut new_state_bytes = current_state.as_ref().to_vec();
+                        new_state_bytes.extend_from_slice(delta.as_ref());
+                        let new_state = WrappedState::new(new_state_bytes);
+
+                        let new_hash = blake3::hash(new_state.as_ref());
+                        let current_hash = blake3::hash(current_state.as_ref());
+
+                        if new_hash.as_bytes() > current_hash.as_bytes() {
+                            self.state_store
+                                .update(&key, new_state.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+                            Ok(UpsertResult::Updated(new_state))
+                        } else {
+                            Ok(UpsertResult::NoChange)
+                        }
+                    }
+                    Err(_) => {
+                        // No existing state - treat delta as initial state
+                        let initial_state = WrappedState::new(delta.as_ref().to_vec());
+                        self.state_store
+                            .store(key, initial_state.clone(), contract.params().into_owned())
+                            .await
+                            .map_err(ExecutorError::other)?;
+                        Ok(UpsertResult::Updated(initial_state))
+                    }
+                }
+            }
+            (Either::Right(delta), None) => {
+                // Delta update without contract code - must have existing state
+                match self.state_store.get(&key).await {
+                    Ok(current_state) => {
+                        // Apply delta by concatenating with current state (simple mock behavior)
+                        let mut new_state_bytes = current_state.as_ref().to_vec();
+                        new_state_bytes.extend_from_slice(delta.as_ref());
+                        let new_state = WrappedState::new(new_state_bytes);
+
+                        let new_hash = blake3::hash(new_state.as_ref());
+                        let current_hash = blake3::hash(current_state.as_ref());
+
+                        if new_hash.as_bytes() > current_hash.as_bytes() {
+                            self.state_store
+                                .update(&key, new_state.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+                            Ok(UpsertResult::Updated(new_state))
+                        } else {
+                            Ok(UpsertResult::NoChange)
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            contract = %key,
+                            "Delta received for non-existent contract state"
+                        );
+                        Err(ExecutorError::request(StdContractError::MissingContract {
+                            key: key.into(),
+                        }))
+                    }
+                }
+            }
         }
     }
 

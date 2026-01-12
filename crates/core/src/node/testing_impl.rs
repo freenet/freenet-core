@@ -2617,4 +2617,72 @@ fn clean_up_tmp_dirs<'a>(labels: impl Iterator<Item = &'a NodeLabel>) {
     }
 }
 
+/// Check convergence from event logs.
+///
+/// This function can be used after `run_simulation` completes to check
+/// if all contracts have converged to the same state across replicas.
+///
+/// # Arguments
+/// * `logs` - Event logs obtained via `sim.event_logs_handle()` before calling `run_simulation`
+///
+/// # Example
+/// ```ignore
+/// let logs_handle = sim.event_logs_handle();
+/// let result = sim.run_simulation::<...>(...);
+/// let convergence = check_convergence_from_logs(&logs_handle).await;
+/// ```
+pub async fn check_convergence_from_logs(
+    logs: &Arc<tokio::sync::Mutex<Vec<crate::tracing::NetLogMessage>>>,
+) -> ConvergenceResult {
+    let logs = logs.lock().await;
+
+    // Group (contract_key -> peer_addr -> latest_state_hash)
+    // Use BTreeMap for deterministic iteration order
+    let mut contract_states: BTreeMap<String, BTreeMap<SocketAddr, String>> = BTreeMap::new();
+
+    // Iterate in insertion order - the last event for each (contract, peer) pair
+    // is the actual current state.
+    for log in logs.iter() {
+        let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+        let state_hash = log.kind.stored_state_hash().map(String::from);
+
+        if let (Some(contract_key), Some(state_hash)) = (contract_key, state_hash) {
+            contract_states
+                .entry(contract_key)
+                .or_default()
+                .insert(log.peer_id.addr, state_hash);
+        }
+    }
+
+    let mut converged = Vec::new();
+    let mut diverged = Vec::new();
+
+    for (contract_key, peer_states) in contract_states {
+        if peer_states.len() < 2 {
+            continue;
+        }
+
+        let unique_states: HashSet<&String> = peer_states.values().collect();
+
+        if unique_states.len() == 1 {
+            let state = unique_states.into_iter().next().unwrap().clone();
+            converged.push(ConvergedContract {
+                contract_key,
+                state_hash: state,
+                replica_count: peer_states.len(),
+            });
+        } else {
+            diverged.push(DivergedContract {
+                contract_key,
+                peer_states: peer_states.into_iter().collect(),
+            });
+        }
+    }
+
+    ConvergenceResult {
+        converged,
+        diverged,
+    }
+}
+
 use crate::contract::OperationMode;
