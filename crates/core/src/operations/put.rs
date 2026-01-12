@@ -500,6 +500,23 @@ impl Operation for PutOp {
                                 })),
                             })
                         } else {
+                            // Non-originator target peer - emit put_success for convergence checking
+                            // Without this event, the target peer's stored state won't be tracked,
+                            // causing convergence checks to fail (they need contracts replicated
+                            // across multiple peers). See issue #2680.
+                            let own_location = op_manager.ring.connection_manager.own_location();
+                            let hash = Some(state_hash_full(&merged_value));
+                            if let Some(event) = NetEventLog::put_success(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                own_location,
+                                None, // hop_count unknown without initial HTL
+                                hash,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
                             // Send response back to upstream
                             let response = PutMsg::Response { id, key };
                             let upstream =
