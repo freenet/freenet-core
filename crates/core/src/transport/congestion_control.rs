@@ -1230,8 +1230,8 @@ mod tests {
         let ledbat_config = CongestionControlConfig::new(CongestionControlAlgorithm::Ledbat);
         let ledbat = ledbat_config.build_with_time_source(time.clone());
 
-        // BBR's initial_cwnd (10 * MSS = 10 * 1463 = 14630)
-        let bbr_initial = 10 * 1463;
+        // BBR's initial_cwnd (10 * MSS)
+        let bbr_initial = BbrConfig::default().initial_cwnd;
 
         // Simulate traffic to build up state, then trigger repeated timeouts
         // This simulates the "timeout storm" seen in production
@@ -1250,11 +1250,6 @@ mod tests {
         }
 
         let ledbat_cwnd_after_warmup = ledbat.current_cwnd();
-        println!(
-            "After warmup: BBR cwnd={}, LEDBAT cwnd={}",
-            bbr.current_cwnd(),
-            ledbat_cwnd_after_warmup
-        );
 
         // LEDBAT should have grown significantly
         assert!(
@@ -1264,61 +1259,29 @@ mod tests {
         );
 
         // Phase 2: Simulate "timeout storm" - 10 consecutive timeouts
-        // This is what happens in production when ACK delay + RTT exceeds RTO
-        println!("\nSimulating timeout storm (10 consecutive timeouts):");
-        for i in 0..10 {
+        for _ in 0..10 {
             bbr.on_timeout();
             ledbat.on_timeout();
 
-            let bbr_cwnd = bbr.current_cwnd();
-            let ledbat_cwnd = ledbat.current_cwnd();
-            println!(
-                "  Timeout {}: BBR cwnd={}, LEDBAT cwnd={}",
-                i + 1,
-                bbr_cwnd,
-                ledbat_cwnd
-            );
-
-            // BBR always resets to initial_cwnd - no memory of past state!
+            // BBR always resets to initial_cwnd - no memory of past state
             assert_eq!(
-                bbr_cwnd, bbr_initial,
-                "BBR should reset to initial_cwnd ({}) on every timeout, got {}",
-                bbr_initial, bbr_cwnd
+                bbr.current_cwnd(),
+                bbr_initial,
+                "BBR should reset to initial_cwnd on every timeout"
             );
         }
 
-        let bbr_cwnd_final = bbr.current_cwnd();
-        let ledbat_cwnd_final = ledbat.current_cwnd();
-
-        println!(
-            "\nFinal state: BBR cwnd={}, LEDBAT cwnd={}",
-            bbr_cwnd_final, ledbat_cwnd_final
-        );
-
         // BBR is stuck at initial_cwnd after timeout storm
         assert_eq!(
-            bbr_cwnd_final, bbr_initial,
+            bbr.current_cwnd(),
+            bbr_initial,
             "BBR remains stuck at initial_cwnd after timeout storm"
         );
 
-        // LEDBAT should still maintain reasonable cwnd through its adaptive floor
-        // Even after 10 timeouts, LEDBAT's adaptive behavior keeps cwnd above MSS
+        // LEDBAT maintains higher cwnd through its adaptive floor
         assert!(
-            ledbat_cwnd_final > bbr_cwnd_final,
-            "LEDBAT ({}) should maintain higher cwnd than BBR ({}) after timeout storm",
-            ledbat_cwnd_final,
-            bbr_cwnd_final
-        );
-
-        // The key insight: LEDBAT retains SOME memory of the connection's capacity,
-        // while BBR loses ALL memory on every timeout. In high-latency scenarios
-        // where spurious timeouts keep occurring, BBR can never build up state.
-        let ledbat_retention = ledbat_cwnd_final as f64 / ledbat_cwnd_after_warmup as f64;
-        println!(
-            "LEDBAT retained {:.1}% of warmup cwnd ({} -> {})",
-            ledbat_retention * 100.0,
-            ledbat_cwnd_after_warmup,
-            ledbat_cwnd_final
+            ledbat.current_cwnd() > bbr.current_cwnd(),
+            "LEDBAT should maintain higher cwnd than BBR after timeout storm"
         );
     }
 }
