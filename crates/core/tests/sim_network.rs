@@ -297,6 +297,9 @@ impl TestResult {
     ///
     /// This ensures tests are exercising the full range of contract operations
     /// for robust coverage. Fails if any operation type has zero occurrences.
+    ///
+    /// Also tracks concurrent PUTs - multiple PUTs to the same contract from different peers.
+    /// This exercises the CRDT merge logic that was fixed in PR #2683.
     fn verify_operation_coverage(self) -> Self {
         let rt = create_runtime();
         let logs = rt.block_on(async { self.logs_handle.lock().await.clone() });
@@ -308,12 +311,32 @@ impl TestResult {
         let mut contracts_with_puts: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        // Track PUTs per contract per peer to detect concurrent puts
+        // Key: contract_key, Value: set of (peer_addr, state_hash) tuples
+        let mut puts_per_contract: std::collections::HashMap<
+            String,
+            std::collections::HashSet<(String, String)>,
+        > = std::collections::HashMap::new();
+
         for log in &logs {
             let variant = log.kind.variant_name();
             if variant.starts_with("Put") {
                 put_count += 1;
                 if let Some(key) = log.kind.contract_key() {
-                    contracts_with_puts.insert(format!("{:?}", key));
+                    let key_str = format!("{:?}", key);
+                    contracts_with_puts.insert(key_str.clone());
+
+                    // Track peer and state for this PUT
+                    let peer_addr = format!("{}", log.peer_id.addr);
+                    let state_hash = log
+                        .kind
+                        .state_hash()
+                        .map(|h| h[..8].to_string())
+                        .unwrap_or_default();
+                    puts_per_contract
+                        .entry(key_str)
+                        .or_default()
+                        .insert((peer_addr, state_hash));
                 }
             } else if variant.starts_with("Get") {
                 get_count += 1;
@@ -324,12 +347,34 @@ impl TestResult {
             }
         }
 
+        // Count contracts with concurrent puts (multiple unique peer+state combinations)
+        let contracts_with_concurrent_puts: Vec<_> = puts_per_contract
+            .iter()
+            .filter(|(_, puts)| puts.len() > 1)
+            .collect();
+
         tracing::info!("=== OPERATION COVERAGE: {} ===", self.name);
         tracing::info!("PUT operations:       {}", put_count);
         tracing::info!("GET operations:       {}", get_count);
         tracing::info!("UPDATE operations:    {}", update_count);
         tracing::info!("SUBSCRIBE operations: {}", subscribe_count);
         tracing::info!("Contracts with PUTs:  {}", contracts_with_puts.len());
+        tracing::info!(
+            "Contracts with concurrent PUTs: {}",
+            contracts_with_concurrent_puts.len()
+        );
+
+        // Log details of concurrent puts for debugging
+        for (contract, puts) in &contracts_with_concurrent_puts {
+            tracing::debug!(
+                "  Contract {} has {} concurrent puts from peers:",
+                &contract[..20],
+                puts.len()
+            );
+            for (peer, hash) in puts.iter().take(5) {
+                tracing::debug!("    peer={} state={}", peer, hash);
+            }
+        }
 
         // Verify minimum coverage - all operation types should be exercised
         assert!(
