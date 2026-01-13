@@ -831,3 +831,261 @@ fn test_issue_2697_large_transfer_with_timeouts(#[case] rtt_ms: u64, #[case] tra
         final_bw_kbps
     );
 }
+
+// =============================================================================
+// Realistic Throughput Tests - Respect pacing_rate like real transport does
+// =============================================================================
+
+/// Helper to simulate realistic transfer respecting pacing_rate.
+///
+/// Unlike the basic tests that blast packets, this simulates what the real
+/// transport does: send only as many bytes as pacing_rate allows per time unit.
+fn simulate_paced_transfer(
+    controller: &BbrController<VirtualTime>,
+    time: &VirtualTime,
+    rtt: Duration,
+    transfer_bytes: usize,
+    packet_size: usize,
+) -> (usize, Duration) {
+    use crate::simulation::TimeSource;
+
+    let mut bytes_sent = 0usize;
+    let start_time = time.now_nanos();
+
+    while bytes_sent < transfer_bytes {
+        // Check pacing rate - how many bytes can we send this RTT?
+        let pacing_rate = controller.pacing_rate();
+        let bytes_allowed_by_pacing = (pacing_rate as f64 * rtt.as_secs_f64()) as usize;
+
+        // Check cwnd - don't exceed congestion window
+        let cwnd = controller.current_cwnd();
+        let flightsize = controller.flightsize();
+        let bytes_allowed_by_cwnd = cwnd.saturating_sub(flightsize);
+
+        // Send the minimum of what pacing and cwnd allow
+        let bytes_to_send = bytes_allowed_by_pacing
+            .min(bytes_allowed_by_cwnd)
+            .min(transfer_bytes - bytes_sent)
+            .max(packet_size); // Send at least one packet
+
+        let packets_to_send = (bytes_to_send / packet_size).max(1);
+
+        let mut tokens = Vec::new();
+        for _ in 0..packets_to_send {
+            tokens.push(controller.on_send(packet_size));
+        }
+
+        time.advance(rtt);
+
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+            bytes_sent += packet_size;
+        }
+    }
+
+    let elapsed = Duration::from_nanos(time.now_nanos() - start_time);
+    (bytes_sent, elapsed)
+}
+
+/// Test that BBR achieves reasonable throughput on a fresh connection.
+///
+/// This test documents the ACTUAL behavior when respecting pacing_rate.
+/// The current BBR implementation is slow to ramp up, which explains
+/// Ian's observation of 12 KB/s transfers.
+///
+/// Expected vs actual (with pacing respected):
+/// - 50ms RTT: ~400 KB/s actual (want 1+ MB/s)
+/// - 135ms RTT: ~16 KB/s actual (want 500+ KB/s) <- matches Ian's 12 KB/s!
+/// - 250ms RTT: ~80 KB/s actual (want 250+ KB/s)
+#[rstest]
+#[case::domestic_broadband(50, 100_000)] // 50ms - current: ~400KB/s, want: 1+ MB/s
+#[case::intercontinental(135, 10_000)] // 135ms - current: ~16KB/s, want: 500+ KB/s
+#[case::high_latency(250, 50_000)] // 250ms - current: ~80KB/s, want: 250+ KB/s
+fn test_fresh_connection_ramps_up_throughput(
+    #[case] rtt_ms: u64,
+    #[case] min_expected_throughput: usize,
+) {
+    use crate::simulation::TimeSource;
+
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(rtt_ms);
+    let packet_size = 1400;
+    let transfer_size = 500 * 1024; // 500KB transfer
+
+    // Print initial state for debugging
+    println!("\n[{}ms RTT] Initial state:", rtt_ms);
+    println!(
+        "  pacing_rate: {} B/s ({:.1} KB/s)",
+        controller.pacing_rate(),
+        controller.pacing_rate() as f64 / 1024.0
+    );
+    println!("  cwnd: {} bytes", controller.current_cwnd());
+
+    // Simulate paced transfer
+    let (bytes_sent, elapsed) =
+        simulate_paced_transfer(&controller, &time, rtt, transfer_size, packet_size);
+
+    let throughput = bytes_sent as f64 / elapsed.as_secs_f64();
+    let throughput_kbps = throughput / 1024.0;
+
+    // Print final state
+    println!("[{}ms RTT] Final state:", rtt_ms);
+    println!(
+        "  pacing_rate: {} B/s ({:.1} KB/s)",
+        controller.pacing_rate(),
+        controller.pacing_rate() as f64 / 1024.0
+    );
+    println!("  cwnd: {} bytes", controller.current_cwnd());
+    println!(
+        "  max_bw: {} B/s ({:.1} KB/s)",
+        controller.max_bw(),
+        controller.max_bw() as f64 / 1024.0
+    );
+    println!("  throughput: {:.1} KB/s", throughput_kbps);
+
+    // These are CURRENT thresholds (documenting actual behavior)
+    // TODO: Increase these when BBR ramp-up is fixed
+    assert!(
+        throughput >= min_expected_throughput as f64,
+        "[{}ms RTT] Fresh connection throughput {:.1} KB/s is below even current expected {} KB/s",
+        rtt_ms,
+        throughput_kbps,
+        min_expected_throughput / 1024
+    );
+}
+
+/// Test that timeout on fresh connection doesn't cause permanent slowdown.
+///
+/// This simulates the problematic scenario:
+/// 1. Fresh connection starts transfer
+/// 2. Timeout occurs before building up max_bdp_seen
+/// 3. Connection should still recover to reasonable throughput
+///
+/// Current behavior: early timeout significantly hurts throughput because
+/// max_bdp_seen is 0, so cwnd falls back to initial_cwnd.
+#[rstest]
+#[case::early_timeout_domestic(50, 50_000)] // Lower threshold due to early timeout impact
+#[case::early_timeout_intercontinental(135, 5_000)]
+#[case::early_timeout_high_latency(250, 20_000)]
+fn test_early_timeout_recovers_throughput(
+    #[case] rtt_ms: u64,
+    #[case] min_expected_throughput: usize,
+) {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(rtt_ms);
+    let packet_size = 1400;
+
+    println!("\n[{}ms RTT] Testing early timeout recovery", rtt_ms);
+    println!("  Initial pacing_rate: {} B/s", controller.pacing_rate());
+    println!("  Initial cwnd: {} bytes", controller.current_cwnd());
+
+    // Phase 1: Send just a few packets (fresh connection)
+    for _ in 0..5 {
+        let token = controller.on_send(packet_size);
+        time.advance(rtt);
+        controller.on_ack_with_token(rtt, packet_size, Some(token));
+    }
+
+    println!("  After 5 packets:");
+    println!("    pacing_rate: {} B/s", controller.pacing_rate());
+    println!("    cwnd: {} bytes", controller.current_cwnd());
+    println!("    max_bw: {} B/s", controller.max_bw());
+
+    // Phase 2: EARLY TIMEOUT (before max_bdp_seen is built up)
+    controller.on_timeout();
+
+    let post_timeout_cwnd = controller.current_cwnd();
+    let post_timeout_pacing = controller.pacing_rate();
+
+    println!("  After early timeout:");
+    println!("    pacing_rate: {} B/s", post_timeout_pacing);
+    println!("    cwnd: {} bytes", post_timeout_cwnd);
+    println!("    max_bw: {} B/s", controller.max_bw());
+
+    // Phase 3: Continue transfer and measure throughput
+    let transfer_size = 500 * 1024; // 500KB
+    let (bytes_sent, elapsed) =
+        simulate_paced_transfer(&controller, &time, rtt, transfer_size, packet_size);
+
+    let throughput = bytes_sent as f64 / elapsed.as_secs_f64();
+    let throughput_kbps = throughput / 1024.0;
+
+    println!("  Final throughput: {:.1} KB/s", throughput_kbps);
+
+    // Key assertion: even after early timeout, should have some throughput
+    assert!(
+        throughput >= min_expected_throughput as f64,
+        "[{}ms RTT] Post-early-timeout throughput {:.1} KB/s is below {} KB/s. \
+         Post-timeout state: cwnd={}B, pacing={}B/s",
+        rtt_ms,
+        throughput_kbps,
+        min_expected_throughput / 1024,
+        post_timeout_cwnd,
+        post_timeout_pacing
+    );
+}
+
+/// Test that pacing_rate is at least 1 MB/s for fresh connections.
+///
+/// The real transport uses pacing_rate to throttle sends. If pacing_rate
+/// is too low, the connection will be artificially slow regardless of cwnd.
+#[test]
+fn test_initial_pacing_rate_is_reasonable() {
+    let controller = BbrController::new(BbrConfig::default());
+
+    let initial_pacing = controller.pacing_rate();
+
+    // Initial pacing rate should be at least 1 MB/s
+    // (set in controller.rs as INITIAL_PACING_RATE = 1_000_000)
+    assert!(
+        initial_pacing >= 1_000_000,
+        "Initial pacing rate {} B/s is below 1 MB/s minimum",
+        initial_pacing
+    );
+}
+
+/// Test that pacing_rate grows during normal operation.
+///
+/// After successful transfers, pacing_rate should increase as BBR
+/// discovers the available bandwidth.
+#[test]
+fn test_pacing_rate_grows_with_successful_transfers() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(50);
+    let packet_size = 1400;
+
+    let initial_pacing = controller.pacing_rate();
+
+    // Send traffic for 20 RTTs
+    for _ in 0..20 {
+        let cwnd = controller.current_cwnd();
+        let packets = (cwnd / packet_size).max(1);
+
+        let mut tokens = Vec::new();
+        for _ in 0..packets {
+            tokens.push(controller.on_send(packet_size));
+        }
+
+        time.advance(rtt);
+
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+        }
+    }
+
+    let final_pacing = controller.pacing_rate();
+
+    // Pacing rate should have increased significantly
+    assert!(
+        final_pacing > initial_pacing * 10,
+        "Pacing rate didn't grow enough: {} -> {} (expected 10x+ increase)",
+        initial_pacing,
+        final_pacing
+    );
+}
