@@ -901,7 +901,6 @@ fn simulate_paced_transfer(
 #[case::domestic_broadband(50, 1_000_000)] // 50ms RTT should achieve 1+ MB/s
 #[case::intercontinental(135, 500_000)] // 135ms RTT should achieve 500+ KB/s
 #[case::high_latency(250, 250_000)] // 250ms RTT should achieve 250+ KB/s
-#[ignore] // TODO: Enable once BBR bootstrap/ramp-up is fixed (issue #2697)
 fn test_fresh_connection_ramps_up_throughput(
     #[case] rtt_ms: u64,
     #[case] min_expected_throughput: usize,
@@ -970,7 +969,6 @@ fn test_fresh_connection_ramps_up_throughput(
 #[case::early_timeout_domestic(50, 500_000)] // 50ms RTT should recover to 500+ KB/s
 #[case::early_timeout_intercontinental(135, 250_000)] // 135ms RTT should recover to 250+ KB/s
 #[case::early_timeout_high_latency(250, 125_000)] // 250ms RTT should recover to 125+ KB/s
-#[ignore] // TODO: Enable once BBR bootstrap/ramp-up is fixed (issue #2697)
 fn test_early_timeout_recovers_throughput(
     #[case] rtt_ms: u64,
     #[case] min_expected_throughput: usize,
