@@ -32,7 +32,7 @@ use std::time::Duration;
 ///
 /// The test runs the simulation 3 times with the same seed and compares traces.
 /// All three runs must produce identical results.
-#[test]
+#[test_log::test]
 fn test_strict_determinism_exact_event_equality() {
     use freenet::dev_tool::SimNetwork;
 
@@ -144,12 +144,14 @@ fn test_strict_determinism_exact_event_equality() {
 
     // Debug: Print detailed event breakdown before assertions
     if trace1.total_events != trace2.total_events || trace2.total_events != trace3.total_events {
-        eprintln!("\n=== DETERMINISM DEBUG ===");
-        eprintln!(
+        tracing::info!("\n=== DETERMINISM DEBUG ===");
+        tracing::info!(
             "Run 1 total: {}, Run 2 total: {}, Run 3 total: {}",
-            trace1.total_events, trace2.total_events, trace3.total_events
+            trace1.total_events,
+            trace2.total_events,
+            trace3.total_events
         );
-        eprintln!("\nEvent counts by type:");
+        tracing::info!("\nEvent counts by type:");
 
         let mut all_types: std::collections::BTreeSet<&String> =
             trace1.event_counts.keys().collect();
@@ -161,15 +163,18 @@ fn test_strict_determinism_exact_event_equality() {
             let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
             let count3 = trace3.event_counts.get(event_type).unwrap_or(&0);
             if count1 != count2 || count2 != count3 {
-                eprintln!(
+                tracing::info!(
                     "  {} : {} vs {} vs {} (DIFFERS)",
-                    event_type, count1, count2, count3
+                    event_type,
+                    count1,
+                    count2,
+                    count3
                 );
             } else {
-                eprintln!("  {} : {} (same)", event_type, count1);
+                tracing::info!("  {} : {} (same)", event_type, count1);
             }
         }
-        eprintln!("=========================\n");
+        tracing::info!("=========================\n");
     }
 
     // STRICT ASSERTION 1: Exact same total event count across all 3 runs
@@ -228,15 +233,15 @@ fn test_strict_determinism_exact_event_equality() {
     }
 
     // Print event breakdown on success for verification
-    eprintln!("\n=== DETERMINISM TEST PASSED ===");
-    eprintln!("Total events matched: {}", trace1.total_events);
-    eprintln!("\nEvent type breakdown:");
+    tracing::info!("\n=== DETERMINISM TEST PASSED ===");
+    tracing::info!("Total events matched: {}", trace1.total_events);
+    tracing::info!("\nEvent type breakdown:");
     let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
     sorted_types.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
     for (event_type, count) in &sorted_types {
-        eprintln!("  {:20} : {:5}", event_type, count);
+        tracing::info!("  {:20} : {:5}", event_type, count);
     }
-    eprintln!("================================\n");
+    tracing::info!("================================\n");
 
     tracing::info!(
         "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 3 runs",
@@ -253,7 +258,7 @@ fn test_strict_determinism_exact_event_equality() {
 /// - More complex routing decisions
 ///
 /// The test runs 3 times with the same seed and verifies exact event equality.
-#[test]
+#[test_log::test]
 fn test_strict_determinism_multi_gateway() {
     use freenet::dev_tool::SimNetwork;
 
@@ -358,12 +363,14 @@ fn test_strict_determinism_multi_gateway() {
 
     // Debug output if event counts differ
     if trace1.total_events != trace2.total_events || trace2.total_events != trace3.total_events {
-        eprintln!("\n=== MULTI-GATEWAY DETERMINISM DEBUG ===");
-        eprintln!(
+        tracing::info!("\n=== MULTI-GATEWAY DETERMINISM DEBUG ===");
+        tracing::info!(
             "Run 1 total: {}, Run 2 total: {}, Run 3 total: {}",
-            trace1.total_events, trace2.total_events, trace3.total_events
+            trace1.total_events,
+            trace2.total_events,
+            trace3.total_events
         );
-        eprintln!("\nEvent counts by type:");
+        tracing::info!("\nEvent counts by type:");
 
         let mut all_types: std::collections::BTreeSet<&String> =
             trace1.event_counts.keys().collect();
@@ -375,15 +382,18 @@ fn test_strict_determinism_multi_gateway() {
             let count2 = trace2.event_counts.get(event_type).unwrap_or(&0);
             let count3 = trace3.event_counts.get(event_type).unwrap_or(&0);
             if count1 != count2 || count2 != count3 {
-                eprintln!(
+                tracing::info!(
                     "  {} : {} vs {} vs {} (DIFFERS)",
-                    event_type, count1, count2, count3
+                    event_type,
+                    count1,
+                    count2,
+                    count3
                 );
             } else {
-                eprintln!("  {} : {} (same)", event_type, count1);
+                tracing::info!("  {} : {} (same)", event_type, count1);
             }
         }
-        eprintln!("========================================\n");
+        tracing::info!("========================================\n");
     }
 
     // STRICT ASSERTION 1: Exact same total event count
@@ -442,15 +452,15 @@ fn test_strict_determinism_multi_gateway() {
     }
 
     // Print event breakdown on success
-    eprintln!("\n=== MULTI-GATEWAY DETERMINISM TEST PASSED ===");
-    eprintln!("Gateways: 2, Total events matched: {}", trace1.total_events);
-    eprintln!("\nEvent type breakdown:");
+    tracing::info!("\n=== MULTI-GATEWAY DETERMINISM TEST PASSED ===");
+    tracing::info!("Gateways: 2, Total events matched: {}", trace1.total_events);
+    tracing::info!("\nEvent type breakdown:");
     let mut sorted_types: Vec<_> = trace1.event_counts.iter().collect();
     sorted_types.sort_by(|a, b| b.1.cmp(a.1));
     for (event_type, count) in &sorted_types {
-        eprintln!("  {:20} : {:5}", event_type, count);
+        tracing::info!("  {:20} : {:5}", event_type, count);
     }
-    eprintln!("==============================================\n");
+    tracing::info!("==============================================\n");
 
     tracing::info!(
         "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events matched exactly across 3 runs (2 gateways)",
@@ -1388,7 +1398,7 @@ mod simulation_primitives {
     }
 
     /// Tests that fault injection decisions are deterministic.
-    #[test]
+    #[test_log::test]
     fn test_fault_config_determinism() {
         let config = FaultConfig::builder().message_loss_rate(0.3).build();
 
@@ -1409,7 +1419,7 @@ mod simulation_primitives {
     }
 
     /// Tests virtual time wakeup ordering.
-    #[test]
+    #[test_log::test]
     fn test_virtual_time_wakeup_order() {
         let vt = VirtualTime::new();
 
@@ -1434,7 +1444,7 @@ mod simulation_primitives {
     }
 
     /// Tests that crashed nodes block all messages.
-    #[test]
+    #[test_log::test]
     fn test_crashed_node_blocks_messages() {
         let config = FaultConfig::builder().crashed_node(addr(1000)).build();
         let rng = SimulationRng::new(42);
@@ -1899,7 +1909,7 @@ async fn test_minimal_network() {
 ///
 /// Uses Turmoil for deterministic scheduling - tokio::time calls inside
 /// Turmoil hosts are intercepted and advanced deterministically.
-#[test]
+#[test_log::test]
 fn test_graceful_shutdown_no_deadlock() {
     use freenet::dev_tool::SimNetwork;
 
@@ -1957,7 +1967,7 @@ fn test_graceful_shutdown_no_deadlock() {
 /// This test verifies the fix for fragile string-based error matching.
 /// The EventLoopExitReason enum should be used instead of comparing
 /// error message strings.
-#[test]
+#[test_log::test]
 fn test_graceful_shutdown_typed_error() {
     use freenet::EventLoopExitReason;
 
@@ -1987,7 +1997,7 @@ fn test_graceful_shutdown_typed_error() {
 /// Note: This tests that Turmoil scheduling is deterministic, not that the
 /// full event sequence matches (which requires API changes to capture events
 /// from run_simulation).
-#[test]
+#[test_log::test]
 fn test_turmoil_determinism() {
     use freenet::dev_tool::SimNetwork;
 

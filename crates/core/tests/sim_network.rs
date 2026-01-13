@@ -204,12 +204,12 @@ impl TestResult {
     /// Assert the simulation completed successfully.
     fn assert_ok(self) -> Self {
         if let Err(e) = &self.simulation_result {
-            eprintln!("\n============================================================");
-            eprintln!("SIMULATION TEST FAILED: {}", self.name);
-            eprintln!("============================================================");
-            eprintln!("Seed for reproduction: 0x{:X}", self.seed);
-            eprintln!("Error: {:?}", e);
-            eprintln!("============================================================\n");
+            tracing::error!("============================================================");
+            tracing::error!("SIMULATION TEST FAILED: {}", self.name);
+            tracing::error!("============================================================");
+            tracing::error!("Seed for reproduction: 0x{:X}", self.seed);
+            tracing::error!("Error: {:?}", e);
+            tracing::error!("============================================================");
         }
         assert!(
             self.simulation_result.is_ok(),
@@ -222,8 +222,8 @@ impl TestResult {
 
     /// Log convergence results and optionally assert convergence.
     fn check_convergence(self) -> Self {
-        eprintln!("\n=== CONVERGENCE CHECK: {} ===", self.name);
-        eprintln!(
+        tracing::info!("=== CONVERGENCE CHECK: {} ===", self.name);
+        tracing::info!(
             "Result: {} converged, {} diverged, {} events",
             self.convergence.converged.len(),
             self.convergence.diverged.len(),
@@ -231,29 +231,32 @@ impl TestResult {
         );
 
         // Get logs for detailed analysis
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = create_runtime();
         let logs = rt.block_on(async { self.logs_handle.lock().await.clone() });
 
         for diverged in &self.convergence.diverged {
-            eprintln!(
-                "\nDIVERGED: {} - {} unique states across {} peers",
+            tracing::warn!(
+                "DIVERGED: {} - {} unique states across {} peers",
                 diverged.contract_key,
                 diverged.unique_state_count(),
                 diverged.peer_states.len()
             );
             for (peer, hash) in &diverged.peer_states {
-                eprintln!("  peer {}: {}", peer, hash);
+                tracing::warn!("  peer {}: {}", peer, hash);
             }
 
             // Show stored_hash events only (PutSuccess, UpdateSuccess, BroadcastApplied)
-            eprintln!("\n  Stored state events for this contract:");
+            tracing::debug!(
+                "Stored state events for contract {}:",
+                diverged.contract_key
+            );
             for log in &logs {
                 let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
                 if contract_key.as_ref() == Some(&diverged.contract_key) {
                     if let Some(state_hash) = log.kind.stored_state_hash() {
                         let variant = log.kind.variant_name();
-                        eprintln!(
-                            "    {} @ {}: {} -> {}",
+                        tracing::debug!(
+                            "  {} @ {}: {} -> {}",
                             log.tx,
                             log.peer_id.addr,
                             variant,
@@ -264,13 +267,13 @@ impl TestResult {
             }
 
             // Show Subscribe events
-            eprintln!("\n  Subscribe events for this contract:");
+            tracing::debug!("Subscribe events for contract {}:", diverged.contract_key);
             for log in &logs {
                 let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
                 if contract_key.as_ref() == Some(&diverged.contract_key) {
                     let variant = log.kind.variant_name();
                     if variant.contains("Subscribe") {
-                        eprintln!("    {} @ {}: {}", log.tx, log.peer_id.addr, variant);
+                        tracing::debug!("  {} @ {}: {}", log.tx, log.peer_id.addr, variant);
                     }
                 }
             }
@@ -287,6 +290,88 @@ impl TestResult {
         }
 
         tracing::info!("{} PASSED", self.name);
+        self
+    }
+
+    /// Verify that all operation types (PUT, GET, UPDATE, SUBSCRIBE) were executed.
+    ///
+    /// This ensures tests are exercising the full range of contract operations
+    /// for robust coverage. Fails if any operation type has zero occurrences.
+    fn verify_operation_coverage(self) -> Self {
+        let rt = create_runtime();
+        let logs = rt.block_on(async { self.logs_handle.lock().await.clone() });
+
+        let mut put_count = 0;
+        let mut get_count = 0;
+        let mut update_count = 0;
+        let mut subscribe_count = 0;
+        let mut contracts_with_puts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for log in &logs {
+            let variant = log.kind.variant_name();
+            if variant.starts_with("Put") {
+                put_count += 1;
+                if let Some(key) = log.kind.contract_key() {
+                    contracts_with_puts.insert(format!("{:?}", key));
+                }
+            } else if variant.starts_with("Get") {
+                get_count += 1;
+            } else if variant.starts_with("Update") {
+                update_count += 1;
+            } else if variant.starts_with("Subscribe") {
+                subscribe_count += 1;
+            }
+        }
+
+        tracing::info!("=== OPERATION COVERAGE: {} ===", self.name);
+        tracing::info!("PUT operations:       {}", put_count);
+        tracing::info!("GET operations:       {}", get_count);
+        tracing::info!("UPDATE operations:    {}", update_count);
+        tracing::info!("SUBSCRIBE operations: {}", subscribe_count);
+        tracing::info!("Contracts with PUTs:  {}", contracts_with_puts.len());
+
+        // Verify minimum coverage - all operation types should be exercised
+        assert!(
+            put_count > 0,
+            "{}: No PUT operations detected - test not exercising puts",
+            self.name
+        );
+        assert!(
+            get_count > 0,
+            "{}: No GET operations detected - test not exercising gets",
+            self.name
+        );
+        assert!(
+            update_count > 0,
+            "{}: No UPDATE operations detected - test not exercising updates",
+            self.name
+        );
+        assert!(
+            subscribe_count > 0,
+            "{}: No SUBSCRIBE operations detected - test not exercising subscribes",
+            self.name
+        );
+
+        // Verify at least one contract is being tested
+        // Note: For larger convergence tests, multiple contracts should naturally be created
+        // given sufficient iterations. Small CI tests may only have 1 contract.
+        assert!(
+            !contracts_with_puts.is_empty(),
+            "{}: No contracts with PUTs - test not exercising contract creation",
+            self.name
+        );
+
+        tracing::info!(
+            "{}: Operation coverage verified (PUT={}, GET={}, UPDATE={}, SUBSCRIBE={}, contracts={})",
+            self.name,
+            put_count,
+            get_count,
+            update_count,
+            subscribe_count,
+            contracts_with_puts.len()
+        );
+
         self
     }
 }
@@ -317,7 +402,7 @@ fn create_runtime() -> tokio::runtime::Runtime {
 // =============================================================================
 
 /// Test that SimNetwork can be created and peers can be built.
-#[test]
+#[test_log::test]
 fn test_sim_network_basic_setup() {
     const SEED: u64 = 0xBA51C_5E70_0001;
 
@@ -339,7 +424,7 @@ fn test_sim_network_basic_setup() {
 }
 
 /// Test that peers can start and run under Turmoil's deterministic scheduler.
-#[test]
+#[test_log::test]
 fn test_sim_network_peer_startup() {
     TestConfig::small("peer-startup", 0xBEE2_5747_0001)
         .with_nodes(2)
@@ -350,7 +435,7 @@ fn test_sim_network_peer_startup() {
 }
 
 /// Test network connectivity under Turmoil's deterministic scheduler.
-#[test]
+#[test_log::test]
 fn test_sim_network_connectivity() {
     TestConfig::small("connectivity-test", 0xC0EE_3C70_0001)
         .with_max_contracts(2)
@@ -364,7 +449,7 @@ fn test_sim_network_connectivity() {
 // =============================================================================
 
 /// CI simulation test - small network with contract operations.
-#[test]
+#[test_log::test]
 fn ci_quick_simulation() {
     TestConfig::small("ci-quick-sim", 0xC1F1_ED5E_ED00)
         .with_nodes(4)
@@ -374,15 +459,17 @@ fn ci_quick_simulation() {
         .with_sleep(Duration::from_secs(2))
         .run()
         .assert_ok()
+        .verify_operation_coverage()
         .check_convergence();
 }
 
 /// CI simulation test - medium network with more operations.
-#[test]
+#[test_log::test]
 fn ci_medium_simulation() {
     TestConfig::medium("ci-medium-sim", 0xC1F1_ED7E_ED01)
         .run()
         .assert_ok()
+        .verify_operation_coverage()
         .check_convergence();
 }
 
@@ -392,7 +479,7 @@ fn ci_medium_simulation() {
 
 /// Replica validation test with stepwise consistency checking.
 /// Verifies that contracts converge to the same state across all replicas.
-#[test]
+#[test_log::test]
 fn replica_validation_and_stepwise_consistency() {
     TestConfig::medium("replica-validation", 0xBEE1_1CA5_0001)
         .with_gateways(2)
@@ -406,17 +493,19 @@ fn replica_validation_and_stepwise_consistency() {
         .require_convergence()
         .run()
         .assert_ok()
+        .verify_operation_coverage()
         .check_convergence();
 }
 
 /// Dense network test with high connectivity.
 /// Tests contract replication and convergence in a densely connected network.
-#[test]
+#[test_log::test]
 fn dense_network_replication() {
     TestConfig::large("dense-network", 0xDE05_E0F0_0001)
         .require_convergence()
         .run()
         .assert_ok()
+        .verify_operation_coverage()
         .check_convergence();
 }
 
@@ -425,7 +514,7 @@ fn dense_network_replication() {
 // =============================================================================
 
 /// Verify that running the same simulation twice produces identical results.
-#[test]
+#[test_log::test]
 fn test_turmoil_determinism_verification() {
     const SEED: u64 = 0xDE7E_2A11_0001;
 
@@ -498,8 +587,8 @@ fn test_turmoil_determinism_verification() {
 /// Fix applied in this codebase:
 /// - MIN_RTO increased from 200ms to 300ms
 /// - BBR now uses adaptive timeout floor based on max BDP seen
-#[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_high_latency_timeout_regression() {
+#[test_log::test]
+fn test_high_latency_timeout_regression() {
     use freenet::simulation::FaultConfig;
 
     // Use a fixed seed for reproducibility
@@ -509,74 +598,79 @@ async fn test_high_latency_timeout_regression() {
         SEED
     );
 
-    // Create a network with 1 gateway and 3 peers
-    let mut sim = SimNetwork::new(
-        "high-latency-regression",
-        1,  // gateways
-        3,  // nodes
-        7,  // ring_max_htl
-        3,  // rnd_if_htl_above
-        10, // max_connections
-        2,  // min_connections
-        SEED,
-    )
-    .await;
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
 
-    // Configure high latency (150-200ms) - similar to intercontinental connections
-    // This latency, combined with ACK_CHECK_INTERVAL (100ms), would have caused
-    // spurious timeouts with the old MIN_RTO of 200ms
-    let fault_config = FaultConfig::builder()
-        .latency_range(Duration::from_millis(150)..Duration::from_millis(200))
-        .build();
-    sim.with_fault_injection(fault_config);
-
-    sim.with_start_backoff(Duration::from_millis(100));
-
-    // Start the network
-    let _handles = sim
-        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+    rt.block_on(async {
+        // Create a network with 1 gateway and 3 peers
+        let mut sim = SimNetwork::new(
+            "high-latency-regression",
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
         .await;
 
-    // Give time for initial connections with high latency
-    // (needs more time than normal due to latency)
-    for _ in 0..50 {
-        sim.advance_time(Duration::from_millis(100));
-        tokio::task::yield_now().await;
-    }
+        // Configure high latency (150-200ms) - similar to intercontinental connections
+        // This latency, combined with ACK_CHECK_INTERVAL (100ms), would have caused
+        // spurious timeouts with the old MIN_RTO of 200ms
+        let fault_config = FaultConfig::builder()
+            .latency_range(Duration::from_millis(150)..Duration::from_millis(200))
+            .build();
+        sim.with_fault_injection(fault_config);
 
-    // Check connectivity with a longer timeout due to high latency
-    match sim.check_partial_connectivity(Duration::from_secs(60), 0.5) {
-        Ok(()) => {
-            tracing::info!("High-latency network established connectivity");
+        sim.with_start_backoff(Duration::from_millis(100));
+
+        // Start the network
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+            .await;
+
+        // Give time for initial connections with high latency
+        // (needs more time than normal due to latency)
+        for _ in 0..50 {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::task::yield_now().await;
         }
-        Err(e) => {
-            tracing::warn!(
-                "High-latency connectivity check incomplete: {} (this may be acceptable)",
-                e
-            );
+
+        // Check connectivity with a longer timeout due to high latency
+        match sim.check_partial_connectivity(Duration::from_secs(60), 0.5) {
+            Ok(()) => {
+                tracing::info!("High-latency network established connectivity");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "High-latency connectivity check incomplete: {} (this may be acceptable)",
+                    e
+                );
+            }
         }
-    }
 
-    // The key test: verify we don't have excessive timeouts
-    // With the old MIN_RTO=200ms, we'd see hundreds of timeouts
-    // With the fix (MIN_RTO=300ms + adaptive floor), timeouts should be minimal
-    let summary = sim.get_operation_summary().await;
-    let total_timeouts = summary.timeouts;
+        // The key test: verify we don't have excessive timeouts
+        // With the old MIN_RTO=200ms, we'd see hundreds of timeouts
+        // With the fix (MIN_RTO=300ms + adaptive floor), timeouts should be minimal
+        let summary = sim.get_operation_summary().await;
+        let total_timeouts = summary.timeouts;
 
-    tracing::info!(
-        "High-latency test results: {} total timeouts, {:.1}% success rate",
-        total_timeouts,
-        summary.overall_success_rate() * 100.0
-    );
+        tracing::info!(
+            "High-latency test results: {} total timeouts, {:.1}% success rate",
+            total_timeouts,
+            summary.overall_success_rate() * 100.0
+        );
 
-    // Before the fix, we'd see 100+ timeouts per second
-    // After the fix, timeouts should be rare (mostly actual network issues)
-    // Allow up to 50 timeouts for a 60-second test (less than 1/second)
-    assert!(
-        total_timeouts < 50,
-        "Expected <50 timeouts with MIN_RTO=300ms fix, got {} (timeout storm detected!)",
-        total_timeouts
-    );
+        // Before the fix, we'd see 100+ timeouts per second
+        // After the fix, timeouts should be rare (mostly actual network issues)
+        // Allow up to 50 timeouts for a 60-second test (less than 1/second)
+        assert!(
+            total_timeouts < 50,
+            "Expected <50 timeouts with MIN_RTO=300ms fix, got {} (timeout storm detected!)",
+            total_timeouts
+        );
 
-    tracing::info!("High-latency regression test PASSED - no timeout storm detected");
+        tracing::info!("High-latency regression test PASSED - no timeout storm detected");
+    });
 }
