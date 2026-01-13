@@ -13,7 +13,10 @@
 //!
 //! ## Supported Algorithms
 //!
-//! - **BBR** (default): Model-based congestion control that estimates bandwidth
+//! - **FixedRate** (default): Non-adaptive congestion control that transmits at
+//!   a constant rate (default 25 Mbps). A pragmatic fallback while adaptive
+//!   algorithms are being stabilized.
+//! - **BBR**: Model-based congestion control that estimates bandwidth
 //!   and RTT, tolerating packet loss as long as bandwidth remains stable.
 //! - **LEDBAT++**: Low Extra Delay Background Transport, optimized for
 //!   background traffic that should yield to foreground applications.
@@ -48,6 +51,7 @@ use crate::simulation::{RealTime, TimeSource};
 
 use super::bbr::DeliveryRateToken;
 use super::bbr::{BbrConfig, BbrController, BbrStats};
+use super::fixed_rate::{FixedRateConfig, FixedRateController};
 use super::ledbat::{LedbatConfig, LedbatController, LedbatStats};
 
 // =============================================================================
@@ -68,7 +72,6 @@ pub enum CongestionControlAlgorithm {
     /// Model-based congestion control that estimates bandwidth and RTT.
     /// Tolerates packet loss as long as bandwidth remains stable.
     /// Better suited for lossy or high-latency paths.
-    #[default]
     Bbr,
 
     /// LEDBAT++ (Low Extra Delay Background Transport)
@@ -77,6 +80,14 @@ pub enum CongestionControlAlgorithm {
     /// Yields to loss-based flows (TCP) and maintains low queuing delay.
     /// Based on draft-irtf-iccrg-ledbat-plus-plus.
     Ledbat,
+
+    /// Fixed-rate (non-adaptive)
+    ///
+    /// Transmits at a constant rate regardless of network feedback.
+    /// A pragmatic fallback when adaptive algorithms have bugs or instabilities.
+    /// Default rate: 25 Mbps.
+    #[default]
+    FixedRate,
 }
 
 impl fmt::Display for CongestionControlAlgorithm {
@@ -84,6 +95,7 @@ impl fmt::Display for CongestionControlAlgorithm {
         match self {
             CongestionControlAlgorithm::Bbr => write!(f, "BBR"),
             CongestionControlAlgorithm::Ledbat => write!(f, "LEDBAT++"),
+            CongestionControlAlgorithm::FixedRate => write!(f, "FixedRate"),
         }
     }
 }
@@ -269,6 +281,8 @@ pub enum CongestionController<T: TimeSource = RealTime> {
     Bbr(BbrController<T>),
     /// LEDBAT++ congestion controller.
     Ledbat(LedbatController<T>),
+    /// Fixed-rate congestion controller.
+    FixedRate(FixedRateController<T>),
 }
 
 impl<T: TimeSource> fmt::Debug for CongestionController<T> {
@@ -284,6 +298,11 @@ impl<T: TimeSource> fmt::Debug for CongestionController<T> {
                 .field("cwnd", &c.current_cwnd())
                 .field("flightsize", &c.flightsize())
                 .finish_non_exhaustive(),
+            Self::FixedRate(c) => f
+                .debug_struct("CongestionController::FixedRate")
+                .field("rate", &c.rate())
+                .field("flightsize", &c.flightsize())
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -295,6 +314,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
                 c.on_send(bytes);
             }
             Self::Ledbat(c) => c.on_send(bytes),
+            Self::FixedRate(c) => c.on_send(bytes),
         }
     }
 
@@ -302,6 +322,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.on_ack(rtt_sample, bytes_acked),
             Self::Ledbat(c) => c.on_ack(rtt_sample, bytes_acked),
+            Self::FixedRate(c) => c.on_ack(rtt_sample, bytes_acked),
         }
     }
 
@@ -309,6 +330,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.on_ack_without_rtt(bytes_acked),
             Self::Ledbat(c) => c.on_ack_without_rtt(bytes_acked),
+            Self::FixedRate(c) => c.on_ack_without_rtt(bytes_acked),
         }
     }
 
@@ -316,6 +338,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.on_loss(0), // BBR on_loss takes bytes_lost, use 0 for generic interface
             Self::Ledbat(c) => c.on_loss(),
+            Self::FixedRate(c) => c.on_loss(),
         }
     }
 
@@ -323,6 +346,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.on_timeout(),
             Self::Ledbat(c) => c.on_timeout(),
+            Self::FixedRate(c) => c.on_timeout(),
         }
     }
 
@@ -330,6 +354,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.current_cwnd(),
             Self::Ledbat(c) => c.current_cwnd(),
+            Self::FixedRate(c) => c.current_cwnd(),
         }
     }
 
@@ -337,6 +362,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.current_rate(rtt) as usize,
             Self::Ledbat(c) => c.current_rate(rtt),
+            Self::FixedRate(c) => c.current_rate(rtt),
         }
     }
 
@@ -344,6 +370,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.flightsize(),
             Self::Ledbat(c) => c.flightsize(),
+            Self::FixedRate(c) => c.flightsize(),
         }
     }
 
@@ -351,6 +378,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.base_delay().unwrap_or(Duration::ZERO),
             Self::Ledbat(c) => c.base_delay(),
+            Self::FixedRate(c) => c.base_delay(),
         }
     }
 
@@ -358,6 +386,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.queuing_delay().unwrap_or(Duration::ZERO),
             Self::Ledbat(c) => c.queuing_delay(),
+            Self::FixedRate(c) => c.queuing_delay(),
         }
     }
 
@@ -365,6 +394,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(c) => c.current_cwnd(), // BBR doesn't track peak separately
             Self::Ledbat(c) => c.peak_cwnd(),
+            Self::FixedRate(c) => c.peak_cwnd(),
         }
     }
 
@@ -398,6 +428,17 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
                     ssthresh: s.ssthresh,
                 }
             }
+            Self::FixedRate(c) => CongestionControlStats {
+                algorithm: CongestionControlAlgorithm::FixedRate,
+                cwnd: c.current_cwnd(),
+                flightsize: c.flightsize(),
+                queuing_delay: Duration::ZERO,
+                base_delay: Duration::ZERO,
+                peak_cwnd: c.current_cwnd(),
+                total_losses: 0, // Fixed rate doesn't track losses
+                total_timeouts: 0,
+                ssthresh: c.rate(), // Use rate as ssthresh equivalent
+            },
         }
     }
 
@@ -405,6 +446,7 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         match self {
             Self::Bbr(_) => CongestionControlAlgorithm::Bbr,
             Self::Ledbat(_) => CongestionControlAlgorithm::Ledbat,
+            Self::FixedRate(_) => CongestionControlAlgorithm::FixedRate,
         }
     }
 }
@@ -553,12 +595,81 @@ impl<T: TimeSource> CongestionControl for LedbatController<T> {
     }
 }
 
+// =============================================================================
+// FixedRateController Implementation of CongestionControl
+// =============================================================================
+
+/// Direct implementation of `CongestionControl` for `FixedRateController`.
+impl<T: TimeSource> CongestionControl for FixedRateController<T> {
+    fn on_send(&self, bytes: usize) {
+        FixedRateController::on_send(self, bytes)
+    }
+
+    fn on_ack(&self, rtt_sample: Duration, bytes_acked: usize) {
+        FixedRateController::on_ack(self, rtt_sample, bytes_acked)
+    }
+
+    fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        FixedRateController::on_ack_without_rtt(self, bytes_acked)
+    }
+
+    fn on_loss(&self) {
+        FixedRateController::on_loss(self)
+    }
+
+    fn on_timeout(&self) {
+        FixedRateController::on_timeout(self)
+    }
+
+    fn current_cwnd(&self) -> usize {
+        FixedRateController::current_cwnd(self)
+    }
+
+    fn current_rate(&self, rtt: Duration) -> usize {
+        FixedRateController::current_rate(self, rtt)
+    }
+
+    fn flightsize(&self) -> usize {
+        FixedRateController::flightsize(self)
+    }
+
+    fn base_delay(&self) -> Duration {
+        FixedRateController::base_delay(self)
+    }
+
+    fn queuing_delay(&self) -> Duration {
+        FixedRateController::queuing_delay(self)
+    }
+
+    fn peak_cwnd(&self) -> usize {
+        FixedRateController::peak_cwnd(self)
+    }
+
+    fn stats(&self) -> CongestionControlStats {
+        CongestionControlStats {
+            algorithm: CongestionControlAlgorithm::FixedRate,
+            cwnd: self.current_cwnd(),
+            flightsize: self.flightsize(),
+            queuing_delay: Duration::ZERO,
+            base_delay: Duration::ZERO,
+            peak_cwnd: self.current_cwnd(),
+            total_losses: 0,
+            total_timeouts: 0,
+            ssthresh: self.rate(),
+        }
+    }
+
+    fn algorithm(&self) -> CongestionControlAlgorithm {
+        CongestionControlAlgorithm::FixedRate
+    }
+}
+
 impl<T: TimeSource> CongestionController<T> {
     /// Get BBR-specific statistics if this is a BBR controller.
     pub fn bbr_stats(&self) -> Option<BbrStats> {
         match self {
             Self::Bbr(c) => Some(c.stats()),
-            Self::Ledbat(_) => None,
+            Self::Ledbat(_) | Self::FixedRate(_) => None,
         }
     }
 
@@ -568,7 +679,7 @@ impl<T: TimeSource> CongestionController<T> {
     /// to LEDBAT-specific metrics like periodic slowdown counts.
     pub fn ledbat_stats(&self) -> Option<LedbatStats> {
         match self {
-            Self::Bbr(_) => None,
+            Self::Bbr(_) | Self::FixedRate(_) => None,
             Self::Ledbat(c) => Some(c.stats()),
         }
     }
@@ -577,15 +688,23 @@ impl<T: TimeSource> CongestionController<T> {
     pub fn as_bbr(&self) -> Option<&BbrController<T>> {
         match self {
             Self::Bbr(c) => Some(c),
-            Self::Ledbat(_) => None,
+            Self::Ledbat(_) | Self::FixedRate(_) => None,
         }
     }
 
     /// Get a reference to the inner LEDBAT controller if applicable.
     pub fn as_ledbat(&self) -> Option<&LedbatController<T>> {
         match self {
-            Self::Bbr(_) => None,
+            Self::Bbr(_) | Self::FixedRate(_) => None,
             Self::Ledbat(c) => Some(c),
+        }
+    }
+
+    /// Get a reference to the inner FixedRate controller if applicable.
+    pub fn as_fixed_rate(&self) -> Option<&FixedRateController<T>> {
+        match self {
+            Self::Bbr(_) | Self::Ledbat(_) => None,
+            Self::FixedRate(c) => Some(c),
         }
     }
 
@@ -595,11 +714,15 @@ impl<T: TimeSource> CongestionController<T> {
     /// to `on_ack_with_token` when the ACK arrives. This enables accurate delivery
     /// rate estimation, which is critical for BBR's bandwidth probing.
     ///
-    /// For LEDBAT, returns None (LEDBAT doesn't use per-packet tokens).
+    /// For LEDBAT and FixedRate, returns None (they don't use per-packet tokens).
     pub fn on_send_with_token(&self, bytes: usize) -> Option<DeliveryRateToken> {
         match self {
             Self::Bbr(c) => Some(c.on_send(bytes)),
             Self::Ledbat(c) => {
+                c.on_send(bytes);
+                None
+            }
+            Self::FixedRate(c) => {
                 c.on_send(bytes);
                 None
             }
@@ -612,7 +735,7 @@ impl<T: TimeSource> CongestionController<T> {
     /// rate computation. Without the token, BBR falls back to a per-packet estimate
     /// (bytes_acked / rtt) which is less accurate and can cause cwnd to stall.
     ///
-    /// For LEDBAT, the token is ignored (LEDBAT uses delay-based estimation).
+    /// For LEDBAT and FixedRate, the token is ignored.
     pub fn on_ack_with_token(
         &self,
         rtt_sample: Duration,
@@ -622,6 +745,20 @@ impl<T: TimeSource> CongestionController<T> {
         match self {
             Self::Bbr(c) => c.on_ack_with_token(rtt_sample, bytes_acked, token),
             Self::Ledbat(c) => c.on_ack(rtt_sample, bytes_acked),
+            Self::FixedRate(c) => c.on_ack(rtt_sample, bytes_acked),
+        }
+    }
+
+    /// Returns the configured fixed rate in bytes/sec, or 0 for adaptive algorithms.
+    ///
+    /// This is useful for telemetry to distinguish between fixed-rate transfers
+    /// (where the rate is a configuration choice) and adaptive transfers
+    /// (where the rate adapts to network conditions).
+    pub fn configured_rate(&self) -> usize {
+        match self {
+            Self::Bbr(_) => 0,
+            Self::Ledbat(_) => 0,
+            Self::FixedRate(c) => c.rate(),
         }
     }
 }
@@ -683,20 +820,27 @@ pub enum AlgorithmConfig {
         /// Randomize ssthresh to prevent synchronization.
         randomize_ssthresh: bool,
     },
+    /// Fixed-rate specific configuration.
+    FixedRate {
+        /// Target transmission rate in bytes per second.
+        rate_bytes_per_sec: usize,
+    },
 }
 
 impl Default for CongestionControlConfig {
     fn default() -> Self {
-        // Default to BBR
-        let bbr_config = BbrConfig::default();
+        // Default to FixedRate (25 Mbps) - pragmatic choice while adaptive algorithms are unstable
+        use super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
         Self {
-            algorithm: CongestionControlAlgorithm::Bbr,
-            initial_cwnd: bbr_config.initial_cwnd,
-            min_cwnd: bbr_config.min_cwnd,
-            max_cwnd: bbr_config.max_cwnd,
-            ssthresh: 1_000_000, // Not used by BBR, but keep a reasonable default
+            algorithm: CongestionControlAlgorithm::FixedRate,
+            initial_cwnd: usize::MAX / 2, // Not used by FixedRate
+            min_cwnd: usize::MAX / 2,
+            max_cwnd: usize::MAX / 2,
+            ssthresh: DEFAULT_RATE_BYTES_PER_SEC,
             min_ssthresh: None,
-            algorithm_config: AlgorithmConfig::Bbr,
+            algorithm_config: AlgorithmConfig::FixedRate {
+                rate_bytes_per_sec: DEFAULT_RATE_BYTES_PER_SEC,
+            },
         }
     }
 }
@@ -705,8 +849,34 @@ impl CongestionControlConfig {
     /// Create a new configuration for the specified algorithm with defaults.
     pub fn new(algorithm: CongestionControlAlgorithm) -> Self {
         match algorithm {
-            CongestionControlAlgorithm::Bbr => Self::default(),
+            CongestionControlAlgorithm::Bbr => Self::from_bbr_config(BbrConfig::default()),
             CongestionControlAlgorithm::Ledbat => Self::from_ledbat_config(LedbatConfig::default()),
+            CongestionControlAlgorithm::FixedRate => Self::default(),
+        }
+    }
+
+    /// Create a configuration for fixed-rate with the specified rate in bytes/sec.
+    pub fn fixed_rate(rate_bytes_per_sec: usize) -> Self {
+        Self::from_fixed_rate_config(FixedRateConfig::new(rate_bytes_per_sec))
+    }
+
+    /// Create a configuration for fixed-rate with the specified rate in Mbps.
+    pub fn fixed_rate_mbps(mbps: usize) -> Self {
+        Self::from_fixed_rate_config(FixedRateConfig::from_mbps(mbps))
+    }
+
+    /// Create a configuration from an existing FixedRateConfig.
+    pub fn from_fixed_rate_config(config: FixedRateConfig) -> Self {
+        Self {
+            algorithm: CongestionControlAlgorithm::FixedRate,
+            initial_cwnd: usize::MAX / 2,
+            min_cwnd: usize::MAX / 2,
+            max_cwnd: usize::MAX / 2,
+            ssthresh: config.rate_bytes_per_sec,
+            min_ssthresh: None,
+            algorithm_config: AlgorithmConfig::FixedRate {
+                rate_bytes_per_sec: config.rate_bytes_per_sec,
+            },
         }
     }
 
@@ -859,13 +1029,25 @@ impl CongestionControlConfig {
                     time_source,
                 ))
             }
+            CongestionControlAlgorithm::FixedRate => {
+                let rate = match &self.algorithm_config {
+                    AlgorithmConfig::FixedRate { rate_bytes_per_sec } => *rate_bytes_per_sec,
+                    _ => super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC,
+                };
+
+                let fixed_rate_config = FixedRateConfig::new(rate);
+                CongestionController::FixedRate(FixedRateController::new_with_time_source(
+                    fixed_rate_config,
+                    time_source,
+                ))
+            }
         }
     }
 
     /// Convert to the native LedbatConfig if this is a LEDBAT configuration.
     pub fn as_ledbat_config(&self) -> Option<LedbatConfig> {
         match &self.algorithm_config {
-            AlgorithmConfig::Bbr => None,
+            AlgorithmConfig::Bbr | AlgorithmConfig::FixedRate { .. } => None,
             AlgorithmConfig::Ledbat {
                 enable_slow_start,
                 delay_exit_threshold,
@@ -894,7 +1076,17 @@ impl CongestionControlConfig {
                 max_cwnd: self.max_cwnd,
                 ..Default::default()
             }),
-            AlgorithmConfig::Ledbat { .. } => None,
+            AlgorithmConfig::Ledbat { .. } | AlgorithmConfig::FixedRate { .. } => None,
+        }
+    }
+
+    /// Convert to the native FixedRateConfig if this is a FixedRate configuration.
+    pub fn as_fixed_rate_config(&self) -> Option<FixedRateConfig> {
+        match &self.algorithm_config {
+            AlgorithmConfig::FixedRate { rate_bytes_per_sec } => {
+                Some(FixedRateConfig::new(*rate_bytes_per_sec))
+            }
+            AlgorithmConfig::Bbr | AlgorithmConfig::Ledbat { .. } => None,
         }
     }
 }
@@ -905,14 +1097,27 @@ mod tests {
     use crate::simulation::VirtualTime;
 
     #[test]
-    fn test_default_config_creates_bbr() {
+    fn test_default_config_creates_fixed_rate() {
         let config = CongestionControlConfig::default();
-        assert_eq!(config.algorithm, CongestionControlAlgorithm::Bbr);
+        assert_eq!(config.algorithm, CongestionControlAlgorithm::FixedRate);
+    }
+
+    #[test]
+    fn test_build_fixed_rate_controller() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        assert_eq!(
+            controller.algorithm(),
+            CongestionControlAlgorithm::FixedRate
+        );
+        assert!(controller.current_cwnd() > 0);
+        assert_eq!(controller.flightsize(), 0);
     }
 
     #[test]
     fn test_build_bbr_controller() {
-        let config = CongestionControlConfig::default();
+        let config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
         let controller = config.build();
 
         assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Bbr);
@@ -936,7 +1141,10 @@ mod tests {
 
         // Can be cloned (Arc)
         let _clone = controller.clone();
-        assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Bbr);
+        assert_eq!(
+            controller.algorithm(),
+            CongestionControlAlgorithm::FixedRate
+        );
     }
 
     #[test]
@@ -945,7 +1153,10 @@ mod tests {
         let time_source = VirtualTime::new();
         let controller = config.build_with_time_source(time_source);
 
-        assert_eq!(controller.algorithm(), CongestionControlAlgorithm::Bbr);
+        assert_eq!(
+            controller.algorithm(),
+            CongestionControlAlgorithm::FixedRate
+        );
     }
 
     #[test]
@@ -968,13 +1179,34 @@ mod tests {
         let controller = config.build();
 
         let stats = controller.stats();
-        assert_eq!(stats.algorithm, CongestionControlAlgorithm::Bbr);
+        assert_eq!(stats.algorithm, CongestionControlAlgorithm::FixedRate);
         assert!(stats.cwnd > 0);
     }
 
     #[test]
-    fn test_bbr_specific_stats_access() {
+    fn test_fixed_rate_specific_stats_access() {
         let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        // Access FixedRate-specific stats via method
+        let fixed_rate = controller.as_fixed_rate();
+        assert!(fixed_rate.is_some());
+
+        // Access via pattern matching
+        match &controller {
+            CongestionController::FixedRate(fr) => {
+                assert_eq!(
+                    fr.rate(),
+                    super::super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC
+                );
+            }
+            _ => panic!("Expected FixedRate"),
+        }
+    }
+
+    #[test]
+    fn test_bbr_specific_stats_access() {
+        let config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
         let controller = config.build();
 
         // Access BBR-specific stats via method
@@ -987,7 +1219,7 @@ mod tests {
                 let stats = bbr.stats();
                 assert!(stats.cwnd > 0);
             }
-            CongestionController::Ledbat(_) => panic!("Expected BBR"),
+            _ => panic!("Expected BBR"),
         }
     }
 
@@ -1002,19 +1234,19 @@ mod tests {
 
         // Access via pattern matching
         match &controller {
-            CongestionController::Bbr(_) => panic!("Expected LEDBAT"),
             CongestionController::Ledbat(ledbat) => {
                 let stats = ledbat.stats();
                 assert!(stats.cwnd > 0);
                 // LEDBAT-specific field
                 assert_eq!(stats.periodic_slowdowns, 0);
             }
+            _ => panic!("Expected LEDBAT"),
         }
     }
 
     #[test]
     fn test_as_bbr_accessor() {
-        let config = CongestionControlConfig::default();
+        let config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
         let controller = config.build();
 
         let bbr = controller.as_bbr();
@@ -1030,6 +1262,32 @@ mod tests {
         let ledbat = controller.as_ledbat();
         assert!(ledbat.is_some());
         assert!(ledbat.unwrap().current_cwnd() > 0);
+    }
+
+    #[test]
+    fn test_as_fixed_rate_accessor() {
+        let config = CongestionControlConfig::default();
+        let controller = config.build();
+
+        let fixed_rate = controller.as_fixed_rate();
+        assert!(fixed_rate.is_some());
+        assert_eq!(
+            fixed_rate.unwrap().rate(),
+            super::super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC
+        );
+    }
+
+    #[test]
+    fn test_fixed_rate_mbps_constructor() {
+        let config = CongestionControlConfig::fixed_rate_mbps(50);
+        let controller = config.build();
+
+        assert_eq!(
+            controller.algorithm(),
+            CongestionControlAlgorithm::FixedRate
+        );
+        let fixed_rate = controller.as_fixed_rate().unwrap();
+        assert_eq!(fixed_rate.rate(), 50 * 1_000_000 / 8); // 50 Mbps in bytes/sec
     }
 
     #[test]
@@ -1097,7 +1355,8 @@ mod tests {
 
     #[test]
     fn test_builder_methods() {
-        let config = CongestionControlConfig::default()
+        // Use BBR explicitly since it respects cwnd settings
+        let config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr)
             .with_initial_cwnd(60_000)
             .with_min_cwnd(3_000)
             .with_max_cwnd(2_000_000)
@@ -1222,8 +1481,8 @@ mod tests {
     fn test_bbr_vs_ledbat_timeout_recovery() {
         let time = VirtualTime::new();
 
-        // Create BBR controller (default algorithm)
-        let bbr_config = CongestionControlConfig::default();
+        // Create BBR controller (explicitly request BBR)
+        let bbr_config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
         let bbr = bbr_config.build_with_time_source(time.clone());
 
         // Create LEDBAT controller

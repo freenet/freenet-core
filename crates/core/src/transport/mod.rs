@@ -61,6 +61,7 @@ mod received_packet_tracker;
 
 pub(crate) mod bbr;
 pub mod congestion_control;
+pub(crate) mod fixed_rate;
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
 pub mod metrics;
@@ -85,7 +86,7 @@ use std::time::Duration;
 
 /// Statistics from a completed stream transfer.
 ///
-/// Provides metrics for telemetry including LEDBAT congestion control data.
+/// Provides metrics for telemetry including congestion control data.
 /// Used to emit TransferEvent telemetry when streams complete.
 #[derive(Debug, Clone)]
 pub struct TransferStats {
@@ -95,7 +96,8 @@ pub struct TransferStats {
     pub remote_addr: SocketAddr,
     /// Total bytes transferred.
     pub bytes_transferred: u64,
-    /// Time elapsed from start to completion.
+    /// Time elapsed from start to transmission completion.
+    /// Note: This is when we finished SENDING, not when all ACKs arrived.
     pub elapsed: Duration,
     /// Peak congestion window during transfer (bytes).
     pub peak_cwnd_bytes: u32,
@@ -115,6 +117,13 @@ pub struct TransferStats {
     /// Total retransmission timeouts (RTO events) during transfer.
     /// High values indicate severe congestion or path issues.
     pub total_timeouts: u32,
+    /// Bytes still in flight (sent but not yet ACKed) when transmission completed.
+    /// High values relative to bytes_transferred indicate ACK lag.
+    /// This helps estimate the gap between transmission end and final ACK.
+    pub final_flightsize: u32,
+    /// Configured transmission rate (bytes/sec) for fixed-rate controller.
+    /// Zero for adaptive algorithms (BBR, LEDBAT).
+    pub configured_rate: u32,
 }
 
 impl TransferStats {

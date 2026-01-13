@@ -397,25 +397,33 @@ pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHan
 ///
 /// The entire transport stack (MockSocket delays AND protocol timers) uses VirtualTime,
 /// ensuring consistent timing behavior for benchmarks.
+///
+/// Uses the congestion control algorithm from `FREENET_CONGESTION_ALGO` environment variable
+/// (defaults to BBR for high-throughput benchmarks).
 pub async fn create_peer_pair_with_virtual_time(
     channels: Channels,
     delay: Duration,
     time_source: VirtualTime,
 ) -> PeerPair<VirtualTime> {
-    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_virtual_time(
+    // Use configurable congestion control (defaults to BBR for benchmarks)
+    let config = Some(get_congestion_config());
+
+    let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_congestion_config(
         PacketDropPolicy::ReceiveAll,
         PacketDelayPolicy::Fixed(delay),
         channels.clone(),
         time_source.clone(),
+        config.clone(),
     )
     .await
     .expect("create peer A");
 
-    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_virtual_time(
+    let (peer_b_pub, peer_b, peer_b_addr) = create_mock_peer_with_congestion_config(
         PacketDropPolicy::ReceiveAll,
         PacketDelayPolicy::Fixed(delay),
         channels.clone(),
         time_source,
+        config,
     )
     .await
     .expect("create peer B");
