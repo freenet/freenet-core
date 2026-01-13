@@ -196,8 +196,7 @@ jobs:
         run: |
           cargo test -p freenet --no-default-features --features trace,websocket,redb,simulation_tests \
             --test simulation_integration \
-            --test sim_network \
-            --test turmoil_primitives \
+            --test simulation_smoke \
             -- --test-threads=1
 
   six_peer_regression:

@@ -443,4 +443,36 @@ mod tests {
         assert!(config.crashed_nodes.contains(&addr(3000)));
         assert_eq!(config.node_crash_rate, 0.01);
     }
+
+    #[test]
+    fn test_fault_config_determinism() {
+        let config = FaultConfig::builder().message_loss_rate(0.3).build();
+
+        let rng1 = SimulationRng::new(12345);
+        let rng2 = SimulationRng::new(12345);
+
+        let decisions1: Vec<bool> = (0..100)
+            .map(|_| config.should_drop_message(&rng1))
+            .collect();
+        let decisions2: Vec<bool> = (0..100)
+            .map(|_| config.should_drop_message(&rng2))
+            .collect();
+
+        assert_eq!(
+            decisions1, decisions2,
+            "Fault decisions should be deterministic with same seed"
+        );
+    }
+
+    #[test]
+    fn test_crashed_node_blocks_messages() {
+        let config = FaultConfig::builder().crashed_node(addr(1000)).build();
+        let rng = SimulationRng::new(42);
+
+        // Messages to/from crashed node are blocked
+        assert!(!config.can_deliver(&addr(1000), &addr(2000), 0, &rng));
+        assert!(!config.can_deliver(&addr(2000), &addr(1000), 0, &rng));
+        // Messages between healthy nodes are allowed
+        assert!(config.can_deliver(&addr(2000), &addr(3000), 0, &rng));
+    }
 }
