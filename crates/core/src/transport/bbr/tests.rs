@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use rstest::rstest;
+
 use crate::simulation::VirtualTime;
 
 use super::config::BbrConfig;
@@ -571,31 +573,44 @@ fn test_bbr_adaptive_timeout_floor_with_high_bdp() {
 
 /// Regression test for issue #2697: BBR timeout should preserve bandwidth/RTT estimates.
 ///
-/// On high-latency links (125-250ms RTT), timeouts were causing `on_timeout()` to reset
+/// On high-latency links (125-500ms RTT), timeouts were causing `on_timeout()` to reset
 /// both `bw_filter` and `rtt_tracker`, which cleared all learned state. This caused:
 ///
 /// 1. `max_bw()` returns 0 (bandwidth filter cleared)
 /// 2. `min_rtt()` returns None (RTT tracker reset to u64::MAX)
 /// 3. BDP calculation falls back to initial_cwnd (14KB)
-/// 4. With 250ms RTT and 14KB cwnd → max ~56KB/s throughput
+/// 4. With high RTT and 14KB cwnd → severely limited throughput
 /// 5. Slow recovery triggers more timeouts → death spiral
 ///
 /// The fix (PR #2699) preserves bandwidth and RTT estimates across timeouts since they
 /// represent physical path characteristics that don't change due to timeout.
-#[test]
+///
+/// Parameters:
+/// - `rtt_ms`: RTT in milliseconds (tests intercontinental to satellite links)
+/// - `warmup_rounds`: Number of RTTs to establish bandwidth measurements
+/// - `packets_per_round`: Packets sent per RTT during warmup
+#[rstest]
+#[case::intercontinental_minimal(125, 30, 10)]
+#[case::intercontinental_standard(135, 50, 20)]
+#[case::high_latency_standard(250, 50, 20)]
+#[case::high_latency_extended(250, 100, 30)]
+#[case::satellite_link(500, 50, 20)]
 #[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
-fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
+fn test_issue_2697_timeout_preserves_bandwidth_and_rtt(
+    #[case] rtt_ms: u64,
+    #[case] warmup_rounds: usize,
+    #[case] packets_per_round: usize,
+) {
     let time = VirtualTime::new();
     let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
 
-    // Simulate HIGH_LATENCY conditions: 250ms RTT (intercontinental/satellite link)
-    let rtt = Duration::from_millis(250);
+    let rtt = Duration::from_millis(rtt_ms);
     let packet_size = 1400;
 
     // Phase 1: Establish good bandwidth/RTT measurements
-    for _ in 0..50 {
+    for _ in 0..warmup_rounds {
         let mut tokens = Vec::new();
-        for _ in 0..20 {
+        for _ in 0..packets_per_round {
             tokens.push(controller.on_send(packet_size));
         }
         time.advance(rtt);
@@ -610,11 +625,13 @@ fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
     // Verify we have good measurements before timeout
     assert!(
         pre_timeout_max_bw > 0,
-        "Should have bandwidth measurement before timeout"
+        "[{}ms RTT] Should have bandwidth measurement before timeout",
+        rtt_ms
     );
     assert!(
         pre_timeout_min_rtt.is_some(),
-        "Should have RTT measurement before timeout"
+        "[{}ms RTT] Should have RTT measurement before timeout",
+        rtt_ms
     );
 
     // Phase 2: Trigger timeout (simulates spurious timeout on high-latency link)
@@ -627,13 +644,15 @@ fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
     // These represent physical path characteristics that don't change
     assert!(
         post_timeout_max_bw > 0,
-        "Bandwidth estimate must be preserved across timeout (was {}, now {})",
+        "[{}ms RTT] Bandwidth estimate must be preserved across timeout (was {}, now {})",
+        rtt_ms,
         pre_timeout_max_bw,
         post_timeout_max_bw
     );
     assert!(
         post_timeout_min_rtt.is_some(),
-        "RTT estimate must be preserved across timeout (was {:?}, now {:?})",
+        "[{}ms RTT] RTT estimate must be preserved across timeout (was {:?}, now {:?})",
+        rtt_ms,
         pre_timeout_min_rtt,
         post_timeout_min_rtt
     );
@@ -642,7 +661,8 @@ fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
     let bw_retention = post_timeout_max_bw as f64 / pre_timeout_max_bw as f64;
     assert!(
         bw_retention >= 0.25,
-        "Bandwidth should retain at least 25% after timeout (retained {:.1}%)",
+        "[{}ms RTT] Bandwidth should retain at least 25% after timeout (retained {:.1}%)",
+        rtt_ms,
         bw_retention * 100.0
     );
 }
@@ -650,21 +670,32 @@ fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
 /// Regression test for issue #2697: Repeated timeouts must not wipe bandwidth estimates.
 ///
 /// This simulates a realistic scenario where:
-/// 1. Connection operates on 250ms RTT link
+/// 1. Connection operates on high-latency link
 /// 2. ACK batching + jitter causes spurious timeouts
 /// 3. Each timeout should NOT wipe bandwidth state to 0
 /// 4. Bandwidth estimate should be preserved across each timeout
-#[test]
+///
+/// Parameters:
+/// - `rtt_ms`: RTT in milliseconds
+/// - `timeout_count`: Number of consecutive timeouts to simulate
+#[rstest]
+#[case::intercontinental_3_timeouts(135, 3)]
+#[case::high_latency_5_timeouts(250, 5)]
+#[case::high_latency_10_timeouts(250, 10)]
+#[case::satellite_5_timeouts(500, 5)]
 #[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
-fn test_issue_2697_repeated_timeouts_preserve_bandwidth() {
+fn test_issue_2697_repeated_timeouts_preserve_bandwidth(
+    #[case] rtt_ms: u64,
+    #[case] timeout_count: usize,
+) {
     let time = VirtualTime::new();
     let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
 
-    let rtt = Duration::from_millis(250);
+    let rtt = Duration::from_millis(rtt_ms);
     let packet_size = 1400;
 
-    // Phase 1: Build up good state
-    for _ in 0..30 {
+    // Phase 1: Build up good state with sufficient traffic
+    for _ in 0..50 {
         let mut tokens = Vec::new();
         for _ in 0..20 {
             tokens.push(controller.on_send(packet_size));
@@ -678,18 +709,20 @@ fn test_issue_2697_repeated_timeouts_preserve_bandwidth() {
     let healthy_max_bw = controller.max_bw();
     assert!(
         healthy_max_bw > 0,
-        "Should have healthy bandwidth before storm"
+        "[{}ms RTT] Should have healthy bandwidth before storm",
+        rtt_ms
     );
 
     // Phase 2: Simulate timeout storm - check bandwidth IMMEDIATELY after each timeout
-    for i in 0..5 {
+    for i in 0..timeout_count {
         controller.on_timeout();
 
         // CRITICAL: Check bandwidth immediately after timeout (before any recovery)
         let post_timeout_bw = controller.max_bw();
         assert!(
             post_timeout_bw > 0,
-            "Timeout #{}: Bandwidth must NOT reset to 0 (was {}, now {})",
+            "[{}ms RTT] Timeout #{}: Bandwidth must NOT reset to 0 (was {}, now {})",
+            rtt_ms,
             i + 1,
             healthy_max_bw,
             post_timeout_bw
@@ -707,4 +740,97 @@ fn test_issue_2697_repeated_timeouts_preserve_bandwidth() {
             }
         }
     }
+}
+
+/// Regression test for issue #2697: Large transfers must complete after timeout recovery.
+///
+/// Simulates a realistic large transfer (like the 2.9MB River web interface) on a
+/// high-latency link, with timeouts occurring during the transfer. The transfer
+/// should still complete at reasonable throughput, not degrade to ~1 KB/s.
+///
+/// Parameters:
+/// - `rtt_ms`: RTT in milliseconds
+/// - `transfer_kb`: Transfer size in KB
+#[rstest]
+#[case::river_ui_intercontinental(135, 2900)]
+#[case::river_ui_high_latency(250, 2900)]
+#[case::large_contract_satellite(500, 1024)]
+#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
+fn test_issue_2697_large_transfer_with_timeouts(#[case] rtt_ms: u64, #[case] transfer_kb: usize) {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(rtt_ms);
+    let packet_size = 1400;
+    let transfer_bytes = transfer_kb * 1024;
+
+    // Phase 1: Establish connection with good bandwidth measurements
+    for _ in 0..30 {
+        let mut tokens = Vec::new();
+        for _ in 0..20 {
+            tokens.push(controller.on_send(packet_size));
+        }
+        time.advance(rtt);
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+        }
+    }
+
+    let healthy_max_bw = controller.max_bw();
+    assert!(
+        healthy_max_bw > 0,
+        "Should establish bandwidth before transfer"
+    );
+
+    // Phase 2: Simulate transfer with periodic timeouts (every ~500KB)
+    let mut bytes_transferred = 0usize;
+    let timeout_interval = 500 * 1024; // Timeout every 500KB
+    let mut next_timeout_at = timeout_interval;
+
+    while bytes_transferred < transfer_bytes {
+        // Send a burst
+        let burst_size = 20;
+        let mut tokens = Vec::new();
+        for _ in 0..burst_size {
+            tokens.push(controller.on_send(packet_size));
+        }
+
+        time.advance(rtt);
+
+        // Receive ACKs
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+            bytes_transferred += packet_size;
+        }
+
+        // Inject timeout at intervals
+        if bytes_transferred >= next_timeout_at {
+            controller.on_timeout();
+
+            // CRITICAL: Bandwidth must not collapse to 0
+            let post_timeout_bw = controller.max_bw();
+            assert!(
+                post_timeout_bw > 0,
+                "[{}ms RTT, {}KB transfer] Bandwidth collapsed to 0 at {}KB transferred",
+                rtt_ms,
+                transfer_kb,
+                bytes_transferred / 1024
+            );
+
+            next_timeout_at += timeout_interval;
+        }
+    }
+
+    // Phase 3: Verify final throughput is reasonable
+    let final_bw = controller.max_bw();
+    let final_bw_kbps = final_bw as f64 / 1024.0;
+
+    // Should maintain at least 10 KB/s (much better than the ~1 KB/s bug)
+    assert!(
+        final_bw_kbps >= 10.0,
+        "[{}ms RTT, {}KB transfer] Final bandwidth {:.1} KB/s is too low (bug caused ~1 KB/s)",
+        rtt_ms,
+        transfer_kb,
+        final_bw_kbps
+    );
 }
