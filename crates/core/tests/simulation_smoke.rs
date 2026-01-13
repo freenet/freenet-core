@@ -15,10 +15,29 @@ use freenet::dev_tool::SimNetwork;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Helper to let tokio tasks run for a specified duration.
-/// Unlike advance_time(), this uses real tokio sleeps to drive task execution.
-async fn let_network_run(duration: Duration) {
-    tokio::time::sleep(duration).await;
+/// Helper to let tokio tasks run and process network messages.
+///
+/// SimulationSocket uses VirtualTime internally for message delivery scheduling.
+/// This helper advances VirtualTime in chunks while yielding to tokio to let
+/// tasks process delivered messages. This is necessary because:
+/// 1. Messages are scheduled for delivery at VirtualTime + latency
+/// 2. Tasks need tokio runtime time to process received messages
+///
+/// Note: This is different from run_simulation() which uses Turmoil's scheduler.
+/// These smoke tests run on plain tokio with manual time advancement.
+async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+
+    while elapsed < duration {
+        // Advance virtual time to trigger message delivery
+        sim.advance_time(step);
+        // Yield to tokio so tasks can process delivered messages
+        tokio::task::yield_now().await;
+        // Also give a small real-time sleep for task scheduling
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        elapsed += step;
+    }
 }
 
 // =============================================================================
@@ -55,7 +74,7 @@ async fn test_smoke_event_types_consistency() {
             .await;
 
         // Let tokio tasks run to generate events
-        let_network_run(Duration::from_secs(3)).await;
+        let_network_run(&mut sim, Duration::from_secs(3)).await;
 
         sim.get_event_counts().await
     }
@@ -99,7 +118,7 @@ async fn test_event_summary_ordering() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(3)).await;
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
 
     let summary = sim.get_deterministic_event_summary().await;
 
@@ -152,7 +171,7 @@ async fn test_smoke_small_network() {
     assert_eq!(handles.len(), 3, "Expected 1 gateway + 2 nodes = 3 handles");
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     // Verify we captured events
     let event_counts = sim.get_event_counts().await;
@@ -241,7 +260,7 @@ async fn test_event_state_hash_capture() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(5)).await;
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
 
     // Get event summary and look for state hashes
     let summary = sim.get_deterministic_event_summary().await;
@@ -330,7 +349,7 @@ async fn test_eventual_consistency_state_hashes() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(6)).await;
+    let_network_run(&mut sim, Duration::from_secs(6)).await;
 
     let summary = sim.get_deterministic_event_summary().await;
 
@@ -440,7 +459,7 @@ async fn test_fault_injection_bridge() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(3)).await;
+    let_network_run(&mut sim_normal, Duration::from_secs(3)).await;
 
     let normal_events = sim_normal.get_event_counts().await;
     let normal_total: usize = normal_events.values().sum();
@@ -460,7 +479,7 @@ async fn test_fault_injection_bridge() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(3)).await;
+    let_network_run(&mut sim_lossy, Duration::from_secs(3)).await;
 
     let lossy_events = sim_lossy.get_event_counts().await;
     let lossy_total: usize = lossy_events.values().sum();
@@ -497,7 +516,7 @@ async fn test_partition_injection_bridge() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     let pre_partition = sim.get_event_counts().await;
     let pre_total: usize = pre_partition.values().sum();
@@ -522,7 +541,7 @@ async fn test_partition_injection_bridge() {
     sim.with_fault_injection(fault_config);
 
     // Let tokio tasks run during partition
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     sim.clear_fault_injection();
 
@@ -549,7 +568,7 @@ async fn test_latency_injection() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim_fast, Duration::from_secs(2)).await;
 
     let fast_events = sim_fast.get_event_counts().await;
     let fast_total: usize = fast_events.values().sum();
@@ -568,7 +587,7 @@ async fn test_latency_injection() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim_slow, Duration::from_secs(2)).await;
 
     let slow_events = sim_slow.get_event_counts().await;
     let slow_total: usize = slow_events.values().sum();
@@ -603,7 +622,7 @@ async fn test_node_crash_recovery() {
         .await;
 
     // Let tokio tasks run to generate events
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     // Find a non-gateway node to crash
     let all_addrs = sim.all_node_addresses();
@@ -630,7 +649,7 @@ async fn test_node_crash_recovery() {
     );
 
     // Let some time pass while crashed
-    let_network_run(Duration::from_millis(500)).await;
+    let_network_run(&mut sim, Duration::from_millis(500)).await;
 
     // Recover the node
     let recovered = sim.recover_node(&node_to_crash);
@@ -673,7 +692,7 @@ async fn test_virtual_time_always_enabled() {
         .await;
 
     // Let tokio tasks run
-    let_network_run(Duration::from_secs(1)).await;
+    let_network_run(&mut sim, Duration::from_secs(1)).await;
 
     // VirtualTime is independent of real time in start_with_rand_gen mode
     // Just verify it's accessible after network start
@@ -699,7 +718,7 @@ async fn test_node_restart() {
         .await;
 
     // Let tokio tasks run
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     let all_addrs = sim.all_node_addresses();
     let node_to_restart = all_addrs
@@ -718,7 +737,7 @@ async fn test_node_restart() {
     assert!(crashed);
 
     // Let some time pass while crashed
-    let_network_run(Duration::from_millis(200)).await;
+    let_network_run(&mut sim, Duration::from_millis(200)).await;
 
     let restart_seed = SEED.wrapping_add(0x1000);
     let handle = sim
@@ -733,7 +752,7 @@ async fn test_node_restart() {
     assert_eq!(addr_before, addr_after);
 
     // Let tokio tasks run after restart
-    let_network_run(Duration::from_secs(2)).await;
+    let_network_run(&mut sim, Duration::from_secs(2)).await;
 
     tracing::info!("Node restart test completed successfully");
 }
@@ -757,7 +776,7 @@ async fn test_crash_restart_edge_cases() {
         .await;
 
     // Let tokio tasks run
-    let_network_run(Duration::from_secs(1)).await;
+    let_network_run(&mut sim, Duration::from_secs(1)).await;
 
     // Test with a non-existent node label
     let fake_label: NodeLabel = "node-999".into();
@@ -808,7 +827,7 @@ async fn test_minimal_network() {
     assert_eq!(handles.len(), 2, "Should have exactly 2 nodes");
 
     // Let tokio tasks run
-    let_network_run(Duration::from_secs(1)).await;
+    let_network_run(&mut sim, Duration::from_secs(1)).await;
 
     let all_addrs = sim.all_node_addresses();
     assert_eq!(all_addrs.len(), 2, "Should track 2 node addresses");
