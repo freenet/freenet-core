@@ -487,6 +487,8 @@ mod tests {
             final_ssthresh_bytes: 100000,
             min_ssthresh_floor_bytes: 5696,
             total_timeouts: 0,
+            final_flightsize: 0,
+            configured_rate: 0,
         };
 
         metrics.record_transfer_completed(&stats);
@@ -514,6 +516,8 @@ mod tests {
             final_ssthresh_bytes: 100000,
             min_ssthresh_floor_bytes: 5696,
             total_timeouts: 0,
+            final_flightsize: 0,
+            configured_rate: 0,
         };
 
         metrics.record_transfer_completed(&stats);
@@ -540,6 +544,8 @@ mod tests {
                 final_ssthresh_bytes: 100000,
                 min_ssthresh_floor_bytes: 5696,
                 total_timeouts: 0,
+                final_flightsize: 0,
+                configured_rate: 0,
             };
             metrics.record_transfer_completed(&stats);
         }

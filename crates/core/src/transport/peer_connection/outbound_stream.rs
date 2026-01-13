@@ -254,6 +254,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
         total_timeouts: generic_stats.total_timeouts as u32,
+        final_flightsize: generic_stats.flightsize as u32,
+        configured_rate: congestion_controller.configured_rate() as u32,
     })
 }
 

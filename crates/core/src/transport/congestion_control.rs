@@ -748,6 +748,19 @@ impl<T: TimeSource> CongestionController<T> {
             Self::FixedRate(c) => c.on_ack(rtt_sample, bytes_acked),
         }
     }
+
+    /// Returns the configured fixed rate in bytes/sec, or 0 for adaptive algorithms.
+    ///
+    /// This is useful for telemetry to distinguish between fixed-rate transfers
+    /// (where the rate is a configuration choice) and adaptive transfers
+    /// (where the rate adapts to network conditions).
+    pub fn configured_rate(&self) -> usize {
+        match self {
+            Self::Bbr(_) => 0,
+            Self::Ledbat(_) => 0,
+            Self::FixedRate(c) => c.rate(),
+        }
+    }
 }
 
 // =============================================================================
