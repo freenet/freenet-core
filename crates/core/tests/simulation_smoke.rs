@@ -6,10 +6,7 @@
 //!
 //! For deterministic tests that use Turmoil, see `simulation_integration.rs`.
 //!
-//! These tests can run in parallel (no global state conflicts).
-//! Enable with: cargo test -p freenet --features simulation_tests --test simulation_smoke
-
-#![cfg(feature = "simulation_tests")]
+//! These tests can run in parallel in CI (no Turmoil global state conflicts).
 
 use freenet::dev_tool::SimNetwork;
 use std::collections::HashMap;
