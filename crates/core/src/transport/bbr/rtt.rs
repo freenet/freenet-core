@@ -184,11 +184,10 @@ impl RttTracker {
         self.next_probe_rtt_nanos.store(next, Ordering::Release);
     }
 
-    /// Reset min_rtt to unknown state (e.g., after a timeout).
-    pub(crate) fn reset_min_rtt(&self) {
-        self.min_rtt_nanos.store(u64::MAX, Ordering::Release);
-        self.min_rtt_stamp_nanos.store(0, Ordering::Release);
-    }
+    // NOTE: reset_min_rtt() was removed because it caused a "death spiral" on
+    // high-latency links. Resetting min_rtt to u64::MAX makes compute_bdp()
+    // return only initial_cwnd (14KB), which is too small for high-latency
+    // transfers. See issue #2682.
 }
 
 impl Default for RttTracker {
