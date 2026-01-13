@@ -626,8 +626,13 @@ struct UpdateContract {
 
 #[derive(Debug)]
 pub(crate) enum UpsertResult {
+    /// The incoming state was identical to the current state (same hash).
     NoChange,
+    /// The incoming state won the CRDT merge and is now stored.
     Updated(WrappedState),
+    /// The current state won the CRDT merge - incoming was rejected.
+    /// Contains the winning current state which should be propagated.
+    CurrentWon(WrappedState),
 }
 
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {

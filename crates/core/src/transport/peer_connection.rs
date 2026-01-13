@@ -34,6 +34,7 @@ pub mod streaming_buffer;
 pub(crate) mod streaming_buffer;
 
 use super::{
+    bbr::DeliveryRateToken,
     congestion_control::{CongestionControl, CongestionController},
     connection_handler::SerializedMessage,
     global_bandwidth::GlobalBandwidthManager,
@@ -676,14 +677,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         .lock()
                         .report_received_receipts(&confirm_receipt);
 
-                    // Feed ACK info to BBR for congestion window adjustment
+                    // Feed ACK info to congestion controller for window adjustment
                     // All ACKs decrement flightsize, but only non-retransmitted packets
                     // update RTT estimation (Karn's algorithm)
-                    for (rtt_sample_opt, packet_size) in ack_info {
+                    // For BBR: passing the delivery token enables accurate bandwidth estimation
+                    for (rtt_sample_opt, packet_size, token) in ack_info {
                         match rtt_sample_opt {
                             Some(rtt_sample) => {
                                 // Normal packet: full RTT processing + flightsize decrement
-                                self.remote_conn.congestion_controller.on_ack(rtt_sample, packet_size);
+                                // For BBR: token enables accurate delivery rate computation
+                                self.remote_conn.congestion_controller.on_ack_with_token(
+                                    rtt_sample,
+                                    packet_size,
+                                    token,
+                                );
                             }
                             None => {
                                 // Retransmitted packet: only decrement flightsize (no RTT update)
@@ -1158,6 +1165,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     #[inline]
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
+        // Get token before sending (captures send-time state for BBR)
+        // Estimate noop packet size (~50 bytes typically)
+        let token = self
+            .remote_conn
+            .congestion_controller
+            .on_send_with_token(50);
         packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
@@ -1168,6 +1181,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             receipts,
             (),
             &self.remote_conn.sent_tracker,
+            token,
         )
         .await
     }
@@ -1211,6 +1225,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .remote_conn
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Get token before sending (captures send-time state for BBR)
+        // Use actual data length plus overhead estimate
+        let packet_size = data.len() + 40; // ShortMessage header overhead
+        let token = self
+            .remote_conn
+            .congestion_controller
+            .on_send_with_token(packet_size);
         packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
@@ -1219,6 +1240,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             receipts,
             symmetric_message::ShortMessage(data.into()),
             &self.remote_conn.sent_tracker,
+            token,
         )
         .await?;
         Ok(())
@@ -1324,6 +1346,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
 
+        // Get token before sending (captures send-time state for BBR)
+        // This also updates the congestion controller's flightsize
+        let token = self
+            .remote_conn
+            .congestion_controller
+            .on_send_with_token(packet_size);
+
         // Send the fragment
         packet_sending(
             self.remote_conn.remote_addr,
@@ -1338,11 +1367,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 payload: fragment.payload,
             },
             &self.remote_conn.sent_tracker,
+            token,
         )
         .await?;
-
-        // Track for congestion controller
-        self.remote_conn.congestion_controller.on_send(packet_size);
 
         tracing::trace!(
             stream_id = %fragment.stream_id.0,
@@ -1355,6 +1382,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
     socket: &Arc<S>,
@@ -1363,6 +1391,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     confirm_receipt: Vec<u32>,
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    delivery_token: Option<DeliveryRateToken>,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -1395,9 +1424,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         elapsed_ms = elapsed.as_millis(),
                         "Successfully sent packet"
                     );
-                    sent_tracker
-                        .lock()
-                        .report_sent_packet(packet_id, packet_data);
+                    sent_tracker.lock().report_sent_packet_with_token(
+                        packet_id,
+                        packet_data,
+                        delivery_token,
+                    );
                     Ok(())
                 }
                 Err(e) => {
@@ -1425,9 +1456,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                             .send_to(&packet_data, remote_addr)
                             .await
                             .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
-                        sent_tracker
-                            .lock()
-                            .report_sent_packet(packet_id, packet_data);
+                        sent_tracker.lock().report_sent_packet_with_token(
+                            packet_id,
+                            packet_data,
+                            delivery_token,
+                        );
                     }
                 }};
             }
@@ -1737,6 +1770,7 @@ mod tests {
             message: ProximityCacheMessage::CacheAnnounce {
                 added: vec![ContractInstanceId::new([1u8; 32])],
                 removed: vec![],
+                is_response: false,
             },
         });
         assert_fast_serialize("ProximityCacheMessage", &cache_msg);
@@ -1802,7 +1836,7 @@ mod tests {
         assert_eq!(ack_info.len(), 3, "Should have 3 ACK entries");
 
         // All 3 should have RTT samples (not retransmitted)
-        for (rtt_opt, size) in &ack_info {
+        for (rtt_opt, size, _token) in &ack_info {
             assert!(
                 rtt_opt.is_some(),
                 "Non-retransmitted packets should have RTT samples"
@@ -1811,7 +1845,7 @@ mod tests {
         }
 
         // Apply ACKs to BBR - this should decrement flightsize
-        for (rtt_opt, size) in ack_info {
+        for (rtt_opt, size, _token) in ack_info {
             match rtt_opt {
                 Some(rtt) => congestion.on_ack(rtt, size),
                 None => congestion.on_ack_without_rtt(size),
@@ -1842,7 +1876,7 @@ mod tests {
         );
 
         // THIS IS THE KEY TEST: Retransmitted packet should return size but NO RTT
-        let (rtt_opt, size) = &ack_info[0];
+        let (rtt_opt, size, _token) = &ack_info[0];
         assert!(
             rtt_opt.is_none(),
             "Retransmitted packets should NOT have RTT samples (Karn's algorithm)"
@@ -1853,7 +1887,7 @@ mod tests {
         );
 
         // Apply the ACK - should call on_ack_without_rtt, NOT skip the call entirely
-        for (rtt_opt, size) in ack_info {
+        for (rtt_opt, size, _token) in ack_info {
             match rtt_opt {
                 Some(rtt) => congestion.on_ack(rtt, size),
                 None => congestion.on_ack_without_rtt(size),
@@ -1869,7 +1903,7 @@ mod tests {
 
         // Also ACK the last packet (4) to verify normal flow still works
         let (ack_info, _) = tracker.report_received_receipts(&[4]);
-        for (rtt_opt, size) in ack_info {
+        for (rtt_opt, size, _token) in ack_info {
             match rtt_opt {
                 Some(rtt) => congestion.on_ack(rtt, size),
                 None => congestion.on_ack_without_rtt(size),

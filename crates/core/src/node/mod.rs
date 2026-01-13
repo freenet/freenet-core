@@ -1397,7 +1397,9 @@ async fn handle_interest_sync_message(
                 })
                 .await
             {
-                Ok(ContractHandlerEvent::UpdateResponse { new_value: Ok(_) }) => {
+                Ok(ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(_), ..
+                }) => {
                     tracing::debug!(contract = %key, "ResyncResponse state applied successfully");
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {

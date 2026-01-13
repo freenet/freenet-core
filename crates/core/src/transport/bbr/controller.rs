@@ -124,6 +124,12 @@ pub struct BbrController<T: TimeSource = RealTime> {
     /// Number of timeouts.
     timeouts: AtomicU64,
 
+    // === Adaptive Timeout Floor ===
+    /// Maximum BDP ever observed (for adaptive timeout floor).
+    /// Unlike other estimates that get reset on timeout, this persists
+    /// to provide a floor for cwnd recovery after spurious timeouts.
+    max_bdp_seen: AtomicUsize,
+
     // === Time Source ===
     time_source: T,
 
@@ -170,6 +176,7 @@ impl<T: TimeSource> BbrController<T> {
             last_round_for_loss: AtomicU64::new(0),
             probe_rtt_rounds: AtomicU64::new(0),
             timeouts: AtomicU64::new(0),
+            max_bdp_seen: AtomicUsize::new(0),
             time_source,
             epoch_nanos,
         }
@@ -196,6 +203,26 @@ impl<T: TimeSource> BbrController<T> {
     pub fn on_send(&self, bytes: usize) -> DeliveryRateToken {
         let now = self.now_nanos();
         let inflight = self.flightsize.fetch_add(bytes, Ordering::AcqRel);
+
+        // Handle cold start: if we have no valid bandwidth samples, ensure we
+        // can still send at a reasonable rate. This happens when:
+        // 1. Connection just started (no data transferred yet)
+        // 2. Bandwidth samples expired (idle too long with only keepalive traffic)
+        //
+        // Note: Keepalive packets are filtered from bandwidth estimation (see on_ack),
+        // so the filter stays empty during idle periods rather than filling with
+        // misleadingly low samples.
+        if !self.bw_filter.has_samples(now) {
+            // No valid bandwidth samples - ensure pacing rate allows probing.
+            // Initial rate of 1 MB/s is aggressive enough to discover real bandwidth
+            // while not overwhelming the network.
+            const INITIAL_PACING_RATE: u64 = 1_000_000;
+            let current_rate = self.pacing_rate.load(Ordering::Acquire);
+            if current_rate < INITIAL_PACING_RATE {
+                self.pacing_rate
+                    .store(INITIAL_PACING_RATE, Ordering::Release);
+            }
+        }
 
         // We're NOT application-limited when actively sending
         // The caller should call set_app_limited(true) when there's no more data to send
@@ -262,8 +289,16 @@ impl<T: TimeSource> BbrController<T> {
 
         // Update bandwidth filter
         if let Some(rate) = delivery_rate {
-            // Only update if not application-limited
-            if !self.delivery_sampler.is_app_limited() {
+            // Only update bandwidth filter for significant data transfers.
+            // Keepalive packets (~27-50 bytes) produce misleadingly low bandwidth
+            // samples that can pollute the filter and cause pacing to throttle
+            // real data transfers to keepalive rates (~270 B/s).
+            //
+            // Threshold: 100 bytes covers keepalives while allowing small
+            // control messages to still be excluded from bandwidth estimation.
+            const MIN_BYTES_FOR_BW_SAMPLE: usize = 100;
+
+            if bytes_acked >= MIN_BYTES_FOR_BW_SAMPLE && !self.delivery_sampler.is_app_limited() {
                 self.bw_filter.update(rate, now);
             }
         }
@@ -332,16 +367,29 @@ impl<T: TimeSource> BbrController<T> {
     }
 
     /// Called on retransmission timeout.
+    ///
+    /// Unlike the original aggressive reset, we now use an adaptive floor based on
+    /// the maximum BDP ever observed. This prevents "timeout storms" where spurious
+    /// timeouts (caused by high latency + ACK batching delay) would completely reset
+    /// state, making recovery impossible.
+    ///
+    /// See: v0.1.92 regression where MIN_RTO=200ms < RTT+ACK_DELAY=244ms caused
+    /// 935 timeouts in 10 seconds on intercontinental connections.
     pub fn on_timeout(&self) {
         self.timeouts.fetch_add(1, Ordering::AcqRel);
+
+        let old_cwnd = self.cwnd.load(Ordering::Acquire);
 
         // Reset to Startup
         self.state.enter_startup();
         self.full_bw_count.store(0, Ordering::Release);
         self.full_bw.store(0, Ordering::Release);
 
-        // Reset cwnd to initial value
-        self.cwnd.store(self.config.initial_cwnd, Ordering::Release);
+        // Calculate adaptive floor based on max BDP ever seen.
+        // Use 1/4 of max BDP as minimum cwnd (similar to LEDBAT's approach).
+        let max_bdp = self.max_bdp_seen.load(Ordering::Acquire);
+        let adaptive_min = (max_bdp / 4).max(self.config.initial_cwnd);
+        self.cwnd.store(adaptive_min, Ordering::Release);
 
         // Reset bandwidth bounds and filter (estimates may be stale after timeout)
         self.bw_hi.store(u64::MAX, Ordering::Release);
@@ -352,6 +400,15 @@ impl<T: TimeSource> BbrController<T> {
 
         // Reset RTT tracker (min_rtt may be stale)
         self.rtt_tracker.reset_min_rtt();
+
+        if old_cwnd != adaptive_min {
+            tracing::warn!(
+                old_cwnd_kb = old_cwnd / 1024,
+                new_cwnd_kb = adaptive_min / 1024,
+                max_bdp_kb = max_bdp / 1024,
+                "BBR timeout - reset to adaptive floor, entering Startup"
+            );
+        }
     }
 
     /// Get the current congestion window in bytes.
@@ -384,6 +441,11 @@ impl<T: TimeSource> BbrController<T> {
         self.compute_bdp()
     }
 
+    /// Get the maximum BDP ever observed (for adaptive timeout floor).
+    pub fn max_bdp_seen(&self) -> usize {
+        self.max_bdp_seen.load(Ordering::Acquire)
+    }
+
     /// Get current BBR state.
     pub fn state(&self) -> BbrState {
         self.state.load()
@@ -408,6 +470,7 @@ impl<T: TimeSource> BbrController<T> {
             full_bw: self.full_bw.load(Ordering::Acquire),
             probe_rtt_rounds: self.probe_rtt_rounds.load(Ordering::Acquire),
             timeouts: self.timeouts.load(Ordering::Acquire),
+            max_bdp_seen: self.max_bdp_seen.load(Ordering::Acquire),
             is_app_limited: self.delivery_sampler.is_app_limited(),
             pacing_gain: self.current_pacing_gain(),
             cwnd_gain: self.current_cwnd_gain(),
@@ -564,6 +627,10 @@ impl<T: TimeSource> BbrController<T> {
         let bdp = self.compute_bdp();
         let cwnd_gain = self.current_cwnd_gain();
         let pacing_gain = self.current_pacing_gain();
+
+        // Update max_bdp_seen for adaptive timeout floor.
+        // This persists across timeouts to prevent cwnd collapse.
+        let _ = self.max_bdp_seen.fetch_max(bdp, Ordering::AcqRel);
 
         // Compute target cwnd
         let mut target_cwnd = (bdp as f64 * cwnd_gain) as usize;

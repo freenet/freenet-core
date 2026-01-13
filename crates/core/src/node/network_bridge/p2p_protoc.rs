@@ -79,6 +79,7 @@ type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
+    #[allow(dead_code)]
     accepted_peers: Arc<DashSet<SocketAddr>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
@@ -1697,6 +1698,174 @@ impl P2pConnManager {
                                     .send_prune_notifications(result.prune_notifications)
                                     .await;
                             }
+                            NodeEvent::BroadcastStateChange { key, new_state } => {
+                                // Automatic network peer notification when state changes
+                                tracing::debug!(
+                                    contract = %key,
+                                    state_size = new_state.size(),
+                                    "BroadcastStateChange event received"
+                                );
+                                let self_addr = op_manager.ring.connection_manager.get_own_addr();
+                                let Some(self_addr) = self_addr else {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        "Cannot broadcast state change - no own address"
+                                    );
+                                    continue;
+                                };
+
+                                let targets =
+                                    op_manager.get_broadcast_targets_update(&key, &self_addr);
+                                tracing::debug!(
+                                    contract = %key,
+                                    target_count = targets.len(),
+                                    self_addr = %self_addr,
+                                    "BroadcastStateChange: found targets"
+                                );
+
+                                // If no direct targets (not part of subscription tree), fall back
+                                // to ring-based routing to find a peer that might cache this contract.
+                                // This ensures newly-stored contracts reach the subscription tree.
+                                let targets = if targets.is_empty() {
+                                    if let Some(fallback_target) = op_manager
+                                        .ring
+                                        .closest_potentially_caching(&key, [self_addr].as_slice())
+                                    {
+                                        if let Some(addr) = fallback_target.socket_addr() {
+                                            tracing::debug!(
+                                                contract = %key,
+                                                fallback_peer = %addr,
+                                                "BroadcastStateChange: Using ring-based fallback target"
+                                            );
+                                            vec![fallback_target]
+                                        } else {
+                                            tracing::debug!(
+                                                contract = %key,
+                                                "BroadcastStateChange: No targets and no fallback - skipping"
+                                            );
+                                            continue;
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            contract = %key,
+                                            "BroadcastStateChange: No targets and no fallback - skipping"
+                                        );
+                                        continue;
+                                    }
+                                } else {
+                                    targets
+                                };
+
+                                // Get our summary once for all targets
+                                let our_summary = op_manager
+                                    .interest_manager
+                                    .get_contract_summary(&op_manager, &key)
+                                    .await;
+
+                                let update_tx = crate::message::Transaction::new::<
+                                    crate::operations::update::UpdateMsg,
+                                >();
+
+                                tracing::debug!(
+                                    tx = %update_tx,
+                                    contract = %key,
+                                    target_count = targets.len(),
+                                    "Broadcasting state change to network peers"
+                                );
+
+                                for target in targets {
+                                    let Some(peer_addr) = target.socket_addr() else {
+                                        continue;
+                                    };
+
+                                    let peer_key =
+                                        crate::ring::PeerKey::from(target.pub_key().clone());
+
+                                    // Get peer's cached summary
+                                    let their_summary = op_manager
+                                        .interest_manager
+                                        .get_peer_summary(&key, &peer_key);
+
+                                    // Skip if summaries are equal (no change to send)
+                                    if let (Some(ours), Some(theirs)) =
+                                        (&our_summary, &their_summary)
+                                    {
+                                        if ours.as_ref() == theirs.as_ref() {
+                                            tracing::trace!(
+                                                contract = %key,
+                                                peer = %peer_addr,
+                                                "Skipping broadcast - peer already has our state"
+                                            );
+                                            continue;
+                                        }
+                                    }
+
+                                    // Compute delta if we have their summary (uses memoization cache)
+                                    let payload = match (&our_summary, &their_summary) {
+                                        (Some(ours), Some(theirs)) => {
+                                            match op_manager
+                                                .interest_manager
+                                                .compute_delta(
+                                                    &op_manager,
+                                                    &key,
+                                                    theirs,
+                                                    ours,
+                                                    new_state.size(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(delta) => {
+                                                    crate::message::DeltaOrFullState::Delta(
+                                                        delta.as_ref().to_vec(),
+                                                    )
+                                                }
+                                                Err(err) => {
+                                                    tracing::debug!(
+                                                        contract = %key,
+                                                        error = %err,
+                                                        "Delta computation failed, falling back to full state"
+                                                    );
+                                                    crate::message::DeltaOrFullState::FullState(
+                                                        new_state.as_ref().to_vec(),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        _ => crate::message::DeltaOrFullState::FullState(
+                                            new_state.as_ref().to_vec(),
+                                        ),
+                                    };
+
+                                    let msg = crate::operations::update::UpdateMsg::BroadcastTo {
+                                        id: update_tx,
+                                        key,
+                                        payload,
+                                        // Include our summary so peer doesn't echo back
+                                        sender_summary_bytes: our_summary
+                                            .as_ref()
+                                            .map(|s| s.as_ref().to_vec())
+                                            .unwrap_or_default(),
+                                    };
+
+                                    if let Err(err) = ctx.bridge.send(peer_addr, msg.into()).await {
+                                        tracing::warn!(
+                                            tx = %update_tx,
+                                            peer = %peer_addr,
+                                            error = %err,
+                                            "Failed to send state change broadcast"
+                                        );
+                                    } else {
+                                        // Update cached summary for successful send
+                                        if let Some(summary) = &our_summary {
+                                            op_manager.interest_manager.update_peer_summary(
+                                                &key,
+                                                &peer_key,
+                                                Some(summary.clone()),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         },
                     }
                 }
@@ -2745,34 +2914,53 @@ impl P2pConnManager {
                 }
             } else {
                 // Not promoting to ring - either unknown identity or transient on non-gateway.
-                // These connections don't go through should_accept() so there's no pending
-                // reservation. Compute location from address directly.
-                let loc = Location::from_address(&peer_addr);
-                connection_manager.try_register_transient(peer_addr, Some(loc));
-                tracing::info!(
-                    peer_id = ?peer_id,
-                    %peer_addr,
-                    "Registered transient connection (not added to ring topology)"
-                );
-                let ttl = connection_manager.transient_ttl();
-                let drop_tx = self.bridge.ev_listener_tx.clone();
-                let cm = connection_manager.clone();
-                GlobalExecutor::spawn(async move {
-                    sleep(ttl).await;
-                    if cm.drop_transient(peer_addr).is_some() {
-                        tracing::info!(%peer_addr, "Transient connection expired; dropping");
-                        if let Err(err) = drop_tx
-                            .send(Right(NodeEvent::DropConnection(peer_addr)))
-                            .await
-                        {
-                            tracing::warn!(
-                                %peer_addr,
-                                ?err,
-                                "Failed to dispatch DropConnection for expired transient"
-                            );
+                //
+                // IMPORTANT: Before registering as transient, check if the connection was already
+                // promoted to ring by another code path (e.g., handle_connect_peer running during
+                // our yield_now().await or callback sends). This prevents a race condition where:
+                // 1. We start with peer_id=None, so promote_to_ring=false
+                // 2. We yield at yield_now().await or cb.send_result().await
+                // 3. Message arrives, handle_connect_peer promotes connection to ring
+                // 4. We resume and would register as transient (re-inserting a dropped entry)
+                // 5. TTL timer fires and removes the connection from ring!
+                //
+                // By checking has_connection_or_pending, we skip transient registration if the
+                // connection was already promoted to ring during our await points.
+                if connection_manager.has_connection_or_pending(peer_addr) {
+                    tracing::debug!(
+                        %peer_addr,
+                        "Skipping transient registration - connection already in ring topology"
+                    );
+                } else {
+                    // These connections don't go through should_accept() so there's no pending
+                    // reservation. Compute location from address directly.
+                    let loc = Location::from_address(&peer_addr);
+                    connection_manager.try_register_transient(peer_addr, Some(loc));
+                    tracing::info!(
+                        peer_id = ?peer_id,
+                        %peer_addr,
+                        "Registered transient connection (not added to ring topology)"
+                    );
+                    let ttl = connection_manager.transient_ttl();
+                    let drop_tx = self.bridge.ev_listener_tx.clone();
+                    let cm = connection_manager.clone();
+                    GlobalExecutor::spawn(async move {
+                        sleep(ttl).await;
+                        if cm.drop_transient(peer_addr).is_some() {
+                            tracing::info!(%peer_addr, "Transient connection expired; dropping");
+                            if let Err(err) = drop_tx
+                                .send(Right(NodeEvent::DropConnection(peer_addr)))
+                                .await
+                            {
+                                tracing::warn!(
+                                    %peer_addr,
+                                    ?err,
+                                    "Failed to dispatch DropConnection for expired transient"
+                                );
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.

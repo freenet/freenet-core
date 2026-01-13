@@ -912,6 +912,22 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 }
                                 self.last_asym_attempt.insert(remote_addr, now_nanos);
 
+                                // Issue #2684: Verify packet is actually an intro packet before attempting
+                                // asymmetric decryption. When a connection closes, subsequent symmetric
+                                // packets may arrive before the rate limit expires. Without this check,
+                                // these packets would be passed to gateway_connection() which expects
+                                // PACKET_TYPE_INTRO (0x01) but receives PACKET_TYPE_SYMMETRIC (0x02),
+                                // causing "invalid packet type" errors in the decrypt function.
+                                if !packet_data.is_intro_packet() {
+                                    tracing::trace!(
+                                        peer_addr = %remote_addr,
+                                        direction = "inbound",
+                                        packet_type = ?packet_data.packet_type(),
+                                        "Dropping non-intro packet from unknown address (likely from closed connection)"
+                                    );
+                                    continue;
+                                }
+
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                                 let task = GlobalExecutor::spawn(gw_ongoing_connection

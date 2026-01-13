@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
 
+use super::bbr::DeliveryRateToken;
 use super::bbr::{BbrConfig, BbrController, BbrStats};
 use super::ledbat::{LedbatConfig, LedbatController, LedbatStats};
 
@@ -585,6 +586,42 @@ impl<T: TimeSource> CongestionController<T> {
         match self {
             Self::Bbr(_) => None,
             Self::Ledbat(c) => Some(c),
+        }
+    }
+
+    /// Called when a packet is sent. Returns a delivery rate token for BBR.
+    ///
+    /// For BBR, the returned token must be stored with the sent packet and passed
+    /// to `on_ack_with_token` when the ACK arrives. This enables accurate delivery
+    /// rate estimation, which is critical for BBR's bandwidth probing.
+    ///
+    /// For LEDBAT, returns None (LEDBAT doesn't use per-packet tokens).
+    pub fn on_send_with_token(&self, bytes: usize) -> Option<DeliveryRateToken> {
+        match self {
+            Self::Bbr(c) => Some(c.on_send(bytes)),
+            Self::Ledbat(c) => {
+                c.on_send(bytes);
+                None
+            }
+        }
+    }
+
+    /// Called when an ACK is received, with optional delivery rate token.
+    ///
+    /// For BBR, passing the token from the original send enables accurate delivery
+    /// rate computation. Without the token, BBR falls back to a per-packet estimate
+    /// (bytes_acked / rtt) which is less accurate and can cause cwnd to stall.
+    ///
+    /// For LEDBAT, the token is ignored (LEDBAT uses delay-based estimation).
+    pub fn on_ack_with_token(
+        &self,
+        rtt_sample: Duration,
+        bytes_acked: usize,
+        token: Option<DeliveryRateToken>,
+    ) {
+        match self {
+            Self::Bbr(c) => c.on_ack_with_token(rtt_sample, bytes_acked, token),
+            Self::Ledbat(c) => c.on_ack(rtt_sample, bytes_acked),
         }
     }
 }
@@ -1171,5 +1208,80 @@ mod tests {
         // Should handle edge cases gracefully
         let bandwidth = stats.effective_bandwidth(Duration::from_nanos(1));
         assert_eq!(bandwidth, 0); // 0 / small_rtt = 0
+    }
+
+    /// Regression test: BBR's complete state reset on timeout vs LEDBAT's adaptive behavior.
+    ///
+    /// This test documents the behavioral difference that causes BBR to suffer "timeout storms"
+    /// on high-latency networks (935 timeouts in 10s observed in production).
+    ///
+    /// Key issue: BBR resets ALL state on timeout (cwnd, bandwidth estimates, min_rtt),
+    /// which means it cannot recover in scenarios where spurious timeouts keep occurring.
+    /// LEDBAT maintains an adaptive floor based on past measurements.
+    #[test]
+    fn test_bbr_vs_ledbat_timeout_recovery() {
+        let time = VirtualTime::new();
+
+        // Create BBR controller (default algorithm)
+        let bbr_config = CongestionControlConfig::default();
+        let bbr = bbr_config.build_with_time_source(time.clone());
+
+        // Create LEDBAT controller
+        let ledbat_config = CongestionControlConfig::new(CongestionControlAlgorithm::Ledbat);
+        let ledbat = ledbat_config.build_with_time_source(time.clone());
+
+        // BBR's initial_cwnd (10 * MSS)
+        let bbr_initial = BbrConfig::default().initial_cwnd;
+
+        // Simulate traffic to build up state, then trigger repeated timeouts
+        // This simulates the "timeout storm" seen in production
+
+        // Phase 1: Build up cwnd with normal traffic
+        for _ in 0..50 {
+            for _ in 0..20 {
+                bbr.on_send(1400);
+                ledbat.on_send(1400);
+            }
+            time.advance(Duration::from_millis(50));
+            for _ in 0..20 {
+                bbr.on_ack(Duration::from_millis(50), 1400);
+                ledbat.on_ack(Duration::from_millis(50), 1400);
+            }
+        }
+
+        let ledbat_cwnd_after_warmup = ledbat.current_cwnd();
+
+        // LEDBAT should have grown significantly
+        assert!(
+            ledbat_cwnd_after_warmup > 100_000,
+            "LEDBAT cwnd ({}) should have grown significantly during warmup",
+            ledbat_cwnd_after_warmup
+        );
+
+        // Phase 2: Simulate "timeout storm" - 10 consecutive timeouts
+        for _ in 0..10 {
+            bbr.on_timeout();
+            ledbat.on_timeout();
+
+            // BBR always resets to initial_cwnd - no memory of past state
+            assert_eq!(
+                bbr.current_cwnd(),
+                bbr_initial,
+                "BBR should reset to initial_cwnd on every timeout"
+            );
+        }
+
+        // BBR is stuck at initial_cwnd after timeout storm
+        assert_eq!(
+            bbr.current_cwnd(),
+            bbr_initial,
+            "BBR remains stuck at initial_cwnd after timeout storm"
+        );
+
+        // LEDBAT maintains higher cwnd through its adaptive floor
+        assert!(
+            ledbat.current_cwnd() > bbr.current_cwnd(),
+            "LEDBAT should maintain higher cwnd than BBR after timeout storm"
+        );
     }
 }

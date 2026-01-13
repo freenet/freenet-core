@@ -2146,10 +2146,14 @@ pub(crate) mod test {
                                 contract: contract.clone(),
                                 state: WrappedState::new(self.random_byte_vec()),
                                 related_contracts: RelatedContracts::new(),
-                                subscribe: false,
+                                // Subscribe to ensure this peer joins the subscription tree
+                                // and can receive/propagate updates
+                                subscribe: true,
                             };
 
-                            tracing::debug!("sending put to an existing contract");
+                            tracing::debug!(
+                                "sending put to an existing contract with subscribe=true"
+                            );
 
                             return Some(request.into());
                         }

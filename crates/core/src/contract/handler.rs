@@ -486,6 +486,8 @@ pub(crate) enum ContractHandlerEvent {
     /// The response to an update query
     UpdateResponse {
         new_value: Result<WrappedState, ExecutorError>,
+        /// True if the stored state actually changed after the merge.
+        state_changed: bool,
     },
     // The response to an update query where the state has not changed
     UpdateNoChange {
@@ -592,7 +594,7 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::UpdateQuery { key, .. } => {
                 write!(f, "update query {{ {key} }}")
             }
-            ContractHandlerEvent::UpdateResponse { new_value } => match new_value {
+            ContractHandlerEvent::UpdateResponse { new_value, .. } => match new_value {
                 Ok(v) => {
                     write!(f, "update query response {{ {v} }}",)
                 }

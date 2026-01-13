@@ -1,4 +1,5 @@
 use super::*;
+use crate::message::NodeEvent;
 use crate::node::OpManager;
 use crate::wasm_runtime::{InMemoryContractStore, MockStateStorage, StateStorage};
 use std::sync::Arc;
@@ -103,6 +104,31 @@ where
     ) -> Response {
         unreachable!("MockRuntime does not handle client requests directly")
     }
+
+    /// Emit BroadcastStateChange to notify network peers of state change.
+    /// Called when state is updated or when our state wins a CRDT merge.
+    async fn broadcast_state_change(&self, key: ContractKey, state: &WrappedState) {
+        if let Some(op_manager) = &self.op_manager {
+            tracing::debug!(
+                contract = %key,
+                state_size = state.size(),
+                "MockRuntime: Emitting BroadcastStateChange"
+            );
+            if let Err(err) = op_manager
+                .notify_node_event(NodeEvent::BroadcastStateChange {
+                    key,
+                    new_state: state.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "MockRuntime: Failed to broadcast state change"
+                );
+            }
+        }
+    }
 }
 
 /// ContractExecutor implementation for MockRuntime with any storage type
@@ -159,7 +185,11 @@ where
         // - The state with the lexicographically larger hash wins
         // - This ensures all peers converge to the same state regardless of
         //   message arrival order (important for delayed broadcasts)
-        match (state, code) {
+        //
+        // CRITICAL: When state changes (Updated) or when our state wins the merge
+        // (CurrentWon), we emit BroadcastStateChange to propagate to network peers.
+        // This ensures peers with "losing" states get updated.
+        let result = match (state, code) {
             (Either::Left(incoming_state), Some(contract)) => {
                 // New contract with code - check if we should accept this state
                 // First store the contract itself
@@ -186,8 +216,8 @@ where
                             // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - reject incoming
-                            Ok(UpsertResult::NoChange)
+                            // Current state wins - return it so it can be propagated
+                            Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
                     Err(_) => {
@@ -219,8 +249,8 @@ where
                             // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - reject incoming
-                            Ok(UpsertResult::NoChange)
+                            // Current state wins - return it so it can be propagated
+                            Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
                     Err(_) => {
@@ -307,7 +337,21 @@ where
                     }
                 }
             }
+        };
+
+        // Emit BroadcastStateChange for Updated and CurrentWon cases.
+        // - Updated: Our state changed, notify peers so they can update
+        // - CurrentWon: Our state won the merge, notify peers so they update to our state
+        if let Ok(ref upsert_result) = result {
+            match upsert_result {
+                UpsertResult::Updated(state) | UpsertResult::CurrentWon(state) => {
+                    self.broadcast_state_change(key, state).await;
+                }
+                UpsertResult::NoChange => {}
+            }
         }
+
+        result
     }
 
     fn register_contract_notifier(
@@ -525,8 +569,8 @@ mod test {
             .await
             .expect("update attempt should not error");
         assert!(
-            matches!(result, UpsertResult::NoChange),
-            "Smaller hash should be rejected (NoChange)"
+            matches!(result, UpsertResult::CurrentWon(_)),
+            "Smaller hash should be rejected (CurrentWon indicating local state won)"
         );
 
         // Verify the stored state is still the larger-hash one
@@ -787,10 +831,10 @@ mod test {
             .await
             .unwrap();
 
-        // S1 should be rejected
+        // S1 should be rejected (local state S3 won)
         assert!(
-            matches!(result, UpsertResult::NoChange),
-            "Delayed old broadcast should be rejected"
+            matches!(result, UpsertResult::CurrentWon(_)),
+            "Delayed old broadcast should be rejected (CurrentWon indicating local state won)"
         );
 
         // S3 should still be stored

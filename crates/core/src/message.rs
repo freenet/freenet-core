@@ -361,6 +361,10 @@ pub enum ProximityCacheMessage {
         added: Vec<ContractInstanceId>,
         /// Contracts we've stopped caching.
         removed: Vec<ContractInstanceId>,
+        /// True if this is a response to a received announcement.
+        /// Recipients should not respond to responses (prevents ping-pong).
+        #[serde(default)]
+        is_response: bool,
     },
     /// Request a neighbor's full cache state (used on new connections).
     CacheStateRequest,
@@ -645,6 +649,13 @@ pub(crate) enum NodeEvent {
     ClientDisconnected {
         client_id: ClientId,
     },
+    /// Broadcast state change to interested network peers.
+    /// Emitted by executor when local state changes.
+    /// Handled by p2p_protoc which has access to OpManager and network.
+    BroadcastStateChange {
+        key: ContractKey,
+        new_state: WrappedState,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +751,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::ClientDisconnected { client_id } => {
                 write!(f, "ClientDisconnected (client: {client_id})")
+            }
+            NodeEvent::BroadcastStateChange { key, .. } => {
+                write!(f, "BroadcastStateChange (contract: {key})")
             }
         }
     }

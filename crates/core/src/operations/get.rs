@@ -877,15 +877,11 @@ impl Operation for GetOp {
                         "GET Request received"
                     );
 
-                    // Use sender_from_addr (looked up from source_addr) instead of message field
-                    let Some(sender) = sender_from_addr.clone() else {
-                        tracing::warn!(
-                            tx = %id,
-                            %instance_id,
-                            "GET: Request without sender lookup - cannot process"
-                        );
-                        return Err(OpError::invalid_transition(self.id));
-                    };
+                    // Use sender_from_addr if available, but allow processing without it.
+                    // The sender may not be in our ring if this is a transient connection
+                    // or in simulation where direct sends bypass connection establishment.
+                    // Routing uses upstream_addr (stored from source_addr), not sender.
+                    let sender = sender_from_addr.clone();
 
                     // Check if operation is already completed
                     if matches!(self.state, Some(GetState::Finished { .. })) {
@@ -1074,8 +1070,8 @@ impl Operation for GetOp {
                                 tx = %id,
                                 %instance_id,
                                 %this_peer,
-                                "Contract not found @ peer {}, forwarding to other peers",
-                                sender
+                                sender = ?sender,
+                                "Contract not found @ peer, forwarding to other peers"
                             );
 
                             // Forward using standard routing helper
@@ -1084,7 +1080,7 @@ impl Operation for GetOp {
                                 id,
                                 instance_id,
                                 (htl, fetch_contract),
-                                (this_peer, sender.clone()),
+                                (this_peer, sender),
                                 new_visited,
                                 op_manager,
                                 stats,
@@ -1102,20 +1098,13 @@ impl Operation for GetOp {
                     let id = *id;
                     let instance_id = *instance_id;
 
-                    // Use sender_from_addr for logging
-                    let Some(sender) = sender_from_addr.clone() else {
-                        tracing::warn!(
-                            tx = %id,
-                            %instance_id,
-                            "GET: NotFound response without sender lookup - cannot process"
-                        );
-                        return Err(OpError::invalid_transition(self.id));
-                    };
+                    // Use sender_from_addr for logging (optional - sender may not be in ring)
+                    let sender = sender_from_addr.clone();
 
                     tracing::info!(
                         tx = %id,
                         %instance_id,
-                        peer_addr = %sender,
+                        sender = ?sender,
                         phase = "not_found",
                         "GET NotFound response received"
                     );
@@ -1125,7 +1114,7 @@ impl Operation for GetOp {
                         tx = %id,
                         %instance_id,
                         peer_addr = %this_peer,
-                        from = %sender,
+                        sender = ?sender,
                         phase = "retry",
                         "Contract not found at peer, retrying with other peers"
                     );
@@ -1149,7 +1138,7 @@ impl Operation for GetOp {
                             let instance_id = state_instance_id;
 
                             // Add the failed peer to tried list
-                            if let Some(addr) = sender.socket_addr() {
+                            if let Some(addr) = sender.as_ref().and_then(|s| s.socket_addr()) {
                                 tried_peers.insert(addr);
                             }
 
@@ -1477,7 +1466,7 @@ impl Operation for GetOp {
                         }
                         Some(GetState::ReceivedRequest) => {
                             // Return NotFound to sender
-                            tracing::debug!(tx = %id, %instance_id, "Returning NotFound to {}", sender);
+                            tracing::debug!(tx = %id, %instance_id, sender = ?sender, "Returning NotFound to upstream");
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
@@ -1504,17 +1493,10 @@ impl Operation for GetOp {
                     let id = *id;
                     let key = *key;
 
-                    // Use sender_from_addr for logging
-                    let Some(sender) = sender_from_addr.clone() else {
-                        tracing::warn!(
-                            tx = %id,
-                            %key,
-                            "GET: Response without sender lookup - cannot process"
-                        );
-                        return Err(OpError::invalid_transition(self.id));
-                    };
+                    // Use sender_from_addr for logging (optional - sender may not be in ring)
+                    let sender = sender_from_addr.clone();
 
-                    tracing::info!(tx = %id, contract = %key, state = ?self.state, phase = "response", "GET Response received with state");
+                    tracing::info!(tx = %id, contract = %key, sender = ?sender, state = ?self.state, phase = "response", "GET Response received with state");
 
                     // Check if contract is required
                     let require_contract = matches!(
@@ -1543,14 +1525,14 @@ impl Operation for GetOp {
                             // no contract, consider this like an error ignoring the incoming update value
                             tracing::warn!(
                                 tx = %id,
-                                "Contract not received from peer {} while required",
-                                sender
+                                sender = ?sender,
+                                "Contract not received from peer while required"
                             );
 
                             tracing::warn!(
                                 tx = %id,
                                 %key,
-                                at = %sender,
+                                sender = ?sender,
                                 "Contract not received while required, returning response to upstream",
                             );
 
@@ -1813,19 +1795,21 @@ impl Operation for GetOp {
                         // Original requester, operation completed successfully
                         tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
 
-                        // Emit get_success telemetry
+                        // Emit get_success telemetry (only if sender is known)
                         let hop_count =
                             current_hop.map(|h| op_manager.ring.max_hops_to_live.saturating_sub(h));
                         let hash = Some(state_hash_full(value));
-                        if let Some(event) = NetEventLog::get_success(
-                            &id,
-                            &op_manager.ring,
-                            key,
-                            sender.clone(),
-                            hop_count,
-                            hash,
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
+                        if let Some(sender_peer) = sender {
+                            if let Some(event) = NetEventLog::get_success(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                sender_peer,
+                                hop_count,
+                                hash,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                         }
 
                         new_state = Some(GetState::Finished { key });
@@ -1882,19 +1866,13 @@ impl Operation for GetOp {
                     let id = *id;
                     let instance_id = *instance_id;
 
-                    let Some(sender) = sender_from_addr.clone() else {
-                        tracing::warn!(
-                            tx = %id,
-                            %instance_id,
-                            "GET: Found response with empty state but no sender lookup"
-                        );
-                        return Err(OpError::invalid_transition(self.id));
-                    };
+                    // Use sender_from_addr for logging (optional - sender may not be in ring)
+                    let sender = sender_from_addr.clone();
 
                     tracing::warn!(
                         tx = %id,
                         %instance_id,
-                        peer_addr = %sender,
+                        sender = ?sender,
                         phase = "response",
                         "GET Found response with empty state - treating as NotFound"
                     );
@@ -1993,7 +1971,7 @@ async fn try_forward_or_return(
     id: Transaction,
     instance_id: ContractInstanceId,
     (htl, fetch_contract): (usize, bool),
-    (this_peer, sender): (PeerKeyLocation, PeerKeyLocation),
+    (this_peer, sender): (PeerKeyLocation, Option<PeerKeyLocation>),
     visited: super::VisitedPeers,
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
@@ -2003,6 +1981,7 @@ async fn try_forward_or_return(
         tx = %id,
         %instance_id,
         peer_addr = %this_peer,
+        sender = ?sender,
         phase = "forward",
         "Contract not found while processing a get request"
     );
@@ -2017,7 +1996,7 @@ async fn try_forward_or_return(
     let (new_target, alternatives) = if new_htl == 0 {
         tracing::warn!(
             tx = %id,
-            peer_addr = %sender,
+            sender = ?sender,
             htl = 0,
             phase = "error",
             "The maximum hops have been exceeded, sending response back to the node"
@@ -2060,7 +2039,7 @@ async fn try_forward_or_return(
             id,
             Some(GetState::AwaitingResponse {
                 instance_id,
-                requester: Some(sender),
+                requester: sender,
                 retries: 0,
                 fetch_contract,
                 current_hop: new_htl,

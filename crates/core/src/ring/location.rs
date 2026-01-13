@@ -22,16 +22,29 @@ impl Location {
                 let value: u32 = ipv4.into();
                 // Mask out the last byte for sybil mitigation
                 let masked_value = value & 0xFFFFFF00;
-                let hashed = distribute_hash(masked_value as u64);
+                // For localhost (127.x.x.x), include port to differentiate simulation peers
+                let hash_input = if ipv4.is_loopback() {
+                    (masked_value as u64) | ((addr.port() as u64) << 32)
+                } else {
+                    masked_value as u64
+                };
+                let hashed = distribute_hash(hash_input);
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
-                // We only use the first 3 segments for sybil migation
+                // We only use the first 3 segments for sybil mitigation
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
                     | u64::from(segments[2]);
-                let hashed = distribute_hash(combined_segments);
+                // For localhost/link-local (::1 or fe80::), include port to differentiate
+                // simulation peers. These addresses have first 3 segments as 0 or similar.
+                let hash_input = if ipv6.is_loopback() || combined_segments == 0 {
+                    combined_segments | ((addr.port() as u64) << 48)
+                } else {
+                    combined_segments
+                };
+                let hashed = distribute_hash(hash_input);
                 Location(hashed as f64 / u64::MAX as f64)
             }
         }
@@ -676,6 +689,56 @@ mod test {
         let loc2 = Location::from_address(&addr2);
 
         assert_ne!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_ipv6_localhost_different_ports() {
+        // IPv6 localhost (::1) addresses with different ports should have different locations.
+        // This is essential for simulation tests where multiple peers run on localhost
+        // with different ports. Without this, all peers would get location 0 because
+        // the first 3 segments of ::1 are all zeros.
+        let addr1 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 54710);
+        let addr2 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 59678);
+        let addr3 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 52112);
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+        let loc3 = Location::from_address(&addr3);
+
+        // All three should be different
+        assert_ne!(
+            loc1, loc2,
+            "Localhost ports 54710 and 59678 should have different locations"
+        );
+        assert_ne!(
+            loc1, loc3,
+            "Localhost ports 54710 and 52112 should have different locations"
+        );
+        assert_ne!(
+            loc2, loc3,
+            "Localhost ports 59678 and 52112 should have different locations"
+        );
+
+        // All should be valid locations (between 0 and 1)
+        assert!(loc1.as_f64() > 0.0 && loc1.as_f64() < 1.0);
+        assert!(loc2.as_f64() > 0.0 && loc2.as_f64() < 1.0);
+        assert!(loc3.as_f64() > 0.0 && loc3.as_f64() < 1.0);
+    }
+
+    #[test]
+    fn test_ipv4_localhost_different_ports() {
+        // IPv4 localhost (127.0.0.1) addresses with different ports should also have
+        // different locations for simulation tests.
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54710);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 59678);
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+
+        assert_ne!(
+            loc1, loc2,
+            "IPv4 localhost ports should have different locations"
+        );
     }
 
     // ============ Original tests ============

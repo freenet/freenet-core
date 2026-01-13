@@ -193,10 +193,17 @@ where
                         new_value: Ok(state),
                         state_changed: false,
                     },
-                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {
-                        new_value: Ok(state),
+                    Ok(UpsertResult::Updated(new_state)) => ContractHandlerEvent::PutResponse {
+                        new_value: Ok(new_state),
                         state_changed: true,
                     },
+                    Ok(UpsertResult::CurrentWon(current_state)) => {
+                        // Merge resulted in no change (incoming state was old/already incorporated).
+                        ContractHandlerEvent::PutResponse {
+                            new_value: Ok(current_state),
+                            state_changed: false,
+                        }
+                    }
                     Err(err) => {
                         if err.is_fatal() {
                             tracing::error!(
@@ -265,6 +272,7 @@ where
                                 );
                                 ContractHandlerEvent::UpdateResponse {
                                     new_value: Ok(current_state),
+                                    state_changed: false,
                                 }
                             }
                             Ok((None, _)) => {
@@ -290,7 +298,16 @@ where
                     }
                     Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {
                         new_value: Ok(state),
+                        state_changed: true,
                     },
+                    Ok(UpsertResult::CurrentWon(current_state)) => {
+                        // Merge resulted in no change (incoming state was old/already incorporated).
+                        // Return current state with state_changed=false.
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(current_state),
+                            state_changed: false,
+                        }
+                    }
                     Err(err) => {
                         if err.is_fatal() {
                             tracing::error!(
@@ -303,6 +320,7 @@ where
                         }
                         ContractHandlerEvent::UpdateResponse {
                             new_value: Err(err),
+                            state_changed: false,
                         }
                     }
                 };
