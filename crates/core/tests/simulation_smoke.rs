@@ -6,10 +6,11 @@
 //!
 //! For deterministic tests that use Turmoil, see `simulation_integration.rs`.
 //!
-//! These tests can run in parallel in CI (no Turmoil global state conflicts).
-//!
-//! NOTE: These tests use real tokio time (not VirtualTime) since start_with_rand_gen()
-//! spawns tasks that run on tokio's scheduler, not Turmoil's deterministic scheduler.
+//! NOTE: These tests must run serially (behind simulation_tests feature) because they
+//! use global state: reset_all_simulation_state(), GlobalRng, GlobalSimulationTime,
+//! and VirtualTime registries. Running in parallel causes state corruption.
+
+#![cfg(feature = "simulation_tests")]
 
 use freenet::dev_tool::SimNetwork;
 use std::collections::HashMap;
