@@ -29,7 +29,7 @@ use tracing::{span, Instrument};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    congestion_control::CongestionControlConfig,
+    congestion_control::{CongestionControlAlgorithm, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
@@ -217,7 +217,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
-            congestion_config: None, // Production uses default (BBR)
+            // Production uses BBR - set explicitly since Default is now FixedRate
+            congestion_config: Some(CongestionControlConfig::new(
+                CongestionControlAlgorithm::Bbr,
+            )),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
