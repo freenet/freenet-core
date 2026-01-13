@@ -429,7 +429,7 @@ fn test_bdp_scales_with_bandwidth() {
 /// 4. BBR could never build up measurements before the next timeout
 ///
 /// Fix:
-/// 1. MIN_RTO was increased to 300ms to account for ACK batching delay
+/// 1. MIN_RTO was increased to 500ms to account for ACK batching delay
 /// 2. BBR now uses adaptive timeout floor based on max BDP seen
 ///
 /// This test verifies BBR's timeout behavior with minimal traffic (no high BDP).

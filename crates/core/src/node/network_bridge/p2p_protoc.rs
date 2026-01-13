@@ -1700,10 +1700,10 @@ impl P2pConnManager {
                             }
                             NodeEvent::BroadcastStateChange { key, new_state } => {
                                 // Automatic network peer notification when state changes
-                                tracing::info!(
+                                tracing::debug!(
                                     contract = %key,
                                     state_size = new_state.size(),
-                                    "RECEIVED BroadcastStateChange event in p2p_protoc"
+                                    "BroadcastStateChange event received"
                                 );
                                 let self_addr = op_manager.ring.connection_manager.get_own_addr();
                                 let Some(self_addr) = self_addr else {
@@ -1716,7 +1716,7 @@ impl P2pConnManager {
 
                                 let targets =
                                     op_manager.get_broadcast_targets_update(&key, &self_addr);
-                                tracing::info!(
+                                tracing::debug!(
                                     contract = %key,
                                     target_count = targets.len(),
                                     self_addr = %self_addr,
@@ -1732,21 +1732,21 @@ impl P2pConnManager {
                                         .closest_potentially_caching(&key, [self_addr].as_slice())
                                     {
                                         if let Some(addr) = fallback_target.socket_addr() {
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 contract = %key,
                                                 fallback_peer = %addr,
                                                 "BroadcastStateChange: Using ring-based fallback target"
                                             );
                                             vec![fallback_target]
                                         } else {
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 contract = %key,
                                                 "BroadcastStateChange: No targets and no fallback - skipping"
                                             );
                                             continue;
                                         }
                                     } else {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             contract = %key,
                                             "BroadcastStateChange: No targets and no fallback - skipping"
                                         );
@@ -1819,7 +1819,12 @@ impl P2pConnManager {
                                                         delta.as_ref().to_vec(),
                                                     )
                                                 }
-                                                Err(_) => {
+                                                Err(err) => {
+                                                    tracing::debug!(
+                                                        contract = %key,
+                                                        error = %err,
+                                                        "Delta computation failed, falling back to full state"
+                                                    );
                                                     crate::message::DeltaOrFullState::FullState(
                                                         new_state.as_ref().to_vec(),
                                                     )
