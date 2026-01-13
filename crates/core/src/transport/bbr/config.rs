@@ -19,6 +19,21 @@ pub(crate) const MSS: usize = MAX_DATA_SIZE;
 /// This allows BBR to double its sending rate each round trip during Startup.
 pub(crate) const STARTUP_PACING_GAIN: f64 = 2.77;
 
+/// Minimum pacing rate during Startup: 25 MB/s.
+///
+/// This floor prevents the "bootstrap death spiral" where:
+/// 1. Low pacing_rate limits how fast we send
+/// 2. BBR measures bandwidth from our limited sends
+/// 3. Low measured bandwidth → lower pacing_rate → stuck
+///
+/// By maintaining a high floor during Startup, we can discover the actual
+/// available bandwidth. Once BBR exits Startup (via bandwidth plateau or loss),
+/// it uses the measured bandwidth without this floor.
+///
+/// 25 MB/s is chosen to handle high-bandwidth links while still being safe
+/// for most network paths (congestion will trigger loss-based exit from Startup).
+pub(crate) const STARTUP_MIN_PACING_RATE: u64 = 25_000_000;
+
 /// Startup cwnd gain: 2.0
 /// Provides headroom for ACK aggregation during startup.
 pub(crate) const STARTUP_CWND_GAIN: f64 = 2.0;

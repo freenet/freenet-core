@@ -225,18 +225,21 @@ fn test_startup_initial_state() {
 
 #[test]
 fn test_startup_to_drain_transition() {
-    let mut harness =
-        BbrTestHarness::new(BbrConfig::default(), NetworkCondition::DATACENTER, 12345);
+    let mut harness = BbrTestHarness::new(BbrConfig::default(), NetworkCondition::LAN, 12345);
 
-    // Run enough RTTs to plateau bandwidth and exit Startup
-    let snapshots = harness.run_rtts(20, 100_000);
+    // Run enough RTTs to plateau bandwidth and exit Startup.
+    // Use LAN conditions (1ms RTT, 100 MB/s) for fast bandwidth discovery.
+    // With MIN_BW_FOR_STARTUP_EXIT = 1 MB/s, need enough traffic to measure
+    // bandwidth above this threshold.
+    let snapshots = harness.run_rtts(30, 1_000_000);
 
     // Should eventually exit Startup
     let final_state = snapshots.last().unwrap().state;
     assert!(
         final_state == BbrState::Drain || final_state == BbrState::ProbeBW,
-        "Expected Drain or ProbeBW, got {:?}",
-        final_state
+        "Expected Drain or ProbeBW, got {:?}. max_bw: {} bytes/sec",
+        final_state,
+        snapshots.last().unwrap().max_bw
     );
 }
 

@@ -12,7 +12,7 @@ use super::bandwidth::BandwidthFilter;
 use super::config::{
     BbrConfig, BETA, DRAIN_PACING_GAIN, PROBE_BW_CWND_GAIN, PROBE_RTT_CWND_GAIN,
     PROBE_RTT_MIN_CWND, STARTUP_CWND_GAIN, STARTUP_FULL_BW_ROUNDS, STARTUP_FULL_BW_THRESHOLD,
-    STARTUP_LOSS_THRESHOLD, STARTUP_PACING_GAIN,
+    STARTUP_LOSS_THRESHOLD, STARTUP_MIN_PACING_RATE, STARTUP_PACING_GAIN,
 };
 use super::delivery_rate::{DeliveryRateSampler, DeliveryRateToken};
 use super::rtt::RttTracker;
@@ -150,8 +150,8 @@ impl<T: TimeSource> BbrController<T> {
         let epoch_nanos = time_source.now_nanos();
         let initial_cwnd = config.initial_cwnd;
 
-        // Initial pacing rate: assume 1 MB/s until we have measurements
-        let initial_pacing_rate = 1_000_000u64;
+        // Initial pacing rate: use STARTUP_MIN_PACING_RATE to prevent bootstrap death spiral
+        let initial_pacing_rate = STARTUP_MIN_PACING_RATE;
 
         Self {
             config,
@@ -214,13 +214,11 @@ impl<T: TimeSource> BbrController<T> {
         // misleadingly low samples.
         if !self.bw_filter.has_samples(now) {
             // No valid bandwidth samples - ensure pacing rate allows probing.
-            // Initial rate of 1 MB/s is aggressive enough to discover real bandwidth
-            // while not overwhelming the network.
-            const INITIAL_PACING_RATE: u64 = 1_000_000;
+            // Use STARTUP_MIN_PACING_RATE to prevent bootstrap death spiral.
             let current_rate = self.pacing_rate.load(Ordering::Acquire);
-            if current_rate < INITIAL_PACING_RATE {
+            if current_rate < STARTUP_MIN_PACING_RATE {
                 self.pacing_rate
-                    .store(INITIAL_PACING_RATE, Ordering::Release);
+                    .store(STARTUP_MIN_PACING_RATE, Ordering::Release);
             }
         }
 
@@ -303,11 +301,12 @@ impl<T: TimeSource> BbrController<T> {
             }
         }
 
+        // Update cwnd and pacing rate FIRST so startup floors apply
+        // before state machine checks for bandwidth plateau
+        self.update_model();
+
         // Run state machine
         self.update_state(now);
-
-        // Update cwnd and pacing rate
-        self.update_model();
     }
 
     /// Called when packets are detected as lost.
@@ -525,6 +524,19 @@ impl<T: TimeSource> BbrController<T> {
             self.full_bw_count.fetch_add(1, Ordering::AcqRel);
         }
 
+        // Don't exit Startup until we've achieved meaningful throughput.
+        // This prevents the bootstrap problem where low initial cwnd leads to
+        // low bandwidth measurements, which causes premature STARTUP exit
+        // before the cwnd floor has time to boost throughput.
+        //
+        // Require at least 1 MB/s measured bandwidth before allowing exit.
+        // This is well above the death spiral threshold (~15 KB/s) but low
+        // enough for most network conditions.
+        const MIN_BW_FOR_STARTUP_EXIT: u64 = 1_000_000; // 1 MB/s
+        if max_bw < MIN_BW_FOR_STARTUP_EXIT {
+            return;
+        }
+
         // Exit Startup after STARTUP_FULL_BW_ROUNDS without growth
         if self.full_bw_count.load(Ordering::Acquire) >= STARTUP_FULL_BW_ROUNDS {
             self.state.enter_drain();
@@ -652,6 +664,22 @@ impl<T: TimeSource> BbrController<T> {
         // Compute target cwnd
         let mut target_cwnd = (bdp as f64 * cwnd_gain) as usize;
 
+        // During Startup, ensure cwnd is large enough to utilize the minimum pacing rate.
+        // This prevents the bootstrap problem where low cwnd limits sends, which limits
+        // measured bandwidth, which keeps cwnd low.
+        //
+        // Startup min cwnd = STARTUP_MIN_PACING_RATE × min_rtt × cwnd_gain
+        let state = self.state.load();
+        if state == BbrState::Startup {
+            let min_rtt_nanos = self.rtt_tracker.min_rtt_nanos();
+            if min_rtt_nanos != u64::MAX {
+                let startup_bdp = (STARTUP_MIN_PACING_RATE as u128 * min_rtt_nanos as u128
+                    / 1_000_000_000) as usize;
+                let startup_min_cwnd = (startup_bdp as f64 * cwnd_gain) as usize;
+                target_cwnd = target_cwnd.max(startup_min_cwnd);
+            }
+        }
+
         // Apply inflight_hi bound (loss response) before min_cwnd
         let inflight_hi = self.inflight_hi.load(Ordering::Acquire);
         if inflight_hi < usize::MAX {
@@ -669,7 +697,16 @@ impl<T: TimeSource> BbrController<T> {
         let bw_hi = self.bw_hi.load(Ordering::Acquire);
         let effective_bw = max_bw.min(bw_hi);
 
-        let pacing_rate = (effective_bw as f64 * pacing_gain) as u64;
+        let mut pacing_rate = (effective_bw as f64 * pacing_gain) as u64;
+
+        // During Startup, apply a minimum pacing rate floor to prevent
+        // the "bootstrap death spiral" where low pacing limits sends,
+        // which limits measured bandwidth, which limits pacing further.
+        // This allows BBR to discover actual available bandwidth.
+        if state == BbrState::Startup {
+            pacing_rate = pacing_rate.max(STARTUP_MIN_PACING_RATE);
+        }
+
         self.pacing_rate
             .store(pacing_rate.max(1), Ordering::Release);
     }
