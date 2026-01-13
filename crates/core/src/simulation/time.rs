@@ -720,4 +720,31 @@ mod tests {
             .await
             .expect("sleep should complete immediately");
     }
+
+    #[test]
+    fn test_virtual_time_wakeup_order_reverse_registration() {
+        let vt = VirtualTime::new();
+
+        // Register wakeups in REVERSE order (5, 4, 3, 2, 1)
+        for i in (0..5).rev() {
+            drop(vt.sleep_until((i + 1) * 100));
+        }
+
+        // Wakeups should still fire in deadline order (1, 2, 3, 4, 5)
+        let mut fired = Vec::new();
+        while let Some((id, deadline)) = vt.advance_to_next_wakeup() {
+            fired.push((id.as_u64(), deadline));
+        }
+
+        // Verify ordering - each deadline should be >= previous
+        for i in 1..fired.len() {
+            assert!(
+                fired[i].1 >= fired[i - 1].1,
+                "Wakeups should be ordered by deadline, not registration order"
+            );
+        }
+
+        // Verify we got all 5 wakeups
+        assert_eq!(fired.len(), 5);
+    }
 }
