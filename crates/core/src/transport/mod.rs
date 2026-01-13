@@ -61,6 +61,7 @@ mod received_packet_tracker;
 
 pub(crate) mod bbr;
 pub mod congestion_control;
+pub(crate) mod fixed_rate;
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
 pub mod metrics;
