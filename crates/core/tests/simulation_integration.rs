@@ -790,7 +790,8 @@ fn test_deterministic_replay_events() {
 /// Test that SimNetwork can be created and peers can be built.
 #[test_log::test]
 fn test_sim_network_basic_setup() {
-    const SEED: u64 = 0xBA51C_5E70_0001;
+    #[allow(clippy::unusual_byte_groupings)]
+    const SEED: u64 = 0xBA51C_5E70_0001; // "BASIC SETO 0001"
 
     setup_deterministic_state(SEED);
     let rt = create_runtime();

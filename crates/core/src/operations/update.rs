@@ -969,7 +969,6 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let sender = op_manager.ring.connection_manager.own_location();
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
     let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
@@ -1073,12 +1072,7 @@ pub(crate) async fn request_update(
             .closest_potentially_caching(&key, [sender_addr].as_slice());
 
         if let Some(target) = remote_target {
-            // Subscribe on behalf of the requesting peer (no upstream_addr - direct registration)
-            op_manager
-                .ring
-                .add_downstream(&key, sender.clone(), None)
-                .map_err(|_| RingError::NoCachingPeers(*key.id()))?;
-
+            // Found a remote peer to send the update to
             target
         } else {
             // No remote peers available, handle locally
