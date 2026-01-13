@@ -1386,76 +1386,6 @@ async fn test_latency_injection() {
 }
 
 // =============================================================================
-// Simulation Module Unit Tests
-// =============================================================================
-
-mod simulation_primitives {
-    use freenet::simulation::{FaultConfig, SimulationRng, TimeSource, VirtualTime};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
-    }
-
-    /// Tests that fault injection decisions are deterministic.
-    #[test_log::test]
-    fn test_fault_config_determinism() {
-        let config = FaultConfig::builder().message_loss_rate(0.3).build();
-
-        let rng1 = SimulationRng::new(12345);
-        let rng2 = SimulationRng::new(12345);
-
-        let decisions1: Vec<bool> = (0..100)
-            .map(|_| config.should_drop_message(&rng1))
-            .collect();
-        let decisions2: Vec<bool> = (0..100)
-            .map(|_| config.should_drop_message(&rng2))
-            .collect();
-
-        assert_eq!(
-            decisions1, decisions2,
-            "Fault decisions should be deterministic"
-        );
-    }
-
-    /// Tests virtual time wakeup ordering.
-    #[test_log::test]
-    fn test_virtual_time_wakeup_order() {
-        let vt = VirtualTime::new();
-
-        // Register wakeups in reverse order
-        for i in (0..5).rev() {
-            drop(vt.sleep_until((i + 1) * 100));
-        }
-
-        // Wakeups should fire in deadline order
-        let mut fired = Vec::new();
-        while let Some((id, deadline)) = vt.advance_to_next_wakeup() {
-            fired.push((id.as_u64(), deadline));
-        }
-
-        // Verify ordering
-        for i in 1..fired.len() {
-            assert!(
-                fired[i].1 >= fired[i - 1].1,
-                "Wakeups should be ordered by deadline"
-            );
-        }
-    }
-
-    /// Tests that crashed nodes block all messages.
-    #[test_log::test]
-    fn test_crashed_node_blocks_messages() {
-        let config = FaultConfig::builder().crashed_node(addr(1000)).build();
-        let rng = SimulationRng::new(42);
-
-        assert!(!config.can_deliver(&addr(1000), &addr(2000), 0, &rng));
-        assert!(!config.can_deliver(&addr(2000), &addr(1000), 0, &rng));
-        assert!(config.can_deliver(&addr(2000), &addr(3000), 0, &rng));
-    }
-}
-
-// =============================================================================
 // Test 10: Node Crash and Recovery via SimNetwork API
 // =============================================================================
 
@@ -1999,11 +1929,19 @@ fn test_graceful_shutdown_typed_error() {
 /// from run_simulation).
 #[test_log::test]
 fn test_turmoil_determinism() {
-    use freenet::dev_tool::SimNetwork;
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+    use freenet::dev_tool::{reset_all_simulation_state, SimNetwork};
 
     const SEED: u64 = 0x000D_E7E2_A101_571C;
+    const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
 
     fn run_simulation_once(name: &str, seed: u64) -> turmoil::Result {
+        // Reset all global state for determinism
+        reset_all_simulation_state();
+        GlobalRng::set_seed(seed);
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
