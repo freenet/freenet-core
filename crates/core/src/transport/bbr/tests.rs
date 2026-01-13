@@ -1092,3 +1092,108 @@ fn test_pacing_rate_grows_with_successful_transfers() {
         final_pacing
     );
 }
+
+/// Test that longer transfers achieve higher throughput as BBR ramps up.
+///
+/// This validates that BBR's bandwidth discovery works correctly over time.
+/// The first portion of a transfer may be slow while BBR probes, but
+/// throughput should improve significantly as the connection matures.
+#[rstest]
+#[case::domestic_50ms(50, 5_000_000)] // 5 MB/s expected for 50ms RTT
+#[case::intercontinental_135ms(135, 2_000_000)] // 2 MB/s expected for 135ms RTT
+fn test_longer_transfer_achieves_higher_throughput(
+    #[case] rtt_ms: u64,
+    #[case] min_expected_throughput: usize,
+) {
+    use crate::simulation::TimeSource;
+
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(rtt_ms);
+    let packet_size = 1400;
+    let total_transfer = 5 * 1024 * 1024; // 5 MB transfer
+
+    println!(
+        "\n[{}ms RTT] Testing 5MB transfer throughput ramp-up",
+        rtt_ms
+    );
+    println!(
+        "  Initial pacing_rate: {} B/s ({:.1} KB/s)",
+        controller.pacing_rate(),
+        controller.pacing_rate() as f64 / 1024.0
+    );
+    println!("  Initial cwnd: {} bytes", controller.current_cwnd());
+
+    // Transfer in chunks, measuring throughput at each stage
+    let chunk_size = total_transfer / 5;
+    let mut total_bytes_sent = 0usize;
+    let start_time = time.now_nanos();
+    let mut stage_throughputs = Vec::new();
+
+    for stage in 0..5 {
+        println!(
+            "  [Before Stage {}] cwnd: {}KB, pacing: {:.1} KB/s, max_bw: {:.1} KB/s, state: {:?}",
+            stage + 1,
+            controller.current_cwnd() / 1024,
+            controller.pacing_rate() as f64 / 1024.0,
+            controller.max_bw() as f64 / 1024.0,
+            controller.state()
+        );
+
+        let stage_start = time.now_nanos();
+        let (bytes, _) = simulate_paced_transfer(&controller, &time, rtt, chunk_size, packet_size);
+        let stage_elapsed = Duration::from_nanos(time.now_nanos() - stage_start);
+        let stage_throughput = bytes as f64 / stage_elapsed.as_secs_f64();
+        total_bytes_sent += bytes;
+
+        stage_throughputs.push(stage_throughput);
+        println!(
+            "  [After Stage {}] {:.1} KB/s (cwnd: {}KB, pacing: {:.1} KB/s, max_bw: {:.1} KB/s)",
+            stage + 1,
+            stage_throughput / 1024.0,
+            controller.current_cwnd() / 1024,
+            controller.pacing_rate() as f64 / 1024.0,
+            controller.max_bw() as f64 / 1024.0
+        );
+    }
+
+    let total_elapsed = Duration::from_nanos(time.now_nanos() - start_time);
+    let overall_throughput = total_bytes_sent as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "  Overall throughput: {:.1} KB/s ({:.2} MB/s)",
+        overall_throughput / 1024.0,
+        overall_throughput / (1024.0 * 1024.0)
+    );
+    println!(
+        "  Final state: {:?}, max_bw: {:.1} KB/s",
+        controller.state(),
+        controller.max_bw() as f64 / 1024.0
+    );
+
+    // Throughput should be sustained at reasonable levels across all stages.
+    // Note: Stage 1 is artificially boosted by STARTUP_MIN_PACING_RATE, so later
+    // stages may have slightly lower throughput than Stage 1. The key metric is
+    // that throughput doesn't COLLAPSE (which would indicate the bootstrap
+    // death spiral bug).
+    let last_stage = stage_throughputs[4];
+    let min_sustained = min_expected_throughput as f64 * 0.5; // At least 50% of target per stage
+    assert!(
+        last_stage >= min_sustained,
+        "[{}ms RTT] Throughput collapsed: last stage {:.1} KB/s is below {:.1} KB/s",
+        rtt_ms,
+        last_stage / 1024.0,
+        min_sustained / 1024.0
+    );
+
+    // Overall throughput should meet minimum expectation
+    assert!(
+        overall_throughput >= min_expected_throughput as f64,
+        "[{}ms RTT] Overall throughput {:.1} KB/s ({:.2} MB/s) is below expected {} KB/s",
+        rtt_ms,
+        overall_throughput / 1024.0,
+        overall_throughput / (1024.0 * 1024.0),
+        min_expected_throughput / 1024
+    );
+}

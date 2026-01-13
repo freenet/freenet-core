@@ -57,6 +57,16 @@ pub(crate) struct DeliveryRateSample {
     pub lost: u64,
 }
 
+/// Minimum idle gap (in nanoseconds) before resetting burst tracking.
+/// If less than this time has passed since the last send, we consider it
+/// part of the same "continuous transfer" and don't reset first_sent_delivered.
+/// This prevents spurious resets when pacing naturally creates gaps between RTTs.
+///
+/// 500ms is chosen to distinguish between:
+/// - Normal pacing gaps (10-200ms): NOT idle, same transfer
+/// - True idle periods (> 500ms): Connection was idle, reset tracking
+const IDLE_RESET_THRESHOLD_NANOS: u64 = 500_000_000; // 500ms
+
 /// Delivery rate sampler for per-packet tracking.
 ///
 /// This sampler maintains state needed to compute delivery rates from ACKs.
@@ -73,6 +83,8 @@ pub(crate) struct DeliveryRateSampler {
     first_sent_time_nanos: AtomicU64,
     /// Bytes delivered when the first packet in the current burst was sent.
     first_sent_delivered: AtomicU64,
+    /// Timestamp of the most recent send (for idle detection).
+    last_send_time_nanos: AtomicU64,
     /// Whether the connection is currently application-limited.
     /// True if cwnd > flightsize (we could send more but have nothing to send).
     app_limited: AtomicBool,
@@ -91,6 +103,7 @@ impl DeliveryRateSampler {
             lost: AtomicU64::new(0),
             first_sent_time_nanos: AtomicU64::new(0),
             first_sent_delivered: AtomicU64::new(0),
+            last_send_time_nanos: AtomicU64::new(0),
             app_limited: AtomicBool::new(false),
             round_count: AtomicU64::new(0),
             round_start_delivered: AtomicU64::new(0),
@@ -115,9 +128,23 @@ impl DeliveryRateSampler {
         let delivered = self.delivered.load(Ordering::Acquire);
         let sent_before = self.sent.fetch_add(bytes as u64, Ordering::AcqRel);
 
-        // If this is the first packet in a new burst (no packets in flight),
-        // record the current state for the burst.
-        let (first_sent_delivered, first_sent_time_nanos) = if inflight == 0 {
+        // Determine if we should reset burst tracking.
+        // We only reset when BOTH conditions are true:
+        // 1. No packets currently in flight (inflight == 0)
+        // 2. Connection was truly idle (time since last send > threshold)
+        //
+        // This prevents spurious resets during normal pacing gaps between RTTs,
+        // which would cause each RTT's worth of packets to be measured in isolation
+        // and produce artificially low bandwidth samples.
+        let last_send = self.last_send_time_nanos.load(Ordering::Acquire);
+        let time_since_last_send = now_nanos.saturating_sub(last_send);
+        let is_truly_idle = inflight == 0 && time_since_last_send > IDLE_RESET_THRESHOLD_NANOS;
+
+        // Also reset if this is the very first send (first_sent_time_nanos == 0)
+        let first_sent_time_current = self.first_sent_time_nanos.load(Ordering::Acquire);
+        let should_reset = is_truly_idle || first_sent_time_current == 0;
+
+        let (first_sent_delivered, first_sent_time_nanos) = if should_reset {
             self.first_sent_delivered
                 .store(delivered, Ordering::Release);
             self.first_sent_time_nanos
@@ -126,9 +153,13 @@ impl DeliveryRateSampler {
         } else {
             (
                 self.first_sent_delivered.load(Ordering::Acquire),
-                self.first_sent_time_nanos.load(Ordering::Acquire),
+                first_sent_time_current,
             )
         };
+
+        // Update last send time
+        self.last_send_time_nanos
+            .store(now_nanos, Ordering::Release);
 
         let is_app_limited = self.app_limited.load(Ordering::Acquire);
 
@@ -186,13 +217,22 @@ impl DeliveryRateSampler {
 
         // Cap delivery rate to send rate to prevent overestimation when ACKs arrive in bursts.
         // This follows the quiche implementation: delivery_rate = min(send_rate, ack_rate)
+        //
+        // However, we only apply this cap when bytes_sent_since_token is significant.
+        // For packets near the end of a burst, bytes_sent_since_token is tiny (almost nothing
+        // was sent after this packet), which would create an artificially low send_rate cap.
+        // This caused a bug where BBR's max_bw would collapse after exiting Startup.
         let bytes_sent_since_token = self.sent.load(Ordering::Acquire).saturating_sub(token.sent);
-        let send_rate = if bytes_sent_since_token > 0 && interval_nanos > 0 {
-            (bytes_sent_since_token as u128 * 1_000_000_000 / interval_nanos as u128) as u64
+        let delivery_rate = if bytes_sent_since_token >= delivered_bytes / 2 {
+            // Only apply send_rate cap when we've sent at least half as much as we've delivered
+            // since this token was created. This avoids the "last packet" problem.
+            let send_rate =
+                (bytes_sent_since_token as u128 * 1_000_000_000 / interval_nanos as u128) as u64;
+            delivery_rate.min(send_rate)
         } else {
-            u64::MAX // No cap if we can't compute send rate
+            // Don't apply send_rate cap for packets near end of burst
+            delivery_rate
         };
-        let delivery_rate = delivery_rate.min(send_rate);
 
         // Compute RTT for this packet
         let rtt_nanos = now_nanos.saturating_sub(token.sent_time_nanos);
@@ -257,6 +297,7 @@ impl DeliveryRateSampler {
         self.lost.store(0, Ordering::Release);
         self.first_sent_time_nanos.store(0, Ordering::Release);
         self.first_sent_delivered.store(0, Ordering::Release);
+        self.last_send_time_nanos.store(0, Ordering::Release);
         self.app_limited.store(false, Ordering::Release);
         self.round_count.store(0, Ordering::Release);
         self.round_start_delivered.store(0, Ordering::Release);
