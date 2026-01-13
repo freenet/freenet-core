@@ -618,15 +618,18 @@ async fn test_different_seeds_produce_different_events() {
 }
 
 // =============================================================================
-// Test 2: Fault Injection with Deterministic Behavior
+// Test 2: Simulation Determinism (Event Types)
 // =============================================================================
 
-/// Tests that simulation produces deterministic results with the same seed.
+/// Tests that simulation produces consistent event types with the same seed.
 ///
-/// VirtualTime is always enabled, making simulation fully deterministic.
-/// Uses VirtualTime exclusively - no start_paused.
+/// NOTE: This test only verifies that the same event TYPES are captured,
+/// not that exact counts match. For strict determinism tests, see
+/// test_strict_determinism_exact_event_equality.
+///
+/// Uses proper deterministic setup (GlobalRng, GlobalSimulationTime).
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_fault_injection_deterministic() {
+async fn test_simulation_determinism_event_types() {
     use freenet::config::{GlobalRng, GlobalSimulationTime};
 
     const SEED: u64 = 0xFA01_7777_1234;
@@ -733,10 +736,12 @@ async fn test_event_summary_ordering() {
 // Test 4: Small Network Connectivity
 // =============================================================================
 
-/// Minimal network test: 1 gateway + 2 nodes.
-/// Uses VirtualTime exclusively - no start_paused.
+/// Smoke test: verifies a minimal network (1 gateway + 2 nodes) can start.
+///
+/// This is NOT a determinism test - it simply verifies basic functionality.
+/// Uses VirtualTime for time advancement.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_small_network_connectivity() {
+async fn test_smoke_small_network() {
     const SEED: u64 = 0x5A11_1111;
 
     let mut sim = SimNetwork::new("small-network", 1, 2, 7, 3, 5, 1, SEED).await;
@@ -1247,68 +1252,6 @@ async fn test_partition_injection_bridge() {
     // The key verification is that the API works without error
     // Actual partition effects depend on which addresses are involved
     tracing::info!("Partition injection bridge test passed");
-}
-
-/// Tests that fault injection with the same seed produces deterministic results.
-///
-/// This verifies that the fault injection bridge uses seeded RNG for reproducible
-/// message loss decisions across multiple runs.
-/// Uses VirtualTime exclusively - no start_paused.
-#[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_deterministic_fault_injection() {
-    use freenet::simulation::FaultConfig;
-
-    const SEED: u64 = 0xDE7E_FA01;
-
-    async fn run_with_fault_injection(name: &str, seed: u64) -> HashMap<String, usize> {
-        let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
-        sim.with_start_backoff(Duration::from_millis(50));
-
-        // Inject 30% message loss - with seeded RNG this should be deterministic
-        let fault_config = FaultConfig::builder().message_loss_rate(0.3).build();
-        sim.with_fault_injection(fault_config);
-
-        let _handles = sim
-            .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 3)
-            .await;
-
-        // Use VirtualTime advancement
-        for _ in 0..30 {
-            sim.advance_time(Duration::from_millis(100));
-            tokio::task::yield_now().await;
-        }
-        let events = sim.get_event_counts().await;
-        sim.clear_fault_injection();
-        events
-    }
-
-    // Run twice with same seed
-    let events1 = run_with_fault_injection("det-fault-run1", SEED).await;
-    let events2 = run_with_fault_injection("det-fault-run2", SEED).await;
-
-    // Both runs should produce events
-    let total1: usize = events1.values().sum();
-    let total2: usize = events2.values().sum();
-
-    assert!(total1 > 0, "Run 1 should capture events");
-    assert!(total2 > 0, "Run 2 should capture events");
-
-    // With deterministic fault injection, event types should be consistent
-    let types1: std::collections::HashSet<&String> = events1.keys().collect();
-    let types2: std::collections::HashSet<&String> = events2.keys().collect();
-
-    assert_eq!(
-        types1, types2,
-        "Event types should be consistent across runs.\nRun 1: {:?}\nRun 2: {:?}",
-        events1, events2
-    );
-
-    tracing::info!(
-        "Deterministic fault injection test: run1={} events, run2={} events",
-        total1,
-        total2
-    );
-    tracing::info!("Deterministic fault injection test passed");
 }
 
 /// Tests latency injection via the fault bridge using VirtualTime.
