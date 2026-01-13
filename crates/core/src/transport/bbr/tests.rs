@@ -568,7 +568,7 @@ fn test_bbr_adaptive_timeout_floor_with_high_bdp() {
 }
 
 // =============================================================================
-// Regression: Issue #2697 - BBR Death Spiral on High-Latency Links
+// Regression: Issue #2682/#2697 - BBR Death Spiral on High-Latency Links
 // =============================================================================
 
 /// Regression test for issue #2697: BBR timeout should preserve bandwidth/RTT estimates.
@@ -595,7 +595,6 @@ fn test_bbr_adaptive_timeout_floor_with_high_bdp() {
 #[case::high_latency_standard(250, 50, 20)]
 #[case::high_latency_extended(250, 100, 30)]
 #[case::satellite_link(500, 50, 20)]
-#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
 fn test_issue_2697_timeout_preserves_bandwidth_and_rtt(
     #[case] rtt_ms: u64,
     #[case] warmup_rounds: usize,
@@ -683,7 +682,6 @@ fn test_issue_2697_timeout_preserves_bandwidth_and_rtt(
 #[case::high_latency_5_timeouts(250, 5)]
 #[case::high_latency_10_timeouts(250, 10)]
 #[case::satellite_5_timeouts(500, 5)]
-#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
 fn test_issue_2697_repeated_timeouts_preserve_bandwidth(
     #[case] rtt_ms: u64,
     #[case] timeout_count: usize,
@@ -755,7 +753,6 @@ fn test_issue_2697_repeated_timeouts_preserve_bandwidth(
 #[case::river_ui_intercontinental(135, 2900)]
 #[case::river_ui_high_latency(250, 2900)]
 #[case::large_contract_satellite(500, 1024)]
-#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
 fn test_issue_2697_large_transfer_with_timeouts(#[case] rtt_ms: u64, #[case] transfer_kb: usize) {
     let time = VirtualTime::new();
     let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());

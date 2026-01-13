@@ -391,15 +391,32 @@ impl<T: TimeSource> BbrController<T> {
         let adaptive_min = (max_bdp / 4).max(self.config.initial_cwnd);
         self.cwnd.store(adaptive_min, Ordering::Release);
 
-        // Reset bandwidth bounds and filter (estimates may be stale after timeout)
-        self.bw_hi.store(u64::MAX, Ordering::Release);
-        self.bw_lo.store(0, Ordering::Release);
+        // Reset inflight bounds (loss response limits)
         self.inflight_hi.store(usize::MAX, Ordering::Release);
         self.inflight_lo.store(0, Ordering::Release);
-        self.bw_filter.reset();
 
-        // Reset RTT tracker (min_rtt may be stale)
-        self.rtt_tracker.reset_min_rtt();
+        // Reset bandwidth bounds but NOT the bandwidth filter itself.
+        // bw_hi/bw_lo are loss-response limits; the filter holds actual estimates.
+        self.bw_hi.store(u64::MAX, Ordering::Release);
+        self.bw_lo.store(0, Ordering::Release);
+
+        // NOTE: We intentionally do NOT reset bw_filter or min_rtt here.
+        //
+        // These represent physical path characteristics (link capacity and propagation
+        // delay) that don't change on timeout. Resetting them causes a "death spiral"
+        // on high-latency links:
+        //
+        // 1. Timeout resets bw_filter → max_bw returns 0
+        // 2. Timeout resets min_rtt → min_rtt_nanos returns u64::MAX
+        // 3. compute_bdp() falls back to initial_cwnd (14KB) when either is invalid
+        // 4. 14KB cwnd on high-latency link (e.g., 250ms RTT) = ~56KB/s max throughput
+        // 5. Slow transfer = more timeouts = stuck at minimum cwnd
+        //
+        // By preserving bandwidth and RTT estimates, we can recover quickly after
+        // spurious timeouts while still entering Startup to probe for changes.
+        // BBR naturally refreshes these estimates through normal operation.
+        //
+        // See issue #2682 for the regression this caused.
 
         if old_cwnd != adaptive_min {
             tracing::warn!(
