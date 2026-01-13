@@ -564,3 +564,147 @@ fn test_bbr_adaptive_timeout_floor_with_high_bdp() {
         );
     }
 }
+
+// =============================================================================
+// Regression: Issue #2697 - BBR Death Spiral on High-Latency Links
+// =============================================================================
+
+/// Regression test for issue #2697: BBR timeout should preserve bandwidth/RTT estimates.
+///
+/// On high-latency links (125-250ms RTT), timeouts were causing `on_timeout()` to reset
+/// both `bw_filter` and `rtt_tracker`, which cleared all learned state. This caused:
+///
+/// 1. `max_bw()` returns 0 (bandwidth filter cleared)
+/// 2. `min_rtt()` returns None (RTT tracker reset to u64::MAX)
+/// 3. BDP calculation falls back to initial_cwnd (14KB)
+/// 4. With 250ms RTT and 14KB cwnd → max ~56KB/s throughput
+/// 5. Slow recovery triggers more timeouts → death spiral
+///
+/// The fix (PR #2699) preserves bandwidth and RTT estimates across timeouts since they
+/// represent physical path characteristics that don't change due to timeout.
+#[test]
+#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
+fn test_issue_2697_timeout_preserves_bandwidth_and_rtt() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    // Simulate HIGH_LATENCY conditions: 250ms RTT (intercontinental/satellite link)
+    let rtt = Duration::from_millis(250);
+    let packet_size = 1400;
+
+    // Phase 1: Establish good bandwidth/RTT measurements
+    for _ in 0..50 {
+        let mut tokens = Vec::new();
+        for _ in 0..20 {
+            tokens.push(controller.on_send(packet_size));
+        }
+        time.advance(rtt);
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+        }
+    }
+
+    let pre_timeout_max_bw = controller.max_bw();
+    let pre_timeout_min_rtt = controller.min_rtt();
+
+    // Verify we have good measurements before timeout
+    assert!(
+        pre_timeout_max_bw > 0,
+        "Should have bandwidth measurement before timeout"
+    );
+    assert!(
+        pre_timeout_min_rtt.is_some(),
+        "Should have RTT measurement before timeout"
+    );
+
+    // Phase 2: Trigger timeout (simulates spurious timeout on high-latency link)
+    controller.on_timeout();
+
+    let post_timeout_max_bw = controller.max_bw();
+    let post_timeout_min_rtt = controller.min_rtt();
+
+    // CRITICAL: Bandwidth and RTT must be preserved across timeout
+    // These represent physical path characteristics that don't change
+    assert!(
+        post_timeout_max_bw > 0,
+        "Bandwidth estimate must be preserved across timeout (was {}, now {})",
+        pre_timeout_max_bw,
+        post_timeout_max_bw
+    );
+    assert!(
+        post_timeout_min_rtt.is_some(),
+        "RTT estimate must be preserved across timeout (was {:?}, now {:?})",
+        pre_timeout_min_rtt,
+        post_timeout_min_rtt
+    );
+
+    // Verify reasonable preservation (allow some reduction but not total reset)
+    let bw_retention = post_timeout_max_bw as f64 / pre_timeout_max_bw as f64;
+    assert!(
+        bw_retention >= 0.25,
+        "Bandwidth should retain at least 25% after timeout (retained {:.1}%)",
+        bw_retention * 100.0
+    );
+}
+
+/// Regression test for issue #2697: Repeated timeouts must not wipe bandwidth estimates.
+///
+/// This simulates a realistic scenario where:
+/// 1. Connection operates on 250ms RTT link
+/// 2. ACK batching + jitter causes spurious timeouts
+/// 3. Each timeout should NOT wipe bandwidth state to 0
+/// 4. Bandwidth estimate should be preserved across each timeout
+#[test]
+#[ignore] // Requires PR #2699 fix - remove #[ignore] once BBR timeout reset is fixed
+fn test_issue_2697_repeated_timeouts_preserve_bandwidth() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(250);
+    let packet_size = 1400;
+
+    // Phase 1: Build up good state
+    for _ in 0..30 {
+        let mut tokens = Vec::new();
+        for _ in 0..20 {
+            tokens.push(controller.on_send(packet_size));
+        }
+        time.advance(rtt);
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+        }
+    }
+
+    let healthy_max_bw = controller.max_bw();
+    assert!(
+        healthy_max_bw > 0,
+        "Should have healthy bandwidth before storm"
+    );
+
+    // Phase 2: Simulate timeout storm - check bandwidth IMMEDIATELY after each timeout
+    for i in 0..5 {
+        controller.on_timeout();
+
+        // CRITICAL: Check bandwidth immediately after timeout (before any recovery)
+        let post_timeout_bw = controller.max_bw();
+        assert!(
+            post_timeout_bw > 0,
+            "Timeout #{}: Bandwidth must NOT reset to 0 (was {}, now {})",
+            i + 1,
+            healthy_max_bw,
+            post_timeout_bw
+        );
+
+        // Brief recovery attempt (2 RTTs worth of traffic)
+        for _ in 0..2 {
+            let mut tokens = Vec::new();
+            for _ in 0..5 {
+                tokens.push(controller.on_send(packet_size));
+            }
+            time.advance(rtt);
+            for token in tokens {
+                controller.on_ack_with_token(rtt, packet_size, Some(token));
+            }
+        }
+    }
+}
