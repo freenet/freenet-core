@@ -127,6 +127,18 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
     fn connection_idle_timeout(&self) -> Duration {
         Duration::from_secs(120) // default for RealTime
     }
+
+    /// Returns whether keepalive pings should be enabled for connections using this time source.
+    ///
+    /// VirtualTime returns `false` because:
+    /// 1. The interaction between auto-advance and keepalive timing causes spurious failures
+    /// 2. Aborting the keepalive task with VirtualTime causes hangs (abort() + VirtualSleep issue)
+    /// 3. Keepalive is meaningless for simulated connections anyway
+    ///
+    /// See issue #2695 for details.
+    fn supports_keepalive(&self) -> bool {
+        true // default for RealTime
+    }
 }
 
 /// Real-time implementation that delegates to tokio.
@@ -494,6 +506,11 @@ impl TimeSource for VirtualTime {
     /// takes ~14 minutes of real time.
     fn connection_idle_timeout(&self) -> Duration {
         Duration::from_secs(86400) // 24 hours
+    }
+
+    /// Disable keepalive for VirtualTime connections. See [`TimeSource::supports_keepalive`].
+    fn supports_keepalive(&self) -> bool {
+        false
     }
 }
 
