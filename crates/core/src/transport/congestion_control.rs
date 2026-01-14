@@ -1287,7 +1287,7 @@ mod tests {
             CongestionControlAlgorithm::FixedRate
         );
         let fixed_rate = controller.as_fixed_rate().unwrap();
-        assert_eq!(fixed_rate.rate(), 100 * 1_000_000 / 8); // 100 Mbps in bytes/sec
+        assert_eq!(fixed_rate.rate(), 50 * 1_000_000 / 8); // 50 Mbps in bytes/sec
     }
 
     #[test]
