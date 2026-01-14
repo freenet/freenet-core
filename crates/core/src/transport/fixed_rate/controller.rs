@@ -12,16 +12,13 @@ use crate::simulation::{RealTime, TimeSource};
 /// - Account for sequential multi-hop transfer (3-5x slower than single hop)
 /// - Remain conservative enough not to degrade other network usage
 /// - Work reliably across real network paths (validated on nova↔vega)
-///
-/// Note: Localhost tests may use BBR via FREENET_CONGESTION_CONTROL=bbr
-/// because FixedRate has timing issues on loopback interfaces.
 pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 12_500_000;
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
 pub struct FixedRateConfig {
     /// Target transmission rate in bytes per second.
-    /// Default: 50 Mbps (6,250,000 bytes/sec)
+    /// Default: 100 Mbps (12,500,000 bytes/sec)
     pub rate_bytes_per_sec: usize,
 }
 

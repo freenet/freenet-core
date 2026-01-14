@@ -139,8 +139,9 @@ impl<T: TimeSource> TokenBucket<T> {
         let now_nanos = self.time_source.now_nanos();
         let elapsed_nanos = now_nanos.saturating_sub(state.last_refill_nanos);
 
-        // Avoid precision issues with very small intervals (< 1ms)
-        if elapsed_nanos < 1_000_000 {
+        // Skip refill if no time has elapsed (handles repeated calls in same tick).
+        // Removed the 1ms guard that was causing token starvation on fast networks.
+        if elapsed_nanos == 0 {
             return;
         }
 
@@ -208,13 +209,15 @@ mod tests {
 
     #[test]
     fn test_token_bucket_immediate_tokens() {
-        let bucket = TokenBucket::new(10_000, 1_000_000);
+        // Use VirtualTime to prevent token refill during test
+        let time_source = VirtualTime::new();
+        let bucket = TokenBucket::new_with_time_source(10_000, 1_000_000, time_source);
 
         // Reserve less than available - should be immediate
         let wait = bucket.reserve(5_000);
         assert_eq!(wait, Duration::ZERO);
 
-        // Tokens already deducted
+        // Tokens already deducted (no time advanced, so no refill)
         assert_eq!(bucket.available_tokens(), 5_000);
     }
 
