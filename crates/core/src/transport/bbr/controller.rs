@@ -529,10 +529,10 @@ impl<T: TimeSource> BbrController<T> {
         // low bandwidth measurements, which causes premature STARTUP exit
         // before the cwnd floor has time to boost throughput.
         //
-        // Require at least 1 MB/s measured bandwidth before allowing exit.
+        // Require at least 100 KB/s measured bandwidth before allowing exit.
         // This is well above the death spiral threshold (~15 KB/s) but low
-        // enough for most network conditions.
-        const MIN_BW_FOR_STARTUP_EXIT: u64 = 1_000_000; // 1 MB/s
+        // enough for virtualized CI environments.
+        const MIN_BW_FOR_STARTUP_EXIT: u64 = 100_000; // 100 KB/s
         if max_bw < MIN_BW_FOR_STARTUP_EXIT {
             return;
         }
