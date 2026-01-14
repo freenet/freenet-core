@@ -50,7 +50,7 @@ impl TokenBucket<RealTime> {
     /// ```ignore
     /// use freenet::transport::token_bucket::TokenBucket;
     /// let bucket = TokenBucket::new(
-    ///     10_000,      // 10 KB burst
+    ///     1_000_000,   // 1 MB burst
     ///     1_000_000,   // 1 MB/s rate
     /// );
     /// ```

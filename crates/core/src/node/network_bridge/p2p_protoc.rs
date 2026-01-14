@@ -509,6 +509,7 @@ impl P2pConnManager {
             bandwidth_limit,
             global_bandwidth,
             ledbat_min_ssthresh,
+            None, // Uses FREENET_CONGESTION_CONTROL env var, defaults to FixedRate
         )
         .await?;
 

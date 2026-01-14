@@ -20,7 +20,7 @@
 //!
 //! Configure via `CongestionControlConfig`:
 //! ```ignore
-//! let config = CongestionControlConfig::fixed_rate(25_000_000); // 25 Mbps
+//! let config = CongestionControlConfig::fixed_rate(12_500_000); // 100 Mbps
 //! let controller = config.build();
 //! ```
 //!
