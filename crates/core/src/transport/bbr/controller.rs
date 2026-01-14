@@ -523,19 +523,6 @@ impl<T: TimeSource> BbrController<T> {
             self.full_bw_count.fetch_add(1, Ordering::AcqRel);
         }
 
-        // Don't exit Startup until we've achieved meaningful throughput.
-        // This prevents the bootstrap problem where low initial cwnd leads to
-        // low bandwidth measurements, which causes premature STARTUP exit
-        // before the cwnd floor has time to boost throughput.
-        //
-        // Require at least 100 KB/s measured bandwidth before allowing exit.
-        // This is well above the death spiral threshold (~15 KB/s) but low
-        // enough for virtualized CI environments.
-        const MIN_BW_FOR_STARTUP_EXIT: u64 = 100_000; // 100 KB/s
-        if max_bw < MIN_BW_FOR_STARTUP_EXIT {
-            return;
-        }
-
         // Exit Startup after STARTUP_FULL_BW_ROUNDS without growth
         if self.full_bw_count.load(Ordering::Acquire) >= STARTUP_FULL_BW_ROUNDS {
             self.state.enter_drain();
@@ -662,14 +649,14 @@ impl<T: TimeSource> BbrController<T> {
 
         // Compute target cwnd
         let mut target_cwnd = (bdp as f64 * cwnd_gain) as usize;
+        let state = self.state.load();
+        let startup_min_rate = self.config.startup_min_pacing_rate;
 
         // During Startup, ensure cwnd is large enough to utilize the minimum pacing rate.
         // This prevents the bootstrap problem where low cwnd limits sends, which limits
         // measured bandwidth, which keeps cwnd low.
         //
         // Startup min cwnd = startup_min_pacing_rate × min_rtt × cwnd_gain
-        let state = self.state.load();
-        let startup_min_rate = self.config.startup_min_pacing_rate;
         if state == BbrState::Startup {
             let min_rtt_nanos = self.rtt_tracker.min_rtt_nanos();
             if min_rtt_nanos != u64::MAX {
