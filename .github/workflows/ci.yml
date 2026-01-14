@@ -264,6 +264,8 @@ jobs:
           # Use mold linker to avoid rust-lld crashes (see issue #2519)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          # Use lower BBR startup pacing rate in CI (1 MB/s vs 25 MB/s default)
+          FREENET_BBR_STARTUP_RATE: "1000000"
         # Use Docker NAT to simulate realistic network topology where peers
         # are behind NAT and gateways are on the public network. This provides
         # better test coverage for NAT traversal and gateway connection code paths.

@@ -301,12 +301,11 @@ impl<T: TimeSource> BbrController<T> {
             }
         }
 
-        // Update cwnd and pacing rate FIRST so startup floors apply
-        // before state machine checks for bandwidth plateau
-        self.update_model();
-
-        // Run state machine
+        // Run state machine first to check for mode transitions
         self.update_state(now);
+
+        // Update cwnd and pacing rate based on current state
+        self.update_model();
     }
 
     /// Called when packets are detected as lost.
