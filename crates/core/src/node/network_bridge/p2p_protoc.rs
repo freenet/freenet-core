@@ -2698,7 +2698,10 @@ impl P2pConnManager {
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
-            GlobalExecutor::spawn(async move {
+            // Use tokio::spawn directly instead of GlobalExecutor::spawn.
+            // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
+            // reliably poll tasks in certain test contexts (see issue #2709).
+            tokio::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
             // Yield to allow the spawned peer_connection_listener task to start.
