@@ -12,7 +12,7 @@ use super::bandwidth::BandwidthFilter;
 use super::config::{
     BbrConfig, BETA, DRAIN_PACING_GAIN, PROBE_BW_CWND_GAIN, PROBE_RTT_CWND_GAIN,
     PROBE_RTT_MIN_CWND, STARTUP_CWND_GAIN, STARTUP_FULL_BW_ROUNDS, STARTUP_FULL_BW_THRESHOLD,
-    STARTUP_LOSS_THRESHOLD, STARTUP_MIN_PACING_RATE, STARTUP_PACING_GAIN,
+    STARTUP_LOSS_THRESHOLD, STARTUP_PACING_GAIN,
 };
 use super::delivery_rate::{DeliveryRateSampler, DeliveryRateToken};
 use super::rtt::RttTracker;
@@ -150,8 +150,8 @@ impl<T: TimeSource> BbrController<T> {
         let epoch_nanos = time_source.now_nanos();
         let initial_cwnd = config.initial_cwnd;
 
-        // Initial pacing rate: use STARTUP_MIN_PACING_RATE to prevent bootstrap death spiral
-        let initial_pacing_rate = STARTUP_MIN_PACING_RATE;
+        // Initial pacing rate: use startup_min_pacing_rate to prevent bootstrap death spiral
+        let initial_pacing_rate = config.startup_min_pacing_rate;
 
         Self {
             config,
@@ -214,11 +214,11 @@ impl<T: TimeSource> BbrController<T> {
         // misleadingly low samples.
         if !self.bw_filter.has_samples(now) {
             // No valid bandwidth samples - ensure pacing rate allows probing.
-            // Use STARTUP_MIN_PACING_RATE to prevent bootstrap death spiral.
+            // Use startup_min_pacing_rate to prevent bootstrap death spiral.
+            let min_rate = self.config.startup_min_pacing_rate;
             let current_rate = self.pacing_rate.load(Ordering::Acquire);
-            if current_rate < STARTUP_MIN_PACING_RATE {
-                self.pacing_rate
-                    .store(STARTUP_MIN_PACING_RATE, Ordering::Release);
+            if current_rate < min_rate {
+                self.pacing_rate.store(min_rate, Ordering::Release);
             }
         }
 
@@ -668,13 +668,14 @@ impl<T: TimeSource> BbrController<T> {
         // This prevents the bootstrap problem where low cwnd limits sends, which limits
         // measured bandwidth, which keeps cwnd low.
         //
-        // Startup min cwnd = STARTUP_MIN_PACING_RATE × min_rtt × cwnd_gain
+        // Startup min cwnd = startup_min_pacing_rate × min_rtt × cwnd_gain
         let state = self.state.load();
+        let startup_min_rate = self.config.startup_min_pacing_rate;
         if state == BbrState::Startup {
             let min_rtt_nanos = self.rtt_tracker.min_rtt_nanos();
             if min_rtt_nanos != u64::MAX {
-                let startup_bdp = (STARTUP_MIN_PACING_RATE as u128 * min_rtt_nanos as u128
-                    / 1_000_000_000) as usize;
+                let startup_bdp =
+                    (startup_min_rate as u128 * min_rtt_nanos as u128 / 1_000_000_000) as usize;
                 let startup_min_cwnd = (startup_bdp as f64 * cwnd_gain) as usize;
                 target_cwnd = target_cwnd.max(startup_min_cwnd);
             }
@@ -704,7 +705,7 @@ impl<T: TimeSource> BbrController<T> {
         // which limits measured bandwidth, which limits pacing further.
         // This allows BBR to discover actual available bandwidth.
         if state == BbrState::Startup {
-            pacing_rate = pacing_rate.max(STARTUP_MIN_PACING_RATE);
+            pacing_rate = pacing_rate.max(startup_min_rate);
         }
 
         self.pacing_rate

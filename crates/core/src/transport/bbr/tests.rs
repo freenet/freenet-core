@@ -1173,7 +1173,7 @@ fn test_longer_transfer_achieves_higher_throughput(
     );
 
     // Throughput should be sustained at reasonable levels across all stages.
-    // Note: Stage 1 is artificially boosted by STARTUP_MIN_PACING_RATE, so later
+    // Note: Stage 1 is artificially boosted by startup_min_pacing_rate, so later
     // stages may have slightly lower throughput than Stage 1. The key metric is
     // that throughput doesn't COLLAPSE (which would indicate the bootstrap
     // death spiral bug).

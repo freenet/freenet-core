@@ -54,6 +54,26 @@ const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 /// This prevents unbounded growth of the last_asym_attempt HashMap.
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Create BBR config with optional environment variable override for startup pacing rate.
+///
+/// In CI or constrained environments, set FREENET_BBR_STARTUP_RATE to a lower value
+/// (e.g., "5000000" for 5 MB/s) to reduce aggressiveness during startup.
+fn bbr_config_with_env_override() -> CongestionControlConfig {
+    let mut config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
+
+    if let Ok(rate_str) = std::env::var("FREENET_BBR_STARTUP_RATE") {
+        if let Ok(rate) = rate_str.parse::<u64>() {
+            tracing::debug!(
+                "Using custom BBR startup pacing rate from FREENET_BBR_STARTUP_RATE: {} bytes/sec",
+                rate
+            );
+            config = config.with_startup_min_pacing_rate(rate);
+        }
+    }
+
+    config
+}
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S, T> = BoxFuture<
@@ -218,9 +238,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             last_asym_attempt: HashMap::new(),
             time_source,
             // Production uses BBR - set explicitly since Default is now FixedRate
-            congestion_config: Some(CongestionControlConfig::new(
-                CongestionControlAlgorithm::Bbr,
-            )),
+            // Note: FREENET_BBR_STARTUP_RATE env var can override for CI/testing
+            congestion_config: Some(bbr_config_with_env_override()),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,

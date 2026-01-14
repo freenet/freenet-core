@@ -184,6 +184,9 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          # Use lower BBR startup pacing rate in CI (5 MB/s vs 25 MB/s default)
+          # to reduce aggressiveness in virtualized network environments
+          FREENET_BBR_STARTUP_RATE: "5000000"
         # Run all tests in parallel using all 16 cores (simulation tests excluded via feature flag)
         run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=16
 

@@ -19,7 +19,7 @@ pub(crate) const MSS: usize = MAX_DATA_SIZE;
 /// This allows BBR to double its sending rate each round trip during Startup.
 pub(crate) const STARTUP_PACING_GAIN: f64 = 2.77;
 
-/// Minimum pacing rate during Startup: 25 MB/s.
+/// Default minimum pacing rate during Startup: 25 MB/s.
 ///
 /// This floor prevents the "bootstrap death spiral" where:
 /// 1. Low pacing_rate limits how fast we send
@@ -30,9 +30,10 @@ pub(crate) const STARTUP_PACING_GAIN: f64 = 2.77;
 /// available bandwidth. Once BBR exits Startup (via bandwidth plateau or loss),
 /// it uses the measured bandwidth without this floor.
 ///
-/// 25 MB/s is chosen to handle high-bandwidth links while still being safe
-/// for most network paths (congestion will trigger loss-based exit from Startup).
-pub(crate) const STARTUP_MIN_PACING_RATE: u64 = 25_000_000;
+/// 25 MB/s handles high-bandwidth links while congestion triggers loss-based
+/// exit from Startup on constrained paths. Can be lowered via BbrConfig for
+/// testing or constrained environments.
+pub(crate) const DEFAULT_STARTUP_MIN_PACING_RATE: u64 = 25_000_000;
 
 /// Startup cwnd gain: 2.0
 /// Provides headroom for ACK aggregation during startup.
@@ -147,6 +148,11 @@ pub struct BbrConfig {
     /// ProbeRTT interval randomization range (±).
     /// Adds jitter to prevent synchronized ProbeRTT across flows.
     pub probe_rtt_jitter: Duration,
+
+    /// Minimum pacing rate during Startup (bytes/sec).
+    /// Prevents bootstrap death spiral on high-latency links.
+    /// Default is 25 MB/s; can be lowered for testing.
+    pub startup_min_pacing_rate: u64,
 }
 
 impl Default for BbrConfig {
@@ -163,6 +169,8 @@ impl Default for BbrConfig {
             enable_probe_rtt: true,
             // ±2.5s jitter on ProbeRTT interval
             probe_rtt_jitter: Duration::from_millis(2500),
+            // 25 MB/s default startup pacing floor
+            startup_min_pacing_rate: DEFAULT_STARTUP_MIN_PACING_RATE,
         }
     }
 }
