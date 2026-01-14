@@ -255,7 +255,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let pending_pings_for_task = pending_pings.clone();
 
         let task_time_source = time_source.clone();
+        let keepalive_enabled = time_source.supports_keepalive();
         let keep_alive_handle = GlobalExecutor::spawn(async move {
+            // Exit immediately if keepalive is disabled for this time source.
+            // VirtualTime disables keepalive because auto-advance + keepalive timing
+            // causes spurious connection closures. See issue #2695.
+            if !keepalive_enabled {
+                tracing::debug!(
+                    target: "freenet_core::transport::keepalive_lifecycle",
+                    remote = ?remote_addr,
+                    "Keep-alive task SKIPPED (time source does not support keepalive)"
+                );
+                return;
+            }
+
             tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,

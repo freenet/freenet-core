@@ -15,8 +15,10 @@ use dashmap::DashMap;
 use freenet::simulation::{TimeSource, VirtualTime};
 use freenet::transport::congestion_control::CongestionControlConfig;
 use freenet::transport::mock_transport::{
-    create_mock_peer_with_congestion_config, Channels, PacketDelayPolicy, PacketDropPolicy,
+    create_mock_peer_with_congestion_config, Channels, MockSocket, PacketDelayPolicy,
+    PacketDropPolicy,
 };
+use freenet::transport::PeerConnection;
 use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,19 +129,36 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                         }
                     };
 
-                    // Send from B to A
-                    let send_result = conn_b.send(message).await;
-                    let sent_ok = match send_result {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!("cold_start send failed: {:?}", e);
-                            false
-                        }
-                    };
+                    // IMPORTANT: PeerConnection requires bidirectional recv() polling for
+                    // congestion control to work - the sender needs to process incoming ACKs.
+                    // We use tokio::select! with biased to run recv on both sides concurrently.
+                    // See comment in outbound_stream.rs about cwnd waiting.
 
-                    // Receive at A
+                    // Start the send (returns immediately, spawns outbound_stream task)
+                    let send_result = conn_b.send(message).await;
+                    let sent_ok = send_result.is_ok();
+
+                    // Now run both recv() calls concurrently until receiver gets the message
+                    // The sender's recv() processes ACKs to unblock the outbound_stream task
                     let received_len = if sent_ok {
-                        match conn_a.recv().await {
+                        let mut recv_result = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                // Receiver side - wait for the actual data
+                                result = conn_a.recv(), if recv_result.is_none() => {
+                                    recv_result = Some(result);
+                                }
+                                // Sender side - process ACKs to unblock cwnd
+                                _ = conn_b.recv() => {
+                                    // ACK processed, continue loop
+                                }
+                            }
+                            if recv_result.is_some() {
+                                break;
+                            }
+                        }
+                        match recv_result.unwrap() {
                             Ok(received) => {
                                 std_black_box(&received);
                                 received.len()
@@ -153,7 +172,6 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                         0
                     };
 
-                    // Keep peers alive until end of iteration
                     drop(conn_a);
                     drop(conn_b);
                     drop(peer_a);
@@ -284,22 +302,47 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                         }
                     };
 
-                    // Send warmup transfers (send then recv for each)
+                    // Helper: bidirectional send/recv using select!
+                    // Returns (sent_ok, received_data_or_empty)
+                    async fn bidirectional_transfer(
+                        sender: &mut PeerConnection<MockSocket, VirtualTime>,
+                        receiver: &mut PeerConnection<MockSocket, VirtualTime>,
+                        data: Vec<u8>,
+                    ) -> (bool, Vec<u8>) {
+                        let send_result = sender.send(data).await;
+                        let sent_ok = send_result.is_ok();
+                        if !sent_ok {
+                            return (false, vec![]);
+                        }
+                        let mut recv_result = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                result = receiver.recv(), if recv_result.is_none() => {
+                                    recv_result = Some(result);
+                                }
+                                _ = sender.recv() => {}
+                            }
+                            if recv_result.is_some() {
+                                break;
+                            }
+                        }
+                        match recv_result.unwrap() {
+                            Ok(data) => (true, data),
+                            Err(_) => (false, vec![]),
+                        }
+                    }
+
+                    // Send warmup transfers with bidirectional handling
                     let mut warmup_ok = true;
                     for i in 0..WARMUP_COUNT {
                         let warmup_msg = vec![0xABu8; warmup_size];
-                        if let Err(e) = conn_a.send(warmup_msg).await {
-                            eprintln!("warm warmup send {} failed: {:?}", i, e);
+                        let (ok, _) =
+                            bidirectional_transfer(&mut conn_a, &mut conn_b, warmup_msg).await;
+                        if !ok {
+                            eprintln!("warm warmup {} failed", i);
                             warmup_ok = false;
                             break;
-                        }
-                        match conn_b.recv().await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!("warm warmup recv {} failed: {:?}", i, e);
-                                warmup_ok = false;
-                                break;
-                            }
                         }
                     }
 
@@ -313,30 +356,19 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                         continue;
                     }
 
-                    // Send measured transfer
+                    // Send measured transfer with bidirectional handling
                     let message = vec![0xABu8; transfer_size];
-                    let send_result = conn_a.send(message).await;
-                    let sent_ok = match send_result {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!("warm measured send failed: {:?}", e);
-                            false
-                        }
-                    };
-
-                    // Receive measured transfer
-                    let received_len = if sent_ok {
-                        match conn_b.recv().await {
-                            Ok(received) => {
-                                std_black_box(&received);
-                                received.len()
-                            }
-                            Err(e) => {
-                                eprintln!("warm measured recv failed: {:?}", e);
-                                0
-                            }
-                        }
+                    let (sent_ok, received) =
+                        bidirectional_transfer(&mut conn_a, &mut conn_b, message).await;
+                    let received_len = if sent_ok && !received.is_empty() {
+                        std_black_box(&received);
+                        received.len()
                     } else {
+                        if !sent_ok {
+                            eprintln!("warm measured send failed");
+                        } else {
+                            eprintln!("warm measured recv failed");
+                        }
                         0
                     };
 
@@ -460,19 +492,26 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                         }
                     };
 
-                    // Send from A to B
+                    // Send from A to B with bidirectional handling
+                    // See cold_start benchmark for explanation of why this is needed
                     let send_result = conn_a.send(message).await;
-                    let sent_ok = match send_result {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!("cwnd_evolution send failed: {:?}", e);
-                            false
-                        }
-                    };
+                    let sent_ok = send_result.is_ok();
 
-                    // Receive at B
                     let received = if sent_ok {
-                        match conn_b.recv().await {
+                        let mut recv_result = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                result = conn_b.recv(), if recv_result.is_none() => {
+                                    recv_result = Some(result);
+                                }
+                                _ = conn_a.recv() => {}
+                            }
+                            if recv_result.is_some() {
+                                break;
+                            }
+                        }
+                        match recv_result.unwrap() {
                             Ok(received) => Some(received),
                             Err(e) => {
                                 eprintln!("cwnd_evolution recv failed: {:?}", e);
@@ -480,6 +519,7 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
                             }
                         }
                     } else {
+                        eprintln!("cwnd_evolution send failed");
                         None
                     };
 
@@ -622,19 +662,25 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                             }
                         };
 
-                        // Send from A to B
+                        // Send from A to B with bidirectional handling
                         let send_result = conn_a.send(message).await;
-                        let sent_ok = match send_result {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("rtt_{} send failed: {:?}", rtt_ms, e);
-                                false
-                            }
-                        };
+                        let sent_ok = send_result.is_ok();
 
-                        // Receive at B
                         let received_len = if sent_ok {
-                            match conn_b.recv().await {
+                            let mut recv_result = None;
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    result = conn_b.recv(), if recv_result.is_none() => {
+                                        recv_result = Some(result);
+                                    }
+                                    _ = conn_a.recv() => {}
+                                }
+                                if recv_result.is_some() {
+                                    break;
+                                }
+                            }
+                            match recv_result.unwrap() {
                                 Ok(received) => {
                                     std_black_box(&received);
                                     received.len()
@@ -645,6 +691,7 @@ pub fn bench_rtt_scenarios(c: &mut Criterion) {
                                 }
                             }
                         } else {
+                            eprintln!("rtt_{} send failed", rtt_ms);
                             0
                         };
 
@@ -723,7 +770,21 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
                             auto_advance.abort();
                             continue;
                         }
-                        let received: Vec<u8> = match peers.conn_b.recv().await {
+                        // Bidirectional recv for congestion control
+                        let mut recv_result = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                result = peers.conn_b.recv(), if recv_result.is_none() => {
+                                    recv_result = Some(result);
+                                }
+                                _ = peers.conn_a.recv() => {}
+                            }
+                            if recv_result.is_some() {
+                                break;
+                            }
+                        }
+                        let received: Vec<u8> = match recv_result.unwrap() {
                             Ok(r) => r,
                             Err(e) => {
                                 eprintln!("high_bandwidth recv failed: {:?}", e);
