@@ -303,10 +303,10 @@ impl<T: TimeSource> BbrController<T> {
             }
         }
 
-        // Run state machine
+        // Run state machine first to check for mode transitions
         self.update_state(now);
 
-        // Update cwnd and pacing rate
+        // Update cwnd and pacing rate based on current state
         self.update_model();
     }
 
@@ -651,6 +651,23 @@ impl<T: TimeSource> BbrController<T> {
 
         // Compute target cwnd
         let mut target_cwnd = (bdp as f64 * cwnd_gain) as usize;
+        let state = self.state.load();
+        let startup_min_rate = self.config.startup_min_pacing_rate;
+
+        // During Startup, ensure cwnd is large enough to utilize the minimum pacing rate.
+        // This prevents the bootstrap problem where low cwnd limits sends, which limits
+        // measured bandwidth, which keeps cwnd low.
+        //
+        // Startup min cwnd = startup_min_pacing_rate × min_rtt × cwnd_gain
+        if state == BbrState::Startup {
+            let min_rtt_nanos = self.rtt_tracker.min_rtt_nanos();
+            if min_rtt_nanos != u64::MAX {
+                let startup_bdp =
+                    (startup_min_rate as u128 * min_rtt_nanos as u128 / 1_000_000_000) as usize;
+                let startup_min_cwnd = (startup_bdp as f64 * cwnd_gain) as usize;
+                target_cwnd = target_cwnd.max(startup_min_cwnd);
+            }
+        }
 
         // Apply inflight_hi bound (loss response) before min_cwnd
         let inflight_hi = self.inflight_hi.load(Ordering::Acquire);
@@ -669,24 +686,18 @@ impl<T: TimeSource> BbrController<T> {
         let bw_hi = self.bw_hi.load(Ordering::Acquire);
         let effective_bw = max_bw.min(bw_hi);
 
-        let pacing_rate = (effective_bw as f64 * pacing_gain) as u64;
+        let mut pacing_rate = (effective_bw as f64 * pacing_gain) as u64;
 
-        // Apply minimum pacing rate floor during Startup to ensure we can probe for bandwidth.
-        // Without this, low initial samples can cause a death spiral where:
-        //   low samples → low pacing → slow sending → low samples
-        // During Startup, we should be aggressive about probing (1 MB/s minimum).
-        // After Startup, we trust the measured bandwidth more.
-        const STARTUP_MIN_PACING_RATE: u64 = 1_000_000; // 1 MB/s
-        const MIN_PACING_RATE: u64 = 10_000; // 10 KB/s absolute floor
-
-        let min_rate = if self.state.load() == BbrState::Startup {
-            STARTUP_MIN_PACING_RATE
-        } else {
-            MIN_PACING_RATE
-        };
+        // During Startup, apply a minimum pacing rate floor to prevent
+        // the "bootstrap death spiral" where low pacing limits sends,
+        // which limits measured bandwidth, which limits pacing further.
+        // This allows BBR to discover actual available bandwidth.
+        if state == BbrState::Startup {
+            pacing_rate = pacing_rate.max(startup_min_rate);
+        }
 
         self.pacing_rate
-            .store(pacing_rate.max(min_rate), Ordering::Release);
+            .store(pacing_rate.max(1), Ordering::Release);
     }
 
     /// Compute the Bandwidth-Delay Product.

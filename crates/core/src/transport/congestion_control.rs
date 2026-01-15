@@ -808,7 +808,11 @@ pub struct CongestionControlConfig {
 #[non_exhaustive]
 pub enum AlgorithmConfig {
     /// BBR specific configuration.
-    Bbr,
+    Bbr {
+        /// Minimum pacing rate during Startup (bytes/sec).
+        /// Default is 25 MB/s; can be lowered for testing.
+        startup_min_pacing_rate: u64,
+    },
     /// LEDBAT++ specific configuration.
     Ledbat {
         /// Enable slow start phase.
@@ -907,7 +911,9 @@ impl CongestionControlConfig {
             max_cwnd: config.max_cwnd,
             ssthresh: 1_000_000,
             min_ssthresh: None,
-            algorithm_config: AlgorithmConfig::Bbr,
+            algorithm_config: AlgorithmConfig::Bbr {
+                startup_min_pacing_rate: config.startup_min_pacing_rate,
+            },
         }
     }
 
@@ -938,6 +944,20 @@ impl CongestionControlConfig {
     /// Set the minimum ssthresh floor for timeout recovery.
     pub fn with_min_ssthresh(mut self, min_ssthresh: Option<usize>) -> Self {
         self.min_ssthresh = min_ssthresh;
+        self
+    }
+
+    /// Set the startup minimum pacing rate for BBR (bytes/sec).
+    ///
+    /// This only affects BBR configurations. For other algorithms, this is ignored.
+    /// Lower values are safer for virtualized/constrained network environments (like CI).
+    pub fn with_startup_min_pacing_rate(mut self, rate: u64) -> Self {
+        if let AlgorithmConfig::Bbr {
+            ref mut startup_min_pacing_rate,
+        } = self.algorithm_config
+        {
+            *startup_min_pacing_rate = rate;
+        }
         self
     }
 
@@ -977,10 +997,18 @@ impl CongestionControlConfig {
     fn build_inner<T: TimeSource>(&self, time_source: T) -> CongestionController<T> {
         match self.algorithm {
             CongestionControlAlgorithm::Bbr => {
+                let startup_min_pacing_rate = match &self.algorithm_config {
+                    AlgorithmConfig::Bbr {
+                        startup_min_pacing_rate,
+                    } => *startup_min_pacing_rate,
+                    _ => BbrConfig::default().startup_min_pacing_rate,
+                };
+
                 let bbr_config = BbrConfig {
                     initial_cwnd: self.initial_cwnd,
                     min_cwnd: self.min_cwnd,
                     max_cwnd: self.max_cwnd,
+                    startup_min_pacing_rate,
                     ..Default::default()
                 };
 
@@ -1047,7 +1075,7 @@ impl CongestionControlConfig {
     /// Convert to the native LedbatConfig if this is a LEDBAT configuration.
     pub fn as_ledbat_config(&self) -> Option<LedbatConfig> {
         match &self.algorithm_config {
-            AlgorithmConfig::Bbr | AlgorithmConfig::FixedRate { .. } => None,
+            AlgorithmConfig::Bbr { .. } | AlgorithmConfig::FixedRate { .. } => None,
             AlgorithmConfig::Ledbat {
                 enable_slow_start,
                 delay_exit_threshold,
@@ -1070,10 +1098,13 @@ impl CongestionControlConfig {
     /// Convert to the native BbrConfig if this is a BBR configuration.
     pub fn as_bbr_config(&self) -> Option<BbrConfig> {
         match &self.algorithm_config {
-            AlgorithmConfig::Bbr => Some(BbrConfig {
+            AlgorithmConfig::Bbr {
+                startup_min_pacing_rate,
+            } => Some(BbrConfig {
                 initial_cwnd: self.initial_cwnd,
                 min_cwnd: self.min_cwnd,
                 max_cwnd: self.max_cwnd,
+                startup_min_pacing_rate: *startup_min_pacing_rate,
                 ..Default::default()
             }),
             AlgorithmConfig::Ledbat { .. } | AlgorithmConfig::FixedRate { .. } => None,
@@ -1086,7 +1117,7 @@ impl CongestionControlConfig {
             AlgorithmConfig::FixedRate { rate_bytes_per_sec } => {
                 Some(FixedRateConfig::new(*rate_bytes_per_sec))
             }
-            AlgorithmConfig::Bbr | AlgorithmConfig::Ledbat { .. } => None,
+            AlgorithmConfig::Bbr { .. } | AlgorithmConfig::Ledbat { .. } => None,
         }
     }
 }

@@ -238,7 +238,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             last_asym_attempt: HashMap::new(),
             time_source,
             // Check FREENET_CONGESTION_CONTROL env var, default to FixedRate for production.
-            // Tests can set FREENET_CONGESTION_CONTROL=bbr for faster localhost transfers.
+            // Set FREENET_CONGESTION_CONTROL=bbr for BBR congestion control.
+            // For BBR, FREENET_BBR_STARTUP_RATE can override the startup pacing rate.
             congestion_config: Some(congestion_config.unwrap_or_else(|| {
                 let algo = match std::env::var("FREENET_CONGESTION_CONTROL")
                     .unwrap_or_default()
@@ -249,7 +250,20 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                     "ledbat" => CongestionControlAlgorithm::Ledbat,
                     _ => CongestionControlAlgorithm::FixedRate, // Default for production
                 };
-                CongestionControlConfig::new(algo)
+                let mut config = CongestionControlConfig::new(algo);
+                // Allow overriding BBR startup pacing rate via env var (for CI/testing)
+                if algo == CongestionControlAlgorithm::Bbr {
+                    if let Ok(rate_str) = std::env::var("FREENET_BBR_STARTUP_RATE") {
+                        if let Ok(rate) = rate_str.parse::<u64>() {
+                            tracing::debug!(
+                                "Using custom BBR startup pacing rate: {} bytes/sec",
+                                rate
+                            );
+                            config = config.with_startup_min_pacing_rate(rate);
+                        }
+                    }
+                }
+                config
             })),
         };
         let connection_handler = OutboundConnectionHandler {

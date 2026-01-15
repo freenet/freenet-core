@@ -41,17 +41,16 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
                     // Create FRESH VirtualTime for each iter_custom call
                     let ts = VirtualTime::new();
 
-                    // Create connection FIRST before auto-advance to avoid
-                    // timeouts during handshake
+                    // Spawn auto-advance task BEFORE connection - handshake has
+                    // VirtualTime-dependent timeouts that require time to advance
+                    let auto_advance = spawn_auto_advance_task(ts.clone());
+
                     let channels: Channels = Arc::new(DashMap::new());
                     let mut peers =
                         create_peer_pair_with_virtual_time(channels, Duration::ZERO, ts.clone())
                             .await
                             .connect()
                             .await;
-
-                    // Spawn auto-advance task AFTER connection is established
-                    let auto_advance = spawn_auto_advance_task(ts.clone());
 
                     let mut total_virtual_time = Duration::ZERO;
 
@@ -118,8 +117,10 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                         // Create FRESH VirtualTime for each iter_custom call
                         let ts = VirtualTime::new();
 
-                        // Create connection FIRST before auto-advance to avoid
-                        // timeouts during handshake
+                        // Spawn auto-advance task BEFORE connection - handshake has
+                        // VirtualTime-dependent timeouts that require time to advance
+                        let auto_advance = spawn_auto_advance_task(ts.clone());
+
                         let channels: Channels = Arc::new(DashMap::new());
                         let mut peers = create_peer_pair_with_virtual_time(
                             channels,
@@ -129,9 +130,6 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
                         .await
                         .connect()
                         .await;
-
-                        // Spawn auto-advance task AFTER connection is established
-                        let auto_advance = spawn_auto_advance_task(ts.clone());
 
                         let mut total_virtual_time = Duration::ZERO;
 
