@@ -3549,6 +3549,15 @@ async fn peer_connection_listener(
     );
 
     loop {
+        // Yield to allow the tokio runtime to schedule other tasks.
+        // This is critical for cooperative scheduling - without it, tokio's coop
+        // budget can be exhausted and channel recv() will return Pending even when
+        // messages are available. See https://github.com/tokio-rs/tokio/issues/7108
+        //
+        // We cannot add this yield inside deterministic_select! because it would
+        // break determinism guarantees for simulation testing.
+        tokio::task::yield_now().await;
+
         // Drain all pending outbound messages first before checking inbound.
         // This ensures queued outbound messages are sent promptly without starving
         // the inbound channel (which would happen with biased select).
