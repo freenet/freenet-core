@@ -150,8 +150,8 @@ impl<T: TimeSource> BbrController<T> {
         let epoch_nanos = time_source.now_nanos();
         let initial_cwnd = config.initial_cwnd;
 
-        // Initial pacing rate: use startup_min_pacing_rate to prevent bootstrap death spiral
-        let initial_pacing_rate = config.startup_min_pacing_rate;
+        // Initial pacing rate: assume 1 MB/s until we have measurements
+        let initial_pacing_rate = 1_000_000u64;
 
         Self {
             config,
@@ -214,11 +214,13 @@ impl<T: TimeSource> BbrController<T> {
         // misleadingly low samples.
         if !self.bw_filter.has_samples(now) {
             // No valid bandwidth samples - ensure pacing rate allows probing.
-            // Use startup_min_pacing_rate to prevent bootstrap death spiral.
-            let min_rate = self.config.startup_min_pacing_rate;
+            // Initial rate of 1 MB/s is aggressive enough to discover real bandwidth
+            // while not overwhelming the network.
+            const INITIAL_PACING_RATE: u64 = 1_000_000;
             let current_rate = self.pacing_rate.load(Ordering::Acquire);
-            if current_rate < min_rate {
-                self.pacing_rate.store(min_rate, Ordering::Release);
+            if current_rate < INITIAL_PACING_RATE {
+                self.pacing_rate
+                    .store(INITIAL_PACING_RATE, Ordering::Release);
             }
         }
 
