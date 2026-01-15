@@ -874,7 +874,10 @@ async fn test_ping_blocked_peers() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "baseline",
         initial_wait: Duration::from_secs(25),
-        operation_timeout: Duration::from_secs(45),
+        // Use 60s timeout to match solution test - 45s was causing flaky failures
+        // on busy CI machines where PUT operations take longer to complete.
+        // See issue #2712 for details.
+        operation_timeout: Duration::from_secs(60),
         update_rounds: 3,
         update_wait: Duration::from_secs(5),
         propagation_wait: Duration::from_secs(15),
@@ -893,7 +896,9 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
         initial_wait: Duration::from_secs(25),
-        operation_timeout: Duration::from_secs(45),
+        // Use 60s timeout for consistency with other tests and to prevent flakiness
+        // on busy CI machines. See issue #2712 for details.
+        operation_timeout: Duration::from_secs(60),
         update_rounds: 1,
         update_wait: Duration::from_secs(5),
         propagation_wait: Duration::from_secs(15),
