@@ -168,7 +168,7 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
-pub(crate) use self::connection_handler::create_connection_handler;
+pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
@@ -206,8 +206,11 @@ pub enum TransportError {
     Serialization(#[from] bincode::Error),
 }
 
-/// Make connection handler more testable
-pub(crate) trait Socket: Sized + Send + Sync + 'static {
+/// Socket trait for abstracting UDP communication.
+///
+/// This trait allows the transport layer to work with both real UDP sockets
+/// and mock sockets for testing.
+pub trait Socket: Sized + Send + Sync + 'static {
     fn bind(addr: SocketAddr) -> impl Future<Output = io::Result<Self>> + Send;
     fn recv_from(
         &self,

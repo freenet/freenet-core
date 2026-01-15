@@ -14,6 +14,17 @@
 //! Using `biased` makes selection deterministic but always polls branches in declaration order,
 //! which can cause starvation. This macro provides fair selection that is still deterministic.
 //!
+//! # Cooperative scheduling note
+//!
+//! This macro uses `std::future::poll_fn` which does NOT respect tokio's cooperative
+//! scheduling budget. In tight loops, this can exhaust the coop budget, causing channel
+//! recv() to return Pending even when messages are available.
+//! See <https://github.com/tokio-rs/tokio/issues/7108>.
+//!
+//! **Solution**: Callers should add `tokio::task::yield_now().await` at the start of
+//! tight loops that use this macro. We cannot add the yield inside the macro because
+//! it would break determinism guarantees for simulation testing.
+//!
 //! # Supported features
 //!
 //! - Up to 5 branches

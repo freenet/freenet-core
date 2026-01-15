@@ -5,14 +5,20 @@ use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
 
-/// Default rate: 25 Mbps in bytes/sec (25 * 1_000_000 / 8)
-pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 3_125_000;
+/// Default rate: 100 Mbps in bytes/sec (100 * 1_000_000 / 8)
+///
+/// This rate is chosen to:
+/// - Support fast contract retrieval (user-visible critical path)
+/// - Account for sequential multi-hop transfer (3-5x slower than single hop)
+/// - Remain conservative enough not to degrade other network usage
+/// - Work reliably across real network paths (validated on nova↔vega)
+pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 12_500_000;
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
 pub struct FixedRateConfig {
     /// Target transmission rate in bytes per second.
-    /// Default: 25 Mbps (3,125,000 bytes/sec)
+    /// Default: 100 Mbps (12,500,000 bytes/sec)
     pub rate_bytes_per_sec: usize,
 }
 
@@ -155,7 +161,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = FixedRateConfig::default();
-        assert_eq!(config.rate_bytes_per_sec, 3_125_000); // 25 Mbps
+        assert_eq!(config.rate_bytes_per_sec, 12_500_000); // 100 Mbps
     }
 
     #[test]

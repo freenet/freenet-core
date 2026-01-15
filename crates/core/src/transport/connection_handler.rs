@@ -54,26 +54,6 @@ const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 /// This prevents unbounded growth of the last_asym_attempt HashMap.
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Create BBR config with optional environment variable override for startup pacing rate.
-///
-/// In CI or constrained environments, set FREENET_BBR_STARTUP_RATE to a lower value
-/// (e.g., "5000000" for 5 MB/s) to reduce aggressiveness during startup.
-fn bbr_config_with_env_override() -> CongestionControlConfig {
-    let mut config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
-
-    if let Ok(rate_str) = std::env::var("FREENET_BBR_STARTUP_RATE") {
-        if let Ok(rate) = rate_str.parse::<u64>() {
-            tracing::debug!(
-                "Using custom BBR startup pacing rate from FREENET_BBR_STARTUP_RATE: {} bytes/sec",
-                rate
-            );
-            config = config.with_startup_min_pacing_rate(rate);
-        }
-    }
-
-    config
-}
-
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S, T> = BoxFuture<
@@ -101,7 +81,23 @@ const SOCKET_BIND_MAX_RETRIES: usize = 5;
 const SOCKET_BIND_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new(Duration::from_millis(50), Duration::from_secs(1));
 
-pub(crate) async fn create_connection_handler<S: Socket>(
+/// Create a pair of connection handlers for managing transport connections.
+///
+/// This is the main entry point for establishing UDP connections with NAT traversal.
+/// Returns an outbound handler (for initiating connections) and inbound handler
+/// (for receiving connection notifications).
+///
+/// # Arguments
+/// * `keypair` - X25519 keypair for this peer
+/// * `listen_host` - IP address to bind to (use 0.0.0.0 for all interfaces)
+/// * `listen_port` - UDP port to bind to
+/// * `is_gateway` - Whether this peer acts as a gateway
+/// * `bandwidth_limit` - Optional per-connection bandwidth limit in bytes/sec
+/// * `global_bandwidth` - Optional shared bandwidth manager
+/// * `ledbat_min_ssthresh` - Optional minimum slow-start threshold for LEDBAT
+/// * `congestion_config` - Optional congestion control config (defaults to FixedRate)
+#[allow(clippy::too_many_arguments)]
+pub async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,
@@ -109,6 +105,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     bandwidth_limit: Option<usize>,
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     ledbat_min_ssthresh: Option<usize>,
+    congestion_config: Option<CongestionControlConfig>,
 ) -> Result<(OutboundConnectionHandler<S>, InboundConnectionHandler<S>), TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
@@ -135,6 +132,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         bandwidth_limit,
         global_bandwidth,
         ledbat_min_ssthresh,
+        congestion_config,
     )?;
     Ok((
         och,
@@ -207,6 +205,7 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
 
 #[allow(private_bounds)]
 impl<S: Socket> OutboundConnectionHandler<S> {
+    #[allow(clippy::too_many_arguments)]
     fn config_listener(
         socket: Arc<S>,
         keypair: TransportKeypair,
@@ -215,6 +214,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         bandwidth_limit: Option<usize>,
         global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
         ledbat_min_ssthresh: Option<usize>,
+        congestion_config: Option<CongestionControlConfig>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -237,9 +237,20 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
-            // Production uses BBR - set explicitly since Default is now FixedRate
-            // Note: FREENET_BBR_STARTUP_RATE env var can override for CI/testing
-            congestion_config: Some(bbr_config_with_env_override()),
+            // Production uses BBR - set explicitly for best performance.
+            // FREENET_CONGESTION_CONTROL env var can override for testing.
+            congestion_config: Some(congestion_config.unwrap_or_else(|| {
+                let algo = match std::env::var("FREENET_CONGESTION_CONTROL")
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .as_str()
+                {
+                    "fixed" | "fixedrate" => CongestionControlAlgorithm::FixedRate,
+                    "ledbat" => CongestionControlAlgorithm::Ledbat,
+                    _ => CongestionControlAlgorithm::Bbr, // Default for production
+                };
+                CongestionControlConfig::new(algo)
+            })),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -269,7 +280,16 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None, None)
+        Self::config_listener(
+            socket,
+            keypair,
+            is_gateway,
+            socket_addr,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -286,6 +306,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             is_gateway,
             socket_addr,
             bandwidth_limit,
+            None,
             None,
             None,
         )
@@ -1355,7 +1376,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 bandwidth_limit.unwrap_or(10_000_000) // 10 MB/s default
             };
             let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                10_000, // capacity = 10 KB burst
+                1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
                 initial_rate,
                 time_source.clone(),
             ));
@@ -1653,7 +1674,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 };
                                             let token_bucket =
                                                 Arc::new(TokenBucket::new_with_time_source(
-                                                    10_000, // capacity = 10 KB burst
+                                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
                                                     initial_rate,
                                                     time_source.clone(),
                                                 ));
@@ -1754,7 +1775,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     bandwidth_limit.unwrap_or(10_000_000)
                                 };
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                                    10_000, // capacity = 10 KB burst
+                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
                                     initial_rate,
                                     time_source.clone(),
                                 ));
