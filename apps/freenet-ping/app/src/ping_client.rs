@@ -197,6 +197,54 @@ pub async fn wait_for_subscribe_response(
     }
 }
 
+// Wait for an UPDATE response with the expected key
+#[allow(dead_code)]
+pub async fn wait_for_update_response(
+    client: &mut WebApi,
+    expected_key: &ContractKey,
+) -> Result<ContractKey, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    loop {
+        let resp = timeout(Duration::from_secs(60), client.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary,
+            }))) => {
+                if &key == expected_key {
+                    tracing::debug!(
+                        "Received update response for key: {}, summary: {:?}",
+                        key,
+                        summary
+                    );
+                    return Ok(key);
+                } else {
+                    return Err(
+                        format!("unexpected key: expected {}, got {}", expected_key, key).into(),
+                    );
+                }
+            }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
+                // Update notifications are expected when subscribed - just skip them
+                tracing::trace!("Received update notification for key: {}", key);
+                continue;
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("Unexpected response while waiting for update: {}", other);
+            }
+            Ok(Err(err)) => {
+                tracing::error!(err=%err);
+                return Err(err.into());
+            }
+            Err(_) => {
+                return Err("timeout waiting for update response".into());
+            }
+        }
+    }
+}
+
 /// WebSocket configuration with increased message size limit to match server (100MB)
 fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()

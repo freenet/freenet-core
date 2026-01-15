@@ -34,7 +34,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 /// Test for subscription propagation in a partially connected network.
@@ -286,6 +286,13 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             node_clients.push(client);
             println!("Connected to regular node {i}");
         }
+
+        // Wait for nodes to connect to the network
+        println!("Waiting for nodes to connect to the network...");
+        for (i, client) in node_clients.iter_mut().enumerate() {
+            wait_for_node_connected(client, &format!("Node{i}"), 1, 60).await?;
+        }
+        println!("All nodes connected to the network!");
 
         // Log the node connectivity
         println!("Node connectivity setup:");

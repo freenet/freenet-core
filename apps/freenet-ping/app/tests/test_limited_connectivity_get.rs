@@ -36,10 +36,13 @@
 
 mod common;
 
-use std::{net::TcpListener, time::Duration};
+use std::{
+    net::{SocketAddr, TcpListener},
+    time::Duration,
+};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -49,7 +52,10 @@ use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
-use common::{base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config};
+use common::{
+    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
+    ws_config,
+};
 
 /// Test that GET requests for non-existent contracts terminate gracefully
 /// even when the requesting node has limited connectivity (only connected to gateway).
@@ -61,13 +67,17 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
     println!("🔧 Testing GET for non-existent contract with limited connectivity");
     println!("   Network: Gateway + 1 peer (peer only connected to gateway)");
 
+    // Use unique IPs for each node
+    let gw_ip = test_ip_for_node(0);
+    let peer_ip = test_ip_for_node(1);
+
     // Create sockets for the network
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_peer = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_peer = TcpListener::bind(SocketAddr::new(peer_ip.into(), 0))?;
 
     // Configure gateway
-    let (config_gw, preset_cfg_gw) = base_node_test_config(
+    let (config_gw, preset_cfg_gw) = base_node_test_config_with_ip(
         true,
         vec![],
         Some(network_socket_gw.local_addr()?.port()),
@@ -75,16 +85,17 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
         "gw_limited_connectivity_get",
         None,
         None,
+        Some(gw_ip),
     )
     .await?;
     let public_port = config_gw.network_api.public_port.unwrap();
     let path = preset_cfg_gw.temp_dir.path().to_path_buf();
-    let config_info = gw_config_from_path(public_port, &path)?;
+    let config_info = gw_config_from_path_with_ip(public_port, &path, gw_ip)?;
     let serialized_gateway = serde_json::to_string(&config_info)?;
     let _ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure peer - only knows about the gateway (limited connectivity)
-    let (config_peer, preset_cfg_peer) = base_node_test_config(
+    let (config_peer, preset_cfg_peer) = base_node_test_config_with_ip(
         false,
         vec![serialized_gateway],
         None,
@@ -92,6 +103,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
         "peer_limited_connectivity_get",
         None,
         None,
+        Some(peer_ip),
     )
     .await?;
     let ws_api_port_peer = config_peer.ws_api.ws_api_port.unwrap();
@@ -139,7 +151,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
 
         // Connect to peer's WebSocket API
         let uri_peer = format!(
-            "ws://127.0.0.1:{ws_api_port_peer}/v1/contract/command?encodingProtocol=native"
+            "ws://{peer_ip}:{ws_api_port_peer}/v1/contract/command?encodingProtocol=native"
         );
         let (stream_peer, _) =
             connect_async_with_config(&uri_peer, Some(ws_config()), false).await?;
