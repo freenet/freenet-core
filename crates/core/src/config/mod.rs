@@ -19,7 +19,11 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use crate::{dev_tool::PeerId, local_node::OperationMode, transport::TransportKeypair};
+use crate::{
+    dev_tool::PeerId,
+    local_node::OperationMode,
+    transport::{CongestionControlAlgorithm, CongestionControlConfig, TransportKeypair},
+};
 
 mod secret;
 pub use secret::*;
@@ -119,6 +123,8 @@ impl Default for ConfigArgs {
                 streaming_enabled: None,   // Default: disabled
                 streaming_threshold: None, // Default: 64KB (set in NetworkApiConfig)
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
+                congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
+                bbr_startup_rate: None,    // Uses default from BBR config
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -313,6 +319,17 @@ impl ConfigArgs {
             if self.network_api.ledbat_min_ssthresh.is_none() {
                 self.network_api.ledbat_min_ssthresh = cfg.network_api.ledbat_min_ssthresh;
             }
+            // Merge congestion control: CLI args override config file
+            if self.network_api.congestion_control.is_none()
+                && cfg.network_api.congestion_control != default_congestion_control()
+            {
+                self.network_api
+                    .congestion_control
+                    .get_or_insert(cfg.network_api.congestion_control);
+            }
+            if self.network_api.bbr_startup_rate.is_none() {
+                self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
+            }
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
@@ -503,6 +520,12 @@ impl ConfigArgs {
                     .network_api
                     .ledbat_min_ssthresh
                     .or_else(default_ledbat_min_ssthresh),
+                congestion_control: self
+                    .network_api
+                    .congestion_control
+                    .clone()
+                    .unwrap_or_else(default_congestion_control),
+                bbr_startup_rate: self.network_api.bbr_startup_rate,
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -799,6 +822,28 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub ledbat_min_ssthresh: Option<usize>,
+
+    /// Congestion control algorithm for transport connections.
+    ///
+    /// Available algorithms:
+    /// - `fixedrate` (default): Fixed-rate transmission at 100 Mbps, ignores network feedback
+    /// - `bbr`: BBR (Bottleneck Bandwidth and RTT) - model-based, tolerates packet loss
+    /// - `ledbat`: LEDBAT++ - delay-based, yields to foreground traffic
+    ///
+    /// Default: `fixedrate` (most stable for production)
+    #[arg(long, env = "FREENET_CONGESTION_CONTROL")]
+    #[serde(rename = "congestion-control", skip_serializing_if = "Option::is_none")]
+    pub congestion_control: Option<String>,
+
+    /// BBR startup minimum pacing rate (bytes/sec).
+    ///
+    /// Only used when congestion_control is set to "bbr".
+    /// Lower values are safer for virtualized/constrained network environments (like CI).
+    ///
+    /// Default: 25 MB/s (25_000_000 bytes/sec)
+    #[arg(long, env = "FREENET_BBR_STARTUP_RATE")]
+    #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
+    pub bbr_startup_rate: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -938,6 +983,51 @@ pub struct NetworkApiConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub ledbat_min_ssthresh: Option<usize>,
+
+    /// Congestion control algorithm for transport connections.
+    ///
+    /// Available algorithms:
+    /// - `fixedrate` (default): Fixed-rate transmission at 100 Mbps
+    /// - `bbr`: BBR (Bottleneck Bandwidth and RTT)
+    /// - `ledbat`: LEDBAT++ (Low Extra Delay Background Transport)
+    #[serde(default = "default_congestion_control", rename = "congestion-control")]
+    pub congestion_control: String,
+
+    /// BBR startup minimum pacing rate (bytes/sec).
+    ///
+    /// Only used when congestion_control is "bbr".
+    #[serde(
+        default = "default_bbr_startup_rate",
+        rename = "bbr-startup-rate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bbr_startup_rate: Option<u64>,
+}
+
+impl NetworkApiConfig {
+    /// Build a `CongestionControlConfig` from the current network API configuration.
+    ///
+    /// This parses the `congestion_control` string to determine the algorithm
+    /// and applies any algorithm-specific settings like `bbr_startup_rate`.
+    pub fn build_congestion_config(&self) -> CongestionControlConfig {
+        let algo = match self.congestion_control.to_lowercase().as_str() {
+            "bbr" => CongestionControlAlgorithm::Bbr,
+            "ledbat" => CongestionControlAlgorithm::Ledbat,
+            _ => CongestionControlAlgorithm::FixedRate, // Default for production
+        };
+
+        let mut config = CongestionControlConfig::new(algo);
+
+        // Apply BBR-specific settings
+        if algo == CongestionControlAlgorithm::Bbr {
+            if let Some(rate) = self.bbr_startup_rate {
+                tracing::debug!("Using custom BBR startup pacing rate: {} bytes/sec", rate);
+                config = config.with_startup_min_pacing_rate(rate);
+            }
+        }
+
+        config
+    }
 }
 
 mod port_allocation;
@@ -977,6 +1067,20 @@ fn default_streaming_threshold() -> usize {
 /// See: docs/architecture/transport/configuration/bandwidth-configuration.md
 fn default_ledbat_min_ssthresh() -> Option<usize> {
     Some(100 * 1024) // 100KB floor
+}
+
+/// Default congestion control algorithm.
+///
+/// Returns "fixedrate" - the most stable option for production.
+fn default_congestion_control() -> String {
+    "fixedrate".to_string()
+}
+
+/// Default BBR startup pacing rate.
+///
+/// Returns None to use the BBR default (25 MB/s).
+fn default_bbr_startup_rate() -> Option<u64> {
+    None
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
@@ -2191,5 +2295,85 @@ mod tests {
             args.streaming_threshold.is_none(),
             "NetworkArgs.streaming_threshold should be None by default"
         );
+    }
+
+    #[test]
+    fn test_congestion_control_config_defaults() {
+        // Verify default congestion control is fixedrate
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+        "#;
+        let network_api: NetworkApiConfig = toml::from_str(config_str).unwrap();
+        assert_eq!(
+            network_api.congestion_control, "fixedrate",
+            "Default congestion control should be fixedrate"
+        );
+        assert!(
+            network_api.bbr_startup_rate.is_none(),
+            "Default BBR startup rate should be None"
+        );
+
+        // Build the congestion config and verify the algorithm
+        let cc_config = network_api.build_congestion_config();
+        assert_eq!(cc_config.algorithm, CongestionControlAlgorithm::FixedRate);
+    }
+
+    #[test]
+    fn test_congestion_control_config_bbr() {
+        // Test BBR configuration with custom startup rate
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+            congestion-control = "bbr"
+            bbr-startup-rate = 10000000
+        "#;
+
+        let config: NetworkApiConfig = toml::from_str(config_str).unwrap();
+        assert_eq!(config.congestion_control, "bbr");
+        assert_eq!(config.bbr_startup_rate, Some(10_000_000));
+
+        // Build the congestion config and verify BBR with custom startup rate
+        let cc_config = config.build_congestion_config();
+        assert_eq!(cc_config.algorithm, CongestionControlAlgorithm::Bbr);
+    }
+
+    #[test]
+    fn test_congestion_control_config_ledbat() {
+        // Test LEDBAT configuration
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+            congestion-control = "ledbat"
+        "#;
+
+        let config: NetworkApiConfig = toml::from_str(config_str).unwrap();
+        assert_eq!(config.congestion_control, "ledbat");
+
+        let cc_config = config.build_congestion_config();
+        assert_eq!(cc_config.algorithm, CongestionControlAlgorithm::Ledbat);
+    }
+
+    #[test]
+    fn test_congestion_control_config_serde_roundtrip() {
+        // Test serialization/deserialization of congestion control config
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+            congestion-control = "bbr"
+            bbr-startup-rate = 5000000
+        "#;
+
+        let config: NetworkApiConfig = toml::from_str(config_str).unwrap();
+
+        // Round-trip test
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("congestion-control = \"bbr\""));
+        assert!(serialized.contains("bbr-startup-rate = 5000000"));
+
+        // Deserialize again and verify
+        let config2: NetworkApiConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config2.congestion_control, "bbr");
+        assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
     }
 }
