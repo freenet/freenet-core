@@ -1,0 +1,26 @@
+name: Notify River on PR Merge
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  notify_river:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Send message to River
+        env:
+          RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
+        run: |
+          riverctl --node-url "${{ secrets.RIVER_GATEWAY_URL }}" \
+            message send \
+            "${{ secrets.RIVER_ROOM_ID }}" \
+            "PR #${{ github.event.pull_request.number }} merged: ${{ github.event.pull_request.title }} (by @${{ github.event.pull_request.user.login }}, merged by @${{ github.event.pull_request.merged_by.login }}) - ${{ github.event.pull_request.html_url }}"
