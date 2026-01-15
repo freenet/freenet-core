@@ -542,19 +542,26 @@ criterion_group!(
 );
 
 // Main entry point - comprehensive extended suite
-// With VirtualTime: ~2-3 minutes (vs ~40 minutes with real time)
+//
+// TODO: VirtualTime network benchmarks hang during warmup - needs investigation.
+// The issue affects all benchmarks that use create_mock_peer_with_virtual_time or
+// create_peer_pair_with_virtual_time. The auto-advance task doesn't seem to
+// properly advance time during connection handshake, causing timeouts.
+// Disabled groups: high_latency_extended, packet_loss_extended, large_files_extended,
+// streaming_extended, ledbat_validation_extended, slow_start_extended
+//
+// For now, only micro-benchmarks (allocation, level0, level1) are enabled as they
+// don't require VirtualTime network connections.
 criterion_main!(
-    // Resilience testing (VirtualTime)
-    high_latency_extended,
-    // TODO: packet_loss_extended hangs during warmup - needs investigation
-    // packet_loss_extended,
-    large_files_extended,
-    // Micro-benchmarks (fast, no network)
+    // Micro-benchmarks (fast, no network) - these work reliably
     allocation_extended,
     level0_extended,
     level1_extended,
-    // VirtualTime network tests
-    streaming_extended,
-    ledbat_validation_extended,
-    slow_start_extended,
+    // TODO: Re-enable after fixing VirtualTime benchmark hangs:
+    // high_latency_extended,
+    // packet_loss_extended,
+    // large_files_extended,
+    // streaming_extended,
+    // ledbat_validation_extended,
+    // slow_start_extended,
 );
