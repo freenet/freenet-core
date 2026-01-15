@@ -48,7 +48,7 @@ use transport::streaming::*;
 pub fn bench_high_latency_sustained(c: &mut Criterion) {
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
@@ -184,10 +184,14 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
 ///
 /// Measures throughput degradation under packet loss. With VirtualTime,
 /// retransmission timeouts resolve instantly.
+///
+/// Note: Uses 4 worker threads to ensure the auto-advance task can run
+/// even when peer tasks are blocked waiting for retransmissions.
 pub fn bench_packet_loss_resilience(c: &mut Criterion) {
-    // Use multi-threaded runtime to allow packet delivery to proceed concurrently
+    // Use multi-threaded runtime with extra threads for packet loss scenarios
+    // More threads needed because retransmissions can block multiple tasks
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
@@ -309,7 +313,7 @@ pub fn bench_packet_loss_resilience(c: &mut Criterion) {
 pub fn bench_large_file_transfers(c: &mut Criterion) {
     // Use multi-threaded runtime to allow packet delivery to proceed concurrently
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
