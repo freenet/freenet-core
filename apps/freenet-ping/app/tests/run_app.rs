@@ -20,7 +20,8 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
-    gw_config_from_path_with_rng, test_ip_for_node, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    gw_config_from_path_with_rng, test_ip_for_node, wait_for_node_connected, APP_TAG, PACKAGE_DIR,
+    PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -188,71 +189,6 @@ async fn collect_node_diagnostics(
 
     println!("=== END DIAGNOSTICS: {phase} ===\n");
     Ok(())
-}
-
-/// Wait for a node to be connected to the network (have at least `min_peers` connections).
-/// Returns the number of connected peers once ready, or error if timeout.
-async fn wait_for_node_connected(
-    client: &mut WebApi,
-    node_name: &str,
-    min_peers: usize,
-    timeout_secs: u64,
-) -> anyhow::Result<usize> {
-    let start = std::time::Instant::now();
-    let timeout_duration = Duration::from_secs(timeout_secs);
-
-    loop {
-        if start.elapsed() > timeout_duration {
-            return Err(anyhow!(
-                "{} failed to connect to network within {}s",
-                node_name,
-                timeout_secs
-            ));
-        }
-
-        // Query connected peers
-        if let Err(e) = client
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await
-        {
-            tracing::warn!("{}: Failed to send query: {}", node_name, e);
-            sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-
-        // Wait for response with short timeout
-        match timeout(Duration::from_secs(5), client.recv()).await {
-            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => {
-                let peer_count = peers.len();
-                if peer_count >= min_peers {
-                    tracing::info!(
-                        "{}: Connected with {} peer(s) after {:?}",
-                        node_name,
-                        peer_count,
-                        start.elapsed()
-                    );
-                    return Ok(peer_count);
-                }
-                tracing::debug!(
-                    "{}: Only {} peers connected, waiting for {}...",
-                    node_name,
-                    peer_count,
-                    min_peers
-                );
-            }
-            Ok(Ok(_other)) => {
-                // Ignore other messages
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("{}: Error receiving response: {}", node_name, e);
-            }
-            Err(_) => {
-                tracing::debug!("{}: Query timed out, retrying...", node_name);
-            }
-        }
-
-        sleep(Duration::from_secs(1)).await;
-    }
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
