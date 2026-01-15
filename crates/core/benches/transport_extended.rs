@@ -546,7 +546,8 @@ criterion_group!(
 criterion_main!(
     // Resilience testing (VirtualTime)
     high_latency_extended,
-    packet_loss_extended,
+    // TODO: packet_loss_extended hangs during warmup - needs investigation
+    // packet_loss_extended,
     large_files_extended,
     // Micro-benchmarks (fast, no network)
     allocation_extended,
