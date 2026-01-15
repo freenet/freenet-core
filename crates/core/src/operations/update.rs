@@ -825,7 +825,7 @@ async fn update_contract(
             ..
         }) => {
             tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
-            Err(OpError::UnexpectedOpState)
+            Err(err.into())
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
             // Helper to extract state from UpdateData variants that contain state
