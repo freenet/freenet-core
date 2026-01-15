@@ -8,7 +8,7 @@
 mod common;
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -16,13 +16,17 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 use testresult::TestResult;
 use tokio::{select, time::timeout};
 
 use common::{
-    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
-    PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
+    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
@@ -61,20 +65,26 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
 {
     println!("🔧 Setting up 50-node network...");
 
-    // Setup sockets
+    // Generate unique IPs for all nodes
+    let gateway_ips: Vec<_> = (0..NUM_GATEWAYS).map(test_ip_for_node).collect();
+    let node_ips: Vec<_> = (0..NUM_REGULAR_NODES)
+        .map(|i| test_ip_for_node(NUM_GATEWAYS + i))
+        .collect();
+
+    // Setup sockets with unique IPs
     let mut gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
     let mut ws_api_gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
-    for _ in 0..NUM_GATEWAYS {
-        gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-        ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+    for &gw_ip in &gateway_ips {
+        gateway_sockets.push(TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?);
+        ws_api_gateway_sockets.push(TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?);
     }
 
     let mut ws_api_node_sockets = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
-    for _ in 0..NUM_REGULAR_NODES {
-        let socket = TcpListener::bind("127.0.0.1:0")?;
+    for &node_ip in &node_ips {
+        let socket = TcpListener::bind(SocketAddr::new(node_ip.into(), 0))?;
         regular_node_addresses.push(socket.local_addr()?);
-        ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        ws_api_node_sockets.push(TcpListener::bind(SocketAddr::new(node_ip.into(), 0))?);
     }
 
     // Configure gateways
@@ -84,7 +94,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
     for i in 0..NUM_GATEWAYS {
-        let (cfg, preset) = base_node_test_config(
+        let gw_ip = gateway_ips[i];
+        let (cfg, preset) = base_node_test_config_with_ip(
             true,
             vec![],
             Some(gateway_sockets[i].local_addr()?.port()),
@@ -92,12 +103,13 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             &format!("gw_50node_{i}"),
             None,
             None,
+            Some(gw_ip),
         )
         .await?;
 
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        let config_info = gw_config_from_path(public_port, &path)?;
+        let config_info = gw_config_from_path_with_ip(public_port, &path, gw_ip)?;
 
         ws_api_ports_gw.push(cfg.ws_api.ws_api_port.unwrap());
         gateway_info.push(config_info);
@@ -135,7 +147,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             }
         }
 
-        let (cfg, preset) = base_node_test_config(
+        let node_ip = node_ips[i];
+        let (cfg, preset) = base_node_test_config_with_ip(
             false,
             serialized_gateways.clone(),
             None,
@@ -143,6 +156,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             &format!("node_50node_{i}"),
             None,
             Some(blocked_addresses.clone()),
+            Some(node_ip),
         )
         .await?;
 
@@ -217,7 +231,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         println!("📡 Connecting to {NUM_GATEWAYS} gateways...");
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
-            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+            let gw_ip = gateway_ips[i];
+            let uri = format!("ws://{gw_ip}:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
@@ -232,7 +247,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         println!("📡 Connecting to {NUM_REGULAR_NODES} regular nodes...");
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
-            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+            let node_ip = node_ips[i];
+            let uri = format!("ws://{node_ip}:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             node_clients.push(client);

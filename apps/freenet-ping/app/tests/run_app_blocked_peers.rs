@@ -46,7 +46,7 @@ use std::{
 use anyhow::anyhow;
 use common::{
     base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
-    ping_states_equal, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    ping_states_equal, wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::{
@@ -302,13 +302,15 @@ async fn run_blocked_peers_test_inner(
         tokio::time::sleep(config.initial_wait).await;
 
         // Connect to nodes via WebSocket
+        // NOTE: WebSocket servers bind to the same IP as the network port (varied loopback IPs),
+        // so we must connect to the correct IP for each node.
         let uri_gw =
-            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
+            format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 = format!(
-            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
+            "ws://{node1_ip}:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
+            "ws://{node2_ip}:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         tracing::info!("Connecting to Gateway at {}", uri_gw);
@@ -324,6 +326,12 @@ async fn run_blocked_peers_test_inner(
         let (stream_node2, _) =
             connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
         let mut client_node2 = WebApi::start(stream_node2);
+
+        // Wait for nodes to connect to the network before proceeding with operations
+        tracing::info!("Waiting for nodes to connect to the network...");
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 60).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 60).await?;
+        tracing::info!("All nodes connected to the network!");
 
         // Compile/load contract code (same helper used by other app tests)
         let path_to_code = std::path::PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);

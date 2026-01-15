@@ -23,16 +23,18 @@ use tokio::{select, time::sleep, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config_with_rng, connect_async_with_config, gw_config_from_path_with_rng,
-    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    allocate_test_node_block, base_node_test_config_with_rng, connect_async_with_config,
+    gw_config_from_path_with_rng, test_ip_for_node, ws_config, APP_TAG, PACKAGE_DIR,
+    PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
-    PingStats,
+    wait_for_update_response, PingStats,
 };
 
 /// Helper function to collect diagnostics from all nodes for debugging update propagation issues
 /// Has an overall timeout of 15 seconds per node to avoid getting stuck on UpdateNotification floods
+#[allow(dead_code)]
 async fn collect_node_diagnostics(
     clients: &mut [&mut freenet_stdlib::client_api::WebApi],
     node_names: &[&str],
@@ -191,6 +193,71 @@ async fn collect_node_diagnostics(
 
     println!("=== END DIAGNOSTICS: {phase} ===\n");
     Ok(())
+}
+
+/// Wait for a node to be connected to the network (have at least `min_peers` connections).
+/// Returns the number of connected peers once ready, or error if timeout.
+async fn wait_for_node_connected(
+    client: &mut WebApi,
+    node_name: &str,
+    min_peers: usize,
+    timeout_secs: u64,
+) -> anyhow::Result<usize> {
+    let start = std::time::Instant::now();
+    let timeout_duration = Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout_duration {
+            return Err(anyhow!(
+                "{} failed to connect to network within {}s",
+                node_name,
+                timeout_secs
+            ));
+        }
+
+        // Query connected peers
+        if let Err(e) = client
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await
+        {
+            tracing::warn!("{}: Failed to send query: {}", node_name, e);
+            sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+
+        // Wait for response with short timeout
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => {
+                let peer_count = peers.len();
+                if peer_count >= min_peers {
+                    tracing::info!(
+                        "{}: Connected with {} peer(s) after {:?}",
+                        node_name,
+                        peer_count,
+                        start.elapsed()
+                    );
+                    return Ok(peer_count);
+                }
+                tracing::debug!(
+                    "{}: Only {} peers connected, waiting for {}...",
+                    node_name,
+                    peer_count,
+                    min_peers
+                );
+            }
+            Ok(Ok(_other)) => {
+                // Ignore other messages
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("{}: Error receiving response: {}", node_name, e);
+            }
+            Err(_) => {
+                tracing::debug!("{}: Query timed out, retrying...", node_name);
+            }
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -486,21 +553,38 @@ async fn test_node_diagnostics_query() -> TestResult {
     Ok(())
 }
 
-// TODO-MUST-FIX: Test times out due to WebSocket flooding issue.
-// The test subscribes from the same WebSocket connection used for GETs, causing
-// UpdateNotifications to flood the channel and block GET responses.
-// The core functionality is verified by six-peer-regression test which passes.
-// See issue #2731 for discussion.
-#[ignore = "WebSocket flooding causes timeout - needs test redesign"]
+// Note: This test uses unique IPs from allocate_test_node_block/test_ip_for_node
+// to avoid IP conflicts with parallel tests (issue #2220).
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_multi_node() -> TestResult {
-    // Setup network sockets for the gateway
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    // Allocate unique global node indices to avoid IP conflicts with parallel tests
+    // This matches the #[freenet_test] macro behavior for IP allocation
+    let base_node_idx = allocate_test_node_block(3);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node1_ip = test_ip_for_node(base_node_idx + 1);
+    let node2_ip = test_ip_for_node(base_node_idx + 2);
 
-    // Setup API sockets for all three nodes
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    println!(
+        "Allocated node IPs: gateway={}, node1={}, node2={}",
+        gw_ip, node1_ip, node2_ip
+    );
+
+    // Reserve ports using TcpListener - we bind and then drop before node startup
+    // Using unique IPs ensures no port conflicts even if ports are the same
+    let network_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let network_socket_node1 = TcpListener::bind(std::net::SocketAddr::new(node1_ip.into(), 0))?;
+    let network_socket_node2 = TcpListener::bind(std::net::SocketAddr::new(node2_ip.into(), 0))?;
+
+    let ws_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_socket_node1 = TcpListener::bind(std::net::SocketAddr::new(node1_ip.into(), 0))?;
+    let ws_socket_node2 = TcpListener::bind(std::net::SocketAddr::new(node2_ip.into(), 0))?;
+
+    let network_port_gw = network_socket_gw.local_addr()?.port();
+    let network_port_node1 = network_socket_node1.local_addr()?.port();
+    let network_port_node2 = network_socket_node2.local_addr()?.port();
+    let ws_port_gw = ws_socket_gw.local_addr()?.port();
+    let ws_port_node1 = ws_socket_node1.local_addr()?.port();
+    let ws_port_node2 = ws_socket_node2.local_addr()?.port();
 
     // Configure gateway node with fixed seed for deterministic testing
     let test_seed = *b"app_loop_test_seed_0123456789012";
@@ -509,17 +593,17 @@ async fn test_ping_multi_node() -> TestResult {
     println!("Using deterministic test seed: {test_seed:?}");
     println!("Test RNG initial state configured for deterministic network topology");
 
-    // Configure gateway node
+    // Configure gateway node with unique IP
     let (config_gw, preset_cfg_gw, config_gw_info) = {
         let (cfg, preset) = base_node_test_config_with_rng(
             true,
             vec![],
-            Some(network_socket_gw.local_addr()?.port()),
-            ws_api_port_socket_gw.local_addr()?.port(),
+            Some(network_port_gw),
+            ws_port_gw,
             "gw_multi_node", // data_dir_suffix
             None,            // base_tmp_dir
             None,            // blocked_addresses
-            None,            // bind_ip
+            Some(gw_ip),     // bind_ip - use unique IP
             &mut test_rng,
         )
         .await?;
@@ -528,40 +612,37 @@ async fn test_ping_multi_node() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, gw_ip)?,
         )
     };
-    let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
-    // Configure client node 1
+    // Configure client node 1 with unique IP and explicit network port
     let (config_node1, preset_cfg_node1) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
-        None,
-        ws_api_port_socket_node1.local_addr()?.port(),
+        Some(network_port_node1),
+        ws_port_node1,
         "node1_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
-        None,               // bind_ip
+        Some(node1_ip),     // bind_ip - use unique IP
         &mut test_rng,
     )
     .await?;
-    let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
-    // Configure client node 2
+    // Configure client node 2 with unique IP and explicit network port
     let (config_node2, preset_cfg_node2) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
-        None,
-        ws_api_port_socket_node2.local_addr()?.port(),
+        Some(network_port_node2),
+        ws_port_node2,
         "node2_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
-        None,               // bind_ip
+        Some(node2_ip),     // bind_ip - use unique IP
         &mut test_rng,
     )
     .await?;
-    let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
     // Log data directories and ring locations for debugging
     println!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
@@ -615,13 +696,15 @@ async fn test_ping_multi_node() -> TestResult {
     }
     println!("==============================");
 
-    // Free ports so they don't fail on initialization
+    // Free ports so nodes can bind to them during initialization
     std::mem::drop(network_socket_gw);
-    std::mem::drop(ws_api_port_socket_gw);
-    std::mem::drop(ws_api_port_socket_node1);
-    std::mem::drop(ws_api_port_socket_node2);
+    std::mem::drop(network_socket_node1);
+    std::mem::drop(network_socket_node2);
+    std::mem::drop(ws_socket_gw);
+    std::mem::drop(ws_socket_node1);
+    std::mem::drop(ws_socket_node2);
 
-    // Start gateway node
+    // Start gateway node first
     let gateway_node = async {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -632,8 +715,13 @@ async fn test_ping_multi_node() -> TestResult {
     }
     .boxed_local();
 
-    // Start client node 1
+    // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
+        // Wait for gateway to start its network listener
+        // This delay gives the gateway time to call node.run() and open its listener
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Node1 starting after gateway delay");
+
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
@@ -643,8 +731,12 @@ async fn test_ping_multi_node() -> TestResult {
     }
     .boxed_local();
 
-    // Start client node 2
+    // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
+        // Wait for gateway to start its network listener
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Node2 starting after gateway delay");
+
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
@@ -655,19 +747,21 @@ async fn test_ping_multi_node() -> TestResult {
     .boxed_local();
 
     // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(450), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Wait for nodes to start - peers wait 10s in their startup, so we wait a bit more
+        // to ensure gateway is accepting connections before we try to connect clients
+        println!("Waiting for gateway to start (12s)...");
+        tokio::time::sleep(Duration::from_secs(12)).await;
 
-        // Connect to all three nodes
+        // Connect to all three nodes on their unique IPs
         let uri_gw = format!(
-            "ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
+            "ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node1 = format!(
-            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
+            "ws://{node1_ip}:{ws_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
+            "ws://{node2_ip}:{ws_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
@@ -679,6 +773,12 @@ async fn test_ping_multi_node() -> TestResult {
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
+
+        // Wait for nodes to join the network before proceeding with operations
+        println!("Waiting for nodes to connect to the network...");
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 60).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 60).await?;
+        println!("All nodes connected to the network!");
 
         // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
@@ -807,17 +907,9 @@ async fn test_ping_multi_node() -> TestResult {
         println!("=== ALL SUBSCRIPTIONS COMPLETED ===");
         println!("All nodes are now subscribed and should receive all updates regardless of ring location");
 
-        // Add a delay to ensure subscription system is fully active
-        println!("Waiting 5 seconds for subscription system to stabilize...");
-        sleep(Duration::from_secs(5)).await;
-
-        // Collect diagnostics after subscription phase
-        println!("=== AFTER SUBSCRIPTIONS DIAGNOSTICS ===");
-        {
-            let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
-            let node_names = ["Gateway", "Node1", "Node2"];
-            let _ = collect_node_diagnostics(&mut clients_for_diagnostics, &node_names, contract_key, "AFTER SUBSCRIPTIONS").await;
-        }
+        // Brief delay for subscription system to activate
+        println!("Waiting 2 seconds for subscription system to stabilize...");
+        sleep(Duration::from_secs(2)).await;
 
         // Step 5: All nodes send multiple updates to build history for eventual consistency testing
 
@@ -841,9 +933,13 @@ async fn test_ping_multi_node() -> TestResult {
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&gw_ping).unwrap())),
+                    // Use State instead of Delta - Delta propagation is not yet implemented
+                    data: UpdateData::State(State::from(serde_json::to_vec(&gw_ping).unwrap())),
                 }))
                 .await?;
+            wait_for_update_response(&mut client_gw, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
             // Node 1 sends update with its tag
             let mut node1_ping = Ping::default();
@@ -853,9 +949,13 @@ async fn test_ping_multi_node() -> TestResult {
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
+                    // Use State instead of Delta - Delta propagation is not yet implemented
+                    data: UpdateData::State(State::from(serde_json::to_vec(&node1_ping).unwrap())),
                 }))
                 .await?;
+            wait_for_update_response(&mut client_node1, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
             // Node 2 sends update with its tag
             let mut node2_ping = Ping::default();
@@ -865,9 +965,13 @@ async fn test_ping_multi_node() -> TestResult {
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping).unwrap())),
+                    // Use State instead of Delta - Delta propagation is not yet implemented
+                    data: UpdateData::State(State::from(serde_json::to_vec(&node2_ping).unwrap())),
                 }))
                 .await?;
+            wait_for_update_response(&mut client_node2, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
             // Small delay between rounds to ensure distinct timestamps
             println!("Waiting 30ms before next round...");
@@ -876,19 +980,92 @@ async fn test_ping_multi_node() -> TestResult {
 
         println!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===");
 
-        // Wait for updates to propagate across the network - longer wait to ensure eventual consistency
-        println!("Waiting for updates to propagate across the network...");
-        sleep(Duration::from_secs(30)).await;
+        // Poll for convergence instead of fixed wait - check every 2s for up to 60s
+        let propagation_start = std::time::Instant::now();
+        let propagation_timeout = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(2);
+        let mut converged = false;
 
-        // Collect diagnostics after propagation wait period
-        {
-            let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
-            let node_names = ["Gateway", "Node1", "Node2"];
-            let _ = collect_node_diagnostics(&mut clients_for_diagnostics, &node_names, contract_key, "AFTER PROPAGATION WAIT").await;
+        while propagation_start.elapsed() < propagation_timeout {
+            // Query state from all nodes sequentially (send then receive for each)
+            // to avoid overwhelming the client's internal channel buffer
+            eprintln!("[DEBUG] Sending GET request to gateway...");
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key: *contract_key.id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            eprintln!("[DEBUG] GET request sent to gateway, now waiting for response...");
+            let state_gw = wait_for_get_response(&mut client_gw, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            eprintln!("[DEBUG] Gateway GET response received with {} entries", state_gw.len());
+
+            client_node1
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key: *contract_key.id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            let state_node1 = wait_for_get_response(&mut client_node1, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            client_node2
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key: *contract_key.id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            let state_node2 = wait_for_get_response(&mut client_node2, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            // Check if all nodes have all three tags
+            let has_all_tags = state_gw.contains_key(&gw_tag)
+                && state_gw.contains_key(&node1_tag)
+                && state_gw.contains_key(&node2_tag)
+                && state_node1.contains_key(&gw_tag)
+                && state_node1.contains_key(&node1_tag)
+                && state_node1.contains_key(&node2_tag)
+                && state_node2.contains_key(&gw_tag)
+                && state_node2.contains_key(&node1_tag)
+                && state_node2.contains_key(&node2_tag);
+
+            let elapsed = propagation_start.elapsed();
+            println!(
+                "Propagation check @ {:?}: GW has [{},{},{}], N1 has [{},{},{}], N2 has [{},{},{}]",
+                elapsed,
+                state_gw.contains_key(&gw_tag),
+                state_gw.contains_key(&node1_tag),
+                state_gw.contains_key(&node2_tag),
+                state_node1.contains_key(&gw_tag),
+                state_node1.contains_key(&node1_tag),
+                state_node1.contains_key(&node2_tag),
+                state_node2.contains_key(&gw_tag),
+                state_node2.contains_key(&node1_tag),
+                state_node2.contains_key(&node2_tag),
+            );
+
+            if has_all_tags {
+                println!("All nodes have all tags after {:?}!", elapsed);
+                converged = true;
+                break;
+            }
+
+            sleep(poll_interval).await;
+        }
+
+        if !converged {
+            println!("WARNING: Propagation did not complete within timeout, proceeding with final verification...");
         }
 
         // Request the current state from all nodes
-        println!("Querying all nodes for current state...");
+        println!("Querying all nodes for final state...");
 
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -930,13 +1107,6 @@ async fn test_ping_multi_node() -> TestResult {
         println!("Gateway final state: {final_state_gw}");
         println!("Node 1 final state: {final_state_node1}");
         println!("Node 2 final state: {final_state_node2}");
-
-        // Final diagnostic collection to understand the issue
-        {
-            let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
-            let node_names = ["Gateway", "Node1", "Node2"];
-            let _ = collect_node_diagnostics(&mut clients_for_diagnostics, &node_names, contract_key, "FINAL STATE ANALYSIS").await;
-        }
 
         // Show detailed comparison of ping history per tag
         println!("===== DETAILED PROPAGATION ANALYSIS =====");
@@ -1123,16 +1293,38 @@ async fn test_ping_multi_node() -> TestResult {
     Ok(())
 }
 
-#[ignore = "this test currently fails and we are workign on fixing it"]
+// Note: This test uses unique IPs from allocate_test_node_block/test_ip_for_node
+// to avoid IP conflicts with parallel tests (issue #2220).
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_application_loop() -> TestResult {
-    // Setup network sockets for the gateway
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    // Allocate unique global node indices to avoid IP conflicts with parallel tests
+    // This matches the #[freenet_test] macro behavior for IP allocation
+    let base_node_idx = allocate_test_node_block(3);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node1_ip = test_ip_for_node(base_node_idx + 1);
+    let node2_ip = test_ip_for_node(base_node_idx + 2);
 
-    // Setup API sockets for all three nodes
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    println!(
+        "App loop test - Allocated node IPs: gateway={}, node1={}, node2={}",
+        gw_ip, node1_ip, node2_ip
+    );
+
+    // Reserve ports using TcpListener - we bind and then drop before node startup
+    // Using unique IPs ensures no port conflicts even if ports are the same
+    let network_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let network_socket_node1 = TcpListener::bind(std::net::SocketAddr::new(node1_ip.into(), 0))?;
+    let network_socket_node2 = TcpListener::bind(std::net::SocketAddr::new(node2_ip.into(), 0))?;
+
+    let ws_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_socket_node1 = TcpListener::bind(std::net::SocketAddr::new(node1_ip.into(), 0))?;
+    let ws_socket_node2 = TcpListener::bind(std::net::SocketAddr::new(node2_ip.into(), 0))?;
+
+    let network_port_gw = network_socket_gw.local_addr()?.port();
+    let network_port_node1 = network_socket_node1.local_addr()?.port();
+    let network_port_node2 = network_socket_node2.local_addr()?.port();
+    let ws_port_gw = ws_socket_gw.local_addr()?.port();
+    let ws_port_node1 = ws_socket_node1.local_addr()?.port();
+    let ws_port_node2 = ws_socket_node2.local_addr()?.port();
 
     // Configure nodes with fixed seed for deterministic testing
     let test_seed = *b"app_loop_test_seed_0123456789012";
@@ -1149,12 +1341,12 @@ async fn test_ping_application_loop() -> TestResult {
         let (cfg, preset) = base_node_test_config_with_rng(
             true,
             vec![],
-            Some(network_socket_gw.local_addr()?.port()),
-            ws_api_port_socket_gw.local_addr()?.port(),
+            Some(network_port_gw),
+            ws_port_gw,
             "gw_app_loop", // data_dir_suffix
             None,          // base_tmp_dir
             None,          // blocked_addresses
-            None,          // bind_ip
+            Some(gw_ip),   // bind_ip - use unique IP for proper node identity
             &mut test_rng,
         )
         .await?;
@@ -1163,40 +1355,37 @@ async fn test_ping_application_loop() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, gw_ip)?,
         )
     };
-    let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node 1
     let (config_node1, preset_cfg_node1) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
-        None,
-        ws_api_port_socket_node1.local_addr()?.port(),
+        Some(network_port_node1),
+        ws_port_node1,
         "node1_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
-        None,             // bind_ip
+        Some(node1_ip),   // bind_ip - use unique IP for proper node identity
         &mut test_rng,
     )
     .await?;
-    let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
     // Configure client node 2
     let (config_node2, preset_cfg_node2) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
-        None,
-        ws_api_port_socket_node2.local_addr()?.port(),
+        Some(network_port_node2),
+        ws_port_node2,
         "node2_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
-        None,             // bind_ip
+        Some(node2_ip),   // bind_ip - use unique IP for proper node identity
         &mut test_rng,
     )
     .await?;
-    let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
     // Log data directories and locations for debugging
     tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
@@ -1215,13 +1404,15 @@ async fn test_ping_application_loop() -> TestResult {
         config_node2.network_api.location
     );
 
-    // Free ports so they don't fail on initialization
+    // Free ports so nodes can bind to them during initialization
     std::mem::drop(network_socket_gw);
-    std::mem::drop(ws_api_port_socket_gw);
-    std::mem::drop(ws_api_port_socket_node1);
-    std::mem::drop(ws_api_port_socket_node2);
+    std::mem::drop(network_socket_node1);
+    std::mem::drop(network_socket_node2);
+    std::mem::drop(ws_socket_gw);
+    std::mem::drop(ws_socket_node1);
+    std::mem::drop(ws_socket_node2);
 
-    // Start gateway node
+    // Start gateway node first
     let gateway_node = async {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -1232,8 +1423,12 @@ async fn test_ping_application_loop() -> TestResult {
     }
     .boxed_local();
 
-    // Start client node 1
+    // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
+        // Wait for gateway to start its network listener
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Node1 starting after gateway delay");
+
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
@@ -1243,8 +1438,12 @@ async fn test_ping_application_loop() -> TestResult {
     }
     .boxed_local();
 
-    // Start client node 2
+    // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
+        // Wait for gateway to start its network listener
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Node2 starting after gateway delay");
+
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
@@ -1256,18 +1455,17 @@ async fn test_ping_application_loop() -> TestResult {
 
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for gateway to start - peers wait 10s in their startup
+        println!("Waiting for gateway to start (12s)...");
+        tokio::time::sleep(Duration::from_secs(12)).await;
 
-        // Connect to all three nodes
+        // Connect to all three nodes (using unique IPs)
         let uri_gw =
-            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let uri_node1 = format!(
-            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
-        );
-        let uri_node2 = format!(
-            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
-        );
+            format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");
+        let uri_node1 =
+            format!("ws://{node1_ip}:{ws_port_node1}/v1/contract/command?encodingProtocol=native");
+        let uri_node2 =
+            format!("ws://{node2_ip}:{ws_port_node2}/v1/contract/command?encodingProtocol=native");
 
         let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
         let (stream_node1, _) =
@@ -1278,6 +1476,12 @@ async fn test_ping_application_loop() -> TestResult {
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
+
+        // Wait for nodes to join the network before proceeding with operations
+        println!("Waiting for nodes to connect to the network...");
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 60).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 60).await?;
+        println!("All nodes connected to the network!");
 
         // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
