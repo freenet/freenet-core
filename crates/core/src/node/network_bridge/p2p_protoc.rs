@@ -30,8 +30,9 @@ use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
 use crate::ring::{Location, PeerKey, SubscriptionRecoveryGuard};
 use crate::transport::{
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, ExpectedInboundTracker,
-    PeerConnectionApi, Socket, TransportError, TransportKeypair, TransportPublicKey,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, CongestionControlConfig,
+    ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError, TransportKeypair,
+    TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -349,6 +350,8 @@ pub(in crate::node) struct P2pConnManager {
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     /// Minimum ssthresh floor for LEDBAT timeout recovery.
     ledbat_min_ssthresh: Option<usize>,
+    /// Congestion control configuration.
+    congestion_config: CongestionControlConfig,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
     message_processor: Arc<MessageProcessor>,
@@ -433,6 +436,7 @@ impl P2pConnManager {
                     ))
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
+            congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             message_processor,
         })
@@ -497,6 +501,7 @@ impl P2pConnManager {
             bandwidth_limit,
             global_bandwidth,
             ledbat_min_ssthresh,
+            congestion_config,
             blocked_addresses,
             message_processor,
         } = self;
@@ -509,7 +514,7 @@ impl P2pConnManager {
             bandwidth_limit,
             global_bandwidth,
             ledbat_min_ssthresh,
-            None, // Uses FREENET_CONGESTION_CONTROL env var, defaults to FixedRate
+            Some(congestion_config.clone()),
         )
         .await?;
 
@@ -578,6 +583,7 @@ impl P2pConnManager {
             bandwidth_limit,
             global_bandwidth: None, // Already used for connection handler, not needed in ctx
             ledbat_min_ssthresh,
+            congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             message_processor,
         };

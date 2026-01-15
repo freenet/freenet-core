@@ -29,7 +29,7 @@ use tracing::{span, Instrument};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    congestion_control::{CongestionControlAlgorithm, CongestionControlConfig},
+    congestion_control::CongestionControlConfig,
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
@@ -237,34 +237,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
-            // Check FREENET_CONGESTION_CONTROL env var, default to FixedRate for production.
-            // Set FREENET_CONGESTION_CONTROL=bbr for BBR congestion control.
-            // For BBR, FREENET_BBR_STARTUP_RATE can override the startup pacing rate.
-            congestion_config: Some(congestion_config.unwrap_or_else(|| {
-                let algo = match std::env::var("FREENET_CONGESTION_CONTROL")
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .as_str()
-                {
-                    "bbr" => CongestionControlAlgorithm::Bbr,
-                    "ledbat" => CongestionControlAlgorithm::Ledbat,
-                    _ => CongestionControlAlgorithm::FixedRate, // Default for production
-                };
-                let mut config = CongestionControlConfig::new(algo);
-                // Allow overriding BBR startup pacing rate via env var (for CI/testing)
-                if algo == CongestionControlAlgorithm::Bbr {
-                    if let Ok(rate_str) = std::env::var("FREENET_BBR_STARTUP_RATE") {
-                        if let Ok(rate) = rate_str.parse::<u64>() {
-                            tracing::debug!(
-                                "Using custom BBR startup pacing rate: {} bytes/sec",
-                                rate
-                            );
-                            config = config.with_startup_min_pacing_rate(rate);
-                        }
-                    }
-                }
-                config
-            })),
+            // Use provided config or default to FixedRate (100 Mbps).
+            // Congestion control settings are now centralized in config/mod.rs and can be
+            // configured via FREENET_CONGESTION_CONTROL env var or config file.
+            congestion_config: Some(congestion_config.unwrap_or_default()),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
