@@ -53,18 +53,19 @@ pub fn create_benchmark_runtime() -> tokio::runtime::Runtime {
 /// Get the congestion control algorithm from environment variable.
 ///
 /// Set `FREENET_CONGESTION_ALGO` to:
-/// - `bbr` or `BBR` - Use BBR (Bottleneck Bandwidth and RTT) - **default**
+/// - `fixedrate` or `fixed` - Use FixedRate (100 Mbps)
+/// - `bbr` or `BBR` - Use BBR (Bottleneck Bandwidth and RTT)
 /// - `ledbat` or `LEDBAT` - Use LEDBAT++ (Low Extra Delay Background Transport)
 ///
-/// If not set, defaults to BBR which is the production default.
+/// If not set, defaults to `CongestionControlAlgorithm::default()` (production default).
 ///
 /// ## Example
 ///
 /// ```bash
-/// # Run benchmarks with LEDBAT for comparison
-/// FREENET_CONGESTION_ALGO=ledbat cargo bench --bench transport_ci
+/// # Run benchmarks with BBR for comparison
+/// FREENET_CONGESTION_ALGO=bbr cargo bench --bench transport_ci
 ///
-/// # Run benchmarks with BBR (default)
+/// # Run benchmarks with production default
 /// cargo bench --bench transport_ci
 /// ```
 pub fn get_congestion_algorithm() -> CongestionControlAlgorithm {
@@ -74,13 +75,14 @@ pub fn get_congestion_algorithm() -> CongestionControlAlgorithm {
         .as_str()
     {
         "ledbat" => CongestionControlAlgorithm::Ledbat,
-        "bbr" | "" => CongestionControlAlgorithm::Bbr,
+        "bbr" => CongestionControlAlgorithm::Bbr,
+        "fixedrate" | "fixed" | "" => CongestionControlAlgorithm::default(),
         other => {
             eprintln!(
-                "Warning: Unknown FREENET_CONGESTION_ALGO value '{}', using BBR",
+                "Warning: Unknown FREENET_CONGESTION_ALGO value '{}', using default",
                 other
             );
-            CongestionControlAlgorithm::Bbr
+            CongestionControlAlgorithm::default()
         }
     }
 }
