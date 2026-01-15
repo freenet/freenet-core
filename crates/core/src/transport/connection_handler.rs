@@ -237,17 +237,17 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             expected_non_gateway: expected_non_gateway.clone(),
             last_asym_attempt: HashMap::new(),
             time_source,
-            // Production uses BBR - set explicitly for best performance.
-            // FREENET_CONGESTION_CONTROL env var can override for testing.
+            // Check FREENET_CONGESTION_CONTROL env var, default to FixedRate for production.
+            // Set FREENET_CONGESTION_CONTROL=bbr for BBR congestion control.
             congestion_config: Some(congestion_config.unwrap_or_else(|| {
                 let algo = match std::env::var("FREENET_CONGESTION_CONTROL")
                     .unwrap_or_default()
                     .to_lowercase()
                     .as_str()
                 {
-                    "fixed" | "fixedrate" => CongestionControlAlgorithm::FixedRate,
+                    "bbr" => CongestionControlAlgorithm::Bbr,
                     "ledbat" => CongestionControlAlgorithm::Ledbat,
-                    _ => CongestionControlAlgorithm::Bbr, // Default for production
+                    _ => CongestionControlAlgorithm::FixedRate, // Default for production
                 };
                 CongestionControlConfig::new(algo)
             })),
