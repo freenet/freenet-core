@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use rstest::rstest;
 
+use crate::dev_tool::TimeSource;
 use crate::simulation::VirtualTime;
 
 use super::config::BbrConfig;
@@ -829,5 +830,143 @@ fn test_issue_2697_large_transfer_with_timeouts(#[case] rtt_ms: u64, #[case] tra
         rtt_ms,
         transfer_kb,
         final_bw_kbps
+    );
+}
+
+/// Test that BBR achieves reasonable throughput on realistic network conditions.
+///
+/// This test catches the production issue where transfers only achieve ~45 KB/s
+/// despite the network supporting 2 MB/s. The problem is likely in how pacing_rate
+/// interacts with the actual send rate.
+///
+/// Parameters:
+/// - `rtt_ms`: RTT in milliseconds
+/// - `link_bandwidth_kbps`: Link capacity in KB/s
+/// - `transfer_kb`: Transfer size in KB
+/// - `min_throughput_fraction`: Minimum acceptable throughput as fraction of link bandwidth
+#[rstest]
+#[case::river_ui_intercontinental(135, 2000, 2900, 0.25)]
+#[case::river_ui_continental(50, 5000, 2900, 0.40)]
+#[case::small_contract_lan(1, 100000, 500, 0.30)]
+fn test_bbr_achieves_reasonable_throughput(
+    #[case] rtt_ms: u64,
+    #[case] link_bandwidth_kbps: u64,
+    #[case] transfer_kb: usize,
+    #[case] min_throughput_fraction: f64,
+) {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let rtt = Duration::from_millis(rtt_ms);
+    let link_bandwidth = link_bandwidth_kbps * 1024; // bytes/sec
+    let packet_size = 1400;
+    let transfer_bytes = transfer_kb * 1024;
+
+    // Track total virtual time elapsed during transfer
+    let start_time_nanos = time.now_nanos();
+    let mut bytes_transferred = 0usize;
+
+    // Phase 1: Warmup to establish bandwidth (10 RTTs)
+    for _ in 0..10 {
+        let mut tokens = Vec::new();
+        // Send at link rate
+        let bytes_per_rtt = (link_bandwidth as u128 * rtt.as_nanos() / 1_000_000_000) as usize;
+        let packets_per_rtt = (bytes_per_rtt / packet_size).max(1);
+
+        for _ in 0..packets_per_rtt {
+            if controller.flightsize() + packet_size <= controller.current_cwnd() {
+                tokens.push(controller.on_send(packet_size));
+            }
+        }
+        time.advance(rtt);
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+        }
+    }
+
+    // Record warmup bandwidth
+    let warmup_bw = controller.max_bw();
+    let warmup_pacing = controller.pacing_rate();
+
+    // Phase 2: Transfer data, respecting pacing_rate
+    while bytes_transferred < transfer_bytes {
+        // Compute how many bytes we can send this RTT based on pacing_rate
+        let pacing_rate = controller.pacing_rate();
+        let bytes_this_rtt = if pacing_rate > 0 {
+            (pacing_rate as u128 * rtt.as_nanos() / 1_000_000_000) as usize
+        } else {
+            packet_size
+        };
+
+        let mut tokens = Vec::new();
+        let mut sent_this_rtt = 0;
+
+        while sent_this_rtt < bytes_this_rtt && bytes_transferred + sent_this_rtt < transfer_bytes {
+            if controller.flightsize() + packet_size <= controller.current_cwnd() {
+                tokens.push(controller.on_send(packet_size));
+                sent_this_rtt += packet_size;
+            } else {
+                break; // cwnd limited
+            }
+        }
+
+        time.advance(rtt);
+
+        // Receive ACKs
+        for token in tokens {
+            controller.on_ack_with_token(rtt, packet_size, Some(token));
+            bytes_transferred += packet_size;
+        }
+    }
+
+    let elapsed_nanos = time.now_nanos() - start_time_nanos;
+    let elapsed_secs = elapsed_nanos as f64 / 1_000_000_000.0;
+    let achieved_throughput = bytes_transferred as f64 / elapsed_secs;
+    let achieved_throughput_kbps = achieved_throughput / 1024.0;
+    let link_bandwidth_kbps_f64 = link_bandwidth as f64 / 1024.0;
+    let throughput_fraction = achieved_throughput / link_bandwidth as f64;
+
+    let final_bw = controller.max_bw();
+    let final_pacing = controller.pacing_rate();
+    let final_cwnd = controller.current_cwnd();
+
+    // Log detailed metrics for debugging
+    eprintln!(
+        "\n=== BBR Throughput Test Results ===\n\
+         Network: {}ms RTT, {} KB/s link\n\
+         Transfer: {} KB in {:.2}s\n\
+         \n\
+         Warmup: max_bw={} B/s, pacing={} B/s\n\
+         Final:  max_bw={} B/s, pacing={} B/s, cwnd={} B\n\
+         \n\
+         Achieved throughput: {:.1} KB/s ({:.1}% of link)\n\
+         Required minimum: {:.1}% of link ({:.1} KB/s)\n",
+        rtt_ms,
+        link_bandwidth_kbps,
+        transfer_kb,
+        elapsed_secs,
+        warmup_bw,
+        warmup_pacing,
+        final_bw,
+        final_pacing,
+        final_cwnd,
+        achieved_throughput_kbps,
+        throughput_fraction * 100.0,
+        min_throughput_fraction * 100.0,
+        link_bandwidth_kbps_f64 * min_throughput_fraction,
+    );
+
+    // Assert throughput meets minimum requirement
+    assert!(
+        throughput_fraction >= min_throughput_fraction,
+        "[{}ms RTT, {}KB/s link] Achieved throughput {:.1} KB/s ({:.1}%) \
+         is below minimum {:.1}% ({:.1} KB/s). \
+         This replicates the production issue where transfers only achieve ~45 KB/s.",
+        rtt_ms,
+        link_bandwidth_kbps,
+        achieved_throughput_kbps,
+        throughput_fraction * 100.0,
+        min_throughput_fraction * 100.0,
+        link_bandwidth_kbps_f64 * min_throughput_fraction,
     );
 }

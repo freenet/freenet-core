@@ -509,6 +509,7 @@ impl P2pConnManager {
             bandwidth_limit,
             global_bandwidth,
             ledbat_min_ssthresh,
+            None, // Uses FREENET_CONGESTION_CONTROL env var, defaults to FixedRate
         )
         .await?;
 
@@ -2697,7 +2698,10 @@ impl P2pConnManager {
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
-            GlobalExecutor::spawn(async move {
+            // Use tokio::spawn directly instead of GlobalExecutor::spawn.
+            // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
+            // reliably poll tasks in certain test contexts (see issue #2709).
+            tokio::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
             // Yield to allow the spawned peer_connection_listener task to start.
@@ -3545,6 +3549,15 @@ async fn peer_connection_listener(
     );
 
     loop {
+        // Yield to allow the tokio runtime to schedule other tasks.
+        // This is critical for cooperative scheduling - without it, tokio's coop
+        // budget can be exhausted and channel recv() will return Pending even when
+        // messages are available. See https://github.com/tokio-rs/tokio/issues/7108
+        //
+        // We cannot add this yield inside deterministic_select! because it would
+        // break determinism guarantees for simulation testing.
+        tokio::task::yield_now().await;
+
         // Drain all pending outbound messages first before checking inbound.
         // This ensures queued outbound messages are sent promptly without starving
         // the inbound channel (which would happen with biased select).

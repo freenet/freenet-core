@@ -670,8 +670,23 @@ impl<T: TimeSource> BbrController<T> {
         let effective_bw = max_bw.min(bw_hi);
 
         let pacing_rate = (effective_bw as f64 * pacing_gain) as u64;
+
+        // Apply minimum pacing rate floor during Startup to ensure we can probe for bandwidth.
+        // Without this, low initial samples can cause a death spiral where:
+        //   low samples → low pacing → slow sending → low samples
+        // During Startup, we should be aggressive about probing (1 MB/s minimum).
+        // After Startup, we trust the measured bandwidth more.
+        const STARTUP_MIN_PACING_RATE: u64 = 1_000_000; // 1 MB/s
+        const MIN_PACING_RATE: u64 = 10_000; // 10 KB/s absolute floor
+
+        let min_rate = if self.state.load() == BbrState::Startup {
+            STARTUP_MIN_PACING_RATE
+        } else {
+            MIN_PACING_RATE
+        };
+
         self.pacing_rate
-            .store(pacing_rate.max(1), Ordering::Release);
+            .store(pacing_rate.max(min_rate), Ordering::Release);
     }
 
     /// Compute the Bandwidth-Delay Product.
