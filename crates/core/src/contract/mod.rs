@@ -11,7 +11,8 @@ pub mod storages;
 
 pub(crate) use executor::{
     mediator_channels, mock_runtime::MockRuntime, op_request_channel, run_op_request_mediator,
-    Callback, ExecutorToEventLoopChannel, NetworkEventListenerHalve, UpsertResult,
+    Callback, ContractExecutor, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+    UpsertResult,
 };
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel,
@@ -24,7 +25,6 @@ pub(crate) use handler::{
 pub use executor::{Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
 
-use executor::ContractExecutor;
 use tracing::Instrument;
 
 pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>

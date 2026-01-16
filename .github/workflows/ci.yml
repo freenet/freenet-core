@@ -204,9 +204,10 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         # Simulation tests use global state (socket registries, RNG, counters)
-        # and must run serially to avoid race conditions
+        # and must run serially to avoid race conditions.
+        # Includes: basic simulation, subscription topology validation
         run: |
-          cargo test -p freenet --no-default-features --features trace,websocket,redb,simulation_tests \
+          cargo test -p freenet --no-default-features --features trace,websocket,redb,simulation_tests,testing \
             --test simulation_integration \
             --test simulation_smoke \
             -- --test-threads=1

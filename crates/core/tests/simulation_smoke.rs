@@ -835,3 +835,94 @@ async fn test_minimal_network() {
 
     tracing::info!("Minimal network test passed");
 }
+
+// =============================================================================
+// Subscription Topology Validation
+// =============================================================================
+// These tests validate the subscription topology infrastructure to detect
+// issues like bidirectional cycles (#2720), orphan seeders (#2719), etc.
+
+/// Helper to create a contract ID from a seed
+fn make_contract_id(seed: u8) -> freenet_stdlib::prelude::ContractInstanceId {
+    freenet_stdlib::prelude::ContractInstanceId::new([seed; 32])
+}
+
+/// Test that topology snapshot infrastructure is working correctly.
+///
+/// This test verifies:
+/// 1. SimNetwork creates and starts nodes correctly
+/// 2. The periodic topology registration task runs
+/// 3. Topology snapshots are captured for all peers
+/// 4. The validate_subscription_topology function can be called
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_topology_infrastructure() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+    use freenet::dev_tool::reset_all_simulation_state;
+
+    const SEED: u64 = 0x1234_5678;
+
+    // Reset all global state and set up deterministic time/RNG
+    reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "topology-infra-test",
+        1,  // 1 gateway
+        3,  // 3 peers
+        7,  // max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start network with minimal operations - just verify infrastructure
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Let the network run to establish connections
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    // Wait for topology registration task to run (1 second interval)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify topology snapshots were captured
+    let snapshots = sim.get_topology_snapshots();
+
+    // Should have captured snapshots for all 4 peers (1 gateway + 3 nodes)
+    assert!(
+        snapshots.len() >= 4,
+        "Expected at least 4 topology snapshots (1 gateway + 3 nodes), got {}",
+        snapshots.len()
+    );
+
+    // Verify each snapshot has valid data
+    for snap in &snapshots {
+        // Each peer should have a valid address and location
+        assert!(
+            snap.location >= 0.0 && snap.location <= 1.0,
+            "Invalid location {} for peer {}",
+            snap.location,
+            snap.peer_addr
+        );
+    }
+
+    // Verify validate_subscription_topology can be called
+    let contract_id = make_contract_id(1);
+    let result = sim.validate_subscription_topology(&contract_id, 0.5);
+
+    // With no contracts created, should have no issues
+    assert!(
+        result.is_healthy(),
+        "Empty topology should be healthy, got {} issues",
+        result.issue_count
+    );
+
+    tracing::info!("Topology infrastructure test passed");
+}

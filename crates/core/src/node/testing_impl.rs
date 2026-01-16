@@ -101,22 +101,176 @@ pub use self::turmoil_runner::{run_turmoil_simulation, TurmoilConfig, TurmoilRes
 
 pub(crate) type EventId = u32;
 
+/// A controlled operation to execute on a specific node during simulation.
+///
+/// `SimOperation` allows tests to specify exact operations instead of relying
+/// on random event generation. This enables precise testing of specific scenarios
+/// like subscription topology formation.
+///
+/// # Usage
+///
+/// ```ignore
+/// use freenet::dev_tool::{SimNetwork, SimOperation, NodeLabel};
+///
+/// let mut sim = SimNetwork::new("test", 1, 3, ...).await;
+///
+/// // Create a contract and have specific nodes subscribe
+/// let contract = SimOperation::create_test_contract(42);
+/// let operations = vec![
+///     (NodeLabel::gateway("test", 0), SimOperation::Put {
+///         contract: contract.clone(),
+///         state: vec![1, 2, 3],
+///         subscribe: true,
+///     }),
+///     (NodeLabel::node("test", 0), SimOperation::Subscribe {
+///         contract_id: *contract.key().id(),
+///     }),
+/// ];
+///
+/// let handles = sim.start_with_controlled_events(operations).await;
+/// ```
+#[derive(Clone, Debug)]
+pub enum SimOperation {
+    /// PUT a new contract with initial state.
+    Put {
+        /// The contract container (code + parameters)
+        contract: ContractContainer,
+        /// Initial state bytes
+        state: Vec<u8>,
+        /// Whether to subscribe to updates after PUT
+        subscribe: bool,
+    },
+    /// GET a contract's current state.
+    Get {
+        /// The contract instance ID to retrieve
+        contract_id: ContractInstanceId,
+        /// Whether to return the contract code
+        return_contract_code: bool,
+        /// Whether to subscribe to updates after GET
+        subscribe: bool,
+    },
+    /// SUBSCRIBE to a contract's updates.
+    Subscribe {
+        /// The contract instance ID to subscribe to
+        contract_id: ContractInstanceId,
+    },
+    /// UPDATE a contract's state.
+    Update {
+        /// The contract key to update
+        key: ContractKey,
+        /// New state data
+        data: Vec<u8>,
+    },
+}
+
+impl SimOperation {
+    /// Creates a deterministic test contract from a seed.
+    ///
+    /// The contract code and parameters are derived from the seed,
+    /// making it reproducible across test runs.
+    pub fn create_test_contract(seed: u8) -> ContractContainer {
+        let mut code_bytes = vec![0u8; 32];
+        let mut params_bytes = vec![0u8; 16];
+
+        // Fill with deterministic bytes based on seed
+        for (i, byte) in code_bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8);
+        }
+        for (i, byte) in params_bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8).wrapping_mul(2);
+        }
+
+        let code = ContractCode::from(code_bytes);
+        let params = Parameters::from(params_bytes);
+        ContractWasmAPIVersion::V1(WrappedContract::new(code.into(), params)).into()
+    }
+
+    /// Creates a deterministic test state from a seed.
+    pub fn create_test_state(seed: u8) -> Vec<u8> {
+        let mut state_bytes = vec![0u8; 64];
+        for (i, byte) in state_bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8).wrapping_mul(3);
+        }
+        state_bytes
+    }
+
+    /// Converts this operation to a ClientRequest.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn into_client_request(self) -> freenet_stdlib::client_api::ClientRequest<'static> {
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+
+        match self {
+            SimOperation::Put {
+                contract,
+                state,
+                subscribe,
+            } => ClientRequest::ContractOp(ContractRequest::Put {
+                contract,
+                state: WrappedState::new(state),
+                related_contracts: RelatedContracts::new(),
+                subscribe,
+            }),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code,
+                subscribe,
+            } => ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_id,
+                return_contract_code,
+                subscribe,
+            }),
+            SimOperation::Subscribe { contract_id } => {
+                ClientRequest::ContractOp(ContractRequest::Subscribe {
+                    key: contract_id,
+                    summary: None,
+                })
+            }
+            SimOperation::Update { key, data } => {
+                ClientRequest::ContractOp(ContractRequest::Update {
+                    key,
+                    data: UpdateData::State(State::from(data)),
+                })
+            }
+        }
+    }
+}
+
+/// A scheduled operation for controlled event simulation.
+#[derive(Clone, Debug)]
+pub struct ScheduledOperation {
+    /// Which node should execute this operation
+    pub node: NodeLabel,
+    /// The operation to execute
+    pub operation: SimOperation,
+}
+
+impl ScheduledOperation {
+    /// Create a new scheduled operation.
+    pub fn new(node: NodeLabel, operation: SimOperation) -> Self {
+        Self { node, operation }
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub struct NodeLabel(Arc<str>);
 
 impl NodeLabel {
-    fn gateway(network_name: &str, id: usize) -> Self {
+    /// Creates a gateway label for a network.
+    pub fn gateway(network_name: &str, id: usize) -> Self {
         Self(format!("{network_name}-gateway-{id}").into())
     }
 
-    fn node(network_name: &str, id: usize) -> Self {
+    /// Creates a regular node label for a network.
+    pub fn node(network_name: &str, id: usize) -> Self {
         Self(format!("{network_name}-node-{id}").into())
     }
 
-    fn is_gateway(&self) -> bool {
+    /// Returns true if this is a gateway label.
+    pub fn is_gateway(&self) -> bool {
         self.0.contains("-gateway-")
     }
 
+    /// Returns true if this is a regular node label.
     pub fn is_node(&self) -> bool {
         self.0.contains("-node-")
     }
@@ -349,6 +503,97 @@ impl<S> Drop for EventChain<S> {
     fn drop(&mut self) {
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
+        }
+    }
+}
+
+/// A controlled event chain that triggers events in a specific sequence.
+///
+/// Unlike `EventChain` which randomly selects peers, `ControlledEventChain`
+/// triggers events in the exact order specified, allowing deterministic testing.
+pub struct ControlledEventChain {
+    user_ev_controller: watch::Sender<(EventId, TransportPublicKey)>,
+    /// Sequence of (EventId, NodeLabel) to trigger, in order
+    event_sequence: Vec<(EventId, NodeLabel)>,
+    /// Map from NodeLabel to TransportPublicKey
+    label_to_key: HashMap<NodeLabel, TransportPublicKey>,
+    /// Current position in the event sequence
+    current_index: usize,
+}
+
+impl ControlledEventChain {
+    /// Create a new controlled event chain.
+    pub fn new(
+        user_ev_controller: watch::Sender<(EventId, TransportPublicKey)>,
+        event_sequence: Vec<(EventId, NodeLabel)>,
+        label_to_key: HashMap<NodeLabel, TransportPublicKey>,
+    ) -> Self {
+        Self {
+            user_ev_controller,
+            event_sequence,
+            label_to_key,
+            current_index: 0,
+        }
+    }
+
+    /// Trigger the next event in the sequence.
+    ///
+    /// Returns the EventId that was triggered, or None if all events have been triggered.
+    pub fn trigger_next(&mut self) -> Option<EventId> {
+        if self.current_index >= self.event_sequence.len() {
+            return None;
+        }
+
+        let (event_id, label) = &self.event_sequence[self.current_index];
+        let key = self
+            .label_to_key
+            .get(label)
+            .expect("Label should exist in mapping");
+
+        match self.user_ev_controller.send((*event_id, key.clone())) {
+            Ok(()) => {
+                self.current_index += 1;
+                Some(*event_id)
+            }
+            Err(e) => {
+                tracing::error!("Failed to send event {}: {:?}", event_id, e);
+                None
+            }
+        }
+    }
+
+    /// Trigger all remaining events in sequence.
+    ///
+    /// Returns the number of events triggered.
+    pub fn trigger_all(&mut self) -> usize {
+        let mut count = 0;
+        while self.trigger_next().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    /// Returns true if all events have been triggered.
+    pub fn is_complete(&self) -> bool {
+        self.current_index >= self.event_sequence.len()
+    }
+
+    /// Returns the number of events remaining.
+    pub fn remaining(&self) -> usize {
+        self.event_sequence.len().saturating_sub(self.current_index)
+    }
+}
+
+impl futures::stream::Stream for ControlledEventChain {
+    type Item = EventId;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.trigger_next() {
+            Some(event_id) => std::task::Poll::Ready(Some(event_id)),
+            None => std::task::Poll::Ready(None),
         }
     }
 }
@@ -1142,7 +1387,11 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
+        use crate::ring::topology_registry::set_current_network_name;
         use crate::transport::in_memory_socket::is_socket_registered;
+
+        // Set the current network name so Ring can register topology snapshots
+        set_current_network_name(&self.name);
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
         let mut peers = vec![];
@@ -1318,6 +1567,281 @@ impl SimNetwork {
 
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers
+    }
+
+    /// Starts the network with controlled events instead of random event generation.
+    ///
+    /// This method allows tests to specify exact operations to execute on specific nodes,
+    /// enabling precise testing of scenarios like subscription topology formation.
+    ///
+    /// # Arguments
+    ///
+    /// * `operations` - A list of `(NodeLabel, SimOperation)` pairs specifying which
+    ///   operations to execute on which nodes.
+    ///
+    /// # Returns
+    ///
+    /// A vector of join handles for the node tasks and the number of operations scheduled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let contract = SimOperation::create_test_contract(42);
+    /// let operations = vec![
+    ///     ScheduledOperation::new(
+    ///         NodeLabel::gateway("test", 0),
+    ///         SimOperation::Put {
+    ///             contract: contract.clone(),
+    ///             state: vec![1, 2, 3],
+    ///             subscribe: true,
+    ///         }
+    ///     ),
+    ///     ScheduledOperation::new(
+    ///         NodeLabel::node("test", 0),
+    ///         SimOperation::Subscribe {
+    ///             contract_id: *contract.key().id(),
+    ///         }
+    ///     ),
+    /// ];
+    ///
+    /// let (handles, num_ops) = sim.start_with_controlled_events(operations).await;
+    /// ```
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn start_with_controlled_events(
+        &mut self,
+        operations: Vec<ScheduledOperation>,
+    ) -> (Vec<tokio::task::JoinHandle<anyhow::Result<()>>>, usize) {
+        use crate::ring::topology_registry::set_current_network_name;
+        use crate::transport::in_memory_socket::is_socket_registered;
+
+        // Set the current network name so Ring can register topology snapshots
+        set_current_network_name(&self.name);
+
+        let num_operations = operations.len();
+        let mut peers = vec![];
+
+        // Build a map of label -> list of (event_id, operation)
+        let mut operations_by_node: HashMap<NodeLabel, Vec<(EventId, SimOperation)>> =
+            HashMap::new();
+        for (event_id, scheduled_op) in operations.into_iter().enumerate() {
+            operations_by_node
+                .entry(scheduled_op.node)
+                .or_default()
+                .push((event_id as EventId, scheduled_op.operation));
+        }
+
+        // Phase 1: Start all gateways first and collect their addresses
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        let mut gateway_addrs = Vec::with_capacity(gateways.len());
+
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            let gateway_addr = *config
+                .peer_key_location
+                .peer_addr
+                .as_known()
+                .expect("Gateway should have known address");
+            gateway_addrs.push(gateway_addr);
+
+            tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway with controlled events");
+
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: true,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            let mut user_events = MemoryEventsGen::new(
+                self.receiver_ch.clone(),
+                node.config.key_pair.public().clone(),
+            );
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("in_mem_gateway_controlled", %label);
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
+            };
+            let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: gateway_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
+
+            peers.push(handle);
+
+            tokio::time::sleep(self.start_backoff).await;
+        }
+
+        // Phase 2: Wait for all gateways to be registered
+        let registration_timeout = Duration::from_secs(10);
+        let poll_interval = Duration::from_millis(10);
+        let start = tokio::time::Instant::now();
+
+        'wait_loop: loop {
+            let mut all_registered = true;
+            for addr in &gateway_addrs {
+                if !is_socket_registered(&self.name, addr) {
+                    all_registered = false;
+                    break;
+                }
+            }
+
+            if all_registered {
+                tracing::debug!(
+                    "All {} gateways registered in {:?}",
+                    gateway_addrs.len(),
+                    start.elapsed()
+                );
+                break 'wait_loop;
+            }
+
+            if start.elapsed() > registration_timeout {
+                tracing::warn!(
+                    "Timeout waiting for gateway registration. {} of {} registered.",
+                    gateway_addrs
+                        .iter()
+                        .filter(|a| is_socket_registered(&self.name, a))
+                        .count(),
+                    gateway_addrs.len()
+                );
+                break 'wait_loop;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Phase 3: Start regular nodes
+        for (node, label) in std::mem::take(&mut self.nodes) {
+            let node_addr = *self
+                .node_addresses
+                .get(&label)
+                .expect("Node address should be tracked");
+
+            tracing::debug!(peer = %label, addr = %node_addr, "starting regular node with controlled events");
+
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: false,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            let mut user_events = MemoryEventsGen::new(
+                self.receiver_ch.clone(),
+                node.config.key_pair.public().clone(),
+            );
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("in_mem_node_controlled", %label);
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
+            };
+            let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: node_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
+
+            peers.push(handle);
+
+            tokio::time::sleep(self.start_backoff).await;
+        }
+
+        // Warn if there were operations for unknown nodes
+        if !operations_by_node.is_empty() {
+            let unknown_nodes: Vec<_> = operations_by_node.keys().collect();
+            tracing::warn!(
+                "Operations scheduled for unknown nodes: {:?}",
+                unknown_nodes
+            );
+        }
+
+        self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
+        (peers, num_operations)
+    }
+
+    /// Creates an event chain for controlled events.
+    ///
+    /// Unlike the standard `event_chain()`, this allows specifying the exact
+    /// sequence of events to trigger, enabling deterministic testing.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_sequence` - Pairs of `(EventId, NodeLabel)` specifying which events
+    ///   to trigger on which nodes, in order.
+    ///
+    /// # Returns
+    ///
+    /// A ControlledEventChain that can be used as a Stream.
+    pub fn controlled_event_chain(
+        &mut self,
+        event_sequence: Vec<(EventId, NodeLabel)>,
+    ) -> ControlledEventChain {
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("controller should be set");
+        let label_to_key: HashMap<_, _> = self.labels.iter().cloned().collect();
+        ControlledEventChain::new(user_ev_controller, event_sequence, label_to_key)
     }
 
     /// Builds peer nodes and returns the controller to trigger events.
@@ -2347,6 +2871,105 @@ impl SimNetwork {
         // Run the simulation
         sim.run()
     }
+
+    // =========================================================================
+    // Subscription Topology Validation
+    // =========================================================================
+
+    /// Get the network name for this simulation.
+    pub fn network_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get all subscription topology snapshots registered for this network.
+    ///
+    /// Returns snapshots registered by nodes via the topology registry.
+    /// Call this after nodes have been running to see their subscription state.
+    pub fn get_topology_snapshots(&self) -> Vec<crate::ring::topology_registry::TopologySnapshot> {
+        crate::ring::topology_registry::get_all_topology_snapshots(&self.name)
+    }
+
+    /// Validate subscription topology for a specific contract.
+    ///
+    /// Checks for:
+    /// - Bidirectional cycles that create isolated islands
+    /// - Orphan seeders without recovery paths
+    /// - Unreachable seeders
+    /// - Proximity violations in upstream selection
+    ///
+    /// Returns a validation result with any issues found.
+    pub fn validate_subscription_topology(
+        &self,
+        contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+        contract_location: f64,
+    ) -> crate::ring::topology_registry::TopologyValidationResult {
+        crate::ring::topology_registry::validate_topology(
+            &self.name,
+            contract_id,
+            contract_location,
+        )
+    }
+
+    /// Clear all topology snapshots for this network.
+    ///
+    /// Call this at the start of a test or after topology validation
+    /// to reset the state.
+    pub fn clear_topology_snapshots(&self) {
+        crate::ring::topology_registry::clear_topology_snapshots(&self.name);
+    }
+
+    /// Assert that subscription topology is healthy for a contract.
+    ///
+    /// # Panics
+    /// Panics if any topology issues are detected.
+    pub fn assert_topology_healthy(
+        &self,
+        contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+        contract_location: f64,
+    ) {
+        let result = self.validate_subscription_topology(contract_id, contract_location);
+
+        if !result.is_healthy() {
+            let mut issues = Vec::new();
+
+            if !result.bidirectional_cycles.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2720: {} bidirectional cycles found: {:?}",
+                    result.bidirectional_cycles.len(),
+                    result.bidirectional_cycles
+                ));
+            }
+
+            if !result.orphan_seeders.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2719: {} orphan seeders found: {:?}",
+                    result.orphan_seeders.len(),
+                    result.orphan_seeders
+                ));
+            }
+
+            if !result.unreachable_seeders.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2720: {} unreachable seeders found: {:?}",
+                    result.unreachable_seeders.len(),
+                    result.unreachable_seeders
+                ));
+            }
+
+            if !result.proximity_violations.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2721: {} proximity violations found",
+                    result.proximity_violations.len()
+                ));
+            }
+
+            panic!(
+                "Subscription topology has {} issues:\n{}",
+                result.issue_count,
+                issues.join("\n")
+            );
+        }
+    }
 }
 
 /// Result of a convergence check.
@@ -2595,10 +3218,17 @@ impl Drop for SimNetwork {
     fn drop(&mut self) {
         // Clean up the fault injector for this network
         use crate::node::network_bridge::set_fault_injector;
+        use crate::ring::topology_registry::{
+            clear_current_network_name, clear_topology_snapshots,
+        };
         set_fault_injector(&self.name, None);
 
         // Clean up the VirtualTime registration for this network
         unregister_network_time_source(&self.name);
+
+        // Clean up topology registry for this network
+        clear_topology_snapshots(&self.name);
+        clear_current_network_name();
 
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
