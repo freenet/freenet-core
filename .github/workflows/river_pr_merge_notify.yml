@@ -11,7 +11,7 @@ jobs:
     if: github.event.pull_request.merged == true
     steps:
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install riverctl
         run: cargo install riverctl
