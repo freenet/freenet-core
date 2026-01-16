@@ -714,16 +714,22 @@ impl Ring {
 
     /// Set the upstream source for a contract (the peer we get updates FROM).
     ///
+    /// **Proximity validation**: Only accepts a peer as upstream if they are CLOSER to the
+    /// contract location than we are. This creates a DAG that naturally flows toward the
+    /// contract location, preventing cycles and optimizing subscription trees.
+    ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
+    /// - `NotCloserToContract`: The upstream is not closer to the contract than we are
     pub fn set_upstream(
         &self,
         contract: &ContractKey,
         upstream: PeerKeyLocation,
     ) -> Result<(), SubscriptionError> {
+        let own_location = self.connection_manager.own_location().location();
         let own_addr = self.connection_manager.get_own_addr();
         self.seeding_manager
-            .set_upstream(contract, upstream, own_addr)
+            .set_upstream(contract, upstream, own_location, own_addr)
     }
 
     /// Remove a subscriber and check if upstream notification is needed.

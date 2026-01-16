@@ -18,7 +18,7 @@ use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::{KnownPeerKeyLocation, Location, RingError},
+    ring::{KnownPeerKeyLocation, Location, RingError, SubscriptionError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -959,6 +959,17 @@ impl Operation for SubscribeOp {
                                                 %key,
                                                 upstream = %sender_addr,
                                                 "subscribe: registered upstream source"
+                                            );
+                                        }
+                                        Err(SubscriptionError::NotCloserToContract) => {
+                                            // This is expected behavior - the sender is not closer
+                                            // to the contract than we are, so we're likely near the
+                                            // contract source. We don't need an upstream in this case.
+                                            tracing::debug!(
+                                                tx = %msg_id,
+                                                %key,
+                                                candidate_upstream = %sender_addr,
+                                                "subscribe: skipping upstream registration - we are closer to contract"
                                             );
                                         }
                                         Err(e) => {
