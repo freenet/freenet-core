@@ -2857,6 +2857,23 @@ impl P2pConnManager {
                     }
                 }
 
+                // Let proximity cache manager handle new ring connection
+                if let Some(cache_msg) = self
+                    .bridge
+                    .op_manager
+                    .proximity_cache
+                    .on_ring_connection_established(peer_addr)
+                {
+                    let msg = NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg });
+                    if let Err(e) = self.bridge.send(peer_addr, msg).await {
+                        tracing::warn!(
+                            %peer_addr,
+                            error = %e,
+                            "Failed to send proximity cache message to new peer"
+                        );
+                    }
+                }
+
                 // Check if new peer is closer to any contracts we're seeding without upstream.
                 // If so, attempt to subscribe through them to join the subscription tree.
                 let our_loc = connection_manager.own_location();

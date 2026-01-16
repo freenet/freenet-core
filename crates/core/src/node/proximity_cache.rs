@@ -264,10 +264,19 @@ impl ProximityCacheManager {
         }
     }
 
-    /// Generate a cache state request for a newly connected peer.
-    #[allow(dead_code)]
-    pub fn request_cache_state() -> ProximityCacheMessage {
-        ProximityCacheMessage::CacheStateRequest
+    /// Called when a new ring connection is established.
+    ///
+    /// Returns a message to send to the peer to exchange cache state,
+    /// enabling UPDATE forwarding to nearby seeders.
+    pub fn on_ring_connection_established(
+        &self,
+        peer_addr: SocketAddr,
+    ) -> Option<ProximityCacheMessage> {
+        debug!(
+            peer = %peer_addr,
+            "PROXIMITY_CACHE: New ring connection, requesting cache state"
+        );
+        Some(ProximityCacheMessage::CacheStateRequest)
     }
 
     /// Check if we have a contract cached locally.
