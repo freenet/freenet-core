@@ -389,14 +389,20 @@ impl SeedingManager {
     }
 
     /// Get all contracts that we're seeding but don't have an upstream subscription for,
-    /// AND where we have active interest (local client subscriptions or downstream peers).
+    /// AND where we have active interest (local client subscriptions, downstream peers,
+    /// or an existing subscription entry indicating we're part of the subscription tree).
     ///
     /// These are contracts where we may be "isolated" from the subscription tree and
     /// should attempt to establish an upstream connection when possible.
     ///
-    /// IMPORTANT: We only want to re-subscribe if we have active interest. If a client
-    /// disconnects and pruning occurs, we should NOT try to re-subscribe just because
-    /// the contract is still in our cache.
+    /// A contract is considered to have active interest if ANY of:
+    /// - It has local client subscriptions (clients actively want updates)
+    /// - It has downstream peers (we need updates to forward to them)
+    /// - It has an existing subscription entry (we're part of the subscription tree
+    ///   and should recover our upstream connection, e.g., after upstream disconnected)
+    ///
+    /// Contracts that were intentionally pruned (no clients, no downstream, no entry)
+    /// should NOT be auto-recovered to avoid re-subscribing after cleanup.
     ///
     /// PERFORMANCE NOTE: This method iterates all seeded contracts. Callers should use
     /// `can_request_subscription()` to filter results before spawning subscription
@@ -408,7 +414,7 @@ impl SeedingManager {
 
         // Filter to contracts that:
         // 1. Don't have an upstream subscription
-        // 2. Have active interest (local clients OR downstream peers)
+        // 2. Have active interest (local clients, downstream peers, or subscription entry)
         let mut result: Vec<ContractKey> = seeded_contracts
             .into_iter()
             .filter(|key| {
@@ -424,7 +430,12 @@ impl SeedingManager {
                     .map(|subs| subs.iter().any(|e| e.role == SubscriberType::Downstream))
                     .unwrap_or(false);
 
-                has_clients || has_downstream
+                // Also check if we have any subscription entry at all - this means we were
+                // part of the subscription tree and should try to recover. This covers
+                // the case where we had upstream that disconnected but no clients/downstream.
+                let has_subscription_entry = self.subscriptions.contains_key(key);
+
+                has_clients || has_downstream || has_subscription_entry
             })
             .collect();
 
@@ -1663,7 +1674,7 @@ mod tests {
     // ========== Tests for contracts_without_upstream filtering ==========
 
     #[test]
-    fn test_contracts_without_upstream_requires_active_interest() {
+    fn test_contracts_without_upstream_requires_active_interest_or_subscription_entry() {
         use super::super::seeding_cache::AccessType;
 
         let manager = SeedingManager::new();
@@ -1672,11 +1683,12 @@ mod tests {
         // Add contract to cache (seeding it)
         manager.record_contract_access(contract, 1000, AccessType::Put);
 
-        // Contract is cached but has no active interest (no clients, no downstream)
+        // Contract is cached but has no active interest (no clients, no downstream, no subscription entry)
+        // This ensures intentionally pruned contracts don't get auto-recovered
         let contracts = manager.contracts_without_upstream();
         assert!(
             contracts.is_empty(),
-            "Should not include contracts without active interest"
+            "Contracts without active interest should not be recovered"
         );
 
         // Add a client subscription - now it has active interest
@@ -1685,6 +1697,46 @@ mod tests {
 
         let contracts = manager.contracts_without_upstream();
         assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0], contract);
+    }
+
+    #[test]
+    fn test_contracts_without_upstream_includes_orphaned_subscription_entry() {
+        use super::super::seeding_cache::AccessType;
+
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        // Add contract to cache
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+
+        // Set upstream (creates subscription entry)
+        manager
+            .set_upstream(&contract, upstream.clone(), None)
+            .unwrap();
+
+        // Verify it has upstream - should NOT be in the list
+        let contracts = manager.contracts_without_upstream();
+        assert!(
+            contracts.is_empty(),
+            "Contract with upstream should not be returned"
+        );
+
+        // Now simulate upstream disconnect: remove the upstream but keep the subscription entry
+        // This is what happens when upstream peer disconnects
+        if let Some(mut subs) = manager.subscriptions.get_mut(&contract) {
+            subs.retain(|e| e.role != SubscriberType::Upstream);
+        }
+
+        // Now the contract has a subscription entry (even if empty) but no upstream
+        // This represents an orphaned seeder that should be recovered
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "Orphaned contract with subscription entry should be recovered"
+        );
         assert_eq!(contracts[0], contract);
     }
 
