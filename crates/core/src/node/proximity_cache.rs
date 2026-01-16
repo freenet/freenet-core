@@ -279,12 +279,6 @@ impl ProximityCacheManager {
         Some(ProximityCacheMessage::CacheStateRequest)
     }
 
-    /// Generate a cache state request for a newly connected peer.
-    #[allow(dead_code)]
-    pub fn request_cache_state() -> ProximityCacheMessage {
-        ProximityCacheMessage::CacheStateRequest
-    }
-
     /// Check if we have a contract cached locally.
     #[allow(dead_code)]
     pub fn is_cached_locally(&self, contract_key: &ContractKey) -> bool {
