@@ -48,6 +48,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod seeding;
 mod seeding_cache;
+pub mod topology_registry;
 
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
@@ -173,6 +174,11 @@ impl Ring {
 
         // Interval for GET subscription cache sweep (60 seconds)
         // Cleans up expired GET-triggered subscriptions and sends Unsubscribed messages
+        //
+        // Interval for topology snapshot registration (1 second in test mode)
+        // Registers subscription topology with the global registry for validation
+        #[cfg(any(test, feature = "testing"))]
+        const TOPOLOGY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
         const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
@@ -227,6 +233,14 @@ impl Ring {
         GlobalExecutor::spawn(Self::sweep_get_subscription_cache(
             ring.clone(),
             GET_SUBSCRIPTION_SWEEP_INTERVAL,
+        ));
+
+        // Spawn periodic topology snapshot registration task (test mode only)
+        // This allows SimNetwork to validate subscription topology during tests
+        #[cfg(any(test, feature = "testing"))]
+        GlobalExecutor::spawn(Self::register_topology_snapshots_periodically(
+            ring.clone(),
+            TOPOLOGY_SNAPSHOT_INTERVAL,
         ));
 
         Ok(ring)
@@ -510,6 +524,62 @@ impl Ring {
                     "Cleaned up expired GET subscription from local state"
                 );
             }
+        }
+    }
+
+    /// Periodically register topology snapshots for simulation testing.
+    ///
+    /// This task only runs when `CURRENT_NETWORK_NAME` is set (i.e., during SimNetwork tests).
+    /// It allows SimNetwork to validate subscription topology by querying the global registry.
+    #[cfg(any(test, feature = "testing"))]
+    async fn register_topology_snapshots_periodically(
+        ring: Arc<Self>,
+        interval_duration: Duration,
+    ) {
+        use topology_registry::{get_current_network_name, register_topology_snapshot};
+
+        tracing::info!("Topology snapshot registration task started");
+
+        // Add small initial delay to let network stabilize (use short delay in tests)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.tick().await; // Skip first immediate tick
+
+        loop {
+            interval.tick().await;
+
+            // Only register if we're in a simulation context
+            let Some(network_name) = get_current_network_name() else {
+                tracing::debug!("Topology snapshot: no network name set, skipping");
+                continue;
+            };
+
+            let Some(peer_addr) = ring.connection_manager.get_own_addr() else {
+                tracing::debug!("Topology snapshot: no peer address yet, skipping");
+                continue;
+            };
+
+            let location = ring
+                .connection_manager
+                .own_location()
+                .location()
+                .map(|l| l.as_f64())
+                .unwrap_or(0.0);
+
+            let snapshot = ring
+                .seeding_manager
+                .generate_topology_snapshot(peer_addr, location);
+            let contract_count = snapshot.contracts.len();
+            register_topology_snapshot(&network_name, snapshot);
+
+            tracing::info!(
+                %peer_addr,
+                location,
+                network = %network_name,
+                contract_count,
+                "Registered topology snapshot"
+            );
         }
     }
 
@@ -1306,6 +1376,48 @@ impl Ring {
             .await?;
         tracing::debug!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
+    }
+
+    /// Register a topology snapshot for this peer with the global registry.
+    ///
+    /// This should be called periodically during simulation tests to enable
+    /// topology validation. The snapshot captures the current subscription
+    /// state for all contracts.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)] // Used by SimNetwork tests
+    pub fn register_topology_snapshot(&self, network_name: &str) {
+        let Some(peer_addr) = self.connection_manager.get_own_addr() else {
+            return;
+        };
+        let location = self
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.0);
+
+        let snapshot = self
+            .seeding_manager
+            .generate_topology_snapshot(peer_addr, location);
+        topology_registry::register_topology_snapshot(network_name, snapshot);
+    }
+
+    /// Get a topology snapshot for this peer without registering it.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)] // Used by SimNetwork tests
+    pub fn get_topology_snapshot(&self) -> Option<topology_registry::TopologySnapshot> {
+        let peer_addr = self.connection_manager.get_own_addr()?;
+        let location = self
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.0);
+
+        Some(
+            self.seeding_manager
+                .generate_topology_snapshot(peer_addr, location),
+        )
     }
 }
 
