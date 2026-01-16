@@ -74,15 +74,23 @@ pub mod dev_tool {
     pub use node::{
         testing_impl::{
             check_convergence_from_logs, run_turmoil_simulation, ContractDistribution,
-            ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
-            NetworkPeer, NodeLabel, OperationStats, OperationSummary, PeerMessage, PeerStatus,
-            PutOperationStats, RunningNode, SimNetwork, TurmoilConfig, TurmoilResult,
-            UpdateOperationStats,
+            ControlledEventChain, ConvergedContract, ConvergenceResult, DivergedContract,
+            EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
+            PeerMessage, PeerStatus, PutOperationStats, RunningNode, ScheduledOperation,
+            SimNetwork, SimOperation, TurmoilConfig, TurmoilResult, UpdateOperationStats,
         },
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
+
+    // Re-export topology registry for subscription validation in tests
+    pub use ring::topology_registry::{
+        clear_all_topology_snapshots, clear_current_network_name, clear_topology_snapshots,
+        get_all_topology_snapshots, get_current_network_name, get_topology_snapshot,
+        register_topology_snapshot, set_current_network_name, validate_topology,
+        ContractSubscription, ProximityViolation, TopologySnapshot, TopologyValidationResult,
+    };
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 
     // Re-export simulation types for test infrastructure
