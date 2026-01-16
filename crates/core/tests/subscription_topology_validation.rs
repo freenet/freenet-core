@@ -848,18 +848,202 @@ fn test_subscription_topology_healthy() {
 }
 
 // =============================================================================
-// Note: SeedingManager tests are in seeding.rs unit tests
+// Tests using the TopologyRegistry infrastructure
 // =============================================================================
-// The SeedingManager is not publicly exported, so we can't test it directly here.
-// However, the above tests demonstrate the algorithmic issues with subscription
-// topology that need to be fixed in the actual implementation.
+// These tests demonstrate how SimNetwork integration tests will work once
+// nodes start registering their topology snapshots.
+
+use freenet::dev_tool::{
+    clear_all_topology_snapshots, register_topology_snapshot, validate_topology,
+    ContractSubscription, TopologySnapshot,
+};
+use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+fn make_contract_id(seed: u8) -> ContractInstanceId {
+    ContractInstanceId::new([seed; 32])
+}
+
+fn make_contract_key(seed: u8) -> ContractKey {
+    ContractKey::from_id_and_code(
+        ContractInstanceId::new([seed; 32]),
+        CodeHash::new([seed.wrapping_add(1); 32]),
+    )
+}
+
+/// Test the topology registry with bidirectional cycles.
+///
+/// This test uses the actual topology registry infrastructure to validate
+/// that bidirectional cycles are detected.
+#[test]
+fn test_topology_registry_detects_bidirectional_cycles() {
+    let network = "test-registry-bidirectional";
+    clear_all_topology_snapshots();
+
+    let peer_a: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+    let peer_b: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+    let contract_id = make_contract_id(1);
+    let contract_key = make_contract_key(1);
+
+    // Create bidirectional cycle: A → B and B → A
+    let mut snap_a = TopologySnapshot::new(peer_a, 0.3);
+    snap_a.set_contract(
+        contract_id,
+        ContractSubscription {
+            contract_key,
+            upstream: Some(peer_b),
+            downstream: vec![peer_b],
+            is_seeding: true,
+            has_client_subscriptions: false,
+        },
+    );
+
+    let mut snap_b = TopologySnapshot::new(peer_b, 0.4);
+    snap_b.set_contract(
+        contract_id,
+        ContractSubscription {
+            contract_key,
+            upstream: Some(peer_a),
+            downstream: vec![peer_a],
+            is_seeding: true,
+            has_client_subscriptions: false,
+        },
+    );
+
+    register_topology_snapshot(network, snap_a);
+    register_topology_snapshot(network, snap_b);
+
+    let result = validate_topology(network, &contract_id, 0.5);
+
+    // EXPECTED FAILURE: The topology registry DOES detect bidirectional cycles
+    // This test passes because the infrastructure works correctly.
+    // The ACTUAL issue (#2720) is that the SeedingManager allows these cycles to form.
+    assert!(
+        !result.bidirectional_cycles.is_empty(),
+        "TopologyRegistry should detect bidirectional cycle"
+    );
+
+    clear_all_topology_snapshots();
+}
+
+/// Test the topology registry with orphan seeders.
+#[test]
+fn test_topology_registry_detects_orphan_seeders() {
+    let network = "test-registry-orphan";
+    clear_all_topology_snapshots();
+
+    let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+    let contract_id = make_contract_id(1);
+    let contract_key = make_contract_key(1);
+
+    // Create orphan seeder: seeding but no upstream, no downstream
+    let mut snap = TopologySnapshot::new(peer, 0.3);
+    snap.set_contract(
+        contract_id,
+        ContractSubscription {
+            contract_key,
+            upstream: None,
+            downstream: vec![],
+            is_seeding: true,
+            has_client_subscriptions: false,
+        },
+    );
+
+    register_topology_snapshot(network, snap);
+
+    let result = validate_topology(network, &contract_id, 0.5);
+
+    // EXPECTED PASS: The topology registry detects orphan seeders
+    // The ACTUAL issue (#2719) is that the SeedingManager doesn't recover them
+    assert!(
+        !result.orphan_seeders.is_empty(),
+        "TopologyRegistry should detect orphan seeder"
+    );
+
+    clear_all_topology_snapshots();
+}
+
+/// Test the topology registry with proximity violations.
+#[test]
+fn test_topology_registry_detects_proximity_violations() {
+    let network = "test-registry-proximity";
+    clear_all_topology_snapshots();
+
+    let peer_close: SocketAddr = "10.0.1.1:5000".parse().unwrap(); // Close to contract
+    let peer_far: SocketAddr = "10.0.2.1:5000".parse().unwrap(); // Far from contract
+    let contract_id = make_contract_id(1);
+    let contract_key = make_contract_key(1);
+    let contract_location = 0.5;
+
+    // Create a bad topology: far peer subscribes to close peer
+    // This is actually correct topology, so let's make it backwards
+    // Peer at 0.48 (close) has peer at 0.1 (far) as upstream - BAD
+    let mut snap_close = TopologySnapshot::new(peer_close, 0.48);
+    snap_close.set_contract(
+        contract_id,
+        ContractSubscription {
+            contract_key,
+            upstream: Some(peer_far), // Upstream is FAR from contract
+            downstream: vec![],
+            is_seeding: true,
+            has_client_subscriptions: false,
+        },
+    );
+
+    let mut snap_far = TopologySnapshot::new(peer_far, 0.1);
+    snap_far.set_contract(
+        contract_id,
+        ContractSubscription {
+            contract_key,
+            upstream: None,
+            downstream: vec![peer_close],
+            is_seeding: true,
+            has_client_subscriptions: false,
+        },
+    );
+
+    register_topology_snapshot(network, snap_close);
+    register_topology_snapshot(network, snap_far);
+
+    let result = validate_topology(network, &contract_id, contract_location);
+
+    // EXPECTED PASS: The topology registry detects proximity violations
+    // The ACTUAL issue (#2721) is that subscribe.rs doesn't consider proximity
+    assert!(
+        !result.proximity_violations.is_empty(),
+        "TopologyRegistry should detect proximity violation: close peer (0.48) has far peer (0.1) as upstream"
+    );
+
+    clear_all_topology_snapshots();
+}
+
+// =============================================================================
+// Note on Integration Testing
+// =============================================================================
+// The tests above use the TopologyRegistry infrastructure directly. For full
+// integration testing with SimNetwork, nodes need to register their topology
+// snapshots periodically. This can be done by:
 //
-// To add proper unit tests that use SeedingManager directly, add them to:
-// crates/core/src/ring/seeding.rs (in the #[cfg(test)] mod tests section)
+// 1. Adding a periodic task in the node's main loop that calls:
+//    ring.register_topology_snapshot(network_name);
 //
-// The tests above validate the EXPECTED behavior and will fail when the
-// simulated topology matches what can happen in production due to:
-// - #2720: Bidirectional subscriptions without cycle detection
-// - #2719: Orphan seeders without recovery
-// - #2718: Dead code in proximity cache
-// - #2721: No proximity-aware upstream selection
+// 2. Or calling it from specific points like after subscribe operations complete
+//
+// The SimNetwork methods (validate_subscription_topology, assert_topology_healthy)
+// can then be used in simulation tests to validate the topology.
+//
+// Example future integration test:
+//
+// #[cfg(feature = "simulation_tests")]
+// #[tokio::test]
+// async fn test_subscription_topology_in_simulation() {
+//     let sim = SimNetwork::new("test", 1, 5, 7, 3, 10, 2, 42).await;
+//     let handles = sim.start_with_rand_gen::<SmallRng>(42, 3, 50).await;
+//
+//     // Wait for subscriptions to form
+//     tokio::time::sleep(Duration::from_secs(5)).await;
+//
+//     // Validate topology for each contract
+//     for (contract_id, contract_loc) in contracts {
+//         sim.assert_topology_healthy(&contract_id, contract_loc);
+//     }
+// }

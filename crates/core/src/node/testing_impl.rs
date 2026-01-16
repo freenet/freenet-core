@@ -2347,6 +2347,105 @@ impl SimNetwork {
         // Run the simulation
         sim.run()
     }
+
+    // =========================================================================
+    // Subscription Topology Validation
+    // =========================================================================
+
+    /// Get the network name for this simulation.
+    pub fn network_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get all subscription topology snapshots registered for this network.
+    ///
+    /// Returns snapshots registered by nodes via the topology registry.
+    /// Call this after nodes have been running to see their subscription state.
+    pub fn get_topology_snapshots(&self) -> Vec<crate::ring::topology_registry::TopologySnapshot> {
+        crate::ring::topology_registry::get_all_topology_snapshots(&self.name)
+    }
+
+    /// Validate subscription topology for a specific contract.
+    ///
+    /// Checks for:
+    /// - Bidirectional cycles that create isolated islands
+    /// - Orphan seeders without recovery paths
+    /// - Unreachable seeders
+    /// - Proximity violations in upstream selection
+    ///
+    /// Returns a validation result with any issues found.
+    pub fn validate_subscription_topology(
+        &self,
+        contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+        contract_location: f64,
+    ) -> crate::ring::topology_registry::TopologyValidationResult {
+        crate::ring::topology_registry::validate_topology(
+            &self.name,
+            contract_id,
+            contract_location,
+        )
+    }
+
+    /// Clear all topology snapshots for this network.
+    ///
+    /// Call this at the start of a test or after topology validation
+    /// to reset the state.
+    pub fn clear_topology_snapshots(&self) {
+        crate::ring::topology_registry::clear_topology_snapshots(&self.name);
+    }
+
+    /// Assert that subscription topology is healthy for a contract.
+    ///
+    /// # Panics
+    /// Panics if any topology issues are detected.
+    pub fn assert_topology_healthy(
+        &self,
+        contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+        contract_location: f64,
+    ) {
+        let result = self.validate_subscription_topology(contract_id, contract_location);
+
+        if !result.is_healthy() {
+            let mut issues = Vec::new();
+
+            if !result.bidirectional_cycles.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2720: {} bidirectional cycles found: {:?}",
+                    result.bidirectional_cycles.len(),
+                    result.bidirectional_cycles
+                ));
+            }
+
+            if !result.orphan_seeders.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2719: {} orphan seeders found: {:?}",
+                    result.orphan_seeders.len(),
+                    result.orphan_seeders
+                ));
+            }
+
+            if !result.unreachable_seeders.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2720: {} unreachable seeders found: {:?}",
+                    result.unreachable_seeders.len(),
+                    result.unreachable_seeders
+                ));
+            }
+
+            if !result.proximity_violations.is_empty() {
+                issues.push(format!(
+                    "ISSUE #2721: {} proximity violations found",
+                    result.proximity_violations.len()
+                ));
+            }
+
+            panic!(
+                "Subscription topology has {} issues:\n{}",
+                result.issue_count,
+                issues.join("\n")
+            );
+        }
+    }
 }
 
 /// Result of a convergence check.

@@ -48,6 +48,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod seeding;
 mod seeding_cache;
+pub mod topology_registry;
 
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
@@ -1286,6 +1287,48 @@ impl Ring {
             .await?;
         tracing::debug!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
+    }
+
+    /// Register a topology snapshot for this peer with the global registry.
+    ///
+    /// This should be called periodically during simulation tests to enable
+    /// topology validation. The snapshot captures the current subscription
+    /// state for all contracts.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)] // Used by SimNetwork tests
+    pub fn register_topology_snapshot(&self, network_name: &str) {
+        let Some(peer_addr) = self.connection_manager.get_own_addr() else {
+            return;
+        };
+        let location = self
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.0);
+
+        let snapshot = self
+            .seeding_manager
+            .generate_topology_snapshot(peer_addr, location);
+        topology_registry::register_topology_snapshot(network_name, snapshot);
+    }
+
+    /// Get a topology snapshot for this peer without registering it.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)] // Used by SimNetwork tests
+    pub fn get_topology_snapshot(&self) -> Option<topology_registry::TopologySnapshot> {
+        let peer_addr = self.connection_manager.get_own_addr()?;
+        let location = self
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.0);
+
+        Some(
+            self.seeding_manager
+                .generate_topology_snapshot(peer_addr, location),
+        )
     }
 }
 

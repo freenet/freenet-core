@@ -966,6 +966,78 @@ impl SeedingManager {
     pub fn remove_subscription(&self, key: &ContractKey) {
         self.subscriptions.remove(key);
     }
+
+    /// Generate a topology snapshot for testing/validation.
+    ///
+    /// This creates a snapshot of the current subscription state for all contracts
+    /// this peer is tracking. Used by SimNetwork for topology validation.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)] // Used by Ring::register_topology_snapshot
+    pub fn generate_topology_snapshot(
+        &self,
+        peer_addr: std::net::SocketAddr,
+        location: f64,
+    ) -> super::topology_registry::TopologySnapshot {
+        use super::topology_registry::{ContractSubscription, TopologySnapshot};
+
+        let mut snapshot = TopologySnapshot::new(peer_addr, location);
+
+        // Add subscriptions for all contracts
+        for entry in self.subscriptions.iter() {
+            let contract_key = *entry.key();
+            let subs = entry.value();
+
+            let upstream = subs
+                .iter()
+                .find(|e| e.role == SubscriberType::Upstream)
+                .and_then(|e| e.peer.socket_addr());
+
+            let downstream: Vec<_> = subs
+                .iter()
+                .filter(|e| e.role == SubscriberType::Downstream)
+                .filter_map(|e| e.peer.socket_addr())
+                .collect();
+
+            let is_seeding = self.seeding_cache.read().contains(&contract_key);
+            let has_client_subscriptions = self.has_client_subscriptions(contract_key.id());
+
+            snapshot.set_contract(
+                *contract_key.id(),
+                ContractSubscription {
+                    contract_key,
+                    upstream,
+                    downstream,
+                    is_seeding,
+                    has_client_subscriptions,
+                },
+            );
+        }
+
+        // Also add contracts we're seeding but not subscribed to
+        for contract_key in self.seeding_cache.read().iter() {
+            if !snapshot.contracts.contains_key(contract_key.id()) {
+                let has_client_subscriptions = self.has_client_subscriptions(contract_key.id());
+
+                snapshot.set_contract(
+                    *contract_key.id(),
+                    ContractSubscription {
+                        contract_key,
+                        upstream: None,
+                        downstream: vec![],
+                        is_seeding: true,
+                        has_client_subscriptions,
+                    },
+                );
+            }
+        }
+
+        snapshot.timestamp_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        snapshot
+    }
 }
 
 #[cfg(test)]
