@@ -640,20 +640,56 @@ impl OpManager {
 
         // Collect upstream peer (for bidirectional propagation through subscription tree)
         // Updates should flow both toward the root AND toward the leaves
-        let upstream_target: Option<PeerKeyLocation> = self
-            .ring
-            .get_upstream(key)
-            .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
+        let raw_upstream = self.ring.get_upstream(key);
+        let upstream_target: Option<PeerKeyLocation> = raw_upstream
+            .clone()
             .filter(|pk| {
-                pk.socket_addr()
+                let dominated_out = pk.socket_addr().as_ref() == Some(sender);
+                if dominated_out {
+                    tracing::warn!(
+                        contract = %format!("{:.8}", key),
+                        upstream = ?pk.socket_addr(),
+                        sender = %sender,
+                        "UPSTREAM_FILTERED: upstream matches sender (would echo back)"
+                    );
+                }
+                !dominated_out
+            })
+            .filter(|pk| {
+                let is_connected = pk
+                    .socket_addr()
                     .map(|addr| {
                         self.ring
                             .connection_manager
                             .get_peer_by_addr(addr)
                             .is_some()
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if !is_connected {
+                    tracing::warn!(
+                        contract = %format!("{:.8}", key),
+                        upstream = ?pk.socket_addr(),
+                        "UPSTREAM_FILTERED: upstream peer not connected"
+                    );
+                }
+                is_connected
             });
+
+        // Log upstream status for debugging subscription tree issues
+        if raw_upstream.is_none() {
+            tracing::info!(
+                contract = %format!("{:.8}", key),
+                sender = %sender,
+                is_local = is_local_update_initiator,
+                "UPSTREAM_STATUS: no upstream registered for this contract"
+            );
+        } else if upstream_target.is_some() {
+            tracing::info!(
+                contract = %format!("{:.8}", key),
+                upstream = ?upstream_target.as_ref().and_then(|p| p.socket_addr()),
+                "UPSTREAM_STATUS: upstream available and connected"
+            );
+        }
 
         // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
         let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);

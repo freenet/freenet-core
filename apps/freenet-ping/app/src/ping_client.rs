@@ -86,12 +86,29 @@ pub async fn wait_for_put_response(
 }
 
 // Wait for a GET response with the expected key and return the deserialized Ping state
+// Has an overall timeout of 60 seconds to prevent getting stuck on UpdateNotification floods
 pub async fn wait_for_get_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
 ) -> Result<Ping, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut skipped_notifications = 0;
+
     loop {
-        let resp = timeout(Duration::from_secs(60), client.recv()).await;
+        // Check overall timeout
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timeout waiting for get response (skipped {} other messages)",
+                skipped_notifications
+            )
+            .into());
+        }
+
+        // Use the smaller of remaining time or 5 seconds for per-recv timeout
+        let recv_timeout = remaining.min(Duration::from_secs(5));
+        let resp = timeout(recv_timeout, client.recv()).await;
+
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
@@ -100,6 +117,13 @@ pub async fn wait_for_get_response(
             }))) => {
                 if &key != expected_key {
                     return Err("unexpected key".into());
+                }
+
+                if skipped_notifications > 0 {
+                    tracing::debug!(
+                        "Received GetResponse after skipping {} other messages",
+                        skipped_notifications
+                    );
                 }
 
                 match serde_json::from_slice::<Ping>(&state) {
@@ -114,15 +138,23 @@ pub async fn wait_for_get_response(
                     }
                 };
             }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                ..
+            }))) => {
+                // Silently skip update notifications (expected when subscribed)
+                skipped_notifications += 1;
+            }
             Ok(Ok(other)) => {
                 tracing::warn!("Unexpected response while waiting for get: {}", other);
+                skipped_notifications += 1;
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
                 return Err(err.into());
             }
             Err(_) => {
-                return Err("timeout waiting for get response".into());
+                // Per-recv timeout, continue checking overall deadline
+                continue;
             }
         }
     }

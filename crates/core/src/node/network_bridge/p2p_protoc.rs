@@ -1730,38 +1730,22 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no direct targets (not part of subscription tree), fall back
-                                // to ring-based routing to find a peer that might cache this contract.
-                                // This ensures newly-stored contracts reach the subscription tree.
-                                let targets = if targets.is_empty() {
-                                    if let Some(fallback_target) = op_manager
-                                        .ring
-                                        .closest_potentially_caching(&key, [self_addr].as_slice())
-                                    {
-                                        if let Some(addr) = fallback_target.socket_addr() {
-                                            tracing::debug!(
-                                                contract = %key,
-                                                fallback_peer = %addr,
-                                                "BroadcastStateChange: Using ring-based fallback target"
-                                            );
-                                            vec![fallback_target]
-                                        } else {
-                                            tracing::debug!(
-                                                contract = %key,
-                                                "BroadcastStateChange: No targets and no fallback - skipping"
-                                            );
-                                            continue;
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            contract = %key,
-                                            "BroadcastStateChange: No targets and no fallback - skipping"
-                                        );
-                                        continue;
-                                    }
-                                } else {
-                                    targets
-                                };
+                                // If no targets exist (no downstream, no upstream, no proximity neighbors),
+                                // skip broadcast. This can happen when:
+                                // 1. Gateway just PUT a new contract (no subscribers yet)
+                                // 2. A leaf node with no registered upstream
+                                if targets.is_empty() {
+                                    // Check if we SHOULD have had an upstream
+                                    let has_upstream_registered =
+                                        op_manager.ring.get_upstream(&key).is_some();
+                                    tracing::warn!(
+                                        contract = %key,
+                                        self_addr = %self_addr,
+                                        has_upstream_registered = has_upstream_registered,
+                                        "BROADCAST_NO_TARGETS: skipping broadcast - no downstream, upstream, or proximity targets"
+                                    );
+                                    continue;
+                                }
 
                                 // Get our summary once for all targets
                                 let our_summary = op_manager
