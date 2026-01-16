@@ -732,6 +732,19 @@ impl Ring {
             .set_upstream(contract, upstream, own_location, own_addr)
     }
 
+    /// Force-set upstream for notification purposes only.
+    ///
+    /// This is used when proximity validation fails but we still need to track the peer
+    /// for pruning notifications. See `SeedingManager::force_set_upstream_for_notifications`.
+    pub fn force_set_upstream_for_notifications(
+        &self,
+        contract: &ContractKey,
+        upstream: PeerKeyLocation,
+    ) {
+        self.seeding_manager
+            .force_set_upstream_for_notifications(contract, upstream)
+    }
+
     /// Remove a subscriber and check if upstream notification is needed.
     pub fn remove_subscriber(
         &self,

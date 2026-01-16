@@ -962,14 +962,23 @@ impl Operation for SubscribeOp {
                                             );
                                         }
                                         Err(SubscriptionError::NotCloserToContract) => {
-                                            // This is expected behavior - the sender is not closer
-                                            // to the contract than we are, so we're likely near the
-                                            // contract source. We don't need an upstream in this case.
+                                            // The sender is not closer to the contract than we are.
+                                            // This is expected when we're near the contract source.
+                                            // We still register them as upstream for pruning notifications,
+                                            // but log that this is a suboptimal tree structure.
                                             tracing::debug!(
                                                 tx = %msg_id,
                                                 %key,
                                                 candidate_upstream = %sender_addr,
-                                                "subscribe: skipping upstream registration - we are closer to contract"
+                                                "subscribe: upstream not closer to contract - registering anyway for pruning notifications"
+                                            );
+
+                                            // Force-register the upstream for pruning notification purposes
+                                            // even though it's not optimal for the subscription tree.
+                                            // This ensures the subscription can be properly cleaned up later.
+                                            op_manager.ring.force_set_upstream_for_notifications(
+                                                key,
+                                                sender_peer.clone(),
                                             );
                                         }
                                         Err(e) => {

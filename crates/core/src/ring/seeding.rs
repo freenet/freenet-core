@@ -388,6 +388,38 @@ impl SeedingManager {
         Ok(())
     }
 
+    /// Force-set upstream for notification purposes only.
+    ///
+    /// This is used when proximity validation fails but we still need to track the peer
+    /// for pruning notifications. When we later unsubscribe, we need to notify this peer
+    /// to remove us from their downstream list.
+    ///
+    /// Unlike `set_upstream`, this bypasses proximity validation and is only for
+    /// maintaining correct subscription tree cleanup semantics.
+    pub fn force_set_upstream_for_notifications(
+        &self,
+        contract: &ContractKey,
+        upstream: PeerKeyLocation,
+    ) {
+        let mut subs = self.subscriptions.entry(*contract).or_default();
+
+        // Remove any existing upstream
+        subs.retain(|e| e.role != SubscriberType::Upstream);
+
+        let upstream_addr = upstream
+            .socket_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        subs.push(SubscriptionEntry::new(upstream, SubscriberType::Upstream));
+
+        debug!(
+            %contract,
+            upstream = %upstream_addr,
+            "force_set_upstream_for_notifications: registered upstream for pruning notifications only"
+        );
+    }
+
     /// Get the upstream peer for a contract (if any).
     #[allow(dead_code)] // Public API for debugging/future use
     pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
