@@ -537,4 +537,185 @@ mod tests {
 
         clear_topology_snapshots(network);
     }
+
+    #[test]
+    fn test_proximity_violation_detection() {
+        let network = "test-proximity-violation";
+        clear_topology_snapshots(network);
+
+        let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let upstream_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Contract at 0.5
+        // Downstream peer at 0.45 (distance 0.05 from contract)
+        // Upstream peer at 0.8 (distance 0.3 from contract)
+        // Violation: upstream is farther from contract than downstream
+        let mut snap_downstream = TopologySnapshot::new(peer, 0.45);
+        snap_downstream.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: Some(upstream_peer),
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        let mut snap_upstream = TopologySnapshot::new(upstream_peer, 0.8);
+        snap_upstream.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![peer],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap_downstream);
+        register_topology_snapshot(network, snap_upstream);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            !result.proximity_violations.is_empty(),
+            "Should detect proximity violation when upstream is farther from contract than downstream"
+        );
+
+        // Verify the violation details
+        let violation = &result.proximity_violations[0];
+        assert_eq!(violation.downstream_addr, peer);
+        assert_eq!(violation.upstream_addr, upstream_peer);
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_unreachable_seeder_detection() {
+        let network = "test-unreachable";
+        clear_topology_snapshots(network);
+
+        let source_peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let reachable_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let unreachable_peer: SocketAddr = "10.0.3.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Contract at 0.5
+        // Source peer at 0.5 (is source, distance 0)
+        // Reachable peer at 0.6 (connected to source as downstream)
+        // Unreachable peer at 0.7 (not connected to anyone)
+
+        let mut snap_source = TopologySnapshot::new(source_peer, 0.5);
+        snap_source.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![reachable_peer],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        let mut snap_reachable = TopologySnapshot::new(reachable_peer, 0.6);
+        snap_reachable.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: Some(source_peer),
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        // Unreachable peer - no upstream connection, not a source
+        let mut snap_unreachable = TopologySnapshot::new(unreachable_peer, 0.7);
+        snap_unreachable.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None, // No upstream!
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap_source);
+        register_topology_snapshot(network, snap_reachable);
+        register_topology_snapshot(network, snap_unreachable);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            !result.unreachable_seeders.is_empty(),
+            "Should detect unreachable seeder"
+        );
+        assert!(
+            result
+                .unreachable_seeders
+                .iter()
+                .any(|(addr, _)| *addr == unreachable_peer),
+            "Unreachable peer should be in the list"
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_healthy_topology_no_issues() {
+        let network = "test-healthy";
+        clear_topology_snapshots(network);
+
+        let source_peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let downstream_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Healthy topology: source → downstream (correct direction)
+        // Contract at 0.5, source at 0.5 (is source), downstream at 0.6
+        let mut snap_source = TopologySnapshot::new(source_peer, 0.5);
+        snap_source.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![downstream_peer],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        let mut snap_downstream = TopologySnapshot::new(downstream_peer, 0.6);
+        snap_downstream.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: Some(source_peer),
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap_source);
+        register_topology_snapshot(network, snap_downstream);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            result.is_healthy(),
+            "Healthy topology should have no issues, got: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity={}",
+            result.bidirectional_cycles.len(),
+            result.orphan_seeders.len(),
+            result.disconnected_upstream.len(),
+            result.unreachable_seeders.len(),
+            result.proximity_violations.len()
+        );
+
+        clear_topology_snapshots(network);
+    }
 }
