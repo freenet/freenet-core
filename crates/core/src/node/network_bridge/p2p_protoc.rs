@@ -1730,38 +1730,17 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no direct targets (not part of subscription tree), fall back
-                                // to ring-based routing to find a peer that might cache this contract.
-                                // This ensures newly-stored contracts reach the subscription tree.
-                                let targets = if targets.is_empty() {
-                                    if let Some(fallback_target) = op_manager
-                                        .ring
-                                        .closest_potentially_caching(&key, [self_addr].as_slice())
-                                    {
-                                        if let Some(addr) = fallback_target.socket_addr() {
-                                            tracing::debug!(
-                                                contract = %key,
-                                                fallback_peer = %addr,
-                                                "BroadcastStateChange: Using ring-based fallback target"
-                                            );
-                                            vec![fallback_target]
-                                        } else {
-                                            tracing::debug!(
-                                                contract = %key,
-                                                "BroadcastStateChange: No targets and no fallback - skipping"
-                                            );
-                                            continue;
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            contract = %key,
-                                            "BroadcastStateChange: No targets and no fallback - skipping"
-                                        );
-                                        continue;
-                                    }
-                                } else {
-                                    targets
-                                };
+                                // If no subscribers exist yet, skip broadcast. The proper flow is:
+                                // gateway stores contract → peers subscribe → tree forms → updates flow.
+                                // Pushing state to a fallback peer fails because that peer doesn't have
+                                // the contract code/parameters.
+                                if targets.is_empty() {
+                                    tracing::debug!(
+                                        contract = %key,
+                                        "BroadcastStateChange: No subscribers - skipping broadcast"
+                                    );
+                                    continue;
+                                }
 
                                 // Get our summary once for all targets
                                 let our_summary = op_manager
