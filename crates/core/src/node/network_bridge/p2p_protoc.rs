@@ -43,8 +43,8 @@ use crate::{
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_aborted_op, process_message_decoupled, proximity_cache::ProximityCacheManager,
-        NetEventRegister, NodeConfig, OpManager, PeerId,
+        handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
+        PeerId,
     },
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
@@ -2857,23 +2857,21 @@ impl P2pConnManager {
                     }
                 }
 
-                // Send CacheStateRequest to exchange proximity cache state with new peer.
-                // This allows peers to know which contracts each other has cached,
-                // enabling UPDATE forwarding to nearby seeders.
-                let cache_request_msg = NetMessage::V1(NetMessageV1::ProximityCache {
-                    message: ProximityCacheManager::request_cache_state(),
-                });
-                if let Err(e) = self.bridge.send(peer_addr, cache_request_msg).await {
-                    tracing::warn!(
-                        %peer_addr,
-                        error = %e,
-                        "Failed to send CacheStateRequest to new peer"
-                    );
-                } else {
-                    tracing::debug!(
-                        %peer_addr,
-                        "Sent CacheStateRequest to new peer"
-                    );
+                // Let proximity cache manager handle new ring connection
+                if let Some(cache_msg) = self
+                    .bridge
+                    .op_manager
+                    .proximity_cache
+                    .on_ring_connection_established(peer_addr)
+                {
+                    let msg = NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg });
+                    if let Err(e) = self.bridge.send(peer_addr, msg).await {
+                        tracing::warn!(
+                            %peer_addr,
+                            error = %e,
+                            "Failed to send proximity cache message to new peer"
+                        );
+                    }
                 }
 
                 // Check if new peer is closer to any contracts we're seeding without upstream.
