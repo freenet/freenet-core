@@ -265,7 +265,6 @@ impl ProximityCacheManager {
     }
 
     /// Generate a cache state request for a newly connected peer.
-    #[allow(dead_code)]
     pub fn request_cache_state() -> ProximityCacheMessage {
         ProximityCacheMessage::CacheStateRequest
     }
