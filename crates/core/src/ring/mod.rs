@@ -741,8 +741,9 @@ impl Ring {
         contract: &ContractKey,
         upstream: PeerKeyLocation,
     ) {
+        let own_addr = self.connection_manager.get_own_addr();
         self.seeding_manager
-            .force_set_upstream_for_notifications(contract, upstream)
+            .force_set_upstream_for_notifications(contract, upstream, own_addr)
     }
 
     /// Remove a subscriber and check if upstream notification is needed.

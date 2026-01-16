@@ -396,11 +396,29 @@ impl SeedingManager {
     ///
     /// Unlike `set_upstream`, this bypasses proximity validation and is only for
     /// maintaining correct subscription tree cleanup semantics.
+    ///
+    /// **Note:** This replaces any existing upstream for the contract.
+    ///
+    /// The `own_addr` parameter is used to prevent self-references (will silently
+    /// return without registering if upstream matches our own address).
     pub fn force_set_upstream_for_notifications(
         &self,
         contract: &ContractKey,
         upstream: PeerKeyLocation,
+        own_addr: Option<std::net::SocketAddr>,
     ) {
+        // Validate: prevent self-reference (same check as set_upstream)
+        if let (Some(own), Some(up_addr)) = (own_addr, upstream.socket_addr()) {
+            if own == up_addr {
+                warn!(
+                    %contract,
+                    upstream = %up_addr,
+                    "force_set_upstream_for_notifications: rejected self-reference"
+                );
+                return;
+            }
+        }
+
         let mut subs = self.subscriptions.entry(*contract).or_default();
 
         // Remove any existing upstream
@@ -2116,6 +2134,85 @@ mod tests {
         assert!(
             result.is_ok(),
             "Should accept upstream when own_location is None even with own_addr set"
+        );
+    }
+
+    // ========== Tests for force_set_upstream_for_notifications ==========
+
+    #[test]
+    fn test_force_set_upstream_registers_peer() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        // Force-register upstream (bypassing proximity check)
+        manager.force_set_upstream_for_notifications(&contract, upstream.clone(), None);
+
+        // Verify upstream is retrievable via get_upstream
+        let retrieved = manager.get_upstream(&contract);
+        assert!(retrieved.is_some(), "Upstream should be registered");
+        assert_eq!(
+            retrieved.unwrap().socket_addr(),
+            upstream.socket_addr(),
+            "Retrieved upstream should match registered peer"
+        );
+    }
+
+    #[test]
+    fn test_force_set_upstream_supports_pruning_notifications() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream = test_peer_loc(2);
+
+        // Force-register upstream (simulating NotCloserToContract scenario)
+        manager.force_set_upstream_for_notifications(&contract, upstream.clone(), None);
+
+        // Add a downstream
+        manager
+            .add_downstream(&contract, downstream.clone(), None, None)
+            .unwrap();
+
+        // Remove downstream - should trigger upstream notification need
+        let downstream_peer_id = PeerId::new(
+            downstream.socket_addr().unwrap(),
+            downstream.pub_key().clone(),
+        );
+        let result = manager.remove_subscriber(&contract, &downstream_peer_id);
+
+        // Verify pruning would notify the force-registered upstream
+        assert!(
+            result.notify_upstream.is_some(),
+            "Should notify upstream when last downstream removed"
+        );
+        assert_eq!(
+            result.notify_upstream.unwrap().socket_addr(),
+            upstream.socket_addr(),
+            "Notification target should be the force-registered upstream"
+        );
+    }
+
+    #[test]
+    fn test_force_set_upstream_replaces_existing() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+
+        // Register first upstream normally
+        manager
+            .set_upstream(&contract, upstream1.clone(), None, None)
+            .unwrap();
+
+        // Force-register a different upstream
+        manager.force_set_upstream_for_notifications(&contract, upstream2.clone(), None);
+
+        // Verify the second upstream replaced the first
+        let retrieved = manager.get_upstream(&contract);
+        assert_eq!(
+            retrieved.unwrap().socket_addr(),
+            upstream2.socket_addr(),
+            "Force-registered upstream should replace existing"
         );
     }
 }
