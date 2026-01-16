@@ -163,6 +163,9 @@ pub struct TopologyValidationResult {
     pub bidirectional_cycles: Vec<(SocketAddr, SocketAddr)>,
     /// Orphan seeders (peers seeding without upstream or downstream)
     pub orphan_seeders: Vec<(SocketAddr, ContractInstanceId)>,
+    /// Disconnected upstream (seeders with downstream but no upstream, not a source)
+    /// These are problematic because downstream peers depend on them but they can't receive updates
+    pub disconnected_upstream: Vec<(SocketAddr, ContractInstanceId)>,
     /// Unreachable seeders (seeders that can't receive updates from source)
     pub unreachable_seeders: Vec<(SocketAddr, ContractInstanceId)>,
     /// Proximity violations (upstream is farther from contract than downstream)
@@ -243,18 +246,29 @@ pub fn validate_topology(
         }
     }
 
-    // Check for orphan seeders
+    // Source detection threshold: peers within 5% of ring distance to contract are considered sources
+    const SOURCE_THRESHOLD: f64 = 0.05;
+
+    // Check for orphan seeders and disconnected upstream
     for &seeder in &seeders {
         if let Some((upstream, downstream)) = subscription_graph.get(&seeder) {
             // Check if seeder is close to contract location (is source)
+            // Use ring_distance for consistent wrap-around handling
             let is_source = peer_locations
                 .get(&seeder)
-                .map(|loc| (loc - contract_location).abs() < 0.01)
+                .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
                 .unwrap_or(false);
 
             // Orphan if: not source, no upstream, no downstream
             if !is_source && upstream.is_none() && downstream.is_empty() {
                 result.orphan_seeders.push((seeder, *contract_id));
+                result.issue_count += 1;
+            }
+
+            // Disconnected upstream: has downstream but no upstream (not a source)
+            // This is problematic because downstream peers depend on us but we can't receive updates
+            if !is_source && upstream.is_none() && !downstream.is_empty() {
+                result.disconnected_upstream.push((seeder, *contract_id));
                 result.issue_count += 1;
             }
         }
@@ -285,9 +299,10 @@ pub fn validate_topology(
     }
 
     // Check for unreachable seeders using BFS from source
+    // Use ring_distance for consistent wrap-around handling
     let source_candidates: Vec<_> = peer_locations
         .iter()
-        .filter(|(_, loc)| ((*loc) - contract_location).abs() < 0.05)
+        .filter(|(_, loc)| ring_distance(**loc, contract_location) < SOURCE_THRESHOLD)
         .map(|(addr, _)| *addr)
         .collect();
 
@@ -411,6 +426,113 @@ mod tests {
         assert!(
             !result.orphan_seeders.is_empty(),
             "Should detect orphan seeder"
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_disconnected_upstream_detection() {
+        let network = "test-disconnected-upstream";
+        clear_topology_snapshots(network);
+
+        let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let downstream_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Create disconnected upstream: has downstream but no upstream (not source)
+        let mut snap = TopologySnapshot::new(peer, 0.3); // Location 0.3, contract at 0.5
+        snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![downstream_peer], // Has downstream but no upstream
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            !result.disconnected_upstream.is_empty(),
+            "Should detect disconnected upstream seeder"
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_ring_distance_wrap_around() {
+        let network = "test-wrap-around";
+        clear_topology_snapshots(network);
+
+        let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Contract at location 0.02, peer at location 0.99
+        // Ring distance should be 0.03 (through wrap-around), not 0.97
+        // This peer should be considered a source (within 0.05 threshold)
+        let mut snap = TopologySnapshot::new(peer, 0.99);
+        snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap);
+
+        // Contract location at 0.02 - peer at 0.99 is within 0.05 ring distance
+        let result = validate_topology(network, &contract_id, 0.02);
+        assert!(
+            result.orphan_seeders.is_empty(),
+            "Peer at 0.99 should be considered source for contract at 0.02 (ring distance 0.03)"
+        );
+        assert!(
+            result.disconnected_upstream.is_empty(),
+            "Peer at 0.99 should be considered source, not disconnected upstream"
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_source_seeder_not_orphan() {
+        let network = "test-source-not-orphan";
+        clear_topology_snapshots(network);
+
+        let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Peer at same location as contract (0.5) - should be considered source
+        let mut snap = TopologySnapshot::new(peer, 0.5);
+        snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![], // No upstream, no downstream - but it's a source
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            result.orphan_seeders.is_empty(),
+            "Source seeder should not be flagged as orphan"
         );
 
         clear_topology_snapshots(network);

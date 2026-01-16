@@ -1065,9 +1065,10 @@ async fn test_controlled_events_subscription() {
     let result = sim.validate_subscription_topology(&contract_id, contract_location);
 
     tracing::info!(
-        "Topology validation: cycles={}, orphans={}, unreachable={}, proximity_violations={}",
+        "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity_violations={}",
         result.bidirectional_cycles.len(),
         result.orphan_seeders.len(),
+        result.disconnected_upstream.len(),
         result.unreachable_seeders.len(),
         result.proximity_violations.len()
     );
@@ -1088,6 +1089,15 @@ async fn test_controlled_events_subscription() {
          Orphan seeders have no upstream and won't receive updates.",
         result.orphan_seeders.len(),
         result.orphan_seeders
+    );
+
+    // Assert no disconnected upstream (seeders with downstream but no upstream)
+    assert!(
+        result.disconnected_upstream.is_empty(),
+        "Found {} disconnected upstream seeders: {:?}. \
+         These seeders have downstream peers but can't receive updates themselves.",
+        result.disconnected_upstream.len(),
+        result.disconnected_upstream
     );
 
     // Assert no unreachable seeders
