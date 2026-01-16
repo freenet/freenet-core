@@ -1207,3 +1207,392 @@ fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
 
     sim.run()
 }
+
+// =============================================================================
+// Subscription Topology Validation
+// =============================================================================
+// These tests validate the subscription topology infrastructure to detect
+// issues like bidirectional cycles (#2720), orphan seeders (#2719), etc.
+
+/// Helper to let tokio tasks run and process network messages.
+///
+/// SimulationSocket uses VirtualTime internally for message delivery scheduling.
+/// This helper advances VirtualTime in chunks while yielding to tokio to let
+/// tasks process delivered messages.
+async fn let_network_run_for_topology(sim: &mut SimNetwork, duration: Duration) {
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+
+    while elapsed < duration {
+        // Advance virtual time to trigger message delivery
+        sim.advance_time(step);
+        // Yield to tokio so tasks can process delivered messages
+        tokio::task::yield_now().await;
+        // Also give a small real-time sleep for task scheduling
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        elapsed += step;
+    }
+}
+
+/// Test topology capture with a single seeder (gateway only).
+///
+/// This test validates the topology infrastructure without triggering the
+/// bidirectional cycle issue (#2720) by using only a single subscriber.
+///
+/// ## Scenario
+/// 1. Gateway PUTs a contract with subscribe=true
+/// 2. Wait for topology registration
+/// 3. Verify: gateway's snapshot shows it's seeding the contract
+/// 4. Verify: no topology issues (no cycles since only one subscriber)
+///
+/// ## Related
+/// - For the multi-subscriber test that detects #2720, see `test_bidirectional_cycle_issue_2720`
+/// - This test runs in CI while #2720 remains open
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_topology_single_seeder() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+    use futures::StreamExt;
+
+    const SEED: u64 = 0x5EED_0001_CAFE;
+
+    // Reset all global state and set up deterministic time/RNG
+    reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "single-seeder-test",
+        1,  // 1 gateway
+        2,  // 2 peers (they won't subscribe)
+        7,  // max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Create a test contract
+    let contract = SimOperation::create_test_contract(99);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(99);
+
+    // Schedule only ONE operation: gateway PUTs the contract with subscribe=true
+    // No other nodes subscribe - this avoids #2720 bidirectional cycle issue
+    let operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway("single-seeder-test", 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state.clone(),
+            subscribe: true,
+        },
+    )];
+
+    // Start network with controlled events
+    let (_handles, num_ops) = sim.start_with_controlled_events(operations).await;
+    assert_eq!(num_ops, 1, "Should have scheduled 1 operation");
+
+    // Let nodes establish connections
+    let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
+
+    // Create and trigger the controlled event chain
+    let event_sequence = vec![(0, NodeLabel::gateway("single-seeder-test", 0))]; // PUT
+    let mut event_chain = sim.controlled_event_chain(event_sequence);
+
+    // Trigger PUT event
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(0), "Should trigger PUT event");
+
+    // Let the PUT propagate through the network
+    let_network_run_for_topology(&mut sim, Duration::from_secs(5)).await;
+
+    // Wait for topology registration (runs every 1 second)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Get topology snapshots
+    let snapshots = sim.get_topology_snapshots();
+    tracing::info!("Captured {} topology snapshots", snapshots.len());
+
+    // Find the gateway's snapshot with the contract
+    let gateway_with_contract = snapshots
+        .iter()
+        .find(|snap| snap.contracts.contains_key(&contract_id));
+
+    assert!(
+        gateway_with_contract.is_some(),
+        "Gateway should have the contract in its topology snapshot. \
+         Available snapshots: {} peers",
+        snapshots.len()
+    );
+
+    let gateway_snap = gateway_with_contract.unwrap();
+    let contract_sub = gateway_snap.contracts.get(&contract_id).unwrap();
+
+    // Gateway should be seeding (it did PUT with subscribe=true)
+    assert!(
+        contract_sub.is_seeding,
+        "Gateway should be seeding the contract after PUT with subscribe=true"
+    );
+
+    // Gateway is the source - it should have no upstream (it's the origin)
+    // and may have downstream peers if they subscribed
+    tracing::info!(
+        "Gateway {} is seeding contract: upstream={:?}, downstream={:?}",
+        gateway_snap.peer_addr,
+        contract_sub.upstream,
+        contract_sub.downstream
+    );
+
+    // Validate topology - should have no issues since only one subscriber
+    // Use the actual contract location derived from the contract ID
+    let contract_location = Location::from(&contract_id).as_f64();
+    tracing::info!("Contract location: {}", contract_location);
+    let result = sim.validate_subscription_topology(&contract_id, contract_location);
+
+    tracing::info!(
+        "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity={}",
+        result.bidirectional_cycles.len(),
+        result.orphan_seeders.len(),
+        result.disconnected_upstream.len(),
+        result.unreachable_seeders.len(),
+        result.proximity_violations.len()
+    );
+
+    // With only one subscriber (the gateway/source), there should be no cycles
+    assert!(
+        result.bidirectional_cycles.is_empty(),
+        "Single seeder should have no bidirectional cycles, found: {:?}",
+        result.bidirectional_cycles
+    );
+
+    // Gateway is the source, so it's not an orphan (orphan = seeder without upstream, not a source)
+    assert!(
+        result.orphan_seeders.is_empty(),
+        "Source seeder should not be marked as orphan, found: {:?}",
+        result.orphan_seeders
+    );
+
+    // Gateway is the source with no downstream initially, should not be disconnected
+    // (disconnected = has downstream but no upstream, not a source)
+    assert!(
+        result.disconnected_upstream.is_empty(),
+        "Source seeder should not be disconnected, found: {:?}",
+        result.disconnected_upstream
+    );
+
+    // No unreachable seeders since only the source is seeding
+    assert!(
+        result.unreachable_seeders.is_empty(),
+        "Should have no unreachable seeders, found: {:?}",
+        result.unreachable_seeders
+    );
+
+    // Overall topology should be healthy
+    assert!(
+        result.is_healthy(),
+        "Single seeder topology should be healthy, got {} issues",
+        result.issue_count
+    );
+
+    tracing::info!("Single seeder topology test passed - gateway correctly seeding contract");
+}
+
+/// Regression test for Issue #2720: Bidirectional subscription cycles.
+///
+/// This test creates multiple subscribers and verifies the subscription topology
+/// is correct. It INTENTIONALLY detects the bidirectional cycle bug in #2720.
+///
+/// ## Why this test is `#[ignore]`
+///
+/// This test exposes a known bug where when multiple peers subscribe to the same
+/// contract, they sometimes create bidirectional subscription relationships
+/// (A upstream of B, and B upstream of A). This creates isolated cycles that
+/// cannot receive updates from the source.
+///
+/// ## Scenario
+/// 1. Gateway PUTs a contract with subscribe=true (becomes the source)
+/// 2. Node 1 subscribes to the same contract
+/// 3. Node 2 subscribes to the same contract
+/// 4. Verify: topology has no bidirectional cycles (FAILS due to #2720)
+///
+/// ## When to enable this test
+/// Remove `#[ignore]` once Issue #2720 is fixed. The test passing indicates
+/// the subscription topology correctly forms a directed acyclic graph from
+/// subscribers toward the source.
+///
+/// ## Related
+/// - Issue #2720: https://github.com/freenet/freenet-core/issues/2720
+/// - For a passing topology test, see `test_topology_single_seeder`
+///
+/// ## Manual run
+/// ```bash
+/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720 -- --ignored
+/// ```
+#[ignore] // Enable once Issue #2720 (bidirectional subscriptions) is fixed
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_bidirectional_cycle_issue_2720() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+    use futures::StreamExt;
+
+    const SEED: u64 = 0xC0DE_CAFE_1234;
+
+    // Reset all global state and set up deterministic time/RNG
+    reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "controlled-events-test",
+        1,  // 1 gateway
+        2,  // 2 peers
+        7,  // max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Create a test contract
+    let contract = SimOperation::create_test_contract(42);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(42);
+
+    // Schedule controlled operations:
+    // 1. Gateway PUTs the contract with subscribe=true
+    // 2. Node 1 subscribes (node numbering starts after gateways)
+    // 3. Node 2 subscribes
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway("controlled-events-test", 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state.clone(),
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node("controlled-events-test", 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node("controlled-events-test", 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    // Start network with controlled events
+    let (_handles, num_ops) = sim.start_with_controlled_events(operations).await;
+    assert_eq!(num_ops, 3, "Should have scheduled 3 operations");
+
+    // Let nodes establish connections
+    let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
+
+    // Create and trigger the controlled event chain
+    let event_sequence = vec![
+        (0, NodeLabel::gateway("controlled-events-test", 0)), // PUT
+        (1, NodeLabel::node("controlled-events-test", 1)),    // Subscribe on node 1
+        (2, NodeLabel::node("controlled-events-test", 2)),    // Subscribe on node 2
+    ];
+    let mut event_chain = sim.controlled_event_chain(event_sequence);
+
+    // Trigger first event (PUT) and let it complete
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(0), "Should trigger PUT event");
+    let_network_run_for_topology(&mut sim, Duration::from_secs(5)).await;
+
+    // Trigger subscribe events
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(1), "Should trigger first subscribe event");
+    let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
+
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(2), "Should trigger second subscribe event");
+    let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
+
+    // Wait for topology registration
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Get topology snapshots
+    let snapshots = sim.get_topology_snapshots();
+    tracing::info!("Captured {} topology snapshots", snapshots.len());
+
+    // Check if any peer has contract subscriptions
+    let mut peers_with_contract = 0;
+    for snap in &snapshots {
+        if let Some(sub) = snap.contracts.get(&contract_id) {
+            peers_with_contract += 1;
+            tracing::debug!(
+                "Peer {} has contract: upstream={:?}, downstream={:?}, seeding={}",
+                snap.peer_addr,
+                sub.upstream,
+                sub.downstream,
+                sub.is_seeding
+            );
+        }
+    }
+
+    // We expect at least the gateway to have the contract
+    assert!(
+        peers_with_contract >= 1,
+        "Expected at least 1 peer with contract subscription, found {}",
+        peers_with_contract
+    );
+
+    // Validate topology for this contract using actual contract location
+    let contract_location = Location::from(&contract_id).as_f64();
+    let result = sim.validate_subscription_topology(&contract_id, contract_location);
+
+    tracing::info!(
+        "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity_violations={}",
+        result.bidirectional_cycles.len(),
+        result.orphan_seeders.len(),
+        result.disconnected_upstream.len(),
+        result.unreachable_seeders.len(),
+        result.proximity_violations.len()
+    );
+
+    // Assert no bidirectional cycles (Issue #2720)
+    assert!(
+        result.bidirectional_cycles.is_empty(),
+        "ISSUE #2720: Found {} bidirectional subscription cycles: {:?}. \
+         Bidirectional cycles create isolated islands that can't receive updates from the source.",
+        result.bidirectional_cycles.len(),
+        result.bidirectional_cycles
+    );
+
+    // Assert no orphan seeders (Issue #2719)
+    assert!(
+        result.orphan_seeders.is_empty(),
+        "ISSUE #2719: Found {} orphan seeders: {:?}. \
+         Orphan seeders have no upstream and won't receive updates.",
+        result.orphan_seeders.len(),
+        result.orphan_seeders
+    );
+
+    // Assert no disconnected upstream (seeders with downstream but no upstream)
+    assert!(
+        result.disconnected_upstream.is_empty(),
+        "Found {} disconnected upstream seeders: {:?}. \
+         These seeders have downstream peers but can't receive updates themselves.",
+        result.disconnected_upstream.len(),
+        result.disconnected_upstream
+    );
+
+    // Assert no unreachable seeders
+    assert!(
+        result.unreachable_seeders.is_empty(),
+        "Found {} unreachable seeders: {:?}. \
+         These seeders cannot receive updates from the contract source.",
+        result.unreachable_seeders.len(),
+        result.unreachable_seeders
+    );
+
+    tracing::info!("Bidirectional cycle regression test passed (Issue #2720 is fixed!)");
+}
