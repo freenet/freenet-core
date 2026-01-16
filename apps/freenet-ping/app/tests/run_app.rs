@@ -32,13 +32,14 @@ use freenet_ping_app::ping_client::{
 };
 
 /// Helper function to collect diagnostics from all nodes for debugging update propagation issues
+/// Has an overall timeout of 15 seconds per node to avoid getting stuck on UpdateNotification floods
 async fn collect_node_diagnostics(
     clients: &mut [&mut freenet_stdlib::client_api::WebApi],
     node_names: &[&str],
     contract_key: ContractKey,
     phase: &str,
 ) -> anyhow::Result<()> {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     println!("=== NODE DIAGNOSTICS: {phase} ===");
 
@@ -56,17 +57,31 @@ async fn collect_node_diagnostics(
     for (i, (client, node_name)) in clients.iter_mut().zip(node_names.iter()).enumerate() {
         println!("Collecting diagnostics from {node_name} (index {i})...");
 
-        // Send diagnostic request
-        match client
-            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+        // Send diagnostic request with timeout to avoid blocking forever
+        let send_result = timeout(
+            Duration::from_secs(5),
+            client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
                 config: config.clone(),
-            }))
-            .await
-        {
-            Ok(_) => {
+            })),
+        )
+        .await;
+
+        match send_result {
+            Ok(Ok(_)) => {
                 // Keep receiving messages until we get a diagnostic response (ignore everything else)
+                // Overall timeout of 15 seconds per node to avoid getting stuck on update storms
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut skipped_messages = 0;
+
                 loop {
-                    match timeout(Duration::from_secs(5), client.recv()).await {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        println!("WARNING: {node_name} diagnostics timed out after skipping {skipped_messages} messages");
+                        break;
+                    }
+
+                    let recv_timeout = remaining.min(Duration::from_secs(2));
+                    match timeout(recv_timeout, client.recv()).await {
                         Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
                             response,
                         )))) => {
@@ -149,6 +164,7 @@ async fn collect_node_diagnostics(
                         }
                         Ok(Ok(_other_message)) => {
                             // Ignore any other message (UpdateNotifications, etc.) and keep waiting
+                            skipped_messages += 1;
                             continue;
                         }
                         Ok(Err(e)) => {
@@ -156,14 +172,17 @@ async fn collect_node_diagnostics(
                             break;
                         }
                         Err(_) => {
-                            println!("ERROR: {node_name} diagnostic request timed out");
-                            break;
+                            // Per-recv timeout, continue checking overall deadline
+                            continue;
                         }
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 println!("ERROR: Failed to send diagnostic request to {node_name}: {e}");
+            }
+            Err(_) => {
+                println!("WARNING: {node_name} diagnostic request send timed out");
             }
         }
 

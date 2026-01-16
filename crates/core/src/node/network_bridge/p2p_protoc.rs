@@ -1730,14 +1730,19 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no subscribers exist yet, skip broadcast. The proper flow is:
-                                // gateway stores contract → peers subscribe → tree forms → updates flow.
-                                // Pushing state to a fallback peer fails because that peer doesn't have
-                                // the contract code/parameters.
+                                // If no targets exist (no downstream, no upstream, no proximity neighbors),
+                                // skip broadcast. This can happen when:
+                                // 1. Gateway just PUT a new contract (no subscribers yet)
+                                // 2. A leaf node with no registered upstream
                                 if targets.is_empty() {
-                                    tracing::debug!(
+                                    // Check if we SHOULD have had an upstream
+                                    let has_upstream_registered =
+                                        op_manager.ring.get_upstream(&key).is_some();
+                                    tracing::warn!(
                                         contract = %key,
-                                        "BroadcastStateChange: No subscribers - skipping broadcast"
+                                        self_addr = %self_addr,
+                                        has_upstream_registered = has_upstream_registered,
+                                        "BROADCAST_NO_TARGETS: skipping broadcast - no downstream, upstream, or proximity targets"
                                     );
                                     continue;
                                 }
