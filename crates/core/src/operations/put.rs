@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-pub(crate) use self::messages::PutMsg;
+pub(crate) use self::messages::{PutMsg, PutStreamingPayload};
+use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
 use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
@@ -579,27 +580,350 @@ impl Operation for PutOp {
                     }
                 }
 
-                // Streaming variants - placeholder handlers until full implementation
-                // These will be implemented in Step 4 of Phase 3
+                // Phase 4: Streaming PUT request handler
                 PutMsg::RequestStreaming {
-                    id, contract_key, ..
+                    id: _msg_id,
+                    stream_id,
+                    contract_key,
+                    total_size,
+                    htl,
+                    skip_list,
+                    subscribe: msg_subscribe,
                 } => {
-                    tracing::warn!(
+                    tracing::info!(
                         tx = %id,
                         contract = %contract_key,
-                        "PUT RequestStreaming received but streaming not yet implemented"
+                        stream_id = %stream_id,
+                        total_size,
+                        htl,
+                        is_originator,
+                        phase = "streaming_request",
+                        "Processing PUT RequestStreaming"
                     );
-                    // For now, return an error - streaming will be implemented in later step
-                    Err(OpError::UnexpectedOpState)
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream data"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    tracing::debug!(
+                        tx = %id,
+                        stream_id = %stream_id,
+                        received_size = stream_data.len(),
+                        expected_size = total_size,
+                        "Stream data assembled"
+                    );
+
+                    // Step 3: Deserialize the streaming payload
+                    let payload: PutStreamingPayload = match bincode::deserialize(&stream_data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to deserialize streaming payload"
+                            );
+                            return Err(OpError::invalid_transition(id));
+                        }
+                    };
+
+                    let contract = &payload.contract;
+                    let value = payload.value;
+                    let related_contracts = payload.related_contracts;
+                    let key = contract.key();
+
+                    // Verify contract key matches
+                    if key != *contract_key {
+                        tracing::error!(
+                            tx = %id,
+                            expected = %contract_key,
+                            actual = %key,
+                            "Contract key mismatch in streaming payload"
+                        );
+                        return Err(OpError::invalid_transition(id));
+                    }
+
+                    // Step 4: Store contract locally (same as regular Request)
+                    let was_seeding = op_manager.ring.is_seeding_contract(&key);
+                    let (merged_value, _state_changed) = put_contract(
+                        op_manager,
+                        key,
+                        value.clone(),
+                        related_contracts.clone(),
+                        contract,
+                    )
+                    .await?;
+
+                    // Mark as seeding if not already
+                    if !was_seeding {
+                        let evicted = op_manager.ring.seed_contract(key, value.size() as u64);
+                        super::announce_contract_cached(op_manager, &key).await;
+
+                        let mut removed_contracts = Vec::new();
+                        for evicted_key in evicted {
+                            if op_manager
+                                .interest_manager
+                                .unregister_local_seeding(&evicted_key)
+                            {
+                                removed_contracts.push(evicted_key);
+                            }
+                        }
+
+                        let became_interested =
+                            op_manager.interest_manager.register_local_seeding(&key);
+                        let added = if became_interested { vec![key] } else { vec![] };
+                        if !added.is_empty() || !removed_contracts.is_empty() {
+                            super::broadcast_change_interests(op_manager, added, removed_contracts)
+                                .await;
+                        }
+                    }
+
+                    // Step 5: Determine forwarding
+                    let htl = *htl;
+                    let mut new_skip_list = skip_list.clone();
+                    if let Some(addr) = upstream_addr {
+                        new_skip_list.insert(addr);
+                    }
+                    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+                        new_skip_list.insert(own_addr);
+                    }
+
+                    let next_hop = if htl > 0 {
+                        op_manager
+                            .ring
+                            .closest_potentially_caching(&key, &new_skip_list)
+                    } else {
+                        None
+                    };
+
+                    let next_peer_known =
+                        next_hop.and_then(|p| KnownPeerKeyLocation::try_from(p).ok());
+
+                    if let Some(next_peer) = next_peer_known {
+                        // Forward to next hop - for now, forward as regular message
+                        // TODO: In future, could forward as streaming if payload is still large
+                        let next_addr = next_peer.socket_addr();
+
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            peer_addr = %next_addr,
+                            htl = htl - 1,
+                            phase = "forward",
+                            "Forwarding PUT (from streaming) to next hop"
+                        );
+
+                        if let Some(event) = NetEventLog::put_request(
+                            &id,
+                            &op_manager.ring,
+                            key,
+                            PeerKeyLocation::from(next_peer.clone()),
+                            htl.saturating_sub(1),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+
+                        // Forward as regular PUT (simplifies implementation)
+                        let forward_msg = PutMsg::Request {
+                            id,
+                            contract: contract.clone(),
+                            related_contracts,
+                            value: merged_value,
+                            htl: htl.saturating_sub(1),
+                            skip_list: new_skip_list,
+                        };
+
+                        let new_state = Some(PutState::AwaitingResponse {
+                            subscribe: *msg_subscribe,
+                            next_hop: Some(next_addr),
+                            current_htl: htl,
+                        });
+
+                        Ok(OperationResult {
+                            return_msg: Some(NetMessage::from(forward_msg)),
+                            next_hop: Some(next_addr),
+                            state: Some(OpEnum::Put(PutOp {
+                                id,
+                                state: new_state,
+                                upstream_addr,
+                            })),
+                        })
+                    } else {
+                        // No next hop - we're the final destination
+                        tracing::info!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "complete",
+                            "Streaming PUT complete at this node"
+                        );
+
+                        if is_originator {
+                            let own_location = op_manager.ring.connection_manager.own_location();
+                            let hash = Some(state_hash_full(&merged_value));
+                            if let Some(event) = NetEventLog::put_success(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                own_location,
+                                Some(0),
+                                hash,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
+                            if *msg_subscribe {
+                                start_subscription_after_put(op_manager, id, key, false).await;
+                            }
+
+                            Ok(OperationResult {
+                                return_msg: None,
+                                next_hop: None,
+                                state: Some(OpEnum::Put(PutOp {
+                                    id,
+                                    state: Some(PutState::Finished { key }),
+                                    upstream_addr: None,
+                                })),
+                            })
+                        } else {
+                            // Send ResponseStreaming back to upstream
+                            let own_location = op_manager.ring.connection_manager.own_location();
+                            let hash = Some(state_hash_full(&merged_value));
+                            if let Some(event) = NetEventLog::put_success(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                own_location,
+                                None,
+                                hash,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
+                            let upstream =
+                                upstream_addr.expect("non-originator must have upstream");
+                            let response = PutMsg::ResponseStreaming {
+                                id,
+                                key,
+                                continue_forwarding: false,
+                            };
+
+                            Ok(OperationResult {
+                                return_msg: Some(NetMessage::from(response)),
+                                next_hop: Some(upstream),
+                                state: None,
+                            })
+                        }
+                    }
                 }
 
-                PutMsg::ResponseStreaming { id, key, .. } => {
-                    tracing::warn!(
+                // Phase 4: Streaming PUT response handler
+                PutMsg::ResponseStreaming {
+                    id: _msg_id,
+                    key,
+                    continue_forwarding,
+                } => {
+                    tracing::info!(
                         tx = %id,
                         contract = %key,
-                        "PUT ResponseStreaming received but streaming not yet implemented"
+                        continue_forwarding,
+                        is_originator,
+                        phase = "streaming_response",
+                        "Processing PUT ResponseStreaming"
                     );
-                    Err(OpError::UnexpectedOpState)
+
+                    // Extract current HTL for telemetry
+                    let current_htl = match &self.state {
+                        Some(PutState::AwaitingResponse { current_htl, .. }) => Some(*current_htl),
+                        _ => None,
+                    };
+
+                    if is_originator {
+                        // We initiated the streaming PUT - operation complete
+                        let hop_count = current_htl
+                            .map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
+
+                        if let Some(event) = NetEventLog::put_success(
+                            &id,
+                            &op_manager.ring,
+                            *key,
+                            op_manager.ring.connection_manager.own_location(),
+                            hop_count,
+                            None, // No hash available in streaming response
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+
+                        // Start subscription if requested
+                        if subscribe {
+                            start_subscription_after_put(op_manager, id, *key, false).await;
+                        }
+
+                        tracing::info!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "complete",
+                            "Streaming PUT operation complete (originator)"
+                        );
+
+                        Ok(OperationResult {
+                            return_msg: None,
+                            next_hop: None,
+                            state: Some(OpEnum::Put(PutOp {
+                                id,
+                                state: Some(PutState::Finished { key: *key }),
+                                upstream_addr: None,
+                            })),
+                        })
+                    } else {
+                        // Forward response to upstream
+                        let upstream = upstream_addr.expect("non-originator must have upstream");
+
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            peer_addr = %upstream,
+                            phase = "response",
+                            "Forwarding PUT ResponseStreaming to upstream"
+                        );
+
+                        // Forward as regular Response for simplicity
+                        // (streaming is only needed for large payloads, responses are small)
+                        let response = PutMsg::Response { id, key: *key };
+
+                        Ok(OperationResult {
+                            return_msg: Some(NetMessage::from(response)),
+                            next_hop: Some(upstream),
+                            state: None, // Operation complete for this node
+                        })
+                    }
                 }
             }
         })
@@ -885,6 +1209,17 @@ mod messages {
     use crate::message::{InnerMessage, Transaction};
     use crate::ring::Location;
     use crate::transport::peer_connection::StreamId;
+
+    /// Payload for streaming PUT requests.
+    /// This struct is serialized and sent via the stream, while the metadata
+    /// is sent via the RequestStreaming message.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct PutStreamingPayload {
+        pub contract: ContractContainer,
+        #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+        pub related_contracts: RelatedContracts<'static>,
+        pub value: WrappedState,
+    }
 
     /// PUT operation messages.
     ///

@@ -171,7 +171,6 @@ impl OrphanStreamRegistry {
     ///
     /// Should be called periodically to clean up orphan streams that were
     /// never claimed. Each expired stream's handle is cancelled.
-    #[allow(dead_code)] // Phase 3 infrastructure - will be called from a periodic cleanup task
     pub fn gc_expired(&self) {
         let now = Instant::now();
         let mut expired_count = 0;
@@ -210,6 +209,37 @@ impl OrphanStreamRegistry {
     #[allow(dead_code)]
     pub fn waiter_count(&self) -> usize {
         self.stream_waiters.len()
+    }
+
+    /// Start the background GC task for expired orphan streams.
+    ///
+    /// This spawns a task that runs periodically to clean up orphan streams
+    /// that were never claimed. Should be called once after the registry is created.
+    ///
+    /// The task runs every 5 seconds and removes streams older than `ORPHAN_STREAM_TIMEOUT`.
+    pub fn start_gc_task(registry: std::sync::Arc<Self>) {
+        use crate::config::GlobalExecutor;
+
+        GlobalExecutor::spawn(Self::gc_task(registry));
+    }
+
+    /// Background task to periodically garbage collect expired orphan streams.
+    async fn gc_task(registry: std::sync::Arc<Self>) {
+        use crate::config::GlobalRng;
+
+        // Add random initial delay to prevent synchronized GC across peers
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(5u64..=15u64));
+        tokio::time::sleep(initial_delay).await;
+
+        const GC_INTERVAL: Duration = Duration::from_secs(5);
+        let mut interval = tokio::time::interval(GC_INTERVAL);
+
+        tracing::debug!("Orphan stream GC task started");
+
+        loop {
+            interval.tick().await;
+            registry.gc_expired();
+        }
     }
 }
 

@@ -299,6 +299,16 @@ pub(crate) trait PeerConnectionApi: Send {
     fn recv(
         &mut self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
+
+    /// Sets the orphan stream registry for handling race conditions between
+    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+    ///
+    /// This should be called by the node layer after connection establishment,
+    /// before any messages are processed.
+    fn set_orphan_stream_registry(
+        &mut self,
+        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+    );
 }
 
 #[cfg(test)]
