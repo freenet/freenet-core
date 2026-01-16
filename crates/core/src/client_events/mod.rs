@@ -1880,7 +1880,7 @@ pub(crate) mod test {
     }
 
     impl MemoryEventsGen {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         pub fn new(
             signal: Receiver<(EventId, TransportPublicKey)>,
             key: TransportPublicKey,
@@ -1896,7 +1896,7 @@ pub(crate) mod test {
     }
 
     impl<R> MemoryEventsGen<R> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         pub fn generate_events(
             &mut self,
             events: impl IntoIterator<Item = (EventId, ClientRequest<'static>)>,

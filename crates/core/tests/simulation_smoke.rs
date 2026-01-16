@@ -835,3 +835,269 @@ async fn test_minimal_network() {
 
     tracing::info!("Minimal network test passed");
 }
+
+// =============================================================================
+// Subscription Topology Validation
+// =============================================================================
+// These tests validate the subscription topology infrastructure to detect
+// issues like bidirectional cycles (#2720), orphan seeders (#2719), etc.
+
+/// Helper to create a contract ID from a seed
+fn make_contract_id(seed: u8) -> freenet_stdlib::prelude::ContractInstanceId {
+    freenet_stdlib::prelude::ContractInstanceId::new([seed; 32])
+}
+
+/// Test that topology snapshot infrastructure is working correctly.
+///
+/// This test verifies:
+/// 1. SimNetwork creates and starts nodes correctly
+/// 2. The periodic topology registration task runs
+/// 3. Topology snapshots are captured for all peers
+/// 4. The validate_subscription_topology function can be called
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_topology_infrastructure() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+    use freenet::dev_tool::reset_all_simulation_state;
+
+    const SEED: u64 = 0x1234_5678;
+
+    // Reset all global state and set up deterministic time/RNG
+    reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "topology-infra-test",
+        1,  // 1 gateway
+        3,  // 3 peers
+        7,  // max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start network with minimal operations - just verify infrastructure
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Let the network run to establish connections
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    // Wait for topology registration task to run (1 second interval)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify topology snapshots were captured
+    let snapshots = sim.get_topology_snapshots();
+
+    // Should have captured snapshots for all 4 peers (1 gateway + 3 nodes)
+    assert!(
+        snapshots.len() >= 4,
+        "Expected at least 4 topology snapshots (1 gateway + 3 nodes), got {}",
+        snapshots.len()
+    );
+
+    // Verify each snapshot has valid data
+    for snap in &snapshots {
+        // Each peer should have a valid address and location
+        assert!(
+            snap.location >= 0.0 && snap.location <= 1.0,
+            "Invalid location {} for peer {}",
+            snap.location,
+            snap.peer_addr
+        );
+    }
+
+    // Verify validate_subscription_topology can be called
+    let contract_id = make_contract_id(1);
+    let result = sim.validate_subscription_topology(&contract_id, 0.5);
+
+    // With no contracts created, should have no issues
+    assert!(
+        result.is_healthy(),
+        "Empty topology should be healthy, got {} issues",
+        result.issue_count
+    );
+
+    tracing::info!("Topology infrastructure test passed");
+}
+
+/// Test using controlled events to reliably create contracts and subscriptions.
+///
+/// This test demonstrates the `start_with_controlled_events` API that allows
+/// precise control over which operations are executed on which nodes, bypassing
+/// the unreliable random event generator.
+///
+/// Scenario:
+/// 1. Gateway PUTs a contract with subscribe=true
+/// 2. Node 1 subscribes to the same contract
+/// 3. Node 2 subscribes to the same contract
+/// 4. Verify topology snapshots show correct subscription relationships
+///
+/// This test detects bidirectional cycles (Issue #2720) and other topology issues.
+///
+/// KNOWN FAILURE: This test currently fails due to Issue #2720 (bidirectional subscriptions).
+/// Run manually with: cargo test --features "simulation_tests,testing" test_controlled_events --ignored
+#[ignore] // Enable once Issue #2720 (bidirectional subscriptions) is fixed
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_controlled_events_subscription() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+    use freenet::dev_tool::{
+        reset_all_simulation_state, NodeLabel, ScheduledOperation, SimOperation,
+    };
+    use futures::StreamExt;
+
+    const SEED: u64 = 0xC0DE_CAFE_1234;
+
+    // Reset all global state and set up deterministic time/RNG
+    reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "controlled-events-test",
+        1,  // 1 gateway
+        2,  // 2 peers
+        7,  // max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Create a test contract
+    let contract = SimOperation::create_test_contract(42);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(42);
+
+    // Schedule controlled operations:
+    // 1. Gateway PUTs the contract with subscribe=true
+    // 2. Node 1 subscribes (node numbering starts after gateways)
+    // 3. Node 2 subscribes
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway("controlled-events-test", 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state.clone(),
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node("controlled-events-test", 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node("controlled-events-test", 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    // Start network with controlled events
+    let (_handles, num_ops) = sim.start_with_controlled_events(operations).await;
+    assert_eq!(num_ops, 3, "Should have scheduled 3 operations");
+
+    // Let nodes establish connections
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    // Create and trigger the controlled event chain
+    let event_sequence = vec![
+        (0, NodeLabel::gateway("controlled-events-test", 0)), // PUT
+        (1, NodeLabel::node("controlled-events-test", 1)),    // Subscribe on node 1
+        (2, NodeLabel::node("controlled-events-test", 2)),    // Subscribe on node 2
+    ];
+    let mut event_chain = sim.controlled_event_chain(event_sequence);
+
+    // Trigger first event (PUT) and let it complete
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(0), "Should trigger PUT event");
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    // Trigger subscribe events
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(1), "Should trigger first subscribe event");
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    let event = event_chain.next().await;
+    assert_eq!(event, Some(2), "Should trigger second subscribe event");
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    // Wait for topology registration
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Get topology snapshots
+    let snapshots = sim.get_topology_snapshots();
+    tracing::info!("Captured {} topology snapshots", snapshots.len());
+
+    // Check if any peer has contract subscriptions
+    let mut peers_with_contract = 0;
+    for snap in &snapshots {
+        if let Some(sub) = snap.contracts.get(&contract_id) {
+            peers_with_contract += 1;
+            tracing::debug!(
+                "Peer {} has contract: upstream={:?}, downstream={:?}, seeding={}",
+                snap.peer_addr,
+                sub.upstream,
+                sub.downstream,
+                sub.is_seeding
+            );
+        }
+    }
+
+    // We expect at least the gateway to have the contract
+    assert!(
+        peers_with_contract >= 1,
+        "Expected at least 1 peer with contract subscription, found {}",
+        peers_with_contract
+    );
+
+    // Validate topology for this contract
+    let contract_location = 0.5;
+    let result = sim.validate_subscription_topology(&contract_id, contract_location);
+
+    tracing::info!(
+        "Topology validation: cycles={}, orphans={}, unreachable={}, proximity_violations={}",
+        result.bidirectional_cycles.len(),
+        result.orphan_seeders.len(),
+        result.unreachable_seeders.len(),
+        result.proximity_violations.len()
+    );
+
+    // Assert no bidirectional cycles (Issue #2720)
+    assert!(
+        result.bidirectional_cycles.is_empty(),
+        "ISSUE #2720: Found {} bidirectional subscription cycles: {:?}. \
+         Bidirectional cycles create isolated islands that can't receive updates from the source.",
+        result.bidirectional_cycles.len(),
+        result.bidirectional_cycles
+    );
+
+    // Assert no orphan seeders (Issue #2719)
+    assert!(
+        result.orphan_seeders.is_empty(),
+        "ISSUE #2719: Found {} orphan seeders: {:?}. \
+         Orphan seeders have no upstream and won't receive updates.",
+        result.orphan_seeders.len(),
+        result.orphan_seeders
+    );
+
+    // Assert no unreachable seeders
+    assert!(
+        result.unreachable_seeders.is_empty(),
+        "Found {} unreachable seeders: {:?}. \
+         These seeders cannot receive updates from the contract source.",
+        result.unreachable_seeders.len(),
+        result.unreachable_seeders
+    );
+
+    tracing::info!("Controlled events subscription test passed");
+}

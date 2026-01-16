@@ -16,6 +16,7 @@
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -27,6 +28,29 @@ use std::{
 /// Value: TopologySnapshot for that peer
 static TOPOLOGY_REGISTRY: LazyLock<DashMap<(String, SocketAddr), TopologySnapshot>> =
     LazyLock::new(DashMap::new);
+
+/// Global current network name for simulation testing.
+/// Set by SimNetwork before starting nodes so that Ring can register topology snapshots
+/// with the correct network name.
+static CURRENT_NETWORK_NAME: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Set the current simulation network name.
+/// Called by SimNetwork before starting nodes.
+pub fn set_current_network_name(name: &str) {
+    *CURRENT_NETWORK_NAME.write() = Some(name.to_string());
+}
+
+/// Get the current simulation network name.
+/// Returns None if not in a simulation context.
+pub fn get_current_network_name() -> Option<String> {
+    CURRENT_NETWORK_NAME.read().clone()
+}
+
+/// Clear the current simulation network name.
+/// Called when SimNetwork is dropped or test ends.
+pub fn clear_current_network_name() {
+    *CURRENT_NETWORK_NAME.write() = None;
+}
 
 /// A snapshot of a peer's subscription topology for a contract.
 #[derive(Debug, Clone)]
