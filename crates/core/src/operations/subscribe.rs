@@ -938,6 +938,12 @@ impl Operation for SubscribeOp {
                             // Register the sender as our upstream source
                             // Use retry with backoff for peer lookup (same as downstream)
                             if let Some(sender_addr) = source_addr {
+                                tracing::info!(
+                                    tx = %msg_id,
+                                    contract = %format!("{:.8}", key),
+                                    source_addr = %sender_addr,
+                                    "SUBSCRIPTION_ACCEPTED: attempting to register upstream"
+                                );
                                 if let Some(sender_peer) =
                                     wait_for_peer_location(op_manager, sender_addr, msg_id).await
                                 {
@@ -947,38 +953,44 @@ impl Operation for SubscribeOp {
                                             if let Some(event) = NetEventLog::upstream_set(
                                                 &op_manager.ring,
                                                 *key,
-                                                sender_peer,
+                                                sender_peer.clone(),
                                             ) {
                                                 op_manager
                                                     .ring
                                                     .register_events(Either::Left(event))
                                                     .await;
                                             }
-                                            tracing::debug!(
+                                            tracing::info!(
                                                 tx = %msg_id,
-                                                %key,
+                                                contract = %format!("{:.8}", key),
                                                 upstream = %sender_addr,
-                                                "subscribe: registered upstream source"
+                                                "SUBSCRIPTION_UPSTREAM_SET: registered upstream for bidirectional update flow"
                                             );
                                         }
                                         Err(e) => {
-                                            tracing::warn!(
+                                            tracing::error!(
                                                 tx = %msg_id,
-                                                %key,
+                                                contract = %format!("{:.8}", key),
                                                 upstream = %sender_addr,
                                                 error = ?e,
-                                                "subscribe: rejected upstream registration"
+                                                "SUBSCRIPTION_UPSTREAM_REJECTED: failed to register upstream"
                                             );
                                         }
                                     }
                                 } else {
-                                    tracing::warn!(
+                                    tracing::error!(
                                         tx = %msg_id,
-                                        %key,
+                                        contract = %format!("{:.8}", key),
                                         upstream = %sender_addr,
-                                        "subscribe: failed to find upstream peer after retries, subscription tree may be incomplete"
+                                        "SUBSCRIPTION_UPSTREAM_MISSING: failed to find upstream peer after retries"
                                     );
                                 }
+                            } else {
+                                tracing::warn!(
+                                    tx = %msg_id,
+                                    contract = %format!("{:.8}", key),
+                                    "SUBSCRIPTION_NO_SOURCE_ADDR: no source address for upstream registration"
+                                );
                             }
 
                             // Forward response to requester or complete
