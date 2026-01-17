@@ -2368,6 +2368,36 @@ impl SimNetwork {
         result.converged.len() as f64 / total as f64
     }
 
+    /// Returns the number of unique contracts that have been subscribed to.
+    ///
+    /// Counts distinct contracts from SubscribeSuccess events. Use this to verify
+    /// that subscribed contracts are actually getting replicated and converged.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscribed_count = sim.count_subscribed_contracts().await;
+    /// let converged = sim.check_convergence().await;
+    /// assert_eq!(subscribed_count, converged.total_contracts(),
+    ///     "All subscribed contracts should be replicated and checked for convergence");
+    /// ```
+    pub async fn count_subscribed_contracts(&self) -> usize {
+        use std::collections::HashSet;
+        let logs = self.event_listener.logs.lock().await;
+
+        let mut subscribed_contracts: HashSet<String> = HashSet::new();
+
+        for log in logs.iter() {
+            if let crate::tracing::EventKind::Subscribe(
+                crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
+            ) = &log.kind
+            {
+                subscribed_contracts.insert(format!("{:?}", key));
+            }
+        }
+
+        subscribed_contracts.len()
+    }
+
     // =========================================================================
     // Gap 4: Direct State Query API (event-based)
     // =========================================================================
@@ -3121,8 +3151,9 @@ impl OperationSummary {
     }
 
     /// Returns overall success rate (0.0 to 1.0).
+    /// Includes timeouts as failed operations.
     pub fn overall_success_rate(&self) -> f64 {
-        let completed = self.total_completed();
+        let completed = self.total_completed() + self.timeouts;
         if completed == 0 {
             return 1.0; // No operations completed yet
         }

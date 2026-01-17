@@ -174,7 +174,7 @@ async fn run_verification(
         tracing::info!(
             "Overall: {}/{} succeeded ({:.1}% success rate), {} timeouts",
             summary.total_succeeded(),
-            summary.total_completed(),
+            summary.total_completed() + summary.timeouts,
             summary.overall_success_rate() * 100.0,
             summary.timeouts
         );
@@ -239,19 +239,30 @@ async fn run_verification(
         // Reduced from 500ms to 100ms for faster simulation completion
         let poll_interval = Duration::from_millis(100);
 
-        // Calculate minimum expected contracts based on events
-        // Approximately 30% of events generate new contracts (puts with new keys)
-        // Require at least 1 contract, scale with events
-        let min_expected_contracts = std::cmp::max(1, config.events / 10) as usize;
+        // Strict convergence check: ALL subscribed contracts must be replicated
+        // and converged. This catches bugs where contracts are subscribed to but
+        // not getting replicated/broadcasted.
+        //
+        // Process:
+        // 1. Count unique contracts from SubscribeSuccess events
+        // 2. Wait for all those contracts to have 2+ replicas (subscribers)
+        // 3. Verify all replicated contracts have converged states
+        // 4. Fail if subscribed contracts aren't replicated or don't converge
+        let subscribed_count = network.count_subscribed_contracts().await;
+
+        if subscribed_count == 0 {
+            tracing::warn!("No contracts were subscribed to during the test");
+            return Ok(());
+        }
 
         tracing::info!(
-            "Checking convergence (timeout: {}s, min contracts: {})...",
-            timeout_secs,
-            min_expected_contracts
+            "Found {} subscribed contracts, checking convergence (timeout: {}s)...",
+            subscribed_count,
+            timeout_secs
         );
 
         match network
-            .await_convergence(timeout, poll_interval, min_expected_contracts)
+            .await_convergence(timeout, poll_interval, subscribed_count)
             .await
         {
             Ok(result) => {
@@ -292,12 +303,26 @@ async fn run_verification(
                 );
             }
             Err(result) => {
-                let msg = format!(
-                    "Convergence check failed: {} contracts converged, {} still diverged. \
-                     Eventual consistency requires 100% convergence.",
-                    result.converged.len(),
-                    result.diverged.len()
-                );
+                let total_replicated = result.total_contracts();
+                let unreplicated = subscribed_count.saturating_sub(total_replicated);
+
+                let msg = if unreplicated > 0 {
+                    format!(
+                        "Convergence check failed: {} subscribed contracts, but only {} replicated (2+ peers). \
+                         {} contracts failed to replicate, {} diverged.",
+                        subscribed_count,
+                        total_replicated,
+                        unreplicated,
+                        result.diverged.len()
+                    )
+                } else {
+                    format!(
+                        "Convergence check failed: {} contracts converged, {} still diverged. \
+                         Eventual consistency requires 100% convergence.",
+                        result.converged.len(),
+                        result.diverged.len()
+                    )
+                };
                 tracing::error!("{}", msg);
 
                 // Log details of diverged contracts
@@ -307,6 +332,14 @@ async fn run_verification(
                         diverged.contract_key,
                         diverged.unique_state_count(),
                         diverged.peer_states.len()
+                    );
+                }
+
+                if unreplicated > 0 {
+                    tracing::error!(
+                        "  {} contracts were subscribed to but never replicated to 2+ peers. \
+                         This indicates a replication/broadcast bug.",
+                        unreplicated
                     );
                 }
 
