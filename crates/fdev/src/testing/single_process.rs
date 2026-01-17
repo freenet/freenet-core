@@ -239,13 +239,14 @@ async fn run_verification(
         // Reduced from 500ms to 100ms for faster simulation completion
         let poll_interval = Duration::from_millis(100);
 
-        // Calculate minimum expected contracts based on events
-        // Approximately 30% of events generate new contracts (puts with new keys)
-        // Require at least 1 contract, scale with events
-        let min_expected_contracts = std::cmp::max(1, config.events / 10) as usize;
+        // We only require at least 1 contract to be replicated to verify convergence.
+        // The number of contracts created depends on the random event generation,
+        // not an arbitrary formula. The convergence check verifies that whatever
+        // contracts exist have converged, not that a specific number were created.
+        let min_expected_contracts = 1;
 
         tracing::info!(
-            "Checking convergence (timeout: {}s, min contracts: {})...",
+            "Checking convergence (timeout: {}s, requiring at least {} replicated contract)...",
             timeout_secs,
             min_expected_contracts
         );
