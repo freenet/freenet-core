@@ -1656,64 +1656,96 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     }
 
     // Second client gets the contract (without subscribing)
+    // Use retry loop to handle transient UDP packet loss in CI (see issue #2682)
     let get_start = std::time::Instant::now();
-    tracing::info!(
-        contract = %contract_key,
-        client = 2,
-        phase = "get_request",
-        "Sending GET request"
-    );
-    make_get(&mut client_api2, contract_key, true, false).await?;
-
-    // Wait for get response on second client
     let mut get_response_received = false;
-    let start = std::time::Instant::now();
-    while !get_response_received && start.elapsed() < Duration::from_secs(30) {
-        let resp = tokio::time::timeout(Duration::from_secs(5), client_api2.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                key,
-                contract: Some(_),
-                state: _,
-            }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in GET response");
-                tracing::info!(
-                    contract = %contract_key,
-                    client = 2,
-                    elapsed_ms = get_start.elapsed().as_millis(),
-                    phase = "get_response",
-                    "GET response received"
-                );
-                get_response_received = true;
+    const MAX_GET_ATTEMPTS: u32 = 3;
+    const GET_ATTEMPT_TIMEOUT_SECS: u64 = 15;
+
+    for attempt in 1..=MAX_GET_ATTEMPTS {
+        tracing::info!(
+            contract = %contract_key,
+            client = 2,
+            attempt,
+            max_attempts = MAX_GET_ATTEMPTS,
+            phase = "get_request",
+            "Sending GET request"
+        );
+        make_get(&mut client_api2, contract_key, true, false).await?;
+
+        // Wait for get response on second client
+        let attempt_start = std::time::Instant::now();
+        while !get_response_received
+            && attempt_start.elapsed() < Duration::from_secs(GET_ATTEMPT_TIMEOUT_SECS)
+        {
+            let resp = tokio::time::timeout(Duration::from_secs(5), client_api2.recv()).await;
+            match resp {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    contract: Some(_),
+                    state: _,
+                }))) => {
+                    assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+                    tracing::info!(
+                        contract = %contract_key,
+                        client = 2,
+                        attempt,
+                        elapsed_ms = get_start.elapsed().as_millis(),
+                        phase = "get_response",
+                        "GET response received"
+                    );
+                    get_response_received = true;
+                }
+                Ok(Ok(other)) => {
+                    tracing::debug!(
+                        contract = %contract_key,
+                        client = 2,
+                        attempt,
+                        elapsed_ms = attempt_start.elapsed().as_millis(),
+                        response = ?other,
+                        "Received unexpected response while waiting for GET"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        contract = %contract_key,
+                        client = 2,
+                        attempt,
+                        elapsed_ms = attempt_start.elapsed().as_millis(),
+                        error = %e,
+                        phase = "get_error",
+                        "WebSocket error receiving GET response"
+                    );
+                    bail!("WebSocket error while waiting for GET response: {}", e);
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        contract = %contract_key,
+                        client = 2,
+                        attempt,
+                        elapsed_ms = attempt_start.elapsed().as_millis(),
+                        "Waiting for GET response (no message in 5s)"
+                    );
+                }
             }
-            Ok(Ok(other)) => {
-                tracing::debug!(
-                    contract = %contract_key,
-                    client = 2,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    response = ?other,
-                    "Received unexpected response while waiting for GET"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    contract = %contract_key,
-                    client = 2,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    error = %e,
-                    phase = "get_error",
-                    "WebSocket error receiving GET response"
-                );
-                bail!("WebSocket error while waiting for GET response: {}", e);
-            }
-            Err(_) => {
-                tracing::debug!(
-                    contract = %contract_key,
-                    client = 2,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "Waiting for GET response (no message in 5s)"
-                );
-            }
+        }
+
+        if get_response_received {
+            break;
+        }
+
+        if attempt < MAX_GET_ATTEMPTS {
+            tracing::warn!(
+                contract = %contract_key,
+                client = 2,
+                attempt,
+                elapsed_ms = get_start.elapsed().as_millis(),
+                phase = "get_retry",
+                "GET response not received within {}s, retrying (attempt {}/{})",
+                GET_ATTEMPT_TIMEOUT_SECS,
+                attempt,
+                MAX_GET_ATTEMPTS
+            );
         }
     }
 
@@ -1721,11 +1753,16 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
         tracing::error!(
             contract = %contract_key,
             client = 2,
-            elapsed_ms = start.elapsed().as_millis(),
+            elapsed_ms = get_start.elapsed().as_millis(),
             phase = "get_timeout",
-            "GET response timeout after 30 seconds"
+            "GET response timeout after {} attempts ({} seconds each)",
+            MAX_GET_ATTEMPTS,
+            GET_ATTEMPT_TIMEOUT_SECS
         );
-        bail!("Client 2: Did not receive GET response within 30 seconds");
+        bail!(
+            "Client 2: Did not receive GET response after {} attempts",
+            MAX_GET_ATTEMPTS
+        );
     }
 
     // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
