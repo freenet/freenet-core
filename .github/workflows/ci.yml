@@ -187,17 +187,9 @@ jobs:
           # Default congestion control is FixedRate for CI stability.
           # To test BBR: set FREENET_CONGESTION_CONTROL=bbr and optionally FREENET_BBR_STARTUP_RATE
         # Run all tests in parallel using all 16 cores
-        # Exclude operations tests (run separately with limited parallelism due to transport bandwidth constraints)
-        # Simulation tests excluded via feature flag
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=16 --skip test_put --skip test_get --skip test_update --skip test_subscription
-
-      - name: Test operations (serial)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Operations tests create real network connections on localhost.
-        # Run serially for reliable test results.
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb --test operations -- --test-threads=1
+        # Operations tests use dynamic port allocation with unique IPs (127.x.y.1) and are fully thread-safe
+        # Simulation tests excluded via feature flag (run separately below due to global state)
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb
 
       - name: Test simulation (serial)
         env:
