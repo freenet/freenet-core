@@ -3385,7 +3385,6 @@ pub enum PeerLifecycleEvent {
 
 #[cfg(feature = "trace")]
 pub mod tracer {
-    use std::io::IsTerminal;
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use tracing::level_filters::LevelFilter;
@@ -3491,17 +3490,18 @@ pub mod tracer {
         }
 
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
-        let force_file_logs = std::env::var("FREENET_LOG_TO_FILE").is_ok();
         let use_json = std::env::var("FREENET_LOG_FORMAT")
             .map(|v| v.to_lowercase() == "json")
             .unwrap_or(false);
 
         // Determine if we should write to files:
-        // - If FREENET_LOG_TO_FILE is set, always use file logging
-        // - If stdout is not a terminal (running as service), use file logging
-        // - If FREENET_LOG_TO_STDERR is set, use stderr instead
-        // - Otherwise, use stdout (interactive mode)
-        let use_file_logging = force_file_logs || (!to_stderr && !std::io::stdout().is_terminal());
+        // - Always write to files when a log directory is available (ensures diagnostic reports work)
+        // - Can be disabled with FREENET_LOG_TO_STDERR (uses stderr instead)
+        // - The FREENET_DISABLE_LOGS env var disables all logging
+        //
+        // Note: On Windows especially, logs must go to files because Task Scheduler
+        // doesn't capture stdout, making `freenet service report` unable to collect logs.
+        let use_file_logging = !to_stderr && get_log_dir().is_some();
 
         // Build filter
         let filter_layer = tracing_subscriber::EnvFilter::builder()
