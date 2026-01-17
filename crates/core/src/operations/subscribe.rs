@@ -998,6 +998,8 @@ impl Operation for SubscribeOp {
                                         upstream = %sender_addr,
                                         "SUBSCRIPTION_UPSTREAM_MISSING: failed to find upstream peer after retries"
                                     );
+                                    // Issue #2741: Record failure for backoff, same as set_upstream failure
+                                    op_manager.ring.complete_subscription_request(key, false);
                                 }
                             } else {
                                 tracing::warn!(
@@ -1005,6 +1007,8 @@ impl Operation for SubscribeOp {
                                     contract = %format!("{:.8}", key),
                                     "SUBSCRIPTION_NO_SOURCE_ADDR: no source address for upstream registration"
                                 );
+                                // Issue #2741: Record failure for backoff, same as set_upstream failure
+                                op_manager.ring.complete_subscription_request(key, false);
                             }
 
                             // Forward response to requester or complete
