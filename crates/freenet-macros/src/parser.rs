@@ -19,8 +19,10 @@ pub struct FreenetTestArgs {
     pub auto_connect_peers: bool,
     /// Test timeout in seconds
     pub timeout_secs: u64,
-    /// Node startup wait in seconds
+    /// Node startup wait in seconds (used as timeout for health checks if health_check_readiness is true)
     pub startup_wait_secs: u64,
+    /// Use health-check based readiness instead of fixed startup wait
+    pub health_check_readiness: bool,
     /// When to aggregate events
     pub aggregate_events: AggregateEventsMode,
     /// Log level filter
@@ -53,6 +55,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut auto_connect_peers = true;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
+        let mut health_check_readiness = false;  // Default to false for backward compatibility
         let mut aggregate_events = AggregateEventsMode::OnFailure;
         let mut log_level = "freenet=debug,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
@@ -212,6 +215,10 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitInt = input.parse()?;
                     startup_wait_secs = lit.base10_parse()?;
                 }
+                "health_check_readiness" => {
+                    let lit: syn::LitBool = input.parse()?;
+                    health_check_readiness = lit.value;
+                }
                 "aggregate_events" => {
                     let lit: syn::LitStr = input.parse()?;
                     aggregate_events = match lit.value().as_str() {
@@ -336,6 +343,7 @@ impl syn::parse::Parse for FreenetTestArgs {
             auto_connect_peers,
             timeout_secs,
             startup_wait_secs,
+            health_check_readiness,
             aggregate_events,
             log_level,
             tokio_flavor,

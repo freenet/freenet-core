@@ -51,6 +51,59 @@ Based on 4 recent successful PR runs:
 
 **Total main push runtime:** ~1.5 minutes
 
+## Update: Parallel Test Infrastructure Already Exists!
+
+**Discovery:** The `#[freenet_test]` macro **already has full infrastructure for parallel testing!**
+
+### Evidence:
+
+1. **Thread-safe node allocation** (`crates/core/src/test_utils.rs:1048`):
+   ```rust
+   pub fn allocate_test_node_block(node_count: usize) -> usize {
+       GLOBAL_NODE_INDEX.fetch_add(node_count, std::sync::atomic::Ordering::SeqCst)
+   }
+   ```
+   - Uses atomic counter to allocate unique node index blocks per test
+   - Completely thread-safe for parallel test execution
+
+2. **Unique IP addresses per node** (`crates/core/src/test_utils.rs:1061`):
+   ```rust
+   pub fn test_ip_for_node(node_idx: usize) -> std::net::Ipv4Addr {
+       let second_octet = ((node_idx / 254) % 254) + 1;
+       let third_octet = (node_idx % 254) + 1;
+       std::net::Ipv4Addr::new(127, second_octet as u8, third_octet as u8, 1)
+   }
+   ```
+   - Each node gets a unique loopback IP (127.x.y.1)
+   - Supports up to 64,516 unique test nodes
+   - No port conflicts even with parallel tests!
+
+3. **Dynamic port allocation** (`crates/freenet-macros/src/codegen.rs:247-249`):
+   ```rust
+   let network_port = reserve_local_port_on_ip(node_ip)?;
+   let ws_port = reserve_local_port_on_ip(node_ip)?;
+   ```
+   - Ports are reserved dynamically per test
+   - No hardcoded ports
+
+4. **Test comment mentions parallelism** (`crates/core/tests/operations.rs:259`):
+   ```rust
+   // Increased timeout for CI where 8 parallel tests compete for resources
+   ```
+
+### Why Tests Run Serially (Currently)
+
+The CI workflow runs with `--test-threads=1` (line 200), but this appears to be **conservative** rather than necessary. The infrastructure is fully designed for parallel execution.
+
+### Recommended Immediate Action
+
+**Phase 1a: Enable Parallel Execution (ZERO CODE CHANGES)**
+1. Change CI workflow from `--test-threads=1` to `--test-threads=4`
+2. Expected impact: 12-15 min → 3-4 min (75% reduction)
+3. Risk: Low (infrastructure already supports it)
+
+If successful, proceed with health-check optimization for further gains.
+
 ## Key Observations
 
 ### 1. Test Job is the Primary Bottleneck
