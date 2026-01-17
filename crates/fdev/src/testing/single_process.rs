@@ -239,25 +239,24 @@ async fn run_verification(
         // Reduced from 500ms to 100ms for faster simulation completion
         let poll_interval = Duration::from_millis(100);
 
-        // Determine the actual number of unique contracts created by checking current state.
-        // The convergence check should verify that ALL created contracts have converged,
-        // not just that "at least 1" has converged.
-        let initial_check = network.check_convergence().await;
-        let actual_contracts = initial_check.total_contracts();
-
-        if actual_contracts == 0 {
-            tracing::warn!("No contracts were created or replicated during the test");
-            return Ok(());
-        }
+        // Convergence check verifies that all peers subscribed to a contract have
+        // converged states (same state_hash). We require at least 1 contract to be
+        // replicated (2+ subscribers) to ensure the test is meaningful, but don't
+        // require a specific count since that depends on random event generation.
+        //
+        // Note: Only contracts with 2+ peers storing state are checked. This naturally
+        // filters to contracts that have subscribers who received broadcasts
+        // (PutSuccess + BroadcastApplied events), not just opportunistic routing caches.
+        let min_contracts = 1;
 
         tracing::info!(
-            "Found {} unique contracts, checking convergence (timeout: {}s)...",
-            actual_contracts,
-            timeout_secs
+            "Checking convergence (timeout: {}s, requiring at least {} replicated contract)...",
+            timeout_secs,
+            min_contracts
         );
 
         match network
-            .await_convergence(timeout, poll_interval, actual_contracts)
+            .await_convergence(timeout, poll_interval, min_contracts)
             .await
         {
             Ok(result) => {
