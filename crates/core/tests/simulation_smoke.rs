@@ -184,7 +184,7 @@ async fn test_smoke_small_network() {
     );
 
     // Check partial connectivity
-    match sim.check_partial_connectivity(Duration::from_secs(10), 0.5) {
+    match sim.check_partial_connectivity(Duration::from_secs(10), 0.5).await {
         Ok(()) => {
             tracing::info!("Small network achieved connectivity");
         }
