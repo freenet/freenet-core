@@ -15,7 +15,9 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .await;
 
     let events = config.events;
-    let next_event_wait_time = config
+    // Virtual time to advance per event (for message delivery simulation)
+    // This is independent of real-time pacing
+    let virtual_time_per_event = config
         .event_wait_ms
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(200));
@@ -41,13 +43,16 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
     // nodes that haven't fully joined will fail.
     let stabilization_time = Duration::from_secs(60);
     tracing::info!(
-        "Network connectivity check passed, stabilizing for {}s",
+        "Network connectivity check passed, stabilizing for {}s virtual time",
         stabilization_time.as_secs()
     );
+    // Advance 60s of virtual time in chunks, with minimal real-time delays
+    // to allow tokio tasks to process messages
     for _ in 0..600 {
         simulated_network.advance_time(Duration::from_millis(100));
         tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Minimal real-time sleep just for scheduler - 1ms instead of 10ms
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
@@ -86,7 +91,14 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
             } => {
                 match event {
                     Some(_event_id) => {
-                        tokio::time::sleep(next_event_wait_time).await;
+                        // Advance VirtualTime to allow message delivery in the simulation
+                        // This replaces real-time sleep with simulated time progression
+                        simulated_network.advance_time(virtual_time_per_event);
+                        // Yield to let tokio tasks process delivered messages
+                        tokio::task::yield_now().await;
+                        // Minimal real-time sleep (1ms) to prevent busy-looping
+                        // and allow the scheduler to run other tasks
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     None => {
                         tracing::info!("All {} events generated successfully", events);
@@ -224,7 +236,8 @@ async fn run_verification(
     let timeout_secs = config.check_convergence;
     if timeout_secs > 0 {
         let timeout = Duration::from_secs(timeout_secs);
-        let poll_interval = Duration::from_millis(500);
+        // Reduced from 500ms to 100ms for faster simulation completion
+        let poll_interval = Duration::from_millis(100);
 
         // Calculate minimum expected contracts based on events
         // Approximately 30% of events generate new contracts (puts with new keys)

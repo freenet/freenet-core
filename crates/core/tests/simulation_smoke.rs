@@ -35,8 +35,8 @@ async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
         sim.advance_time(step);
         // Yield to tokio so tasks can process delivered messages
         tokio::task::yield_now().await;
-        // Also give a small real-time sleep for task scheduling
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Minimal real-time sleep for task scheduling (reduced from 10ms to 1ms)
+        tokio::time::sleep(Duration::from_millis(1)).await;
         elapsed += step;
     }
 }
