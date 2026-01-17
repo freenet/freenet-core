@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "freenet-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "freenet/freenet-agent-skills"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "freenet-dapp-builder@freenet-agent-skills": true,
+    "freenet-core-dev@freenet-agent-skills": true
+  }
+}

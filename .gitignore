@@ -46,6 +46,7 @@ aider.conf.yaml
 CI_STATUS.md
 claude_notes/
 .claude/**
+!.claude/settings.json
 .claude-plugin/
 external_plugins/
 plugins/
