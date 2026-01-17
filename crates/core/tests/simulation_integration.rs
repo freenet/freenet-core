@@ -1235,7 +1235,7 @@ const MULTI_SUBSCRIBER_NETWORK: &str = "multi-subscriber-test";
 ///
 /// # Timing
 /// - `step`: 100ms virtual time advancement per iteration
-/// - Real-time sleep: 10ms per iteration to allow task scheduling
+/// - Real-time sleep: 1ms per iteration to allow task scheduling (reduced from 10ms)
 async fn let_network_run_for_topology(sim: &mut SimNetwork, duration: Duration) {
     let step = Duration::from_millis(100);
     let mut elapsed = Duration::ZERO;
@@ -1245,8 +1245,8 @@ async fn let_network_run_for_topology(sim: &mut SimNetwork, duration: Duration) 
         sim.advance_time(step);
         // Yield to tokio so tasks can process delivered messages
         tokio::task::yield_now().await;
-        // Also give a small real-time sleep for task scheduling
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Minimal real-time sleep for task scheduling (reduced from 10ms to 1ms)
+        tokio::time::sleep(Duration::from_millis(1)).await;
         elapsed += step;
     }
 }
