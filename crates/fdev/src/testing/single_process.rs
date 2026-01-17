@@ -15,12 +15,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .await;
 
     let events = config.events;
-    // Virtual time to advance per event (for message delivery simulation)
-    // This is independent of real-time pacing
-    let virtual_time_per_event = config
+    // Time to wait between events - reduced from 200ms for faster tests
+    // while still allowing adequate time for async task processing
+    let event_wait_time = config
         .event_wait_ms
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(200));
+        .unwrap_or(Duration::from_millis(150));
     let (connectivity_timeout, network_connection_percent) = config.get_connection_check_params();
 
     // Check connectivity first
@@ -46,13 +46,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         "Network connectivity check passed, stabilizing for {}s virtual time",
         stabilization_time.as_secs()
     );
-    // Advance 60s of virtual time in chunks, with minimal real-time delays
-    // to allow tokio tasks to process messages
+    // Advance 60s of virtual time in chunks, with real-time delays to allow
+    // tokio tasks to process messages
     for _ in 0..600 {
         simulated_network.advance_time(Duration::from_millis(100));
         tokio::task::yield_now().await;
-        // Minimal real-time sleep just for scheduler - 1ms instead of 10ms
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
@@ -91,14 +90,11 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
             } => {
                 match event {
                     Some(_event_id) => {
-                        // Advance VirtualTime to allow message delivery in the simulation
-                        // This replaces real-time sleep with simulated time progression
-                        simulated_network.advance_time(virtual_time_per_event);
-                        // Yield to let tokio tasks process delivered messages
-                        tokio::task::yield_now().await;
-                        // Minimal real-time sleep (1ms) to prevent busy-looping
-                        // and allow the scheduler to run other tasks
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        // Sleep between events to pace the simulation.
+                        // Note: VirtualTime advancement happens via the stabilization
+                        // phase and connectivity checks. During event processing, we
+                        // rely on real-time sleep to allow async tasks to complete.
+                        tokio::time::sleep(event_wait_time).await;
                     }
                     None => {
                         tracing::info!("All {} events generated successfully", events);
