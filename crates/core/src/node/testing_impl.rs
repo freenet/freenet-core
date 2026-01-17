@@ -2003,15 +2003,17 @@ impl SimNetwork {
 
         tracing::info!("Number of simulated nodes: {num_nodes}");
 
-        let missing_percent = 1.0 - ((num_nodes - missing.len()) as f64 / num_nodes as f64);
-        if missing_percent > (percent + 0.01/* 1% error tolerance */) {
+        // Calculate the percentage of nodes that are connected
+        let connected_percent = connected.len() as f64 / num_nodes as f64;
+        // Fail if fewer nodes are connected than the required percentage (with tolerance)
+        if connected_percent < (percent - 0.01/* 1% error tolerance */) {
             missing.sort();
             let show_max = missing.len().min(100);
             tracing::error!("Nodes without connection: {:?}(..)", &missing[..show_max],);
             tracing::error!(
-                "Total nodes without connection: {:?},  ({}% > {}%)",
+                "Total nodes without connection: {:?},  ({:.1}% connected < {:.1}% required)",
                 missing.len(),
-                missing_percent * 100.0,
+                connected_percent * 100.0,
                 percent * 100.0
             );
             anyhow::bail!("found disconnected nodes");
