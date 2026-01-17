@@ -1481,36 +1481,32 @@ async fn test_topology_single_seeder() {
 
 /// Regression test for Issue #2720: Bidirectional subscription cycles.
 ///
-/// This test creates multiple subscribers and verifies the subscription topology
-/// is correct. It INTENTIONALLY detects the bidirectional cycle bug in #2720.
-///
-/// ## Why this test is `#[ignore]`
-///
-/// This test exposes a known bug where when multiple peers subscribe to the same
-/// contract, they sometimes create bidirectional subscription relationships
-/// (A upstream of B, and B upstream of A). This creates isolated cycles that
-/// cannot receive updates from the source.
+/// This test validates that the fixes for bidirectional subscription cycles work correctly:
+/// - PR #2729: Circular reference detection in `set_upstream`/`add_downstream`
+/// - PR #2748: Backoff when `set_upstream` fails (enables eventual recovery)
+/// - PR #2740: Orphan recovery detects contracts in subscriptions
 ///
 /// ## Scenario
 /// 1. Gateway PUTs a contract with subscribe=true (becomes the source)
 /// 2. Node 1 subscribes to the same contract
 /// 3. Node 2 subscribes to the same contract
-/// 4. Verify: topology has no bidirectional cycles (FAILS due to #2720)
+/// 4. Wait for topology to stabilize (includes time for orphan recovery if needed)
+/// 5. Verify: topology has no cycles, orphans, or disconnected upstreams
 ///
-/// ## When to enable this test
-/// Remove `#[ignore]` once Issue #2720 is fixed. The test passing indicates
-/// the subscription topology correctly forms a directed acyclic graph from
-/// subscribers toward the source.
+/// ## What this validates
+/// - Circular references are detected and rejected (cycles=0)
+/// - Peers that fail to set upstream get backoff applied
+/// - The topology forms a valid directed acyclic graph toward the source
 ///
 /// ## Related
 /// - Issue #2720: https://github.com/freenet/freenet-core/issues/2720
-/// - For a passing topology test, see `test_topology_single_seeder`
+/// - Issue #2741: https://github.com/freenet/freenet-core/issues/2741
+/// - For a simpler topology test, see `test_topology_single_seeder`
 ///
 /// ## Manual run
 /// ```bash
-/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720 -- --ignored
+/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720
 /// ```
-#[ignore] // Enable once Issue #2720 (bidirectional subscriptions) is fixed
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_bidirectional_cycle_issue_2720() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
@@ -1595,8 +1591,11 @@ async fn test_bidirectional_cycle_issue_2720() {
     assert_eq!(event, Some(2), "Should trigger second subscribe event");
     let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
 
-    // Wait for topology registration
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Allow extra time for topology to stabilize. The primary fix (PR #2729) detects
+    // circular references immediately, but we wait additional time as a safety margin
+    // in case orphan recovery is needed (runs every 30 seconds). This also exercises
+    // the backoff mechanism from PR #2748 when set_upstream fails.
+    let_network_run_for_topology(&mut sim, Duration::from_secs(35)).await;
 
     // Get topology snapshots
     let snapshots = sim.get_topology_snapshots();
