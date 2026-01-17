@@ -15,7 +15,6 @@ use freenet_stdlib::{
 
 use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
-use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
@@ -116,10 +115,6 @@ impl PutOp {
             }
             Some(PutState::AwaitingResponse { current_htl, .. }) => (None, Some(*current_htl)),
             Some(PutState::Finished { key }) => (Some(*key), None),
-            Some(PutState::AwaitingStreamData {
-                contract_key, htl, ..
-            }) => (Some(*contract_key), Some(*htl)),
-            Some(PutState::ForwardingStream { contract_key, .. }) => (Some(*contract_key), None),
             None => (None, None),
         };
 
@@ -1032,9 +1027,9 @@ pub(crate) fn start_op_with_id(
 /// - Final node: (receives Request) → stores contract → sends Response → done
 ///
 /// Streaming flow (when enabled and payload > threshold):
-/// - Originator: PrepareRequest → AwaitingStreamData → AwaitingResponse → Finished
-/// - Forwarder: ReceivedRequest → ForwardingStream → AwaitingResponse → Finished
-/// - Final node: ReceivedRequest → AwaitingStreamData → stores → sends Response → done
+/// State machine for PUT operations.
+/// - Originator: PrepareRequest → AwaitingResponse → Finished
+/// - Forwarder: ReceivedRequest → stores → sends Response → done
 #[derive(Debug, Clone)]
 pub enum PutState {
     /// Local originator preparing to send initial request.
@@ -1054,36 +1049,6 @@ pub enum PutState {
         next_hop: Option<std::net::SocketAddr>,
         /// Current HTL (remaining hops) for hop_count calculation.
         current_htl: usize,
-    },
-    /// Waiting for stream data to arrive after receiving RequestStreaming.
-    /// Used when we're the receiving end of a streaming PUT.
-    #[allow(dead_code)]
-    AwaitingStreamData {
-        /// StreamId we're waiting for
-        stream_id: StreamId,
-        /// Contract key being stored
-        contract_key: ContractKey,
-        /// Expected total size of the stream
-        total_size: u64,
-        /// Whether to subscribe after storing
-        subscribe: bool,
-        /// HTL for potential forwarding
-        htl: usize,
-    },
-    /// Forwarding a stream to the next hop.
-    /// Used when we're an intermediate node in a streaming PUT.
-    #[allow(dead_code)]
-    ForwardingStream {
-        /// Original stream ID from upstream
-        upstream_stream_id: StreamId,
-        /// New stream ID for downstream
-        downstream_stream_id: StreamId,
-        /// Contract key being forwarded
-        contract_key: ContractKey,
-        /// Next hop address
-        next_hop: std::net::SocketAddr,
-        /// Whether to subscribe after storing
-        subscribe: bool,
     },
     /// Operation completed successfully.
     Finished { key: ContractKey },

@@ -7,7 +7,6 @@ use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
 use crate::node::IsOperationCompleted;
-use crate::transport::peer_connection::StreamId;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -323,36 +322,6 @@ enum GetState {
         /// Bloom filter tracking visited peers across all hops
         visited: super::VisitedPeers,
     },
-    /// Waiting for streaming response data to arrive.
-    /// Used when we're the requester and received ResponseStreaming.
-    #[allow(dead_code)]
-    AwaitingStreamData {
-        /// StreamId we're waiting for
-        stream_id: StreamId,
-        /// Contract key being fetched
-        key: ContractKey,
-        /// Instance ID for routing
-        instance_id: ContractInstanceId,
-        /// Expected total size of the stream
-        total_size: u64,
-        /// Whether the response includes contract code
-        includes_contract: bool,
-        /// Whether to subscribe after receiving
-        subscribe: bool,
-    },
-    /// Sending a streaming response back to the requester.
-    /// Used when we have the contract and it exceeds the streaming threshold.
-    #[allow(dead_code)]
-    SendingStreamResponse {
-        /// StreamId for the outbound stream
-        stream_id: StreamId,
-        /// Contract key being sent
-        key: ContractKey,
-        /// Instance ID for the contract
-        instance_id: ContractInstanceId,
-        /// Address to send the response to
-        target_addr: std::net::SocketAddr,
-    },
     /// Operation completed successfully
     Finished { key: ContractKey },
 }
@@ -381,28 +350,6 @@ impl Display for GetState {
                 ..
             } => {
                 write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
-            }
-            GetState::AwaitingStreamData {
-                stream_id,
-                key,
-                total_size,
-                ..
-            } => {
-                write!(
-                    f,
-                    "AwaitingStreamData(stream: {stream_id}, key: {key}, size: {total_size})"
-                )
-            }
-            GetState::SendingStreamResponse {
-                stream_id,
-                key,
-                target_addr,
-                ..
-            } => {
-                write!(
-                    f,
-                    "SendingStreamResponse(stream: {stream_id}, key: {key}, target: {target_addr})"
-                )
             }
             GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
         }
@@ -2098,40 +2045,16 @@ impl Operation for GetOp {
                     let id = *msg_id;
                     let stream_id = *stream_id;
 
-                    tracing::debug!(
+                    // The acknowledgment confirms the stream was received.
+                    // For now, we just log it and clean up.
+                    tracing::info!(
                         tx = %id,
                         stream_id = %stream_id,
                         phase = "streaming_ack",
-                        "Processing GET ResponseStreamingAck"
+                        "Streaming GET response acknowledged"
                     );
-
-                    // The acknowledgment confirms the stream was received.
-                    // For now, we just log it and clean up. In future, this could
-                    // be used for retransmission or error handling.
-                    match &self.state {
-                        Some(GetState::SendingStreamResponse { .. }) => {
-                            // Streaming response confirmed - operation complete for this node
-                            tracing::info!(
-                                tx = %id,
-                                stream_id = %stream_id,
-                                phase = "complete",
-                                "Streaming GET response acknowledged"
-                            );
-                            new_state = None;
-                            return_msg = None;
-                        }
-                        _ => {
-                            // Unexpected ack - log but don't fail
-                            tracing::warn!(
-                                tx = %id,
-                                stream_id = %stream_id,
-                                state = ?self.state,
-                                "ResponseStreamingAck received in unexpected state"
-                            );
-                            new_state = None;
-                            return_msg = None;
-                        }
-                    }
+                    new_state = None;
+                    return_msg = None;
                 }
             }
 

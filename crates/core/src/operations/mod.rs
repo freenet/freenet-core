@@ -337,9 +337,6 @@ pub(crate) enum OpError {
     OpNotAvailable(#[from] OpNotAvailable),
 
     // Streaming-related errors
-    #[allow(dead_code)]
-    #[error("stream timed out waiting for data")]
-    StreamTimeout,
     #[error("stream was cancelled")]
     StreamCancelled,
     #[error("failed to claim orphan stream")]
@@ -587,8 +584,8 @@ async fn has_contract(
 /// The threshold comparison is exclusive (`>`), meaning payloads exactly at the
 /// threshold will NOT use streaming. This is intentional: the threshold represents
 /// "the maximum size for non-streaming transfers", so payloads must exceed it.
-#[allow(dead_code)]
-pub(crate) fn should_use_streaming(
+#[cfg(test)]
+fn should_use_streaming(
     streaming_enabled: bool,
     streaming_threshold: usize,
     payload_size: usize,

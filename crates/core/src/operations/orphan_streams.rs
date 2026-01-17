@@ -195,13 +195,13 @@ impl OrphanStreamRegistry {
     }
 
     /// Returns the number of orphan streams currently registered.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn orphan_count(&self) -> usize {
         self.orphan_streams.len()
     }
 
     /// Returns the number of waiters currently registered.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn waiter_count(&self) -> usize {
         self.stream_waiters.len()
     }
