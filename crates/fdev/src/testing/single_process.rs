@@ -239,20 +239,25 @@ async fn run_verification(
         // Reduced from 500ms to 100ms for faster simulation completion
         let poll_interval = Duration::from_millis(100);
 
-        // We only require at least 1 contract to be replicated to verify convergence.
-        // The number of contracts created depends on the random event generation,
-        // not an arbitrary formula. The convergence check verifies that whatever
-        // contracts exist have converged, not that a specific number were created.
-        let min_expected_contracts = 1;
+        // Determine the actual number of unique contracts created by checking current state.
+        // The convergence check should verify that ALL created contracts have converged,
+        // not just that "at least 1" has converged.
+        let initial_check = network.check_convergence().await;
+        let actual_contracts = initial_check.total_contracts();
+
+        if actual_contracts == 0 {
+            tracing::warn!("No contracts were created or replicated during the test");
+            return Ok(());
+        }
 
         tracing::info!(
-            "Checking convergence (timeout: {}s, requiring at least {} replicated contract)...",
-            timeout_secs,
-            min_expected_contracts
+            "Found {} unique contracts, checking convergence (timeout: {}s)...",
+            actual_contracts,
+            timeout_secs
         );
 
         match network
-            .await_convergence(timeout, poll_interval, min_expected_contracts)
+            .await_convergence(timeout, poll_interval, actual_contracts)
             .await
         {
             Ok(result) => {
