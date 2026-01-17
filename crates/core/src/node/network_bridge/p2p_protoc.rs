@@ -2481,8 +2481,9 @@ impl P2pConnManager {
                     state.peer_backoff.record_success(peer_addr);
                 }
 
-                // For outbound connections, we always know who we're connecting to
-                self.handle_successful_connection(Some(peer), connection, state, None, false)
+                // For outbound connections, respect the transient flag from the handshake.
+                // Gateway connections should remain transient until CONNECT acceptance.
+                self.handle_successful_connection(Some(peer), connection, state, None, transient)
                     .await?;
             }
             HandshakeEvent::OutboundFailed {
