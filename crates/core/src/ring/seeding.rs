@@ -447,9 +447,10 @@ impl SeedingManager {
     pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
         // Get all contracts from BOTH seeding cache AND subscriptions.
         // This ensures we recover intermediate forwarding nodes that may have been
-        // evicted from the seeding cache but still have downstream subscribers.
-        // Issue #2717: Previously only checked seeding_cache, missing orphaned
-        // intermediate nodes that had downstream peers but weren't in seeding_cache.
+        // evicted from the seeding cache (due to cache pressure) or were never cached
+        // (e.g., added directly as downstream forwarding node) but still have downstream
+        // subscribers. Issue #2717: Previously only checked seeding_cache, missing
+        // orphaned intermediate nodes that had downstream peers but weren't in seeding_cache.
         let mut contracts_to_check: HashSet<ContractKey> =
             self.seeding_cache.read().iter().collect();
         contracts_to_check.extend(self.subscriptions.iter().map(|e| *e.key()));
@@ -1865,6 +1866,39 @@ mod tests {
             contracts.len(),
             1,
             "Should detect orphan intermediate node even when not in seeding_cache"
+        );
+        assert_eq!(contracts[0], contract);
+    }
+
+    /// Test that contracts appearing in BOTH seeding_cache AND subscriptions are deduplicated.
+    /// The HashSet merge should ensure each contract appears only once in the result.
+    #[test]
+    fn test_contracts_without_upstream_deduplicates_when_in_both_sources() {
+        use super::super::seeding_cache::AccessType;
+
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let downstream = test_peer_loc(1);
+
+        // Add contract to seeding_cache via record_contract_access
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+        assert!(
+            manager.is_seeding_contract(&contract),
+            "Contract should be in seeding cache"
+        );
+
+        // Also add downstream subscriber (creates subscription entry)
+        manager
+            .add_downstream(&contract, downstream, None, None)
+            .unwrap();
+
+        // Contract is now in BOTH seeding_cache AND subscriptions
+        // It should appear exactly once in results (not duplicated)
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "Contract in both sources should appear exactly once (HashSet deduplication)"
         );
         assert_eq!(contracts[0], contract);
     }
