@@ -187,19 +187,9 @@ jobs:
           # Default congestion control is FixedRate for CI stability.
           # To test BBR: set FREENET_CONGESTION_CONTROL=bbr and optionally FREENET_BBR_STARTUP_RATE
         # Run all tests in parallel using all 16 cores
-        # Exclude operations tests (run separately with limited parallelism due to transport bandwidth constraints)
-        # Simulation tests excluded via feature flag
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=16 --skip test_put --skip test_get --skip test_update --skip test_subscription
-
-      - name: Test operations (parallel)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Operations tests use dynamic port allocation with unique IPs per node (127.x.y.1).
-        # The infrastructure (allocate_test_node_block, test_ip_for_node, reserve_local_port_on_ip)
-        # is fully thread-safe and designed for parallel execution.
-        # Runs in parallel automatically (test runner uses available CPU cores, typically 16 on ubicloud-standard-16).
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb --test operations
+        # Operations tests use dynamic port allocation with unique IPs (127.x.y.1) and are fully thread-safe
+        # Simulation tests excluded via feature flag (run separately below due to global state)
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb
 
       - name: Test simulation (serial)
         env:
