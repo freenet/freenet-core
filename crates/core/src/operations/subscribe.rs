@@ -975,6 +975,20 @@ impl Operation for SubscribeOp {
                                                 error = ?e,
                                                 "SUBSCRIPTION_UPSTREAM_REJECTED: failed to register upstream"
                                             );
+                                            // Issue #2741: When set_upstream fails (e.g., due to circular
+                                            // reference), we're left without an upstream but may have
+                                            // downstream subscribers. Record this as a subscription failure
+                                            // so the backoff mechanism applies. The periodic orphan recovery
+                                            // (every 30s) will detect this contract via contracts_without_upstream()
+                                            // and attempt to find a valid upstream through different routing.
+                                            //
+                                            // We don't trigger immediate recovery here because:
+                                            // 1. The same routing might select the same problematic peer
+                                            // 2. The periodic recovery with backoff prevents subscription spam
+                                            // 3. Network topology may change by the next recovery cycle
+                                            op_manager
+                                                .ring
+                                                .complete_subscription_request(key, false);
                                         }
                                     }
                                 } else {
@@ -984,6 +998,8 @@ impl Operation for SubscribeOp {
                                         upstream = %sender_addr,
                                         "SUBSCRIPTION_UPSTREAM_MISSING: failed to find upstream peer after retries"
                                     );
+                                    // Issue #2741: Record failure for backoff, same as set_upstream failure
+                                    op_manager.ring.complete_subscription_request(key, false);
                                 }
                             } else {
                                 tracing::warn!(
@@ -991,6 +1007,8 @@ impl Operation for SubscribeOp {
                                     contract = %format!("{:.8}", key),
                                     "SUBSCRIPTION_NO_SOURCE_ADDR: no source address for upstream registration"
                                 );
+                                // Issue #2741: Record failure for backoff, same as set_upstream failure
+                                op_manager.ring.complete_subscription_request(key, false);
                             }
 
                             // Forward response to requester or complete
