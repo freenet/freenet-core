@@ -58,7 +58,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use testresult::TestResult;
 use tokio::{select, time::sleep};
 use tracing::{span, Instrument, Level};
 
@@ -96,7 +95,7 @@ const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
 
 /// Runs a blocked peers test with the provided configuration.
 /// Wraps the test in a retry loop to handle port allocation race conditions.
-async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
+async fn run_blocked_peers_test(config: BlockedPeersConfig) -> Result<(), anyhow::Error> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
@@ -121,21 +120,19 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-                // Non-retryable error - convert to TestResult which will panic
-                return Err(e.into());
+                // Non-retryable error
+                return Err(e);
             }
         }
     }
 
     // All retries exhausted
-    Err(last_error
-        .unwrap_or_else(|| {
-            anyhow!(
-                "Port allocation failed after {} attempts",
-                MAX_PORT_RETRY_ATTEMPTS
-            )
-        })
-        .into())
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "Port allocation failed after {} attempts",
+            MAX_PORT_RETRY_ATTEMPTS
+        )
+    }))
 }
 
 /// Inner implementation of blocked peers test (returns anyhow::Result for error inspection)
@@ -878,7 +875,7 @@ async fn run_blocked_peers_test_inner(
 
 /// Standard blocked peers test (baseline)
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_ping_blocked_peers() -> TestResult {
+async fn test_ping_blocked_peers() -> anyhow::Result<()> {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "baseline",
         initial_wait: Duration::from_secs(25),
@@ -895,12 +892,13 @@ async fn test_ping_blocked_peers() -> TestResult {
         send_final_updates: true,
         subscribe_immediately: false,
     })
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Simple blocked peers test
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_ping_blocked_peers_simple() -> TestResult {
+async fn test_ping_blocked_peers_simple() -> anyhow::Result<()> {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
         initial_wait: Duration::from_secs(25),
@@ -916,7 +914,8 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
         send_final_updates: false,
         subscribe_immediately: false,
     })
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Solution/reference implementation for blocked peers
@@ -925,7 +924,7 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // fails with "Connection reset without closing handshake" during cleanup.
 // Likely a test teardown race rather than functional bug.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_ping_blocked_peers_solution() -> TestResult {
+async fn test_ping_blocked_peers_solution() -> anyhow::Result<()> {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",
         initial_wait: Duration::from_secs(25),
@@ -939,5 +938,6 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         send_final_updates: true,
         subscribe_immediately: true,
     })
-    .await
+    .await?;
+    Ok(())
 }

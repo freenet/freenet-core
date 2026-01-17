@@ -1,4 +1,5 @@
-/// Minimal test to debug connection timing issues
+//! Minimal test to debug connection timing issues
+
 mod common;
 
 use std::{
@@ -9,7 +10,6 @@ use std::{
 use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_stdlib::client_api::WebApi;
 use futures::FutureExt;
-use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
@@ -19,7 +19,7 @@ use common::{
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_connection_timing() -> TestResult {
+async fn test_connection_timing() -> anyhow::Result<()> {
     println!("🔧 Testing connection timing with 2 nodes");
 
     // Use unique IPs for each node to ensure unique ring locations
@@ -132,15 +132,16 @@ async fn test_connection_timing() -> TestResult {
     select! {
         r = gateway_future => {
             r?;
-            Err(anyhow::anyhow!("Gateway stopped unexpectedly").into())
+            anyhow::bail!("Gateway stopped unexpectedly");
         }
         r = node1_future => {
             r?;
-            Err(anyhow::anyhow!("Node1 stopped unexpectedly").into())
+            anyhow::bail!("Node1 stopped unexpectedly");
         }
         r = test => {
             r??;
-            Ok(())
         }
     }
+
+    Ok(())
 }

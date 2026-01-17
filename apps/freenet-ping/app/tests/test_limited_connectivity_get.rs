@@ -41,14 +41,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
-use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
@@ -63,7 +61,7 @@ use common::{
 /// This is a regression test for the bug fixed in PR #2416 where GET requests
 /// could cycle back to the originator, causing confusing failures.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
+async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<()> {
     println!("🔧 Testing GET for non-existent contract with limited connectivity");
     println!("   Network: Gateway + 1 peer (peer only connected to gateway)");
 
@@ -213,9 +211,9 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
                 let err_str = format!("{e:?}");
                 if err_str.contains("no peers to forward") && err_str.contains("no upstream") {
                     println!("❌ FAILURE: Got the cycle error that PR #2416 was supposed to fix!");
-                    return Err(anyhow!(
+                    anyhow::bail!(
                         "GET request cycled back - the bloom filter fix is not working"
-                    ));
+                    );
                 }
                 println!("✅ Got WebSocket error (not the cycle error): {e:?}");
                 println!("   Request terminated (acceptable outcome)");
@@ -238,24 +236,24 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
     select! {
         r = gateway_future => {
             match r {
-                Err(e) => return Err(anyhow!("Gateway stopped unexpectedly: {}", e).into()),
-                Ok(_) => return Err(anyhow!("Gateway stopped unexpectedly").into()),
+                Err(e) => anyhow::bail!("Gateway stopped unexpectedly: {}", e),
+                Ok(_) => anyhow::bail!("Gateway stopped unexpectedly"),
             }
         }
         r = peer_future => {
             match r {
-                Err(e) => return Err(anyhow!("Peer stopped unexpectedly: {}", e).into()),
-                Ok(_) => return Err(anyhow!("Peer stopped unexpectedly").into()),
+                Err(e) => anyhow::bail!("Peer stopped unexpectedly: {}", e),
+                Ok(_) => anyhow::bail!("Peer stopped unexpectedly"),
             }
         }
         r = test => {
             match r {
-                Err(e) => return Err(anyhow!("Test timed out: {}", e).into()),
+                Err(e) => anyhow::bail!("Test timed out: {}", e),
                 Ok(Ok(_)) => {
                     println!("Test completed successfully!");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 },
-                Ok(Err(e)) => return Err(anyhow!("Test failed: {}", e).into()),
+                Ok(Err(e)) => anyhow::bail!("Test failed: {}", e),
             }
         }
     }

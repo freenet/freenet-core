@@ -14,7 +14,6 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use rand::SeedableRng;
-use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tracing::{span, Instrument, Level};
 
@@ -192,7 +191,7 @@ async fn collect_node_diagnostics(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_node_diagnostics_query() -> TestResult {
+async fn test_node_diagnostics_query() -> anyhow::Result<()> {
     // Allocate unique IPs to avoid conflicts with parallel tests
     let base_node_idx = allocate_test_node_block(2);
     let gw_ip = test_ip_for_node(base_node_idx);
@@ -473,11 +472,11 @@ async fn test_node_diagnostics_query() -> TestResult {
     select! {
         gw = gateway_node => {
             let Err(gw) = gw;
-            return Err(anyhow!("Gateway node failed: {}", gw).into());
+            anyhow::bail!("Gateway node failed: {}", gw);
         }
         n = client_node => {
             let Err(n) = n;
-            return Err(anyhow!("Client node failed: {}", n).into());
+            anyhow::bail!("Client node failed: {}", n);
         }
         r = test => {
             r??;
@@ -490,7 +489,7 @@ async fn test_node_diagnostics_query() -> TestResult {
 // Note: This test uses unique IPs from allocate_test_node_block/test_ip_for_node
 // to avoid IP conflicts with parallel tests (issue #2220).
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_ping_multi_node() -> TestResult {
+async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Allocate unique global node indices to avoid IP conflicts with parallel tests
     // This matches the #[freenet_test] macro behavior for IP allocation
     let base_node_idx = allocate_test_node_block(3);
@@ -1193,15 +1192,15 @@ async fn test_ping_multi_node() -> TestResult {
     select! {
         gw = gateway_node => {
             let Err(gw) = gw;
-            return Err(anyhow!("Gateway node failed: {}", gw).into());
+            anyhow::bail!("Gateway node failed: {}", gw);
         }
         n1 = node1 => {
             let Err(n1) = n1;
-            return Err(anyhow!("Node 1 failed: {}", n1).into());
+            anyhow::bail!("Node 1 failed: {}", n1);
         }
         n2 = node2 => {
             let Err(n2) = n2;
-            return Err(anyhow!("Node 2 failed: {}", n2).into());
+            anyhow::bail!("Node 2 failed: {}", n2);
         }
         r = test => {
             r??;
@@ -1214,7 +1213,7 @@ async fn test_ping_multi_node() -> TestResult {
 // Note: This test uses unique IPs from allocate_test_node_block/test_ip_for_node
 // to avoid IP conflicts with parallel tests (issue #2220).
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_ping_application_loop() -> TestResult {
+async fn test_ping_application_loop() -> anyhow::Result<()> {
     // Allocate unique global node indices to avoid IP conflicts with parallel tests
     // This matches the #[freenet_test] macro behavior for IP allocation
     let base_node_idx = allocate_test_node_block(3);
@@ -1650,15 +1649,15 @@ async fn test_ping_application_loop() -> TestResult {
     select! {
         gw = gateway_node => {
             let Err(gw) = gw;
-            return Err(anyhow!("Gateway node failed: {}", gw).into());
+            anyhow::bail!("Gateway node failed: {}", gw);
         }
         n1 = node1 => {
             let Err(n1) = n1;
-            return Err(anyhow!("Node 1 failed: {}", n1).into());
+            anyhow::bail!("Node 1 failed: {}", n1);
         }
         n2 = node2 => {
             let Err(n2) = n2;
-            return Err(anyhow!("Node 2 failed: {}", n2).into());
+            anyhow::bail!("Node 2 failed: {}", n2);
         }
         r = test => {
             r??;

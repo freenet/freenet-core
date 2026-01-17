@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -14,7 +13,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
@@ -24,7 +22,7 @@ use common::{
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_small_network_get_failure() -> TestResult {
+async fn test_small_network_get_failure() -> anyhow::Result<()> {
     const NUM_GATEWAYS: usize = 1;
     const NUM_NODES: usize = 3;
 
@@ -210,7 +208,7 @@ async fn test_small_network_get_failure() -> TestResult {
             }
             Ok(Err(e)) => {
                 println!("Error receiving put response: {e:?}");
-                return Err(anyhow!("Failed to get put response - error: {}", e));
+                anyhow::bail!("Failed to get put response - error: {}", e);
             }
             Err(_) => {
                 println!("⚠️  Timeout waiting for put response after 90s");
@@ -218,7 +216,7 @@ async fn test_small_network_get_failure() -> TestResult {
                 println!("   - Network connectivity in small network topology");
                 println!("   - PUT operation propagation delays");
                 println!("   - Gateway stability under timeout conditions");
-                return Err(anyhow!("PUT operation timed out after 90 seconds"));
+                anyhow::bail!("PUT operation timed out after 90 seconds");
             }
         }
 
@@ -293,27 +291,27 @@ async fn test_small_network_get_failure() -> TestResult {
                         } else {
                             println!("❌ Node2 failed to retrieve the contract (empty state)");
                             println!("   This would have reproduced the production issue!");
-                            return Err(anyhow!("GET returned empty state"));
+                            anyhow::bail!("GET returned empty state");
                         }
                     }
                     _ => {
                         println!("❌ Node2 failed to retrieve the contract");
                         println!("   This would have reproduced the production issue!");
-                        return Err(anyhow!("GET failed"));
+                        anyhow::bail!("GET failed");
                     }
                 }
             }
             Ok(Ok(_)) => {
                 println!("Got unexpected response type");
-                return Err(anyhow!("Unexpected response type"));
+                anyhow::bail!("Unexpected response type");
             }
             Ok(Err(e)) => {
                 println!("❌ Error during get: {e}");
-                return Err(anyhow!("Get operation failed: {}", e));
+                anyhow::bail!("Get operation failed: {}", e);
             }
             Err(_) => {
                 println!("❌ Timeout waiting for get response after 45s");
-                return Err(anyhow!("Get operation timed out"));
+                anyhow::bail!("Get operation timed out");
             }
         }
 
@@ -341,20 +339,20 @@ async fn test_small_network_get_failure() -> TestResult {
                     get2_start.elapsed().as_millis()
                 );
                 if state.is_empty() {
-                    return Err(anyhow!("Second GET returned empty state"));
+                    anyhow::bail!("Second GET returned empty state");
                 }
             }
             Ok(Ok(resp)) => {
                 println!("Got unexpected response: {resp:?}");
-                return Err(anyhow!("Unexpected response type"));
+                anyhow::bail!("Unexpected response type");
             }
             Ok(Err(e)) => {
                 println!("❌ Error during second get: {e}");
-                return Err(anyhow!("Second GET operation failed: {}", e));
+                anyhow::bail!("Second GET operation failed: {}", e);
             }
             Err(_) => {
                 println!("❌ Timeout waiting for second get response after 45s");
-                return Err(anyhow!("Second GET operation timed out"));
+                anyhow::bail!("Second GET operation timed out");
             }
         }
 
@@ -365,30 +363,30 @@ async fn test_small_network_get_failure() -> TestResult {
     select! {
         r = gateway_future => {
             match r {
-                Err(e) => return Err(anyhow!("Gateway node stopped unexpectedly: {}", e).into()),
-                Ok(_) => return Err(anyhow!("Gateway node stopped unexpectedly").into()),
+                Err(e) => anyhow::bail!("Gateway node stopped unexpectedly: {}", e),
+                Ok(_) => anyhow::bail!("Gateway node stopped unexpectedly"),
             }
         }
         r = node1_future => {
             match r {
-                Err(e) => return Err(anyhow!("Node1 stopped unexpectedly: {}", e).into()),
-                Ok(_) => return Err(anyhow!("Node1 stopped unexpectedly").into()),
+                Err(e) => anyhow::bail!("Node1 stopped unexpectedly: {}", e),
+                Ok(_) => anyhow::bail!("Node1 stopped unexpectedly"),
             }
         }
         r = node2_future => {
             match r {
-                Err(e) => return Err(anyhow!("Node2 stopped unexpectedly: {}", e).into()),
-                Ok(_) => return Err(anyhow!("Node2 stopped unexpectedly").into()),
+                Err(e) => anyhow::bail!("Node2 stopped unexpectedly: {}", e),
+                Ok(_) => anyhow::bail!("Node2 stopped unexpectedly"),
             }
         }
         r = test => {
             match r {
-                Err(e) => return Err(anyhow!("Test timed out: {}", e).into()),
+                Err(e) => anyhow::bail!("Test timed out: {}", e),
                 Ok(Ok(_)) => {
                     println!("Test completed successfully!");
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 },
-                Ok(Err(e)) => return Err(anyhow!("Test failed: {}", e).into()),
+                Ok(Err(e)) => anyhow::bail!("Test failed: {}", e),
             }
         }
     }

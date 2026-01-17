@@ -198,6 +198,8 @@ pub async fn wait_for_subscribe_response(
 }
 
 // Wait for an UPDATE response with the expected key
+// Used by integration tests in tests/run_app.rs
+#[allow(dead_code)]
 pub async fn wait_for_update_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
