@@ -31,6 +31,25 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .check_partial_connectivity(connectivity_timeout, network_connection_percent)
         .await?;
 
+    // Post-connectivity stabilization: advance VirtualTime to let all nodes fully
+    // establish their ring positions before generating events. The connectivity check
+    // only ensures a percentage of nodes have at least one connection, but nodes need
+    // additional time to build their full connection set for reliable routing.
+    //
+    // This is especially important when connectivity_percent < 1.0, as the remaining
+    // nodes may still be joining. Without this stabilization, operations targeting
+    // nodes that haven't fully joined will fail.
+    let stabilization_time = Duration::from_secs(60);
+    tracing::info!(
+        "Network connectivity check passed, stabilizing for {}s",
+        stabilization_time.as_secs()
+    );
+    for _ in 0..600 {
+        simulated_network.advance_time(Duration::from_millis(100));
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     // event_chain now borrows &mut self, so we can still access simulated_network after
     // Use Option so we can drop the stream when events complete, signaling peers to disconnect
     let mut stream = Some(simulated_network.event_chain(events, None));
