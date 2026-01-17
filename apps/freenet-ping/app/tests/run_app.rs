@@ -8,7 +8,7 @@ use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{
         ClientRequest, ContractRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery,
-        QueryResponse, WebApi,
+        QueryResponse,
     },
     prelude::*,
 };
