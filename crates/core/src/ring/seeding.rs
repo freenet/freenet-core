@@ -445,13 +445,19 @@ impl SeedingManager {
     /// requests, which provides rate-limiting via exponential backoff. For very large
     /// caches (10,000+ contracts), consider adding result caching with a short TTL.
     pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
-        // Get all contracts we're seeding from the cache
-        let seeded_contracts: Vec<ContractKey> = self.seeding_cache.read().iter().collect();
+        // Get all contracts from BOTH seeding cache AND subscriptions.
+        // This ensures we recover intermediate forwarding nodes that may have been
+        // evicted from the seeding cache but still have downstream subscribers.
+        // Issue #2717: Previously only checked seeding_cache, missing orphaned
+        // intermediate nodes that had downstream peers but weren't in seeding_cache.
+        let mut contracts_to_check: HashSet<ContractKey> =
+            self.seeding_cache.read().iter().collect();
+        contracts_to_check.extend(self.subscriptions.iter().map(|e| e.key().clone()));
 
         // Filter to contracts that:
         // 1. Don't have an upstream subscription
         // 2. Have active interest (local clients, downstream peers, or subscription entry)
-        let mut result: Vec<ContractKey> = seeded_contracts
+        let mut result: Vec<ContractKey> = contracts_to_check
             .into_iter()
             .filter(|key| {
                 if self.has_upstream(key) {
@@ -1827,6 +1833,38 @@ mod tests {
             contracts.len(),
             1,
             "Should include contracts with downstream subscribers"
+        );
+        assert_eq!(contracts[0], contract);
+    }
+
+    /// Issue #2717: Test that orphaned intermediate nodes (with downstream but not in seeding_cache)
+    /// are properly recovered. This happens when a contract is evicted from seeding_cache due to
+    /// cache pressure, but the peer still has downstream subscribers waiting for updates.
+    #[test]
+    fn test_contracts_without_upstream_intermediate_not_in_seeding_cache() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let downstream = test_peer_loc(1);
+
+        // Directly add downstream subscriber WITHOUT adding to seeding_cache.
+        // This simulates an intermediate forwarding node that was evicted from cache
+        // but still has downstream peers.
+        manager
+            .add_downstream(&contract, downstream, None, None)
+            .unwrap();
+
+        // Verify contract is NOT in seeding_cache
+        assert!(
+            !manager.is_seeding_contract(&contract),
+            "Contract should NOT be in seeding cache for this test"
+        );
+
+        // But it should still be detected as needing recovery because it has downstream
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "Should detect orphan intermediate node even when not in seeding_cache"
         );
         assert_eq!(contracts[0], contract);
     }
