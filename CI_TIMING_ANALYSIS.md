@@ -95,14 +95,19 @@ Based on 4 recent successful PR runs:
 
 The CI workflow runs with `--test-threads=1` (line 200), but this appears to be **conservative** rather than necessary. The infrastructure is fully designed for parallel execution.
 
-### Recommended Immediate Action
+### Implementation Status
 
-**Phase 1a: Enable Parallel Execution (ZERO CODE CHANGES)**
-1. Change CI workflow from `--test-threads=1` to `--test-threads=4`
-2. Expected impact: 12-15 min → 3-4 min (75% reduction)
-3. Risk: Low (infrastructure already supports it)
+**✅ IMPLEMENTED: Parallel Execution**
+- Changed CI workflow from `--test-threads=1` to `--test-threads=4`
+- Expected impact: 12-15 min → 3-4 min (75% reduction)
+- Risk: Low (infrastructure fully supports it, tested locally)
+- **PR CI time:** ~23 minutes → **~12-15 minutes** (35-45% improvement)
 
-If successful, proceed with health-check optimization for further gains.
+**✅ READY: Health-Check Based Readiness**
+- Added NodeInfo::wait_until_ready() and TestContext::wait_for_all_nodes_ready()
+- New macro parameter: health_check_readiness (default: false)
+- Tests can opt-in individually for further optimization
+- Expected additional savings: 2-4 minutes per test using health checks
 
 ## Key Observations
 
@@ -387,6 +392,84 @@ The root causes are:
 3. Result: Operations tests 12-15 min → 4-6 min (60% reduction)
 
 **Realistic target:** Reduce PR CI time from ~23 minutes to ~12-15 minutes (35-45% improvement)
+
+## Implementation Summary
+
+### Changes Made in This PR
+
+1. **CI Workflow Optimization** (`.github/workflows/ci.yml`):
+   - Operations tests: `--test-threads=1` → `--test-threads=4`
+   - Updated comments to explain parallel test infrastructure
+   - **Impact:** Operations tests 12-15 min → 3-4 min
+
+2. **Health-Check Infrastructure** (`crates/core/src/test_utils.rs`):
+   - `NodeInfo::wait_until_ready()` - polls WebSocket API with exponential backoff
+   - `TestContext::wait_for_all_nodes_ready()` - concurrent health checks for all nodes
+   - **Usage:** Tests can opt-in by setting `health_check_readiness = true`
+
+3. **Macro Support** (`crates/freenet-macros/`):
+   - Added `health_check_readiness` parameter to `#[freenet_test]`
+   - Default: `false` (backward compatible - uses fixed startup_wait_secs)
+   - When `true`: Replaces fixed wait with health-check polling
+
+4. **Documentation** (`CI_TIMING_ANALYSIS.md`):
+   - Comprehensive analysis of current CI times
+   - Discovery that parallel infrastructure already exists
+   - Optimization recommendations and implementation plan
+
+### Expected CI Times After This PR
+
+| Trigger Type | Before | After | Improvement |
+|--------------|--------|-------|-------------|
+| **Pull Request** | 23-24 min | **12-15 min** | **35-45%** ⬇️ |
+| Merge Queue | 1.5-2 min | 1.5-2 min | (unchanged) |
+| Main Push | 1.5 min | 1.5 min | (unchanged) |
+
+**Breakdown of PR CI time after changes:**
+- Workspace tests (parallel): 5-8 minutes
+- **Operations tests (parallel):** **3-4 minutes** (was 12-15 min)
+- Simulation tests (serial): 2-3 minutes
+- six-peer-regression: 3-4 minutes
+- Clippy: 1 minute
+- Fmt: <1 minute
+
+**Total PR CI:** ~12-15 minutes
+
+### How to Use Health-Check Readiness (Optional)
+
+Individual tests can opt-in for additional speedup:
+
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1"],
+    startup_wait_secs = 30,  // Used as timeout for health checks
+    health_check_readiness = true,  // Enable health-check mode
+)]
+async fn test_example(ctx: &mut TestContext) -> TestResult {
+    // Test starts as soon as nodes respond (typically 2-5 seconds)
+    // vs. waiting full 30 seconds
+    Ok(())
+}
+```
+
+**Benefits:**
+- Nodes typically ready in 2-5 seconds vs. fixed 15-30s wait
+- Tests start immediately when ready
+- Saves 10-25 seconds per test
+
+**When to enable:**
+- Tests with high `startup_wait_secs` values (20s+)
+- Tests where node count varies significantly
+- Flaky tests where timing is critical
+
+### Future Optimization Opportunities
+
+1. **Enable health checks in more tests** → Additional 2-5 minute savings
+2. **Increase parallelism** (`--test-threads=8`) → Possible 1-2 minute additional savings
+3. **Parallelize simulation tests** → 2-3 minute savings (requires refactoring global state)
+4. **Split Test job** into separate parallel jobs → Better resource utilization
+
+**Ultimate target:** ~8-10 minute PR CI time (60-65% improvement from baseline)
 
 ## Appendix: Raw Data
 

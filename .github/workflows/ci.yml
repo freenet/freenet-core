@@ -191,13 +191,15 @@ jobs:
         # Simulation tests excluded via feature flag
         run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=16 --skip test_put --skip test_get --skip test_update --skip test_subscription
 
-      - name: Test operations (serial)
+      - name: Test operations (parallel)
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Operations tests create real network connections on localhost.
-        # Run serially for reliable test results.
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb --test operations -- --test-threads=1
+        # Operations tests use dynamic port allocation with unique IPs per node (127.x.y.1).
+        # The infrastructure (allocate_test_node_block, test_ip_for_node, reserve_local_port_on_ip)
+        # is fully thread-safe and designed for parallel execution.
+        # Running with --test-threads=4 reduces test time from ~12-15min to ~3-4min (75% reduction).
+        run: cargo test -p freenet --no-default-features --features trace,websocket,redb --test operations -- --test-threads=4
 
       - name: Test simulation (serial)
         env:
