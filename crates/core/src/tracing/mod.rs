@@ -3385,6 +3385,7 @@ pub enum PeerLifecycleEvent {
 
 #[cfg(feature = "trace")]
 pub mod tracer {
+    use std::io::IsTerminal;
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use tracing::level_filters::LevelFilter;
@@ -3503,12 +3504,20 @@ pub mod tracer {
         // doesn't capture stdout, making `freenet service report` unable to collect logs.
         let use_file_logging = !to_stderr && get_log_dir().is_some();
 
-        // Build filter
-        let filter_layer = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_filter.into())
-            .from_env_lossy()
-            .add_directive("stretto=off".parse().expect("infallible"))
-            .add_directive("sqlx=error".parse().expect("infallible"));
+        // Build filter (we'll create separate instances for each layer since filters are consumed)
+        fn build_filter(default_filter: LevelFilter) -> tracing_subscriber::EnvFilter {
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(default_filter.into())
+                .from_env_lossy()
+                .add_directive("stretto=off".parse().expect("infallible"))
+                .add_directive("sqlx=error".parse().expect("infallible"))
+        }
+
+        let filter_layer = build_filter(default_filter);
+
+        // Also output to console when running interactively (stdout is a terminal)
+        // This restores the expected console output while keeping file logging for diagnostic reports
+        let also_log_to_console = std::io::stdout().is_terminal();
 
         // Get rate limit from environment or use default (1000 events/sec)
         let rate_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT")
@@ -3597,9 +3606,23 @@ pub mod tracer {
                         .with_writer(error_writer.clone())
                         .with_filter(error_filter);
 
-                    let subscriber = base.with(main_layer).with(error_layer);
-                    tracing::subscriber::set_global_default(subscriber)
-                        .expect("Error setting subscriber");
+                    // Add console layer if running interactively
+                    if also_log_to_console {
+                        let console_filter = build_filter(default_filter);
+                        let console_layer = tracing_subscriber::fmt::layer()
+                            .with_level(true)
+                            .pretty()
+                            .with_filter(console_filter);
+
+                        let subscriber =
+                            base.with(main_layer).with(error_layer).with(console_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    } else {
+                        let subscriber = base.with(main_layer).with(error_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    }
                 } else {
                     // Create layers for main and error logs (typed against plain registry)
                     let main_layer = tracing_subscriber::fmt::layer()
@@ -3618,9 +3641,25 @@ pub mod tracer {
                         .with_writer(error_writer)
                         .with_filter(error_filter);
 
-                    let subscriber = Registry::default().with(main_layer).with(error_layer);
-                    tracing::subscriber::set_global_default(subscriber)
-                        .expect("Error setting subscriber");
+                    // Add console layer if running interactively
+                    if also_log_to_console {
+                        let console_filter = build_filter(default_filter);
+                        let console_layer = tracing_subscriber::fmt::layer()
+                            .with_level(true)
+                            .pretty()
+                            .with_filter(console_filter);
+
+                        let subscriber = Registry::default()
+                            .with(main_layer)
+                            .with(error_layer)
+                            .with(console_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    } else {
+                        let subscriber = Registry::default().with(main_layer).with(error_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    }
                 }
 
                 return Ok(());
