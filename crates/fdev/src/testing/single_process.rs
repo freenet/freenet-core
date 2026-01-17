@@ -174,7 +174,7 @@ async fn run_verification(
         tracing::info!(
             "Overall: {}/{} succeeded ({:.1}% success rate), {} timeouts",
             summary.total_succeeded(),
-            summary.total_completed(),
+            summary.total_completed() + summary.timeouts,
             summary.overall_success_rate() * 100.0,
             summary.timeouts
         );

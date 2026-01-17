@@ -3121,8 +3121,9 @@ impl OperationSummary {
     }
 
     /// Returns overall success rate (0.0 to 1.0).
+    /// Includes timeouts as failed operations.
     pub fn overall_success_rate(&self) -> f64 {
-        let completed = self.total_completed();
+        let completed = self.total_completed() + self.timeouts;
         if completed == 0 {
             return 1.0; // No operations completed yet
         }
