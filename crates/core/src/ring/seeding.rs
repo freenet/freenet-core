@@ -452,7 +452,7 @@ impl SeedingManager {
         // intermediate nodes that had downstream peers but weren't in seeding_cache.
         let mut contracts_to_check: HashSet<ContractKey> =
             self.seeding_cache.read().iter().collect();
-        contracts_to_check.extend(self.subscriptions.iter().map(|e| e.key().clone()));
+        contracts_to_check.extend(self.subscriptions.iter().map(|e| *e.key()));
 
         // Filter to contracts that:
         // 1. Don't have an upstream subscription
