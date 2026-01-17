@@ -60,8 +60,8 @@ async fn test_50_node_operations() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn setup_50_node_network() -> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)>
-{
+async fn setup_50_node_network(
+) -> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)> {
     println!("🔧 Setting up 50-node network...");
 
     // Generate unique IPs for all nodes
