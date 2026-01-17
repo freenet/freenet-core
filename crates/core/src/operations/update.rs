@@ -577,7 +577,7 @@ impl Operation for UpdateOp {
                     return_msg = None;
                 }
 
-                // ---- Streaming handlers (Phase 4) ----
+                // ---- Streaming handlers ----
                 UpdateMsg::RequestUpdateStreaming {
                     id,
                     stream_id,
@@ -1725,7 +1725,7 @@ mod messages {
             sender_summary_bytes: Vec<u8>,
         },
 
-        // ---- Streaming variants (Phase 4) ----
+        // ---- Streaming variants ----
         /// Streaming variant of RequestUpdate for large state updates.
         ///
         /// Used when the state size exceeds the streaming threshold (default 64KB).

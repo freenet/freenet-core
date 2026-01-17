@@ -580,7 +580,7 @@ impl Operation for PutOp {
                     }
                 }
 
-                // Phase 4: Streaming PUT request handler
+                // Streaming PUT request handler
                 PutMsg::RequestStreaming {
                     id: _msg_id,
                     stream_id,
@@ -844,7 +844,7 @@ impl Operation for PutOp {
                     }
                 }
 
-                // Phase 4: Streaming PUT response handler
+                // Streaming PUT response handler
                 PutMsg::ResponseStreaming {
                     id: _msg_id,
                     key,

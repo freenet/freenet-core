@@ -69,7 +69,6 @@ pub(crate) struct OperationResult {
 pub(crate) struct OpInitialization<Op> {
     /// The source address of the peer that sent this message.
     /// Used for sending error responses (Aborted) and as upstream_addr.
-    /// Note: Currently unused but prepared for Phase 4 of #2164.
     #[allow(dead_code)]
     pub source_addr: Option<SocketAddr>,
     pub op: Op,
@@ -337,14 +336,12 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // Streaming-related errors (Phase 3 infrastructure - will be used by streaming handlers)
+    // Streaming-related errors
     #[allow(dead_code)]
     #[error("stream timed out waiting for data")]
     StreamTimeout,
-    #[allow(dead_code)]
     #[error("stream was cancelled")]
     StreamCancelled,
-    #[allow(dead_code)]
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
 

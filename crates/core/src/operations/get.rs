@@ -1895,7 +1895,7 @@ impl Operation for GetOp {
                     }
                 }
 
-                // Phase 4: Streaming GET response handler
+                // Streaming GET response handler
                 GetMsg::ResponseStreaming {
                     id: msg_id,
                     instance_id,
@@ -2090,7 +2090,7 @@ impl Operation for GetOp {
                     }
                 }
 
-                // Phase 4: Streaming GET response acknowledgment handler
+                // Streaming GET response acknowledgment handler
                 GetMsg::ResponseStreamingAck {
                     id: msg_id,
                     stream_id,
