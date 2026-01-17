@@ -1078,7 +1078,10 @@ fn test_high_latency_timeout_regression() {
         }
 
         // Check connectivity with a longer timeout due to high latency
-        match sim.check_partial_connectivity(Duration::from_secs(60), 0.5).await {
+        match sim
+            .check_partial_connectivity(Duration::from_secs(60), 0.5)
+            .await
+        {
             Ok(()) => {
                 tracing::info!("High-latency network established connectivity");
             }
