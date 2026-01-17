@@ -1981,8 +1981,9 @@ impl SimNetwork {
             // Yield to tokio so tasks can process delivered messages
             tokio::task::yield_now().await;
 
-            // Small real-time sleep to allow task scheduling without spinning CPU
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Minimal real-time sleep to allow task scheduling without spinning CPU
+            // Reduced from 10ms to 1ms for faster simulation execution
+            tokio::time::sleep(Duration::from_millis(1)).await;
 
             // Check which nodes have connected
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
