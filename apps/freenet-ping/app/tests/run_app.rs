@@ -316,7 +316,8 @@ async fn test_node_diagnostics_query() -> TestResult {
             }))
             .await?;
 
-        match timeout(Duration::from_secs(10), client_gw.recv()).await {
+        // Use 30s timeout to handle resource contention when tests run in parallel
+        match timeout(Duration::from_secs(30), client_gw.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
                 println!("✓ Gateway diagnostics received successfully!");
 
@@ -369,7 +370,8 @@ async fn test_node_diagnostics_query() -> TestResult {
             }))
             .await?;
 
-        match timeout(Duration::from_secs(10), client_node.recv()).await {
+        // Use 30s timeout to handle resource contention when tests run in parallel
+        match timeout(Duration::from_secs(30), client_node.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
                 println!("✓ Client node diagnostics received successfully!");
 
@@ -431,7 +433,8 @@ async fn test_node_diagnostics_query() -> TestResult {
             }))
             .await?;
 
-        match timeout(Duration::from_secs(10), client_gw.recv()).await {
+        // Use 30s timeout to handle resource contention when tests run in parallel
+        match timeout(Duration::from_secs(30), client_gw.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
                 println!("✓ Full diagnostics received successfully!");
                 println!("  - Subscriptions: {}", response.subscriptions.len());
@@ -943,34 +946,31 @@ async fn test_ping_multi_node() -> TestResult {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            // Check if all nodes have all three tags
-            let has_all_tags = state_gw.contains_key(&gw_tag)
-                && state_gw.contains_key(&node1_tag)
-                && state_gw.contains_key(&node2_tag)
-                && state_node1.contains_key(&gw_tag)
-                && state_node1.contains_key(&node1_tag)
-                && state_node1.contains_key(&node2_tag)
-                && state_node2.contains_key(&gw_tag)
-                && state_node2.contains_key(&node1_tag)
-                && state_node2.contains_key(&node2_tag);
+            // Check if all nodes have all three tags with matching counts
+            let get_count = |state: &Ping, tag: &str| state.get(tag).map(|v| v.len()).unwrap_or(0);
+
+            let gw_counts = (get_count(&state_gw, &gw_tag), get_count(&state_gw, &node1_tag), get_count(&state_gw, &node2_tag));
+            let n1_counts = (get_count(&state_node1, &gw_tag), get_count(&state_node1, &node1_tag), get_count(&state_node1, &node2_tag));
+            let n2_counts = (get_count(&state_node2, &gw_tag), get_count(&state_node2, &node1_tag), get_count(&state_node2, &node2_tag));
+
+            // All nodes should have the expected count (ping_rounds) for each tag
+            let all_have_expected_counts =
+                gw_counts.0 == ping_rounds && gw_counts.1 == ping_rounds && gw_counts.2 == ping_rounds &&
+                n1_counts.0 == ping_rounds && n1_counts.1 == ping_rounds && n1_counts.2 == ping_rounds &&
+                n2_counts.0 == ping_rounds && n2_counts.1 == ping_rounds && n2_counts.2 == ping_rounds;
 
             let elapsed = propagation_start.elapsed();
             println!(
-                "Propagation check @ {:?}: GW has [{},{},{}], N1 has [{},{},{}], N2 has [{},{},{}]",
+                "Propagation check @ {:?}: GW[{},{},{}], N1[{},{},{}], N2[{},{},{}] (expected {} each)",
                 elapsed,
-                state_gw.contains_key(&gw_tag),
-                state_gw.contains_key(&node1_tag),
-                state_gw.contains_key(&node2_tag),
-                state_node1.contains_key(&gw_tag),
-                state_node1.contains_key(&node1_tag),
-                state_node1.contains_key(&node2_tag),
-                state_node2.contains_key(&gw_tag),
-                state_node2.contains_key(&node1_tag),
-                state_node2.contains_key(&node2_tag),
+                gw_counts.0, gw_counts.1, gw_counts.2,
+                n1_counts.0, n1_counts.1, n1_counts.2,
+                n2_counts.0, n2_counts.1, n2_counts.2,
+                ping_rounds
             );
 
-            if has_all_tags {
-                println!("All nodes have all tags after {:?}!", elapsed);
+            if all_have_expected_counts {
+                println!("All nodes have all {} entries per tag after {:?}!", ping_rounds, elapsed);
                 converged = true;
                 break;
             }
