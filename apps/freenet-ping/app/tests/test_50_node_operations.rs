@@ -21,7 +21,6 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use testresult::TestResult;
 use tokio::{select, time::timeout};
 
 use common::{
@@ -35,7 +34,7 @@ const CONNECTIVITY_RATIO: f64 = 0.1; // 10% connectivity to reduce network load
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "large scale test - run manually"]
-async fn test_50_node_operations() -> TestResult {
+async fn test_50_node_operations() -> anyhow::Result<()> {
     println!("🚀 Starting 50-node operations test");
     println!("   Gateway nodes: {NUM_GATEWAYS}");
     println!("   Regular nodes: {NUM_REGULAR_NODES}");
@@ -61,7 +60,7 @@ async fn test_50_node_operations() -> TestResult {
     Ok(())
 }
 
-async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)>
+async fn setup_50_node_network() -> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)>
 {
     println!("🔧 Setting up 50-node network...");
 
@@ -296,7 +295,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             (result, _index, remaining) = select_all_futures => {
                 match result {
                     Err(err) => {
-                        return Err(anyhow!("Node failed: {}", err).into());
+                        anyhow::bail!("Node failed: {}", err);
                     }
                     Ok(_) => {
                         all_futures = remaining;
@@ -314,14 +313,14 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         }
     }
 
-    Err(anyhow!("Network setup failed").into())
+    anyhow::bail!("Network setup failed")
 }
 
 async fn test_put_propagation(
     gateway_clients: &mut [WebApi],
     contract_key: &ContractKey,
     wrapped_state: &WrappedState,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n📤 Testing PUT propagation...");
 
     let start_time = std::time::Instant::now();
@@ -365,7 +364,7 @@ async fn test_put_propagation(
             },
             Err(e) => {
                 println!("   ⚠️  Gateway {i} send failed: {e}");
-                last_error = Some(e.into());
+                last_error = Some(anyhow::anyhow!("Gateway {} send failed: {}", i, e));
             }
         }
 
@@ -374,9 +373,7 @@ async fn test_put_propagation(
     }
 
     if !put_success {
-        return Err(last_error
-            .unwrap_or_else(|| anyhow!("All gateways failed"))
-            .into());
+        return Err(last_error.unwrap_or_else(|| anyhow!("All gateways failed")));
     }
 
     let put_time = start_time.elapsed();
@@ -392,7 +389,7 @@ async fn test_put_propagation(
 async fn test_concurrent_gets(
     node_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n📥 Testing concurrent GET operations...");
 
     let concurrent_requests = std::cmp::min(10, node_clients.len());
@@ -470,7 +467,7 @@ async fn test_concurrent_gets(
     println!("      - Max response time: {max_time:?}");
 
     if success_rate < 70.0 {
-        return Err(anyhow!("Sequential GET success rate too low: {:.1}%", success_rate).into());
+        anyhow::bail!("Sequential GET success rate too low: {:.1}%", success_rate);
     }
 
     println!("   ✅ Sequential GET test completed");
@@ -481,7 +478,7 @@ async fn test_mass_subscription(
     node_clients: &mut [WebApi],
     _gateway_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n🔔 Testing mass subscription operations...");
 
     let subscribers = std::cmp::min(15, node_clients.len());
@@ -536,11 +533,10 @@ async fn test_mass_subscription(
     println!("      - Subscription time: {subscription_time:?}");
 
     if subscription_rate < 75.0 {
-        return Err(anyhow!(
+        anyhow::bail!(
             "Mass subscription success rate too low: {:.1}%",
             subscription_rate
-        )
-        .into());
+        );
     }
 
     // Wait a bit for subscriptions to stabilize
@@ -553,7 +549,7 @@ async fn test_mass_subscription(
 async fn test_update_propagation(
     node_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n🔄 Testing UPDATE propagation...");
 
     // Create updated ping state
@@ -590,13 +586,13 @@ async fn test_update_propagation(
         }
         Ok(Ok(response)) => {
             println!("   ❌ Unexpected update response: {response:?}");
-            return Err(anyhow!("Unexpected update response").into());
+            anyhow::bail!("Unexpected update response");
         }
         Ok(Err(e)) => {
-            return Err(anyhow!("Update error: {}", e).into());
+            anyhow::bail!("Update error: {}", e);
         }
         Err(_) => {
-            return Err(anyhow!("Update request timed out").into());
+            anyhow::bail!("Update request timed out");
         }
     }
 
