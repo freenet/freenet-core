@@ -1000,7 +1000,28 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     let Some(res): GwOngoingConnectionResult<S, T> = gw_connection_handshake else {
                         unreachable!("gw_connection_tasks.next() should only return None if empty, which is guarded");
                     };
-                    match res.expect("task shouldn't panic") {
+                    // Issue #2725: Handle JoinError properly - tasks can be cancelled during
+                    // shutdown or cleanup, not just panic. Cancellation is expected behavior
+                    // and should not crash the handler.
+                    let task_result = match res {
+                        Ok(inner) => inner,
+                        Err(join_error) => {
+                            if join_error.is_cancelled() {
+                                tracing::debug!(
+                                    direction = "inbound",
+                                    "Gateway connection task was cancelled"
+                                );
+                            } else {
+                                // Task panicked - log but don't propagate to avoid crashing handler
+                                tracing::error!(
+                                    direction = "inbound",
+                                    "Gateway connection task panicked: {join_error}"
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    match task_result {
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
                             let sent_tracker = outbound_remote_conn.sent_tracker.clone();
@@ -1073,7 +1094,28 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     let Some(res): OngoingConnectionResult<S, T> = connection_handshake else {
                         unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
                     };
-                    match res.expect("task shouldn't panic") {
+                    // Issue #2725: Handle JoinError properly - tasks can be cancelled during
+                    // shutdown or cleanup, not just panic. Cancellation is expected behavior
+                    // and should not crash the handler.
+                    let task_result = match res {
+                        Ok(inner) => inner,
+                        Err(join_error) => {
+                            if join_error.is_cancelled() {
+                                tracing::debug!(
+                                    direction = "outbound",
+                                    "Connection task was cancelled"
+                                );
+                            } else {
+                                // Task panicked - log but don't propagate to avoid crashing handler
+                                tracing::error!(
+                                    direction = "outbound",
+                                    "Connection task panicked: {join_error}"
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    match task_result {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
                                 if self
