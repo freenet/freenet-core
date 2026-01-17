@@ -2,7 +2,7 @@ use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
-pub(crate) use self::messages::UpdateMsg;
+pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
@@ -573,6 +573,319 @@ impl Operation for UpdateOp {
                         target_count = broadcast_to.len(),
                         "Received deprecated Broadcasting message - ignoring (propagation is automatic)"
                     );
+                    new_state = None;
+                    return_msg = None;
+                }
+
+                // ---- Streaming handlers (Phase 4) ----
+                UpdateMsg::RequestUpdateStreaming {
+                    id,
+                    stream_id,
+                    key,
+                    total_size,
+                } => {
+                    use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
+
+                    tracing::info!(
+                        tx = %id,
+                        contract = %key,
+                        stream_id = %stream_id,
+                        total_size,
+                        "Processing UPDATE RequestUpdateStreaming"
+                    );
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry for UPDATE"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                assembled_size = data.len(),
+                                expected_size = total_size,
+                                "Stream assembled for UPDATE"
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream for UPDATE"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    // Step 3: Deserialize the streaming payload
+                    let payload: UpdateStreamingPayload = match bincode::deserialize(&stream_data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                error = %e,
+                                "Failed to deserialize UpdateStreamingPayload"
+                            );
+                            return Err(OpError::invalid_transition(self.id));
+                        }
+                    };
+
+                    let UpdateStreamingPayload {
+                        related_contracts,
+                        value,
+                    } = payload;
+
+                    // Step 4: Apply the update (same logic as RequestUpdate)
+                    let self_location = op_manager.ring.connection_manager.own_location();
+                    let executing_addr = self_location.socket_addr();
+
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        executing_peer = ?executing_addr,
+                        request_sender = ?source_addr,
+                        "UPDATE RequestUpdateStreaming: applying update"
+                    );
+
+                    // Update contract locally
+                    let UpdateExecution {
+                        value: updated_value,
+                        summary,
+                        changed,
+                        ..
+                    } = update_contract(
+                        op_manager,
+                        *key,
+                        UpdateData::State(State::from(value.clone())),
+                        related_contracts.clone(),
+                    )
+                    .await?;
+
+                    // Emit telemetry
+                    let hash_after = Some(state_hash_full(&updated_value));
+                    if let Some(sender_addr) = source_addr {
+                        if let Some(requester_pkl) = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_by_addr(sender_addr)
+                        {
+                            if let Some(event) = NetEventLog::update_success(
+                                id,
+                                &op_manager.ring,
+                                *key,
+                                requester_pkl,
+                                None, // No before hash for streaming
+                                hash_after.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                        }
+                    }
+
+                    if !changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "UPDATE streaming yielded no state change"
+                        );
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "UPDATE streaming succeeded, state changed"
+                        );
+                    }
+
+                    // Network propagation is automatic via BroadcastStateChange
+                    if self.upstream_addr.is_none() {
+                        new_state = Some(UpdateState::Finished {
+                            key: *key,
+                            summary: summary.clone(),
+                        });
+                    } else {
+                        new_state = None;
+                    }
+                    return_msg = None;
+                }
+
+                UpdateMsg::BroadcastToStreaming {
+                    id,
+                    stream_id,
+                    key,
+                    total_size,
+                } => {
+                    use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
+
+                    let sender_addr =
+                        source_addr.expect("BroadcastToStreaming requires source_addr");
+
+                    tracing::info!(
+                        tx = %id,
+                        contract = %key,
+                        stream_id = %stream_id,
+                        total_size,
+                        sender = %sender_addr,
+                        "Processing UPDATE BroadcastToStreaming"
+                    );
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry for broadcast"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                assembled_size = data.len(),
+                                expected_size = total_size,
+                                "Stream assembled for broadcast"
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream for broadcast"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    // Step 3: Deserialize the broadcast streaming payload
+                    let payload: BroadcastStreamingPayload =
+                        match bincode::deserialize(&stream_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(
+                                    tx = %id,
+                                    error = %e,
+                                    "Failed to deserialize BroadcastStreamingPayload"
+                                );
+                                return Err(OpError::invalid_transition(self.id));
+                            }
+                        };
+
+                    let BroadcastStreamingPayload {
+                        state_bytes,
+                        sender_summary_bytes,
+                    } = payload;
+
+                    // Step 4: Apply the update (same logic as BroadcastTo with FullState)
+                    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
+
+                    // Update sender's cached summary in our interest manager
+                    if let Some(sender_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                        op_manager.interest_manager.update_peer_summary(
+                            key,
+                            &sender_key,
+                            Some(sender_summary.clone()),
+                        );
+                    }
+
+                    let update_data = UpdateData::State(State::from(state_bytes.clone()));
+
+                    // For telemetry
+                    let state_for_telemetry = WrappedState::from(state_bytes.clone());
+
+                    // Emit telemetry: broadcast received from upstream peer
+                    if let Some(requester_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        if let Some(event) = NetEventLog::update_broadcast_received(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            requester_pkl,
+                            state_for_telemetry.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+                    }
+
+                    tracing::debug!("Attempting contract value update - BroadcastToStreaming");
+                    let UpdateExecution {
+                        value: updated_value,
+                        summary: _summary,
+                        changed,
+                        ..
+                    } = update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                        .await?;
+
+                    tracing::debug!("Contract successfully updated - BroadcastToStreaming");
+
+                    // Refresh GET subscription cache TTL
+                    op_manager.ring.touch_get_subscription(key);
+
+                    // Emit telemetry: broadcast applied
+                    if let Some(event) = NetEventLog::update_broadcast_applied(
+                        id,
+                        &op_manager.ring,
+                        *key,
+                        &state_for_telemetry,
+                        &updated_value,
+                        changed,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
+                    if !changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "BroadcastToStreaming update produced no change"
+                        );
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "Successfully updated contract via BroadcastToStreaming"
+                        );
+                    }
+
+                    // Network peer propagation is automatic via BroadcastStateChange
                     new_state = None;
                     return_msg = None;
                 }
@@ -1350,7 +1663,31 @@ mod messages {
     use crate::{
         message::{InnerMessage, Transaction},
         ring::{Location, PeerKeyLocation},
+        transport::peer_connection::StreamId,
     };
+
+    /// Payload for streaming UPDATE requests.
+    ///
+    /// Contains the same data as RequestUpdate but serialized for streaming.
+    /// The metadata (key, stream_id, total_size) is sent via RequestUpdateStreaming message.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct UpdateStreamingPayload {
+        #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+        pub related_contracts: RelatedContracts<'static>,
+        pub value: WrappedState,
+    }
+
+    /// Payload for streaming broadcast updates.
+    ///
+    /// Contains full state for broadcasting to subscribers via streaming.
+    /// Used when the full state is large (>streaming_threshold).
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct BroadcastStreamingPayload {
+        /// Full contract state bytes
+        pub state_bytes: Vec<u8>,
+        /// Sender's current state summary bytes
+        pub sender_summary_bytes: Vec<u8>,
+    }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     /// Update operation messages.
@@ -1387,6 +1724,35 @@ mod messages {
             /// Use `StateSummary::from(sender_summary_bytes.clone())` to convert.
             sender_summary_bytes: Vec<u8>,
         },
+
+        // ---- Streaming variants (Phase 4) ----
+        /// Streaming variant of RequestUpdate for large state updates.
+        ///
+        /// Used when the state size exceeds the streaming threshold (default 64KB).
+        /// The actual state data is sent via a separate stream identified by stream_id.
+        RequestUpdateStreaming {
+            id: Transaction,
+            /// Identifies the stream carrying the update payload
+            stream_id: StreamId,
+            /// Contract key being updated
+            key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+        },
+
+        /// Streaming variant of BroadcastTo for large full state broadcasts.
+        ///
+        /// Used when broadcasting full state (not delta) and the state size exceeds
+        /// the streaming threshold. Deltas are typically small and use regular BroadcastTo.
+        BroadcastToStreaming {
+            id: Transaction,
+            /// Identifies the stream carrying the broadcast payload
+            stream_id: StreamId,
+            /// Contract key being broadcast
+            key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+        },
     }
 
     impl InnerMessage for UpdateMsg {
@@ -1394,7 +1760,9 @@ mod messages {
             match self {
                 UpdateMsg::RequestUpdate { id, .. }
                 | UpdateMsg::Broadcasting { id, .. }
-                | UpdateMsg::BroadcastTo { id, .. } => id,
+                | UpdateMsg::BroadcastTo { id, .. }
+                | UpdateMsg::RequestUpdateStreaming { id, .. }
+                | UpdateMsg::BroadcastToStreaming { id, .. } => id,
             }
         }
 
@@ -1402,7 +1770,9 @@ mod messages {
             match self {
                 UpdateMsg::RequestUpdate { key, .. }
                 | UpdateMsg::Broadcasting { key, .. }
-                | UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
+                | UpdateMsg::BroadcastTo { key, .. }
+                | UpdateMsg::RequestUpdateStreaming { key, .. }
+                | UpdateMsg::BroadcastToStreaming { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -1413,6 +1783,12 @@ mod messages {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
                 UpdateMsg::Broadcasting { id, .. } => write!(f, "Broadcasting(id: {id})"),
                 UpdateMsg::BroadcastTo { id, .. } => write!(f, "BroadcastTo(id: {id})"),
+                UpdateMsg::RequestUpdateStreaming { id, stream_id, .. } => {
+                    write!(f, "RequestUpdateStreaming(id: {id}, stream: {stream_id})")
+                }
+                UpdateMsg::BroadcastToStreaming { id, stream_id, .. } => {
+                    write!(f, "BroadcastToStreaming(id: {id}, stream: {stream_id})")
+                }
             }
         }
     }
