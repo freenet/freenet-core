@@ -1657,6 +1657,7 @@ use rand::{Rng, RngCore, SeedableRng};
 
 /// Global seed for deterministic simulation.
 /// Set this before any RNG operations to ensure reproducibility.
+/// Note: For test isolation, prefer using set_seed() which sets the thread-local seed.
 static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Counter for deterministic thread indexing.
@@ -1664,11 +1665,14 @@ static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::n
 static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Thread-local seeded RNG for deterministic operations.
-// Each thread gets its own RNG seeded from the global seed + deterministic thread index.
+// Each thread gets its own RNG seeded from the seed + deterministic thread index.
 std::thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
     // Deterministic thread index assigned at first RNG access
     static THREAD_INDEX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    // Thread-local seed for test isolation. When set, takes precedence over SIMULATION_SEED.
+    // This prevents parallel tests from interfering with each other's RNG sequences.
+    static THREAD_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Global RNG abstraction for deterministic simulation testing.
@@ -1741,40 +1745,50 @@ impl GlobalRng {
     /// Call this at test/simulation startup for reproducibility.
     /// Must call `clear_seed()` when done to avoid affecting other tests.
     pub fn set_seed(seed: u64) {
-        // Reset thread index counter first so threads get fresh indices
-        Self::reset_thread_index_counter();
+        // Set thread-local seed for test isolation. This prevents parallel tests from
+        // interfering with each other's RNG sequences.
+        // See: https://github.com/freenet/freenet-core/issues/2733
+        THREAD_SEED.with(|s| s.set(Some(seed)));
+        // Also set global seed for code that spawns new threads (they'll inherit the seed)
         *SIMULATION_SEED.lock() = Some(seed);
-        // Clear thread-local RNG and index so it gets re-seeded with fresh index
+        // Clear thread-local RNG so it gets re-seeded with the new seed
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        THREAD_INDEX.with(|idx| {
-            idx.set(None);
-        });
+        // NOTE: We intentionally do NOT reset THREAD_INDEX_COUNTER or clear THREAD_INDEX.
+        // Thread indices remain stable across set_seed() calls to ensure determinism.
     }
 
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
+        // Clear thread-local seed
+        THREAD_SEED.with(|s| s.set(None));
+        // Clear global seed
         *SIMULATION_SEED.lock() = None;
+        // Clear thread-local RNG
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        THREAD_INDEX.with(|idx| {
-            idx.set(None);
-        });
-        // Reset thread index counter for next simulation
-        Self::reset_thread_index_counter();
+        // NOTE: We do NOT reset THREAD_INDEX_COUNTER here to avoid race conditions
+        // with parallel tests. Thread indices remain stable. See set_seed() for details.
     }
 
     /// Resets the thread index counter for deterministic simulation.
-    /// This should be called between simulation runs to ensure reproducibility.
+    ///
+    /// **Warning:** This function should NOT be called in parallel test environments.
+    /// Resetting the global counter while other tests are running causes race conditions
+    /// that break determinism. See issue #2733 for details.
+    ///
+    /// This is only safe to call when you have exclusive control over all threads
+    /// using GlobalRng (e.g., single-threaded tests with `--test-threads=1`).
     pub fn reset_thread_index_counter() {
         THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Returns true if a simulation seed is set.
+    /// Returns true if a simulation seed is set (either thread-local or global).
     pub fn is_seeded() -> bool {
-        SIMULATION_SEED.lock().is_some()
+        // Check thread-local seed first, then global
+        THREAD_SEED.with(|s| s.get()).is_some() || SIMULATION_SEED.lock().is_some()
     }
 
     /// Creates a RAII guard that sets the seed and clears it on drop.
@@ -1817,13 +1831,19 @@ impl GlobalRng {
     }
 
     /// Executes a closure with access to the global RNG.
-    /// Uses seeded RNG if set, otherwise system RNG.
+    /// Uses seeded RNG if set (thread-local or global), otherwise system RNG.
     #[inline]
     pub fn with_rng<F, R>(f: F) -> R
     where
         F: FnOnce(&mut dyn RngCore) -> R,
     {
-        if let Some(seed) = *SIMULATION_SEED.lock() {
+        // Check thread-local seed first for test isolation, then fall back to global seed.
+        // This prevents parallel tests from interfering with each other's RNG sequences.
+        let seed = THREAD_SEED
+            .with(|s| s.get())
+            .or_else(|| *SIMULATION_SEED.lock());
+
+        if let Some(seed) = seed {
             // Simulation mode: use thread-local seeded RNG
             THREAD_RNG.with(|rng_cell| {
                 let mut rng_ref = rng_cell.borrow_mut();
