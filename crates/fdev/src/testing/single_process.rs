@@ -28,7 +28,8 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         network_connection_percent * 100.0
     );
     simulated_network
-        .check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
+        .check_partial_connectivity(connectivity_timeout, network_connection_percent)
+        .await?;
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
     // Use Option so we can drop the stream when events complete, signaling peers to disconnect

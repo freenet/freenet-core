@@ -1935,26 +1935,56 @@ impl SimNetwork {
 
     /// Checks that all peers in the network have acquired at least one connection to any
     /// other peers.
-    pub fn check_connectivity(&self, time_out: Duration) -> anyhow::Result<()> {
-        self.connectivity(time_out, 1.0)
+    ///
+    /// This function advances VirtualTime to allow connection messages to be delivered.
+    pub async fn check_connectivity(&mut self, time_out: Duration) -> anyhow::Result<()> {
+        self.connectivity(time_out, 1.0).await
     }
 
     /// Checks that a percentage (given as a float between 0 and 1) of the nodes has at least
     /// one connection to any other peers.
-    pub fn check_partial_connectivity(
-        &self,
+    ///
+    /// This function advances VirtualTime to allow connection messages to be delivered.
+    pub async fn check_partial_connectivity(
+        &mut self,
         time_out: Duration,
         percent: f64,
     ) -> anyhow::Result<()> {
-        self.connectivity(time_out, percent)
+        self.connectivity(time_out, percent).await
     }
 
-    fn connectivity(&self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
+    /// Internal connectivity check that advances VirtualTime.
+    ///
+    /// Issue #2725: The previous implementation used std::time::Instant (real wall-clock time)
+    /// but never advanced VirtualTime. Since simulations use VirtualTime for deterministic
+    /// message delivery, connection handshake messages were never delivered, causing all
+    /// connectivity checks to fail with "found disconnected nodes".
+    ///
+    /// This implementation advances VirtualTime in small steps while checking connectivity,
+    /// allowing connection messages to be delivered and processed.
+    async fn connectivity(&mut self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
         let num_nodes = self.number_of_nodes;
         let mut connected = HashSet::new();
         let elapsed = std::time::Instant::now();
+
+        // Time step for advancing VirtualTime - small enough for responsiveness,
+        // large enough to batch message delivery efficiently
+        let time_step = Duration::from_millis(100);
+
         while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
         {
+            // Advance VirtualTime to trigger message delivery
+            // This is critical for VirtualTime-based simulations where messages
+            // are scheduled for delivery at VirtualTime + latency
+            self.advance_time(time_step);
+
+            // Yield to tokio so tasks can process delivered messages
+            tokio::task::yield_now().await;
+
+            // Small real-time sleep to allow task scheduling without spinning CPU
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Check which nodes have connected
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
                 if !connected.contains(&node)
                     && self.is_connected(&NodeLabel::node(&self.name, node))
