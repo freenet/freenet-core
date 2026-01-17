@@ -1195,10 +1195,13 @@ impl NodeInfo {
     /// let ready_time = node.wait_until_ready(Duration::from_secs(30)).await?;
     /// tracing::info!("Node ready in {:?}", ready_time);
     /// ```
-    pub async fn wait_until_ready(&self, timeout: std::time::Duration) -> anyhow::Result<std::time::Duration> {
+    pub async fn wait_until_ready(
+        &self,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<std::time::Duration> {
+        use freenet_stdlib::client_api::{ClientRequest, NodeDiagnosticsConfig, NodeQuery, WebApi};
         use std::time::Instant;
         use tokio::time::sleep;
-        use freenet_stdlib::client_api::{ClientRequest, NodeQuery, NodeDiagnosticsConfig, WebApi};
 
         let start = Instant::now();
         let mut attempt = 0;
@@ -1218,20 +1221,30 @@ impl NodeInfo {
             // Try to connect and send a simple diagnostics request
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                tokio_tungstenite::connect_async(&self.ws_url())
-            ).await {
+                tokio_tungstenite::connect_async(&self.ws_url()),
+            )
+            .await
+            {
                 Ok(Ok((stream, _))) => {
                     // Connected! Try to send a ping-like request
                     let mut client = WebApi::start(stream);
 
                     // Send a minimal diagnostics request
-                    if let Ok(_) = client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
-                        config: NodeDiagnosticsConfig {
-                            log_path: None,
-                            start_time: None,
-                            end_time: None,
-                        },
-                    })).await {
+                    if client
+                        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                            config: NodeDiagnosticsConfig {
+                                include_node_info: false,
+                                include_network_info: false,
+                                include_subscriptions: false,
+                                contract_keys: vec![],
+                                include_system_metrics: false,
+                                include_detailed_peer_info: false,
+                                include_subscriber_peer_ids: false,
+                            },
+                        }))
+                        .await
+                        .is_ok()
+                    {
                         // Node is ready!
                         tracing::debug!(
                             "Node '{}' ready after {:?} ({} attempts)",
@@ -1789,18 +1802,21 @@ impl TestContext {
         let start = Instant::now();
         let mut failed_nodes = Vec::new();
 
-        tracing::info!("Waiting for {} nodes to become ready...", self.node_order.len());
+        tracing::info!(
+            "Waiting for {} nodes to become ready...",
+            self.node_order.len()
+        );
 
         // Wait for all nodes concurrently using join_all for better performance
-        let results: Vec<_> = futures::future::join_all(
-            self.node_order.iter().map(|label| async move {
+        let results: Vec<_> =
+            futures::future::join_all(self.node_order.iter().map(|label| async move {
                 let node = self.nodes.get(label).unwrap();
                 match node.wait_until_ready(timeout_per_node).await {
                     Ok(duration) => Ok((label.clone(), duration)),
                     Err(e) => Err((label.clone(), e)),
                 }
-            })
-        ).await;
+            }))
+            .await;
 
         for result in results {
             match result {

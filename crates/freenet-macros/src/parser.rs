@@ -55,7 +55,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut auto_connect_peers = true;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
-        let mut health_check_readiness = false;  // Default to false for backward compatibility
+        let mut health_check_readiness = false; // Default to false for backward compatibility
         let mut aggregate_events = AggregateEventsMode::OnFailure;
         let mut log_level = "freenet=debug,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
