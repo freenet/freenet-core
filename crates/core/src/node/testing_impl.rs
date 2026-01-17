@@ -2388,7 +2388,7 @@ impl SimNetwork {
 
         for log in logs.iter() {
             if let crate::tracing::EventKind::Subscribe(
-                crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. }
+                crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
             ) = &log.kind
             {
                 subscribed_contracts.insert(format!("{:?}", key));
