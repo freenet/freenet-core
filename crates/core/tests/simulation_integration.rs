@@ -1508,9 +1508,8 @@ async fn test_topology_single_seeder() {
 ///
 /// ## Manual run
 /// ```bash
-/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720 -- --ignored
+/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720
 /// ```
-#[ignore] // Enable once Issue #2720 (bidirectional subscriptions) is fixed
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_bidirectional_cycle_issue_2720() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
@@ -1595,8 +1594,11 @@ async fn test_bidirectional_cycle_issue_2720() {
     assert_eq!(event, Some(2), "Should trigger second subscribe event");
     let_network_run_for_topology(&mut sim, Duration::from_secs(3)).await;
 
-    // Wait for topology registration
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for periodic orphan recovery to fix any disconnected upstream seeders.
+    // The recovery runs every 30 seconds, so we wait 35 seconds to ensure it triggers.
+    // This validates Issue #2741: when set_upstream fails due to circular reference,
+    // the backoff mechanism + periodic recovery will eventually establish a valid topology.
+    let_network_run_for_topology(&mut sim, Duration::from_secs(35)).await;
 
     // Get topology snapshots
     let snapshots = sim.get_topology_snapshots();
