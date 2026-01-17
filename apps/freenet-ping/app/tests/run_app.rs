@@ -728,7 +728,7 @@ async fn test_ping_multi_node() -> TestResult {
         let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
-        // Step 1: Gateway node puts the contrac
+        // Step 1: Gateway node puts the contract
         println!("Gateway node putting contract...");
         let wrapped_state = {
             let ping = Ping::default();
@@ -751,7 +751,7 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         println!("Gateway: put ping contract successfully! key={key}");
 
-        // Step 2: Node 1 gets the contrac
+        // Step 2: Node 1 gets the contract
         println!("Node 1 getting contract...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -767,7 +767,7 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         println!("Node 1: got contract with {} entries", node1_state.len());
 
-        // Step 3: Node 2 gets the contrac
+        // Step 3: Node 2 gets the contract
         println!("Node 2 getting contract...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -909,9 +909,7 @@ async fn test_ping_multi_node() -> TestResult {
         let mut converged = false;
 
         while propagation_start.elapsed() < propagation_timeout {
-            // Query state from all nodes sequentially (send then receive for each)
-            // to avoid overwhelming the client's internal channel buffer
-            eprintln!("[DEBUG] Sending GET request to gateway...");
+            // Query state from all nodes sequentially to avoid overwhelming the channel buffer
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
                     key: *contract_key.id(),
@@ -919,11 +917,9 @@ async fn test_ping_multi_node() -> TestResult {
                     subscribe: false,
                 }))
                 .await?;
-            eprintln!("[DEBUG] GET request sent to gateway, now waiting for response...");
             let state_gw = wait_for_get_response(&mut client_gw, &contract_key)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            eprintln!("[DEBUG] Gateway GET response received with {} entries", state_gw.len());
 
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -1439,7 +1435,7 @@ async fn test_ping_application_loop() -> TestResult {
         let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
-        // Step 1: Gateway node puts the contrac
+        // Step 1: Gateway node puts the contract
         println!("Gateway node putting contract...");
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
@@ -1460,7 +1456,7 @@ async fn test_ping_application_loop() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         println!("Gateway: put ping contract successfully! key={key}");
 
-        // Step 2: Node 1 gets the contrac
+        // Step 2: Node 1 gets the contract
         println!("Node 1 getting contract...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -1476,7 +1472,7 @@ async fn test_ping_application_loop() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         println!("Node 1: got contract with {} entries", node1_state.len());
 
-        // Step 3: Node 2 gets the contrac
+        // Step 3: Node 2 gets the contract
         println!("Node 2 getting contract...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -1492,7 +1488,7 @@ async fn test_ping_application_loop() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         println!("Node 2: got contract with {} entries", node2_state.len());
 
-        // Step 4: Subscribe all clients to the contrac
+        // Step 4: Subscribe all clients to the contract
         // Gateway subscribes
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
