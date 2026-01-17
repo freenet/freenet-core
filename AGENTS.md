@@ -331,6 +331,39 @@ This explains the constraint (joiner doesn't know its address), the rejected app
 
 After creating a PR with `gh pr create`, **immediately review the description** and ask yourself: "Could someone understand why these changes are necessary without reading the issue or digging through code?" If not, use `gh pr edit <number> --body "..."` to improve it before requesting review.
 
+## AI Agent Skills
+
+This repository is configured to use [freenet-agent-skills](https://github.com/freenet/freenet-agent-skills) which provides specialized skills for Freenet development:
+
+- **dapp-builder** – Building decentralized applications (contracts, delegates, UI)
+- **pr-creation** – PR guidelines and multi-perspective review methodology
+- **systematic-debugging** – Hypothesis-driven debugging for complex issues
+
+### Claude Code
+
+Skills are automatically available via the marketplace. When you trust this repository, Claude Code will prompt to install the `freenet-agent-skills` marketplace with plugins enabled.
+
+Configuration: `.claude/settings.json`
+
+### OpenCode
+
+The `opencode.json` configures the `opencode-agent-skills` plugin for skill discovery and pre-approves freenet skills. However, skills must be installed locally:
+
+```bash
+# Option 1: Using openskills CLI
+npm i -g openskills
+openskills install freenet/freenet-agent-skills
+openskills sync
+
+# Option 2: Manual clone
+git clone https://github.com/freenet/freenet-agent-skills ~/.opencode/skills/freenet
+# Then symlink individual skills to ~/.opencode/skills/
+```
+
+Configuration: `opencode.json`
+
+> **Note:** Once freenet-agent-skills is published as an npm package, OpenCode users will simply add `"freenet-agent-skills"` to their plugins array and skills will load automatically.
+
 ## Additional Resources
 - `PRE_COMMIT_HOOK_GUIDE.md` – configures local linting hooks.
 - `README.md` – high-level introduction and build instructions.
