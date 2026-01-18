@@ -67,7 +67,7 @@ async fn example_simulation_test() {
     }
 
     // Wait for connectivity
-    sim.check_partial_connectivity(Duration::from_secs(30), 0.8)
+    sim.check_partial_connectivity(Duration::from_secs(30), 0.8).await
         .expect("Network should connect");
 
     // Generate events

@@ -439,17 +439,20 @@ fn event_summary_format() {
 cargo insta review  # Interactive review of snapshot changes
 ```
 
-#### Deterministic Simulation (Future)
+#### Deterministic Simulation (Future Enhancement)
 
-**Current limitation:** Multi-threaded tokio causes non-deterministic task ordering.
+**Current state:**
+- Multi-threaded tokio causes non-deterministic task ordering
+- The `#[freenet_test]` macro does NOT currently support `start_paused` parameter
+- For deterministic simulation, use `SimNetwork` with VirtualTime (see `simulation-testing.md`)
 
-**Short-term improvement (low effort):**
+**Proposed short-term improvement (not yet implemented):**
 ```rust
-// Add to #[freenet_test] macro options
+// FUTURE: Proposed addition to #[freenet_test] macro options
 #[freenet_test(
     nodes = ["gateway", "peer-1"],
     tokio_flavor = "current_thread",
-    start_paused = true  // NEW: Enable time control
+    start_paused = true  // PROPOSED: Enable time control
 )]
 async fn deterministic_test(ctx: &mut TestContext) -> TestResult {
     // Time only advances explicitly
@@ -457,6 +460,8 @@ async fn deterministic_test(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 ```
+
+**Note:** Until this is implemented, use raw `#[tokio::test(start_paused = true)]` for simple tokio time control, or `SimNetwork` for full deterministic simulation with Turmoil.
 
 **Long-term improvement (high effort):** FoundationDB-style deterministic executor.
 
@@ -547,11 +552,11 @@ assert!(is_linearizable(&history, &contract_model));
 | Add snapshot tests for API responses | 1 day | Regression protection |
 | Extend proptest to ring/location | 2 days | Algorithm correctness |
 
-#### Phase 2: Medium-term (1-2 months)
+#### Phase 2: Medium-term (Future Work)
 
 | Action | Effort | Impact |
 |--------|--------|--------|
-| Add `start_paused = true` to macro | 3 days | Better determinism |
+| Add `start_paused` support to `#[freenet_test]` macro | 3 days | Better determinism for integration tests |
 | Proptest for operation sequences | 1 week | Protocol correctness |
 | Benchmark regression in CI | 3 days | Performance protection |
 | Chaos engineering in test-network | 1 week | Resilience validation |
@@ -672,9 +677,10 @@ let ws_url = network.gateway(0).ws_url();
    - Add endpoint coverage for all v1 handlers
    - Test error responses
 
-3. **Add single-threaded mode to macro**
+3. **Add time control to macro** (Future Work)
    - `tokio_flavor = "current_thread"` already supported
-   - Add `start_paused = true` for time control
+   - Proposed: Add `start_paused = true` parameter for deterministic time control
+   - Note: Currently use `SimNetwork` with VirtualTime for full determinism
 
 ### Medium-term Improvements
 

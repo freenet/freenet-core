@@ -132,7 +132,7 @@ cargo clippy --all-targets --all-features
 Run these in any worktree before pushing a branch or opening a PR.
 
 ## Testing Guidance
-- See `docs/TESTING.md` for mandatory scenarios and expectations.
+- See `docs/architecture/testing/README.md` and `docs/architecture/testing/simulation-testing.md` for detailed testing documentation and best practices.
 - The repository uses the special `TODO-` `MUST-FIX` marker to block commits that temporarily disable tests. If a test must be skipped, leave a `// TODO-` `MUST-FIX:` comment explaining why and create a follow-up issue.
 - Never remove or ignore failing tests without understanding the root cause.
 
@@ -158,7 +158,7 @@ tokio::time::timeout(Duration::from_secs(5), async { ... }).await;
 
 ```rust
 // GOOD - Use TimeSource trait for time operations
-use crate::transport::TimeSource;
+use crate::simulation::TimeSource;
 
 // For sleeping in simulation tests, advance VirtualTime explicitly:
 for _ in 0..10 {
@@ -221,34 +221,76 @@ let socket = SimulationSocket::bind(addr).await?;
 
 | Concern | Abstraction | Location |
 |---------|-------------|----------|
-| Time | `TimeSource` trait, `VirtualTime`, `RealTime` | `crates/core/src/transport/` |
-| RNG | `GlobalRng` | `crates/core/src/config.rs` |
+| Time | `TimeSource` trait, `VirtualTime`, `RealTime` | `crates/core/src/simulation/` |
+| RNG | `GlobalRng`, `GlobalSimulationTime` | `crates/core/src/config/mod.rs` |
 | Sockets | `Socket` trait, `SimulationSocket` | `crates/core/src/transport/` |
-| Async execution | `GlobalExecutor` | `crates/core/src/config.rs` |
+| Async execution | `GlobalExecutor` | `crates/core/src/config/mod.rs` |
 
 #### Test Pattern: Advancing Virtual Time
 
-When migrating tests from `start_paused = true` to explicit VirtualTime:
+**For simulation tests**, use explicit VirtualTime advancement to control time progression:
 
 ```rust
-// OLD PATTERN (implicit tokio paused time):
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_foo() {
-    tokio::time::sleep(Duration::from_secs(3)).await;
-}
-
-// NEW PATTERN (explicit VirtualTime):
 #[tokio::test(flavor = "current_thread")]
-async fn test_foo() {
-    // Advance time explicitly, yielding to let tasks process
+async fn test_simulation() {
+    // Create SimNetwork (provides VirtualTime)
+    let mut sim = SimNetwork::new(
+        "test-network", 1, 3, 7, 3, 10, 2, 0x1234_5678
+    ).await;
+
+    // Advance time explicitly in small steps, yielding between each step
     for _ in 0..30 {
         sim.advance_time(Duration::from_millis(100));
         tokio::task::yield_now().await;
     }
+
+    // Total elapsed: 3 seconds of virtual time
 }
 ```
 
-This makes time progression explicit and deterministic, independent of tokio's internal time handling.
+**Important:** Simulation tests use `SimNetwork::advance_time()` for deterministic time control. This is independent of tokio's time handling and works with Turmoil's deterministic scheduler.
+
+**Note:** Raw tokio tests can use `#[tokio::test(start_paused = true)]`, but simulation tests should use explicit VirtualTime control instead for full determinism.
+
+#### GlobalSimulationTime: Deterministic Timestamps
+
+For deterministic ULID generation and timestamps in tests:
+
+```rust
+use crate::config::GlobalSimulationTime;
+
+// Set base simulation time (typically derived from seed)
+const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + seed_offset);
+
+// Generate deterministic ULIDs
+let ulid = GlobalSimulationTime::new_ulid(); // Uses simulation time + GlobalRng
+
+// Get current simulation time
+let current_ms = GlobalSimulationTime::current_time_ms();
+```
+
+**Note:** `GlobalSimulationTime` is automatically set by `SimNetwork::run_simulation()` based on the provided seed.
+
+#### TimeSource Behavioral Differences
+
+The `TimeSource` trait has methods with different behaviors in simulation vs. real time:
+
+```rust
+use crate::simulation::{TimeSource, VirtualTime, RealTime};
+
+// Connection idle timeout
+// VirtualTime: 24 hours (prevents premature timeout during auto-advance)
+// RealTime: 120 seconds (standard production timeout)
+let timeout = time_source.connection_idle_timeout();
+
+// Keepalive support
+// VirtualTime: false (prevents hangs with auto-advance)
+// RealTime: true (enables keepalive packets)
+let has_keepalive = time_source.supports_keepalive();
+```
+
+**Important:** Components using TimeSource should be aware these values differ between simulation and production environments.
 
 ### Integration Testing with `freenet-test-network`
 - Use the `freenet-test-network` crate from https://github.com/freenet/freenet-test-network to spin up gateways and peers for integration tests.
