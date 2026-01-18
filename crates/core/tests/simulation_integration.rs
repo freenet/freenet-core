@@ -1256,14 +1256,15 @@ fn test_topology_single_seeder() {
 
     const SEED: u64 = 0x5EED_0001_CAFE;
 
-    // Reset all global state
-    reset_all_simulation_state();
+    // Set up deterministic state BEFORE creating SimNetwork
+    // This ensures peer locations are deterministic (uses GlobalRng)
+    setup_deterministic_state(SEED);
 
     let rt = create_runtime();
 
-    // Create SimNetwork
-    let sim = rt.block_on(async {
-        SimNetwork::new(
+    // Create SimNetwork and get gateway location
+    let (sim, gateway_location) = rt.block_on(async {
+        let sim = SimNetwork::new(
             SINGLE_SEEDER_NETWORK,
             1,  // 1 gateway
             2,  // 2 peers (they won't subscribe)
@@ -1273,13 +1274,27 @@ fn test_topology_single_seeder() {
             2,  // min_connections
             SEED,
         )
-        .await
+        .await;
+        // Get gateway location (first peer in the list)
+        let locations = sim.get_peer_locations();
+        let gateway_loc = locations
+            .first()
+            .copied()
+            .expect("Should have at least one gateway");
+        (sim, gateway_loc)
     });
 
-    // Create a test contract
-    let contract = SimOperation::create_test_contract(99);
+    // Note: get_peer_locations() returns locations from SimNetwork config, but actual
+    // running nodes may have different locations due to how ConnectionManager is initialized.
+    // We use a fixed contract seed and validate based on actual topology snapshot locations.
+    // See: https://github.com/freenet/freenet-core/issues/2759 for the peer location non-determinism issue.
+    let _ = gateway_location; // Silence unused variable warning
+
+    // Use a fixed contract seed - we'll determine source status from actual topology
+    let contract_seed = 42u8;
+    let contract = SimOperation::create_test_contract(contract_seed);
     let contract_id = *contract.key().id();
-    let initial_state = SimOperation::create_test_state(99);
+    let initial_state = SimOperation::create_test_state(contract_seed);
 
     // Schedule only ONE operation: gateway PUTs the contract with subscribe=true
     // No other nodes subscribe - this avoids #2720 bidirectional cycle issue
@@ -1293,12 +1308,14 @@ fn test_topology_single_seeder() {
     )];
 
     // Run simulation with controlled events under Turmoil
-    // Wait 10 seconds after operations for topology registration
+    // Wait 45 seconds after operations for:
+    // - Topology registration (runs periodically)
+    // - Orphan recovery (runs every 30 seconds)
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(60), // simulation duration
-        Duration::from_secs(10), // post-operation wait for topology registration
+        Duration::from_secs(120), // simulation duration
+        Duration::from_secs(45),  // post-operation wait for topology stabilization
     );
 
     assert!(
@@ -1365,19 +1382,25 @@ fn test_topology_single_seeder() {
         result.proximity_violations.len()
     );
 
-    // With only one subscriber, there should be no cycles
+    // CRITICAL: With only one subscriber, there should NEVER be cycles
+    // This is the primary assertion - single seeder cannot form cycles
     assert!(
         result.bidirectional_cycles.is_empty(),
         "Single seeder should have no bidirectional cycles, found: {:?}",
         result.bidirectional_cycles
     );
 
-    // Check if gateway is considered a "source" (within SOURCE_THRESHOLD of contract)
+    // Check if gateway is considered a "source" based on actual topology snapshot
     let gateway_is_source = gateway_distance < SOURCE_THRESHOLD;
 
     if gateway_is_source {
-        tracing::info!("Gateway is within SOURCE_THRESHOLD - validating source behavior");
+        tracing::info!(
+            "Gateway IS source (distance={:.4} < threshold={:.4}) - validating healthy topology",
+            gateway_distance,
+            SOURCE_THRESHOLD
+        );
 
+        // Source seeder should have healthy topology
         assert!(
             result.orphan_seeders.is_empty(),
             "Source seeder (within threshold) should not be marked as orphan, found: {:?}",
@@ -1403,18 +1426,12 @@ fn test_topology_single_seeder() {
         );
     } else {
         tracing::warn!(
-            "Gateway is NOT within SOURCE_THRESHOLD (distance={:.4} > {:.4}). \
-             Validation may flag orphan/disconnected issues - this is correct behavior.",
-            gateway_distance,
-            SOURCE_THRESHOLD
+            "Gateway is NOT source (distance={:.4} >= threshold={:.4}) - orphan/disconnected issues are expected",
+            gateway_distance, SOURCE_THRESHOLD
         );
 
-        // Still verify no cycles (impossible with single seeder)
-        assert!(
-            result.bidirectional_cycles.is_empty(),
-            "Single seeder should never have cycles"
-        );
-
+        // Non-source seeder will have orphan/disconnected issues - this is expected behavior
+        // The key assertion (no cycles) already passed above
         if !result.orphan_seeders.is_empty() {
             tracing::info!(
                 "Expected: Gateway flagged as orphan (not a source, no upstream): {:?}",
@@ -1430,7 +1447,7 @@ fn test_topology_single_seeder() {
     }
 
     tracing::info!(
-        "Single seeder topology test passed - gateway_is_source={}, issues={}",
+        "Single seeder topology test passed - gateway_is_source={}, cycles=0, other_issues={}",
         gateway_is_source,
         result.issue_count
     );
@@ -1472,8 +1489,9 @@ fn test_bidirectional_cycle() {
 
     const SEED: u64 = 0xC0DE_CAFE_1234;
 
-    // Reset all global state
-    reset_all_simulation_state();
+    // Set up deterministic state BEFORE creating SimNetwork
+    // This ensures peer locations are deterministic (uses GlobalRng)
+    setup_deterministic_state(SEED);
 
     let rt = create_runtime();
 
