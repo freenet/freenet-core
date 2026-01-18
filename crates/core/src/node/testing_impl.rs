@@ -251,6 +251,19 @@ impl ScheduledOperation {
     }
 }
 
+/// Result of a controlled simulation, including topology snapshots.
+///
+/// This struct captures the simulation result along with topology snapshots
+/// taken at the end of the simulation (before cleanup). This allows tests
+/// to validate subscription topology after the simulation completes.
+#[derive(Debug)]
+pub struct ControlledSimulationResult {
+    /// The Turmoil simulation result
+    pub turmoil_result: turmoil::Result,
+    /// Topology snapshots captured at the end of simulation
+    pub topology_snapshots: Vec<crate::ring::topology_registry::TopologySnapshot>,
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub struct NodeLabel(Arc<str>);
 
@@ -1844,6 +1857,22 @@ impl SimNetwork {
         ControlledEventChain::new(user_ev_controller, event_sequence, label_to_key)
     }
 
+    /// Returns the locations of all peers (gateways + nodes) without consuming them.
+    pub fn get_peer_locations(&self) -> Vec<f64> {
+        let mut locations = Vec::new();
+        for (builder, _) in &self.gateways {
+            if let Some(loc) = &builder.config.location {
+                locations.push(loc.as_f64());
+            }
+        }
+        for (builder, _) in &self.nodes {
+            if let Some(loc) = &builder.config.location {
+                locations.push(loc.as_f64());
+            }
+        }
+        locations
+    }
+
     /// Builds peer nodes and returns the controller to trigger events.
     pub fn build_peers(&mut self) -> Vec<(NodeLabel, NodeConfig)> {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
@@ -1981,9 +2010,8 @@ impl SimNetwork {
             // Yield to tokio so tasks can process delivered messages
             tokio::task::yield_now().await;
 
-            // Minimal real-time sleep to allow task scheduling without spinning CPU
-            // Reduced from 10ms to 1ms for faster simulation execution
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Small real-time sleep to allow task scheduling without spinning CPU
+            tokio::time::sleep(Duration::from_millis(10)).await;
 
             // Check which nodes have connected
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
@@ -2933,6 +2961,304 @@ impl SimNetwork {
 
         // Run the simulation
         sim.run()
+    }
+
+    /// Run a deterministic simulation with controlled events using Turmoil.
+    ///
+    /// Unlike `run_simulation` which uses random events, this method takes
+    /// a predefined sequence of operations that will be executed in order.
+    /// This is useful for testing specific scenarios like subscription topology.
+    ///
+    /// The simulation runs under Turmoil's deterministic scheduler, so
+    /// `tokio::time::sleep` and other time-dependent operations are controlled.
+    ///
+    /// # Arguments
+    /// * `seed` - Random seed for deterministic simulation
+    /// * `operations` - Sequence of operations to execute in order
+    /// * `simulation_duration` - Maximum duration for the simulation
+    /// * `post_operations_wait` - Time to wait after operations complete (for recovery, etc.)
+    ///
+    /// # Returns
+    /// A `turmoil::Result` indicating success or failure.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let operations = vec![
+    ///     ScheduledOperation::new(NodeLabel::gateway("test", 0), SimOperation::Put { ... }),
+    ///     ScheduledOperation::new(NodeLabel::node("test", 1), SimOperation::Subscribe { ... }),
+    /// ];
+    /// let result = sim.run_controlled_simulation(
+    ///     SEED,
+    ///     operations,
+    ///     Duration::from_secs(120),
+    ///     Duration::from_secs(60), // Wait for orphan recovery
+    /// );
+    /// // After simulation, check result.topology_snapshots
+    /// ```
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_controlled_simulation(
+        mut self,
+        seed: u64,
+        operations: Vec<ScheduledOperation>,
+        simulation_duration: Duration,
+        post_operations_wait: Duration,
+    ) -> ControlledSimulationResult {
+        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::ring::topology_registry::{
+            get_all_topology_snapshots, set_current_network_name,
+        };
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Set up deterministic RNG and time for reproducible simulation
+        GlobalRng::set_seed(seed);
+
+        // Derive simulation epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Set the current network name for topology registration
+        set_current_network_name(&self.name);
+
+        // Save network name for topology retrieval after simulation
+        let network_name = self.name.clone();
+
+        // Build Turmoil simulation with seeded RNG for deterministic execution
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(simulation_duration)
+            .rng_seed(seed)
+            .build();
+
+        // Build a map of label -> list of (event_id, operation)
+        let mut operations_by_node: HashMap<NodeLabel, Vec<(EventId, SimOperation)>> =
+            HashMap::new();
+        let mut operation_sequence: Vec<(EventId, NodeLabel)> = Vec::new();
+
+        for (event_id, scheduled_op) in operations.into_iter().enumerate() {
+            let event_id = event_id as EventId;
+            operation_sequence.push((event_id, scheduled_op.node.clone()));
+            operations_by_node
+                .entry(scheduled_op.node)
+                .or_default()
+                .push((event_id, scheduled_op.operation));
+        }
+
+        // Register all gateways as Turmoil hosts
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            // Clone receiver_ch so each node gets its own subscription
+            let mut user_events =
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("turmoil_gateway_controlled", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Register all regular nodes as Turmoil hosts
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            // Clone receiver_ch so each node gets its own subscription
+            let mut user_events =
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("turmoil_node_controlled", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Take the event controller and labels for triggering events
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("user_ev_controller should be set");
+        let labels: Vec<_> = self.labels.clone();
+
+        // Build a map from NodeLabel to peer key for event triggering
+        let label_to_key: HashMap<NodeLabel, _> = labels.into_iter().collect();
+
+        // Register the test client that triggers controlled events
+        sim.client("test", async move {
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Trigger events in the specified order
+            for (event_id, node_label) in operation_sequence {
+                if let Some(peer_key) = label_to_key.get(&node_label) {
+                    tracing::info!(
+                        event_id,
+                        node = %node_label,
+                        "Triggering controlled event"
+                    );
+
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            event_id,
+                            node = %node_label,
+                            "Failed to send event signal - receivers dropped"
+                        );
+                        break;
+                    }
+
+                    // Wait for operation to complete before triggering next
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                } else {
+                    tracing::warn!(
+                        event_id,
+                        node = %node_label,
+                        "No peer key found for node label"
+                    );
+                }
+            }
+
+            // Wait for post-operation processing (orphan recovery, topology stabilization, etc.)
+            tracing::info!(
+                wait_secs = post_operations_wait.as_secs(),
+                "Waiting for post-operation processing"
+            );
+            tokio::time::sleep(post_operations_wait).await;
+
+            Ok(())
+        });
+
+        // Run the simulation
+        let turmoil_result = sim.run();
+
+        // Capture topology snapshots BEFORE self is dropped (which clears them)
+        let topology_snapshots = get_all_topology_snapshots(&network_name);
+
+        ControlledSimulationResult {
+            turmoil_result,
+            topology_snapshots,
+        }
     }
 
     // =========================================================================

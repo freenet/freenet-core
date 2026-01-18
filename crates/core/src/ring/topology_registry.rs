@@ -205,6 +205,21 @@ pub fn validate_topology(
     contract_location: f64,
 ) -> TopologyValidationResult {
     let snapshots = get_all_topology_snapshots(network_name);
+    validate_topology_from_snapshots(&snapshots, contract_id, contract_location)
+}
+
+/// Validates the subscription topology for a contract from provided snapshots.
+///
+/// Use this variant when you have captured snapshots and the global registry
+/// may have been cleared (e.g., after SimNetwork::Drop).
+///
+/// Same validation as `validate_topology` but operates on the provided snapshots
+/// instead of fetching from the global registry.
+pub fn validate_topology_from_snapshots(
+    snapshots: &[TopologySnapshot],
+    contract_id: &ContractInstanceId,
+    contract_location: f64,
+) -> TopologyValidationResult {
     let mut result = TopologyValidationResult::default();
 
     // Build a map of peer -> (upstream, downstream) for this contract
@@ -213,7 +228,7 @@ pub fn validate_topology(
     let mut peer_locations: HashMap<SocketAddr, f64> = HashMap::new();
     let mut seeders: HashSet<SocketAddr> = HashSet::new();
 
-    for snapshot in &snapshots {
+    for snapshot in snapshots {
         peer_locations.insert(snapshot.peer_addr, snapshot.location);
 
         if let Some(sub) = snapshot.contracts.get(contract_id) {
