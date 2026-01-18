@@ -80,7 +80,7 @@ use tracing::info;
 use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
-    config::{ConfigArgs, GlobalExecutor},
+    config::{ConfigArgs, GlobalExecutor, GlobalRng},
     dev_tool::TransportKeypair,
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
@@ -730,6 +730,11 @@ impl SimNetwork {
         seed: u64,
     ) -> Self {
         assert!(nodes > 0);
+
+        // Seed GlobalRng for deterministic location generation
+        // This ensures Location::random() calls in config_gateways/config_nodes are deterministic
+        GlobalRng::set_seed(seed);
+
         let (user_ev_controller, mut receiver_ch) =
             watch::channel((0, TransportKeypair::new().public().clone()));
         receiver_ch.borrow_and_update();
@@ -3706,3 +3711,56 @@ pub async fn check_convergence_from_logs(
 }
 
 use crate::contract::OperationMode;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that peer locations are deterministic with the same seed.
+    ///
+    /// Regression test for issue #2759 - SimNetwork should produce identical
+    /// peer locations across multiple runs with the same seed.
+    #[tokio::test]
+    async fn test_deterministic_peer_locations() {
+        const SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
+        // Create first network
+        let sim1 = SimNetwork::new(
+            "determinism-test-1",
+            2,  // 2 gateways
+            3,  // 3 regular nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+
+        let locations1 = sim1.get_peer_locations();
+
+        // Create second network with same seed
+        let sim2 = SimNetwork::new(
+            "determinism-test-2",
+            2, // same config
+            3,
+            7,
+            3,
+            10,
+            2,
+            SEED, // same seed
+        )
+        .await;
+
+        let locations2 = sim2.get_peer_locations();
+
+        // Verify locations are identical
+        assert_eq!(
+            locations1, locations2,
+            "Peer locations should be identical with the same seed.\n\
+             Run 1: {:?}\n\
+             Run 2: {:?}",
+            locations1, locations2
+        );
+    }
+}
