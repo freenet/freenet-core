@@ -1287,7 +1287,7 @@ fn test_topology_single_seeder() {
     // Note: get_peer_locations() returns locations from SimNetwork config, but actual
     // running nodes may have different locations due to how ConnectionManager is initialized.
     // We use a fixed contract seed and validate based on actual topology snapshot locations.
-    // See: https://github.com/freenet/freenet-core/issues/2755 for related determinism issues.
+    // See: https://github.com/freenet/freenet-core/issues/2759 for the peer location non-determinism issue.
     let _ = gateway_location; // Silence unused variable warning
 
     // Use a fixed contract seed - we'll determine source status from actual topology
