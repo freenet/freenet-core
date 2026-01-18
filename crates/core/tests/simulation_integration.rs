@@ -1717,7 +1717,7 @@ fn test_orphan_seeders_no_source() {
         let orphans_excluding_root: Vec<_> = result
             .orphan_seeders
             .iter()
-            .filter(|addr| **addr != root_snap.peer_addr)
+            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
             .collect();
 
         assert!(
@@ -1736,7 +1736,7 @@ fn test_orphan_seeders_no_source() {
         let disconnected_excluding_root: Vec<_> = result
             .disconnected_upstream
             .iter()
-            .filter(|addr| **addr != root_snap.peer_addr)
+            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
             .collect();
 
         assert!(
@@ -1749,13 +1749,19 @@ fn test_orphan_seeders_no_source() {
             disconnected_excluding_root
         );
 
-        // Assert: No unreachable seeders
+        // Assert: No unreachable seeders for this contract
+        let unreachable_for_contract: Vec<_> = result
+            .unreachable_seeders
+            .iter()
+            .filter(|(_, cid)| *cid == contract_id)
+            .collect();
+
         assert!(
-            result.unreachable_seeders.is_empty(),
+            unreachable_for_contract.is_empty(),
             "ISSUE #2755: Found {} unreachable seeders: {:?}. \
              All seeders should be reachable in a valid topology.",
-            result.unreachable_seeders.len(),
-            result.unreachable_seeders
+            unreachable_for_contract.len(),
+            unreachable_for_contract
         );
 
         tracing::info!(
