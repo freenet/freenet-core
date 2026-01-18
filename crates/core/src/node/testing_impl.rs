@@ -3727,12 +3727,12 @@ mod tests {
         // Create first network
         let sim1 = SimNetwork::new(
             "determinism-test-1",
-            2, // 2 gateways
-            3, // 3 regular nodes
-            7, // ring_max_htl
-            3, // rnd_if_htl_above
+            2,  // 2 gateways
+            3,  // 3 regular nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
             10, // max_connections
-            2, // min_connections
+            2,  // min_connections
             SEED,
         )
         .await;
