@@ -8,7 +8,7 @@
 mod common;
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -16,13 +16,16 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use std::{net::TcpListener, path::PathBuf, time::Duration};
-use testresult::TestResult;
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::{select, time::timeout};
 
 use common::{
-    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
-    PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
+    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
@@ -31,7 +34,7 @@ const CONNECTIVITY_RATIO: f64 = 0.1; // 10% connectivity to reduce network load
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "large scale test - run manually"]
-async fn test_50_node_operations() -> TestResult {
+async fn test_50_node_operations() -> anyhow::Result<()> {
     println!("🚀 Starting 50-node operations test");
     println!("   Gateway nodes: {NUM_GATEWAYS}");
     println!("   Regular nodes: {NUM_REGULAR_NODES}");
@@ -57,24 +60,30 @@ async fn test_50_node_operations() -> TestResult {
     Ok(())
 }
 
-async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)>
-{
+async fn setup_50_node_network(
+) -> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)> {
     println!("🔧 Setting up 50-node network...");
 
-    // Setup sockets
+    // Generate unique IPs for all nodes
+    let gateway_ips: Vec<_> = (0..NUM_GATEWAYS).map(test_ip_for_node).collect();
+    let node_ips: Vec<_> = (0..NUM_REGULAR_NODES)
+        .map(|i| test_ip_for_node(NUM_GATEWAYS + i))
+        .collect();
+
+    // Setup sockets with unique IPs
     let mut gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
     let mut ws_api_gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
-    for _ in 0..NUM_GATEWAYS {
-        gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-        ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+    for &gw_ip in &gateway_ips {
+        gateway_sockets.push(TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?);
+        ws_api_gateway_sockets.push(TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?);
     }
 
     let mut ws_api_node_sockets = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
-    for _ in 0..NUM_REGULAR_NODES {
-        let socket = TcpListener::bind("127.0.0.1:0")?;
+    for &node_ip in &node_ips {
+        let socket = TcpListener::bind(SocketAddr::new(node_ip.into(), 0))?;
         regular_node_addresses.push(socket.local_addr()?);
-        ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        ws_api_node_sockets.push(TcpListener::bind(SocketAddr::new(node_ip.into(), 0))?);
     }
 
     // Configure gateways
@@ -84,7 +93,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
     for i in 0..NUM_GATEWAYS {
-        let (cfg, preset) = base_node_test_config(
+        let gw_ip = gateway_ips[i];
+        let (cfg, preset) = base_node_test_config_with_ip(
             true,
             vec![],
             Some(gateway_sockets[i].local_addr()?.port()),
@@ -92,12 +102,13 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             &format!("gw_50node_{i}"),
             None,
             None,
+            Some(gw_ip),
         )
         .await?;
 
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        let config_info = gw_config_from_path(public_port, &path)?;
+        let config_info = gw_config_from_path_with_ip(public_port, &path, gw_ip)?;
 
         ws_api_ports_gw.push(cfg.ws_api.ws_api_port.unwrap());
         gateway_info.push(config_info);
@@ -135,7 +146,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             }
         }
 
-        let (cfg, preset) = base_node_test_config(
+        let node_ip = node_ips[i];
+        let (cfg, preset) = base_node_test_config_with_ip(
             false,
             serialized_gateways.clone(),
             None,
@@ -143,6 +155,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             &format!("node_50node_{i}"),
             None,
             Some(blocked_addresses.clone()),
+            Some(node_ip),
         )
         .await?;
 
@@ -217,7 +230,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         println!("📡 Connecting to {NUM_GATEWAYS} gateways...");
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
-            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+            let gw_ip = gateway_ips[i];
+            let uri = format!("ws://{gw_ip}:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
@@ -232,7 +246,8 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         println!("📡 Connecting to {NUM_REGULAR_NODES} regular nodes...");
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
-            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+            let node_ip = node_ips[i];
+            let uri = format!("ws://{node_ip}:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             node_clients.push(client);
@@ -280,7 +295,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             (result, _index, remaining) = select_all_futures => {
                 match result {
                     Err(err) => {
-                        return Err(anyhow!("Node failed: {}", err).into());
+                        anyhow::bail!("Node failed: {}", err);
                     }
                     Ok(_) => {
                         all_futures = remaining;
@@ -298,14 +313,14 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         }
     }
 
-    Err(anyhow!("Network setup failed").into())
+    anyhow::bail!("Network setup failed")
 }
 
 async fn test_put_propagation(
     gateway_clients: &mut [WebApi],
     contract_key: &ContractKey,
     wrapped_state: &WrappedState,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n📤 Testing PUT propagation...");
 
     let start_time = std::time::Instant::now();
@@ -349,7 +364,7 @@ async fn test_put_propagation(
             },
             Err(e) => {
                 println!("   ⚠️  Gateway {i} send failed: {e}");
-                last_error = Some(e.into());
+                last_error = Some(anyhow::anyhow!("Gateway {} send failed: {}", i, e));
             }
         }
 
@@ -358,9 +373,7 @@ async fn test_put_propagation(
     }
 
     if !put_success {
-        return Err(last_error
-            .unwrap_or_else(|| anyhow!("All gateways failed"))
-            .into());
+        return Err(last_error.unwrap_or_else(|| anyhow!("All gateways failed")));
     }
 
     let put_time = start_time.elapsed();
@@ -376,7 +389,7 @@ async fn test_put_propagation(
 async fn test_concurrent_gets(
     node_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n📥 Testing concurrent GET operations...");
 
     let concurrent_requests = std::cmp::min(10, node_clients.len());
@@ -454,7 +467,7 @@ async fn test_concurrent_gets(
     println!("      - Max response time: {max_time:?}");
 
     if success_rate < 70.0 {
-        return Err(anyhow!("Sequential GET success rate too low: {:.1}%", success_rate).into());
+        anyhow::bail!("Sequential GET success rate too low: {:.1}%", success_rate);
     }
 
     println!("   ✅ Sequential GET test completed");
@@ -465,7 +478,7 @@ async fn test_mass_subscription(
     node_clients: &mut [WebApi],
     _gateway_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n🔔 Testing mass subscription operations...");
 
     let subscribers = std::cmp::min(15, node_clients.len());
@@ -520,11 +533,10 @@ async fn test_mass_subscription(
     println!("      - Subscription time: {subscription_time:?}");
 
     if subscription_rate < 75.0 {
-        return Err(anyhow!(
+        anyhow::bail!(
             "Mass subscription success rate too low: {:.1}%",
             subscription_rate
-        )
-        .into());
+        );
     }
 
     // Wait a bit for subscriptions to stabilize
@@ -537,7 +549,7 @@ async fn test_mass_subscription(
 async fn test_update_propagation(
     node_clients: &mut [WebApi],
     contract_key: &ContractKey,
-) -> TestResult<()> {
+) -> anyhow::Result<()> {
     println!("\n🔄 Testing UPDATE propagation...");
 
     // Create updated ping state
@@ -574,13 +586,13 @@ async fn test_update_propagation(
         }
         Ok(Ok(response)) => {
             println!("   ❌ Unexpected update response: {response:?}");
-            return Err(anyhow!("Unexpected update response").into());
+            anyhow::bail!("Unexpected update response");
         }
         Ok(Err(e)) => {
-            return Err(anyhow!("Update error: {}", e).into());
+            anyhow::bail!("Update error: {}", e);
         }
         Err(_) => {
-            return Err(anyhow!("Update request timed out").into());
+            anyhow::bail!("Update request timed out");
         }
     }
 
