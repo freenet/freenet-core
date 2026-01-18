@@ -5,7 +5,7 @@
 The Freenet transport layer provides low-level network communication over UDP with:
 - **Encryption**: AES-128-GCM symmetric encryption after RSA key exchange
 - **Reliability**: Packet acknowledgment and retransmission
-- **Congestion Control**: LEDBAT++ (Low Extra Delay Background Transport) with slow start and periodic slowdowns
+- **Congestion Control**: Multiple algorithms available (LEDBAT++, BBRv3, FixedRate) - see [Congestion Control Algorithms](#congestion-control-algorithms)
 - **Rate Limiting**: Token bucket for smooth packet pacing
 - **RTT Tracking**: RFC 6298-compliant RTT estimation
 
@@ -58,7 +58,57 @@ Historical baselines and validation results from development.
 ### Implemented Features
 Documentation for completed transport features.
 
-- **[Global Bandwidth Pool](future/global-bandwidth-pool.md)** - ✅ **IMPLEMENTED** - Fair bandwidth sharing across all connections with atomic connection counting
+- **[Global Bandwidth Pool](design/global-bandwidth-pool.md)** - ✅ **IMPLEMENTED** - Fair bandwidth sharing across all connections with atomic connection counting
+
+## Congestion Control Algorithms
+
+The transport layer supports multiple congestion control algorithms for different network conditions:
+
+### LEDBAT++ (Default)
+**Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/ledbat/`
+
+Low Extra Delay Background Transport with periodic slowdowns (draft-irtf-iccrg-ledbat-plus-plus).
+
+**Use case:** Background traffic that should yield to foreground applications
+- Delay-based congestion control (TARGET = 60ms)
+- Slow start for fast ramp-up (IW26: 38 KB initial window)
+- Periodic slowdowns to probe for available bandwidth
+- Fair bandwidth sharing between concurrent connections
+
+**Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s with default token bucket limit)
+
+**Documentation:** [LEDBAT++ Implementation](design/ledbat-plus-plus.md), [Slow Start Design](design/ledbat-slow-start.md)
+
+### BBRv3
+**Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/bbr/`
+
+Model-based congestion control optimized for lossy/high-latency paths (Google BBRv3).
+
+**Use case:** Networks with high packet loss or variable latency
+- Bandwidth-delay product (BDP) estimation
+- ProbeBW and ProbeRTT phases for continuous adaptation
+- Less sensitive to packet loss than delay-based algorithms
+- Better performance on congested or long-distance paths
+
+**Performance:** Optimized for throughput maximization on challenging network conditions
+
+**Note:** Merged in PR #2674 as an alternative to LEDBAT for specific network scenarios
+
+### FixedRate
+**Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/congestion_control.rs`
+
+Non-adaptive rate control for testing and baseline measurements.
+
+**Use case:** Benchmarking and controlled testing environments
+- Fixed sending rate regardless of network conditions
+- Useful for establishing performance baselines
+- Not recommended for production use
+
+### Selection
+
+Congestion control algorithm is configured per connection. Default is LEDBAT++.
+
+**Code reference:** `crates/core/src/transport/congestion_control.rs:70-90` (CongestionControlAlgorithm enum)
 
 ## Quick Reference
 
@@ -95,7 +145,9 @@ cargo bench --bench transport_perf -- slow_start
 
 ### Source Code Locations
 - **Transport module**: `crates/core/src/transport/`
-- **LEDBAT controller**: `crates/core/src/transport/ledbat.rs`
+- **Congestion control**: `crates/core/src/transport/congestion_control.rs`
+- **LEDBAT controller**: `crates/core/src/transport/ledbat/`
+- **BBR controller**: `crates/core/src/transport/bbr/`
 - **Token bucket**: `crates/core/src/transport/token_bucket.rs`
 - **Global bandwidth pool**: `crates/core/src/transport/global_bandwidth.rs`
 - **RTT tracking**: `crates/core/src/transport/sent_packet_tracker.rs`

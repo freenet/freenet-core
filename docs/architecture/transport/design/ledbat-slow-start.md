@@ -1,7 +1,8 @@
 # LEDBAT Slow Start Design
 
-**Status:** Design Document
+**Status:** ✅ **IMPLEMENTED** - Merged and active in production
 **Created:** 2025-12-16
+**Completed:** 2025-12 (implementation completed within weeks of design)
 **Authors:** Claude (AI-assisted design based on RFC 6817 and performance analysis)
 
 ## Executive Summary
@@ -744,39 +745,47 @@ Ensure existing functionality is preserved:
 
 ---
 
-## 9. Rollout Plan
+## 9. Implementation Summary
 
-### Phase 1: Implementation (Week 1)
+> **All phases completed successfully in December 2025.**
 
-- [ ] Add slow start fields to `LedbatController`
-- [ ] Implement `handle_slow_start()` method
-- [ ] Add unit tests for slow start logic
-- [ ] Add configuration struct and defaults
+### Phase 1: Implementation ✅ COMPLETED
 
-### Phase 2: Shared State (Week 1-2)
+- ✅ Added slow start fields to `LedbatController`
+- ✅ Implemented `handle_slow_start()` method
+- ✅ Added unit tests for slow start logic
+- ✅ Added configuration struct and defaults
 
-- [ ] Implement `PeerDelayState` for shared base_delay
-- [ ] Integrate with `ConnectionHandler`
-- [ ] Add integration tests for fairness
+**Code:** `crates/core/src/transport/ledbat/controller.rs`
 
-### Phase 3: Benchmarking (Week 2)
+### Phase 2: Shared State ✅ COMPLETED
 
-- [ ] Run existing benchmark suite with slow start enabled
-- [ ] Validate >3 MB/s throughput achieved
-- [ ] Measure fairness metrics (Jain's Index)
-- [ ] Test network citizenship (competing with iPerf3)
+- ✅ Implemented `PeerDelayState` for shared base_delay
+- ✅ Integrated with `ConnectionHandler`
+- ✅ Added integration tests for fairness
 
-### Phase 4: Tuning (Week 2-3)
+**Code:** `crates/core/src/transport/ledbat/mod.rs`
 
-- [ ] Adjust ssthresh if needed (50-200 KB range)
-- [ ] Fine-tune delay exit threshold (0.4-0.6 * TARGET)
-- [ ] Verify randomization prevents synchronization
+### Phase 3: Benchmarking ✅ COMPLETED
 
-### Phase 5: Production (Week 3+)
+- ✅ Ran existing benchmark suite with slow start enabled
+- ✅ Validated >3 MB/s throughput achieved
+- ✅ Measured fairness metrics (Jain's Index)
+- ✅ Tested network citizenship (competing with iPerf3)
 
-- [ ] Merge to main branch
-- [ ] Monitor telemetry for real-world performance
-- [ ] Gather user feedback on responsiveness
+**Results:** See `docs/architecture/transport/benchmarking/` for performance analysis
+
+### Phase 4: Tuning ✅ COMPLETED
+
+- ✅ Adjusted ssthresh based on real-world testing
+- ✅ Fine-tuned delay exit threshold
+- ✅ Verified randomization prevents synchronization
+
+### Phase 5: Production ✅ DEPLOYED
+
+- ✅ Merged to main branch
+- ✅ Monitoring telemetry for real-world performance
+- ✅ Gathering user feedback on responsiveness
 
 ### Rollback Plan
 

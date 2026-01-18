@@ -278,6 +278,6 @@ This happens when `min × connections > total`. Either:
 
 ## References
 
-- [Global Bandwidth Pool Design](../future/global-bandwidth-pool.md)
+- [Global Bandwidth Pool Design](../design/global-bandwidth-pool.md)
 - [LEDBAT Slow Start Design](../design/ledbat-slow-start.md)
 - [RFC 6817: LEDBAT](https://tools.ietf.org/html/rfc6817)
