@@ -23,11 +23,12 @@
 //! let handle = orphan_registry.claim_or_wait(stream_id, timeout).await?;
 //! ```
 //!
-//! # Integration
+//! # Phase 4 Dependencies
 //!
-//! - Transport layer (`PeerConnection`) calls `register_orphan()` when streams arrive
-//! - Operations handlers call `claim_or_wait()` when metadata arrives
-//! - Periodic GC task cleans up expired orphans via `gc_expired()`
+//! This infrastructure is completed in Phase 3 but not yet actively used. Phase 4 will:
+//! - Wire transport layer (`PeerConnection`) to call `register_orphan()` when streams arrive
+//! - Wire operations handlers to call `claim_or_wait()` when metadata arrives
+//! - Add periodic GC task to clean up expired orphans via `gc_expired()`
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -40,9 +41,11 @@ use crate::transport::peer_connection::StreamId;
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used when gc_expired is called periodically
 pub const ORPHAN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default timeout when waiting for a stream to arrive after metadata.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
 pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registry for handling race conditions between stream fragments and metadata messages.
@@ -72,6 +75,7 @@ impl OrphanStreamRegistry {
     ///
     /// If someone is already waiting for this stream, the handle is delivered
     /// immediately. Otherwise, it's stored as an orphan until claimed or timeout.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used when transport registers orphans
     pub fn register_orphan(&self, stream_id: StreamId, handle: StreamHandle) {
         // Check if someone is already waiting for this stream
         if let Some((_, waiter)) = self.stream_waiters.remove(&stream_id) {
@@ -107,6 +111,7 @@ impl OrphanStreamRegistry {
     ///
     /// Returns `OrphanStreamError::Timeout` if the stream doesn't arrive within
     /// the timeout period.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
     pub async fn claim_or_wait(
         &self,
         stream_id: StreamId,
@@ -166,6 +171,7 @@ impl OrphanStreamRegistry {
     ///
     /// Should be called periodically to clean up orphan streams that were
     /// never claimed. Each expired stream's handle is cancelled.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be called from a periodic cleanup task
     pub fn gc_expired(&self) {
         let now = Instant::now();
         let mut expired_count = 0;
@@ -195,46 +201,15 @@ impl OrphanStreamRegistry {
     }
 
     /// Returns the number of orphan streams currently registered.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn orphan_count(&self) -> usize {
         self.orphan_streams.len()
     }
 
     /// Returns the number of waiters currently registered.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn waiter_count(&self) -> usize {
         self.stream_waiters.len()
-    }
-
-    /// Start the background GC task for expired orphan streams.
-    ///
-    /// This spawns a task that runs periodically to clean up orphan streams
-    /// that were never claimed. Should be called once after the registry is created.
-    ///
-    /// The task runs every 5 seconds and removes streams older than `ORPHAN_STREAM_TIMEOUT`.
-    pub fn start_gc_task(registry: std::sync::Arc<Self>) {
-        use crate::config::GlobalExecutor;
-
-        GlobalExecutor::spawn(Self::gc_task(registry));
-    }
-
-    /// Background task to periodically garbage collect expired orphan streams.
-    async fn gc_task(registry: std::sync::Arc<Self>) {
-        use crate::config::GlobalRng;
-
-        // Add random initial delay to prevent synchronized GC across peers
-        let initial_delay = Duration::from_secs(GlobalRng::random_range(5u64..=15u64));
-        tokio::time::sleep(initial_delay).await;
-
-        const GC_INTERVAL: Duration = Duration::from_secs(5);
-        let mut interval = tokio::time::interval(GC_INTERVAL);
-
-        tracing::debug!("Orphan stream GC task started");
-
-        loop {
-            interval.tick().await;
-            registry.gc_expired();
-        }
     }
 }
 
@@ -245,6 +220,7 @@ impl Default for OrphanStreamRegistry {
 }
 
 /// Errors that can occur when claiming a stream.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanStreamError {
     /// Timeout waiting for stream to arrive.

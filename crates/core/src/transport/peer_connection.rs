@@ -46,7 +46,6 @@ use super::{
     token_bucket::TokenBucket,
     TransportError,
 };
-use crate::operations::orphan_streams::OrphanStreamRegistry;
 use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
@@ -203,11 +202,6 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     streaming_handles: HashMap<StreamId, streaming::StreamHandle>,
     /// Time source for deterministic simulation support
     time_source: T,
-    /// Optional orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-    /// Set by the node layer after connection establishment.
-    orphan_stream_registry:
-        Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -410,20 +404,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: HashMap::new(),
             time_source,
-            orphan_stream_registry: None,
         }
-    }
-
-    /// Sets the orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages.
-    ///
-    /// This should be called by the node layer after connection establishment,
-    /// before any messages are processed.
-    pub fn set_orphan_stream_registry(
-        &mut self,
-        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
-    ) {
-        self.orphan_stream_registry = Some(registry);
     }
 
     #[instrument(name = "peer_connection", skip_all)]
@@ -1145,19 +1126,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             "Failed to push first fragment to streaming handle"
                         );
                     }
-
-                    // Phase 4: Register with orphan stream registry for race condition handling.
-                    // This allows operations layer to claim the stream when metadata arrives,
-                    // even if the stream fragments arrived first.
-                    if let Some(orphan_registry) = &self.orphan_stream_registry {
-                        orphan_registry.register_orphan(stream_id, streaming_handle.clone());
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            "Registered stream as orphan for operations layer"
-                        );
-                    }
-
                     self.streaming_handles.insert(stream_id, streaming_handle);
                 }
 
@@ -1588,10 +1556,6 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         Box<dyn futures::Future<Output = Result<Vec<u8>, super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move { PeerConnection::recv(self).await })
-    }
-
-    fn set_orphan_stream_registry(&mut self, registry: std::sync::Arc<OrphanStreamRegistry>) {
-        PeerConnection::set_orphan_stream_registry(self, registry);
     }
 }
 

@@ -2689,14 +2689,6 @@ impl P2pConnManager {
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
-
-            // Phase 4: Set orphan stream registry on connection for handling race conditions
-            // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-            let mut connection = connection;
-            connection.set_orphan_stream_registry(
-                self.bridge.op_manager.orphan_stream_registry().clone(),
-            );
-
             // Use tokio::spawn directly instead of GlobalExecutor::spawn.
             // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
             // reliably poll tasks in certain test contexts (see issue #2709).
