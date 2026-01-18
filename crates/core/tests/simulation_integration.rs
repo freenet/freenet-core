@@ -1507,7 +1507,6 @@ async fn test_topology_single_seeder() {
 /// ```bash
 /// cargo test --features "simulation_tests,testing" test_bidirectional_cycle_issue_2720
 /// ```
-#[ignore]
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_bidirectional_cycle_issue_2720() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
