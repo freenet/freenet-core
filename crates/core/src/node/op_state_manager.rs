@@ -355,6 +355,10 @@ impl OpManager {
             );
         }
 
+        // Create orphan stream registry and start GC task
+        let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
+        OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
+
         Ok(Self {
             ring,
             ops,
@@ -370,7 +374,7 @@ impl OpManager {
             proximity_cache,
             interest_manager,
             request_router,
-            orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
+            orphan_stream_registry,
             streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
