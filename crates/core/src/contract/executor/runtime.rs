@@ -342,10 +342,11 @@ impl ContractExecutor for RuntimePool {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
+        network_sender: Option<std::net::SocketAddr>,
     ) -> Result<UpsertResult, ExecutorError> {
         let mut executor = self.pop_executor().await;
         let result = executor
-            .upsert_contract_state(key, update, related_contracts, code)
+            .upsert_contract_state(key, update, related_contracts, code, network_sender)
             .await;
 
         // Check if executor is still healthy after the operation
@@ -555,6 +556,7 @@ impl ContractExecutor for Executor<Runtime> {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
+        network_sender: Option<std::net::SocketAddr>,
     ) -> Result<UpsertResult, ExecutorError> {
         // CRITICAL: When a ContractContainer is provided, use its key instead of the passed-in key.
         // The container's key is authoritative and includes the code hash, which is needed for
@@ -790,6 +792,7 @@ impl ContractExecutor for Executor<Runtime> {
                             }
 
                             // Notify network peers of new contract state (automatic propagation)
+                            // For new contracts (PUT), we don't exclude any sender since this is locally initiated
                             if let Some(op_manager) = &self.op_manager {
                                 tracing::info!(
                                     contract = %key,
@@ -801,6 +804,7 @@ impl ContractExecutor for Executor<Runtime> {
                                         crate::message::NodeEvent::BroadcastStateChange {
                                             key,
                                             new_state: incoming_state.clone(),
+                                            exclude_sender: None, // PUT is locally initiated
                                         },
                                     )
                                     .await
@@ -884,7 +888,7 @@ impl ContractExecutor for Executor<Runtime> {
         }
 
         let updated_state = match self
-            .attempt_state_update(&params, &current_state, &key, &updates)
+            .attempt_state_update(&params, &current_state, &key, &updates, network_sender)
             .await?
         {
             Either::Left(s) => s,
@@ -1547,11 +1551,13 @@ impl Executor<Runtime> {
             })?;
 
         // Notify network peers of state change (automatic propagation)
+        // PUT is locally initiated, so no sender to exclude
         if let Some(op_manager) = &self.op_manager {
             if let Err(err) = op_manager
                 .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
                     new_state: state.clone(),
+                    exclude_sender: None,
                 })
                 .await
             {
@@ -1809,12 +1815,16 @@ impl Executor<Runtime> {
 
     /// Attempts to update the state with the provided updates.
     /// If there were no updates, it will return the current state.
+    ///
+    /// `network_sender` is the address of the peer who sent us this update (for echo-back prevention).
+    /// When Some, the resulting BroadcastStateChange will exclude this sender from broadcast targets.
     async fn attempt_state_update(
         &mut self,
         parameters: &Parameters<'_>,
         current_state: &WrappedState,
         key: &ContractKey,
         updates: &[UpdateData<'_>],
+        network_sender: Option<std::net::SocketAddr>,
     ) -> Result<Either<WrappedState, Vec<RelatedContract>>, ExecutorError> {
         let update_modification =
             match self
@@ -1876,17 +1886,20 @@ impl Executor<Runtime> {
         }
 
         // Notify network peers of state change (automatic propagation)
+        // Pass network_sender as exclude_sender to prevent echo-back to the peer who sent us this update
         if let Some(op_manager) = &self.op_manager {
             if let Err(err) = op_manager
                 .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
+                    exclude_sender: network_sender,
                 })
                 .await
             {
                 tracing::warn!(
                     contract = %key,
                     error = %err,
+                    exclude_sender = ?network_sender,
                     "Failed to broadcast state change to network peers"
                 );
             }
@@ -1910,8 +1923,9 @@ impl Executor<Runtime> {
         let new_state = {
             let start = Instant::now();
             loop {
+                // get_updated_state is only used for local mode, so no network sender to exclude
                 let state_update_res = self
-                    .attempt_state_update(parameters, &current_state, &key, &updates)
+                    .attempt_state_update(parameters, &current_state, &key, &updates, None)
                     .await?;
                 let missing = match state_update_res {
                     Either::Left(new_state) => {

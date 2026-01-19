@@ -655,6 +655,10 @@ pub(crate) enum NodeEvent {
     BroadcastStateChange {
         key: ContractKey,
         new_state: WrappedState,
+        /// The network address that sent us the update that caused this state change.
+        /// Used to prevent echo-back: we don't broadcast back to the peer who sent us the update.
+        /// None when the update originated locally (PUT, client UPDATE) or from ResyncResponse.
+        exclude_sender: Option<SocketAddr>,
     },
 }
 
@@ -752,8 +756,15 @@ impl Display for NodeEvent {
             NodeEvent::ClientDisconnected { client_id } => {
                 write!(f, "ClientDisconnected (client: {client_id})")
             }
-            NodeEvent::BroadcastStateChange { key, .. } => {
-                write!(f, "BroadcastStateChange (contract: {key})")
+            NodeEvent::BroadcastStateChange {
+                key,
+                exclude_sender,
+                ..
+            } => {
+                write!(
+                    f,
+                    "BroadcastStateChange (contract: {key}, exclude: {exclude_sender:?})"
+                )
             }
         }
     }

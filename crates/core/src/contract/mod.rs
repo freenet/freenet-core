@@ -184,6 +184,7 @@ where
                         Either::Left(state.clone()),
                         related_contracts,
                         contract,
+                        None, // PUT is locally initiated, no network sender to exclude
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
@@ -240,6 +241,7 @@ where
                 key,
                 data,
                 related_contracts,
+                network_sender,
             } => {
                 let update_value: Either<WrappedState, StateDelta<'static>> = match data {
                     freenet_stdlib::prelude::UpdateData::State(state) => {
@@ -250,7 +252,13 @@ where
                 };
                 let update_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, update_value, related_contracts, None)
+                    .upsert_contract_state(
+                        key,
+                        update_value,
+                        related_contracts,
+                        None,
+                        network_sender,
+                    )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 

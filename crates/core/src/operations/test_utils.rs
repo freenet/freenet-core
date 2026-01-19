@@ -308,6 +308,7 @@ impl TestNodeBuilder {
                     Either::Left(state),
                     RelatedContracts::default(),
                     Some(contract),
+                    None, // No network sender in tests
                 )
                 .await
                 .expect("pre-load contract");
@@ -358,6 +359,7 @@ impl TestNode {
                 Either::Left(state),
                 RelatedContracts::default(),
                 Some(contract),
+                None, // No network sender in tests
             )
             .await?;
         Ok(result)
@@ -371,7 +373,13 @@ impl TestNode {
     ) -> Result<UpsertResult, Box<dyn std::error::Error>> {
         let result = self
             .executor
-            .upsert_contract_state(key, Either::Left(state), RelatedContracts::default(), None)
+            .upsert_contract_state(
+                key,
+                Either::Left(state),
+                RelatedContracts::default(),
+                None,
+                None,
+            )
             .await?;
         Ok(result)
     }

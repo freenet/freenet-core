@@ -668,12 +668,23 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
            + Send;
 
+    /// Upsert contract state with optional network sender tracking.
+    ///
+    /// # Arguments
+    /// * `key` - The contract key
+    /// * `update` - Either a full state or a delta to apply
+    /// * `related_contracts` - Related contracts needed for validation
+    /// * `code` - Optional contract code (for PUT operations)
+    /// * `network_sender` - The network address that sent us this update (for echo-back prevention).
+    ///   When Some, the resulting BroadcastStateChange will exclude this sender.
+    ///   Should be None for local updates (PUT, client UPDATE) or ResyncResponse.
     fn upsert_contract_state(
         &mut self,
         key: ContractKey,
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
+        network_sender: Option<std::net::SocketAddr>,
     ) -> impl Future<Output = Result<UpsertResult, ExecutorError>> + Send;
 
     fn register_contract_notifier(
