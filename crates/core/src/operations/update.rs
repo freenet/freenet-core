@@ -597,6 +597,17 @@ impl Operation for UpdateOp {
                 } => {
                     use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
 
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %key,
+                            stream_id = %stream_id,
+                            "UPDATE RequestUpdateStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
                     tracing::info!(
                         tx = %id,
                         contract = %key,
@@ -744,6 +755,17 @@ impl Operation for UpdateOp {
                     total_size,
                 } => {
                     use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
+
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %key,
+                            stream_id = %stream_id,
+                            "UPDATE BroadcastToStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
 
                     let sender_addr =
                         source_addr.expect("BroadcastToStreaming requires source_addr");

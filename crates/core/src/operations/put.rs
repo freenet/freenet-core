@@ -585,6 +585,17 @@ impl Operation for PutOp {
                     skip_list,
                     subscribe: msg_subscribe,
                 } => {
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %contract_key,
+                            stream_id = %stream_id,
+                            "PUT RequestStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
                     tracing::info!(
                         tx = %id,
                         contract = %contract_key,
@@ -845,6 +856,16 @@ impl Operation for PutOp {
                     key,
                     continue_forwarding,
                 } => {
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %key,
+                            "PUT ResponseStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
                     tracing::info!(
                         tx = %id,
                         contract = %key,

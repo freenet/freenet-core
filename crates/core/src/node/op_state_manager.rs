@@ -355,9 +355,12 @@ impl OpManager {
             );
         }
 
-        // Create orphan stream registry and start GC task
+        // Create orphan stream registry (always created for transport layer)
+        // GC task only started when streaming is enabled
         let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
-        OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
+        if streaming_enabled {
+            OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
+        }
 
         Ok(Self {
             ring,
