@@ -2710,10 +2710,13 @@ impl P2pConnManager {
 
             // Phase 4: Set orphan stream registry on connection for handling race conditions
             // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+            // Only set when streaming is enabled to avoid memory leaks from uncleanable orphans.
             let mut connection = connection;
-            connection.set_orphan_stream_registry(
-                self.bridge.op_manager.orphan_stream_registry().clone(),
-            );
+            if self.bridge.op_manager.streaming_enabled {
+                connection.set_orphan_stream_registry(
+                    self.bridge.op_manager.orphan_stream_registry().clone(),
+                );
+            }
 
             // Use tokio::spawn directly instead of GlobalExecutor::spawn.
             // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't

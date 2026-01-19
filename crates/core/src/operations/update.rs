@@ -767,8 +767,18 @@ impl Operation for UpdateOp {
                         return Err(OpError::UnexpectedOpState);
                     }
 
-                    let sender_addr =
-                        source_addr.expect("BroadcastToStreaming requires source_addr");
+                    let sender_addr = match source_addr {
+                        Some(addr) => addr,
+                        None => {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %key,
+                                stream_id = %stream_id,
+                                "BroadcastToStreaming received without source_addr"
+                            );
+                            return Err(OpError::UnexpectedOpState);
+                        }
+                    };
 
                     tracing::info!(
                         tx = %id,
