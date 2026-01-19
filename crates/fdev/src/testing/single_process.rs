@@ -15,9 +15,10 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .await;
 
     let events = config.events;
-    // Virtual time to advance per event (for message delivery simulation)
-    // This is independent of real-time pacing
-    let virtual_time_per_event = config
+    // Virtual time to advance between events - this controls simulation pacing.
+    // Internal node timers (ACK checks at 100ms intervals) depend on VirtualTime
+    // advancement, so we use 200ms to ensure timers fire between events.
+    let event_wait_time = config
         .event_wait_ms
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(200));
@@ -46,13 +47,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         "Network connectivity check passed, stabilizing for {}s virtual time",
         stabilization_time.as_secs()
     );
-    // Advance 60s of virtual time in chunks, with minimal real-time delays
-    // to allow tokio tasks to process messages
+    // Advance 60s of virtual time in chunks, with real-time delays to allow
+    // tokio tasks to process messages
     for _ in 0..600 {
         simulated_network.advance_time(Duration::from_millis(100));
         tokio::task::yield_now().await;
-        // Minimal real-time sleep just for scheduler - 1ms instead of 10ms
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
@@ -61,6 +61,11 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     // Track whether events completed normally
     let mut events_completed = false;
+    let mut finalization_start: Option<std::time::Instant> = None;
+    // Finalization timeout - if peers don't shutdown within this time, proceed anyway.
+    // At scale (50+ nodes), peer shutdown can take longer than expected due to the
+    // 1-second sleep in MemoryEventsGen combined with tokio scheduler contention.
+    let finalization_timeout = Duration::from_secs(10);
 
     let join_peer_tasks = async {
         let mut futs = futures::stream::FuturesUnordered::from_iter(join_handles);
@@ -77,6 +82,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     let mut test_result = Ok(());
 
+    // Timer for continuing VirtualTime advancement after events complete.
+    // Peers may have pending operations that need time to complete for graceful shutdown.
+    // Use 1ms interval with 1 second VirtualTime advancement to rapidly process pending timers.
+    let mut finalization_timer = tokio::time::interval(Duration::from_millis(1));
+    finalization_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = &mut ctrl_c  /* SIGINT handling */ => {
@@ -91,23 +102,43 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
             } => {
                 match event {
                     Some(_event_id) => {
-                        // Advance VirtualTime to allow message delivery in the simulation
-                        // This replaces real-time sleep with simulated time progression
-                        simulated_network.advance_time(virtual_time_per_event);
-                        // Yield to let tokio tasks process delivered messages
+                        // Advance VirtualTime between events - this is CRITICAL for
+                        // simulation correctness. Internal node timers (ACK checks,
+                        // retransmissions, etc.) use VirtualTime, so we must advance it
+                        // to allow those timers to fire.
+                        simulated_network.advance_time(event_wait_time);
+                        // Yield and brief real-time sleep to let async tasks process
+                        // the messages delivered by advance_time()
                         tokio::task::yield_now().await;
-                        // Minimal real-time sleep (1ms) to prevent busy-looping
-                        // and allow the scheduler to run other tasks
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     None => {
                         tracing::info!("All {} events generated successfully", events);
                         events_completed = true;
+                        finalization_start = Some(std::time::Instant::now());
                         // Drop the stream to release the watch::Sender, which signals
                         // peers to disconnect. Without this, peers wait forever for
                         // more events and never exit their event loops.
                         stream = None;
                         // Continue to wait for peer tasks to finalize
+                    }
+                }
+            }
+            // Continue advancing VirtualTime during finalization phase.
+            // Peers may have pending operations (Put/Subscribe responses) that depend
+            // on internal timers (ACK checks at 100ms intervals). Without VirtualTime
+            // advancement, these operations never complete and peers can't shutdown.
+            _ = finalization_timer.tick(), if events_completed => {
+                // Advance 1 second of VirtualTime per tick to rapidly process pending timers
+                // and allow operations to timeout/complete. This helps with graceful shutdown.
+                simulated_network.advance_time(Duration::from_secs(1));
+                tokio::task::yield_now().await;
+
+                // Check if finalization is taking too long
+                if let Some(start) = finalization_start {
+                    if start.elapsed() > finalization_timeout {
+                        tracing::warn!("Finalization timeout reached, some peers may not have shutdown gracefully");
+                        break;
                     }
                 }
             }

@@ -35,11 +35,17 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 | `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
 | `--total-bandwidth-limit <bytes/sec>` | Total bandwidth across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection rate (prevents starvation) | 1,000,000 (1 MB/s) |
+| `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
+| `--ledbat-min-ssthresh <bytes>` | Minimum LEDBAT ssthresh floor (for high-latency paths) | None (~5.7KB algorithm default) |
+| `--bbr-startup-rate <bytes/sec>` | BBR initial sending rate (BBR algorithm only) | 25,000,000 (25 MB/s) |
 
 ### Config File (TOML)
 
 ```toml
 [network-api]
+# Congestion control algorithm selection
+congestion-control = "fixedrate"  # Options: "fixedrate" (default), "ledbat", "bbr"
+
 # Per-connection mode (traditional)
 bandwidth-limit = 10000000  # 10 MB/s per connection
 
@@ -49,6 +55,110 @@ min-bandwidth-per-connection = 1000000     # 1 MB/s minimum
 ```
 
 **Note**: If `total-bandwidth-limit` is set, it overrides `bandwidth-limit`.
+
+## LEDBAT Tuning Parameters
+
+### `--ledbat-min-ssthresh` (CRITICAL for High-Latency Paths)
+
+**Purpose:** Sets the minimum slow-start threshold (ssthresh) floor for LEDBAT++ congestion control.
+
+**Default:** None (uses algorithm-derived floor of ~5.7KB per RFC spec)
+
+**Problem Solved:** Without this parameter, LEDBAT++ can become overly conservative on high-latency paths, especially after timeouts. The default behavior causes aggressive cwnd reduction that leads to poor throughput on intercontinental or satellite connections (Issue #2578).
+
+**When to Configure:**
+- **Intercontinental connections** (>100ms RTT): 100KB-500KB
+- **Satellite links** (>500ms RTT): 500KB-2MB
+- **Cross-continent transfers** experiencing timeout storms
+- **Symptom:** Slow transfers that never recover speed after initial timeout
+
+**Calculation Guide:**
+
+The ideal value is approximately half of the Bandwidth-Delay Product (BDP):
+
+```
+min_ssthresh = BDP / 2
+where BDP = bandwidth × RTT
+```
+
+**Examples:**
+
+| Link Type | Bandwidth | RTT | BDP | Recommended min_ssthresh |
+|-----------|-----------|-----|-----|--------------------------|
+| Intercontinental fiber | 10 MB/s | 150ms | 1.5 MB | 750KB (750000) |
+| Transpacific | 5 MB/s | 200ms | 1 MB | 500KB (524288) |
+| Satellite | 2 MB/s | 600ms | 1.2 MB | 600KB (614400) |
+| Local network | 100 MB/s | 10ms | 1 MB | Not needed (default OK) |
+
+**CLI Usage:**
+
+```bash
+# Intercontinental (150ms RTT, 10 MB/s)
+freenet --ledbat-min-ssthresh 750000
+
+# Satellite link (600ms RTT, 2 MB/s)
+freenet --ledbat-min-ssthresh 614400
+```
+
+**TOML Configuration:**
+
+```toml
+[network-api]
+# For high-latency paths
+ledbat-min-ssthresh = 524288  # 500KB
+
+# Can combine with bandwidth limits
+bandwidth-limit = 10000000
+ledbat-min-ssthresh = 750000
+```
+
+**How It Works:**
+
+When LEDBAT++ detects congestion or timeout, it reduces cwnd (congestion window). The `ledbat-min-ssthresh` parameter prevents this reduction from going too low, maintaining a minimum throughput floor appropriate for your network path characteristics.
+
+**Reference:**
+- Issue #2578 - Timeout storms on high-latency paths
+- Code: `crates/core/src/config/mod.rs:805-824`
+- Related: `crates/core/src/transport/ledbat/controller.rs` (ssthresh calculation)
+
+---
+
+### `--bbr-startup-rate` (BBR Algorithm Only)
+
+**Purpose:** Sets the initial sending rate for BBR congestion control during the startup phase.
+
+**Default:** 25 MB/s (25,000,000 bytes/sec)
+
+**When to Configure:**
+- **CI/Virtualized environments:** Lower to 5-10 MB/s to avoid overwhelming virtualized NICs
+- **High-bandwidth production:** Can increase to 50-100 MB/s for faster ramp-up
+
+**Problem Solved:** BBR's aggressive startup can cause "death spiral" in constrained environments where initial packet bursts trigger drops that BBR misinterprets as path capacity.
+
+**CLI Usage:**
+
+```bash
+# Conservative for CI/VM
+freenet --bbr-startup-rate 5000000  # 5 MB/s
+
+# Aggressive for dedicated hardware
+freenet --bbr-startup-rate 50000000  # 50 MB/s
+```
+
+**TOML Configuration:**
+
+```toml
+[network-api]
+bbr-startup-rate = 10000000  # 10 MB/s for moderate startup
+```
+
+**Note:** This parameter only affects connections using BBR algorithm, not LEDBAT++ (the default).
+
+**Reference:**
+- Code: `crates/core/src/config/mod.rs:838-846`
+- Related: `crates/core/src/transport/bbr/` (BBR implementation)
+
+---
 
 ## Global Pool Mode Details
 
@@ -278,6 +388,5 @@ This happens when `min × connections > total`. Either:
 
 ## References
 
-- [Global Bandwidth Pool Design](../future/global-bandwidth-pool.md)
-- [LEDBAT Slow Start Design](../design/ledbat-slow-start.md)
+- [LEDBAT++ Implementation](../design/ledbat-plus-plus.md)
 - [RFC 6817: LEDBAT](https://tools.ietf.org/html/rfc6817)
