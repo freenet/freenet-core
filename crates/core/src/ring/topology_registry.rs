@@ -479,8 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn test_disconnected_upstream_detection() {
-        let network = "test-disconnected-upstream";
+    fn test_de_facto_source_single_seeder() {
+        // Issue #2755: When no peer is within SOURCE_THRESHOLD, a single seeder
+        // acting as tree root (has downstream, no upstream) should be recognized
+        // as a valid de-facto source, NOT flagged as disconnected upstream.
+        let network = "test-de-facto-source";
         clear_topology_snapshots(network);
 
         let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
@@ -488,9 +491,62 @@ mod tests {
         let contract_id = make_contract_id(1);
         let contract_key = make_contract_key(1);
 
-        // Create disconnected upstream: has downstream but no upstream (not source)
-        let mut snap = TopologySnapshot::new(peer, 0.3); // Location 0.3, contract at 0.5
+        // Single seeder acting as tree root: no upstream, has downstream
+        // Location 0.3, contract at 0.5, distance = 0.2 (> 0.05 threshold, not a proper source)
+        // But it's the only seeder and acting as root, so it's a valid de-facto source
+        let mut snap = TopologySnapshot::new(peer, 0.3);
         snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![downstream_peer],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            result.disconnected_upstream.is_empty(),
+            "Single seeder acting as tree root should be valid de-facto source, not disconnected"
+        );
+        assert!(result.is_healthy(), "Topology should be healthy");
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_disconnected_upstream_with_proper_source() {
+        // When a proper source EXISTS (within threshold), other seeders acting
+        // as root (no upstream, has downstream) ARE disconnected upstreams.
+        let network = "test-disconnected-with-source";
+        clear_topology_snapshots(network);
+
+        let source_peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let disconnected_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let downstream_peer: SocketAddr = "10.0.3.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Proper source: within threshold (location 0.52, contract at 0.5, distance = 0.02)
+        let mut source_snap = TopologySnapshot::new(source_peer, 0.52);
+        source_snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key: contract_key.clone(),
+                upstream: None,
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        // Disconnected peer: not a source (location 0.3, distance = 0.2), but acting as root
+        let mut disconnected_snap = TopologySnapshot::new(disconnected_peer, 0.3);
+        disconnected_snap.set_contract(
             contract_id,
             ContractSubscription {
                 contract_key,
@@ -501,12 +557,13 @@ mod tests {
             },
         );
 
-        register_topology_snapshot(network, snap);
+        register_topology_snapshot(network, source_snap);
+        register_topology_snapshot(network, disconnected_snap);
 
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
             !result.disconnected_upstream.is_empty(),
-            "Should detect disconnected upstream seeder"
+            "Should detect disconnected upstream when proper source exists"
         );
 
         clear_topology_snapshots(network);
