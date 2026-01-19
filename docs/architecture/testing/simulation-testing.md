@@ -29,6 +29,13 @@ cargo run -p fdev -- test --gateways 2 --nodes 10 --events 100 --seed 0xDEADBEEF
 
 ### Basic Test Pattern
 
+**See working examples in the codebase:**
+- `crates/core/tests/simulation_integration.rs` - Complete test suite with strict determinism validation
+- `crates/core/tests/simulation_smoke.rs:29-42` - `let_network_run()` time advancement helper
+- `crates/core/tests/sim_network.rs` - Fast CI validation tests
+
+**Example pattern:**
+
 ```rust
 use freenet::dev_tool::{SimNetwork, FaultConfig};
 use std::time::Duration;
@@ -67,7 +74,7 @@ async fn example_simulation_test() {
     }
 
     // Wait for connectivity
-    sim.check_partial_connectivity(Duration::from_secs(30), 0.8)
+    sim.check_partial_connectivity(Duration::from_secs(30), 0.8).await
         .expect("Network should connect");
 
     // Generate events

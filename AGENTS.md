@@ -132,7 +132,7 @@ cargo clippy --all-targets --all-features
 Run these in any worktree before pushing a branch or opening a PR.
 
 ## Testing Guidance
-- See `docs/TESTING.md` for mandatory scenarios and expectations.
+- See `docs/architecture/testing/README.md` and `docs/architecture/testing/simulation-testing.md` for detailed testing documentation and best practices.
 - The repository uses the special `TODO-` `MUST-FIX` marker to block commits that temporarily disable tests. If a test must be skipped, leave a `// TODO-` `MUST-FIX:` comment explaining why and create a follow-up issue.
 - Never remove or ignore failing tests without understanding the root cause.
 
@@ -142,113 +142,109 @@ The codebase uses deterministic simulation testing to ensure reproducible test r
 
 #### ❌ DON'T: Use Non-Deterministic Time Sources
 
-```rust
-// BAD - Uses real time, non-deterministic
-use std::time::Instant;
-let start = Instant::now();
-
-// BAD - Uses tokio's real time
-tokio::time::sleep(Duration::from_secs(1)).await;
-
-// BAD - tokio::time::timeout depends on real time
-tokio::time::timeout(Duration::from_secs(5), async { ... }).await;
-```
+**Avoid:**
+- `std::time::Instant::now()` - uses real wall-clock time
+- `tokio::time::sleep()` - uses tokio's real-time scheduler
+- `tokio::time::timeout()` - depends on real time progression
 
 #### ✅ DO: Use VirtualTime and TimeSource
 
-```rust
-// GOOD - Use TimeSource trait for time operations
-use crate::transport::TimeSource;
+**For time operations in components:**
+- Use `TimeSource` trait for dependency injection
+- **Example:** `crates/core/src/ring/seeding_cache.rs:76` - TimeSource injection in constructor
+- **Example:** `crates/core/src/transport/peer_connection.rs:1674` - VirtualTime initialization for testing
 
-// For sleeping in simulation tests, advance VirtualTime explicitly:
-for _ in 0..10 {
-    sim.advance_time(Duration::from_millis(100));
-    tokio::task::yield_now().await;
-}
-
-// For components that need time, inject TimeSource:
-fn new_with_time_source<T: TimeSource>(time_source: T) -> Self { ... }
-```
+**For time advancement in simulation tests:**
+- **See:** `crates/core/tests/simulation_smoke.rs:29-42` - `let_network_run()` function
+- **Pattern:** Call `sim.advance_time(step)` + `tokio::task::yield_now().await` in a loop
 
 #### ❌ DON'T: Use Non-Deterministic Random Sources
 
-```rust
-// BAD - Uses system entropy, non-deterministic
-let value: u64 = rand::random();
-
-// BAD - Creates unseeded RNG
-let mut rng = rand::thread_rng();
-```
+**Avoid:**
+- `rand::random()` - uses system entropy, non-deterministic
+- `rand::thread_rng()` - creates unseeded RNG
 
 #### ✅ DO: Use GlobalRng
 
-```rust
-// GOOD - Uses seeded RNG in simulation mode
-use crate::config::GlobalRng;
+**API Methods:**
+- `GlobalRng::random_u64()`, `random_range()` - generate random values
+- `GlobalRng::fill_bytes()` - fill byte arrays with random data
+- `GlobalRng::with_rng()` - complex RNG operations with closure
 
-// Generate random values
-let value = GlobalRng::random_u64();
-let in_range = GlobalRng::random_range(0u8..100);
-
-// Fill byte arrays
-let mut bytes = [0u8; 32];
-GlobalRng::fill_bytes(&mut bytes);
-
-// For complex RNG operations
-let result = GlobalRng::with_rng(|rng| {
-    use rand::Rng;
-    rng.random::<f64>()
-});
-```
+**Examples in codebase:**
+- `crates/core/src/ring/location.rs:68` - `random_range()` for random locations
+- `crates/core/src/transport/peer_connection.rs:1667-1669` - `fill_bytes()` for crypto keys
+- `crates/core/src/topology/small_world_rand.rs:11-14` - `with_rng()` for complex distributions
 
 #### ❌ DON'T: Use Real Network I/O in Simulation
 
-```rust
-// BAD - Real UDP socket in simulation code
-use tokio::net::UdpSocket;
-let socket = UdpSocket::bind("0.0.0.0:0").await?;
-```
+**Avoid:**
+- `tokio::net::UdpSocket` - uses real network I/O, not deterministic
 
 #### ✅ DO: Use SimulationSocket
 
-```rust
-// GOOD - In-memory socket with VirtualTime
-use crate::transport::SimulationSocket;
-let socket = SimulationSocket::bind(addr).await?;
-```
+**For simulation tests:**
+- Use `SimulationSocket` for in-memory, deterministic networking
+- **See:** `crates/core/src/transport/in_memory_socket.rs` - Full SimulationSocket implementation
+- **Pattern:** `SimulationSocket::bind(addr).await` - Same API as UdpSocket
 
 #### Key Abstractions
 
 | Concern | Abstraction | Location |
 |---------|-------------|----------|
-| Time | `TimeSource` trait, `VirtualTime`, `RealTime` | `crates/core/src/transport/` |
-| RNG | `GlobalRng` | `crates/core/src/config.rs` |
+| Time | `TimeSource` trait, `VirtualTime`, `RealTime` | `crates/core/src/simulation/` |
+| RNG | `GlobalRng`, `GlobalSimulationTime` | `crates/core/src/config/mod.rs` |
 | Sockets | `Socket` trait, `SimulationSocket` | `crates/core/src/transport/` |
-| Async execution | `GlobalExecutor` | `crates/core/src/config.rs` |
+| Async execution | `GlobalExecutor` | `crates/core/src/config/mod.rs` |
 
 #### Test Pattern: Advancing Virtual Time
 
-When migrating tests from `start_paused = true` to explicit VirtualTime:
+**For simulation tests**, use explicit VirtualTime advancement to control time progression.
 
-```rust
-// OLD PATTERN (implicit tokio paused time):
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_foo() {
-    tokio::time::sleep(Duration::from_secs(3)).await;
-}
+**Complete example:**
+- **See:** `crates/core/tests/simulation_smoke.rs:29-42` - `let_network_run()` helper function
+- **See:** `crates/core/tests/simulation_integration.rs` - Full test suite with VirtualTime
 
-// NEW PATTERN (explicit VirtualTime):
-#[tokio::test(flavor = "current_thread")]
-async fn test_foo() {
-    // Advance time explicitly, yielding to let tasks process
-    for _ in 0..30 {
-        sim.advance_time(Duration::from_millis(100));
-        tokio::task::yield_now().await;
-    }
-}
-```
+**Pattern:**
+1. Create `SimNetwork` (provides VirtualTime)
+2. Loop: `sim.advance_time(step)` + `tokio::task::yield_now().await`
+3. Optionally add small real sleep (1ms) for task scheduling
 
-This makes time progression explicit and deterministic, independent of tokio's internal time handling.
+**Important:** Simulation tests use `SimNetwork::advance_time()` for deterministic time control. This works with Turmoil's deterministic scheduler and is independent of tokio's internal time handling.
+
+**Note:** Raw tokio tests can use `#[tokio::test(start_paused = true)]`, but simulation tests should use explicit VirtualTime control for full determinism.
+
+#### GlobalSimulationTime: Deterministic Timestamps
+
+For deterministic ULID generation and timestamps in simulation tests.
+
+**API Methods:**
+- `GlobalSimulationTime::set_time_ms(ms)` - Set base simulation time
+- `GlobalSimulationTime::new_ulid()` - Generate deterministic ULID
+- `GlobalSimulationTime::current_time_ms()` - Get current simulation time
+
+**Examples in codebase:**
+- `crates/core/src/node/testing_impl.rs:2769-2776` - Seed-based time initialization in `run_simulation()`
+- `crates/core/src/message.rs:50` - `new_ulid()` usage in Transaction::new()
+
+**Note:** `GlobalSimulationTime` is automatically set by `SimNetwork::run_simulation()` based on the provided seed.
+
+#### TimeSource Behavioral Differences
+
+The `TimeSource` trait has methods with different behaviors in simulation vs. real time.
+
+**Key differences:**
+
+| Method | VirtualTime | RealTime | Reason |
+|--------|-------------|----------|--------|
+| `connection_idle_timeout()` | 24 hours | 120 seconds | Prevent premature timeout during auto-advance |
+| `supports_keepalive()` | `false` | `true` | Prevent hangs with auto-advance interactions |
+
+**Implementation:**
+- `crates/core/src/simulation/time.rs:127-129` - RealTime implementation
+- `crates/core/src/simulation/time.rs:507-514` - VirtualTime implementation
+
+**Important:** Components using TimeSource should be aware these values differ between simulation and production environments.
 
 ### Integration Testing with `freenet-test-network`
 - Use the `freenet-test-network` crate from https://github.com/freenet/freenet-test-network to spin up gateways and peers for integration tests.

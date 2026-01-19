@@ -253,6 +253,15 @@ cargo bench --bench transport_ci -- transport/streaming
 
 ## Phase 2: Piped Forwarding
 
+> **Implementation Status:**
+> ✅ **Code Complete** - Phase 2 infrastructure is fully implemented in `crates/core/src/transport/peer_connection/piped_stream.rs`
+> ⏸️ **Not Yet Integrated** - Awaiting integration into the forwarding path (marked with `#[allow(dead_code)]`)
+> 📍 **See:** `crates/core/src/transport/peer_connection.rs:1305` - `send_fragment()` method
+>
+> **Implementation History:**
+> - Phase 4 streaming handlers were implemented (PR #2734) then reverted (commit 462e6a7)
+> - Phase 2 infrastructure remains available for future integration
+
 Phase 2 enables intermediate nodes to forward fragments without full reassembly.
 
 ### Architecture
@@ -331,11 +340,13 @@ for incoming_fragment in source_stream {
 }
 ```
 
-## Future Improvements (Phase 3+)
+## Potential Future Improvements
 
-1. **Flow Control**: Backpressure from slow consumers
-2. **Memory Limits**: Cap total buffered data across streams
-3. **Metrics**: Expose fragment loss, reordering statistics
+> **Note:** These are speculative ideas for discussion, not committed roadmap items.
+
+1. **Flow Control**: Backpressure from slow consumers (Phase 3)
+2. **Memory Limits**: Cap total buffered data across all streams system-wide
+3. **Metrics**: Expose fragment loss, reordering statistics for monitoring
 
 ## Source Code
 
