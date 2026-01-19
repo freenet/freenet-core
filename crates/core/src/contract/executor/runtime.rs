@@ -790,6 +790,7 @@ impl ContractExecutor for Executor<Runtime> {
                             }
 
                             // Notify network peers of new contract state (automatic propagation)
+                            // For new contracts (PUT), we don't exclude any sender since this is locally initiated
                             if let Some(op_manager) = &self.op_manager {
                                 tracing::info!(
                                     contract = %key,
@@ -1876,6 +1877,7 @@ impl Executor<Runtime> {
         }
 
         // Notify network peers of state change (automatic propagation)
+        // Echo-back prevention is handled by summary comparison in p2p_protoc
         if let Some(op_manager) = &self.op_manager {
             if let Err(err) = op_manager
                 .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {

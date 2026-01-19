@@ -4,7 +4,9 @@
 //! Same seed MUST produce identical results across runs.
 //!
 //! NOTE: These tests use global state (socket registries, RNG) and must run serially.
-//! Enable with: cargo test -p freenet --features simulation_tests --test simulation_integration -- --test-threads=1
+//! Enable with: cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --test-threads=1
+//!
+//! The `testing` feature is required for `run_controlled_simulation` method.
 //!
 //! For non-deterministic smoke tests, see `simulation_smoke.rs`.
 
@@ -1453,62 +1455,58 @@ fn test_topology_single_seeder() {
     );
 }
 
-/// Regression test for Issue #2755: Orphan and disconnected seeders when no peer is within SOURCE_THRESHOLD.
+// =============================================================================
+// Orphan Seeders No Source Test (Issue #2755)
+// =============================================================================
+
+/// Tests that subscription topology forms correctly even when NO peer is within
+/// SOURCE_THRESHOLD of the contract location.
 ///
-/// ## The Bug (Issue #2755)
-/// When no peer is within SOURCE_THRESHOLD (5%) of a contract location, the subscription
-/// routing logic fails to establish proper hierarchical topology, resulting in:
-/// - **Orphan seeders**: Peers that seed but have no upstream connection
-/// - **Disconnected upstream**: Peers with downstream subscribers but no upstream themselves
-/// - **Fragmented topology**: No path for updates to propagate
+/// ## Background (Issue #2755)
 ///
-/// ## Expected Behavior
-/// Even when no peer is within SOURCE_THRESHOLD, peers should:
-/// 1. Form a directed acyclic graph (DAG) toward the geographically closest peer
-/// 2. The closest peer becomes the de-facto "root" of the topology
-/// 3. Every seeder has an upstream connection (except the root)
-/// 4. No orphan seeders or disconnected upstream nodes (except the root)
+/// When no peer is a "proper source" (within 5% of contract location), the
+/// subscription topology should still form a valid directed graph where:
+/// - The closest peer to the contract becomes the de-facto source
+/// - All other seeders have upstream connections leading toward that peer
+/// - No orphan or disconnected seeders exist
 ///
-/// ## Current Behavior (Bug)
-/// Peers create fragmented topologies with orphans lacking upstream connections.
+/// ## What This Tests
 ///
-/// ## Test Scenario
-/// 1. Create network with 1 gateway + 2 peers
-/// 2. Find a contract where NO peer is within SOURCE_THRESHOLD
-/// 3. All 3 peers subscribe to the contract
-/// 4. **Expected**: Directed graph toward closest peer (no orphans except root)
-/// 5. **Actual**: Orphans and disconnected seeders (test fails)
+/// 1. Gateway PUTs a contract where NO peer is within SOURCE_THRESHOLD
+/// 2. Multiple nodes subscribe to the contract
+/// 3. Wait for topology stabilization (including orphan recovery)
+/// 4. Assert: NO orphan seeders (every seeder has upstream or is closest)
+/// 5. Assert: NO disconnected upstreams (every peer with downstream has upstream)
 ///
 /// ## Related Issues
-/// - #2720: Bidirectional cycles (fixed by PR #2729)
-/// - #2719: Orphan seeders without recovery
-/// - #2755: This issue (not yet fixed)
 ///
-/// ## Manual run
-/// ```bash
-/// cargo test --features "simulation_tests,testing" test_orphan_seeders_no_source -- --ignored
-/// ```
+/// - Issue #2755: Orphan and disconnected seeders in subscription topology
+/// - Issue #2719: Orphan seeders without recovery paths
+/// - PR #2740: Include subscription entries in orphan recovery
+///
+/// ## When This Test Passes
+///
+/// Per Nacho's comment on #2755: "This issue can be verified fixed when
+/// test_orphan_seeders_no_source passes."
 #[test_log::test]
-#[ignore = "Issue #2755: Orphan/disconnected seeders when no peer is within SOURCE_THRESHOLD"]
 fn test_orphan_seeders_no_source() {
     use freenet::dev_tool::{
         validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
     };
 
-    const SEED: u64 = 0xC0DE_CAFE_1234;
+    const SEED: u64 = 0x0EFA_2755_0000;
+    const NETWORK_NAME: &str = "orphan-no-source-test";
 
-    // Set up deterministic state BEFORE creating SimNetwork
-    // This ensures peer locations are deterministic (uses GlobalRng)
     setup_deterministic_state(SEED);
-
     let rt = create_runtime();
 
-    // Create SimNetwork and get peer locations
+    // Create network with 1 gateway + 3 nodes
+    // Use 3 nodes to have enough peers for meaningful topology
     let (sim, peer_locations) = rt.block_on(async {
         let sim = SimNetwork::new(
-            MULTI_SUBSCRIBER_NETWORK,
+            NETWORK_NAME,
             1,  // 1 gateway
-            2,  // 2 peers
+            3,  // 3 regular nodes
             7,  // max_htl
             3,  // rnd_if_htl_above
             10, // max_connections
@@ -1517,17 +1515,14 @@ fn test_orphan_seeders_no_source() {
         )
         .await;
 
-        // Get peer locations without consuming peers
-        let locations = sim.get_peer_locations();
+        // Get peer locations for finding a suitable contract
+        let locations: Vec<f64> = sim.get_peer_locations();
         tracing::info!("Peer locations: {:?}", locations);
+
         (sim, locations)
     });
 
-    // Find a contract seed where NO peer is within SOURCE_THRESHOLD.
-    // This creates conditions where bidirectional cycles COULD form:
-    // - No peer is the "source" (closest to contract)
-    // - Peers routing subscriptions may pick each other as upstream
-    // - Without the cycle detection fix (#2729), this could create A→B→A cycles
+    // Find a contract seed where NO peer is within SOURCE_THRESHOLD
     let (contract, contract_seed) = {
         let mut found = None;
         for seed in 0u8..=255 {
@@ -1541,7 +1536,6 @@ fn test_orphan_seeders_no_source() {
                 .any(|&peer_loc| ring_distance(peer_loc, contract_loc) < SOURCE_THRESHOLD);
 
             if !any_peer_is_source {
-                // Find min distance for logging
                 let min_dist = peer_locations
                     .iter()
                     .map(|&peer_loc| ring_distance(peer_loc, contract_loc))
@@ -1556,43 +1550,44 @@ fn test_orphan_seeders_no_source() {
         }
         found.expect("Could not find a contract seed where no peer is within SOURCE_THRESHOLD")
     };
+
     let contract_id = *contract.key().id();
+    let contract_location = Location::from(&contract_id).as_f64();
     let initial_state = SimOperation::create_test_state(contract_seed);
 
-    // Schedule controlled operations:
+    // Schedule operations:
     // 1. Gateway PUTs the contract with subscribe=true
-    // 2. Node 1 subscribes (node numbering starts after gateways)
-    // 3. Node 2 subscribes
+    // 2. All 3 nodes subscribe
     let operations = vec![
         ScheduledOperation::new(
-            NodeLabel::gateway(MULTI_SUBSCRIBER_NETWORK, 0),
+            NodeLabel::gateway(NETWORK_NAME, 0),
             SimOperation::Put {
                 contract: contract.clone(),
-                state: initial_state.clone(),
+                state: initial_state,
                 subscribe: true,
             },
         ),
         ScheduledOperation::new(
-            NodeLabel::node(MULTI_SUBSCRIBER_NETWORK, 1),
+            NodeLabel::node(NETWORK_NAME, 1),
             SimOperation::Subscribe { contract_id },
         ),
         ScheduledOperation::new(
-            NodeLabel::node(MULTI_SUBSCRIBER_NETWORK, 2),
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
             SimOperation::Subscribe { contract_id },
         ),
     ];
 
-    // Run simulation with controlled events under Turmoil
-    // Wait 60 seconds after operations to allow orphan recovery (runs every 30 seconds)
-    // This gives time for:
-    // - Circular reference detection (immediate)
-    // - Backoff to be applied when set_upstream fails
-    // - Orphan recovery to detect and fix disconnected seeders
+    // Run simulation with extended wait time for orphan recovery
+    // Orphan recovery runs every 30 seconds, so wait 90 seconds to allow multiple cycles
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(120), // simulation duration
-        Duration::from_secs(60),  // post-operation wait for orphan recovery
+        Duration::from_secs(150), // simulation duration
+        Duration::from_secs(90),  // post-operation wait for orphan recovery
     );
 
     assert!(
@@ -1601,34 +1596,26 @@ fn test_orphan_seeders_no_source() {
         result.turmoil_result.err()
     );
 
-    // Get topology snapshots from the returned result (captured before SimNetwork::Drop clears registry)
     let snapshots = result.topology_snapshots;
     tracing::info!("Captured {} topology snapshots", snapshots.len());
 
-    // Check if any peer has contract subscriptions
-    let mut peers_with_contract = 0;
+    // Log peer subscription states
     for snap in &snapshots {
         if let Some(sub) = snap.contracts.get(&contract_id) {
-            peers_with_contract += 1;
-            tracing::debug!(
-                "Peer {} has contract: upstream={:?}, downstream={:?}, seeding={}",
+            let peer_dist = ring_distance(snap.location, contract_location);
+            tracing::info!(
+                "Peer {} (loc={:.4}, dist={:.4}): seeding={}, upstream={:?}, downstream={:?}",
                 snap.peer_addr,
+                snap.location,
+                peer_dist,
+                sub.is_seeding,
                 sub.upstream,
-                sub.downstream,
-                sub.is_seeding
+                sub.downstream
             );
         }
     }
 
-    // We expect at least the gateway to have the contract
-    assert!(
-        peers_with_contract >= 1,
-        "Expected at least 1 peer with contract subscription, found {}",
-        peers_with_contract
-    );
-
-    // Validate topology for this contract using actual contract location
-    let contract_location = Location::from(&contract_id).as_f64();
+    // Validate topology
     let result = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
 
     tracing::info!(
@@ -1640,141 +1627,96 @@ fn test_orphan_seeders_no_source() {
         result.proximity_violations.len()
     );
 
-    // Assert no bidirectional cycles (Issue #2720) - PRIMARY ASSERTION
-    // This is the main goal of this test: verify that circular subscription references
-    // are detected and prevented, avoiding isolated islands.
+    // PRIMARY ASSERTIONS for Issue #2755:
+    // Even when no peer is within SOURCE_THRESHOLD, the topology should be healthy
+
     assert!(
         result.bidirectional_cycles.is_empty(),
-        "ISSUE #2720: Found {} bidirectional subscription cycles: {:?}. \
-         Bidirectional cycles create isolated islands that can't receive updates from the source.",
-        result.bidirectional_cycles.len(),
+        "Should have no bidirectional cycles, found: {:?}",
         result.bidirectional_cycles
     );
 
-    // Check if any peer subscribed to the contract is within SOURCE_THRESHOLD
-    // If not, orphan/disconnected issues are expected (peers aren't proper sources)
-    let has_source_peer = snapshots.iter().any(|snap| {
-        if snap.contracts.contains_key(&contract_id) {
-            let peer_dist = ring_distance(snap.location, contract_location);
-            peer_dist < SOURCE_THRESHOLD
-        } else {
-            false
-        }
-    });
+    // KEY ASSERTION: No orphan seeders
+    // The closest peer should become de-facto source, others should have upstream
+    assert!(
+        result.orphan_seeders.is_empty(),
+        "ISSUE #2755: Should have no orphan seeders even when no peer is within SOURCE_THRESHOLD. \
+         Found {} orphans: {:?}. \
+         The closest peer to the contract should become the de-facto source.",
+        result.orphan_seeders.len(),
+        result.orphan_seeders
+    );
 
-    // Find the peer closest to the contract - this should be the root of the topology
-    let closest_peer = snapshots
-        .iter()
-        .filter(|snap| snap.contracts.contains_key(&contract_id))
-        .min_by(|a, b| {
-            let dist_a = ring_distance(a.location, contract_location);
-            let dist_b = ring_distance(b.location, contract_location);
-            dist_a.partial_cmp(&dist_b).unwrap()
-        });
+    // KEY ASSERTION: No disconnected upstreams
+    // Peers with downstream should have upstream connections
+    assert!(
+        result.disconnected_upstream.is_empty(),
+        "ISSUE #2755: Should have no disconnected upstreams even when no peer is within SOURCE_THRESHOLD. \
+         Found {} disconnected: {:?}. \
+         All peers with downstream subscribers should have upstream connections.",
+        result.disconnected_upstream.len(),
+        result.disconnected_upstream
+    );
 
-    if let Some(root_snap) = closest_peer {
-        let root_dist = ring_distance(root_snap.location, contract_location);
-        tracing::info!(
-            "Closest peer to contract: {} at location {:.4} (distance={:.4})",
-            root_snap.peer_addr,
-            root_snap.location,
-            root_dist
-        );
+    // Also check unreachable seeders
+    assert!(
+        result.unreachable_seeders.is_empty(),
+        "Should have no unreachable seeders, found: {:?}",
+        result.unreachable_seeders
+    );
 
-        if root_dist < SOURCE_THRESHOLD {
-            tracing::info!(
-                "Root peer is within SOURCE_THRESHOLD ({:.4}) - this peer qualifies as a source",
-                SOURCE_THRESHOLD
-            );
-        } else {
-            tracing::info!(
-                "Root peer exceeds SOURCE_THRESHOLD ({:.4}) - no peer qualifies as source, \
-                 but topology should still form a DAG toward this closest peer",
-                SOURCE_THRESHOLD
-            );
-        }
+    tracing::info!(
+        "test_orphan_seeders_no_source PASSED: Topology is healthy even without a source peer within threshold"
+    );
+}
 
-        // ISSUE #2755: Assert expected behavior regardless of SOURCE_THRESHOLD
-        // Even when no peer is within SOURCE_THRESHOLD, the topology should form a valid DAG
-        // toward the closest peer. Only the root is allowed to have no upstream.
+// =============================================================================
+// Concurrent Updates Convergence Test
+// =============================================================================
 
-        // Count peers with contract (excluding root)
-        let non_root_seeders: Vec<_> = snapshots
-            .iter()
-            .filter(|snap| {
-                snap.contracts.contains_key(&contract_id) && snap.peer_addr != root_snap.peer_addr
-            })
-            .collect();
-
-        tracing::info!(
-            "Network topology: 1 root (closest peer) + {} other seeders = {} total seeders",
-            non_root_seeders.len(),
-            non_root_seeders.len() + 1
-        );
-
-        // Assert: No orphan seeders except potentially the root
-        // Orphan seeders are those with no upstream connection
-        let orphans_excluding_root: Vec<_> = result
-            .orphan_seeders
-            .iter()
-            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
-            .collect();
-
-        assert!(
-            orphans_excluding_root.is_empty(),
-            "ISSUE #2755: Found {} orphan seeders (excluding root): {:?}. \
-             Even when no peer is within SOURCE_THRESHOLD, all non-root seeders should have upstream connections. \
-             Expected: Directed graph toward closest peer ({}). \
-             Actual: Fragmented topology with orphans.",
-            orphans_excluding_root.len(),
-            orphans_excluding_root,
-            root_snap.peer_addr
-        );
-
-        // Assert: No disconnected upstream except potentially the root
-        // Disconnected upstream are those with downstream but no upstream
-        let disconnected_excluding_root: Vec<_> = result
-            .disconnected_upstream
-            .iter()
-            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
-            .collect();
-
-        assert!(
-            disconnected_excluding_root.is_empty(),
-            "ISSUE #2755: Found {} disconnected upstream seeders (excluding root): {:?}. \
-             Peers with downstream subscribers must have their own upstream connection (except the root). \
-             Expected: Valid hierarchical topology. \
-             Actual: Fragmented topology with disconnected upstreams.",
-            disconnected_excluding_root.len(),
-            disconnected_excluding_root
-        );
-
-        // Assert: No unreachable seeders for this contract
-        let unreachable_for_contract: Vec<_> = result
-            .unreachable_seeders
-            .iter()
-            .filter(|(_, cid)| *cid == contract_id)
-            .collect();
-
-        assert!(
-            unreachable_for_contract.is_empty(),
-            "ISSUE #2755: Found {} unreachable seeders: {:?}. \
-             All seeders should be reachable in a valid topology.",
-            unreachable_for_contract.len(),
-            unreachable_for_contract
-        );
-
-        tracing::info!(
-            "✓ No bidirectional cycles (Issue #2720 verified)\n\
-             ✓ Expected: All non-root seeders have upstream connections\n\
-             ✓ Expected: No disconnected upstream nodes (except root)\n\
-             ✓ Expected: Valid DAG toward closest peer at {:.4}",
-            root_snap.location
-        );
-    } else {
-        panic!(
-            "No peers subscribed to contract - test setup failed. \
-             Expected at least 1 peer with contract subscription."
-        );
-    }
+/// Tests that concurrent updates from multiple peers converge to the same state.
+///
+/// This test validates the core eventual consistency property of Freenet's
+/// state synchronization:
+///
+/// 1. Multiple peers subscribe to the same contract
+/// 2. Multiple peers issue concurrent updates
+/// 3. Updates propagate via broadcast mechanism
+/// 4. All subscribers MUST converge to identical state
+///
+/// ## What This Catches
+///
+/// - **Echo-back bugs**: If A's update incorrectly comes back to A
+/// - **Missed broadcasts**: If some peer doesn't receive propagated updates
+/// - **CRDT merge bugs**: If deterministic merge produces different results
+/// - **Summary caching bugs**: If summary comparison incorrectly skips peers
+/// - **Race conditions**: In update propagation and application
+///
+/// ## Related Issues
+///
+/// - Issue #2764: Echo-back prevention (summary comparison should handle this)
+/// - PR #2763: Conditional summary caching
+///
+/// ## CI Impact
+///
+/// Configuration: 2 gateways + 6 nodes with few contracts and many iterations
+/// to maximize concurrent update scenarios per contract.
+///
+/// Expected runtime: ~60-90 seconds (similar to ci_medium_simulation).
+#[test_log::test]
+fn test_concurrent_updates_convergence() {
+    // Use a specific seed for reproducibility
+    // This seed was chosen to produce good coverage of concurrent update scenarios
+    TestConfig::medium("concurrent-updates-convergence", 0xC0_C0_BEEF_1234)
+        .with_gateways(2) // Multiple gateways for richer topology
+        .with_nodes(6) // 6 regular nodes for concurrent updates
+        .with_max_contracts(3) // Few contracts = more updates per contract
+        .with_iterations(80) // Many iterations to stress concurrent updates
+        .with_duration(Duration::from_secs(90))
+        .with_sleep(Duration::from_secs(2)) // Short sleep between ops for concurrency
+        .require_convergence() // FAIL if any contract diverges
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence();
 }

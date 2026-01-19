@@ -261,6 +261,10 @@ impl Operation for UpdateOp {
                             let hash_before = state_before.as_ref().map(state_hash_full);
 
                             // Update contract locally
+                            // Note: RequestUpdate sender should NOT be excluded from broadcast.
+                            // Unlike BroadcastTo (where sender has the state), RequestUpdate sender
+                            // is REQUESTING we apply an update and needs to receive the result
+                            // via subscription to notify their client.
                             let UpdateExecution {
                                 value: updated_value,
                                 summary,

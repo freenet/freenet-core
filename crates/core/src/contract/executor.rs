@@ -668,6 +668,13 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
            + Send;
 
+    /// Upsert contract state.
+    ///
+    /// # Arguments
+    /// * `key` - The contract key
+    /// * `update` - Either a full state or a delta to apply
+    /// * `related_contracts` - Related contracts needed for validation
+    /// * `code` - Optional contract code (for PUT operations)
     fn upsert_contract_state(
         &mut self,
         key: ContractKey,

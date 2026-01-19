@@ -340,8 +340,7 @@ where
         };
 
         // Emit BroadcastStateChange for Updated and CurrentWon cases.
-        // - Updated: Our state changed, notify peers so they can update
-        // - CurrentWon: Our state won the merge, notify peers so they update to our state
+        // Echo-back prevention is handled by summary comparison in p2p_protoc.
         if let Ok(ref upsert_result) = result {
             match upsert_result {
                 UpsertResult::Updated(state) | UpsertResult::CurrentWon(state) => {

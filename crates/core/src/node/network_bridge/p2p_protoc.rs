@@ -1706,7 +1706,9 @@ impl P2pConnManager {
                                     .await;
                             }
                             NodeEvent::BroadcastStateChange { key, new_state } => {
-                                // Automatic network peer notification when state changes
+                                // Automatic network peer notification when state changes.
+                                // Echo-back is prevented by summary comparison: we skip peers
+                                // whose cached summary matches ours (they already have our state).
                                 tracing::debug!(
                                     contract = %key,
                                     state_size = new_state.size(),
