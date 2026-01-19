@@ -1246,8 +1246,8 @@ fn ring_distance(a: f64, b: f64) -> f64 {
 /// 5. Verify: no topology issues (no cycles since only one subscriber)
 ///
 /// ## Related
-/// - For the multi-subscriber test that detects #2720, see `test_bidirectional_cycle`
-/// - This test runs in CI while #2720 remains open
+/// - For Issue #2720 (bidirectional cycles), that bug is now fixed
+/// - For Issue #2755 (orphan/disconnected seeders), see `test_orphan_seeders_no_source` (ignored)
 #[test_log::test]
 fn test_topology_single_seeder() {
     use freenet::dev_tool::{
@@ -1453,36 +1453,44 @@ fn test_topology_single_seeder() {
     );
 }
 
-/// Regression test for Issue #2720: Bidirectional subscription cycles.
+/// Regression test for Issue #2755: Orphan and disconnected seeders when no peer is within SOURCE_THRESHOLD.
 ///
-/// This test validates that the fixes for bidirectional subscription cycles work correctly:
-/// - PR #2729: Circular reference detection in `set_upstream`/`add_downstream`
-/// - PR #2748: Backoff when `set_upstream` fails (enables eventual recovery)
-/// - PR #2740: Orphan recovery detects contracts in subscriptions
+/// ## The Bug (Issue #2755)
+/// When no peer is within SOURCE_THRESHOLD (5%) of a contract location, the subscription
+/// routing logic fails to establish proper hierarchical topology, resulting in:
+/// - **Orphan seeders**: Peers that seed but have no upstream connection
+/// - **Disconnected upstream**: Peers with downstream subscribers but no upstream themselves
+/// - **Fragmented topology**: No path for updates to propagate
 ///
-/// ## Scenario
-/// 1. Gateway PUTs a contract with subscribe=true (becomes the source)
-/// 2. Node 1 subscribes to the same contract
-/// 3. Node 2 subscribes to the same contract
-/// 4. Wait for topology to stabilize (includes time for orphan recovery if needed)
-/// 5. Verify: topology has no cycles, orphans, or disconnected upstreams
+/// ## Expected Behavior
+/// Even when no peer is within SOURCE_THRESHOLD, peers should:
+/// 1. Form a directed acyclic graph (DAG) toward the geographically closest peer
+/// 2. The closest peer becomes the de-facto "root" of the topology
+/// 3. Every seeder has an upstream connection (except the root)
+/// 4. No orphan seeders or disconnected upstream nodes (except the root)
 ///
-/// ## What this validates
-/// - Circular references are detected and rejected (cycles=0)
-/// - Peers that fail to set upstream get backoff applied
-/// - The topology forms a valid directed acyclic graph toward the source
+/// ## Current Behavior (Bug)
+/// Peers create fragmented topologies with orphans lacking upstream connections.
 ///
-/// ## Related
-/// - Issue #2720: https://github.com/freenet/freenet-core/issues/2720
-/// - Issue #2741: https://github.com/freenet/freenet-core/issues/2741
-/// - For a simpler topology test, see `test_topology_single_seeder`
+/// ## Test Scenario
+/// 1. Create network with 1 gateway + 2 peers
+/// 2. Find a contract where NO peer is within SOURCE_THRESHOLD
+/// 3. All 3 peers subscribe to the contract
+/// 4. **Expected**: Directed graph toward closest peer (no orphans except root)
+/// 5. **Actual**: Orphans and disconnected seeders (test fails)
+///
+/// ## Related Issues
+/// - #2720: Bidirectional cycles (fixed by PR #2729)
+/// - #2719: Orphan seeders without recovery
+/// - #2755: This issue (not yet fixed)
 ///
 /// ## Manual run
 /// ```bash
-/// cargo test --features "simulation_tests,testing" test_bidirectional_cycle
+/// cargo test --features "simulation_tests,testing" test_orphan_seeders_no_source -- --ignored
 /// ```
 #[test_log::test]
-fn test_bidirectional_cycle() {
+#[ignore = "Issue #2755: Orphan/disconnected seeders when no peer is within SOURCE_THRESHOLD"]
+fn test_orphan_seeders_no_source() {
     use freenet::dev_tool::{
         validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
     };
@@ -1654,78 +1662,119 @@ fn test_bidirectional_cycle() {
         }
     });
 
-    if has_source_peer {
-        // When we have a proper source peer, log topology health
+    // Find the peer closest to the contract - this should be the root of the topology
+    let closest_peer = snapshots
+        .iter()
+        .filter(|snap| snap.contracts.contains_key(&contract_id))
+        .min_by(|a, b| {
+            let dist_a = ring_distance(a.location, contract_location);
+            let dist_b = ring_distance(b.location, contract_location);
+            dist_a.partial_cmp(&dist_b).unwrap()
+        });
+
+    if let Some(root_snap) = closest_peer {
+        let root_dist = ring_distance(root_snap.location, contract_location);
         tracing::info!(
-            "Network has source peer(s) within SOURCE_THRESHOLD - checking topology health"
+            "Closest peer to contract: {} at location {:.4} (distance={:.4})",
+            root_snap.peer_addr,
+            root_snap.location,
+            root_dist
         );
 
-        // Log orphan/disconnected/unreachable issues for debugging (Issue #2719)
-        // These are separate issues from the bidirectional cycle fix (#2720)
-        if !result.orphan_seeders.is_empty() {
-            tracing::warn!(
-                "ISSUE #2719: Found {} orphan seeders: {:?}. \
-                 This is a separate issue from bidirectional cycles.",
-                result.orphan_seeders.len(),
-                result.orphan_seeders
-            );
-        }
-        if !result.disconnected_upstream.is_empty() {
-            tracing::warn!(
-                "Found {} disconnected upstream seeders: {:?}.",
-                result.disconnected_upstream.len(),
-                result.disconnected_upstream
-            );
-        }
-        if !result.unreachable_seeders.is_empty() {
-            tracing::warn!(
-                "Found {} unreachable seeders: {:?}.",
-                result.unreachable_seeders.len(),
-                result.unreachable_seeders
-            );
-        }
-
-        if result.is_healthy() {
+        if root_dist < SOURCE_THRESHOLD {
             tracing::info!(
-                "Topology is fully healthy - no orphans, disconnected, or unreachable seeders"
+                "Root peer is within SOURCE_THRESHOLD ({:.4}) - this peer qualifies as a source",
+                SOURCE_THRESHOLD
             );
         } else {
-            tracing::warn!(
-                "Topology has {} issues (orphan/disconnected/unreachable) - \
-                 these are tracked separately from the bidirectional cycle fix",
-                result.issue_count
+            tracing::info!(
+                "Root peer exceeds SOURCE_THRESHOLD ({:.4}) - no peer qualifies as source, \
+                 but topology should still form a DAG toward this closest peer",
+                SOURCE_THRESHOLD
             );
         }
 
-        tracing::info!("Bidirectional cycle regression test passed (Issue #2720: cycles=0)");
-    } else {
-        // When no peer is within SOURCE_THRESHOLD, orphan/disconnected issues are expected
-        // because no one is a proper "source" for the contract
-        tracing::warn!(
-            "No peer is within SOURCE_THRESHOLD ({:.4}) of contract location ({:.4}). \
-             Orphan/disconnected issues are expected - the primary assertion (no cycles) passed.",
-            SOURCE_THRESHOLD,
-            contract_location
-        );
+        // ISSUE #2755: Assert expected behavior regardless of SOURCE_THRESHOLD
+        // Even when no peer is within SOURCE_THRESHOLD, the topology should form a valid DAG
+        // toward the closest peer. Only the root is allowed to have no upstream.
 
-        if !result.orphan_seeders.is_empty() {
-            tracing::info!(
-                "Expected: {} orphan seeders (no peer qualifies as source): {:?}",
-                result.orphan_seeders.len(),
-                result.orphan_seeders
-            );
-        }
-        if !result.disconnected_upstream.is_empty() {
-            tracing::info!(
-                "Expected: {} disconnected upstream seeders: {:?}",
-                result.disconnected_upstream.len(),
-                result.disconnected_upstream
-            );
-        }
+        // Count peers with contract (excluding root)
+        let non_root_seeders: Vec<_> = snapshots
+            .iter()
+            .filter(|snap| {
+                snap.contracts.contains_key(&contract_id) && snap.peer_addr != root_snap.peer_addr
+            })
+            .collect();
 
         tracing::info!(
-            "Bidirectional cycle regression test passed (Issue #2720 is fixed!) - \
-             topology has expected orphan issues due to no source peer"
+            "Network topology: 1 root (closest peer) + {} other seeders = {} total seeders",
+            non_root_seeders.len(),
+            non_root_seeders.len() + 1
+        );
+
+        // Assert: No orphan seeders except potentially the root
+        // Orphan seeders are those with no upstream connection
+        let orphans_excluding_root: Vec<_> = result
+            .orphan_seeders
+            .iter()
+            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
+            .collect();
+
+        assert!(
+            orphans_excluding_root.is_empty(),
+            "ISSUE #2755: Found {} orphan seeders (excluding root): {:?}. \
+             Even when no peer is within SOURCE_THRESHOLD, all non-root seeders should have upstream connections. \
+             Expected: Directed graph toward closest peer ({}). \
+             Actual: Fragmented topology with orphans.",
+            orphans_excluding_root.len(),
+            orphans_excluding_root,
+            root_snap.peer_addr
+        );
+
+        // Assert: No disconnected upstream except potentially the root
+        // Disconnected upstream are those with downstream but no upstream
+        let disconnected_excluding_root: Vec<_> = result
+            .disconnected_upstream
+            .iter()
+            .filter(|(addr, cid)| *addr != root_snap.peer_addr && *cid == contract_id)
+            .collect();
+
+        assert!(
+            disconnected_excluding_root.is_empty(),
+            "ISSUE #2755: Found {} disconnected upstream seeders (excluding root): {:?}. \
+             Peers with downstream subscribers must have their own upstream connection (except the root). \
+             Expected: Valid hierarchical topology. \
+             Actual: Fragmented topology with disconnected upstreams.",
+            disconnected_excluding_root.len(),
+            disconnected_excluding_root
+        );
+
+        // Assert: No unreachable seeders for this contract
+        let unreachable_for_contract: Vec<_> = result
+            .unreachable_seeders
+            .iter()
+            .filter(|(_, cid)| *cid == contract_id)
+            .collect();
+
+        assert!(
+            unreachable_for_contract.is_empty(),
+            "ISSUE #2755: Found {} unreachable seeders: {:?}. \
+             All seeders should be reachable in a valid topology.",
+            unreachable_for_contract.len(),
+            unreachable_for_contract
+        );
+
+        tracing::info!(
+            "✓ No bidirectional cycles (Issue #2720 verified)\n\
+             ✓ Expected: All non-root seeders have upstream connections\n\
+             ✓ Expected: No disconnected upstream nodes (except root)\n\
+             ✓ Expected: Valid DAG toward closest peer at {:.4}",
+            root_snap.location
+        );
+    } else {
+        panic!(
+            "No peers subscribed to contract - test setup failed. \
+             Expected at least 1 peer with contract subscription."
         );
     }
 }
