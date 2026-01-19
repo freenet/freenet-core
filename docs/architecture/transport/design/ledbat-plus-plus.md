@@ -829,9 +829,7 @@ Our implementation is **more gradual** than the spec but achieves the same fairn
 2. **RFC 6817** - Low Extra Delay Background Transport (LEDBAT)
    https://datatracker.ietf.org/doc/html/rfc6817
 
-3. **Freenet LEDBAT Slow Start Design** - `docs/architecture/transport/design/ledbat-slow-start.md`
-
-4. **Source Code** - `crates/core/src/transport/ledbat.rs`
+3. **Source Code** - `crates/core/src/transport/ledbat/` (LEDBAT++ controller, slow start, periodic slowdowns)
 
 ---
 

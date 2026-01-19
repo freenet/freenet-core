@@ -35,6 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 | `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
 | `--total-bandwidth-limit <bytes/sec>` | Total bandwidth across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection rate (prevents starvation) | 1,000,000 (1 MB/s) |
+| `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
 | `--ledbat-min-ssthresh <bytes>` | Minimum LEDBAT ssthresh floor (for high-latency paths) | None (~5.7KB algorithm default) |
 | `--bbr-startup-rate <bytes/sec>` | BBR initial sending rate (BBR algorithm only) | 25,000,000 (25 MB/s) |
 
@@ -42,6 +43,9 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 ```toml
 [network-api]
+# Congestion control algorithm selection
+congestion-control = "fixedrate"  # Options: "fixedrate" (default), "ledbat", "bbr"
+
 # Per-connection mode (traditional)
 bandwidth-limit = 10000000  # 10 MB/s per connection
 
@@ -384,6 +388,5 @@ This happens when `min × connections > total`. Either:
 
 ## References
 
-- [Global Bandwidth Pool Design](../design/global-bandwidth-pool.md)
-- [LEDBAT Slow Start Design](../design/ledbat-slow-start.md)
+- [LEDBAT++ Implementation](../design/ledbat-plus-plus.md)
 - [RFC 6817: LEDBAT](https://tools.ietf.org/html/rfc6817)

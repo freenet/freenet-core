@@ -35,9 +35,7 @@ Essential architecture documentation for understanding the transport layer.
 How the transport layer is designed and why.
 
 - **[LEDBAT++ Implementation](design/ledbat-plus-plus.md)** - LEDBAT++ congestion control with periodic slowdowns, dynamic GAIN, and real-world behavior analysis at different latencies
-- **[LEDBAT Slow Start Design](design/ledbat-slow-start.md)** - Original slow start design rationale and integration architecture
 - **[Streaming Infrastructure](design/streaming-infrastructure.md)** - Lock-free fragment reassembly, `futures::Stream` API, and concurrent consumer support
-- **[Global Bandwidth Pool](design/global-bandwidth-pool.md)** - ✅ **IMPLEMENTED** - Fair bandwidth sharing across all connections with atomic connection counting
 
 ### Analysis & Results
 Performance analysis and empirical results.
@@ -66,7 +64,20 @@ Historical baselines and validation results from development.
 
 The transport layer supports multiple congestion control algorithms for different network conditions:
 
-### LEDBAT++ (Default)
+### FixedRate (Default)
+**Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/congestion_control.rs`
+
+Non-adaptive rate control that transmits at a fixed 100 Mbps rate.
+
+**Use case:** Default for production deployments (most stable)
+- Fixed sending rate regardless of network conditions
+- Predictable bandwidth usage
+- No complex congestion feedback
+- Suitable for stable, well-provisioned networks
+
+**Default behavior:** When no `--congestion-control` parameter is specified, FixedRate is used.
+
+### LEDBAT++
 **Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/ledbat/`
 
 Low Extra Delay Background Transport with periodic slowdowns (draft-irtf-iccrg-ledbat-plus-plus).
@@ -79,7 +90,9 @@ Low Extra Delay Background Transport with periodic slowdowns (draft-irtf-iccrg-l
 
 **Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s with default token bucket limit)
 
-**Documentation:** [LEDBAT++ Implementation](design/ledbat-plus-plus.md), [Slow Start Design](design/ledbat-slow-start.md)
+**Documentation:** [LEDBAT++ Implementation](design/ledbat-plus-plus.md)
+
+**Enable:** `--congestion-control ledbat`
 
 ### BBRv3
 **Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/bbr/`
@@ -96,21 +109,30 @@ Model-based congestion control optimized for lossy/high-latency paths (Google BB
 
 **Note:** Merged in PR #2674 as an alternative to LEDBAT for specific network scenarios
 
-### FixedRate
-**Status:** ✅ **IMPLEMENTED** | **Code:** `crates/core/src/transport/congestion_control.rs`
-
-Non-adaptive rate control for testing and baseline measurements.
-
-**Use case:** Benchmarking and controlled testing environments
-- Fixed sending rate regardless of network conditions
-- Useful for establishing performance baselines
-- Not recommended for production use
+**Enable:** `--congestion-control bbr`
 
 ### Selection
 
-Congestion control algorithm is configured per connection. Default is LEDBAT++.
+The congestion control algorithm is configured globally and applies to all connections:
 
-**Code reference:** `crates/core/src/transport/congestion_control.rs:70-90` (CongestionControlAlgorithm enum)
+```bash
+# Default (FixedRate)
+freenet
+
+# Use LEDBAT++
+freenet --congestion-control ledbat
+
+# Use BBR
+freenet --congestion-control bbr
+```
+
+**Config file (TOML):**
+```toml
+[network-api]
+congestion-control = "ledbat"  # or "bbr" or "fixedrate"
+```
+
+**Code reference:** `crates/core/src/config/mod.rs:1075-1077` (default), `crates/core/src/config/mod.rs:1013-1017` (selection logic)
 
 ## Quick Reference
 
