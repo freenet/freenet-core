@@ -1729,3 +1729,54 @@ fn test_bidirectional_cycle() {
         );
     }
 }
+
+// =============================================================================
+// Concurrent Updates Convergence Test
+// =============================================================================
+
+/// Tests that concurrent updates from multiple peers converge to the same state.
+///
+/// This test validates the core eventual consistency property of Freenet's
+/// state synchronization:
+///
+/// 1. Multiple peers subscribe to the same contract
+/// 2. Multiple peers issue concurrent updates
+/// 3. Updates propagate via broadcast mechanism
+/// 4. All subscribers MUST converge to identical state
+///
+/// ## What This Catches
+///
+/// - **Echo-back bugs**: If A's update incorrectly comes back to A
+/// - **Missed broadcasts**: If some peer doesn't receive propagated updates
+/// - **CRDT merge bugs**: If deterministic merge produces different results
+/// - **Summary caching bugs**: If summary comparison incorrectly skips peers
+/// - **Race conditions**: In update propagation and application
+///
+/// ## Related Issues
+///
+/// - Issue #2764: Echo-back prevention (summary comparison should handle this)
+/// - PR #2763: Conditional summary caching
+///
+/// ## CI Impact
+///
+/// Configuration: 2 gateways + 6 nodes with few contracts and many iterations
+/// to maximize concurrent update scenarios per contract.
+///
+/// Expected runtime: ~60-90 seconds (similar to ci_medium_simulation).
+#[test_log::test]
+fn test_concurrent_updates_convergence() {
+    // Use a specific seed for reproducibility
+    // This seed was chosen to produce good coverage of concurrent update scenarios
+    TestConfig::medium("concurrent-updates-convergence", 0xC0_C0_BEEF_1234)
+        .with_gateways(2) // Multiple gateways for richer topology
+        .with_nodes(6) // 6 regular nodes for concurrent updates
+        .with_max_contracts(3) // Few contracts = more updates per contract
+        .with_iterations(80) // Many iterations to stress concurrent updates
+        .with_duration(Duration::from_secs(90))
+        .with_sleep(Duration::from_secs(2)) // Short sleep between ops for concurrency
+        .require_convergence() // FAIL if any contract diverges
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence();
+}
