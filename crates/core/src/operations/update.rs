@@ -484,10 +484,14 @@ impl Operation for UpdateOp {
                         Err(err) => {
                             if is_delta {
                                 // Delta application failed - send ResyncRequest to get full state
+                                // This is a critical debugging event for state divergence issues
                                 tracing::warn!(
+                                    tx = %id,
                                     contract = %key,
+                                    sender = %sender_addr,
                                     error = %err,
-                                    "Delta application failed, sending ResyncRequest"
+                                    event = "delta_apply_failed",
+                                    "Delta application failed, sending ResyncRequest to get full state"
                                 );
 
                                 // Clear cached summary for sender since it's out of sync
@@ -506,6 +510,13 @@ impl Operation for UpdateOp {
                                 }
 
                                 // Send ResyncRequest to sender
+                                tracing::info!(
+                                    tx = %id,
+                                    contract = %key,
+                                    target = %sender_addr,
+                                    event = "resync_request_sent",
+                                    "Sending ResyncRequest to peer after delta failure"
+                                );
                                 let _ = op_manager
                                     .notify_node_event(
                                         crate::message::NodeEvent::SendInterestMessage {

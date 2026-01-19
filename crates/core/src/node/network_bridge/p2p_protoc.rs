@@ -1792,7 +1792,9 @@ impl P2pConnManager {
                                     }
 
                                     // Compute delta if we have their summary (uses memoization cache)
-                                    let payload = match (&our_summary, &their_summary) {
+                                    // Track whether we successfully computed a delta vs sent full state
+                                    let (payload, sent_delta) = match (&our_summary, &their_summary)
+                                    {
                                         (Some(ours), Some(theirs)) => {
                                             match op_manager
                                                 .interest_manager
@@ -1805,25 +1807,32 @@ impl P2pConnManager {
                                                 )
                                                 .await
                                             {
-                                                Ok(delta) => {
+                                                Ok(delta) => (
                                                     crate::message::DeltaOrFullState::Delta(
                                                         delta.as_ref().to_vec(),
-                                                    )
-                                                }
+                                                    ),
+                                                    true,
+                                                ),
                                                 Err(err) => {
                                                     tracing::debug!(
                                                         contract = %key,
                                                         error = %err,
                                                         "Delta computation failed, falling back to full state"
                                                     );
-                                                    crate::message::DeltaOrFullState::FullState(
-                                                        new_state.as_ref().to_vec(),
+                                                    (
+                                                        crate::message::DeltaOrFullState::FullState(
+                                                            new_state.as_ref().to_vec(),
+                                                        ),
+                                                        false,
                                                     )
                                                 }
                                             }
                                         }
-                                        _ => crate::message::DeltaOrFullState::FullState(
-                                            new_state.as_ref().to_vec(),
+                                        _ => (
+                                            crate::message::DeltaOrFullState::FullState(
+                                                new_state.as_ref().to_vec(),
+                                            ),
+                                            false,
                                         ),
                                     };
 
@@ -1845,8 +1854,17 @@ impl P2pConnManager {
                                             error = %err,
                                             "Failed to send state change broadcast"
                                         );
-                                    } else {
-                                        // Update cached summary for successful send
+                                    } else if sent_delta {
+                                        // Only update cached summary when we sent a delta.
+                                        // Delta sends mean we had accurate knowledge of the peer's previous state,
+                                        // so after they apply our delta, they should have our current state.
+                                        //
+                                        // We do NOT update when sending full state because:
+                                        // 1. The peer's resulting state depends on CRDT merge with their existing state
+                                        // 2. We don't know what state they had, so we can't predict the merge result
+                                        //
+                                        // This prevents echo-back loops: after A sends delta to B, A caches that
+                                        // B has A's state, so subsequent broadcasts won't redundantly send to B.
                                         if let Some(summary) = &our_summary {
                                             op_manager.interest_manager.update_peer_summary(
                                                 &key,

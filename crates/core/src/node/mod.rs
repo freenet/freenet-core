@@ -1326,6 +1326,7 @@ async fn handle_interest_sync_message(
             tracing::info!(
                 from = %source,
                 contract = %key,
+                event = "resync_request_received",
                 "Received ResyncRequest - peer needs full state"
             );
 
@@ -1357,10 +1358,12 @@ async fn handle_interest_sync_message(
                 return None;
             };
 
-            tracing::debug!(
+            tracing::info!(
+                to = %source,
                 contract = %key,
                 state_size = state.as_ref().len(),
                 summary_size = summary.as_ref().len(),
+                event = "resync_response_sent",
                 "Sending ResyncResponse with full state"
             );
 
@@ -1380,6 +1383,7 @@ async fn handle_interest_sync_message(
                 from = %source,
                 contract = %key,
                 state_size = state_bytes.len(),
+                event = "resync_response_received",
                 "Received ResyncResponse with full state"
             );
 
@@ -1400,21 +1404,37 @@ async fn handle_interest_sync_message(
                 Ok(ContractHandlerEvent::UpdateResponse {
                     new_value: Ok(_), ..
                 }) => {
-                    tracing::debug!(contract = %key, "ResyncResponse state applied successfully");
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = true,
+                        "ResyncResponse state applied successfully"
+                    );
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                    tracing::debug!(contract = %key, "ResyncResponse state unchanged");
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = false,
+                        "ResyncResponse state unchanged (already had this state)"
+                    );
                 }
                 Ok(other) => {
                     tracing::warn!(
+                        from = %source,
                         contract = %key,
+                        event = "resync_failed",
                         response = ?other,
                         "Unexpected response to resync update"
                     );
                 }
                 Err(e) => {
                     tracing::error!(
+                        from = %source,
                         contract = %key,
+                        event = "resync_failed",
                         error = %e,
                         "Failed to apply resync state"
                     );
