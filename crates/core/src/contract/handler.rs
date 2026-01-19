@@ -482,11 +482,6 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         data: UpdateData<'static>,
         related_contracts: RelatedContracts<'static>,
-        /// The network address that sent us this update (from BroadcastTo message).
-        /// Used for echo-back prevention: after applying the update, the executor
-        /// includes this in BroadcastStateChange so we don't send back to the sender.
-        /// None when the update originated locally (client UPDATE request).
-        network_sender: Option<std::net::SocketAddr>,
     },
     /// The response to an update query
     UpdateResponse {

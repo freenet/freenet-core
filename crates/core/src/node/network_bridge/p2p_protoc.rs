@@ -1705,18 +1705,13 @@ impl P2pConnManager {
                                     .send_prune_notifications(result.prune_notifications)
                                     .await;
                             }
-                            NodeEvent::BroadcastStateChange {
-                                key,
-                                new_state,
-                                exclude_sender,
-                            } => {
-                                // Automatic network peer notification when state changes
-                                // exclude_sender is set when this update came from a network peer,
-                                // to prevent echo-back to the sender
+                            NodeEvent::BroadcastStateChange { key, new_state } => {
+                                // Automatic network peer notification when state changes.
+                                // Echo-back is prevented by summary comparison: we skip peers
+                                // whose cached summary matches ours (they already have our state).
                                 tracing::debug!(
                                     contract = %key,
                                     state_size = new_state.size(),
-                                    ?exclude_sender,
                                     "BroadcastStateChange event received"
                                 );
                                 let self_addr = op_manager.ring.connection_manager.get_own_addr();
@@ -1775,16 +1770,6 @@ impl P2pConnManager {
                                     let Some(peer_addr) = target.socket_addr() else {
                                         continue;
                                     };
-
-                                    // Skip the peer who sent us this update (echo-back prevention)
-                                    if exclude_sender == Some(peer_addr) {
-                                        tracing::debug!(
-                                            contract = %key,
-                                            excluded_peer = %peer_addr,
-                                            "Skipping broadcast to sender (echo-back prevention)"
-                                        );
-                                        continue;
-                                    }
 
                                     let peer_key =
                                         crate::ring::PeerKey::from(target.pub_key().clone());

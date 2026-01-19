@@ -275,7 +275,6 @@ impl Operation for UpdateOp {
                                 *key,
                                 UpdateData::State(State::from(value.clone())),
                                 related_contracts.clone(),
-                                None, // Don't exclude - sender needs the result
                             )
                             .await?;
 
@@ -475,16 +474,9 @@ impl Operation for UpdateOp {
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let is_delta = matches!(payload, crate::message::DeltaOrFullState::Delta(_));
-                    // Pass sender_addr for echo-back prevention - after applying this update,
-                    // we won't broadcast back to the peer who sent it to us
-                    let update_result = update_contract(
-                        op_manager,
-                        *key,
-                        update_data,
-                        RelatedContracts::default(),
-                        Some(sender_addr),
-                    )
-                    .await;
+                    let update_result =
+                        update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                            .await;
 
                     let UpdateExecution {
                         value: updated_value,
@@ -831,16 +823,11 @@ fn build_op_result(
 /// The `update_data` parameter can be:
 /// - `UpdateData::Delta(delta)` - A delta from the client, merged with current state
 /// - `UpdateData::State(state)` - A full state from PUT or executor
-///
-/// The `network_sender` parameter is the address of the peer who sent us this update.
-/// Used for echo-back prevention: after applying the update, we don't broadcast back to this sender.
-/// Should be `Some(addr)` for network-received updates and `None` for locally-initiated updates.
 async fn update_contract(
     op_manager: &OpManager,
     key: ContractKey,
     update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
-    network_sender: Option<std::net::SocketAddr>,
 ) -> Result<UpdateExecution, OpError> {
     let previous_state = match op_manager
         .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -868,7 +855,6 @@ async fn update_contract(
             key,
             data: update_data.clone(),
             related_contracts,
-            network_sender,
         })
         .await
     {
@@ -1167,13 +1153,12 @@ pub(crate) async fn request_update(
             // 2. Either seeding the contract OR has subscribers (verified above)
             // Note: This handles both truly isolated nodes and nodes where subscribers exist
             // but no suitable remote caching peer was found.
-            // network_sender is None because this is a locally-initiated update
             let UpdateExecution {
                 value: _updated_value,
                 summary,
                 changed,
                 ..
-            } = update_contract(op_manager, key, update_data, related_contracts, None).await?;
+            } = update_contract(op_manager, key, update_data, related_contracts).await?;
 
             tracing::debug!(
                 tx = %id,
@@ -1221,7 +1206,6 @@ pub(crate) async fn request_update(
 
     // Apply update locally - this ensures the initiating peer serves the updated state
     // even if the remote UPDATE times out or fails
-    // network_sender is None because this is a locally-initiated update
     let UpdateExecution {
         value: updated_value,
         summary,
@@ -1232,7 +1216,6 @@ pub(crate) async fn request_update(
         key,
         update_data.clone(),
         related_contracts.clone(),
-        None,
     )
     .await
     .map_err(|e| {

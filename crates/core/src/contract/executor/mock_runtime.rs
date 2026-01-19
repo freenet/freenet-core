@@ -107,26 +107,17 @@ where
 
     /// Emit BroadcastStateChange to notify network peers of state change.
     /// Called when state is updated or when our state wins a CRDT merge.
-    ///
-    /// `exclude_sender` is passed through to prevent echo-back to the peer who sent us the update.
-    async fn broadcast_state_change(
-        &self,
-        key: ContractKey,
-        state: &WrappedState,
-        exclude_sender: Option<std::net::SocketAddr>,
-    ) {
+    async fn broadcast_state_change(&self, key: ContractKey, state: &WrappedState) {
         if let Some(op_manager) = &self.op_manager {
             tracing::debug!(
                 contract = %key,
                 state_size = state.size(),
-                ?exclude_sender,
                 "MockRuntime: Emitting BroadcastStateChange"
             );
             if let Err(err) = op_manager
                 .notify_node_event(NodeEvent::BroadcastStateChange {
                     key,
                     new_state: state.clone(),
-                    exclude_sender,
                 })
                 .await
             {
@@ -187,7 +178,6 @@ where
         state: Either<WrappedState, StateDelta<'static>>,
         _related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-        _network_sender: Option<std::net::SocketAddr>,
     ) -> Result<UpsertResult, ExecutorError> {
         // Mock runtime implements a simple CRDT-like merge strategy to ensure
         // deterministic convergence in simulation tests:
@@ -350,13 +340,11 @@ where
         };
 
         // Emit BroadcastStateChange for Updated and CurrentWon cases.
-        // Note: In mock_runtime for testing, we don't apply echo-back prevention (always pass None).
-        // Echo-back prevention is an optimization for production that's implemented in the real runtime.
-        // Tests need to verify correctness, not efficiency, so we keep the simpler behavior.
+        // Echo-back prevention is handled by summary comparison in p2p_protoc.
         if let Ok(ref upsert_result) = result {
             match upsert_result {
                 UpsertResult::Updated(state) | UpsertResult::CurrentWon(state) => {
-                    self.broadcast_state_change(key, state, None).await;
+                    self.broadcast_state_change(key, state).await;
                 }
                 UpsertResult::NoChange => {}
             }
@@ -502,7 +490,6 @@ mod test {
                 Either::Left(smaller_state.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .expect("initial store should succeed");
@@ -515,7 +502,6 @@ mod test {
                 Either::Left(larger_state.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .expect("update with larger hash should succeed");
@@ -566,7 +552,6 @@ mod test {
                 Either::Left(larger_state.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .expect("initial store should succeed");
@@ -579,7 +564,6 @@ mod test {
                 Either::Left(smaller_state.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .expect("update attempt should not error");
@@ -616,7 +600,6 @@ mod test {
                 Either::Left(state.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .expect("initial store should succeed");
@@ -629,7 +612,6 @@ mod test {
                 Either::Left(state.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .expect("update attempt should not error");
@@ -676,7 +658,6 @@ mod test {
                 Either::Left(state_1.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -687,7 +668,6 @@ mod test {
                 Either::Left(state_2.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -698,7 +678,6 @@ mod test {
                 Either::Left(state_3.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -711,7 +690,6 @@ mod test {
                 Either::Left(state_3.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -721,7 +699,6 @@ mod test {
                 Either::Left(state_1.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -731,7 +708,6 @@ mod test {
                 Either::Left(state_2.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -744,7 +720,6 @@ mod test {
                 Either::Left(state_2.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -754,7 +729,6 @@ mod test {
                 Either::Left(state_3.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -764,7 +738,6 @@ mod test {
                 Either::Left(state_1.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -842,7 +815,6 @@ mod test {
                 Either::Left(s3.clone()),
                 RelatedContracts::default(),
                 Some(contract.clone()),
-                None, // No network sender in tests
             )
             .await
             .unwrap();
@@ -854,7 +826,6 @@ mod test {
                 Either::Left(s1.clone()),
                 RelatedContracts::default(),
                 None,
-                None, // No network sender in tests
             )
             .await
             .unwrap();

@@ -1392,16 +1392,12 @@ async fn handle_interest_sync_message(
             let update_data = freenet_stdlib::prelude::UpdateData::State(state);
 
             // Send to contract handler
-            // network_sender is None for ResyncResponse because:
-            // 1. We requested this resync, so we initiated the exchange
-            // 2. We don't want to exclude the responder from future broadcasts
             use crate::contract::ContractHandlerEvent;
             match op_manager
                 .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                     key,
                     data: update_data,
                     related_contracts: Default::default(),
-                    network_sender: None,
                 })
                 .await
             {
