@@ -264,15 +264,47 @@ pub fn validate_topology_from_snapshots(
     // Source detection threshold: peers within 5% of ring distance to contract are considered sources
     const SOURCE_THRESHOLD: f64 = 0.05;
 
+    // Check if any seeder is within SOURCE_THRESHOLD (a "proper" source)
+    let has_proper_source = seeders.iter().any(|seeder| {
+        peer_locations
+            .get(seeder)
+            .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
+            .unwrap_or(false)
+    });
+
+    // Find de-facto sources: when no peer is within SOURCE_THRESHOLD,
+    // any seeder that is acting as a tree root (no upstream, has downstream) is a valid source.
+    // This is important for Issue #2755 - topology should still be valid even without a "proper" source.
+    let de_facto_sources: HashSet<SocketAddr> = if has_proper_source {
+        HashSet::new()
+    } else {
+        // Find all seeders that are acting as tree roots (no upstream but has downstream)
+        seeders
+            .iter()
+            .filter(|seeder| {
+                subscription_graph
+                    .get(*seeder)
+                    .map(|(upstream, downstream)| upstream.is_none() && !downstream.is_empty())
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect()
+    };
+
     // Check for orphan seeders and disconnected upstream
     for &seeder in &seeders {
         if let Some((upstream, downstream)) = subscription_graph.get(&seeder) {
             // Check if seeder is close to contract location (is source)
             // Use ring_distance for consistent wrap-around handling
-            let is_source = peer_locations
+            let is_proper_source = peer_locations
                 .get(&seeder)
                 .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
                 .unwrap_or(false);
+
+            // Also check if this is a de-facto source (acting as tree root when no proper source exists)
+            let is_de_facto_source = de_facto_sources.contains(&seeder);
+
+            let is_source = is_proper_source || is_de_facto_source;
 
             // Orphan if: not source, no upstream, no downstream
             if !is_source && upstream.is_none() && downstream.is_empty() {

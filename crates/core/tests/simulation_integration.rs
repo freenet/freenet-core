@@ -4,7 +4,9 @@
 //! Same seed MUST produce identical results across runs.
 //!
 //! NOTE: These tests use global state (socket registries, RNG) and must run serially.
-//! Enable with: cargo test -p freenet --features simulation_tests --test simulation_integration -- --test-threads=1
+//! Enable with: cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --test-threads=1
+//!
+//! The `testing` feature is required for `run_controlled_simulation` method.
 //!
 //! For non-deterministic smoke tests, see `simulation_smoke.rs`.
 
@@ -1777,6 +1779,221 @@ fn test_orphan_seeders_no_source() {
              Expected at least 1 peer with contract subscription."
         );
     }
+}
+
+// =============================================================================
+// Orphan Seeders No Source Test (Issue #2755)
+// =============================================================================
+
+/// Tests that subscription topology forms correctly even when NO peer is within
+/// SOURCE_THRESHOLD of the contract location.
+///
+/// ## Background (Issue #2755)
+///
+/// When no peer is a "proper source" (within 5% of contract location), the
+/// subscription topology should still form a valid directed graph where:
+/// - The closest peer to the contract becomes the de-facto source
+/// - All other seeders have upstream connections leading toward that peer
+/// - No orphan or disconnected seeders exist
+///
+/// ## What This Tests
+///
+/// 1. Gateway PUTs a contract where NO peer is within SOURCE_THRESHOLD
+/// 2. Multiple nodes subscribe to the contract
+/// 3. Wait for topology stabilization (including orphan recovery)
+/// 4. Assert: NO orphan seeders (every seeder has upstream or is closest)
+/// 5. Assert: NO disconnected upstreams (every peer with downstream has upstream)
+///
+/// ## Related Issues
+///
+/// - Issue #2755: Orphan and disconnected seeders in subscription topology
+/// - Issue #2719: Orphan seeders without recovery paths
+/// - PR #2740: Include subscription entries in orphan recovery
+///
+/// ## When This Test Passes
+///
+/// Per Nacho's comment on #2755: "This issue can be verified fixed when
+/// test_orphan_seeders_no_source passes."
+#[test_log::test]
+fn test_orphan_seeders_no_source() {
+    use freenet::dev_tool::{
+        validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
+    };
+
+    const SEED: u64 = 0x0EFA_2755_0000;
+    const NETWORK_NAME: &str = "orphan-no-source-test";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // Create network with 1 gateway + 3 nodes
+    // Use 3 nodes to have enough peers for meaningful topology
+    let (sim, peer_locations) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            3,  // 3 regular nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+
+        // Get peer locations for finding a suitable contract
+        let locations: Vec<f64> = sim.get_peer_locations();
+        tracing::info!("Peer locations: {:?}", locations);
+
+        (sim, locations)
+    });
+
+    // Find a contract seed where NO peer is within SOURCE_THRESHOLD
+    let (contract, contract_seed) = {
+        let mut found = None;
+        for seed in 0u8..=255 {
+            let contract = SimOperation::create_test_contract(seed);
+            let contract_id = *contract.key().id();
+            let contract_loc = Location::from(&contract_id).as_f64();
+
+            // Check that NO peer is within SOURCE_THRESHOLD of this contract
+            let any_peer_is_source = peer_locations
+                .iter()
+                .any(|&peer_loc| ring_distance(peer_loc, contract_loc) < SOURCE_THRESHOLD);
+
+            if !any_peer_is_source {
+                let min_dist = peer_locations
+                    .iter()
+                    .map(|&peer_loc| ring_distance(peer_loc, contract_loc))
+                    .fold(f64::MAX, f64::min);
+                tracing::info!(
+                    "Found contract seed {} where NO peer is source: location {:.4}, min_dist={:.4} > threshold={:.4}",
+                    seed, contract_loc, min_dist, SOURCE_THRESHOLD
+                );
+                found = Some((contract, seed));
+                break;
+            }
+        }
+        found.expect("Could not find a contract seed where no peer is within SOURCE_THRESHOLD")
+    };
+
+    let contract_id = *contract.key().id();
+    let contract_location = Location::from(&contract_id).as_f64();
+    let initial_state = SimOperation::create_test_state(contract_seed);
+
+    // Schedule operations:
+    // 1. Gateway PUTs the contract with subscribe=true
+    // 2. All 3 nodes subscribe
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    // Run simulation with extended wait time for orphan recovery
+    // Orphan recovery runs every 30 seconds, so wait 90 seconds to allow multiple cycles
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(150), // simulation duration
+        Duration::from_secs(90),  // post-operation wait for orphan recovery
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete successfully: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let snapshots = result.topology_snapshots;
+    tracing::info!("Captured {} topology snapshots", snapshots.len());
+
+    // Log peer subscription states
+    for snap in &snapshots {
+        if let Some(sub) = snap.contracts.get(&contract_id) {
+            let peer_dist = ring_distance(snap.location, contract_location);
+            tracing::info!(
+                "Peer {} (loc={:.4}, dist={:.4}): seeding={}, upstream={:?}, downstream={:?}",
+                snap.peer_addr,
+                snap.location,
+                peer_dist,
+                sub.is_seeding,
+                sub.upstream,
+                sub.downstream
+            );
+        }
+    }
+
+    // Validate topology
+    let result = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
+
+    tracing::info!(
+        "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity_violations={}",
+        result.bidirectional_cycles.len(),
+        result.orphan_seeders.len(),
+        result.disconnected_upstream.len(),
+        result.unreachable_seeders.len(),
+        result.proximity_violations.len()
+    );
+
+    // PRIMARY ASSERTIONS for Issue #2755:
+    // Even when no peer is within SOURCE_THRESHOLD, the topology should be healthy
+
+    assert!(
+        result.bidirectional_cycles.is_empty(),
+        "Should have no bidirectional cycles, found: {:?}",
+        result.bidirectional_cycles
+    );
+
+    // KEY ASSERTION: No orphan seeders
+    // The closest peer should become de-facto source, others should have upstream
+    assert!(
+        result.orphan_seeders.is_empty(),
+        "ISSUE #2755: Should have no orphan seeders even when no peer is within SOURCE_THRESHOLD. \
+         Found {} orphans: {:?}. \
+         The closest peer to the contract should become the de-facto source.",
+        result.orphan_seeders.len(),
+        result.orphan_seeders
+    );
+
+    // KEY ASSERTION: No disconnected upstreams
+    // Peers with downstream should have upstream connections
+    assert!(
+        result.disconnected_upstream.is_empty(),
+        "ISSUE #2755: Should have no disconnected upstreams even when no peer is within SOURCE_THRESHOLD. \
+         Found {} disconnected: {:?}. \
+         All peers with downstream subscribers should have upstream connections.",
+        result.disconnected_upstream.len(),
+        result.disconnected_upstream
+    );
+
+    // Also check unreachable seeders
+    assert!(
+        result.unreachable_seeders.is_empty(),
+        "Should have no unreachable seeders, found: {:?}",
+        result.unreachable_seeders
+    );
+
+    tracing::info!(
+        "test_orphan_seeders_no_source PASSED: Topology is healthy even without a source peer within threshold"
+    );
 }
 
 // =============================================================================
