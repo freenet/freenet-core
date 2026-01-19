@@ -15,12 +15,13 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .await;
 
     let events = config.events;
-    // Time to wait between events - reduced from 200ms for faster tests
-    // while still allowing adequate time for async task processing
+    // Virtual time to advance between events - this controls simulation pacing.
+    // Internal node timers (ACK checks at 100ms intervals) depend on VirtualTime
+    // advancement, so we use 200ms to ensure timers fire between events.
     let event_wait_time = config
         .event_wait_ms
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(150));
+        .unwrap_or(Duration::from_millis(200));
     let (connectivity_timeout, network_connection_percent) = config.get_connection_check_params();
 
     // Check connectivity first
@@ -60,6 +61,11 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     // Track whether events completed normally
     let mut events_completed = false;
+    let mut finalization_start: Option<std::time::Instant> = None;
+    // Finalization timeout - if peers don't shutdown within this time, proceed anyway.
+    // At scale (50+ nodes), peer shutdown can take longer than expected due to the
+    // 1-second sleep in MemoryEventsGen combined with tokio scheduler contention.
+    let finalization_timeout = Duration::from_secs(10);
 
     let join_peer_tasks = async {
         let mut futs = futures::stream::FuturesUnordered::from_iter(join_handles);
@@ -76,6 +82,12 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     let mut test_result = Ok(());
 
+    // Timer for continuing VirtualTime advancement after events complete.
+    // Peers may have pending operations that need time to complete for graceful shutdown.
+    // Use 1ms interval with 1 second VirtualTime advancement to rapidly process pending timers.
+    let mut finalization_timer = tokio::time::interval(Duration::from_millis(1));
+    finalization_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = &mut ctrl_c  /* SIGINT handling */ => {
@@ -90,20 +102,43 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
             } => {
                 match event {
                     Some(_event_id) => {
-                        // Sleep between events to pace the simulation.
-                        // Note: VirtualTime advancement happens via the stabilization
-                        // phase and connectivity checks. During event processing, we
-                        // rely on real-time sleep to allow async tasks to complete.
-                        tokio::time::sleep(event_wait_time).await;
+                        // Advance VirtualTime between events - this is CRITICAL for
+                        // simulation correctness. Internal node timers (ACK checks,
+                        // retransmissions, etc.) use VirtualTime, so we must advance it
+                        // to allow those timers to fire.
+                        simulated_network.advance_time(event_wait_time);
+                        // Yield and brief real-time sleep to let async tasks process
+                        // the messages delivered by advance_time()
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     None => {
                         tracing::info!("All {} events generated successfully", events);
                         events_completed = true;
+                        finalization_start = Some(std::time::Instant::now());
                         // Drop the stream to release the watch::Sender, which signals
                         // peers to disconnect. Without this, peers wait forever for
                         // more events and never exit their event loops.
                         stream = None;
                         // Continue to wait for peer tasks to finalize
+                    }
+                }
+            }
+            // Continue advancing VirtualTime during finalization phase.
+            // Peers may have pending operations (Put/Subscribe responses) that depend
+            // on internal timers (ACK checks at 100ms intervals). Without VirtualTime
+            // advancement, these operations never complete and peers can't shutdown.
+            _ = finalization_timer.tick(), if events_completed => {
+                // Advance 1 second of VirtualTime per tick to rapidly process pending timers
+                // and allow operations to timeout/complete. This helps with graceful shutdown.
+                simulated_network.advance_time(Duration::from_secs(1));
+                tokio::task::yield_now().await;
+
+                // Check if finalization is taking too long
+                if let Some(start) = finalization_start {
+                    if start.elapsed() > finalization_timeout {
+                        tracing::warn!("Finalization timeout reached, some peers may not have shutdown gracefully");
+                        break;
                     }
                 }
             }
