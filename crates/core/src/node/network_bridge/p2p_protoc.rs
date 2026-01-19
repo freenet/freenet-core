@@ -1793,7 +1793,8 @@ impl P2pConnManager {
 
                                     // Compute delta if we have their summary (uses memoization cache)
                                     // Track whether we successfully computed a delta vs sent full state
-                                    let (payload, sent_delta) = match (&our_summary, &their_summary) {
+                                    let (payload, sent_delta) = match (&our_summary, &their_summary)
+                                    {
                                         (Some(ours), Some(theirs)) => {
                                             match op_manager
                                                 .interest_manager
