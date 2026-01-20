@@ -1,6 +1,11 @@
 use super::{
-    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
-    native_api, secrets_store::SecretsStore, RuntimeResult,
+    contract_store::ContractStore,
+    delegate_store::DelegateStore,
+    error::RuntimeInnerError,
+    native_api,
+    secrets_store::SecretsStore,
+    tunables::{BaseTunables, LimitingTunables, DEFAULT_MAX_MEMORY_PAGES},
+    RuntimeResult,
 };
 use freenet_stdlib::{
     memory::{
@@ -11,7 +16,9 @@ use freenet_stdlib::{
 };
 use std::{collections::HashMap, sync::atomic::AtomicI64};
 use wasmer::sys::{CompilerConfig, EngineBuilder};
-use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
+use wasmer::{
+    imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Pages, Store, TypedFunction,
+};
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
@@ -31,11 +38,10 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 #[cfg(unix)]
 fn with_suppressed_stderr<T, F: FnOnce() -> T>(f: F) -> T {
     // Attempt to suppress stderr; if it fails (e.g., stderr already redirected),
-    // just run without suppression
-    match gag::Gag::stderr() {
-        Ok(_gag) => f(),
-        Err(_) => f(),
-    }
+    // just run without suppression. The _gag binding keeps suppression active
+    // for the duration of f().
+    let _gag = gag::Gag::stderr();
+    f()
 }
 
 #[cfg(not(unix))]
@@ -346,8 +352,13 @@ impl Runtime {
     }
 
     fn instance_host_mem(store: &mut Store) -> RuntimeResult<Memory> {
-        // todo: max memory assigned for this runtime
-        Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
+        // Set maximum memory to prevent unbounded growth.
+        // 20 pages initial (1.28 MiB), max DEFAULT_MAX_MEMORY_PAGES (256 MiB).
+        // See: https://github.com/freenet/freenet-core/issues/2774
+        Ok(Memory::new(
+            store,
+            MemoryType::new(20u32, Some(DEFAULT_MAX_MEMORY_PAGES), false),
+        )?)
     }
 
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
@@ -398,9 +409,18 @@ impl Runtime {
             compiler_config.push_middleware(metering.clone());
         }
 
-        let engine = EngineBuilder::new(compiler_config).engine();
+        let mut engine = EngineBuilder::new(compiler_config).engine();
 
-        Store::new(&engine)
+        // Apply memory limits to prevent unbounded virtual address space growth.
+        // Without limits, each WASM instance reserves ~5GB of guard pages, which
+        // accumulates over time and can lead to OOM errors.
+        // See: https://github.com/freenet/freenet-core/issues/2774
+        let base_tunables = BaseTunables::for_target(engine.target());
+        let limiting_tunables =
+            LimitingTunables::new(base_tunables, Pages(DEFAULT_MAX_MEMORY_PAGES));
+        engine.set_tunables(limiting_tunables);
+
+        Store::new(engine)
     }
 
     pub(crate) fn handle_contract_error(
