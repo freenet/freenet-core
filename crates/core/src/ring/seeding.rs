@@ -350,9 +350,9 @@ impl SeedingManager {
     /// leaving both orphaned.
     ///
     /// Instead, we use ring distance as a tie-breaker:
-    /// - If the proposed upstream is **closer** to the contract than we are → promote them
+    /// - If the proposed upstream is **closer** to the contract than we are, promote them
     ///   (remove from downstream, add as upstream). They are more authoritative.
-    /// - If we are **closer** to the contract → reject with CircularReference.
+    /// - If we are **closer** to the contract, reject with CircularReference.
     ///   We should be the source, not them. They will retry via different routing.
     ///
     /// This ensures subscription trees form correctly with updates flowing from peers
@@ -369,6 +369,11 @@ impl SeedingManager {
         own_addr: Option<std::net::SocketAddr>,
         own_location: Option<Location>,
     ) -> Result<UpstreamSetResult, SubscriptionError> {
+        let upstream_addr_str = upstream
+            .socket_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+
         // Validate: prevent self-reference
         if let (Some(own), Some(up_addr)) = (own_addr, upstream.socket_addr()) {
             if own == up_addr {
@@ -406,7 +411,7 @@ impl SeedingManager {
                 let removed = subs.swap_remove(idx);
                 info!(
                     %contract,
-                    upstream = %upstream.pub_key,
+                    upstream = %upstream_addr_str,
                     upstream_distance = %upstream_distance.as_f64(),
                     our_distance = %our_distance.as_f64(),
                     "set_upstream: promoting closer peer from downstream to upstream (issue #2773)"
@@ -417,7 +422,7 @@ impl SeedingManager {
                 // We should be the source/upstream, not them. They will retry via different routing.
                 warn!(
                     %contract,
-                    upstream = %upstream.pub_key,
+                    upstream = %upstream_addr_str,
                     upstream_distance = %upstream_distance.as_f64(),
                     our_distance = %our_distance.as_f64(),
                     "set_upstream: rejected - we are closer to contract (we should be source)"
@@ -431,16 +436,11 @@ impl SeedingManager {
         // Remove any existing upstream
         subs.retain(|e| e.role != SubscriberType::Upstream);
 
-        let upstream_addr = upstream
-            .socket_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "unknown".into());
-
         subs.push(SubscriptionEntry::new(upstream, SubscriberType::Upstream));
 
         info!(
             %contract,
-            upstream = %upstream_addr,
+            upstream = %upstream_addr_str,
             promoted = promoted_from_downstream.is_some(),
             "set_upstream: registered upstream source"
         );
