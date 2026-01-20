@@ -1171,6 +1171,21 @@ async fn handle_pure_network_result(
         Err(OpError::StatePushed) => {
             return Ok(None);
         }
+        Err(OpError::OpNotPresent(tx_id)) => {
+            // OpNotPresent means a response arrived for an operation that no longer exists.
+            // This is benign - it happens when:
+            // 1. An operation timed out before the response arrived
+            // 2. A late response arrives after a peer restart
+            // 3. The operation was already completed via another path
+            //
+            // We log at debug level and return Ok(None) to avoid propagating
+            // confusing "op not present" errors to clients.
+            tracing::debug!(
+                tx = %tx_id,
+                "Network response arrived for non-existent operation (likely timed out or already completed)"
+            );
+            return Ok(None);
+        }
         Err(e) => {
             tracing::error!("Network operation failed: {}", e);
             // TODO: Register error event properly
