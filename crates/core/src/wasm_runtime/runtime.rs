@@ -38,11 +38,10 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 #[cfg(unix)]
 fn with_suppressed_stderr<T, F: FnOnce() -> T>(f: F) -> T {
     // Attempt to suppress stderr; if it fails (e.g., stderr already redirected),
-    // just run without suppression
-    match gag::Gag::stderr() {
-        Ok(_gag) => f(),
-        Err(_) => f(),
-    }
+    // just run without suppression. The _gag binding keeps suppression active
+    // for the duration of f().
+    let _gag = gag::Gag::stderr();
+    f()
 }
 
 #[cfg(not(unix))]
