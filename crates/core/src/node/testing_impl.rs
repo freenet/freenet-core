@@ -1272,7 +1272,8 @@ impl SimNetwork {
             let keypair = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
-            let location = Location::random();
+            // Use location computed from address for consistency with PeerKeyLocation::location()
+            let location = Location::from_address(&addr);
 
             // Track address for crash/restart operations
             self.node_addresses.insert(label.clone(), addr);
@@ -1378,11 +1379,15 @@ impl SimNetwork {
             }
             let port = self.derive_deterministic_port(node_no);
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            // Use location computed from address for consistency with PeerKeyLocation::location().
+            // This ensures the stored location matches what other peers compute when looking at our address.
+            let location = Location::from_address(&addr);
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.key_pair = crate::transport::TransportKeypair::new();
             config.with_own_addr(addr);
             config
+                .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);

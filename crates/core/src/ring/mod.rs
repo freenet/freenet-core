@@ -560,10 +560,11 @@ impl Ring {
                 continue;
             };
 
+            // Use get_stored_location() for consistency with set_upstream distance check.
+            // This ensures topology validation uses the same location as the tie-breaker.
             let location = ring
                 .connection_manager
-                .own_location()
-                .location()
+                .get_stored_location()
                 .map(|l| l.as_f64())
                 .unwrap_or(0.0);
 
@@ -778,8 +779,16 @@ impl Ring {
         observed_addr: Option<ObservedAddr>,
     ) -> Result<AddDownstreamResult, SubscriptionError> {
         let own_addr = self.connection_manager.get_own_addr();
-        self.seeding_manager
-            .add_downstream(contract, subscriber, observed_addr, own_addr)
+        let own_location = self.connection_manager.get_stored_location();
+        let own_pub_key = self.connection_manager.pub_key.as_bytes();
+        self.seeding_manager.add_downstream(
+            contract,
+            subscriber,
+            observed_addr,
+            own_addr,
+            own_location,
+            Some(own_pub_key),
+        )
     }
 
     /// Set the upstream source for a contract (the peer we get updates FROM).
@@ -1378,10 +1387,10 @@ impl Ring {
         let Some(peer_addr) = self.connection_manager.get_own_addr() else {
             return;
         };
+        // Use get_stored_location() for consistency with set_upstream distance check.
         let location = self
             .connection_manager
-            .own_location()
-            .location()
+            .get_stored_location()
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 
@@ -1396,10 +1405,10 @@ impl Ring {
     #[allow(dead_code)] // Used by SimNetwork tests
     pub fn get_topology_snapshot(&self) -> Option<topology_registry::TopologySnapshot> {
         let peer_addr = self.connection_manager.get_own_addr()?;
+        // Use get_stored_location() for consistency with set_upstream distance check.
         let location = self
             .connection_manager
-            .own_location()
-            .location()
+            .get_stored_location()
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 
