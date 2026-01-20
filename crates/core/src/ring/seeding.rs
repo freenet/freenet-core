@@ -2151,4 +2151,139 @@ mod tests {
         assert!(manager.get_upstream(&contract).is_some());
         assert!(manager.get_downstream(&contract).is_empty());
     }
+
+    // ========== Issue #2773: Mutual downstream relationships ==========
+
+    /// Tests the mutual downstream scenario from Issue #2773.
+    ///
+    /// This test demonstrates the race condition where two peers simultaneously
+    /// accept each other as downstream subscribers before either establishes
+    /// an upstream relationship, resulting in a blocked subscription tree.
+    ///
+    /// ## Race Condition Sequence
+    ///
+    /// 1. Peer A sends Subscribe to Peer B
+    /// 2. Peer B sends Subscribe to Peer A (simultaneously)
+    /// 3. Peer A receives B's request, calls add_downstream(B) → succeeds
+    /// 4. Peer B receives A's request, calls add_downstream(A) → succeeds
+    /// 5. Now both have each other as downstream:
+    ///    - Manager_A: downstream=[B], upstream=None
+    ///    - Manager_B: downstream=[A], upstream=None
+    /// 6. SubscriptionAccepted returns to both:
+    ///    - A tries set_upstream(B) → fails (B is A's downstream)
+    ///    - B tries set_upstream(A) → fails (A is B's downstream)
+    ///
+    /// ## Result
+    ///
+    /// Both peers are stuck with:
+    /// - Each other as downstream
+    /// - No upstream
+    /// - No path to receive updates from the contract source
+    ///
+    /// ## Fix (Issue #2773 Option B)
+    ///
+    /// The fix is to remove a peer from downstream when setting them as upstream.
+    /// This prioritizes the upstream relationship (where updates flow FROM) over
+    /// the downstream relationship (where updates flow TO), which resolves the
+    /// deadlock and allows the subscription tree to form correctly.
+    #[test]
+    fn test_mutual_downstream_blocks_upstream_issue_2773() {
+        // Simulate the race condition: both peers independently add each other as downstream
+        // before either can set upstream.
+
+        // Manager A represents Peer A's view
+        let manager_a = SeedingManager::new();
+        // Manager B represents Peer B's view
+        let manager_b = SeedingManager::new();
+
+        let contract = make_contract_key(1);
+
+        // Create peer identities
+        let peer_a_keys = TransportKeypair::new();
+        let peer_b_keys = TransportKeypair::new();
+        let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        let peer_a_loc = PeerKeyLocation::new(peer_a_keys.public().clone(), addr_a);
+        let peer_b_loc = PeerKeyLocation::new(peer_b_keys.public().clone(), addr_b);
+
+        // ---- RACE CONDITION SIMULATION ----
+
+        // Step 1-2: Both peers send Subscribe requests to each other (no await needed)
+
+        // Step 3: Peer A receives B's Subscribe request, adds B as downstream
+        // (This happens because A has the contract and will respond with SubscriptionAccepted)
+        let result_a = manager_a.add_downstream(&contract, peer_b_loc.clone(), None, None);
+        assert!(
+            result_a.is_ok(),
+            "A adding B as downstream should succeed (no prior relationship)"
+        );
+
+        // Step 4: Peer B receives A's Subscribe request, adds A as downstream
+        // (B also has the contract - this is the race condition)
+        let result_b = manager_b.add_downstream(&contract, peer_a_loc.clone(), None, None);
+        assert!(
+            result_b.is_ok(),
+            "B adding A as downstream should succeed (no prior relationship)"
+        );
+
+        // Now verify the problematic state: mutual downstream, no upstream
+        assert!(
+            manager_a.get_downstream(&contract).contains(&peer_b_loc),
+            "A should have B as downstream"
+        );
+        assert!(
+            manager_a.get_upstream(&contract).is_none(),
+            "A should have no upstream yet"
+        );
+
+        assert!(
+            manager_b.get_downstream(&contract).contains(&peer_a_loc),
+            "B should have A as downstream"
+        );
+        assert!(
+            manager_b.get_upstream(&contract).is_none(),
+            "B should have no upstream yet"
+        );
+
+        // ---- UPSTREAM ESTABLISHMENT BLOCKED ----
+
+        // Step 5-6: SubscriptionAccepted returns to both peers
+
+        // A tries to set B as upstream (sender of SubscriptionAccepted)
+        // This FAILS because B is already A's downstream
+        let result_a_upstream = manager_a.set_upstream(&contract, peer_b_loc.clone(), None);
+        assert_eq!(
+            result_a_upstream,
+            Err(SubscriptionError::CircularReference),
+            "A setting B as upstream should fail - B is A's downstream (Issue #2773)"
+        );
+
+        // B tries to set A as upstream
+        // This also FAILS because A is already B's downstream
+        let result_b_upstream = manager_b.set_upstream(&contract, peer_a_loc.clone(), None);
+        assert_eq!(
+            result_b_upstream,
+            Err(SubscriptionError::CircularReference),
+            "B setting A as upstream should fail - A is B's downstream (Issue #2773)"
+        );
+
+        // ---- VERIFY STUCK STATE ----
+
+        // Both peers are now stuck: mutual downstream, no upstream
+        // Neither can receive updates from the contract source
+        assert!(
+            manager_a.get_upstream(&contract).is_none(),
+            "A still has no upstream - STUCK"
+        );
+        assert!(
+            manager_b.get_upstream(&contract).is_none(),
+            "B still has no upstream - STUCK"
+        );
+
+        // This test passes because it demonstrates the CURRENT behavior (the bug).
+        // The fix (Issue #2773 Option B) would change set_upstream to remove the
+        // peer from downstream if they exist there, allowing the upstream relationship
+        // to be established and breaking the deadlock.
+    }
 }
