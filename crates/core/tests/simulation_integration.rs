@@ -2333,3 +2333,208 @@ fn test_pr2763_crdt_convergence_with_resync() {
     // Clean up
     clear_crdt_contracts();
 }
+
+// =============================================================================
+// Issue #2773: Mutual Downstream Race Condition
+// =============================================================================
+
+/// **Issue #2773 - Mutual Downstream Race Condition Test**
+///
+/// This test validates that the subscription topology forms correctly even when
+/// multiple peers subscribe simultaneously, which can trigger the mutual downstream
+/// race condition described in Issue #2773.
+///
+/// ## Background
+///
+/// When two peers A and B both have a contract and simultaneously subscribe:
+/// 1. A receives B's Subscribe → adds B as downstream
+/// 2. B receives A's Subscribe → adds A as downstream
+/// 3. SubscriptionAccepted returns → both try set_upstream on each other
+/// 4. BUG: Both fail with CircularReference, leaving mutual downstream with no upstream
+///
+/// ## What This Test Validates
+///
+/// After the fix (Option B: set_upstream removes peer from downstream):
+/// - Topology should have NO disconnected upstream peers
+/// - All seeders should be reachable from the source
+/// - The subscription tree should be well-formed
+///
+/// This test is IGNORED because it tests EXPECTED behavior after the fix.
+/// It will FAIL (detect disconnected_upstream) until Issue #2773 is implemented.
+///
+/// Run with: `cargo test --ignored test_mutual_downstream_race_condition`
+///
+/// See: https://github.com/freenet/freenet-core/issues/2773
+#[test_log::test]
+#[ignore = "Issue #2773: subscription topology should handle mutual downstream (not yet implemented)"]
+fn test_mutual_downstream_race_condition_issue_2773() {
+    use freenet::dev_tool::{
+        validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
+    };
+
+    const SEED: u64 = 0x2773_RACE_0001;
+    const NETWORK_NAME: &str = "mutual-downstream-race";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // Create network: 1 gateway + 3 nodes
+    // The 3 nodes will all subscribe, potentially creating mutual downstream situations
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            3,  // 3 regular nodes - more chances for mutual downstream
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    // Create a test contract
+    let contract = SimOperation::create_test_contract(0x73);
+    let contract_id = *contract.key().id();
+    let contract_location = Location::from(&contract_id).as_f64();
+    let initial_state = SimOperation::create_test_state(1);
+
+    tracing::info!(
+        "Contract location: {:.4}, testing mutual downstream race condition",
+        contract_location
+    );
+
+    // Schedule operations:
+    // 1. Gateway PUTs the contract with subscribe=true
+    // 2. ALL nodes subscribe IMMEDIATELY (no delays) to maximize race condition chance
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        // All nodes subscribe - in real network, messages may interleave
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    // Run simulation with extended wait time for topology to stabilize
+    // and orphan recovery to attempt fixing any issues
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120), // simulation duration
+        Duration::from_secs(60),  // post-operation wait
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let snapshots = result.topology_snapshots;
+    tracing::info!("Captured {} topology snapshots", snapshots.len());
+
+    // Log peer subscription states for debugging
+    for snap in &snapshots {
+        if let Some(sub) = snap.contracts.get(&contract_id) {
+            let peer_dist = ring_distance(snap.location, contract_location);
+            tracing::info!(
+                "Peer {} (loc={:.4}, dist={:.4}): seeding={}, upstream={:?}, downstream={:?}",
+                snap.peer_addr,
+                snap.location,
+                peer_dist,
+                sub.is_seeding,
+                sub.upstream,
+                sub.downstream
+            );
+        }
+    }
+
+    // Validate topology
+    let validation = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
+
+    tracing::info!(
+        "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}",
+        validation.bidirectional_cycles.len(),
+        validation.orphan_seeders.len(),
+        validation.disconnected_upstream.len(),
+        validation.unreachable_seeders.len()
+    );
+
+    // Log details of any issues found
+    if !validation.disconnected_upstream.is_empty() {
+        tracing::warn!(
+            "ISSUE #2773: Found {} disconnected upstream peers (mutual downstream symptom):",
+            validation.disconnected_upstream.len()
+        );
+        for (addr, contract) in &validation.disconnected_upstream {
+            tracing::warn!("  - {} for contract {}", addr, contract);
+        }
+    }
+
+    // PRIMARY ASSERTIONS for Issue #2773:
+    // After the fix, the topology should be healthy
+
+    assert!(
+        validation.bidirectional_cycles.is_empty(),
+        "Should have no bidirectional cycles, found: {:?}",
+        validation.bidirectional_cycles
+    );
+
+    // KEY ASSERTION: No disconnected upstream
+    // This is the primary symptom of mutual downstream - peers with downstream but no upstream
+    assert!(
+        validation.disconnected_upstream.is_empty(),
+        "ISSUE #2773: Should have no disconnected upstream peers. \
+         Found {} peers with downstream but no upstream (mutual downstream symptom): {:?}. \
+         This test fails until Issue #2773 Option B is implemented.",
+        validation.disconnected_upstream.len(),
+        validation.disconnected_upstream
+    );
+
+    // No orphan seeders
+    assert!(
+        validation.orphan_seeders.is_empty(),
+        "Should have no orphan seeders, found: {:?}",
+        validation.orphan_seeders
+    );
+
+    // Overall topology should be healthy
+    assert!(
+        validation.is_healthy(),
+        "Subscription topology should be healthy after Issue #2773 fix. \
+         Issues found: cycles={}, orphans={}, disconnected={}, unreachable={}",
+        validation.bidirectional_cycles.len(),
+        validation.orphan_seeders.len(),
+        validation.disconnected_upstream.len(),
+        validation.unreachable_seeders.len()
+    );
+
+    tracing::info!(
+        "test_mutual_downstream_race_condition PASSED: healthy topology with {} seeders",
+        snapshots
+            .iter()
+            .filter(|s| s
+                .contracts
+                .get(&contract_id)
+                .map(|c| c.is_seeding)
+                .unwrap_or(false))
+            .count()
+    );
+}
