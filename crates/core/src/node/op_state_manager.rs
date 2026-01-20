@@ -355,6 +355,13 @@ impl OpManager {
             );
         }
 
+        // Create orphan stream registry (always created for transport layer)
+        // GC task only started when streaming is enabled
+        let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
+        if streaming_enabled {
+            OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
+        }
+
         Ok(Self {
             ring,
             ops,
@@ -370,7 +377,7 @@ impl OpManager {
             proximity_cache,
             interest_manager,
             request_router,
-            orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
+            orphan_stream_registry,
             streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),

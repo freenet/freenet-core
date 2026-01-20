@@ -2,7 +2,18 @@
 
 ## Overview
 
-The streaming infrastructure provides lock-free, high-performance fragment reassembly for large message transfers. This is Phase 1 of the streaming transport implementation (Issue #1452).
+The streaming infrastructure provides lock-free, high-performance fragment reassembly for large message transfers (Issue #1452).
+
+## Implementation Status
+
+| Phase | Status | PR | Description |
+|-------|--------|-----|-------------|
+| Phase 1: Lock-Free StreamBuffer | **COMPLETE** | #2443 | Lock-free fragment storage with `AtomicPtr<Bytes>` |
+| Phase 2: Piped Forwarding | **COMPLETE** | #2458/2465 | Intermediate node forwarding without reassembly |
+| Phase 3: Message Layer | **COMPLETE** | #2476 | Streaming message variants and OrphanStreamRegistry |
+| Phase 4: Streaming Handlers | **IN PROGRESS** | - | Implement handlers in put.rs/get.rs |
+| Phase 5: Capability Negotiation | Not started | - | Backward compatibility with non-streaming nodes |
+| Phase 6: Rollout | Not started | - | Shadow mode, metrics, gradual enablement |
 
 ## Problem Statement
 
@@ -10,12 +21,14 @@ The original `InboundStream` implementation used `RwLock<HashMap>` for fragment 
 
 | Metric | RwLock Approach | Lock-Free Approach | Improvement |
 |--------|-----------------|-------------------|-------------|
-| Insert throughput | 23 MB/s | 2,235 MB/s | **96×** |
-| First-fragment latency | 103μs | 25μs | **4×** |
+| Insert throughput | 23 MB/s | 2,235 MB/s | **96x** |
+| First-fragment latency | 103us | 25us | **4x** |
 
-## Architecture
+---
 
-### Component Overview
+## Phase 1: Lock-Free StreamBuffer (COMPLETE)
+
+### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -52,7 +65,7 @@ The original `InboundStream` implementation used `RwLock<HashMap>` for fragment 
 
 #### 1. LockFreeStreamBuffer
 
-The core lock-free buffer using `OnceLock<Bytes>` slots. See `streaming_buffer.rs:39-53` for the struct definition.
+The core lock-free buffer using `OnceLock<Bytes>` slots. See `streaming_buffer.rs:39-53`.
 
 **Key Properties:**
 - **Lock-free writes**: `OnceLock::set()` is a single atomic CAS
@@ -61,14 +74,14 @@ The core lock-free buffer using `OnceLock<Bytes>` slots. See `streaming_buffer.r
 - **Pre-allocated**: Buffer size determined by stream header
 
 **Operations:**
-- `insert(fragment_index, data)` - O(1) lock-free CAS (`streaming_buffer.rs:102-123`)
-- `get(fragment_index)` - O(1) direct array access (`streaming_buffer.rs:195-201`)
-- `assemble()` - O(n) concatenation when complete (`streaming_buffer.rs:216-230`)
-- `iter_contiguous()` - Iterator over contiguous fragments (`streaming_buffer.rs:244-246`)
+- `insert(fragment_index, data)` - O(1) lock-free CAS
+- `get(fragment_index)` - O(1) direct array access
+- `assemble()` - O(n) concatenation when complete
+- `iter_contiguous()` - Iterator over contiguous fragments
 
 #### 2. StreamHandle
 
-Cloneable handle for accessing an inbound stream. See `streaming.rs:107-117` for the struct definition.
+Cloneable handle for accessing an inbound stream. See `streaming.rs:107-117`.
 
 **Design Decision**: The buffer is stored outside the lock because:
 1. Fragment insertion is the hot path (high frequency)
@@ -77,192 +90,35 @@ Cloneable handle for accessing an inbound stream. See `streaming.rs:107-117` for
 
 #### 3. StreamingInboundStream
 
-A `futures::Stream` implementation for incremental consumption. See `streaming.rs:274-281` for the struct and `streaming.rs:303-347` for the `poll_next` implementation.
-
-Multiple consumers can create independent streams from the same handle, each maintaining their own read position.
+A `futures::Stream` implementation for incremental consumption. Multiple consumers can create independent streams from the same handle.
 
 #### 4. StreamRegistry
 
-Global registry for transport-to-operations handoff. See `streaming.rs:352-368` for the struct definition.
+Global registry for transport-to-operations handoff using `DashMap` for lock-free concurrent access.
 
-**Key Design Decisions:**
-- Uses `DashMap` for lock-free concurrent access (avoiding global bottleneck)
-- `cancel_all()` also clears the registry to prevent memory leaks
-- `remove()` should be called when streams complete for explicit cleanup
-
-## Data Flow
-
-### Fragment Insertion (Producer Path)
-
-1. Transport receives encrypted fragment
-2. Decrypt and extract (stream_id, fragment_index, payload)
-3. `registry.get_or_register(stream_id, total_bytes)`
-4. `handle.push_fragment(fragment_index, payload)` - see `streaming.rs:186-210`
-   - Check cancelled (read lock)
-   - `buffer.insert(index, data)` ← Lock-free CAS
-   - `advance_frontier()` ← Lock-free CAS loop
-   - `data_available.notify_waiters()`
-   - `sync.wake_all()` ← Wake poll_next waiters
-
-### Fragment Consumption (Consumer Path)
-
-1. Application gets handle from registry
-2. Create stream with `handle.stream()`
-3. Consume with `while let Some(bytes) = stream.next().await`
-
-The `poll_next` implementation (`streaming.rs:306-347`):
-- Check cancelled state
-- Check if stream is exhausted
-- Try to get next fragment (lock-free)
-- If not available, register waker and return Pending
-
-## Lock-Free Frontier Tracking
-
-The `contiguous_fragments` atomic tracks how many fragments from the start are contiguous. See `streaming_buffer.rs:129-155` for the `advance_frontier()` implementation.
-
-This uses a CAS loop that:
-1. Loads current frontier
-2. Checks if next fragment exists
-3. Attempts CAS to advance
-4. Continues until gap found or all received
-
-This enables:
-- `is_complete()` - O(1) check (`streaming_buffer.rs:158-160`)
-- `iter_contiguous()` - Safe iteration without locking
-
-## Memory Layout
-
-For a 1 MB stream with ~1,424-byte fragments (~702 fragments):
-
-| Component | Size |
-|-----------|------|
-| fragments array (`OnceLock<Bytes>`) | ~11 KB (16 bytes each) |
-| total_size, total_fragments | 12 bytes |
-| contiguous_fragments | 4 bytes |
-| data_available (Notify) | ~48 bytes |
-| **Total overhead** | ~11 KB (1.1% of 1 MB) |
-
-## Error Handling
-
-See `streaming_buffer.rs:264-287` for `InsertError` and `streaming.rs:44-66` for `StreamError`.
-
-## Async Notification
-
-The buffer uses `tokio::sync::Notify` for efficient async waiting:
-
-1. **On insert**: `data_available.notify_waiters()` wakes all async waiters
-2. **On cancel**: Also notifies to unblock `assemble()` calls (`streaming.rs:212-221`)
-3. **poll_next**: Uses synchronous wakers stored in `SyncState`
-
-## Thread Safety
-
-| Component | Synchronization | Access Pattern |
-|-----------|-----------------|----------------|
-| `StreamRegistry.streams` | `DashMap` | Lock-free concurrent access |
-| `fragments` array | `AtomicPtr` (CAS) | Many writers, many readers, clearable |
-| `contiguous_fragments` | `AtomicU32` (CAS loop) | Many writers, many readers |
-| `consumed_frontier` | `AtomicU32` (fetch_max) | Single writer, many readers |
-| `cancelled` flag | `parking_lot::RwLock` | Rare write, frequent read |
-| `wakers` | `parking_lot::RwLock` | Write on wait, read on wake |
-
-## Progressive Memory Reclamation
-
-Unlike `OnceLock`, `AtomicPtr` allows clearing slots after consumption. This enables
-progressive memory reclamation for large streams.
-
-### API Options
-
-| Method | Behavior | Use Case |
-|--------|----------|----------|
-| `stream()` | Clone fragments, keep in buffer | Multiple consumers, fork support |
-| `stream_with_reclaim()` | Take fragments, clear slots | Single consumer, memory-efficient |
-| `mark_consumed(up_to)` | Manually clear slots up to index | Fine-grained control |
-| `take(index)` | Take single fragment, clear slot | Custom consumption patterns |
-
-### Memory Behavior Example
-
-```
-10 MB stream (7,000 fragments)
-
-Without reclaim:
-- All 10 MB held until stream dropped
-- Multiple consumers can read
-
-With reclaim (stream_with_reclaim):
-- Fragment 1 read → Fragment 1 freed (9.999 MB)
-- Fragment 2 read → Fragment 2 freed (9.998 MB)
-- ...at completion, 0 bytes held
-```
-
-### Warning
-
-`stream_with_reclaim()` is incompatible with `fork()` - once a fragment is taken,
-no other consumer can read it. Use only for single-consumer scenarios.
-
-## Performance Characteristics
+### Performance Characteristics
 
 | Operation | Complexity | Synchronization |
 |-----------|------------|-----------------|
 | `insert()` | O(1) | Lock-free CAS |
 | `get()` | O(1) | Atomic load |
 | `take()` | O(1) | Atomic swap |
-| `mark_consumed(n)` | O(n) | n atomic swaps |
 | `is_complete()` | O(1) | Atomic load |
-| `inserted_count()` | O(n) | None (iteration) |
 | `assemble()` | O(n) | None |
-| `push_fragment()` | O(1) | Read lock (cancelled check) |
-| `cancel()` | O(w) | Write lock (w = waker count) |
 
-## Integration Points
+### Progressive Memory Reclamation
 
-### With PeerConnection
+| Method | Behavior | Use Case |
+|--------|----------|----------|
+| `stream()` | Clone fragments, keep in buffer | Multiple consumers |
+| `stream_with_reclaim()` | Take fragments, clear slots | Single consumer, memory-efficient |
+| `mark_consumed(up_to)` | Manually clear slots | Fine-grained control |
 
-See `peer_connection.rs` for:
-- `streaming_registry()` method
-- `recv_stream_handle()` method
+---
 
-### With process_inbound
+## Phase 2: Piped Forwarding (COMPLETE)
 
-When a fragment arrives:
-1. Push to legacy `InboundStream` (for backward compatibility)
-2. Push to `StreamHandle` (for new streaming API)
-
-## Testing
-
-The implementation includes comprehensive tests covering:
-
-- **Edge cases**: Zero-byte streams, single-byte streams, exact boundaries
-- **Concurrency**: Parallel inserts, concurrent consumers, race conditions
-- **Error handling**: Cancelled streams, invalid indices, assembly failures
-- **Async behavior**: Notification timing, cancel during wait
-
-Run tests with:
-```bash
-cargo test -p freenet --lib -- streaming
-```
-
-## Running Benchmarks
-
-```bash
-# Lock-free buffer benchmarks
-cargo bench --bench transport_ci -- streaming_buffer
-
-# Full streaming pipeline benchmarks
-cargo bench --bench transport_ci -- transport/streaming
-```
-
-## Phase 2: Piped Forwarding
-
-> **Implementation Status:**
-> ✅ **Code Complete** - Phase 2 infrastructure is fully implemented in `crates/core/src/transport/peer_connection/piped_stream.rs`
-> ⏸️ **Not Yet Integrated** - Awaiting integration into the forwarding path (marked with `#[allow(dead_code)]`)
-> 📍 **See:** `crates/core/src/transport/peer_connection.rs:1305` - `send_fragment()` method
->
-> **Implementation History:**
-> - Phase 4 streaming handlers were implemented (PR #2734) then reverted (commit 462e6a7)
-> - Phase 2 infrastructure remains available for future integration
-
-Phase 2 enables intermediate nodes to forward fragments without full reassembly.
+Enables intermediate nodes to forward fragments without full reassembly.
 
 ### Architecture
 
@@ -274,9 +130,8 @@ Phase 2 enables intermediate nodes to forward fragments without full reassembly.
                                           │
                                    ┌──────┴──────┐
                                    │ PipedStream │
-                                   │             │
-                                   │ next_to_fwd: 1
-                                   │ buffered: {4}│ ← out-of-order
+                                   │ next_to_fwd │
+                                   │ buffered:{4}│ ← out-of-order
                                    └─────────────┘
 ```
 
@@ -284,14 +139,7 @@ Phase 2 enables intermediate nodes to forward fragments without full reassembly.
 
 #### PipedStream (`piped_stream.rs`)
 
-Buffers out-of-order fragments and forwards in-order fragments immediately:
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `next_to_forward` | `AtomicU32` | Next fragment to forward (1-indexed) |
-| `out_of_order` | `Mutex<BTreeMap>` | Buffered out-of-order fragments |
-| `send_semaphores` | `Vec<Arc<Semaphore>>` | Per-target backpressure |
-| `buffered_bytes` | `AtomicU64` | Memory pressure tracking |
+Buffers out-of-order fragments and forwards in-order fragments immediately.
 
 #### PipedStreamConfig
 
@@ -301,13 +149,6 @@ Buffers out-of-order fragments and forwards in-order fragments immediately:
 | `max_buffered_bytes` | 1 MB | Memory pressure limit |
 | `max_concurrent_sends` | 10 | Per-target send concurrency |
 
-#### send_fragment() on PeerConnection
-
-Low-level API to send a single fragment with full congestion control:
-- LEDBAT cwnd enforcement
-- Token bucket rate limiting
-- Sent packet tracking
-
 ### Memory Efficiency
 
 | Scenario | Memory Usage |
@@ -316,37 +157,186 @@ Low-level API to send a single fragment with full congestion control:
 | Realistic reorder (chunks of 10) | ~12 KB |
 | Worst case (fully reversed) | Full stream |
 
-### Usage
+---
+
+## Phase 3: Message Layer Infrastructure (COMPLETE)
+
+Adds streaming message variants and the orphan stream registry for handling race conditions.
+
+### Message Variants
+
+#### PUT Messages (`operations/put.rs`)
 
 ```rust
-// Create piped stream for forwarding
-let piped = PipedStream::new(stream_id, total_bytes, num_targets, config);
+pub enum PutMsg {
+    Request { ... },      // Existing
+    Response { ... },     // Existing
 
-// As fragments arrive from source
-for incoming_fragment in source_stream {
-    // Returns fragments ready to forward (may cascade)
-    let to_forward = piped.push_fragment(
-        incoming_fragment.number,
-        incoming_fragment.payload
-    )?;
-
-    // Forward to all targets
-    for fragment in to_forward {
-        for (i, target) in targets.iter_mut().enumerate() {
-            let _permit = piped.acquire_send_permit(i).await?;
-            target.send_fragment(fragment.clone()).await?;
-        }
-    }
+    // Streaming variants (Phase 3)
+    RequestStreaming {
+        id: Transaction,
+        stream_id: StreamId,
+        contract_key: ContractKey,
+        total_size: u64,
+        htl: usize,
+        skip_list: HashSet<SocketAddr>,
+        subscribe: bool,
+    },
+    ResponseStreaming {
+        id: Transaction,
+        key: ContractKey,
+        continue_forwarding: bool,
+    },
 }
 ```
 
-## Potential Future Improvements
+#### GET Messages (`operations/get.rs`)
 
-> **Note:** These are speculative ideas for discussion, not committed roadmap items.
+```rust
+pub enum GetMsg {
+    Request { ... },      // Existing
+    Response { ... },     // Existing
 
-1. **Flow Control**: Backpressure from slow consumers (Phase 3)
-2. **Memory Limits**: Cap total buffered data across all streams system-wide
-3. **Metrics**: Expose fragment loss, reordering statistics for monitoring
+    // Streaming variants (Phase 3)
+    ResponseStreaming {
+        id: Transaction,
+        instance_id: ContractInstanceId,
+        stream_id: StreamId,
+        key: ContractKey,
+        total_size: u64,
+        includes_contract: bool,
+    },
+    ResponseStreamingAck {
+        id: Transaction,
+        stream_id: StreamId,
+    },
+}
+```
+
+### OrphanStreamRegistry (`operations/orphan_streams.rs`)
+
+Handles race conditions when stream fragments arrive before their metadata messages.
+
+**Two orderings handled:**
+1. **Stream arrives first**: Transport calls `register_orphan()` when fragments arrive
+2. **Metadata arrives first**: Operations calls `claim_or_wait()` when metadata arrives
+
+```rust
+pub struct OrphanStreamRegistry {
+    // Streams awaiting metadata
+    orphan_streams: DashMap<StreamId, (StreamHandle, Instant)>,
+    // Waiters for streams that haven't arrived yet
+    stream_waiters: DashMap<StreamId, oneshot::Sender<StreamHandle>>,
+}
+```
+
+**Key Constants:**
+- `ORPHAN_STREAM_TIMEOUT`: 30 seconds - unclaimed streams are garbage collected
+- `STREAM_CLAIM_TIMEOUT`: 10 seconds - timeout when waiting for stream
+
+### State Machine Extensions
+
+#### PutState additions
+
+- `AwaitingStreamData { stream_id, contract_key, total_size, subscribe, htl }`
+- `ForwardingStream { upstream_stream_id, downstream_stream_id, contract_key, next_hop, subscribe }`
+
+#### GetState additions
+
+- `AwaitingStreamData { stream_id, key, instance_id, total_size, includes_contract, subscribe }`
+- `SendingStreamResponse { stream_id, key, instance_id, target_addr }`
+
+### Configuration
+
+```rust
+streaming_enabled: bool,        // Default: false
+streaming_threshold: usize,     // Default: 64KB
+```
+
+Streaming is used when: `streaming_enabled && payload_size > streaming_threshold`
+
+---
+
+## Phase 4: Streaming Handlers (IN PROGRESS)
+
+Implements the actual message handlers that use the Phase 3 infrastructure.
+
+### Goals
+
+1. Wire `PeerConnection` to call `orphan_stream_registry.register_orphan()` when streams arrive
+2. Implement `PutMsg::RequestStreaming` handler
+3. Implement `PutMsg::ResponseStreaming` handler
+4. Implement `GetMsg::ResponseStreaming` handler
+5. Implement `GetMsg::ResponseStreamingAck` handler
+6. Add periodic GC task for orphan streams
+
+### Data Flow
+
+```
+                    STREAMING PUT FLOW
+
+Sender                      Intermediate                   Final Node
+  │                              │                              │
+  │─── RequestStreaming ────────►│                              │
+  │─── Stream fragments ────────►│                              │
+  │                              │─── RequestStreaming ────────►│
+  │                              │─── Stream fragments ────────►│
+  │                              │                              │ (stores)
+  │                              │◄── ResponseStreaming ────────│
+  │◄── ResponseStreaming ────────│                              │
+
+
+                    STREAMING GET FLOW
+
+Requester                   Intermediate                   Owner
+  │                              │                              │
+  │─── Request ─────────────────►│                              │
+  │                              │─── Request ─────────────────►│
+  │                              │◄── ResponseStreaming ────────│
+  │                              │◄── Stream fragments ─────────│
+  │◄── ResponseStreaming ────────│                              │
+  │◄── Stream fragments ─────────│                              │
+  │─── ResponseStreamingAck ────►│─── ResponseStreamingAck ────►│
+```
+
+---
+
+## Phase 5: Capability Negotiation (NOT STARTED)
+
+Backward compatibility with non-streaming nodes via handshake negotiation.
+
+### Planned Features
+
+- Add `PeerCapabilities` to handshake protocol
+- Store negotiated transport mode per connection
+- Gate streaming features behind capability check
+- Protocol version bump for streaming support
+
+---
+
+## Phase 6: Rollout (NOT STARTED)
+
+Gradual enablement with monitoring.
+
+### Planned Features
+
+- Feature flags: `FREENET_STREAMING`, `FREENET_STREAMING_THRESHOLD`
+- Shadow mode for A/B validation
+- Prometheus metrics for streaming health
+- Gradual enablement: shadow -> opt-in -> default
+
+---
+
+## Testing
+
+```bash
+# Run streaming tests
+cargo test -p freenet --lib -- streaming
+
+# Run benchmarks
+cargo bench --bench transport_ci -- streaming_buffer
+cargo bench --bench transport_ci -- transport/streaming
+```
 
 ## Source Code
 
@@ -355,8 +345,8 @@ for incoming_fragment in source_stream {
 | Lock-free buffer | `crates/core/src/transport/peer_connection/streaming_buffer.rs` |
 | StreamHandle, Registry | `crates/core/src/transport/peer_connection/streaming.rs` |
 | Piped forwarding | `crates/core/src/transport/peer_connection/piped_stream.rs` |
+| Orphan streams | `crates/core/src/operations/orphan_streams.rs` |
 | Integration | `crates/core/src/transport/peer_connection.rs` |
-| Benchmarks | `crates/core/benches/transport/streaming_buffer.rs` |
 
 ## References
 
