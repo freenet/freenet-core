@@ -12,6 +12,7 @@ mod state_store;
 mod store;
 #[cfg(test)]
 mod tests;
+mod tunables;
 
 pub(crate) use contract::ContractRuntimeInterface;
 pub use contract_store::ContractStore;
