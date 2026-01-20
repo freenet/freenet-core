@@ -536,7 +536,7 @@ mod tests {
         source_snap.set_contract(
             contract_id,
             ContractSubscription {
-                contract_key: contract_key.clone(),
+                contract_key,
                 upstream: None,
                 downstream: vec![],
                 is_seeding: true,

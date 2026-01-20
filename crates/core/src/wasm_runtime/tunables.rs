@@ -4,7 +4,35 @@
 //! that enforces a maximum memory limit on WASM instances. This prevents unbounded
 //! virtual address space accumulation that can lead to OOM errors over time.
 //!
-//! See: https://github.com/freenet/freenet-core/issues/2774
+//! # Background: Virtual Address Space and Guard Pages
+//!
+//! When a WASM instance is created without a maximum memory limit, Wasmer reserves
+//! approximately **5 GB of virtual address space** per instance for guard pages.
+//! Guard pages are unmapped memory regions placed after accessible memory to catch
+//! out-of-bounds access (triggering SIGSEGV instead of memory corruption).
+//!
+//! Without a known maximum, Wasmer must assume memory could grow to 4 GB (WASM32 limit),
+//! so it reserves space accordingly. By specifying a maximum, Wasmer uses proportionally
+//! smaller guard regions.
+//!
+//! # Memory Reclamation
+//!
+//! When a WASM `Instance` is dropped, Wasmer calls `munmap()` to release virtual address
+//! space. However, under burst creation scenarios (many concurrent contract calls),
+//! instances can be created faster than `munmap()` completes, causing virtual space to
+//! accumulate temporarily.
+//!
+//! | Scenario | Virtual Space per Instance | Impact |
+//! |----------|---------------------------|--------|
+//! | No maximum | ~5 GB guard pages | ~400 concurrent instances exhausts 2TB |
+//! | 256 MiB max | ~256 MB + small guards | ~7,800 concurrent instances in 2TB |
+//! | 512 MiB max | ~512 MB + small guards | ~3,900 concurrent instances in 2TB |
+//!
+//! # See Also
+//!
+//! - <https://github.com/freenet/freenet-core/issues/2774> - Original OOM issue
+//! - <https://github.com/wasmerio/wasmer/issues/2780> - Wasmer memory leak discussion
+//! - <https://github.com/wasmerio/wasmer/issues/2563> - Instance creation performance
 
 use std::ptr::NonNull;
 use wasmer::sys::vm::{
@@ -15,8 +43,33 @@ use wasmer::sys::Tunables;
 use wasmer::{MemoryType, Pages, TableType};
 
 /// Default maximum memory limit in WASM pages (64 KiB each).
-/// 4096 pages = 256 MiB, which is sufficient for most contracts while
-/// preventing unbounded growth.
+///
+/// **Current value: 4096 pages = 256 MiB**
+///
+/// # Why 256 MiB?
+///
+/// - Observed contract states are ~2.6 MB, so 256 MiB provides ~100x headroom
+/// - Matches typical WASM memory limits in other runtimes (e.g., Wasmtime defaults)
+/// - Prevents runaway memory growth from buggy contracts
+/// - Allows ~7,800 concurrent instances before hitting 2TB virtual space limit
+///
+/// # What happens if a contract needs more?
+///
+/// Contracts requiring more than this limit will **fail to instantiate** with a clear
+/// error message. This is intentional - contracts needing >256 MiB should be reviewed.
+///
+/// # Increasing this limit
+///
+/// If legitimate contracts require more memory, this constant can be increased:
+///
+/// | Limit | Pages | Concurrent Instances (2TB virt) |
+/// |-------|-------|--------------------------------|
+/// | 256 MiB | 4096 | ~7,800 |
+/// | 512 MiB | 8192 | ~3,900 |
+/// | 1 GiB | 16384 | ~1,950 |
+///
+/// Trade-off: Higher limits support larger operations but reduce concurrent capacity
+/// and allow potentially buggy contracts to consume more resources.
 pub const DEFAULT_MAX_MEMORY_PAGES: u32 = 4096;
 
 /// A tunables wrapper that enforces a maximum memory limit on WASM instances.
