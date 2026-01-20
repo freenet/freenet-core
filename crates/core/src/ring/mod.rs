@@ -795,8 +795,14 @@ impl Ring {
     ) -> Result<UpstreamSetResult, SubscriptionError> {
         let own_addr = self.connection_manager.get_own_addr();
         let own_location = self.connection_manager.get_stored_location();
-        self.seeding_manager
-            .set_upstream(contract, upstream, own_addr, own_location)
+        let own_pub_key = self.connection_manager.pub_key.as_bytes();
+        self.seeding_manager.set_upstream(
+            contract,
+            upstream,
+            own_addr,
+            own_location,
+            Some(own_pub_key),
+        )
     }
 
     /// Remove a subscriber and check if upstream notification is needed.
