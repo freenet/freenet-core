@@ -10,6 +10,7 @@ use tracing::info;
 
 use super::{ContractStore, DelegateStore, SecretsStore};
 
+mod cache;
 mod contract;
 mod contract_metering;
 mod execution_handling;

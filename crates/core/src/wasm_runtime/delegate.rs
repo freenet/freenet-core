@@ -493,6 +493,8 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
+        // Remove from module cache to prevent stale code execution if re-registered
+        self.delegate_modules.pop(key);
         self.delegate_store.remove_delegate(key)
     }
 }

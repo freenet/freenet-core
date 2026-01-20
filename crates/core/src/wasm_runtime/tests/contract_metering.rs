@@ -33,6 +33,7 @@ fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
         cpu_cycles_per_second: Some(1_000_000), // Lower limit to force gas error
         safety_margin: 0.1,
         enable_metering: true,
+        ..Default::default()
     };
 
     let mut runtime =
@@ -84,6 +85,7 @@ fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
         cpu_cycles_per_second: Some(2_000_000),
         safety_margin: 0.1,
         enable_metering: true,
+        ..Default::default()
     };
 
     let mut runtime =
@@ -136,6 +138,7 @@ fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
         cpu_cycles_per_second: Some(3_000_000),
         safety_margin: 0.1,
         enable_metering: true,
+        ..Default::default()
     };
 
     let mut runtime =
@@ -183,6 +186,7 @@ fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
         cpu_cycles_per_second: Some(4_000_000),
         safety_margin: 0.1,
         enable_metering: true,
+        ..Default::default()
     };
 
     let mut runtime =
@@ -235,6 +239,7 @@ fn test_timeout_metering() -> Result<(), Box<dyn std::error::Error>> {
         cpu_cycles_per_second: Some(u64::MAX),
         safety_margin: 0.1,
         enable_metering: true,
+        ..Default::default()
     };
 
     let mut runtime =
