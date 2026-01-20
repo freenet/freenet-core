@@ -2,14 +2,137 @@ use super::*;
 use crate::message::NodeEvent;
 use crate::node::OpManager;
 use crate::wasm_runtime::{InMemoryContractStore, MockStateStorage, StateStorage};
+use dashmap::DashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+
+// =============================================================================
+// CRDT Emulation Mode
+// =============================================================================
+//
+// The CRDT emulation mode allows testing the delta-based sync protocol with
+// contracts that behave like real CRDTs. When a contract is registered as CRDT:
+//
+// 1. State format: [version: u64 LE][data bytes]
+// 2. Summary: [version: u64 LE][blake3 hash of data]
+// 3. Delta: [from_version: u64 LE][to_version: u64 LE][new data]
+// 4. Delta application: FAILS if current version != from_version
+//
+// This enables testing PR #2763's fix: if sender incorrectly caches their summary
+// as recipient's summary, the next delta will have wrong from_version, causing
+// delta application to fail and trigger ResyncRequest.
+
+/// Global registry of contracts using CRDT emulation mode.
+/// Thread-safe for use across multiple simulation nodes.
+static CRDT_CONTRACTS: std::sync::LazyLock<DashSet<ContractInstanceId>> =
+    std::sync::LazyLock::new(DashSet::new);
+
+/// Register a contract to use CRDT emulation mode.
+///
+/// CRDT mode enables version-aware delta computation and application,
+/// which can trigger ResyncRequests when summary caching is incorrect.
+pub fn register_crdt_contract(contract_id: ContractInstanceId) {
+    CRDT_CONTRACTS.insert(contract_id);
+    tracing::debug!(contract = %contract_id, "Registered contract for CRDT emulation mode");
+}
+
+/// Check if a contract uses CRDT emulation mode.
+pub fn is_crdt_contract(contract_id: &ContractInstanceId) -> bool {
+    CRDT_CONTRACTS.contains(contract_id)
+}
+
+/// Clear all CRDT contract registrations (for test cleanup).
+pub fn clear_crdt_contracts() {
+    CRDT_CONTRACTS.clear();
+}
+
+/// CRDT state encoding: [version: u64 LE][data]
+mod crdt_encoding {
+    use super::*;
+
+    /// Minimum state size for CRDT mode (8 bytes for version)
+    pub const MIN_STATE_SIZE: usize = 8;
+
+    /// Encode state with version prefix.
+    pub fn encode_state(version: u64, data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(8 + data.len());
+        result.extend_from_slice(&version.to_le_bytes());
+        result.extend_from_slice(data);
+        result
+    }
+
+    /// Decode version and data from state.
+    pub fn decode_state(state: &[u8]) -> Option<(u64, &[u8])> {
+        if state.len() < MIN_STATE_SIZE {
+            return None;
+        }
+        let version = u64::from_le_bytes(state[0..8].try_into().ok()?);
+        let data = &state[8..];
+        Some((version, data))
+    }
+
+    /// Get version from state without copying data.
+    pub fn get_version(state: &[u8]) -> Option<u64> {
+        if state.len() < MIN_STATE_SIZE {
+            return None;
+        }
+        Some(u64::from_le_bytes(state[0..8].try_into().ok()?))
+    }
+
+    /// Summary format: [version: u64 LE][blake3 hash: 32 bytes] = 40 bytes
+    pub fn create_summary(state: &[u8]) -> Option<Vec<u8>> {
+        let (version, data) = decode_state(state)?;
+        let hash = blake3::hash(data);
+        let mut summary = Vec::with_capacity(40);
+        summary.extend_from_slice(&version.to_le_bytes());
+        summary.extend_from_slice(hash.as_bytes());
+        Some(summary)
+    }
+
+    /// Extract version from summary.
+    pub fn summary_version(summary: &[u8]) -> Option<u64> {
+        if summary.len() < 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(summary[0..8].try_into().ok()?))
+    }
+
+    /// Delta format: [from_version: u64 LE][to_version: u64 LE][new data]
+    pub fn create_delta(from_version: u64, to_version: u64, new_data: &[u8]) -> Vec<u8> {
+        let mut delta = Vec::with_capacity(16 + new_data.len());
+        delta.extend_from_slice(&from_version.to_le_bytes());
+        delta.extend_from_slice(&to_version.to_le_bytes());
+        delta.extend_from_slice(new_data);
+        delta
+    }
+
+    /// Decode delta: returns (from_version, to_version, new_data).
+    pub fn decode_delta(delta: &[u8]) -> Option<(u64, u64, &[u8])> {
+        if delta.len() < 16 {
+            return None;
+        }
+        let from_version = u64::from_le_bytes(delta[0..8].try_into().ok()?);
+        let to_version = u64::from_le_bytes(delta[8..16].try_into().ok()?);
+        let new_data = &delta[16..];
+        Some((from_version, to_version, new_data))
+    }
+}
 
 /// Mock runtime for testing that uses fully in-memory storage.
 ///
 /// Unlike the production runtime which uses disk-based storage with background
 /// threads (file watchers, compaction), this runtime keeps everything in memory
 /// for deterministic simulation testing.
+///
+/// ## CRDT Emulation Mode
+///
+/// Contracts can be registered for CRDT emulation using `register_crdt_contract()`.
+/// In CRDT mode:
+/// - State includes a version number
+/// - Summary includes version for delta computation
+/// - Delta application fails if version mismatch (triggers ResyncRequest)
+///
+/// This enables testing of PR #2763's summary caching fix.
 pub(crate) struct MockRuntime {
     pub contract_store: InMemoryContractStore,
 }
@@ -128,6 +251,73 @@ where
                 );
             }
         }
+    }
+
+    /// Apply a CRDT-mode delta with version checking.
+    ///
+    /// CRDT deltas include version information. If the delta's `from_version`
+    /// doesn't match our current version, delta application FAILS. This triggers
+    /// a ResyncRequest from the caller, which is exactly what PR #2763 was designed
+    /// to prevent through correct summary caching.
+    ///
+    /// Delta format: [from_version: u64][to_version: u64][new_data]
+    async fn apply_crdt_delta(
+        &mut self,
+        key: &ContractKey,
+        current_state: &WrappedState,
+        delta: &StateDelta<'_>,
+        _has_contract_code: bool,
+    ) -> Result<UpsertResult, ExecutorError> {
+        // Decode the delta
+        let (from_version, to_version, new_data) = crdt_encoding::decode_delta(delta.as_ref())
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("Invalid CRDT delta format")))?;
+
+        // Get current version
+        let current_version = crdt_encoding::get_version(current_state.as_ref())
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format")))?;
+
+        tracing::debug!(
+            contract = %key,
+            current_version = current_version,
+            delta_from_version = from_version,
+            delta_to_version = to_version,
+            "CRDT mode: applying delta"
+        );
+
+        // VERSION CHECK: This is the key test for PR #2763!
+        // If sender cached wrong summary, from_version won't match our version.
+        if current_version != from_version {
+            tracing::warn!(
+                contract = %key,
+                current_version = current_version,
+                delta_from_version = from_version,
+                "CRDT delta version mismatch - triggering ResyncRequest"
+            );
+            // Return error to trigger ResyncRequest
+            return Err(ExecutorError::other(anyhow::anyhow!(
+                "CRDT delta version mismatch: expected {}, got {}",
+                current_version,
+                from_version
+            )));
+        }
+
+        // Version matches - apply the delta (replace data with new version)
+        let new_state_bytes = crdt_encoding::encode_state(to_version, new_data);
+        let new_state = WrappedState::new(new_state_bytes);
+
+        self.state_store
+            .update(key, new_state.clone())
+            .await
+            .map_err(ExecutorError::other)?;
+
+        tracing::debug!(
+            contract = %key,
+            old_version = current_version,
+            new_version = to_version,
+            "CRDT mode: delta applied successfully"
+        );
+
+        Ok(UpsertResult::Updated(new_state))
     }
 }
 
@@ -274,7 +464,14 @@ where
 
                 match self.state_store.get(&key).await {
                     Ok(current_state) => {
-                        // Apply delta by concatenating with current state (simple mock behavior)
+                        // Check for CRDT mode - version-aware delta application
+                        if is_crdt_contract(key.id()) {
+                            return self
+                                .apply_crdt_delta(&key, &current_state, &delta, true)
+                                .await;
+                        }
+
+                        // Default mode: Apply delta by concatenating with current state
                         // Then use hash comparison for deterministic convergence
                         let mut new_state_bytes = current_state.as_ref().to_vec();
                         new_state_bytes.extend_from_slice(delta.as_ref());
@@ -308,7 +505,14 @@ where
                 // Delta update without contract code - must have existing state
                 match self.state_store.get(&key).await {
                     Ok(current_state) => {
-                        // Apply delta by concatenating with current state (simple mock behavior)
+                        // Check for CRDT mode - version-aware delta application
+                        if is_crdt_contract(key.id()) {
+                            return self
+                                .apply_crdt_delta(&key, &current_state, &delta, false)
+                                .await;
+                        }
+
+                        // Default mode: Apply delta by concatenating with current state
                         let mut new_state_bytes = current_state.as_ref().to_vec();
                         new_state_bytes.extend_from_slice(delta.as_ref());
                         let new_state = WrappedState::new(new_state_bytes);
@@ -381,29 +585,78 @@ where
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
-        // MockRuntime doesn't have actual contract code to execute summarize_state,
-        // so we return the full state as a fallback summary
         let state = self
             .state_store
             .get(&key)
             .await
             .map_err(ExecutorError::other)?;
-        Ok(StateSummary::from(state.as_ref().to_vec()))
+
+        // Check if this contract uses CRDT emulation mode
+        if is_crdt_contract(key.id()) {
+            // CRDT mode: summary includes version + hash
+            if let Some(summary) = crdt_encoding::create_summary(state.as_ref()) {
+                tracing::trace!(
+                    contract = %key,
+                    version = crdt_encoding::get_version(state.as_ref()),
+                    "CRDT mode: created versioned summary"
+                );
+                return Ok(StateSummary::from(summary));
+            }
+            // Fall through to default if state format is invalid
+            tracing::warn!(
+                contract = %key,
+                "CRDT mode: invalid state format, falling back to hash summary"
+            );
+        }
+
+        // Default mode: hash-based summary (32 bytes) to enable delta efficiency.
+        // With hash summaries, is_delta_efficient(32, state_size) = true when state > 64 bytes.
+        let hash = blake3::hash(state.as_ref());
+        Ok(StateSummary::from(hash.as_bytes().to_vec()))
     }
 
     async fn get_contract_state_delta(
         &mut self,
         key: ContractKey,
-        _their_summary: StateSummary<'static>,
+        their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
-        // MockRuntime doesn't have actual contract code to execute get_state_delta,
-        // so we return the full state as the "delta" (fallback behavior)
-        let state = self
-            .state_store
-            .get(&key)
-            .await
-            .map_err(ExecutorError::other)?;
-        Ok(StateDelta::from(state.as_ref().to_vec()))
+        // Check if this contract uses CRDT emulation mode
+        if is_crdt_contract(key.id()) {
+            // CRDT mode: compute version-aware delta
+            let state = self
+                .state_store
+                .get(&key)
+                .await
+                .map_err(ExecutorError::other)?;
+
+            let their_version =
+                crdt_encoding::summary_version(their_summary.as_ref()).ok_or_else(|| {
+                    ExecutorError::other(anyhow::anyhow!("Invalid CRDT summary format"))
+                })?;
+
+            let (our_version, our_data) =
+                crdt_encoding::decode_state(state.as_ref()).ok_or_else(|| {
+                    ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format"))
+                })?;
+
+            tracing::trace!(
+                contract = %key,
+                their_version = their_version,
+                our_version = our_version,
+                "CRDT mode: computing delta"
+            );
+
+            // Create delta that transforms their state to ours
+            let delta = crdt_encoding::create_delta(their_version, our_version, our_data);
+            return Ok(StateDelta::from(delta));
+        }
+
+        // Default mode: cannot compute real deltas
+        // By returning an error, we trigger the full state fallback path with
+        // sent_delta=false, which correctly avoids caching the sender's summary.
+        Err(ExecutorError::other(anyhow::anyhow!(
+            "MockRuntime cannot compute deltas - use full state sync"
+        )))
     }
 }
 

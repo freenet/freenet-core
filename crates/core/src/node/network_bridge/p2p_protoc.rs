@@ -1838,6 +1838,9 @@ impl P2pConnManager {
                                         ),
                                     };
 
+                                    // Save payload size before moving it into the message
+                                    let payload_size = payload.size();
+
                                     let msg = crate::operations::update::UpdateMsg::BroadcastTo {
                                         id: update_tx,
                                         key,
@@ -1856,17 +1859,31 @@ impl P2pConnManager {
                                             error = %err,
                                             "Failed to send state change broadcast"
                                         );
-                                    } else if sent_delta {
-                                        // Only update cached summary when we sent a delta.
-                                        // Delta sends mean we had accurate knowledge of the peer's previous state,
-                                        // so after they apply our delta, they should have our current state.
-                                        //
-                                        // We do NOT update when sending full state because:
-                                        // 1. The peer's resulting state depends on CRDT merge with their existing state
-                                        // 2. We don't know what state they had, so we can't predict the merge result
-                                        //
-                                        // This prevents echo-back loops: after A sends delta to B, A caches that
-                                        // B has A's state, so subsequent broadcasts won't redundantly send to B.
+                                    } else {
+                                        // Track delta vs full state sends for testing (PR #2763)
+                                        if sent_delta {
+                                            op_manager
+                                                .interest_manager
+                                                .record_delta_send(new_state.size(), payload_size);
+                                            crate::config::GlobalTestMetrics::record_delta_send();
+                                        } else {
+                                            op_manager.interest_manager.record_full_state_send();
+                                            crate::config::GlobalTestMetrics::record_full_state_send();
+                                        }
+                                    }
+
+                                    // PR #2763 FIX: Only update cached summary when we sent a delta.
+                                    // Delta sends mean we had accurate knowledge of the peer's previous state,
+                                    // so after they apply our delta, they should have our current state.
+                                    //
+                                    // We do NOT update when sending full state because:
+                                    // 1. The peer's resulting state depends on CRDT merge with their existing state
+                                    // 2. We don't know what state they had, so we can't predict the merge result
+                                    //
+                                    // This prevents incorrect delta computation: if we send full state to a peer
+                                    // and incorrectly cache our summary as theirs, later deltas will compute
+                                    // from the wrong base state, causing version mismatches and ResyncRequests.
+                                    if sent_delta {
                                         if let Some(summary) = &our_summary {
                                             op_manager.interest_manager.update_peer_summary(
                                                 &key,
