@@ -2062,6 +2062,85 @@ impl GlobalSimulationTime {
     }
 }
 
+// =============================================================================
+// Global Test Metrics (for simulation testing)
+// =============================================================================
+
+/// Global counter for ResyncRequests received across all nodes.
+/// Used in simulation tests to verify correct summary caching behavior.
+static GLOBAL_RESYNC_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Global counter for delta sends across all nodes.
+/// Incremented when a state change broadcast uses delta encoding.
+static GLOBAL_DELTA_SENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Global counter for full state sends across all nodes.
+/// Incremented when a state change broadcast sends full state (not delta).
+static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Global test metrics for tracking events across the simulation network.
+///
+/// These counters are incremented by production code and read by tests to verify
+/// correct behavior. They should only be used in testing scenarios.
+///
+/// # Usage in Tests
+///
+/// ```ignore
+/// use freenet::config::GlobalTestMetrics;
+///
+/// // Reset at test start
+/// GlobalTestMetrics::reset();
+///
+/// // Run simulation...
+///
+/// // Check results
+/// assert_eq!(GlobalTestMetrics::resync_requests(), 0,
+///     "No resyncs should be needed with correct summary caching");
+/// ```
+pub struct GlobalTestMetrics;
+
+impl GlobalTestMetrics {
+    /// Resets all test metrics to zero. Call at the start of each test.
+    pub fn reset() {
+        GLOBAL_RESYNC_REQUESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_DELTA_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_FULL_STATE_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records that a ResyncRequest was received.
+    /// Called from production code when handling ResyncRequest messages.
+    pub fn record_resync_request() {
+        GLOBAL_RESYNC_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the total number of ResyncRequests received since last reset.
+    pub fn resync_requests() -> u64 {
+        GLOBAL_RESYNC_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records that a delta was sent in a state change broadcast.
+    /// Called from p2p_protoc.rs when sent_delta = true.
+    pub fn record_delta_send() {
+        GLOBAL_DELTA_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the total number of delta sends since last reset.
+    pub fn delta_sends() -> u64 {
+        GLOBAL_DELTA_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records that full state was sent in a state change broadcast.
+    /// Called from p2p_protoc.rs when sent_delta = false.
+    pub fn record_full_state_send() {
+        GLOBAL_FULL_STATE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the total number of full state sends since last reset.
+    pub fn full_state_sends() -> u64 {
+        GLOBAL_FULL_STATE_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: Option<String>) {
     #[cfg(feature = "trace")]
     {

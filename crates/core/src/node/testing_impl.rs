@@ -194,6 +194,29 @@ impl SimOperation {
         state_bytes
     }
 
+    /// Creates a CRDT-mode test state with version prefix.
+    ///
+    /// Format: [version: u64 LE][64 bytes of data]
+    ///
+    /// Use this with `register_crdt_contract()` to test version-aware delta handling.
+    /// The CRDT mode enables testing of PR #2763's summary caching fix by:
+    /// - Using version-aware summaries (version + hash)
+    /// - Computing version-specific deltas
+    /// - Failing delta application when versions don't match
+    pub fn create_crdt_state(version: u64, seed: u8) -> Vec<u8> {
+        // State must be > 80 bytes for delta to be "efficient"
+        // (efficiency check: summary_size * 2 < state_size, where summary = 40 bytes)
+        // Using 128 bytes of data for total state size of 136 bytes
+        let mut state_bytes = Vec::with_capacity(8 + 128);
+        // Add version prefix
+        state_bytes.extend_from_slice(&version.to_le_bytes());
+        // Add data (128 bytes to make delta efficient)
+        for i in 0..128u8 {
+            state_bytes.push(seed.wrapping_add(i).wrapping_mul(3));
+        }
+        state_bytes
+    }
+
     /// Converts this operation to a ClientRequest.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn into_client_request(self) -> freenet_stdlib::client_api::ClientRequest<'static> {

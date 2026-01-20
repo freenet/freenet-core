@@ -63,12 +63,15 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
-    pub use crate::config::Config;
+    pub use crate::config::{Config, GlobalTestMetrics};
     pub use client_events::{
         test::MemoryEventsGen, test::NetworkEventGenerator, AuthToken, ClientEventsProxy, ClientId,
         OpenRequest,
     };
-    pub use contract::{storages::Storage, Executor, OperationMode};
+    pub use contract::{
+        clear_crdt_contracts, is_crdt_contract, register_crdt_contract, storages::Storage,
+        Executor, OperationMode,
+    };
     pub use flatbuffers;
     pub use message::Transaction;
     pub use node::{

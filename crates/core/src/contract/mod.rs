@@ -14,6 +14,9 @@ pub(crate) use executor::{
     Callback, ContractExecutor, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
     UpsertResult,
 };
+
+// Re-export CRDT emulation functions for testing
+pub use executor::mock_runtime::{clear_crdt_contracts, is_crdt_contract, register_crdt_contract};
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel,
     in_memory::{MemoryContractHandler, SimulationContractHandler, SimulationHandlerBuilder},

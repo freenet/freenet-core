@@ -1330,6 +1330,10 @@ async fn handle_interest_sync_message(
                 "Received ResyncRequest - peer needs full state"
             );
 
+            // Track this for testing - high counts indicate incorrect summary caching (PR #2763)
+            op_manager.interest_manager.record_resync_request_received();
+            crate::config::GlobalTestMetrics::record_resync_request();
+
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {

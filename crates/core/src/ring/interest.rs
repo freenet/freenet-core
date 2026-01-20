@@ -266,6 +266,10 @@ pub struct InterestManager<T: TimeSource> {
     /// Total bytes saved by sending deltas instead of full state.
     /// Calculated as: sum of (state_size - delta_size) for each delta send.
     delta_bytes_saved: AtomicU64,
+
+    /// Number of ResyncRequests received (indicates delta application failures at remote peer).
+    /// This counter helps detect incorrect summary caching issues (see PR #2763).
+    resync_requests_received: AtomicU64,
 }
 
 impl<T: TimeSource> InterestManager<T> {
@@ -283,6 +287,7 @@ impl<T: TimeSource> InterestManager<T> {
             delta_sends: AtomicU64::new(0),
             full_state_sends: AtomicU64::new(0),
             delta_bytes_saved: AtomicU64::new(0),
+            resync_requests_received: AtomicU64::new(0),
         }
     }
 
@@ -303,6 +308,15 @@ impl<T: TimeSource> InterestManager<T> {
     /// or delta computation failed.
     pub fn record_full_state_send(&self) {
         self.full_state_sends.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a ResyncRequest was received from a peer.
+    ///
+    /// This indicates the peer couldn't apply a delta we sent, likely because
+    /// we had incorrect cached summary for them (the bug PR #2763 fixed).
+    pub fn record_resync_request_received(&self) {
+        self.resync_requests_received
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Register a peer's interest in a contract.
@@ -863,6 +877,7 @@ impl<T: TimeSource> InterestManager<T> {
             delta_sends: self.delta_sends.load(Ordering::Relaxed),
             full_state_sends: self.full_state_sends.load(Ordering::Relaxed),
             delta_bytes_saved: self.delta_bytes_saved.load(Ordering::Relaxed),
+            resync_requests_received: self.resync_requests_received.load(Ordering::Relaxed),
         }
     }
 }
@@ -884,6 +899,9 @@ pub struct InterestManagerStats {
     pub full_state_sends: u64,
     /// Total bytes saved by sending deltas.
     pub delta_bytes_saved: u64,
+    /// Number of ResyncRequests received (indicates delta failures at remote peers).
+    /// With correct summary caching (PR #2763), this should be zero in normal operation.
+    pub resync_requests_received: u64,
 }
 
 #[cfg(test)]
