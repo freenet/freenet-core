@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 
 pub use seeding::{
     AddClientSubscriptionResult, AddDownstreamResult, PruneSubscriptionsResult,
-    RemoveSubscriberResult, SubscriberType, SubscriptionError,
+    RemoveSubscriberResult, SubscriberType, SubscriptionError, UpstreamSetResult,
 };
 
 use crate::message::TransactionType;
@@ -786,14 +786,17 @@ impl Ring {
     ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
+    /// - `CircularReference`: The upstream peer is our downstream AND we are closer to
+    ///   the contract (we should be source, not them)
     pub fn set_upstream(
         &self,
         contract: &ContractKey,
         upstream: PeerKeyLocation,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<UpstreamSetResult, SubscriptionError> {
         let own_addr = self.connection_manager.get_own_addr();
+        let own_location = self.connection_manager.get_stored_location();
         self.seeding_manager
-            .set_upstream(contract, upstream, own_addr)
+            .set_upstream(contract, upstream, own_addr, own_location)
     }
 
     /// Remove a subscriber and check if upstream notification is needed.

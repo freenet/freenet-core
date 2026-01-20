@@ -948,7 +948,20 @@ impl Operation for SubscribeOp {
                                     wait_for_peer_location(op_manager, sender_addr, msg_id).await
                                 {
                                     match op_manager.ring.set_upstream(key, sender_peer.clone()) {
-                                        Ok(()) => {
+                                        Ok(result) => {
+                                            // Issue #2773: Log if a peer was promoted from downstream
+                                            // to upstream (mutual subscription resolution via tie-breaker)
+                                            if let Some(ref promoted) =
+                                                result.promoted_from_downstream
+                                            {
+                                                tracing::info!(
+                                                    tx = %msg_id,
+                                                    contract = %format!("{:.8}", key),
+                                                    promoted_peer = ?promoted.socket_addr(),
+                                                    "SUBSCRIPTION_UPSTREAM_PROMOTED: peer promoted from downstream to upstream (issue #2773)"
+                                                );
+                                            }
+
                                             // Emit telemetry for upstream set
                                             if let Some(event) = NetEventLog::upstream_set(
                                                 &op_manager.ring,
