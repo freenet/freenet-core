@@ -24,12 +24,12 @@ use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
-/// Default capacity for the compiled WASM module cache.
+/// Default capacity for each compiled WASM module cache.
 ///
 /// This limits how many compiled contract/delegate modules are kept in memory.
-/// When the cache is full, the least recently used module is evicted.
+/// When a cache is full, the least recently used module is evicted.
 ///
-/// **Current value: 128 modules**
+/// **Current value: 128 modules per cache**
 ///
 /// # Trade-offs
 ///
@@ -42,8 +42,12 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 /// # Memory Impact
 ///
 /// Each compiled `Module` consumes memory proportional to the contract's complexity.
-/// A typical compiled module is 100KB-1MB. With 128 modules, expect 12-128 MB
-/// of memory for the module cache.
+/// A typical compiled module is 100KB-1MB.
+///
+/// **Note:** The runtime maintains TWO separate caches (contracts and delegates),
+/// so total memory usage is approximately:
+/// - With 128 capacity: 2 × (12-128 MB) = **24-256 MB** total
+/// - With 256 capacity: 2 × (25-256 MB) = **50-512 MB** total
 pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 128;
 
 /// Execute a closure while suppressing stderr output.
@@ -160,8 +164,16 @@ pub struct RuntimeConfig {
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
     pub enable_metering: bool,
-    /// Maximum number of compiled modules to keep in cache.
-    /// When full, least recently used modules are evicted.
+    /// Maximum number of compiled modules to keep in each cache.
+    ///
+    /// The runtime maintains two separate LRU caches: one for contracts
+    /// and one for delegates. Each cache has this capacity.
+    ///
+    /// When a cache is full, the least recently used module is evicted.
+    ///
+    /// **Note:** If set to 0, falls back to 1 (minimum valid capacity).
+    /// This ensures the runtime always functions, though with reduced
+    /// caching efficiency.
     pub module_cache_capacity: usize,
 }
 
