@@ -14,7 +14,8 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use std::{collections::HashMap, sync::atomic::AtomicI64};
+use lru::LruCache;
+use std::{num::NonZeroUsize, sync::atomic::AtomicI64};
 use wasmer::sys::{CompilerConfig, EngineBuilder};
 use wasmer::{
     imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Pages, Store, TypedFunction,
@@ -22,6 +23,28 @@ use wasmer::{
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+
+/// Default capacity for the compiled WASM module cache.
+///
+/// This limits how many compiled contract/delegate modules are kept in memory.
+/// When the cache is full, the least recently used module is evicted.
+///
+/// **Current value: 128 modules**
+///
+/// # Trade-offs
+///
+/// - Higher capacity = more memory usage, but fewer recompilations
+/// - Lower capacity = less memory usage, but more recompilation overhead
+///
+/// Recompilation is relatively expensive (~10-100ms per module), so the cache
+/// should be large enough to hold the "working set" of frequently-used contracts.
+///
+/// # Memory Impact
+///
+/// Each compiled `Module` consumes memory proportional to the contract's complexity.
+/// A typical compiled module is 100KB-1MB. With 128 modules, expect 12-128 MB
+/// of memory for the module cache.
+pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 128;
 
 /// Execute a closure while suppressing stderr output.
 ///
@@ -137,6 +160,9 @@ pub struct RuntimeConfig {
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
     pub enable_metering: bool,
+    /// Maximum number of compiled modules to keep in cache.
+    /// When full, least recently used modules are evicted.
+    pub module_cache_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -146,6 +172,7 @@ impl Default for RuntimeConfig {
             cpu_cycles_per_second: None,
             safety_margin: 0.2,
             enable_metering: false,
+            module_cache_capacity: DEFAULT_MODULE_CACHE_CAPACITY,
         }
     }
 }
@@ -160,13 +187,15 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// loaded delegate modules
-    pub(super) delegate_modules: HashMap<DelegateKey, Module>,
+    /// LRU cache of compiled delegate modules.
+    /// Evicts least recently used modules when capacity is reached.
+    pub(super) delegate_modules: LruCache<DelegateKey, Module>,
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// loaded contract modules
-    pub(super) contract_modules: HashMap<ContractKey, Module>,
+    /// LRU cache of compiled contract modules.
+    /// Evicts least recently used modules when capacity is reached.
+    pub(super) contract_modules: LruCache<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
     pub(super) max_execution_seconds: f64,
 }
@@ -201,6 +230,10 @@ impl Runtime {
         native_api::rand::prepare_export(&mut store, &mut top_level_imports);
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
+        // SAFETY: DEFAULT_MODULE_CACHE_CAPACITY is non-zero
+        let cache_capacity =
+            NonZeroUsize::new(config.module_cache_capacity).unwrap_or(NonZeroUsize::MIN);
+
         Ok(Self {
             wasm_store: Some(store),
             top_level_imports,
@@ -208,10 +241,10 @@ impl Runtime {
 
             secret_store,
             delegate_store,
-            contract_modules: HashMap::new(),
+            contract_modules: LruCache::new(cache_capacity),
 
             contract_store,
-            delegate_modules: HashMap::new(),
+            delegate_modules: LruCache::new(cache_capacity),
             enabled_metering: config.enable_metering,
             max_execution_seconds: config.max_execution_seconds,
         })
@@ -271,9 +304,11 @@ impl Runtime {
         parameters: &Parameters,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
+        // Check cache first (updates LRU order if found)
         let module = if let Some(module) = self.contract_modules.get(key) {
-            module
+            module.clone()
         } else {
+            // Cache miss - compile the module
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
@@ -296,10 +331,10 @@ impl Runtime {
                 }
                 _ => unimplemented!(),
             };
-            self.contract_modules.insert(*key, module);
-            self.contract_modules.get(key).unwrap()
-        }
-        .clone();
+            // Insert into LRU cache (may evict least recently used entry)
+            self.contract_modules.put(*key, module.clone());
+            module
+        };
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
         RunningInstance::new(self, instance, Key::Contract(*key.id()))
@@ -311,9 +346,11 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
+        // Check cache first (updates LRU order if found)
         let module = if let Some(module) = self.delegate_modules.get(key) {
-            module
+            module.clone()
         } else {
+            // Cache miss - compile the module
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
@@ -321,10 +358,10 @@ impl Runtime {
             let store = self.wasm_store.as_ref().unwrap();
             let code = delegate.code().as_ref();
             let module = with_suppressed_stderr(|| Module::new(store, code))?;
-            self.delegate_modules.insert(key.clone(), module);
-            self.delegate_modules.get(key).unwrap()
-        }
-        .clone();
+            // Insert into LRU cache (may evict least recently used entry)
+            self.delegate_modules.put(key.clone(), module.clone());
+            module
+        };
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
         RunningInstance::new(self, instance, Key::Delegate(key.clone()))
