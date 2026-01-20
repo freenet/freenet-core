@@ -2372,7 +2372,7 @@ fn test_mutual_downstream_race_condition_issue_2773() {
         validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
     };
 
-    const SEED: u64 = 0x2773_RACE_0001;
+    const SEED: u64 = 0x2773_0001;
     const NETWORK_NAME: &str = "mutual-downstream-race";
 
     setup_deterministic_state(SEED);
