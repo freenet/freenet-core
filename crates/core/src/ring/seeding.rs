@@ -2151,4 +2151,144 @@ mod tests {
         assert!(manager.get_upstream(&contract).is_some());
         assert!(manager.get_downstream(&contract).is_empty());
     }
+
+    // ========== Issue #2773: Mutual downstream relationships ==========
+
+    /// Tests that set_upstream succeeds even when peer is already downstream.
+    ///
+    /// ## Issue #2773 - Mutual Downstream Race Condition
+    ///
+    /// When two peers simultaneously subscribe to a contract, a race condition
+    /// can cause both to add each other as downstream before either establishes
+    /// upstream. This blocks subscription tree formation:
+    ///
+    /// 1. Peer A receives B's Subscribe → adds B as downstream
+    /// 2. Peer B receives A's Subscribe → adds A as downstream
+    /// 3. SubscriptionAccepted returns → both try set_upstream on each other
+    /// 4. BUG: Both fail with CircularReference, leaving no upstream path
+    ///
+    /// ## Expected Fix (Option B)
+    ///
+    /// `set_upstream()` should remove the peer from downstream if present,
+    /// prioritizing the upstream relationship. This test verifies that behavior.
+    ///
+    /// This test is IGNORED because it tests EXPECTED behavior after the fix.
+    /// It will FAIL until Issue #2773 is implemented.
+    ///
+    /// Run with: `cargo test --ignored test_set_upstream_removes_from_downstream`
+    ///
+    /// See: https://github.com/freenet/freenet-core/issues/2773
+    #[test]
+    #[ignore = "Issue #2773: set_upstream should remove peer from downstream (not yet implemented)"]
+    fn test_set_upstream_removes_from_downstream_issue_2773() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let peer = test_peer_loc(1);
+
+        // First, add peer as downstream (simulating race condition outcome)
+        manager
+            .add_downstream(&contract, peer.clone(), None, None)
+            .expect("Adding downstream should succeed");
+
+        assert!(
+            manager.get_downstream(&contract).contains(&peer),
+            "Peer should be downstream"
+        );
+        assert!(manager.get_upstream(&contract).is_none(), "No upstream yet");
+
+        // Now set the same peer as upstream
+        // EXPECTED (after fix): This should SUCCEED and remove peer from downstream
+        // CURRENT (bug): This returns CircularReference error
+        let result = manager.set_upstream(&contract, peer.clone(), None);
+
+        assert!(
+            result.is_ok(),
+            "set_upstream should succeed by removing peer from downstream first. \
+             Got: {:?}. This test fails until Issue #2773 Option B is implemented.",
+            result
+        );
+
+        // After fix: peer should be upstream, NOT downstream
+        assert_eq!(
+            manager.get_upstream(&contract).as_ref(),
+            Some(&peer),
+            "Peer should now be upstream"
+        );
+        assert!(
+            !manager.get_downstream(&contract).contains(&peer),
+            "Peer should no longer be downstream (moved to upstream)"
+        );
+    }
+
+    /// Tests that mutual downstream deadlock is resolved by set_upstream fix.
+    ///
+    /// This simulates the full race condition from Issue #2773 and verifies
+    /// that the fix (Option B) allows at least one peer to establish upstream.
+    ///
+    /// This test is IGNORED because it tests EXPECTED behavior after the fix.
+    /// It will FAIL until Issue #2773 is implemented.
+    ///
+    /// Run with: `cargo test --ignored test_mutual_downstream_resolved`
+    ///
+    /// See: https://github.com/freenet/freenet-core/issues/2773
+    #[test]
+    #[ignore = "Issue #2773: mutual downstream should be resolvable (not yet implemented)"]
+    fn test_mutual_downstream_resolved_issue_2773() {
+        // Simulate the race condition: both peers independently add each other as downstream
+        let manager_a = SeedingManager::new();
+        let manager_b = SeedingManager::new();
+
+        let contract = make_contract_key(1);
+
+        let peer_a_keys = TransportKeypair::new();
+        let peer_b_keys = TransportKeypair::new();
+        let addr_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        let peer_a_loc = PeerKeyLocation::new(peer_a_keys.public().clone(), addr_a);
+        let peer_b_loc = PeerKeyLocation::new(peer_b_keys.public().clone(), addr_b);
+
+        // Race condition: both add each other as downstream
+        manager_a
+            .add_downstream(&contract, peer_b_loc.clone(), None, None)
+            .expect("A adding B as downstream");
+        manager_b
+            .add_downstream(&contract, peer_a_loc.clone(), None, None)
+            .expect("B adding A as downstream");
+
+        // Verify mutual downstream state (the problematic condition)
+        assert!(manager_a.get_downstream(&contract).contains(&peer_b_loc));
+        assert!(manager_b.get_downstream(&contract).contains(&peer_a_loc));
+        assert!(manager_a.get_upstream(&contract).is_none());
+        assert!(manager_b.get_upstream(&contract).is_none());
+
+        // Now both try to set upstream (simulating SubscriptionAccepted arriving)
+        // EXPECTED (after fix): At least one should succeed
+        // CURRENT (bug): Both fail with CircularReference
+        let result_a = manager_a.set_upstream(&contract, peer_b_loc.clone(), None);
+        let result_b = manager_b.set_upstream(&contract, peer_a_loc.clone(), None);
+
+        // After fix: Both should succeed - each removes the other from downstream
+        // and adds them as upstream
+        assert!(
+            result_a.is_ok(),
+            "A setting B as upstream should succeed after fix. Got: {:?}",
+            result_a
+        );
+        assert!(
+            result_b.is_ok(),
+            "B setting A as upstream should succeed after fix. Got: {:?}",
+            result_b
+        );
+
+        // Verify the deadlock is broken: both have upstream established
+        assert!(
+            manager_a.get_upstream(&contract).is_some(),
+            "A should have upstream after fix"
+        );
+        assert!(
+            manager_b.get_upstream(&contract).is_some(),
+            "B should have upstream after fix"
+        );
+    }
 }
