@@ -1434,6 +1434,51 @@ impl<'a> NetEventLog<'a> {
             kind,
         })
     }
+
+    /// Create a ResyncRequestReceived event.
+    ///
+    /// This is emitted when we receive a ResyncRequest from a peer, indicating
+    /// they failed to apply a delta we sent them. High counts may indicate
+    /// incorrect summary caching (see PR #2763).
+    pub fn resync_request_received(
+        ring: &'a Ring,
+        key: ContractKey,
+        from_peer: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+                key,
+                from_peer,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a ResyncResponseSent event.
+    ///
+    /// This is emitted when we send a ResyncResponse (full state) to a peer
+    /// after they requested a resync due to delta application failure.
+    pub fn resync_response_sent(
+        ring: &'a Ring,
+        key: ContractKey,
+        to_peer: PeerKeyLocation,
+        state_size: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+                key,
+                to_peer,
+                state_size,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2379,6 +2424,11 @@ pub enum EventKind {
     /// Emitted every N seconds (default 30s) with aggregate transport statistics.
     /// This is more efficient than per-transfer events and provides trend data.
     TransportSnapshot(crate::transport::TransportSnapshot),
+    /// Interest sync events for delta-based state synchronization.
+    ///
+    /// Tracks ResyncRequests and ResyncResponses which indicate delta application
+    /// failures. Useful for monitoring the health of the delta sync protocol.
+    InterestSync(InterestSyncEvent),
 }
 
 impl EventKind {
@@ -2394,6 +2444,7 @@ impl EventKind {
     const TRANSFER: u8 = 9;
     const LIFECYCLE: u8 = 10;
     const TRANSPORT_SNAPSHOT: u8 = 11;
+    const INTEREST_SYNC: u8 = 12;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -2409,6 +2460,7 @@ impl EventKind {
             EventKind::Transfer(_) => Self::TRANSFER,
             EventKind::Lifecycle(_) => Self::LIFECYCLE,
             EventKind::TransportSnapshot(_) => Self::TRANSPORT_SNAPSHOT,
+            EventKind::InterestSync(_) => Self::INTEREST_SYNC,
         }
     }
 
@@ -2474,6 +2526,7 @@ impl EventKind {
             EventKind::Disconnected { .. } => "Disconnected",
             EventKind::Timeout { .. } => "Timeout",
             EventKind::TransportSnapshot(_) => "TransportSnapshot",
+            EventKind::InterestSync(_) => "InterestSync",
         }
     }
 }
@@ -3379,6 +3432,42 @@ pub enum PeerLifecycleEvent {
         /// Total connections made during uptime.
         total_connections: u64,
         /// Timestamp when shutdown was initiated.
+        timestamp: u64,
+    },
+}
+
+/// Interest sync events for delta-based state synchronization.
+///
+/// These events track the interest sync protocol operations, particularly
+/// ResyncRequests which indicate delta application failures. High ResyncRequest
+/// counts may indicate incorrect summary caching (see PR #2763).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum InterestSyncEvent {
+    /// A ResyncRequest was received from a peer.
+    ///
+    /// This indicates the peer failed to apply a delta we sent them,
+    /// likely due to version mismatch. We respond with full state.
+    ResyncRequestReceived {
+        /// Contract for which resync was requested.
+        key: ContractKey,
+        /// The peer that sent the ResyncRequest.
+        from_peer: PeerKeyLocation,
+        /// Timestamp of the event.
+        timestamp: u64,
+    },
+    /// A ResyncResponse (full state) was sent to a peer.
+    ///
+    /// This is the response to a ResyncRequest, providing the peer
+    /// with our full state so they can recover from the delta failure.
+    ResyncResponseSent {
+        /// Contract for which resync response was sent.
+        key: ContractKey,
+        /// The peer we sent the response to.
+        to_peer: PeerKeyLocation,
+        /// Size of the state sent (bytes).
+        state_size: usize,
+        /// Timestamp of the event.
         timestamp: u64,
     },
 }

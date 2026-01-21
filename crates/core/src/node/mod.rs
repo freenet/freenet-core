@@ -1357,6 +1357,29 @@ async fn handle_interest_sync_message(
                     .update_peer_summary(&key, pk, None);
             }
 
+            // Get PeerKeyLocation for telemetry
+            let from_peer = op_manager.ring.connection_manager.get_peer_by_addr(source);
+
+            // Emit telemetry for ResyncRequest received
+            if let Some(ref from_pkl) = from_peer {
+                if let Some(event) = crate::tracing::NetEventLog::resync_request_received(
+                    &op_manager.ring,
+                    key,
+                    from_pkl.clone(),
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            } else {
+                tracing::debug!(
+                    contract = %key,
+                    source = %source,
+                    "ResyncRequest telemetry skipped: peer lookup failed"
+                );
+            }
+
             // Fetch current state from store
             let state = get_contract_state(op_manager, &key).await;
             let Some(state) = state else {
@@ -1385,6 +1408,21 @@ async fn handle_interest_sync_message(
                 event = "resync_response_sent",
                 "Sending ResyncResponse with full state"
             );
+
+            // Emit telemetry for ResyncResponse sent
+            if let Some(ref to_pkl) = from_peer {
+                if let Some(event) = crate::tracing::NetEventLog::resync_response_sent(
+                    &op_manager.ring,
+                    key,
+                    to_pkl.clone(),
+                    state.as_ref().len(),
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            }
 
             Some(InterestMessage::ResyncResponse {
                 key,
