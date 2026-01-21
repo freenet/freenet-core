@@ -278,6 +278,24 @@ impl Operation for UpdateOp {
                             )
                             .await?;
 
+                            // Issue #2786: Record this contract in the seeding cache.
+                            // When a node receives state via RequestUpdate (e.g., from
+                            // send_state_to_new_subscriber after subscribing), it needs to
+                            // be recorded as seeding the contract. Without this, nodes
+                            // become part of the subscription tree but never seed the contract,
+                            // causing subscription propagation failures in large networks.
+                            if !op_manager.ring.is_seeding_contract(key) {
+                                let evicted = op_manager
+                                    .ring
+                                    .seed_contract(*key, updated_value.size() as u64);
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    evicted_count = evicted.len(),
+                                    "RequestUpdate: started seeding contract (issue #2786)"
+                                );
+                            }
+
                             // Compute after hash for telemetry
                             let hash_after = Some(state_hash_full(&updated_value));
 
@@ -538,6 +556,21 @@ impl Operation for UpdateOp {
                     };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
+                    // Issue #2786: Record this contract in the seeding cache when we receive
+                    // a full state update via BroadcastTo. This ensures nodes that receive
+                    // updates are properly marked as seeders.
+                    if !is_delta && !op_manager.ring.is_seeding_contract(key) {
+                        let evicted = op_manager
+                            .ring
+                            .seed_contract(*key, updated_value.size() as u64);
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            evicted_count = evicted.len(),
+                            "BroadcastTo: started seeding contract from full state (issue #2786)"
+                        );
+                    }
+
                     // Refresh GET subscription cache TTL when receiving updates
                     // This keeps actively-updated contracts from being evicted
                     op_manager.ring.touch_get_subscription(key);
@@ -704,6 +737,20 @@ impl Operation for UpdateOp {
                         related_contracts.clone(),
                     )
                     .await?;
+
+                    // Issue #2786: Record this contract in the seeding cache (same as RequestUpdate).
+                    // Streaming UPDATE should have identical seeding behavior to non-streaming.
+                    if !op_manager.ring.is_seeding_contract(key) {
+                        let evicted = op_manager
+                            .ring
+                            .seed_contract(*key, updated_value.size() as u64);
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            evicted_count = evicted.len(),
+                            "RequestUpdateStreaming: started seeding contract (issue #2786)"
+                        );
+                    }
 
                     // Emit telemetry
                     let hash_after = Some(state_hash_full(&updated_value));
@@ -902,6 +949,20 @@ impl Operation for UpdateOp {
                         .await?;
 
                     tracing::debug!("Contract successfully updated - BroadcastToStreaming");
+
+                    // Issue #2786: Record this contract in the seeding cache (same as BroadcastTo).
+                    // Streaming broadcasts are always full state (never deltas), so always seed.
+                    if !op_manager.ring.is_seeding_contract(key) {
+                        let evicted = op_manager
+                            .ring
+                            .seed_contract(*key, updated_value.size() as u64);
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            evicted_count = evicted.len(),
+                            "BroadcastToStreaming: started seeding contract (issue #2786)"
+                        );
+                    }
 
                     // Refresh GET subscription cache TTL
                     op_manager.ring.touch_get_subscription(key);
