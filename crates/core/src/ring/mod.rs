@@ -842,6 +842,46 @@ impl Ring {
         self.seeding_manager.get_upstream(contract)
     }
 
+    /// Check if we have an upstream subscription for a contract.
+    pub fn has_upstream(&self, contract: &ContractKey) -> bool {
+        self.seeding_manager.has_upstream(contract)
+    }
+
+    /// Check if we can act as a source for this contract (i.e., accept downstream subscribers).
+    ///
+    /// A peer can accept downstream subscribers if ANY of the following are true:
+    /// - It's within SOURCE_THRESHOLD of the contract location (authoritative source)
+    /// - It already has an upstream subscription (part of the subscription tree)
+    /// - It has local client subscriptions (local clients are interested in the contract)
+    ///
+    /// Issue #2784: Peers that have a contract but no upstream AND no local interest
+    /// should NOT accept downstream subscribers, as this creates disconnected subscription trees.
+    pub fn can_be_subscription_source(&self, contract: &ContractKey) -> bool {
+        const SOURCE_THRESHOLD: f64 = 0.05;
+
+        // Check if we have an upstream (part of subscription tree)
+        if self.seeding_manager.has_upstream(contract) {
+            return true;
+        }
+
+        // Check if we have local client subscriptions (gateway PUT with subscribe=true,
+        // or any local client subscribed via WebSocket)
+        if self.seeding_manager.has_client_subscriptions(contract.id()) {
+            return true;
+        }
+
+        // Check if we're close enough to the contract to be an authoritative source
+        if let Some(own_location) = self.connection_manager.get_stored_location() {
+            let contract_location = Location::from(contract.id());
+            let distance = contract_location.distance(own_location);
+            if distance.as_f64() < SOURCE_THRESHOLD {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Get all network subscriptions across all contracts
     pub fn all_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
         self.seeding_manager.all_subscriptions()

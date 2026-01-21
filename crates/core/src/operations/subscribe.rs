@@ -679,8 +679,22 @@ impl Operation for SubscribeOp {
 
                     // Check if we have the contract
                     if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
-                        // We have the contract - register upstream as subscriber and respond
-                        if let Some(requester_addr) = self.requester_addr {
+                        // We have the contract - but can we act as a source?
+                        // Issue #2784: Only accept downstream subscribers if:
+                        // 1. We're within SOURCE_THRESHOLD of the contract (authoritative source), OR
+                        // 2. We already have an upstream subscription (part of the subscription tree)
+                        //
+                        // Without this check, peers that received the contract via PUT propagation
+                        // (but never subscribed) would accept downstream subscribers, creating
+                        // disconnected subscription trees (peers with downstream but no upstream).
+                        if !op_manager.ring.can_be_subscription_source(&key) {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "subscribe: have contract but cannot be source (no upstream, not close enough), forwarding"
+                            );
+                            // Fall through to forward the request instead of responding
+                        } else if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
                             // Use retry with backoff to handle race condition where Subscribe arrives
                             // before connection is fully established (peer still transient)
@@ -783,8 +797,15 @@ impl Operation for SubscribeOp {
                     )
                     .await?
                     {
-                        // Contract arrived - handle same as above
-                        if let Some(requester_addr) = self.requester_addr {
+                        // Contract arrived - but can we act as a source? (Issue #2784)
+                        if !op_manager.ring.can_be_subscription_source(&key) {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "subscribe: contract arrived but cannot be source (no upstream, not close enough), forwarding"
+                            );
+                            // Fall through to forward the request
+                        } else if let Some(requester_addr) = self.requester_addr {
                             // Use retry with backoff for peer lookup (issue #2518)
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
@@ -964,7 +985,10 @@ impl Operation for SubscribeOp {
 
                             // Register the sender as our upstream source
                             // Use retry with backoff for peer lookup (same as downstream)
-                            if let Some(sender_addr) = source_addr {
+                            // Issue #2784: Track whether upstream was successfully set. If not,
+                            // we must NOT forward Subscribed to the requester (would create
+                            // disconnected upstream - peer with downstream but no upstream).
+                            let upstream_set_success = if let Some(sender_addr) = source_addr {
                                 tracing::debug!(
                                     tx = %msg_id,
                                     contract = %format!("{:.8}", key),
@@ -1006,6 +1030,7 @@ impl Operation for SubscribeOp {
                                                 upstream = %sender_addr,
                                                 "SUBSCRIPTION_UPSTREAM_SET: registered upstream for bidirectional update flow"
                                             );
+                                            true
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -1029,6 +1054,7 @@ impl Operation for SubscribeOp {
                                             op_manager
                                                 .ring
                                                 .complete_subscription_request(key, false);
+                                            false
                                         }
                                     }
                                 } else {
@@ -1040,6 +1066,7 @@ impl Operation for SubscribeOp {
                                     );
                                     // Issue #2741: Record failure for backoff, same as set_upstream failure
                                     op_manager.ring.complete_subscription_request(key, false);
+                                    false
                                 }
                             } else {
                                 tracing::warn!(
@@ -1049,7 +1076,8 @@ impl Operation for SubscribeOp {
                                 );
                                 // Issue #2741: Record failure for backoff, same as set_upstream failure
                                 op_manager.ring.complete_subscription_request(key, false);
-                            }
+                                false
+                            };
 
                             // Fetch contract if we don't have it.
                             // This is non-fatal - if it fails, we still continue with forwarding/completing
@@ -1066,6 +1094,34 @@ impl Operation for SubscribeOp {
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
+
+                                // Issue #2784: If we failed to set upstream, we must NOT forward
+                                // Subscribed and add downstream. This would create a "disconnected
+                                // upstream" - a node with downstream subscribers but no upstream,
+                                // causing updates to not propagate properly.
+                                //
+                                // Instead, return NotFound so the requester retries through
+                                // different routing and finds a valid path.
+                                if !upstream_set_success {
+                                    tracing::warn!(
+                                        tx = %msg_id,
+                                        %key,
+                                        requester = %requester_addr,
+                                        "subscribe: upstream set failed, returning NotFound to requester (issue #2784)"
+                                    );
+                                    return Ok(OperationResult {
+                                        return_msg: Some(NetMessage::from(
+                                            SubscribeMsg::Response {
+                                                id: *msg_id,
+                                                instance_id: *instance_id,
+                                                result: SubscribeMsgResult::NotFound,
+                                            },
+                                        )),
+                                        next_hop: Some(requester_addr),
+                                        state: None,
+                                    });
+                                }
+
                                 // Register them as downstream (they want updates from us)
                                 // Use retry with backoff for peer lookup (issue #2518)
                                 if let Some(downstream_peer) =
