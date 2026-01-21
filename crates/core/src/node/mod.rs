@@ -1444,6 +1444,23 @@ async fn handle_interest_sync_message(
                 "Received ResyncResponse with full state"
             );
 
+            // CRITICAL: Update the sender's cached summary BEFORE applying state.
+            // Issue #2785: When upsert_contract_state emits BroadcastStateChange,
+            // p2p_protoc compares our summary with cached peer summaries to decide
+            // whether to broadcast. If we update the cache after the broadcast
+            // decision, we use stale data and may incorrectly skip broadcasts.
+            //
+            // By updating first, the BroadcastStateChange handler sees the correct
+            // summary from the ResyncResponse sender, ensuring proper echo-back
+            // prevention (we won't send them state they just sent us).
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            if let Some(ref pk) = peer_key {
+                let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes.clone());
+                op_manager
+                    .interest_manager
+                    .update_peer_summary(&key, pk, Some(summary));
+            }
+
             // Apply the full state using an update
             let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
             let update_data = freenet_stdlib::prelude::UpdateData::State(state);
@@ -1496,15 +1513,6 @@ async fn handle_interest_sync_message(
                         "Failed to apply resync state"
                     );
                 }
-            }
-
-            // Update the peer's summary in our interest tracker
-            let peer_key = get_peer_key_from_addr(op_manager, source);
-            if let Some(pk) = peer_key {
-                let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes);
-                op_manager
-                    .interest_manager
-                    .update_peer_summary(&key, &pk, Some(summary));
             }
 
             // No response needed
