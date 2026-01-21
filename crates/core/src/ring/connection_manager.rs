@@ -1164,6 +1164,28 @@ mod tests {
         // Should not panic
     }
 
+    #[test]
+    fn test_update_location_preserves_existing() {
+        // Issue #2773: Once a location is set, subsequent update_location calls
+        // should NOT overwrite it. This ensures distance-based tie-breaker uses
+        // consistent locations throughout the peer's lifetime.
+        let cm = make_connection_manager(None, 1, 10, false);
+
+        // Set initial location
+        let initial_loc = Location::new(0.3);
+        cm.update_location(Some(initial_loc));
+        assert_eq!(cm.get_stored_location(), Some(initial_loc));
+
+        // Try to update to different location - should be ignored
+        let new_loc = Location::new(0.7);
+        cm.update_location(Some(new_loc));
+        assert_eq!(
+            cm.get_stored_location(),
+            Some(initial_loc),
+            "Location should be preserved, not overwritten"
+        );
+    }
+
     // ============ try_set_own_addr tests ============
 
     #[test]
