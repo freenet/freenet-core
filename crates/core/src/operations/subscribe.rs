@@ -719,15 +719,43 @@ impl Operation for SubscribeOp {
                                             result.subscriber,
                                             *id,
                                         );
+
+                                        // Issue #2787: If we need upstream, start a subscription
+                                        // to establish our own upstream connection. This prevents
+                                        // "disconnected upstream" topology issues.
+                                        if result.needs_upstream {
+                                            tracing::info!(
+                                                tx = %id,
+                                                contract = %key,
+                                                "subscribe: starting upstream subscription (issue #2787)"
+                                            );
+                                            let _child_tx = super::start_subscription_request(
+                                                op_manager, *id, key, false,
+                                            );
+                                        }
                                     }
                                     Err(e) => {
+                                        // If downstream registration failed, we should NOT send Subscribed.
+                                        // CircularReference means they're our upstream - creating a cycle.
+                                        // Return NotFound so they retry with a different peer.
                                         tracing::warn!(
                                             tx = %id,
                                             %key,
                                             requester = %requester_addr,
                                             error = ?e,
-                                            "subscribe: rejected downstream registration"
+                                            "subscribe: rejected downstream registration, returning NotFound"
                                         );
+                                        return Ok(OperationResult {
+                                            return_msg: Some(NetMessage::from(
+                                                SubscribeMsg::Response {
+                                                    id: *id,
+                                                    instance_id: *instance_id,
+                                                    result: SubscribeMsgResult::NotFound,
+                                                },
+                                            )),
+                                            next_hop: Some(requester_addr),
+                                            state: None,
+                                        });
                                     }
                                 }
 
@@ -821,15 +849,40 @@ impl Operation for SubscribeOp {
                                             result.subscriber,
                                             *id,
                                         );
+
+                                        // Issue #2787: If we need upstream, start a subscription
+                                        // to establish our own upstream connection.
+                                        if result.needs_upstream {
+                                            tracing::info!(
+                                                tx = %id,
+                                                contract = %key,
+                                                "subscribe: starting upstream subscription (issue #2787, contract arrived)"
+                                            );
+                                            let _child_tx = super::start_subscription_request(
+                                                op_manager, *id, key, false,
+                                            );
+                                        }
                                     }
                                     Err(e) => {
+                                        // If downstream registration failed, return NotFound
                                         tracing::warn!(
                                             tx = %id,
                                             %key,
                                             requester = %requester_addr,
                                             error = ?e,
-                                            "subscribe: rejected downstream registration (local contract)"
+                                            "subscribe: rejected downstream registration (local contract), returning NotFound"
                                         );
+                                        return Ok(OperationResult {
+                                            return_msg: Some(NetMessage::from(
+                                                SubscribeMsg::Response {
+                                                    id: *id,
+                                                    instance_id: *instance_id,
+                                                    result: SubscribeMsgResult::NotFound,
+                                                },
+                                            )),
+                                            next_hop: Some(requester_addr),
+                                            state: None,
+                                        });
                                     }
                                 }
 
@@ -1104,6 +1157,20 @@ impl Operation for SubscribeOp {
                                                 *msg_id,
                                             );
 
+                                            // Issue #2787: If we need upstream after adding a downstream
+                                            // subscriber (e.g., set_upstream failed earlier), start a
+                                            // subscription to establish our upstream connection.
+                                            if result.needs_upstream {
+                                                tracing::info!(
+                                                    tx = %msg_id,
+                                                    contract = %key,
+                                                    "subscribe: starting upstream subscription (issue #2787, intermediate forwarder)"
+                                                );
+                                                let _child_tx = super::start_subscription_request(
+                                                    op_manager, *msg_id, *key, false,
+                                                );
+                                            }
+
                                             tracing::debug!(
                                                 tx = %msg_id,
                                                 %key,
@@ -1112,13 +1179,25 @@ impl Operation for SubscribeOp {
                                             );
                                         }
                                         Err(e) => {
+                                            // If downstream registration failed, return NotFound
                                             tracing::warn!(
                                                 tx = %msg_id,
                                                 %key,
                                                 requester = %requester_addr,
                                                 error = ?e,
-                                                "subscribe: rejected downstream registration (intermediate node)"
+                                                "subscribe: rejected downstream registration (intermediate node), returning NotFound"
                                             );
+                                            return Ok(OperationResult {
+                                                return_msg: Some(NetMessage::from(
+                                                    SubscribeMsg::Response {
+                                                        id: *msg_id,
+                                                        instance_id: *instance_id,
+                                                        result: SubscribeMsgResult::NotFound,
+                                                    },
+                                                )),
+                                                next_hop: Some(requester_addr),
+                                                state: None,
+                                            });
                                         }
                                     }
 

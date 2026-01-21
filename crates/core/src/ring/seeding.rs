@@ -115,6 +115,11 @@ pub struct AddDownstreamResult {
     pub downstream_count: usize,
     /// The subscriber that was added (with resolved address).
     pub subscriber: super::PeerKeyLocation,
+    /// Whether the caller should trigger a subscription to establish upstream.
+    /// This is true when: we're adding a new downstream subscriber AND we don't
+    /// have an upstream AND we're not close enough to the contract to be a source.
+    /// Issue #2787: Ensures intermediate nodes establish upstream connection.
+    pub needs_upstream: bool,
 }
 
 /// Result of adding a client subscription.
@@ -315,6 +320,7 @@ impl SeedingManager {
                 is_new: false,
                 downstream_count,
                 subscriber,
+                needs_upstream: false, // Not a new subscriber, no action needed
             });
         }
 
@@ -329,17 +335,53 @@ impl SeedingManager {
         ));
 
         let new_count = downstream_count + 1;
-        info!(
-            %contract,
-            subscriber = %subscriber_addr,
-            downstream_count = new_count,
-            "add_downstream: registered new downstream subscriber"
-        );
+
+        // Issue #2787: Check if we need to establish upstream after adding a downstream subscriber.
+        // If we have downstream subscribers but no upstream, and we're not close enough to the
+        // contract to be a source, we might need to subscribe to establish our own upstream connection.
+        // However, if our downstream is within SOURCE_THRESHOLD, they're the actual source and we're
+        // acting as an intermediate node that receives updates via broadcast - no upstream needed.
+        let has_upstream = subs.iter().any(|e| e.role == SubscriberType::Upstream);
+
+        // Check if we're close enough to contract to be a valid source (within 5% ring distance)
+        const SOURCE_THRESHOLD: f64 = 0.05;
+        let contract_loc = Location::from(contract.id());
+        let our_loc = own_location.unwrap_or(Location::new(0.5));
+        let our_distance = contract_loc.distance(our_loc).as_f64();
+        let is_source = our_distance < SOURCE_THRESHOLD;
+
+        // Check if the subscriber (our new downstream) is within SOURCE_THRESHOLD.
+        // If so, they're the actual source, and we don't need upstream - updates flow through us to them.
+        // This handles the case where a source node subscribes through an intermediate node.
+        let subscriber_loc = subscriber.location().unwrap_or(contract_loc);
+        let subscriber_distance = contract_loc.distance(subscriber_loc).as_f64();
+        let downstream_is_source = subscriber_distance < SOURCE_THRESHOLD;
+
+        // Only need upstream if: no upstream AND not a source AND downstream isn't the source
+        let needs_upstream = !has_upstream && !is_source && !downstream_is_source;
+
+        if needs_upstream {
+            info!(
+                %contract,
+                subscriber = %subscriber_addr,
+                downstream_count = new_count,
+                our_distance = %our_distance,
+                "add_downstream: needs upstream subscription (issue #2787)"
+            );
+        } else {
+            info!(
+                %contract,
+                subscriber = %subscriber_addr,
+                downstream_count = new_count,
+                "add_downstream: registered new downstream subscriber"
+            );
+        }
 
         Ok(AddDownstreamResult {
             is_new: true,
             downstream_count: new_count,
             subscriber,
+            needs_upstream,
         })
     }
 
@@ -359,18 +401,35 @@ impl SeedingManager {
     /// set_upstream, a naive implementation would reject both with CircularReference,
     /// leaving both orphaned.
     ///
-    /// Instead, we use ring distance as a tie-breaker:
+    /// The tie-breaker uses ring distance, but ONLY when the proposed upstream is already
+    /// our downstream (potential bidirectional cycle):
     /// - If the proposed upstream is **closer** to the contract than we are, promote them
     ///   (remove from downstream, add as upstream). They are more authoritative.
     /// - If we are **closer** to the contract, reject with CircularReference.
     ///   We should be the source, not them. They will retry via different routing.
     ///
-    /// This ensures subscription trees form correctly with updates flowing from peers
-    /// closest to the contract (sources) outward to more distant peers (subscribers).
+    /// # Chain Topology Support (Issue #2787)
+    ///
+    /// When there is NO existing downstream relationship, we accept the upstream unconditionally.
+    /// This supports chain topologies where subscription routing may not follow ring distance order:
+    ///
+    /// ```text
+    /// Example: Contract at loc=0.5
+    ///   A(loc=0.2) → B(loc=0.4) → C(loc=0.7)
+    ///   dist=0.3     dist=0.1     dist=0.2
+    ///
+    /// C has the contract and responds "Subscribed" to B.
+    /// B is closer to contract than C (0.1 vs 0.2), but B should still accept C as upstream
+    /// because C actually has the contract and can provide updates.
+    /// ```
+    ///
+    /// The key insight: a peer who responded "Subscribed" clearly has the contract, so they
+    /// can serve as a valid upstream regardless of ring distance. The distance check is only
+    /// needed to break ties when there's an existing bidirectional relationship.
     ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
-    /// - `CircularReference`: We are closer to the contract than the proposed upstream
+    /// - `CircularReference`: The upstream is our downstream AND we are closer to the contract
     ///   (we should be the source, not them)
     pub fn set_upstream(
         &self,
@@ -402,35 +461,6 @@ impl SeedingManager {
 
         let mut subs = self.subscriptions.entry(*contract).or_default();
 
-        // Issue #2773: ALWAYS check distance to prevent bidirectional cycles.
-        // If we're closer to the contract than the proposed upstream, we should be the
-        // source, not them. This prevents cycles even when the downstream relationship
-        // hasn't been established yet due to race conditions.
-        let contract_loc = Location::from(contract.id());
-        // Use the upstream's configured ring location if provided, otherwise fall back to
-        // computing from IP address (which may differ from the actual configured location).
-        let upstream_loc = upstream_configured_location
-            .or_else(|| upstream.location())
-            .unwrap_or(contract_loc);
-        // Default to 0.5 if unknown, which is equidistant from any contract
-        let our_loc = own_location.unwrap_or(Location::new(0.5));
-
-        let upstream_distance = contract_loc.distance(upstream_loc);
-        let our_distance = contract_loc.distance(our_loc);
-
-        // Compare distances with secondary tie-breaker for equal case.
-        // Equal distances would cause both peers to reject each other, leaving both orphaned.
-        // Use pub_key comparison as secondary tie-breaker: lexicographically smaller wins.
-        let upstream_wins = if upstream_distance < our_distance {
-            true
-        } else if our_distance < upstream_distance {
-            false
-        } else {
-            // Equal distance - use pub_key as secondary tie-breaker
-            // This ensures deterministic winner even when equidistant from contract
-            upstream.pub_key.as_bytes().as_slice() < own_pub_key_bytes
-        };
-
         // Check if this peer is already our downstream for this contract.
         // We check pub_key alone since that's the cryptographic identity - the same peer may
         // connect from different addresses (NAT, reconnect) but is still the same logical peer.
@@ -439,23 +469,52 @@ impl SeedingManager {
         });
         let is_downstream = downstream_idx.is_some();
 
-        // If we're closer to the contract (or win the tie-breaker), reject this upstream.
-        // We should be the source, not them. This prevents bidirectional cycles.
-        if !upstream_wins {
-            info!(
-                %contract,
-                upstream = %upstream_addr_str,
-                is_downstream,
-                upstream_distance = %upstream_distance.as_f64(),
-                our_distance = %our_distance.as_f64(),
-                "set_upstream: rejected - we are closer to contract (issue #2773)"
-            );
-            return Err(SubscriptionError::CircularReference);
-        }
+        // Issue #2787: Only apply distance-based rejection when there's an existing downstream
+        // relationship (potential bidirectional cycle). If no downstream relationship exists,
+        // accept the upstream unconditionally - they responded "Subscribed" so they have the
+        // contract and can provide updates.
+        let promoted_from_downstream = if is_downstream {
+            // Issue #2773: Use distance as tie-breaker to resolve mutual downstream race.
+            let contract_loc = Location::from(contract.id());
+            // Use the upstream's configured ring location if provided, otherwise fall back to
+            // computing from IP address (which may differ from the actual configured location).
+            let upstream_loc = upstream_configured_location
+                .or_else(|| upstream.location())
+                .unwrap_or(contract_loc);
+            // Default to 0.5 if unknown, which is equidistant from any contract
+            let our_loc = own_location.unwrap_or(Location::new(0.5));
 
-        // Upstream is closer (or wins tie-breaker) - accept them
-        let promoted_from_downstream = if let Some(idx) = downstream_idx {
-            // Remove from downstream list (promoting to upstream)
+            let upstream_distance = contract_loc.distance(upstream_loc);
+            let our_distance = contract_loc.distance(our_loc);
+
+            // Compare distances with secondary tie-breaker for equal case.
+            // Equal distances would cause both peers to reject each other, leaving both orphaned.
+            // Use pub_key comparison as secondary tie-breaker: lexicographically smaller wins.
+            let upstream_wins = if upstream_distance < our_distance {
+                true
+            } else if our_distance < upstream_distance {
+                false
+            } else {
+                // Equal distance - use pub_key as secondary tie-breaker
+                // This ensures deterministic winner even when equidistant from contract
+                upstream.pub_key.as_bytes().as_slice() < own_pub_key_bytes
+            };
+
+            if !upstream_wins {
+                // We're closer to the contract - reject this upstream.
+                // We should be the source, not them. This prevents bidirectional cycles.
+                info!(
+                    %contract,
+                    upstream = %upstream_addr_str,
+                    upstream_distance = %upstream_distance.as_f64(),
+                    our_distance = %our_distance.as_f64(),
+                    "set_upstream: rejected - peer is downstream and we are closer to contract (issue #2773)"
+                );
+                return Err(SubscriptionError::CircularReference);
+            }
+
+            // Upstream wins the tie-breaker - promote them from downstream to upstream
+            let idx = downstream_idx.expect("checked is_downstream above");
             let removed = subs.swap_remove(idx);
             info!(
                 %contract,
@@ -466,6 +525,14 @@ impl SeedingManager {
             );
             Some(removed.peer)
         } else {
+            // No downstream relationship - accept upstream unconditionally (issue #2787)
+            // This supports chain topologies where the upstream may be farther from the
+            // contract than we are, but they still have the contract and can provide updates.
+            debug!(
+                %contract,
+                upstream = %upstream_addr_str,
+                "set_upstream: accepting upstream (no existing downstream relationship)"
+            );
             None
         };
 

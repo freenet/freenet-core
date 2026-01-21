@@ -313,8 +313,20 @@ pub fn validate_topology_from_snapshots(
             }
 
             // Disconnected upstream: has downstream but no upstream (not a source)
-            // This is problematic because downstream peers depend on us but we can't receive updates
-            if !is_source && upstream.is_none() && !downstream.is_empty() {
+            // This is problematic because downstream peers depend on us but we can't receive updates.
+            //
+            // Exception (Issue #2787): If any downstream is within SOURCE_THRESHOLD, this node is
+            // acting as a "pseudo-source" - the actual source subscribed through us, so updates
+            // flow through us to them. We don't need upstream in this topology.
+            let has_source_downstream = downstream.iter().any(|ds_addr| {
+                peer_locations
+                    .get(ds_addr)
+                    .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
+                    .unwrap_or(false)
+            });
+
+            if !is_source && upstream.is_none() && !downstream.is_empty() && !has_source_downstream
+            {
                 result.disconnected_upstream.push((seeder, *contract_id));
                 result.issue_count += 1;
             }

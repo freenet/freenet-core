@@ -3012,7 +3012,7 @@ fn test_max_downstream_limit_reached() {
 /// Validates that sequential subscribes form a valid directed graph with
 /// upstream/downstream relationships and no cycles or disconnected nodes.
 #[test_log::test]
-#[ignore = "Issue #2787: Chain topology has disconnected upstream"]
+#[ignore = "Orphan seeder in chain topology - needs investigation"]
 fn test_chain_topology_formation() {
     const SEED: u64 = 0xC4A1_0001_0001;
     const NETWORK_NAME: &str = "chain-topology";
