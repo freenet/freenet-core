@@ -606,6 +606,7 @@ impl Operation for SubscribeOp {
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
                 // Existing operation - response from downstream peer
+                eprintln!("[DEBUG-SUBSCRIBE] LOAD_OR_INIT_POPPED: tx={} - found existing Subscribe operation", id);
                 tracing::warn!(
                     tx = %id,
                     %msg_type,
@@ -624,6 +625,7 @@ impl Operation for SubscribeOp {
                 // Check if this is a response message - if so, the operation was likely
                 // cleaned up due to timeout and we should not create a new operation
                 if matches!(msg, SubscribeMsg::Response { .. }) {
+                    eprintln!("[DEBUG-SUBSCRIBE] SUBSCRIBE_OP_MISSING: tx={} - Response arrived but no operation found!", id);
                     tracing::warn!(
                         tx = %id,
                         phase = "load_or_init",
@@ -947,6 +949,8 @@ impl Operation for SubscribeOp {
                     );
                     match result {
                         SubscribeMsgResult::Subscribed { key } => {
+                            eprintln!("[DEBUG-SUBSCRIBE] SUBSCRIBE_SUBSCRIBED: tx={} key={} requester_addr={:?} source_addr={:?}",
+                                msg_id, key, self.requester_addr, source_addr);
                             tracing::debug!(
                                 tx = %msg_id,
                                 %key,
@@ -972,6 +976,8 @@ impl Operation for SubscribeOp {
                             // Register the sender as our upstream source
                             // Use retry with backoff for peer lookup (same as downstream)
                             if let Some(sender_addr) = source_addr {
+                                eprintln!("[DEBUG-SUBSCRIBE] SUBSCRIPTION_ACCEPTED: tx={} contract={} sender_addr={}",
+                                    msg_id, format!("{:.8}", key), sender_addr);
                                 tracing::info!(
                                     tx = %msg_id,
                                     contract = %format!("{:.8}", key),
