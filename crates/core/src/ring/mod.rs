@@ -842,11 +842,6 @@ impl Ring {
         self.seeding_manager.get_upstream(contract)
     }
 
-    /// Check if we have an upstream subscription for a contract.
-    pub fn has_upstream(&self, contract: &ContractKey) -> bool {
-        self.seeding_manager.has_upstream(contract)
-    }
-
     /// Check if we can act as a source for this contract (i.e., accept downstream subscribers).
     ///
     /// A peer can accept downstream subscribers if ANY of the following are true:
