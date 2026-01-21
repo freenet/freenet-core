@@ -976,8 +976,8 @@ impl Operation for SubscribeOp {
                             // Register the sender as our upstream source
                             // Use retry with backoff for peer lookup (same as downstream)
                             if let Some(sender_addr) = source_addr {
-                                eprintln!("[DEBUG-SUBSCRIBE] SUBSCRIPTION_ACCEPTED: tx={} contract={} sender_addr={}",
-                                    msg_id, format!("{:.8}", key), sender_addr);
+                                eprintln!("[DEBUG-SUBSCRIBE] SUBSCRIPTION_ACCEPTED: tx={} contract={:.8} sender_addr={}",
+                                    msg_id, key, sender_addr);
                                 tracing::info!(
                                     tx = %msg_id,
                                     contract = %format!("{:.8}", key),
