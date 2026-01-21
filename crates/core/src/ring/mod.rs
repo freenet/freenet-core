@@ -805,12 +805,19 @@ impl Ring {
         let own_addr = self.connection_manager.get_own_addr();
         let own_location = self.connection_manager.get_stored_location();
         let own_pub_key = self.connection_manager.pub_key.as_bytes();
+        // Get the upstream's configured ring location, not the location computed from IP address.
+        // PeerKeyLocation::location() computes from IP, which differs from the configured location.
+        let upstream_configured_location = upstream.socket_addr().and_then(|addr| {
+            self.connection_manager
+                .get_configured_location_for_peer(addr)
+        });
         self.seeding_manager.set_upstream(
             contract,
             upstream,
             own_addr,
             own_location,
             Some(own_pub_key),
+            upstream_configured_location,
         )
     }
 

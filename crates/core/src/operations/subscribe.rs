@@ -591,10 +591,26 @@ impl Operation for SubscribeOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let id = *msg.id();
+        let msg_type = if matches!(msg, SubscribeMsg::Request { .. }) {
+            "Request"
+        } else {
+            "Response"
+        };
+        tracing::debug!(
+            tx = %id,
+            %msg_type,
+            source_addr = ?source_addr,
+            "LOAD_OR_INIT_ENTRY: entering load_or_init for Subscribe"
+        );
 
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
                 // Existing operation - response from downstream peer
+                tracing::warn!(
+                    tx = %id,
+                    %msg_type,
+                    "LOAD_OR_INIT_POPPED: found existing Subscribe operation"
+                );
                 Ok(OpInitialization {
                     op: subscribe_op,
                     source_addr,
@@ -608,10 +624,10 @@ impl Operation for SubscribeOp {
                 // Check if this is a response message - if so, the operation was likely
                 // cleaned up due to timeout and we should not create a new operation
                 if matches!(msg, SubscribeMsg::Response { .. }) {
-                    tracing::debug!(
+                    tracing::warn!(
                         tx = %id,
                         phase = "load_or_init",
-                        "SUBSCRIBE response arrived for non-existent operation (likely timed out)"
+                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation (likely timed out or race)"
                     );
                     return Err(OpError::OpNotPresent(id));
                 }
@@ -922,8 +938,22 @@ impl Operation for SubscribeOp {
                     instance_id,
                     result,
                 } => {
+                    tracing::debug!(
+                        tx = %msg_id,
+                        %instance_id,
+                        requester_addr = ?self.requester_addr,
+                        source_addr = ?source_addr,
+                        "SUBSCRIBE_RESPONSE_ENTRY: entered Response handler"
+                    );
                     match result {
                         SubscribeMsgResult::Subscribed { key } => {
+                            tracing::debug!(
+                                tx = %msg_id,
+                                %key,
+                                requester_addr = ?self.requester_addr,
+                                source_addr = ?source_addr,
+                                "SUBSCRIBE_SUBSCRIBED: processing Subscribed response"
+                            );
                             tracing::debug!(
                                 tx = %msg_id,
                                 %key,
@@ -932,8 +962,12 @@ impl Operation for SubscribeOp {
                                 "subscribe: processing Subscribed response"
                             );
 
-                            // Fetch contract if we don't have it
-                            fetch_contract_if_missing(op_manager, *key.id()).await?;
+                            // CRITICAL FIX (issue #2773): Register upstream FIRST, before fetching contract.
+                            // The upstream registration is about subscription tree topology and must succeed
+                            // even if contract fetching fails. Previously, fetch_contract_if_missing could
+                            // fail (e.g., GET timeout) and the `?` would exit early, leaving us without
+                            // an upstream registered. This caused subscription tree pruning to fail because
+                            // the peer had no upstream to notify when clients disconnected.
 
                             // Register the sender as our upstream source
                             // Use retry with backoff for peer lookup (same as downstream)
@@ -981,7 +1015,7 @@ impl Operation for SubscribeOp {
                                             );
                                         }
                                         Err(e) => {
-                                            tracing::error!(
+                                            tracing::warn!(
                                                 tx = %msg_id,
                                                 contract = %format!("{:.8}", key),
                                                 upstream = %sender_addr,
@@ -1022,6 +1056,18 @@ impl Operation for SubscribeOp {
                                 );
                                 // Issue #2741: Record failure for backoff, same as set_upstream failure
                                 op_manager.ring.complete_subscription_request(key, false);
+                            }
+
+                            // Fetch contract if we don't have it.
+                            // This is non-fatal - if it fails, we still continue with forwarding/completing
+                            // the subscription. The contract will eventually arrive via UPDATE broadcasts.
+                            if let Err(e) = fetch_contract_if_missing(op_manager, *key.id()).await {
+                                tracing::debug!(
+                                    tx = %msg_id,
+                                    contract = %format!("{:.8}", key),
+                                    error = ?e,
+                                    "fetch_contract_if_missing failed, will receive state via UPDATE"
+                                );
                             }
 
                             // Forward response to requester or complete

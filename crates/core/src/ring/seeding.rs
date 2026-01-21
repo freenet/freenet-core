@@ -379,6 +379,7 @@ impl SeedingManager {
         own_addr: Option<std::net::SocketAddr>,
         own_location: Option<Location>,
         own_pub_key: Option<&[u8]>,
+        upstream_configured_location: Option<Location>,
     ) -> Result<UpstreamSetResult, SubscriptionError> {
         // For equal-distance tie-breaker. If unknown, use empty slice (upstream always wins ties).
         let own_pub_key_bytes = own_pub_key.unwrap_or(&[]);
@@ -406,7 +407,11 @@ impl SeedingManager {
         // source, not them. This prevents cycles even when the downstream relationship
         // hasn't been established yet due to race conditions.
         let contract_loc = Location::from(contract.id());
-        let upstream_loc = upstream.location().unwrap_or(contract_loc);
+        // Use the upstream's configured ring location if provided, otherwise fall back to
+        // computing from IP address (which may differ from the actual configured location).
+        let upstream_loc = upstream_configured_location
+            .or_else(|| upstream.location())
+            .unwrap_or(contract_loc);
         // Default to 0.5 if unknown, which is equidistant from any contract
         let our_loc = own_location.unwrap_or(Location::new(0.5));
 
@@ -1302,7 +1307,7 @@ mod tests {
         let upstream = test_peer_loc(1);
 
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
 
         let retrieved = manager.get_upstream(&contract);
@@ -1318,10 +1323,10 @@ mod tests {
         let upstream2 = test_peer_loc(2);
 
         manager
-            .set_upstream(&contract, upstream1.clone(), None, None, None)
+            .set_upstream(&contract, upstream1.clone(), None, None, None, None)
             .unwrap();
         manager
-            .set_upstream(&contract, upstream2.clone(), None, None, None)
+            .set_upstream(&contract, upstream2.clone(), None, None, None, None)
             .unwrap();
 
         let retrieved = manager.get_upstream(&contract);
@@ -1373,7 +1378,7 @@ mod tests {
         let downstream2 = test_peer_loc(3);
 
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(
@@ -1405,7 +1410,7 @@ mod tests {
         let client_id = crate::client_events::ClientId::next();
 
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(
@@ -1434,7 +1439,7 @@ mod tests {
         let downstream = test_peer_id(2);
 
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(
@@ -1474,6 +1479,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1494,10 +1500,10 @@ mod tests {
         let downstream = test_peer_loc(3);
 
         manager
-            .set_upstream(&contract1, upstream1.clone(), None, None, None)
+            .set_upstream(&contract1, upstream1.clone(), None, None, None, None)
             .unwrap();
         manager
-            .set_upstream(&contract2, upstream2.clone(), None, None, None)
+            .set_upstream(&contract2, upstream2.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract1, downstream.clone(), None, None, None, None)
@@ -1530,10 +1536,10 @@ mod tests {
         let client_id = crate::client_events::ClientId::next();
 
         manager
-            .set_upstream(&contract1, upstream1.clone(), None, None, None)
+            .set_upstream(&contract1, upstream1.clone(), None, None, None, None)
             .unwrap();
         manager
-            .set_upstream(&contract2, upstream2.clone(), None, None, None)
+            .set_upstream(&contract2, upstream2.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract1, downstream.clone(), None, None, None, None)
@@ -1562,7 +1568,7 @@ mod tests {
         let downstream2 = test_peer_loc(3);
 
         manager
-            .set_upstream(&contract, upstream, None, None, None)
+            .set_upstream(&contract, upstream, None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract, downstream1.clone(), None, None, None, None)
@@ -1606,10 +1612,10 @@ mod tests {
 
         // Setup: client subscribed to 2 contracts
         manager
-            .set_upstream(&contract1, upstream1.clone(), None, None, None)
+            .set_upstream(&contract1, upstream1.clone(), None, None, None, None)
             .unwrap();
         manager
-            .set_upstream(&contract2, upstream2.clone(), None, None, None)
+            .set_upstream(&contract2, upstream2.clone(), None, None, None, None)
             .unwrap();
         manager.add_client_subscription(contract1.id(), client_id);
         manager.add_client_subscription(contract2.id(), client_id);
@@ -1645,13 +1651,13 @@ mod tests {
 
         // Setup contract1: only client subscription
         manager
-            .set_upstream(&contract1, upstream1.clone(), None, None, None)
+            .set_upstream(&contract1, upstream1.clone(), None, None, None, None)
             .unwrap();
         manager.add_client_subscription(contract1.id(), client_id);
 
         // Setup contract2: client + downstream
         manager
-            .set_upstream(&contract2, upstream2.clone(), None, None, None)
+            .set_upstream(&contract2, upstream2.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract2, downstream2.clone(), None, None, None, None)
@@ -1660,7 +1666,7 @@ mod tests {
 
         // Setup contract3: client + other client
         manager
-            .set_upstream(&contract3, upstream3.clone(), None, None, None)
+            .set_upstream(&contract3, upstream3.clone(), None, None, None, None)
             .unwrap();
         manager.add_client_subscription(contract3.id(), client_id);
         manager.add_client_subscription(contract3.id(), other_client);
@@ -1858,7 +1864,7 @@ mod tests {
 
         // Set upstream (creates subscription entry)
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
 
         // Verify it has upstream - should NOT be in the list
@@ -1906,7 +1912,7 @@ mod tests {
 
         // Add upstream subscription
         manager
-            .set_upstream(&contract, upstream, None, None, None)
+            .set_upstream(&contract, upstream, None, None, None, None)
             .unwrap();
 
         // After adding upstream, should NOT be in list
@@ -2027,7 +2033,7 @@ mod tests {
 
         // Setup: upstream, 2 downstream, and client subscription
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract, downstream1.clone(), None, None, None, None)
@@ -2059,10 +2065,10 @@ mod tests {
         let contract2 = make_contract_key(2);
 
         manager
-            .set_upstream(&contract1, test_peer_loc(1), None, None, None)
+            .set_upstream(&contract1, test_peer_loc(1), None, None, None, None)
             .unwrap();
         manager
-            .set_upstream(&contract2, test_peer_loc(2), None, None, None)
+            .set_upstream(&contract2, test_peer_loc(2), None, None, None, None)
             .unwrap();
         assert!(manager
             .add_downstream(&contract1, test_peer_loc(3), None, None, None, None)
@@ -2081,7 +2087,7 @@ mod tests {
 
         // Only upstream, no downstream, no client
         manager
-            .set_upstream(&contract, upstream.clone(), None, None, None)
+            .set_upstream(&contract, upstream.clone(), None, None, None, None)
             .unwrap();
 
         let states = manager.get_all_subscription_states();
@@ -2143,7 +2149,7 @@ mod tests {
         let self_peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), own_addr);
 
         // Try to set ourselves as upstream - should be rejected
-        let result = manager.set_upstream(&contract, self_peer, Some(own_addr), None, None);
+        let result = manager.set_upstream(&contract, self_peer, Some(own_addr), None, None, None);
         assert_eq!(result, Err(SubscriptionError::SelfReference));
     }
 
@@ -2157,7 +2163,7 @@ mod tests {
 
         // Set peer as upstream (we receive updates FROM them)
         manager
-            .set_upstream(&contract, peer.clone(), None, None, None)
+            .set_upstream(&contract, peer.clone(), None, None, None, None)
             .unwrap();
 
         // Try to add same peer as downstream - should be rejected to prevent cycle
@@ -2193,7 +2199,14 @@ mod tests {
         // We set our location to be the contract location (distance 0), so we're closer
         // than any other peer and should reject the circular reference.
         let contract_loc = Location::from(contract.id());
-        let result = manager.set_upstream(&contract, peer.clone(), None, Some(contract_loc), None);
+        let result = manager.set_upstream(
+            &contract,
+            peer.clone(),
+            None,
+            Some(contract_loc),
+            None,
+            None,
+        );
         assert_eq!(
             result,
             Err(SubscriptionError::CircularReference),
@@ -2214,7 +2227,7 @@ mod tests {
 
         // Setting different peers as upstream and downstream should work
         manager
-            .set_upstream(&contract, upstream_peer.clone(), None, None, None)
+            .set_upstream(&contract, upstream_peer.clone(), None, None, None, None)
             .unwrap();
         let result =
             manager.add_downstream(&contract, downstream_peer.clone(), None, None, None, None);
@@ -2245,7 +2258,7 @@ mod tests {
 
         // Set peer (from addr1) as upstream
         manager
-            .set_upstream(&contract, peer_addr1.clone(), None, None, None)
+            .set_upstream(&contract, peer_addr1.clone(), None, None, None, None)
             .unwrap();
 
         // Try to add same peer (from addr2) as downstream - should be rejected
@@ -2288,8 +2301,14 @@ mod tests {
 
         // Now try to set closer_peer as upstream
         // Since they're closer to the contract than we are, they should be promoted
-        let result =
-            manager.set_upstream(&contract, closer_peer.clone(), None, Some(our_loc), None);
+        let result = manager.set_upstream(
+            &contract,
+            closer_peer.clone(),
+            None,
+            Some(our_loc),
+            None,
+            None,
+        );
 
         // Should succeed with promotion
         assert!(
@@ -2332,8 +2351,14 @@ mod tests {
 
         // Now try to set farther_peer as upstream
         // Since we're closer to the contract (at the contract), they should be rejected
-        let result =
-            manager.set_upstream(&contract, farther_peer.clone(), None, Some(our_loc), None);
+        let result = manager.set_upstream(
+            &contract,
+            farther_peer.clone(),
+            None,
+            Some(our_loc),
+            None,
+            None,
+        );
 
         // Should fail with CircularReference (we should be source)
         assert_eq!(
@@ -2364,7 +2389,7 @@ mod tests {
             .unwrap();
 
         // Set a DIFFERENT peer as upstream
-        let result = manager.set_upstream(&contract, upstream_peer.clone(), None, None, None);
+        let result = manager.set_upstream(&contract, upstream_peer.clone(), None, None, None, None);
 
         // Should succeed without promotion (different peer)
         assert!(result.is_ok());
@@ -2443,6 +2468,7 @@ mod tests {
             None,
             Some(closer_loc),
             None,
+            None,
         );
         assert_eq!(
             result_closer,
@@ -2457,6 +2483,7 @@ mod tests {
             closer_peer.clone(),
             None,
             Some(farther_loc),
+            None,
             None,
         );
         assert!(
@@ -2525,6 +2552,7 @@ mod tests {
             None,
             Some(shared_loc),
             Some(pub_key_small.as_bytes().as_slice()),
+            None,
         );
         assert_eq!(
             result,
@@ -2544,6 +2572,7 @@ mod tests {
             None,
             Some(shared_loc),
             Some(pub_key_large.as_bytes().as_slice()),
+            None,
         );
         assert!(
             result2.is_ok(),

@@ -314,9 +314,24 @@ impl ConnectionManager {
         }
     }
 
-    /// Update this node location.
+    /// Update this node location, only if not already set.
+    ///
+    /// This preserves configured locations (set during initialization) while allowing
+    /// peers behind NAT to learn their location from the observed address.
     pub fn update_location(&self, loc: Option<Location>) {
         if let Some(loc) = loc {
+            // Only update if current location is unset (-1.0)
+            let current_bits = self.own_location.load(std::sync::atomic::Ordering::Acquire);
+            let current_val = f64::from_le_bytes(current_bits.to_le_bytes());
+            if current_val >= 0.0 {
+                // Location already set (e.g., from config), don't overwrite
+                tracing::debug!(
+                    current_location = current_val,
+                    new_location = loc.as_f64(),
+                    "update_location: preserving existing location"
+                );
+                return;
+            }
             self.own_location.store(
                 u64::from_le_bytes(loc.as_f64().to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
@@ -381,6 +396,13 @@ impl ConnectionManager {
         // For transient connections, we don't have full peer info yet
         // Return None since we don't have the public key
         None
+    }
+
+    /// Look up the configured Location for a peer by socket address.
+    /// This returns the actual ring location the peer was assigned, not the location
+    /// computed from IP address (which would be different).
+    pub fn get_configured_location_for_peer(&self, addr: SocketAddr) -> Option<Location> {
+        self.location_for_peer.read().get(&addr).copied()
     }
 
     /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
