@@ -1372,6 +1372,12 @@ async fn handle_interest_sync_message(
                         .register_events(either::Either::Left(event))
                         .await;
                 }
+            } else {
+                tracing::debug!(
+                    contract = %key,
+                    source = %source,
+                    "ResyncRequest telemetry skipped: peer lookup failed"
+                );
             }
 
             // Fetch current state from store

@@ -534,7 +534,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
         }
         EventKind::TransportSnapshot(_) => "transport_snapshot".to_string(),
         EventKind::InterestSync(interest_sync_event) => {
-            use super::InterestSyncEvent;
+            use crate::tracing::InterestSyncEvent;
             match interest_sync_event {
                 InterestSyncEvent::ResyncRequestReceived { .. } => {
                     "interest_resync_request_received".to_string()
@@ -1368,7 +1368,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             })
         }
         EventKind::InterestSync(interest_sync_event) => {
-            use super::InterestSyncEvent;
+            use crate::tracing::InterestSyncEvent;
             match interest_sync_event {
                 InterestSyncEvent::ResyncRequestReceived {
                     key,
@@ -1439,5 +1439,82 @@ mod tests {
         // Test ignored event (simplest case that doesn't require PeerId construction)
         let ignored = EventKind::Ignored;
         assert_eq!(event_kind_to_string(&ignored), "ignored");
+    }
+
+    #[test]
+    fn test_event_kind_to_string_interest_sync() {
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::InterestSyncEvent;
+        use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+
+        // Create test fixtures
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let peer = PeerKeyLocation::random();
+
+        // Test ResyncRequestReceived
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+            key,
+            from_peer: peer.clone(),
+            timestamp: 12345,
+        });
+        assert_eq!(
+            event_kind_to_string(&event),
+            "interest_resync_request_received"
+        );
+
+        // Test ResyncResponseSent
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+            key,
+            to_peer: peer,
+            state_size: 1024,
+            timestamp: 12345,
+        });
+        assert_eq!(
+            event_kind_to_string(&event),
+            "interest_resync_response_sent"
+        );
+    }
+
+    #[test]
+    fn test_event_kind_to_json_interest_sync() {
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::InterestSyncEvent;
+        use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+
+        // Create test fixtures
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let peer = PeerKeyLocation::random();
+
+        // Test ResyncRequestReceived JSON structure
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+            key,
+            from_peer: peer.clone(),
+            timestamp: 12345,
+        });
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "resync_request_received");
+        assert!(json["contract_key"].is_string());
+        assert!(json["contract_id"].is_string());
+        assert!(json["from_peer"].is_string());
+        assert_eq!(json["timestamp"], 12345);
+
+        // Test ResyncResponseSent JSON structure
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+            key,
+            to_peer: peer,
+            state_size: 1024,
+            timestamp: 67890,
+        });
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "resync_response_sent");
+        assert!(json["contract_key"].is_string());
+        assert!(json["contract_id"].is_string());
+        assert!(json["to_peer"].is_string());
+        assert_eq!(json["state_size"], 1024);
+        assert_eq!(json["timestamp"], 67890);
     }
 }
