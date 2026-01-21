@@ -926,10 +926,6 @@ where
                 .await;
             }
             NetMessageV1::Subscribe(ref op) => {
-                eprintln!(
-                    "[DEBUG-NODE] Subscribe: handle_op_request START tx={:?}",
-                    tx
-                );
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -937,28 +933,15 @@ where
                     source_addr,
                 )
                 .await;
-                eprintln!(
-                    "[DEBUG-NODE] Subscribe: handle_op_request DONE tx={:?} result={:?}",
-                    tx,
-                    op_result.as_ref().map(|_| "Ok").unwrap_or("Err")
-                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            eprintln!(
-                                "[DEBUG-NODE] Subscribe: Operation still running, retrying tx={:?}",
-                                tx
-                            );
                             tracing::debug!("Pure network: Operation still running");
                             tokio::time::sleep(Duration::from_micros(1_000)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
-                            eprintln!(
-                                "[DEBUG-NODE] Subscribe: Operation already completed tx={:?}",
-                                tx
-                            );
                             tracing::debug!("Pure network: Operation already completed");
                             return Ok(None);
                         }
