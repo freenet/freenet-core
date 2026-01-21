@@ -679,22 +679,12 @@ impl Operation for SubscribeOp {
 
                     // Check if we have the contract
                     if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
-                        // We have the contract - but can we act as a source?
-                        // Issue #2784: Only accept downstream subscribers if:
-                        // 1. We're within SOURCE_THRESHOLD of the contract (authoritative source), OR
-                        // 2. We already have an upstream subscription (part of the subscription tree)
-                        //
-                        // Without this check, peers that received the contract via PUT propagation
-                        // (but never subscribed) would accept downstream subscribers, creating
-                        // disconnected subscription trees (peers with downstream but no upstream).
-                        if !op_manager.ring.can_be_subscription_source(&key) {
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                "subscribe: have contract but cannot be source (no upstream, not close enough), forwarding"
-                            );
-                            // Fall through to forward the request instead of responding
-                        } else if let Some(requester_addr) = self.requester_addr {
+                        // We have the contract - accept the subscription request.
+                        // This is how subscription trees form: peers closer to the contract
+                        // accept subscriptions from peers farther away.
+                        // If we don't have an upstream yet, we'll initiate our own subscription
+                        // toward the contract (handled by orphan recovery or explicit subscription).
+                        if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
                             // Use retry with backoff to handle race condition where Subscribe arrives
                             // before connection is fully established (peer still transient)
@@ -797,15 +787,8 @@ impl Operation for SubscribeOp {
                     )
                     .await?
                     {
-                        // Contract arrived - but can we act as a source? (Issue #2784)
-                        if !op_manager.ring.can_be_subscription_source(&key) {
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                "subscribe: contract arrived but cannot be source (no upstream, not close enough), forwarding"
-                            );
-                            // Fall through to forward the request
-                        } else if let Some(requester_addr) = self.requester_addr {
+                        // Contract arrived - accept the subscription request.
+                        if let Some(requester_addr) = self.requester_addr {
                             // Use retry with backoff for peer lookup (issue #2518)
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
