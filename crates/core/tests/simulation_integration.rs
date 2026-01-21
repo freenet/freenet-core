@@ -2670,6 +2670,15 @@ fn test_mutual_downstream_five_plus_nodes() {
     assert_healthy_topology("5+ node test", &validation);
 
     let seeder_count = count_seeders(&snapshots, &contract_id);
+
+    // Verify all 5 nodes (plus gateway) actually subscribed
+    // Reviewers noted: without this, the test could pass with only 2 nodes
+    assert!(
+        seeder_count >= 5,
+        "5+ node test: Expected at least 5 seeders (excluding gateway), found {}",
+        seeder_count
+    );
+
     tracing::info!(
         "test_mutual_downstream_five_plus_nodes PASSED: {} seeders",
         seeder_count
@@ -2961,19 +2970,28 @@ fn test_max_downstream_limit_reached() {
         seeder_count
     );
 
-    // Find gateway's downstream count
-    let gateway_downstream = snapshots
+    // Find source node's downstream count (node with no upstream but has downstream)
+    // Note: Reviewers flagged that port==0 heuristic is fragile. Better to find by topology role.
+    let source_downstream = snapshots
         .iter()
-        .find(|s| s.peer_addr.port() == 0 || s.peer_addr.to_string().contains("gateway"))
-        .and_then(|s| s.contracts.get(&contract_id))
+        .filter_map(|s| s.contracts.get(&contract_id))
+        .filter(|c| c.is_seeding && c.upstream.is_none() && !c.downstream.is_empty())
         .map(|c| c.downstream.len())
+        .max()
         .unwrap_or(0);
 
+    tracing::info!(
+        "Source node has {} direct downstream subscribers (MAX={})",
+        source_downstream,
+        MAX_DOWNSTREAM
+    );
+
+    // The source (gateway or closest node) should not exceed MAX_DOWNSTREAM
     assert!(
-        gateway_downstream <= MAX_DOWNSTREAM,
-        "Gateway should have at most {} downstream, found {}",
+        source_downstream <= MAX_DOWNSTREAM,
+        "Source should have at most {} downstream, found {}",
         MAX_DOWNSTREAM,
-        gateway_downstream
+        source_downstream
     );
 
     assert!(
@@ -2983,9 +3001,9 @@ fn test_max_downstream_limit_reached() {
     );
 
     tracing::info!(
-        "test_max_downstream_limit_reached PASSED: {} seeders, gateway_downstream={}",
+        "test_max_downstream_limit_reached PASSED: {} seeders, source_downstream={}",
         seeder_count,
-        gateway_downstream
+        source_downstream
     );
 }
 
@@ -3072,9 +3090,12 @@ fn test_chain_topology_formation() {
         validation.disconnected_upstream
     );
 
+    // With 4 nodes subscribing, expect at least 3 to have upstream
+    // (all should point toward the source; 1 may be the closest and act as source)
+    // Reviewers noted: >= 2 is too weak for 4 subscribers
     assert!(
-        nodes_with_upstream >= 2,
-        "Expected at least 2 nodes with upstream, found {}",
+        nodes_with_upstream >= 3,
+        "Chain test: Expected at least 3 of 4 nodes with upstream, found {}",
         nodes_with_upstream
     );
 
