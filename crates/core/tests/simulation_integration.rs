@@ -2350,23 +2350,18 @@ fn test_pr2763_crdt_convergence_with_resync() {
 /// 1. A receives B's Subscribe → adds B as downstream
 /// 2. B receives A's Subscribe → adds A as downstream
 /// 3. SubscriptionAccepted returns → both try set_upstream on each other
-/// 4. BUG: Both fail with CircularReference, leaving mutual downstream with no upstream
+/// 4. FIX: Distance-based tie-breaker ensures only farther peer accepts closer as upstream
 ///
 /// ## What This Test Validates
 ///
-/// After the fix (Option B: set_upstream removes peer from downstream):
+/// After the fix (distance-based tie-breaker in set_upstream):
+/// - Topology should have NO bidirectional cycles
 /// - Topology should have NO disconnected upstream peers
 /// - All seeders should be reachable from the source
 /// - The subscription tree should be well-formed
 ///
-/// This test is IGNORED because it tests EXPECTED behavior after the fix.
-/// It will FAIL (detect disconnected_upstream) until Issue #2773 is implemented.
-///
-/// Run with: `cargo test --ignored test_mutual_downstream_race_condition`
-///
 /// See: https://github.com/freenet/freenet-core/issues/2773
 #[test_log::test]
-#[ignore = "Issue #2773: subscription topology should handle mutual downstream (not yet implemented)"]
 fn test_mutual_downstream_race_condition_issue_2773() {
     use freenet::dev_tool::{
         validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,

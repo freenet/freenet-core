@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 
 pub use seeding::{
     AddClientSubscriptionResult, AddDownstreamResult, PruneSubscriptionsResult,
-    RemoveSubscriberResult, SubscriberType, SubscriptionError,
+    RemoveSubscriberResult, SubscriberType, SubscriptionError, UpstreamSetResult,
 };
 
 use crate::message::TransactionType;
@@ -560,10 +560,11 @@ impl Ring {
                 continue;
             };
 
+            // Use get_stored_location() for consistency with set_upstream distance check.
+            // This ensures topology validation uses the same location as the tie-breaker.
             let location = ring
                 .connection_manager
-                .own_location()
-                .location()
+                .get_stored_location()
                 .map(|l| l.as_f64())
                 .unwrap_or(0.0);
 
@@ -778,22 +779,46 @@ impl Ring {
         observed_addr: Option<ObservedAddr>,
     ) -> Result<AddDownstreamResult, SubscriptionError> {
         let own_addr = self.connection_manager.get_own_addr();
-        self.seeding_manager
-            .add_downstream(contract, subscriber, observed_addr, own_addr)
+        let own_location = self.connection_manager.get_stored_location();
+        let own_pub_key = self.connection_manager.pub_key.as_bytes();
+        self.seeding_manager.add_downstream(
+            contract,
+            subscriber,
+            observed_addr,
+            own_addr,
+            own_location,
+            Some(own_pub_key),
+        )
     }
 
     /// Set the upstream source for a contract (the peer we get updates FROM).
     ///
     /// # Errors
     /// - `SelfReference`: The upstream address matches our own address
+    /// - `CircularReference`: The upstream peer is our downstream AND we are closer to
+    ///   the contract (we should be source, not them)
     pub fn set_upstream(
         &self,
         contract: &ContractKey,
         upstream: PeerKeyLocation,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<UpstreamSetResult, SubscriptionError> {
         let own_addr = self.connection_manager.get_own_addr();
-        self.seeding_manager
-            .set_upstream(contract, upstream, own_addr)
+        let own_location = self.connection_manager.get_stored_location();
+        let own_pub_key = self.connection_manager.pub_key.as_bytes();
+        // Get the upstream's configured ring location, not the location computed from IP address.
+        // PeerKeyLocation::location() computes from IP, which differs from the configured location.
+        let upstream_configured_location = upstream.socket_addr().and_then(|addr| {
+            self.connection_manager
+                .get_configured_location_for_peer(addr)
+        });
+        self.seeding_manager.set_upstream(
+            contract,
+            upstream,
+            own_addr,
+            own_location,
+            Some(own_pub_key),
+            upstream_configured_location,
+        )
     }
 
     /// Remove a subscriber and check if upstream notification is needed.
@@ -1369,10 +1394,10 @@ impl Ring {
         let Some(peer_addr) = self.connection_manager.get_own_addr() else {
             return;
         };
+        // Use get_stored_location() for consistency with set_upstream distance check.
         let location = self
             .connection_manager
-            .own_location()
-            .location()
+            .get_stored_location()
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 
@@ -1387,10 +1412,10 @@ impl Ring {
     #[allow(dead_code)] // Used by SimNetwork tests
     pub fn get_topology_snapshot(&self) -> Option<topology_registry::TopologySnapshot> {
         let peer_addr = self.connection_manager.get_own_addr()?;
+        // Use get_stored_location() for consistency with set_upstream distance check.
         let location = self
             .connection_manager
-            .own_location()
-            .location()
+            .get_stored_location()
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 

@@ -314,9 +314,24 @@ impl ConnectionManager {
         }
     }
 
-    /// Update this node location.
+    /// Update this node location, only if not already set.
+    ///
+    /// This preserves configured locations (set during initialization) while allowing
+    /// peers behind NAT to learn their location from the observed address.
     pub fn update_location(&self, loc: Option<Location>) {
         if let Some(loc) = loc {
+            // Only update if current location is unset (-1.0)
+            let current_bits = self.own_location.load(std::sync::atomic::Ordering::Acquire);
+            let current_val = f64::from_le_bytes(current_bits.to_le_bytes());
+            if current_val >= 0.0 {
+                // Location already set (e.g., from config), don't overwrite
+                tracing::debug!(
+                    current_location = current_val,
+                    new_location = loc.as_f64(),
+                    "update_location: preserving existing location"
+                );
+                return;
+            }
             self.own_location.store(
                 u64::from_le_bytes(loc.as_f64().to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
@@ -381,6 +396,13 @@ impl ConnectionManager {
         // For transient connections, we don't have full peer info yet
         // Return None since we don't have the public key
         None
+    }
+
+    /// Look up the configured Location for a peer by socket address.
+    /// This returns the actual ring location the peer was assigned, not the location
+    /// computed from IP address (which would be different).
+    pub fn get_configured_location_for_peer(&self, addr: SocketAddr) -> Option<Location> {
+        self.location_for_peer.read().get(&addr).copied()
     }
 
     /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
@@ -1140,6 +1162,28 @@ mod tests {
         let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
         cm.update_location(None);
         // Should not panic
+    }
+
+    #[test]
+    fn test_update_location_preserves_existing() {
+        // Issue #2773: Once a location is set, subsequent update_location calls
+        // should NOT overwrite it. This ensures distance-based tie-breaker uses
+        // consistent locations throughout the peer's lifetime.
+        let cm = make_connection_manager(None, 1, 10, false);
+
+        // Set initial location
+        let initial_loc = Location::new(0.3);
+        cm.update_location(Some(initial_loc));
+        assert_eq!(cm.get_stored_location(), Some(initial_loc));
+
+        // Try to update to different location - should be ignored
+        let new_loc = Location::new(0.7);
+        cm.update_location(Some(new_loc));
+        assert_eq!(
+            cm.get_stored_location(),
+            Some(initial_loc),
+            "Location should be preserved, not overwritten"
+        );
     }
 
     // ============ try_set_own_addr tests ============

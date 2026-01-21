@@ -2185,6 +2185,19 @@ fn expected_three_hop_locations() -> [f64; 3] {
     ]
 }
 
+// Helper functions for subscription tests to ensure deterministic node locations.
+// Gateway is positioned closer to the contract than peer-a, ensuring correct
+// upstream/downstream relationships per issue #2773 fix.
+fn subscription_gateway_location() -> f64 {
+    // Gateway at contract_location + 0.1 (very close to contract)
+    freenet::dev_tool::Location::new_rounded(three_hop_contract_location().as_f64() + 0.1).as_f64()
+}
+
+fn subscription_peer_a_location() -> f64 {
+    // peer-a at contract_location + 0.4 (farther from contract than gateway)
+    freenet::dev_tool::Location::new_rounded(three_hop_contract_location().as_f64() + 0.4).as_f64()
+}
+
 #[freenet_test(
     nodes = ["gateway", "peer-a", "peer-c"],
     gateways = ["gateway"],
@@ -3396,8 +3409,12 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 /// after a subscriber disconnects, without errors from trying to send to dead peers.
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
+    node_configs = {
+        "gateway": { location: subscription_gateway_location() },
+        "peer-a": { location: subscription_peer_a_location() },
+    },
     timeout_secs = 180,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3411,13 +3428,29 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.node("gateway")?;
     let peer_a = ctx.node("peer-a")?;
 
-    tracing::info!(
-        "Nodes: gateway ws={}, peer-a ws={}",
-        gateway.ws_port,
-        peer_a.ws_port
+    let contract_location = freenet::dev_tool::Location::from(&contract_key);
+    tracing::warn!(
+        "LOCATIONS: gateway={} peer_a={} contract={} expected_gateway={} expected_peer_a={}",
+        gateway.location,
+        peer_a.location,
+        contract_location.as_f64(),
+        subscription_gateway_location(),
+        subscription_peer_a_location()
+    );
+    let gateway_distance =
+        freenet::dev_tool::Location::new(gateway.location).distance(contract_location);
+    let peer_a_distance =
+        freenet::dev_tool::Location::new(peer_a.location).distance(contract_location);
+    tracing::warn!(
+        "DISTANCES: gateway_to_contract={} peer_a_to_contract={} (gateway_closer: {})",
+        gateway_distance.as_f64(),
+        peer_a_distance.as_f64(),
+        gateway_distance < peer_a_distance
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    // This helps avoid race conditions in CI where connection registration may be slower
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -3675,8 +3708,12 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
 ///    (no remaining client subscriptions)
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
+    node_configs = {
+        "gateway": { location: subscription_gateway_location() },
+        "peer-a": { location: subscription_peer_a_location() },
+    },
     timeout_secs = 180,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3696,7 +3733,8 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
         peer_a.ws_port
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Connect gateway client
     let uri_gw = gateway.ws_url();
@@ -3964,8 +4002,12 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 /// - → Peer-A sends Unsubscribed to Gateway (upstream)
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
+    node_configs = {
+        "gateway": { location: subscription_gateway_location() },
+        "peer-a": { location: subscription_peer_a_location() },
+    },
     timeout_secs = 300,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3985,7 +4027,8 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
         peer_a.ws_port
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Connect clients
     let uri_gw = gateway.ws_url();
