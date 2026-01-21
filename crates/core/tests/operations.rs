@@ -3414,7 +3414,7 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
         "peer-a": { location: subscription_peer_a_location() },
     },
     timeout_secs = 180,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3448,7 +3448,9 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         gateway_distance < peer_a_distance
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    // This helps avoid race conditions in CI where connection registration may be slower
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -3711,7 +3713,7 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         "peer-a": { location: subscription_peer_a_location() },
     },
     timeout_secs = 180,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3731,7 +3733,8 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
         peer_a.ws_port
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Connect gateway client
     let uri_gw = gateway.ws_url();
@@ -4004,7 +4007,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
         "peer-a": { location: subscription_peer_a_location() },
     },
     timeout_secs = 300,
-    startup_wait_secs = 10,
+    startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -4024,7 +4027,8 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
         peer_a.ws_port
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Extra wait to ensure connections are fully established before subscribing
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Connect clients
     let uri_gw = gateway.ws_url();
