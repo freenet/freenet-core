@@ -533,6 +533,17 @@ fn event_kind_to_string(kind: &EventKind) -> String {
             }
         }
         EventKind::TransportSnapshot(_) => "transport_snapshot".to_string(),
+        EventKind::InterestSync(interest_sync_event) => {
+            use super::InterestSyncEvent;
+            match interest_sync_event {
+                InterestSyncEvent::ResyncRequestReceived { .. } => {
+                    "interest_resync_request_received".to_string()
+                }
+                InterestSyncEvent::ResyncResponseSent { .. } => {
+                    "interest_resync_response_sent".to_string()
+                }
+            }
+        }
     }
 }
 
@@ -1355,6 +1366,41 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "min_rtt_us": snapshot.min_rtt_us,
                 "max_rtt_us": snapshot.max_rtt_us,
             })
+        }
+        EventKind::InterestSync(interest_sync_event) => {
+            use super::InterestSyncEvent;
+            match interest_sync_event {
+                InterestSyncEvent::ResyncRequestReceived {
+                    key,
+                    from_peer,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "resync_request_received",
+                        "contract_key": key.to_string(),
+                        "contract_id": key.id().to_string(),
+                        "from_peer": from_peer.to_string(),
+                        "from_peer_addr": from_peer.peer_addr.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                InterestSyncEvent::ResyncResponseSent {
+                    key,
+                    to_peer,
+                    state_size,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "resync_response_sent",
+                        "contract_key": key.to_string(),
+                        "contract_id": key.id().to_string(),
+                        "to_peer": to_peer.to_string(),
+                        "to_peer_addr": to_peer.peer_addr.to_string(),
+                        "state_size": state_size,
+                        "timestamp": timestamp,
+                    })
+                }
+            }
         }
     }
 }
