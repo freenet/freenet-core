@@ -848,9 +848,15 @@ impl Ring {
     /// - It's within SOURCE_THRESHOLD of the contract location (authoritative source)
     /// - It already has an upstream subscription (part of the subscription tree)
     /// - It has local client subscriptions (local clients are interested in the contract)
+    /// - It's already seeding the contract (has it cached and can provide state)
     ///
-    /// Issue #2784: Peers that have a contract but no upstream AND no local interest
-    /// should NOT accept downstream subscribers, as this creates disconnected subscription trees.
+    /// Issue #2784: The key insight is that peers accepting downstream subscribers must be
+    /// able to provide contract state. Being a seeder (having the contract cached) is
+    /// sufficient - you can serve as the root of a subscription subtree.
+    ///
+    /// The original issue was peers forwarding Subscribe responses without setting upstream,
+    /// which created "disconnected upstream" nodes. This check prevents that by ensuring
+    /// we only accept downstream when we can actually serve updates.
     pub fn can_be_subscription_source(&self, contract: &ContractKey) -> bool {
         const SOURCE_THRESHOLD: f64 = 0.05;
 
@@ -862,6 +868,13 @@ impl Ring {
         // Check if we have local client subscriptions (gateway PUT with subscribe=true,
         // or any local client subscribed via WebSocket)
         if self.seeding_manager.has_client_subscriptions(contract.id()) {
+            return true;
+        }
+
+        // Check if we're seeding this contract (have it cached).
+        // Seeders can serve as subscription sources because they have the contract state.
+        // This handles the case where someone PUTs without subscribing, then others subscribe.
+        if self.seeding_manager.is_seeding_contract(contract) {
             return true;
         }
 
