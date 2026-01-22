@@ -253,12 +253,15 @@ where
         }
     }
 
-    /// Apply a CRDT-mode delta with version checking.
+    /// Apply a CRDT-mode delta using LWW-Register (Last-Writer-Wins) semantics.
     ///
-    /// CRDT deltas include version information. If the delta's `from_version`
-    /// doesn't match our current version, delta application FAILS. This triggers
-    /// a ResyncRequest from the caller, which is exactly what PR #2763 was designed
-    /// to prevent through correct summary caching.
+    /// This implements a proper CRDT with convergent merge semantics:
+    /// - Higher version always wins (version acts as logical timestamp)
+    /// - Equal versions use hash comparison as deterministic tiebreaker
+    /// - Lower versions are rejected (we already have newer data)
+    ///
+    /// This ensures all nodes converge to the same state regardless of message
+    /// delivery order, which is essential for simulation test correctness.
     ///
     /// Delta format: [from_version: u64][to_version: u64][new_data]
     async fn apply_crdt_delta(
@@ -269,55 +272,73 @@ where
         _has_contract_code: bool,
     ) -> Result<UpsertResult, ExecutorError> {
         // Decode the delta
-        let (from_version, to_version, new_data) = crdt_encoding::decode_delta(delta.as_ref())
+        let (_from_version, to_version, new_data) = crdt_encoding::decode_delta(delta.as_ref())
             .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("Invalid CRDT delta format")))?;
 
-        // Get current version
-        let current_version = crdt_encoding::get_version(current_state.as_ref())
-            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format")))?;
+        // Get current version and data
+        let (current_version, current_data) = crdt_encoding::decode_state(current_state.as_ref())
+            .ok_or_else(|| {
+            ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format"))
+        })?;
 
         tracing::debug!(
             contract = %key,
             current_version = current_version,
-            delta_from_version = from_version,
             delta_to_version = to_version,
-            "CRDT mode: applying delta"
+            "CRDT mode: applying delta with LWW semantics"
         );
 
-        // VERSION CHECK: This is the key test for PR #2763!
-        // If sender cached wrong summary, from_version won't match our version.
-        if current_version != from_version {
-            tracing::warn!(
+        // LWW-Register CRDT merge logic:
+        // 1. Higher version wins
+        // 2. Equal versions use hash comparison as tiebreaker
+        // 3. Lower versions are rejected
+        let should_update = if to_version > current_version {
+            tracing::debug!(
                 contract = %key,
-                current_version = current_version,
-                delta_from_version = from_version,
-                "CRDT delta version mismatch - triggering ResyncRequest"
+                "CRDT: incoming version {} > current version {} - accepting",
+                to_version, current_version
             );
-            // Return error to trigger ResyncRequest
-            return Err(ExecutorError::other(anyhow::anyhow!(
-                "CRDT delta version mismatch: expected {}, got {}",
-                current_version,
-                from_version
-            )));
+            true
+        } else if to_version == current_version {
+            // Tiebreaker: compare hashes of the data (not the full state)
+            let incoming_hash = blake3::hash(new_data);
+            let current_hash = blake3::hash(current_data);
+            let accept = incoming_hash.as_bytes() > current_hash.as_bytes();
+            tracing::debug!(
+                contract = %key,
+                "CRDT: equal versions, hash tiebreaker - {}",
+                if accept { "accepting incoming" } else { "keeping current" }
+            );
+            accept
+        } else {
+            tracing::debug!(
+                contract = %key,
+                "CRDT: incoming version {} < current version {} - rejecting",
+                to_version, current_version
+            );
+            false
+        };
+
+        if should_update {
+            let new_state_bytes = crdt_encoding::encode_state(to_version, new_data);
+            let new_state = WrappedState::new(new_state_bytes);
+
+            self.state_store
+                .update(key, new_state.clone())
+                .await
+                .map_err(ExecutorError::other)?;
+
+            tracing::debug!(
+                contract = %key,
+                old_version = current_version,
+                new_version = to_version,
+                "CRDT mode: delta applied successfully"
+            );
+
+            Ok(UpsertResult::Updated(new_state))
+        } else {
+            Ok(UpsertResult::NoChange)
         }
-
-        // Version matches - apply the delta (replace data with new version)
-        let new_state_bytes = crdt_encoding::encode_state(to_version, new_data);
-        let new_state = WrappedState::new(new_state_bytes);
-
-        self.state_store
-            .update(key, new_state.clone())
-            .await
-            .map_err(ExecutorError::other)?;
-
-        tracing::debug!(
-            contract = %key,
-            old_version = current_version,
-            new_version = to_version,
-            "CRDT mode: delta applied successfully"
-        );
-
-        Ok(UpsertResult::Updated(new_state))
     }
 }
 
@@ -1096,5 +1117,444 @@ mod test {
             s3.as_ref(),
             "Newer state S3 should still be stored"
         );
+    }
+
+    // =========================================================================
+    // CRDT Emulation Mode Tests (LWW-Register semantics via delta application)
+    // =========================================================================
+    //
+    // These tests verify the CRDT emulation mode that uses version-based
+    // Last-Writer-Wins (LWW) semantics for delta application. This is the
+    // mode used by simulation tests via `register_crdt_contract()`.
+
+    /// Helper to create initial CRDT state with version
+    fn create_crdt_state(version: u64, data: &[u8]) -> WrappedState {
+        WrappedState::new(crdt_encoding::encode_state(version, data))
+    }
+
+    /// Helper to create a CRDT delta
+    fn create_crdt_delta(from_version: u64, to_version: u64, data: &[u8]) -> StateDelta<'static> {
+        StateDelta::from(crdt_encoding::create_delta(from_version, to_version, data))
+    }
+
+    /// Test that higher version wins in CRDT mode delta application
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_higher_version_wins() {
+        let mut executor = create_test_executor().await;
+
+        let contract = create_test_contract(b"crdt_emulation_test_1");
+        let key = contract.key();
+
+        // Register for CRDT mode
+        register_crdt_contract(*key.id());
+
+        // Initialize with version 1
+        let initial_state = create_crdt_state(1, b"initial data");
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(initial_state),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Apply delta with higher version (1 -> 2)
+        let delta = create_crdt_delta(1, 2, b"updated data v2");
+        let result = executor
+            .upsert_contract_state(key, Either::Right(delta), RelatedContracts::default(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, UpsertResult::Updated(_)),
+            "Higher version delta should be accepted"
+        );
+
+        // Verify state was updated
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        let stored = stored.unwrap();
+        let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(data, b"updated data v2");
+        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+    }
+
+    /// Test that lower version is rejected in CRDT mode delta application
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_lower_version_rejected() {
+        let mut executor = create_test_executor().await;
+
+        let contract = create_test_contract(b"crdt_emulation_test_2");
+        let key = contract.key();
+
+        // Register for CRDT mode
+        register_crdt_contract(*key.id());
+
+        // Initialize with version 5
+        let initial_state = create_crdt_state(5, b"version 5 data");
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(initial_state),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Apply delta with lower version (2 -> 3) - should be rejected
+        let delta = create_crdt_delta(2, 3, b"old data v3");
+        let result = executor
+            .upsert_contract_state(key, Either::Right(delta), RelatedContracts::default(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, UpsertResult::NoChange),
+            "Lower version delta should be rejected with NoChange"
+        );
+
+        // Verify state was NOT updated
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        let stored = stored.unwrap();
+        let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
+        assert_eq!(version, 5);
+        assert_eq!(data, b"version 5 data");
+        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+    }
+
+    /// Test that equal versions use hash comparison as tiebreaker
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_equal_version_hash_tiebreaker() {
+        let mut executor = create_test_executor().await;
+
+        let contract = create_test_contract(b"crdt_emulation_test_3");
+        let key = contract.key();
+
+        // Register for CRDT mode
+        register_crdt_contract(*key.id());
+
+        // Create two data values with known hash ordering at same version
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let hash_a = blake3::hash(data_a);
+        let hash_b = blake3::hash(data_b);
+
+        let (smaller_data, larger_data) = if hash_a.as_bytes() < hash_b.as_bytes() {
+            (data_a.as_slice(), data_b.as_slice())
+        } else {
+            (data_b.as_slice(), data_a.as_slice())
+        };
+
+        // Initialize with smaller hash data at version 5
+        let initial_state = create_crdt_state(5, smaller_data);
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(initial_state),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Apply delta with same version but larger hash data - should win
+        let delta = create_crdt_delta(5, 5, larger_data);
+        let result = executor
+            .upsert_contract_state(key, Either::Right(delta), RelatedContracts::default(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, UpsertResult::Updated(_)),
+            "Equal version with larger hash should win"
+        );
+
+        // Verify state has larger hash data
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        let stored = stored.unwrap();
+        let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
+        assert_eq!(version, 5);
+        assert_eq!(data, larger_data);
+        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+    }
+
+    /// Test that equal version with smaller hash is rejected
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_equal_version_smaller_hash_rejected() {
+        let mut executor = create_test_executor().await;
+
+        let contract = create_test_contract(b"crdt_emulation_test_4");
+        let key = contract.key();
+
+        // Register for CRDT mode
+        register_crdt_contract(*key.id());
+
+        // Create two data values with known hash ordering at same version
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let hash_a = blake3::hash(data_a);
+        let hash_b = blake3::hash(data_b);
+
+        let (smaller_data, larger_data) = if hash_a.as_bytes() < hash_b.as_bytes() {
+            (data_a.as_slice(), data_b.as_slice())
+        } else {
+            (data_b.as_slice(), data_a.as_slice())
+        };
+
+        // Initialize with larger hash data at version 5
+        let initial_state = create_crdt_state(5, larger_data);
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(initial_state),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Apply delta with same version but smaller hash data - should be rejected
+        let delta = create_crdt_delta(5, 5, smaller_data);
+        let result = executor
+            .upsert_contract_state(key, Either::Right(delta), RelatedContracts::default(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, UpsertResult::NoChange),
+            "Equal version with smaller hash should be rejected"
+        );
+
+        // Verify state still has larger hash data
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        let stored = stored.unwrap();
+        let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
+        assert_eq!(version, 5);
+        assert_eq!(data, larger_data);
+        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+    }
+
+    /// Test that CRDT emulation mode converges regardless of delta arrival order
+    /// This is the key property ensuring simulation tests work correctly
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_convergence_any_order() {
+        // Simulate 3 peers receiving the same deltas in different orders
+        // All should converge to version 3 with the same data
+
+        let contract = create_test_contract(b"crdt_convergence_test");
+        let key = contract.key();
+        let contract_id = *key.id();
+
+        // Register ONCE at the beginning - don't clear during test to avoid race conditions
+        // with parallel tests that share the global CRDT_CONTRACTS registry
+        register_crdt_contract(contract_id);
+
+        // Define 3 deltas representing updates v1->v2, v2->v3, and a "late" v1->v2
+        let delta_1_to_2 = create_crdt_delta(1, 2, b"data at version 2");
+        let delta_2_to_3 = create_crdt_delta(2, 3, b"data at version 3");
+        let delta_1_to_2_late = create_crdt_delta(1, 2, b"late update to v2"); // Different data, same target version
+
+        let initial = create_crdt_state(1, b"initial");
+
+        // Peer A: receives deltas in order 1->2, 2->3, late 1->2
+        let mut peer_a = create_test_executor().await;
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Left(initial.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_2_to_3.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_a
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2_late.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Peer B: receives deltas in order 2->3, 1->2, late 1->2
+        let mut peer_b = create_test_executor().await;
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Left(initial.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_2_to_3.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_b
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2_late.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Peer C: receives deltas in order late 1->2, 2->3, 1->2
+        let mut peer_c = create_test_executor().await;
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Left(initial.clone()),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2_late.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_2_to_3.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        peer_c
+            .upsert_contract_state(
+                key,
+                Either::Right(delta_1_to_2.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // All peers should have converged to version 3
+        let (state_a, _) = peer_a.fetch_contract(key, false).await.unwrap();
+        let (state_b, _) = peer_b.fetch_contract(key, false).await.unwrap();
+        let (state_c, _) = peer_c.fetch_contract(key, false).await.unwrap();
+
+        let state_a = state_a.unwrap();
+        let state_b = state_b.unwrap();
+        let state_c = state_c.unwrap();
+
+        let (ver_a, data_a) = crdt_encoding::decode_state(state_a.as_ref()).unwrap();
+        let (ver_b, data_b) = crdt_encoding::decode_state(state_b.as_ref()).unwrap();
+        let (ver_c, data_c) = crdt_encoding::decode_state(state_c.as_ref()).unwrap();
+
+        // All should be at version 3 with the same data
+        assert_eq!(ver_a, 3, "Peer A should be at version 3");
+        assert_eq!(ver_b, 3, "Peer B should be at version 3");
+        assert_eq!(ver_c, 3, "Peer C should be at version 3");
+
+        assert_eq!(data_a, data_b, "Peer A and B should have same data");
+        assert_eq!(data_b, data_c, "Peer B and C should have same data");
+        assert_eq!(data_a, b"data at version 3", "All should have v3 data");
+    }
+
+    /// Test idempotency: applying the same delta twice has no effect
+    #[tokio::test(flavor = "current_thread")]
+    async fn crdt_emulation_idempotent() {
+        let mut executor = create_test_executor().await;
+
+        let contract = create_test_contract(b"crdt_idempotent_test");
+        let key = contract.key();
+
+        register_crdt_contract(*key.id());
+
+        // Initialize with version 1
+        let initial = create_crdt_state(1, b"initial");
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(initial),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Apply delta 1->2
+        let delta = create_crdt_delta(1, 2, b"version 2 data");
+        let result1 = executor
+            .upsert_contract_state(
+                key,
+                Either::Right(delta.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result1, UpsertResult::Updated(_)));
+
+        // Apply same delta again - should be NoChange (idempotent)
+        let result2 = executor
+            .upsert_contract_state(
+                key,
+                Either::Right(delta.clone()),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result2, UpsertResult::NoChange),
+            "Applying same delta twice should be idempotent (NoChange)"
+        );
+
+        // Verify state is correct
+        let (stored, _) = executor.fetch_contract(key, false).await.unwrap();
+        let stored = stored.unwrap();
+        let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(data, b"version 2 data");
+        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
     }
 }
