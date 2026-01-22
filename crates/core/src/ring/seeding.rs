@@ -423,16 +423,6 @@ impl SeedingManager {
         self.get_subscription_cache.write().sweep_expired()
     }
 
-    /// Check if a contract is in the GET subscription cache.
-    pub fn is_get_subscription(&self, key: &ContractKey) -> bool {
-        self.get_subscription_cache.read().contains(key)
-    }
-
-    /// Remove a contract from the GET subscription cache.
-    pub fn remove_get_subscription(&self, key: &ContractKey) {
-        self.get_subscription_cache.write().remove(key);
-    }
-
     // =========================================================================
     // Subscription Retry Management (Backoff)
     // =========================================================================

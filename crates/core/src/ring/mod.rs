@@ -55,8 +55,7 @@ pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use interest::PeerKey;
 pub use location::{Distance, Location};
-#[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
-pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation, UnknownAddressError};
+pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -893,18 +892,6 @@ impl Ring {
     /// `has_client_subscriptions()` before removing subscription state.
     pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
         self.seeding_manager.sweep_expired_get_subscriptions()
-    }
-
-    /// Check if a contract is in the GET subscription cache.
-    #[allow(dead_code)]
-    pub fn is_get_subscription(&self, key: &ContractKey) -> bool {
-        self.seeding_manager.is_get_subscription(key)
-    }
-
-    /// Remove a contract from the GET subscription cache.
-    #[allow(dead_code)]
-    pub fn remove_get_subscription(&self, key: &ContractKey) {
-        self.seeding_manager.remove_get_subscription(key)
     }
 
     // ==================== Connection Pruning ====================

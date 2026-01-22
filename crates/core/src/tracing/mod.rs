@@ -972,115 +972,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    /// Create a downstream_added event when a peer subscribes through us.
-    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
-    pub fn downstream_added(
-        ring: &'a Ring,
-        key: ContractKey,
-        subscriber: PeerKeyLocation,
-        downstream_count: usize,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::DownstreamAdded {
-                key,
-                subscriber,
-                downstream_count,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create a downstream_removed event when a downstream subscriber is removed.
-    #[allow(dead_code)] // Helper available for future use
-    pub fn downstream_removed(
-        ring: &'a Ring,
-        key: ContractKey,
-        subscriber: Option<PeerKeyLocation>,
-        reason: DownstreamRemovedReason,
-        downstream_count: usize,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::DownstreamRemoved {
-                key,
-                subscriber,
-                reason,
-                downstream_count,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create an upstream_set event when we subscribe through another peer.
-    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
-    pub fn upstream_set(
-        ring: &'a Ring,
-        key: ContractKey,
-        upstream: PeerKeyLocation,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::UpstreamSet {
-                key,
-                upstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create an unsubscribed event when we unsubscribe from a contract's upstream.
-    #[allow(dead_code)] // Helper available for future use
-    pub fn unsubscribed(
-        ring: &'a Ring,
-        key: ContractKey,
-        reason: UnsubscribedReason,
-        upstream: Option<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::Unsubscribed {
-                key,
-                reason,
-                upstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create a subscription_state snapshot event.
-    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
-    pub fn subscription_state(
-        ring: &'a Ring,
-        key: ContractKey,
-        is_seeding: bool,
-        upstream: Option<PeerKeyLocation>,
-        downstream: Vec<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let downstream_count = downstream.len();
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::SubscriptionState {
-                key,
-                is_seeding,
-                upstream,
-                downstream_count,
-                downstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
     pub fn from_outbound_msg(
         msg: &'a NetMessage,
         ring: &'a Ring,
@@ -3105,7 +2996,11 @@ impl GetEvent {
 /// - Success when subscription is established
 /// - NotFound when contract doesn't exist after search
 /// - Seeding state changes (local client subscriptions)
-/// - Subscription tree structure changes (upstream/downstream relationships)
+///
+/// # Serialization Compatibility
+///
+/// Discriminants 6-10 are reserved for removed variants (2026-01 lease-based refactor).
+/// New variants should be added after `_Reserved10` (discriminant 11+).
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) enum SubscribeEvent {
@@ -3182,74 +3077,20 @@ pub(crate) enum SubscribeEvent {
         reason: SeedingStoppedReason,
         timestamp: u64,
     },
-    /// A downstream subscriber was added for a contract.
-    ///
-    /// This event fires when another peer subscribes through us,
-    /// meaning we need to forward updates to them.
-    DownstreamAdded {
-        /// Contract for which subscriber was added.
-        key: ContractKey,
-        /// The new downstream subscriber.
-        subscriber: PeerKeyLocation,
-        /// Current count of downstream subscribers after this addition.
-        downstream_count: usize,
-        timestamp: u64,
-    },
-    /// A downstream subscriber was removed for a contract.
-    ///
-    /// This event fires when a peer that subscribed through us disconnects or unsubscribes.
-    DownstreamRemoved {
-        /// Contract from which subscriber was removed.
-        key: ContractKey,
-        /// The removed downstream subscriber (if known).
-        subscriber: Option<PeerKeyLocation>,
-        /// Reason for removal.
-        reason: DownstreamRemovedReason,
-        /// Remaining downstream subscribers after removal.
-        downstream_count: usize,
-        timestamp: u64,
-    },
-    /// An upstream source was set for a contract.
-    ///
-    /// This event fires when we subscribe to a contract through another peer,
-    /// meaning we will receive updates from them.
-    UpstreamSet {
-        /// Contract for which upstream was set.
-        key: ContractKey,
-        /// The upstream peer we subscribed through.
-        upstream: PeerKeyLocation,
-        timestamp: u64,
-    },
-    /// We unsubscribed from a contract's upstream.
-    ///
-    /// This event fires when we no longer need to receive updates for a contract,
-    /// typically because all local clients and downstream subscribers have gone.
-    Unsubscribed {
-        /// Contract we unsubscribed from.
-        key: ContractKey,
-        /// Reason for unsubscribing.
-        reason: UnsubscribedReason,
-        /// The upstream peer we unsubscribed from (if any).
-        upstream: Option<PeerKeyLocation>,
-        timestamp: u64,
-    },
-    /// Snapshot of subscription state for a contract.
-    ///
-    /// This periodic or on-change event provides visibility into the full
-    /// subscription tree structure for debugging update propagation.
-    SubscriptionState {
-        /// Contract this state is for.
-        key: ContractKey,
-        /// Whether we are locally seeding this contract (local client subscribed).
-        is_seeding: bool,
-        /// Our upstream source for updates (if any).
-        upstream: Option<PeerKeyLocation>,
-        /// Number of downstream subscribers.
-        downstream_count: usize,
-        /// List of downstream subscribers.
-        downstream: Vec<PeerKeyLocation>,
-        timestamp: u64,
-    },
+    // Reserved discriminants 6-10 for removed variants (2026-01 lease-based refactor).
+    // These placeholders ensure old stored events with these discriminants fail
+    // deserialization cleanly rather than being misinterpreted as new variants.
+    // New variants should be added after _Reserved10.
+    #[doc(hidden)]
+    _Reserved6,
+    #[doc(hidden)]
+    _Reserved7,
+    #[doc(hidden)]
+    _Reserved8,
+    #[doc(hidden)]
+    _Reserved9,
+    #[doc(hidden)]
+    _Reserved10,
 }
 
 impl SubscribeEvent {
@@ -3257,12 +3098,7 @@ impl SubscribeEvent {
     /// Only some variants have the full key; Request and some others have instance_id.
     fn contract_key(&self) -> Option<ContractKey> {
         match self {
-            SubscribeEvent::SubscribeSuccess { key, .. }
-            | SubscribeEvent::DownstreamAdded { key, .. }
-            | SubscribeEvent::DownstreamRemoved { key, .. }
-            | SubscribeEvent::UpstreamSet { key, .. }
-            | SubscribeEvent::Unsubscribed { key, .. }
-            | SubscribeEvent::SubscriptionState { key, .. } => Some(*key),
+            SubscribeEvent::SubscribeSuccess { key, .. } => Some(*key),
             SubscribeEvent::ResponseSent { key, .. } => *key,
             _ => None,
         }
@@ -3277,28 +3113,6 @@ pub enum SeedingStoppedReason {
     LastClientUnsubscribed,
     /// Client disconnected.
     ClientDisconnected,
-}
-
-/// Reason why a downstream subscriber was removed.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum DownstreamRemovedReason {
-    /// Peer explicitly unsubscribed.
-    PeerUnsubscribed,
-    /// Peer disconnected from the network.
-    PeerDisconnected,
-}
-
-/// Reason why we unsubscribed from upstream.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum UnsubscribedReason {
-    /// Last local client unsubscribed.
-    LastClientUnsubscribed,
-    /// Last downstream subscriber disconnected and no local clients.
-    NoRemainingInterest,
-    /// Upstream peer disconnected.
-    UpstreamDisconnected,
 }
 
 /// Direction of data transfer.
