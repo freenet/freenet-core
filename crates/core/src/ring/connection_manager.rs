@@ -401,6 +401,7 @@ impl ConnectionManager {
     /// Look up the configured Location for a peer by socket address.
     /// This returns the actual ring location the peer was assigned, not the location
     /// computed from IP address (which would be different).
+    #[allow(dead_code)] // Available for future use
     pub fn get_configured_location_for_peer(&self, addr: SocketAddr) -> Option<Location> {
         self.location_for_peer.read().get(&addr).copied()
     }

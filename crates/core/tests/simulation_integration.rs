@@ -1485,6 +1485,12 @@ fn test_topology_single_seeder() {
 ///
 /// Per Nacho's comment on #2755: "This issue can be verified fixed when
 /// test_orphan_seeders_no_source passes."
+///
+/// NOTE: This test validates the OLD subscription tree model. In the 2026-01 refactor,
+/// the subscription tree was replaced with lease-based subscriptions and proximity cache.
+/// The concepts of "orphan seeders" and "upstream connections" no longer apply.
+/// Update propagation now works via proximity cache, tested by other convergence tests.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[test_log::test]
 fn test_orphan_seeders_no_source() {
     use freenet::dev_tool::{
@@ -2361,6 +2367,12 @@ fn test_pr2763_crdt_convergence_with_resync() {
 /// - The subscription tree should be well-formed
 ///
 /// See: https://github.com/freenet/freenet-core/issues/2773
+///
+/// NOTE: This test validates the OLD subscription tree model. In the 2026-01 refactor,
+/// the subscription tree was replaced with lease-based subscriptions and proximity cache.
+/// The concepts of "orphan seeders" and "disconnected upstream" no longer apply.
+/// Update propagation now works via proximity cache, tested by other convergence tests.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[test_log::test]
 fn test_mutual_downstream_race_condition_issue_2773() {
     use freenet::dev_tool::{

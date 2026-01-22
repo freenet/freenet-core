@@ -973,6 +973,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a downstream_added event when a peer subscribes through us.
+    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
     pub fn downstream_added(
         ring: &'a Ring,
         key: ContractKey,
@@ -1016,6 +1017,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create an upstream_set event when we subscribe through another peer.
+    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
     pub fn upstream_set(
         ring: &'a Ring,
         key: ContractKey,
@@ -1055,6 +1057,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a subscription_state snapshot event.
+    #[allow(dead_code)] // Unused in lease-based model, kept for telemetry compatibility
     pub fn subscription_state(
         ring: &'a Ring,
         key: ContractKey,

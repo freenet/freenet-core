@@ -15,17 +15,14 @@ use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 
-pub use seeding::{
-    AddClientSubscriptionResult, AddDownstreamResult, PruneSubscriptionsResult,
-    RemoveSubscriberResult, SubscriberType, SubscriptionError, UpstreamSetResult,
-};
+pub use seeding::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
-use crate::transport::{ObservedAddr, TransportPublicKey};
+use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::{GlobalExecutor, GlobalRng},
@@ -129,6 +126,13 @@ impl Drop for SubscriptionRecoveryGuard {
                 .complete_subscription_request(&self.contract_key, false);
         }
     }
+}
+
+/// Result of pruning a connection.
+#[derive(Debug, Default)]
+pub struct PruneConnectionResult {
+    /// Orphaned transactions that need to be retried or failed.
+    pub orphaned_transactions: Vec<Transaction>,
 }
 
 impl Ring {
@@ -331,7 +335,8 @@ impl Ring {
         loop {
             interval.tick().await;
 
-            let subscription_states = ring.get_all_subscription_states();
+            // Get subscription states from the new lease-based model
+            let subscription_states = ring.get_subscription_states();
 
             if subscription_states.is_empty() {
                 continue;
@@ -342,14 +347,14 @@ impl Ring {
                 "Emitting periodic subscription state telemetry"
             );
 
-            for (key, is_seeding, upstream, downstream) in subscription_states {
-                if let Some(event) =
-                    NetEventLog::subscription_state(&ring, key, is_seeding, upstream, downstream)
-                {
-                    ring.event_register
-                        .register_events(Either::Left(event))
-                        .await;
-                }
+            // Log subscription states (simplified - no upstream/downstream in new model)
+            for (key, has_client, is_active, _expires_at) in subscription_states {
+                tracing::trace!(
+                    %key,
+                    has_client_subscription = has_client,
+                    is_active_subscription = is_active,
+                    "Subscription state"
+                );
             }
         }
     }
@@ -382,33 +387,43 @@ impl Ring {
         loop {
             interval.tick().await;
 
-            // Get contracts we're seeding without upstream subscription
-            let mut orphaned_contracts = ring.contracts_without_upstream();
+            // First, expire any stale subscriptions
+            let expired = ring.expire_stale_subscriptions();
+            if !expired.is_empty() {
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "Expired {} stale subscriptions",
+                    expired.len()
+                );
+            }
 
-            if orphaned_contracts.is_empty() {
+            // Get contracts that need subscription renewal (have client subscriptions)
+            let mut contracts_needing_renewal = ring.contracts_needing_renewal();
+
+            if contracts_needing_renewal.is_empty() {
                 continue;
             }
 
             // Shuffle to prevent starvation: without this, the same failing contracts
             // (first N in iteration order) would always be tried first, blocking later
             // contracts from ever being attempted when they hit the batch limit.
-            GlobalRng::shuffle(&mut orphaned_contracts);
+            GlobalRng::shuffle(&mut contracts_needing_renewal);
 
             // Get op_manager to spawn subscription requests
             let Some(op_manager) = ring.upgrade_op_manager() else {
-                tracing::debug!("OpManager not available for subscription recovery");
+                tracing::debug!("OpManager not available for subscription renewal");
                 continue;
             };
 
             let mut attempted = 0;
             let mut skipped = 0;
 
-            for contract in orphaned_contracts {
-                // Limit concurrent recovery attempts to avoid overwhelming the network
+            for contract in contracts_needing_renewal {
+                // Limit concurrent renewal attempts to avoid overwhelming the network
                 if attempted >= Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL {
                     tracing::debug!(
                         limit = Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
-                        "Reached max recovery attempts for this interval, remaining will be tried next cycle"
+                        "Reached max renewal attempts for this interval, remaining will be tried next cycle"
                     );
                     break;
                 }
@@ -442,13 +457,13 @@ impl Ring {
                         if success {
                             tracing::info!(
                                 %contract_key,
-                                "Periodic subscription recovery succeeded"
+                                "Subscription renewal succeeded"
                             );
                         } else if let Err(ref e) = result {
                             tracing::debug!(
                                 %contract_key,
                                 error = %e,
-                                "Periodic subscription recovery failed (will retry with backoff)"
+                                "Subscription renewal failed (will retry with backoff)"
                             );
                         }
 
@@ -462,7 +477,7 @@ impl Ring {
                 tracing::info!(
                     attempted,
                     skipped_rate_limited = skipped,
-                    "Periodic subscription recovery: attempted {} re-subscriptions",
+                    "Subscription renewal: attempted {} renewals",
                     attempted
                 );
             }
@@ -510,17 +525,12 @@ impl Ring {
                     continue;
                 }
 
-                // Remove from local subscription state
-                // Note: We don't send Unsubscribed message here because:
-                // 1. We don't have easy access to P2P bridge from Ring
-                // 2. Upstream peer will eventually prune us when updates fail
-                // 3. This is consistent with existing connection pruning pattern
-                let had_upstream = ring.seeding_manager.get_upstream(&key).is_some();
-                ring.seeding_manager.remove_subscription(&key);
+                // In the lease-based model, just unsubscribe from the contract.
+                // The lease will naturally expire if not renewed.
+                ring.unsubscribe(&key);
 
                 tracing::info!(
                     %key,
-                    had_upstream,
                     "Cleaned up expired GET subscription from local state"
                 );
             }
@@ -598,23 +608,10 @@ impl Ring {
             .record_contract_access(key, size_bytes, AccessType::Get)
     }
 
-    /// Whether this node already is seeding to this contract or not.
+    /// Whether this node already is seeding this contract (has it in cache).
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
         self.seeding_manager.is_seeding_contract(key)
-    }
-
-    /// Whether we're part of the subscription tree for this contract.
-    ///
-    /// Returns true if we have upstream/downstream network subscriptions OR
-    /// local client subscriptions for this contract, indicating our cache
-    /// is being kept fresh via subscription updates.
-    ///
-    /// This is a better indicator of cache freshness than `is_seeding_contract`,
-    /// which only checks if the contract is in our LRU cache.
-    #[inline]
-    pub fn is_in_subscription_tree(&self, key: &ContractKey) -> bool {
-        self.seeding_manager.is_in_subscription_tree(key)
     }
 
     pub fn record_request(
@@ -759,92 +756,56 @@ impl Ring {
         self.router.write().add_event(event);
     }
 
-    // ==================== Subscription Management ====================
+    // ==================== Subscription Management (Lease-Based) ====================
 
-    /// Add a downstream subscriber (a peer that wants updates FROM us).
+    /// Subscribe to a contract with a lease.
     ///
-    /// The `observed_addr` parameter is the transport-level address from which the subscribe
-    /// message was received. This is used instead of the address embedded in `subscriber`
-    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    /// Creates a new subscription or renews an existing one. The subscription
+    /// will expire after `SUBSCRIPTION_LEASE_DURATION` unless renewed.
+    pub fn subscribe(&self, contract: ContractKey) -> SubscribeResult {
+        self.seeding_manager.subscribe(contract)
+    }
+
+    /// Unsubscribe from a contract.
     ///
-    /// Returns information about the operation for telemetry.
+    /// Removes the active subscription. The contract may still be seeded
+    /// (in the seeding cache) until evicted by LRU.
+    pub fn unsubscribe(&self, contract: &ContractKey) {
+        self.seeding_manager.unsubscribe(contract)
+    }
+
+    /// Check if we have an active (non-expired) subscription to a contract.
+    pub fn is_subscribed(&self, contract: &ContractKey) -> bool {
+        self.seeding_manager.is_subscribed(contract)
+    }
+
+    /// Get all contracts with active subscriptions.
+    pub fn get_subscribed_contracts(&self) -> Vec<ContractKey> {
+        self.seeding_manager.get_subscribed_contracts()
+    }
+
+    /// Expire stale subscriptions and return the contracts that were expired.
     ///
-    /// # Errors
-    /// - `SelfReference`: The subscriber address matches our own address
-    /// - `MaxSubscribersReached`: Maximum downstream subscribers limit reached
-    pub fn add_downstream(
-        &self,
-        contract: &ContractKey,
-        subscriber: PeerKeyLocation,
-        observed_addr: Option<ObservedAddr>,
-    ) -> Result<AddDownstreamResult, SubscriptionError> {
-        let own_addr = self.connection_manager.get_own_addr();
-        let own_location = self.connection_manager.get_stored_location();
-        let own_pub_key = self.connection_manager.pub_key.as_bytes();
-        self.seeding_manager.add_downstream(
-            contract,
-            subscriber,
-            observed_addr,
-            own_addr,
-            own_location,
-            Some(own_pub_key),
-        )
+    /// Should be called periodically by a background task.
+    pub fn expire_stale_subscriptions(&self) -> Vec<ContractKey> {
+        self.seeding_manager.expire_stale_subscriptions()
     }
 
-    /// Set the upstream source for a contract (the peer we get updates FROM).
+    /// Check if we should continue seeding a contract.
     ///
-    /// # Errors
-    /// - `SelfReference`: The upstream address matches our own address
-    /// - `CircularReference`: The upstream peer is our downstream AND we are closer to
-    ///   the contract (we should be source, not them)
-    pub fn set_upstream(
-        &self,
-        contract: &ContractKey,
-        upstream: PeerKeyLocation,
-    ) -> Result<UpstreamSetResult, SubscriptionError> {
-        let own_addr = self.connection_manager.get_own_addr();
-        let own_location = self.connection_manager.get_stored_location();
-        let own_pub_key = self.connection_manager.pub_key.as_bytes();
-        // Get the upstream's configured ring location, not the location computed from IP address.
-        // PeerKeyLocation::location() computes from IP, which differs from the configured location.
-        let upstream_configured_location = upstream.socket_addr().and_then(|addr| {
-            self.connection_manager
-                .get_configured_location_for_peer(addr)
-        });
-        self.seeding_manager.set_upstream(
-            contract,
-            upstream,
-            own_addr,
-            own_location,
-            Some(own_pub_key),
-            upstream_configured_location,
-        )
+    /// Returns true if we have an active subscription, client subscriptions,
+    /// or the contract is in our seeding cache.
+    pub fn should_seed(&self, contract: &ContractKey) -> bool {
+        self.seeding_manager.should_seed(contract)
     }
 
-    /// Remove a subscriber and check if upstream notification is needed.
-    pub fn remove_subscriber(
-        &self,
-        contract: &ContractKey,
-        peer: &PeerId,
-    ) -> RemoveSubscriberResult {
-        self.seeding_manager.remove_subscriber(contract, peer)
-    }
-
-    /// Get downstream subscribers for a contract.
-    /// Returns None if no downstream subscribers exist.
-    pub fn subscribers_of(&self, contract: &ContractKey) -> Option<Vec<PeerKeyLocation>> {
-        self.seeding_manager.subscribers_of(contract)
-    }
-
-    /// Get the upstream peer for a contract (the peer we subscribed through).
-    /// Returns None if we don't have an upstream for this contract.
-    pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
-        self.seeding_manager.get_upstream(contract)
-    }
-
-    /// Get all network subscriptions across all contracts
-    pub fn all_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
-        self.seeding_manager.all_subscriptions()
+    /// Get contracts that need subscription renewal.
+    ///
+    /// Returns contracts where:
+    /// - We have an active subscription that will expire soon, OR
+    /// - We have client subscriptions but no active network subscription
+    pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
+        self.seeding_manager.contracts_needing_renewal()
     }
 
     // ==================== Client Subscription Management ====================
@@ -864,12 +825,11 @@ impl Ring {
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
     /// Returns a [`ClientDisconnectResult`] with:
-    /// - `prune_notifications`: contracts needing upstream pruning
-    /// - `affected_contracts`: all contracts where the client was subscribed (for interest cleanup)
+    /// - `affected_contracts`: all contracts where the client was subscribed (for cleanup)
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
-    ) -> seeding::ClientDisconnectResult {
+    ) -> ClientDisconnectResult {
         self.seeding_manager
             .remove_client_from_all_subscriptions(client_id)
     }
@@ -880,33 +840,14 @@ impl Ring {
         self.seeding_manager.seeding_contracts_count()
     }
 
-    /// Get the complete subscription state for all active subscriptions.
+    /// Get subscription state for all contracts (for telemetry).
     ///
-    /// Returns a list of tuples containing:
-    /// - Contract key
-    /// - Whether we're locally seeding (have client subscriptions)
-    /// - Optional upstream peer
-    /// - List of downstream subscribers
-    ///
-    /// Used for periodic telemetry snapshots.
-    pub fn get_all_subscription_states(
-        &self,
-    ) -> Vec<(
-        ContractKey,
-        bool,
-        Option<PeerKeyLocation>,
-        Vec<PeerKeyLocation>,
-    )> {
-        self.seeding_manager.get_all_subscription_states()
+    /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
+    pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
+        self.seeding_manager.get_subscription_states()
     }
 
     // ==================== Subscription Retry Spam Prevention ====================
-
-    /// Get contracts we're seeding but have no upstream subscription for.
-    /// These are candidates for re-establishing network subscription when peers become available.
-    pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
-        self.seeding_manager.contracts_without_upstream()
-    }
 
     /// Check if a subscription request can be made for a contract.
     /// Returns false if request is already pending or in backoff period.
@@ -966,22 +907,14 @@ impl Ring {
         self.seeding_manager.remove_get_subscription(key)
     }
 
-    /// Remove all subscription state for a contract.
-    ///
-    /// Used when a GET subscription is evicted to clean up the subscription map.
-    #[allow(dead_code)]
-    pub fn remove_subscription(&self, key: &ContractKey) {
-        self.seeding_manager.remove_subscription(key)
-    }
-
     // ==================== Connection Pruning ====================
 
-    /// Prune a peer connection and return notifications needed for subscription tree pruning.
+    /// Prune a peer connection.
     ///
-    /// Returns:
-    /// - A list of (contract, upstream) pairs where Unsubscribed messages should be sent.
-    /// - A list of orphaned transactions that need to be retried or failed.
-    pub async fn prune_connection(&self, peer: PeerId) -> PruneSubscriptionsResult {
+    /// Returns orphaned transactions that need to be retried or failed.
+    /// In the new lease-based subscription model, subscriptions are not tied to specific
+    /// peers, so no subscription pruning is needed when a peer disconnects.
+    pub async fn prune_connection(&self, peer: PeerId) -> PruneConnectionResult {
         use crate::tracing::DisconnectReason;
 
         tracing::debug!(%peer, "Removing connection");
@@ -1001,15 +934,11 @@ impl Ring {
             .get_connection_duration_ms(peer.addr);
 
         // This case would be when a connection is being open, so peer location hasn't been recorded yet
-        let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
-            return PruneSubscriptionsResult {
-                notifications: Vec::new(),
+        let Some(_loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
+            return PruneConnectionResult {
                 orphaned_transactions,
             };
         };
-
-        let mut prune_result = self.seeding_manager.prune_subscriptions_for_peer(loc);
-        prune_result.orphaned_transactions = orphaned_transactions;
 
         if let Some(event) = NetEventLog::disconnected_with_context(
             self,
@@ -1024,7 +953,9 @@ impl Ring {
                 .await;
         }
 
-        prune_result
+        PruneConnectionResult {
+            orphaned_transactions,
+        }
     }
 
     async fn connection_maintenance(

@@ -36,7 +36,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, GlobalExecutor, GlobalRng, WebsocketApiConfig},
+    config::{Address, GatewayConfig, GlobalRng, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -44,9 +44,9 @@ use crate::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
-    ring::{Location, PeerKeyLocation, SubscriberType},
+    ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
-    tracing::{DownstreamRemovedReason, EventRegister, NetEventLog, NetEventRegister},
+    tracing::{EventRegister, NetEventLog, NetEventRegister},
 };
 use crate::{
     config::Config,
@@ -959,48 +959,16 @@ where
             NetMessageV1::Unsubscribed {
                 ref key,
                 ref from,
-                ref transaction,
+                transaction: _,
             } => {
-                tracing::debug!(%key, %from, "Received Unsubscribed");
-                let peer_id = PeerId {
-                    addr: from
-                        .socket_addr()
-                        .expect("from peer should have socket address"),
-                    pub_key: from.pub_key().clone(),
-                };
-
-                let result = op_manager.ring.remove_subscriber(key, &peer_id);
-
-                // Emit telemetry for downstream removal
-                if result.removed && result.removed_role == Some(SubscriberType::Downstream) {
-                    if let Some(event) = NetEventLog::downstream_removed(
-                        &op_manager.ring,
-                        *key,
-                        Some(from.clone()),
-                        DownstreamRemovedReason::PeerUnsubscribed,
-                        result.downstream_count,
-                    ) {
-                        op_manager.ring.register_events(Either::Left(event)).await;
-                    }
-                }
-
-                if let Some(upstream) = result.notify_upstream {
-                    let upstream_addr = upstream
-                        .socket_addr()
-                        .expect("upstream must have socket address");
-                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
-
-                    let own_location = op_manager.ring.connection_manager.own_location();
-                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
-                        transaction: *transaction,
-                        key: *key,
-                        from: own_location,
-                    });
-
-                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
-                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
-                    }
-                }
+                // In the simplified architecture (2026-01 refactor), subscriptions are lease-based
+                // and expire automatically. Unsubscribed messages are no longer propagated through
+                // an explicit subscription tree. We just log this for debugging.
+                tracing::debug!(
+                    %key,
+                    %from,
+                    "Received Unsubscribed (no-op in lease-based model)"
+                );
                 break;
             }
             NetMessageV1::ProximityCache { ref message } => {
@@ -1015,87 +983,10 @@ where
                     "Processing ProximityCache message (pure network)"
                 );
 
-                // Check if announced contracts could establish upstream subscriptions.
-                // This runs before handle_message to capture the added contracts.
-                if let crate::message::ProximityCacheMessage::CacheAnnounce { ref added, .. } =
-                    message
-                {
-                    // Check if sender is closer to any contracts we're seeding without upstream
-                    let our_loc = op_manager.ring.connection_manager.own_location();
-                    if let Some(our_location) = our_loc.location() {
-                        // Get sender's location from ring
-                        if let Some(sender_loc) = op_manager
-                            .ring
-                            .connection_manager
-                            .get_peer_location_by_addr(source)
-                            .and_then(|p| p.location())
-                        {
-                            // Build a HashMap for O(1) lookups instead of O(n*m) nested loops
-                            let contracts_without_upstream: std::collections::HashMap<_, _> =
-                                op_manager
-                                    .ring
-                                    .contracts_without_upstream()
-                                    .into_iter()
-                                    .map(|c| (*c.id(), c))
-                                    .collect();
-
-                            for announced_id in added {
-                                // O(1) lookup instead of iterating all contracts
-                                if let Some(contract) = contracts_without_upstream.get(announced_id)
-                                {
-                                    let contract_location = crate::ring::Location::from(contract);
-                                    let our_distance = our_location.distance(contract_location);
-                                    let sender_distance = sender_loc.distance(contract_location);
-
-                                    // Sender is closer - they might be upstream
-                                    if sender_distance < our_distance
-                                        && op_manager.ring.can_request_subscription(contract)
-                                    {
-                                        tracing::info!(
-                                            %contract,
-                                            %source,
-                                            sender_distance = %sender_distance,
-                                            our_distance = %our_distance,
-                                            "Neighbor with cached contract is closer, attempting subscription"
-                                        );
-
-                                        let contract_key = *contract;
-                                        if op_manager.ring.mark_subscription_pending(contract_key) {
-                                            let op_manager_clone = op_manager.clone();
-                                            GlobalExecutor::spawn(async move {
-                                                let instance_id = *contract_key.id();
-                                                let sub_op = crate::operations::subscribe::start_op(
-                                                    instance_id,
-                                                );
-                                                let result =
-                                                    crate::operations::subscribe::request_subscribe(
-                                                        &op_manager_clone,
-                                                        sub_op,
-                                                    )
-                                                    .await;
-
-                                                let success = result.is_ok();
-                                                if let Err(ref e) = result {
-                                                    tracing::warn!(
-                                                        %contract_key,
-                                                        error = %e,
-                                                        "Failed to re-establish subscription on cache announce"
-                                                    );
-                                                }
-                                                op_manager_clone
-                                                    .ring
-                                                    .complete_subscription_request(
-                                                        &contract_key,
-                                                        success,
-                                                    );
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // Note: In the simplified architecture (2026-01 refactor), we no longer
+                // attempt to establish subscriptions based on CacheAnnounce messages.
+                // Update propagation uses the proximity cache directly, and subscriptions
+                // are lease-based with automatic expiry.
 
                 if let Some(response) = op_manager
                     .proximity_cache
