@@ -28,7 +28,7 @@ use crate::node::network_bridge::handshake::{
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::{Location, PeerKey, SubscriptionRecoveryGuard};
+use crate::ring::{Location, PeerKey};
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, CongestionControlConfig,
     ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError, TransportKeypair,
@@ -106,57 +106,6 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
             gateways,
         }
-    }
-
-    /// Send Unsubscribed messages to upstream peers after subscription tree pruning.
-    ///
-    /// This is called after `prune_connection()` or `remove_client_from_all_subscriptions()`
-    /// to notify upstream peers that we're no longer subscribed to certain contracts.
-    /// Notifications are sent concurrently for better performance.
-    pub(crate) async fn send_prune_notifications(
-        &self,
-        notifications: Vec<(freenet_stdlib::prelude::ContractKey, PeerKeyLocation)>,
-    ) {
-        if notifications.is_empty() {
-            return;
-        }
-
-        let own_location = self.op_manager.ring.connection_manager.own_location();
-
-        let futures: Vec<_> = notifications
-            .into_iter()
-            .filter_map(|(contract_key, upstream)| {
-                let Some(upstream_addr) = upstream.socket_addr() else {
-                    // This indicates a bug: we stored an upstream PeerKeyLocation without
-                    // a known address. The Unsubscribed notification cannot be sent.
-                    tracing::error!(
-                        %contract_key,
-                        upstream_key = %upstream.pub_key,
-                        "Cannot send Unsubscribed: upstream address unknown - subscription tree may have stale entries"
-                    );
-                    return None;
-                };
-
-                let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
-                    transaction: Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
-                    key: contract_key,
-                    from: own_location.clone(),
-                });
-
-                Some(async move {
-                    if let Err(e) = self.send(upstream_addr, unsubscribe_msg).await {
-                        tracing::warn!(
-                            %contract_key,
-                            %upstream_addr,
-                            error = %e,
-                            "Failed to send Unsubscribed to upstream after pruning"
-                        );
-                    }
-                })
-            })
-            .collect();
-
-        futures::future::join_all(futures).await;
     }
 
     /// Handle orphaned transactions after a peer connection is pruned.
@@ -925,9 +874,8 @@ impl P2pConnManager {
                                             ))
                                             .await;
 
-                                        ctx.bridge
-                                            .send_prune_notifications(prune_result.notifications)
-                                            .await;
+                                        // Note: In the simplified architecture (2026-01), subscriptions are lease-based
+                                        // and don't require explicit pruning notifications. Just handle orphaned transactions.
 
                                         // Handle orphaned transactions immediately (retry via alternate routes)
                                         ctx.bridge
@@ -1046,10 +994,6 @@ impl P2pConnManager {
                                             peer_addr,
                                             peer.pub_key().clone(),
                                         ))
-                                        .await;
-
-                                    ctx.bridge
-                                        .send_prune_notifications(prune_result.notifications)
                                         .await;
 
                                     // Handle orphaned transactions immediately (retry via alternate routes)
@@ -1405,32 +1349,20 @@ impl P2pConnManager {
                                 }
 
                                 // Collect contract states for specified contracts
+                                // Note: In the simplified 2026-01 architecture, we use lease-based subscriptions
+                                // rather than explicit subscriber tracking.
                                 if !config.contract_keys.is_empty() {
                                     for contract_key in &config.contract_keys {
-                                        // Get actual subscriber information from OpManager
-                                        let subscribers_info =
-                                            op_manager.ring.subscribers_of(contract_key);
-                                        let subscriber_count =
-                                            subscribers_info.as_ref().map(|s| s.len()).unwrap_or(0);
-                                        let subscriber_peer_ids: Vec<String> =
-                                            if config.include_subscriber_peer_ids {
-                                                subscribers_info
-                                                    .as_ref()
-                                                    .map(|s| {
-                                                        s.iter()
-                                                            .map(|pk| pk.pub_key().to_string())
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            };
+                                        // Check if we have an active subscription for this contract
+                                        let is_subscribed =
+                                            op_manager.ring.is_subscribed(contract_key);
+                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
 
                                         response.contract_states.insert(
                                             *contract_key,
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids,
+                                                subscriber_peer_ids: Vec::new(), // Not tracked in new model
                                             },
                                         );
                                     }
@@ -1701,9 +1633,8 @@ impl P2pConnManager {
                                     op_manager.interest_manager.remove_local_client(contract);
                                 }
 
-                                ctx.bridge
-                                    .send_prune_notifications(result.prune_notifications)
-                                    .await;
+                                // Note: In the simplified 2026-01 architecture, subscriptions are lease-based
+                                // and expire automatically, so we don't need to send explicit prune notifications.
                             }
                             NodeEvent::BroadcastStateChange { key, new_state } => {
                                 // Automatic network peer notification when state changes.
@@ -1732,19 +1663,15 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no targets exist (no downstream, no upstream, no proximity neighbors),
-                                // skip broadcast. This can happen when:
+                                // If no targets exist (no proximity neighbors), skip broadcast.
+                                // This can happen when:
                                 // 1. Gateway just PUT a new contract (no subscribers yet)
-                                // 2. A leaf node with no registered upstream
+                                // 2. Isolated node with no connected peers seeding this contract
                                 if targets.is_empty() {
-                                    // Check if we SHOULD have had an upstream
-                                    let has_upstream_registered =
-                                        op_manager.ring.get_upstream(&key).is_some();
                                     tracing::warn!(
                                         contract = %key,
                                         self_addr = %self_addr,
-                                        has_upstream_registered = has_upstream_registered,
-                                        "BROADCAST_NO_TARGETS: skipping broadcast - no downstream, upstream, or proximity targets"
+                                        "BROADCAST_NO_TARGETS: skipping broadcast - no proximity targets"
                                     );
                                     continue;
                                 }
@@ -2907,67 +2834,9 @@ impl P2pConnManager {
                     }
                 }
 
-                // Check if new peer is closer to any contracts we're seeding without upstream.
-                // If so, attempt to subscribe through them to join the subscription tree.
-                let our_loc = connection_manager.own_location();
-                if let Some(our_location) = our_loc.location() {
-                    let ring = &self.bridge.op_manager.ring;
-                    let contracts_without_upstream = ring.contracts_without_upstream();
-
-                    for contract in contracts_without_upstream {
-                        let contract_location = Location::from(&contract);
-                        let our_distance = our_location.distance(contract_location);
-                        let peer_distance = loc.distance(contract_location);
-
-                        // New peer is closer to contract - they might be upstream
-                        if peer_distance < our_distance {
-                            // Check spam prevention
-                            if ring.can_request_subscription(&contract) {
-                                tracing::info!(
-                                    %contract,
-                                    %peer_addr,
-                                    peer_distance = %peer_distance,
-                                    our_distance = %our_distance,
-                                    "New peer closer to contract, attempting subscription"
-                                );
-
-                                // Mark as pending and spawn subscription request
-                                if ring.mark_subscription_pending(contract) {
-                                    let op_manager = self.bridge.op_manager.clone();
-                                    let contract_key = contract;
-                                    GlobalExecutor::spawn(async move {
-                                        // Guard ensures complete_subscription_request is called
-                                        // even if the task panics
-                                        let guard = SubscriptionRecoveryGuard::new(
-                                            op_manager.clone(),
-                                            contract_key,
-                                        );
-
-                                        let instance_id = *contract_key.id();
-                                        let sub_op =
-                                            crate::operations::subscribe::start_op(instance_id);
-                                        let result =
-                                            crate::operations::subscribe::request_subscribe(
-                                                &op_manager,
-                                                sub_op,
-                                            )
-                                            .await;
-
-                                        let success = result.is_ok();
-                                        if let Err(ref e) = result {
-                                            tracing::warn!(
-                                                %contract_key,
-                                                error = %e,
-                                                "Failed to re-establish subscription on peer connect"
-                                            );
-                                        }
-                                        guard.complete(success);
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+                // Note: In the simplified 2026-01 architecture, subscriptions are lease-based
+                // and renewed periodically by the subscription renewal background task.
+                // We no longer attempt to establish subscriptions opportunistically on peer connect.
 
                 if is_transient {
                     connection_manager.drop_transient(peer_addr);
@@ -3148,10 +3017,6 @@ impl P2pConnManager {
                         .op_manager
                         .ring
                         .prune_connection(PeerId::new(remote_addr, peer.pub_key().clone()))
-                        .await;
-
-                    self.bridge
-                        .send_prune_notifications(prune_result.notifications)
                         .await;
 
                     // Handle orphaned transactions immediately (retry via alternate routes)

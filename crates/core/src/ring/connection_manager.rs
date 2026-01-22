@@ -401,6 +401,7 @@ impl ConnectionManager {
     /// Look up the configured Location for a peer by socket address.
     /// This returns the actual ring location the peer was assigned, not the location
     /// computed from IP address (which would be different).
+    #[allow(dead_code)] // Available for future use
     pub fn get_configured_location_for_peer(&self, addr: SocketAddr) -> Option<Location> {
         self.location_for_peer.read().get(&addr).copied()
     }
@@ -420,6 +421,23 @@ impl ConnectionManager {
         drop(connections);
 
         // Transient connections don't have full PeerKeyLocation info
+        None
+    }
+
+    /// Look up a PeerKeyLocation by public key from connections_by_location.
+    /// Used for finding connected peers when we only have their public key (e.g., from interest manager).
+    pub fn get_peer_by_pub_key(
+        &self,
+        pub_key: &crate::transport::TransportPublicKey,
+    ) -> Option<PeerKeyLocation> {
+        let connections = self.connections_by_location.read();
+        for conns in connections.values() {
+            for conn in conns {
+                if &conn.location.pub_key == pub_key {
+                    return Some(conn.location.clone());
+                }
+            }
+        }
         None
     }
 

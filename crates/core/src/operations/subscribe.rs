@@ -682,84 +682,32 @@ impl Operation for SubscribeOp {
                         // We have the contract - register upstream as subscriber and respond
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
-                            // Use retry with backoff to handle race condition where Subscribe arrives
-                            // before connection is fully established (peer still transient)
+                            // In the simplified lease-based model (2026-01), we just confirm
+                            // we have the contract. The requester will register their own subscription.
+                            // Updates propagate via proximity cache, not explicit tree.
+
+                            // Send state to the subscriber so they have initial data
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
                             {
-                                match op_manager.ring.add_downstream(
-                                    &key,
-                                    upstream_peer.clone(),
-                                    Some(requester_addr.into()),
-                                ) {
-                                    Ok(result) => {
-                                        // Emit telemetry for new downstream subscriber
-                                        if result.is_new {
-                                            if let Some(event) = NetEventLog::downstream_added(
-                                                &op_manager.ring,
-                                                key,
-                                                result.subscriber.clone(),
-                                                result.downstream_count,
-                                            ) {
-                                                op_manager
-                                                    .ring
-                                                    .register_events(Either::Left(event))
-                                                    .await;
-                                            }
-                                        }
-
-                                        // Always send current state to the subscriber so they
-                                        // don't miss any updates that were broadcast before
-                                        // they subscribed. This handles both:
-                                        // 1. New subscribers who need initial state
-                                        // 2. Re-subscribing peers whose state may be stale
-                                        send_state_to_new_subscriber(
-                                            op_manager.clone(),
-                                            key,
-                                            result.subscriber,
-                                            *id,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            tx = %id,
-                                            %key,
-                                            requester = %requester_addr,
-                                            error = ?e,
-                                            "subscribe: rejected downstream registration"
-                                        );
-                                    }
-                                }
-
-                                tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
-                                return Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                        id: *id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::Subscribed { key },
-                                    })),
-                                    next_hop: Some(requester_addr),
-                                    state: None,
-                                });
-                            } else {
-                                // Peer lookup failed after retries - return NotFound so subscriber can retry
-                                // This fixes issue #2518: silent subscription failure when connection is transient
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester = %requester_addr,
-                                    "subscribe: peer lookup failed after retries, returning NotFound"
+                                send_state_to_new_subscriber(
+                                    op_manager.clone(),
+                                    key,
+                                    upstream_peer,
+                                    *id,
                                 );
-                                return Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                        id: *id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::NotFound,
-                                    })),
-                                    next_hop: Some(requester_addr),
-                                    state: None,
-                                });
                             }
+
+                            tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
+                            return Ok(OperationResult {
+                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                    id: *id,
+                                    instance_id: *instance_id,
+                                    result: SubscribeMsgResult::Subscribed { key },
+                                })),
+                                next_hop: Some(requester_addr),
+                                state: None,
+                            });
                         } else {
                             // We're the originator and have the contract locally
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator has contract locally)");
@@ -783,83 +731,29 @@ impl Operation for SubscribeOp {
                     )
                     .await?
                     {
-                        // Contract arrived - handle same as above
+                        // Contract arrived - simplified lease-based model
                         if let Some(requester_addr) = self.requester_addr {
-                            // Use retry with backoff for peer lookup (issue #2518)
+                            // Send state to the subscriber
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
                             {
-                                match op_manager.ring.add_downstream(
-                                    &key,
-                                    upstream_peer.clone(),
-                                    Some(requester_addr.into()),
-                                ) {
-                                    Ok(result) => {
-                                        // Emit telemetry for new downstream subscriber
-                                        if result.is_new {
-                                            if let Some(event) = NetEventLog::downstream_added(
-                                                &op_manager.ring,
-                                                key,
-                                                result.subscriber.clone(),
-                                                result.downstream_count,
-                                            ) {
-                                                op_manager
-                                                    .ring
-                                                    .register_events(Either::Left(event))
-                                                    .await;
-                                            }
-                                        }
-
-                                        // Always send current state to the subscriber so they
-                                        // don't miss any updates that were broadcast before
-                                        // they subscribed. This handles both:
-                                        // 1. New subscribers who need initial state
-                                        // 2. Re-subscribing peers whose state may be stale
-                                        send_state_to_new_subscriber(
-                                            op_manager.clone(),
-                                            key,
-                                            result.subscriber,
-                                            *id,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            tx = %id,
-                                            %key,
-                                            requester = %requester_addr,
-                                            error = ?e,
-                                            "subscribe: rejected downstream registration (local contract)"
-                                        );
-                                    }
-                                }
-
-                                return Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                        id: *id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::Subscribed { key },
-                                    })),
-                                    next_hop: Some(requester_addr),
-                                    state: None,
-                                });
-                            } else {
-                                // Peer lookup failed after retries - return NotFound (issue #2518)
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester = %requester_addr,
-                                    "subscribe: peer lookup failed after retries, returning NotFound"
+                                send_state_to_new_subscriber(
+                                    op_manager.clone(),
+                                    key,
+                                    upstream_peer,
+                                    *id,
                                 );
-                                return Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                        id: *id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::NotFound,
-                                    })),
-                                    next_hop: Some(requester_addr),
-                                    state: None,
-                                });
                             }
+
+                            return Ok(OperationResult {
+                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                    id: *id,
+                                    instance_id: *instance_id,
+                                    result: SubscribeMsgResult::Subscribed { key },
+                                })),
+                                next_hop: Some(requester_addr),
+                                state: None,
+                            });
                         } else {
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator, contract arrived after wait)");
                             return Ok(OperationResult {
@@ -955,101 +849,15 @@ impl Operation for SubscribeOp {
                                 "subscribe: processing Subscribed response"
                             );
 
-                            // CRITICAL FIX (issue #2773): Register upstream FIRST, before fetching contract.
-                            // The upstream registration is about subscription tree topology and must succeed
-                            // even if contract fetching fails. Previously, fetch_contract_if_missing could
-                            // fail (e.g., GET timeout) and the `?` would exit early, leaving us without
-                            // an upstream registered. This caused subscription tree pruning to fail because
-                            // the peer had no upstream to notify when clients disconnected.
-
-                            // Register the sender as our upstream source
-                            // Use retry with backoff for peer lookup (same as downstream)
-                            if let Some(sender_addr) = source_addr {
-                                tracing::debug!(
-                                    tx = %msg_id,
-                                    contract = %format!("{:.8}", key),
-                                    source_addr = %sender_addr,
-                                    "SUBSCRIPTION_ACCEPTED: attempting to register upstream"
-                                );
-                                if let Some(sender_peer) =
-                                    wait_for_peer_location(op_manager, sender_addr, msg_id).await
-                                {
-                                    match op_manager.ring.set_upstream(key, sender_peer.clone()) {
-                                        Ok(result) => {
-                                            // Issue #2773: Log if a peer was promoted from downstream
-                                            // to upstream (mutual subscription resolution via tie-breaker)
-                                            if let Some(ref promoted) =
-                                                result.promoted_from_downstream
-                                            {
-                                                tracing::info!(
-                                                    tx = %msg_id,
-                                                    contract = %format!("{:.8}", key),
-                                                    promoted_peer = ?promoted.socket_addr(),
-                                                    "SUBSCRIPTION_UPSTREAM_PROMOTED: peer promoted from downstream to upstream (issue #2773)"
-                                                );
-                                            }
-
-                                            // Emit telemetry for upstream set
-                                            if let Some(event) = NetEventLog::upstream_set(
-                                                &op_manager.ring,
-                                                *key,
-                                                sender_peer.clone(),
-                                            ) {
-                                                op_manager
-                                                    .ring
-                                                    .register_events(Either::Left(event))
-                                                    .await;
-                                            }
-                                            tracing::info!(
-                                                tx = %msg_id,
-                                                contract = %format!("{:.8}", key),
-                                                upstream = %sender_addr,
-                                                "SUBSCRIPTION_UPSTREAM_SET: registered upstream for bidirectional update flow"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                tx = %msg_id,
-                                                contract = %format!("{:.8}", key),
-                                                upstream = %sender_addr,
-                                                error = ?e,
-                                                "SUBSCRIPTION_UPSTREAM_REJECTED: failed to register upstream"
-                                            );
-                                            // Issue #2741: When set_upstream fails (e.g., due to circular
-                                            // reference), we're left without an upstream but may have
-                                            // downstream subscribers. Record this as a subscription failure
-                                            // so the backoff mechanism applies. The periodic orphan recovery
-                                            // (every 30s) will detect this contract via contracts_without_upstream()
-                                            // and attempt to find a valid upstream through different routing.
-                                            //
-                                            // We don't trigger immediate recovery here because:
-                                            // 1. The same routing might select the same problematic peer
-                                            // 2. The periodic recovery with backoff prevents subscription spam
-                                            // 3. Network topology may change by the next recovery cycle
-                                            op_manager
-                                                .ring
-                                                .complete_subscription_request(key, false);
-                                        }
-                                    }
-                                } else {
-                                    tracing::error!(
-                                        tx = %msg_id,
-                                        contract = %format!("{:.8}", key),
-                                        upstream = %sender_addr,
-                                        "SUBSCRIPTION_UPSTREAM_MISSING: failed to find upstream peer after retries"
-                                    );
-                                    // Issue #2741: Record failure for backoff, same as set_upstream failure
-                                    op_manager.ring.complete_subscription_request(key, false);
-                                }
-                            } else {
-                                tracing::warn!(
-                                    tx = %msg_id,
-                                    contract = %format!("{:.8}", key),
-                                    "SUBSCRIPTION_NO_SOURCE_ADDR: no source address for upstream registration"
-                                );
-                                // Issue #2741: Record failure for backoff, same as set_upstream failure
-                                op_manager.ring.complete_subscription_request(key, false);
-                            }
+                            // In the simplified lease-based model (2026-01 refactor), we register
+                            // our subscription locally. No upstream/downstream tree tracking.
+                            op_manager.ring.subscribe(*key);
+                            op_manager.ring.complete_subscription_request(key, true);
+                            tracing::info!(
+                                tx = %msg_id,
+                                contract = %format!("{:.8}", key),
+                                "SUBSCRIPTION_ACCEPTED: registered lease-based subscription"
+                            );
 
                             // Fetch contract if we don't have it.
                             // This is non-fatal - if it fails, we still continue with forwarding/completing
@@ -1066,61 +874,18 @@ impl Operation for SubscribeOp {
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
-                                // Register them as downstream (they want updates from us)
-                                // Use retry with backoff for peer lookup (issue #2518)
-                                if let Some(downstream_peer) =
+                                // In the lease-based model (2026-01), we don't track downstream
+                                // subscribers. Just send state and forward the response.
+                                if let Some(requester_peer) =
                                     wait_for_peer_location(op_manager, requester_addr, msg_id).await
                                 {
-                                    match op_manager.ring.add_downstream(
-                                        key,
-                                        downstream_peer.clone(),
-                                        Some(requester_addr.into()),
-                                    ) {
-                                        Ok(result) => {
-                                            // Emit telemetry for new downstream subscriber
-                                            if result.is_new {
-                                                if let Some(event) = NetEventLog::downstream_added(
-                                                    &op_manager.ring,
-                                                    *key,
-                                                    result.subscriber.clone(),
-                                                    result.downstream_count,
-                                                ) {
-                                                    op_manager
-                                                        .ring
-                                                        .register_events(Either::Left(event))
-                                                        .await;
-                                                }
-                                            }
-
-                                            // Always send current state to the subscriber so they
-                                            // don't miss any updates that were broadcast before
-                                            // they subscribed. This handles both:
-                                            // 1. New subscribers who need initial state
-                                            // 2. Re-subscribing peers whose state may be stale
-                                            send_state_to_new_subscriber(
-                                                op_manager.clone(),
-                                                *key,
-                                                result.subscriber,
-                                                *msg_id,
-                                            );
-
-                                            tracing::debug!(
-                                                tx = %msg_id,
-                                                %key,
-                                                downstream = %requester_addr,
-                                                "subscribe: registered requester as downstream subscriber"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                tx = %msg_id,
-                                                %key,
-                                                requester = %requester_addr,
-                                                error = ?e,
-                                                "subscribe: rejected downstream registration (intermediate node)"
-                                            );
-                                        }
-                                    }
+                                    // Send current state so they don't miss updates
+                                    send_state_to_new_subscriber(
+                                        op_manager.clone(),
+                                        *key,
+                                        requester_peer,
+                                        *msg_id,
+                                    );
 
                                     tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
                                     Ok(OperationResult {
@@ -1137,7 +902,7 @@ impl Operation for SubscribeOp {
                                         state: None,
                                     })
                                 } else {
-                                    // Peer lookup failed after retries - return NotFound (issue #2518)
+                                    // Peer lookup failed after retries - return NotFound
                                     tracing::warn!(
                                         tx = %msg_id,
                                         %key,

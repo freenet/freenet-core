@@ -3407,6 +3407,11 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 ///
 /// The test verifies pruning indirectly by ensuring updates complete successfully
 /// after a subscriber disconnects, without errors from trying to send to dead peers.
+///
+/// NOTE: This test is for the OLD subscription tree model. In the 2026-01 refactor,
+/// subscription trees were replaced with lease-based subscriptions and proximity cache.
+/// Updates now propagate via proximity cache, not explicit subscriber tracking.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     node_configs = {
@@ -3706,6 +3711,11 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
 ///    (because second client is still subscribed)
 /// 4. Second client disconnects → Peer-A should be removed from Gateway's subscribers
 ///    (no remaining client subscriptions)
+///
+/// NOTE: This test is for the OLD subscription tree model. In the 2026-01 refactor,
+/// subscription trees were replaced with lease-based subscriptions and proximity cache.
+/// Subscriber tracking no longer exists; updates propagate via proximity cache.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     node_configs = {
@@ -4000,6 +4010,11 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 /// - No remaining downstream subscribers on Peer-A
 /// - No remaining local client subscriptions on Peer-A
 /// - → Peer-A sends Unsubscribed to Gateway (upstream)
+///
+/// NOTE: This test is for the OLD subscription tree model. In the 2026-01 refactor,
+/// subscription trees were replaced with lease-based subscriptions and proximity cache.
+/// Unsubscribed messages are no longer sent; subscriptions expire via lease timeout.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     node_configs = {

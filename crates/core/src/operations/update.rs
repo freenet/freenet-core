@@ -363,17 +363,7 @@ impl Operation for UpdateOp {
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
                             } else {
-                                // No peers available and we don't have the contract - capture context
-                                let subscribers = op_manager
-                                    .ring
-                                    .subscribers_of(key)
-                                    .map(|subs| {
-                                        subs.iter()
-                                            .filter_map(|loc| loc.socket_addr())
-                                            .map(|addr| format!("{:.8}", addr))
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
+                                // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
                                     .ring
                                     .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
@@ -386,7 +376,6 @@ impl Operation for UpdateOp {
                                 tracing::error!(
                                     tx = %id,
                                     contract = %key,
-                                    subscribers = ?subscribers,
                                     candidates = ?candidates,
                                     connection_count,
                                     peer_addr = ?sender_addr,
@@ -963,6 +952,15 @@ impl OpManager {
     /// - Used to filter out the sender from broadcast targets (avoid echo)
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
     ///   in proximity cache targets if we're seeding the contract
+    ///
+    /// # Hybrid Architecture (2026-01 Refactor)
+    ///
+    /// Updates are propagated via TWO sources:
+    /// 1. Proximity cache: peers who have announced they seed this contract (fast, local knowledge)
+    /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
+    ///
+    /// This hybrid approach ensures updates reach all interested peers even if CacheAnnounce
+    /// messages haven't fully propagated yet.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -973,160 +971,86 @@ impl OpManager {
         let self_addr = self.ring.connection_manager.get_own_addr();
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
-        // Collect explicit subscribers (downstream interest)
-        // Only include subscribers we're currently connected to
-        let subscribers: HashSet<PeerKeyLocation> = self
-            .ring
-            .subscribers_of(key)
-            .map(|subs| {
-                subs.iter()
-                    // Filter out the sender to avoid sending the update back to where it came from
-                    .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
-                    // Only include peers we're actually connected to
-                    .filter(|pk| {
-                        pk.socket_addr()
-                            .map(|addr| {
-                                self.ring
-                                    .connection_manager
-                                    .get_peer_by_addr(addr)
-                                    .is_some()
-                            })
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
 
-        // Collect upstream peer (for bidirectional propagation through subscription tree)
-        // Updates should flow both toward the root AND toward the leaves
-        let raw_upstream = self.ring.get_upstream(key);
-        let upstream_target: Option<PeerKeyLocation> = raw_upstream
-            .clone()
-            .filter(|pk| {
-                let dominated_out = pk.socket_addr().as_ref() == Some(sender);
-                if dominated_out {
-                    tracing::warn!(
-                        contract = %format!("{:.8}", key),
-                        upstream = ?pk.socket_addr(),
-                        sender = %sender,
-                        "UPSTREAM_FILTERED: upstream matches sender (would echo back)"
-                    );
-                }
-                !dominated_out
-            })
-            .filter(|pk| {
-                let is_connected = pk
-                    .socket_addr()
-                    .map(|addr| {
-                        self.ring
-                            .connection_manager
-                            .get_peer_by_addr(addr)
-                            .is_some()
-                    })
-                    .unwrap_or(false);
-                if !is_connected {
-                    tracing::warn!(
-                        contract = %format!("{:.8}", key),
-                        upstream = ?pk.socket_addr(),
-                        "UPSTREAM_FILTERED: upstream peer not connected"
-                    );
-                }
-                is_connected
-            });
-
-        // Log upstream status for debugging subscription tree issues
-        if raw_upstream.is_none() {
-            tracing::info!(
-                contract = %format!("{:.8}", key),
-                sender = %sender,
-                is_local = is_local_update_initiator,
-                "UPSTREAM_STATUS: no upstream registered for this contract"
-            );
-        } else if upstream_target.is_some() {
-            tracing::info!(
-                contract = %format!("{:.8}", key),
-                upstream = ?upstream_target.as_ref().and_then(|p| p.socket_addr()),
-                "UPSTREAM_STATUS: upstream available and connected"
-            );
-        }
-
-        // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
+        // Source 1: Proximity cache (peers who announced they seed this contract)
         let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
-        let mut proximity_targets: HashSet<PeerKeyLocation> = HashSet::new();
+        let proximity_count = proximity_addrs.len();
 
         for addr in proximity_addrs {
+            // Skip sender to avoid echo (unless we're the originator)
             if &addr == sender && !is_local_update_initiator {
                 continue;
             }
+            // Skip ourselves if not local originator
             if !is_local_update_initiator && self_addr.as_ref() == Some(&addr) {
                 continue;
             }
+            // Only include connected peers
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
-                proximity_targets.insert(pkl);
-            } else {
-                tracing::debug!(
-                    peer = %addr,
-                    contract = %key,
-                    "PROXIMITY_CACHE: Skipping disconnected neighbor in UPDATE targets"
-                );
+                targets.insert(pkl);
             }
         }
 
-        // Combine all target sets (HashSet handles deduplication)
-        let subscriber_count = subscribers.len();
-        let proximity_count = proximity_targets.len();
-        let has_upstream = upstream_target.is_some();
-        let mut all_targets: HashSet<PeerKeyLocation> = subscribers;
-        all_targets.extend(proximity_targets);
-        if let Some(upstream) = upstream_target {
-            all_targets.insert(upstream);
+        // Source 2: Interest manager (peers who expressed interest via protocol)
+        let interested_peers = self.interest_manager.get_interested_peers(key);
+        let interest_count = interested_peers.len();
+
+        for (peer_key, _interest) in interested_peers {
+            // Look up peer by public key
+            if let Some(pkl) = self
+                .ring
+                .connection_manager
+                .get_peer_by_pub_key(&peer_key.0)
+            {
+                // Skip sender to avoid echo
+                if let Some(pkl_addr) = pkl.socket_addr() {
+                    if &pkl_addr == sender && !is_local_update_initiator {
+                        continue;
+                    }
+                    // Skip ourselves
+                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        continue;
+                    }
+                }
+                targets.insert(pkl);
+            }
         }
 
-        // Sort targets for deterministic iteration order (HashSet iteration is non-deterministic)
-        let mut targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
-        targets.sort();
+        // Sort targets for deterministic iteration order
+        let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
+        result.sort();
 
         // Trace update propagation for debugging
-        if !targets.is_empty() {
+        if !result.is_empty() {
             tracing::info!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
-                targets = %targets
+                targets = %result
                     .iter()
                     .filter_map(|s| s.socket_addr())
                     .map(|addr| format!("{:.8}", addr))
                     .collect::<Vec<_>>()
                     .join(","),
-                count = targets.len(),
-                subscribers = subscriber_count,
-                proximity = proximity_count,
-                upstream = has_upstream,
+                count = result.len(),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
         } else {
-            let own_addr = self.ring.connection_manager.get_own_addr();
-            let skip_slice = std::slice::from_ref(sender);
-            let fallback_candidates = self
-                .ring
-                .k_closest_potentially_caching(key, skip_slice, 5)
-                .into_iter()
-                .filter_map(|candidate| candidate.socket_addr())
-                .map(|addr| format!("{:.8}", addr))
-                .collect::<Vec<_>>();
-
             tracing::warn!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
-                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
-                fallback_candidates = ?fallback_candidates,
-                phase = "error",
-                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate"
+                self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
+                phase = "warning",
+                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );
         }
 
-        targets
+        result
     }
 }
 
@@ -1362,46 +1286,11 @@ pub(crate) async fn request_update(
         return Err(OpError::UnexpectedOpState);
     };
 
-    // the initial request must provide:
-    // - a peer as close as possible to the contract location
-    // - and the value to update
+    // Find the best peer to send this update to.
+    // In the simplified architecture (2026-01 refactor), we use:
+    // 1. Proximity cache - peers who have announced they seed this contract
+    // 2. Ring-based routing - find closest potentially-caching peer
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
-
-    let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
-        // Clone and filter out self from subscribers to prevent self-targeting
-        let mut filtered_subscribers: Vec<_> = subscribers
-            .iter()
-            .filter(|sub| sub.socket_addr() != Some(sender_addr))
-            .cloned()
-            .collect();
-        filtered_subscribers.pop()
-    } else {
-        None
-    };
-
-    // Check upstream peer in the subscription tree.
-    // This is critical for leaf nodes (subscribers) that want to send updates -
-    // they have no downstream subscribers, but they DO have an upstream peer
-    // through which updates should propagate toward the contract location.
-    let target_from_upstream = op_manager
-        .ring
-        .get_upstream(&key)
-        .filter(|upstream| upstream.socket_addr() != Some(sender_addr))
-        .filter(|upstream| {
-            // Verify the upstream peer is still connected before using it as a target.
-            // Without this check, we might try to send to a disconnected peer instead
-            // of falling through to the proximity cache or ring-based fallback.
-            upstream
-                .socket_addr()
-                .map(|addr| {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_by_addr(addr)
-                        .is_some()
-                })
-                .unwrap_or(false)
-        });
 
     // Check proximity cache for neighbors that have announced caching this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
@@ -1440,20 +1329,8 @@ pub(crate) async fn request_update(
         }
     }
 
-    let target = if let Some(remote_subscriber) = target_from_subscribers {
-        remote_subscriber
-    } else if let Some(upstream_peer) = target_from_upstream {
-        // Use upstream peer from subscription tree - this is how leaf nodes send updates
-        // toward the contract location for propagation through the tree.
-        tracing::debug!(
-            %key,
-            target = ?upstream_peer.socket_addr(),
-            "UPDATE: Using upstream peer from subscription tree as target"
-        );
-        upstream_peer
-    } else if let Some(proximity_neighbor) = target_from_proximity {
+    let target = if let Some(proximity_neighbor) = target_from_proximity {
         // Use peer from proximity cache that announced having this contract.
-        // This aligns with get_broadcast_targets_update() which also uses proximity cache.
         tracing::debug!(
             %key,
             target = ?proximity_neighbor.socket_addr(),
@@ -1479,25 +1356,22 @@ pub(crate) async fn request_update(
 
             let id = update_op.id;
 
-            // Check if we're seeding or subscribed to this contract
+            // Check if we're seeding this contract
             let is_seeding = op_manager.ring.is_seeding_contract(&key);
-            let has_subscribers = op_manager.ring.subscribers_of(&key).is_some();
-            let should_handle_update = is_seeding || has_subscribers;
+            let should_handle_update = is_seeding;
 
             if !should_handle_update {
                 tracing::error!(
                     contract = %key,
                     phase = "error",
-                    "UPDATE: Cannot update contract on isolated node - contract not seeded and no subscribers"
+                    "UPDATE: Cannot update contract on isolated node - contract not seeded"
                 );
                 return Err(OpError::RingError(RingError::NoCachingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:
             // 1. No remote peers are available (isolated node OR no suitable caching peers)
-            // 2. Either seeding the contract OR has subscribers (verified above)
-            // Note: This handles both truly isolated nodes and nodes where subscribers exist
-            // but no suitable remote caching peer was found.
+            // 2. We are seeding the contract (verified above)
             let UpdateExecution {
                 value: _updated_value,
                 summary,

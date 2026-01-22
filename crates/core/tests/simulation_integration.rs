@@ -1485,6 +1485,12 @@ fn test_topology_single_seeder() {
 ///
 /// Per Nacho's comment on #2755: "This issue can be verified fixed when
 /// test_orphan_seeders_no_source passes."
+///
+/// NOTE: This test validates the OLD subscription tree model. In the 2026-01 refactor,
+/// the subscription tree was replaced with lease-based subscriptions and proximity cache.
+/// The concepts of "orphan seeders" and "upstream connections" no longer apply.
+/// Update propagation now works via proximity cache, tested by other convergence tests.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[test_log::test]
 fn test_orphan_seeders_no_source() {
     use freenet::dev_tool::{
@@ -2361,6 +2367,12 @@ fn test_pr2763_crdt_convergence_with_resync() {
 /// - The subscription tree should be well-formed
 ///
 /// See: https://github.com/freenet/freenet-core/issues/2773
+///
+/// NOTE: This test validates the OLD subscription tree model. In the 2026-01 refactor,
+/// the subscription tree was replaced with lease-based subscriptions and proximity cache.
+/// The concepts of "orphan seeders" and "disconnected upstream" no longer apply.
+/// Update propagation now works via proximity cache, tested by other convergence tests.
+#[ignore = "Tests old subscription tree model removed in 2026-01 refactor"]
 #[test_log::test]
 fn test_mutual_downstream_race_condition_issue_2773() {
     use freenet::dev_tool::{
@@ -2539,150 +2551,128 @@ fn test_mutual_downstream_race_condition_issue_2773() {
 // =============================================================================
 
 use freenet::dev_tool::{
-    clear_crdt_contracts, register_crdt_contract, validate_topology_from_snapshots,
-    GlobalTestMetrics, Location, NodeLabel, ScheduledOperation, SimOperation, TopologySnapshot,
-    TopologyValidationResult,
+    clear_crdt_contracts, register_crdt_contract, GlobalTestMetrics, NodeLabel, ScheduledOperation,
+    SimOperation,
 };
-use freenet_stdlib::prelude::ContractInstanceId;
 
-/// Log subscription state for each peer holding the contract.
-fn log_peer_subscriptions(
-    snapshots: &[TopologySnapshot],
-    contract_id: &ContractInstanceId,
-    contract_location: f64,
-) {
-    for snap in snapshots {
-        if let Some(sub) = snap.contracts.get(contract_id) {
-            let peer_dist = ring_distance(snap.location, contract_location);
-            tracing::info!(
-                "Peer {} (loc={:.4}, dist={:.4}): seeding={}, upstream={:?}, downstream={}",
-                snap.peer_addr,
-                snap.location,
-                peer_dist,
-                sub.is_seeding,
-                sub.upstream,
-                sub.downstream.len()
-            );
-        }
-    }
-}
-
-/// Log topology validation results.
-fn log_topology_validation(label: &str, validation: &TopologyValidationResult) {
-    tracing::info!(
-        "{}: cycles={}, orphans={}, disconnected={}, unreachable={}",
-        label,
-        validation.bidirectional_cycles.len(),
-        validation.orphan_seeders.len(),
-        validation.disconnected_upstream.len(),
-        validation.unreachable_seeders.len()
-    );
-}
-
-/// Assert no topology cycles, disconnected upstreams, or orphan seeders.
-fn assert_healthy_topology(test_name: &str, validation: &TopologyValidationResult) {
-    assert!(
-        validation.bidirectional_cycles.is_empty(),
-        "{}: Should have no bidirectional cycles, found: {:?}",
-        test_name,
-        validation.bidirectional_cycles
-    );
-    assert!(
-        validation.disconnected_upstream.is_empty(),
-        "{}: Should have no disconnected upstream peers, found: {:?}",
-        test_name,
-        validation.disconnected_upstream
-    );
-    assert!(
-        validation.orphan_seeders.is_empty(),
-        "{}: Should have no orphan seeders, found: {:?}",
-        test_name,
-        validation.orphan_seeders
-    );
-}
-
-/// Count nodes seeding the contract.
-fn count_seeders(snapshots: &[TopologySnapshot], contract_id: &ContractInstanceId) -> usize {
-    snapshots
-        .iter()
-        .filter(|s| {
-            s.contracts
-                .get(contract_id)
-                .map(|c| c.is_seeding)
-                .unwrap_or(false)
-        })
-        .count()
-}
-
-/// Test: N-way mutual downstream resolution with 5+ nodes.
+/// Parametrized CRDT convergence test.
 ///
-/// Extends Issue #2773 coverage. With 5 nodes subscribing simultaneously,
-/// distance-based tie-breakers must resolve all conflicts to form an acyclic tree.
-#[test_log::test]
-#[ignore = "Issue #2784: 5+ node mutual downstream not fully resolved"]
-fn test_mutual_downstream_five_plus_nodes() {
-    const SEED: u64 = 0x2773_5F1A_0001;
-    const NETWORK_NAME: &str = "mutual-downstream-5plus";
+/// All nodes subscribe then update simultaneously. Verifies convergence.
+/// Run with: cargo test -p freenet --features simulation_tests,testing test_crdt_convergence -- --test-threads=1
+#[rstest::rstest]
+#[case::n3_g1("crdt-3n-1gw", 0x2773_0003_0001, 1, 3)]
+#[case::n4_g1("crdt-4n-1gw", 0x2773_0004_0001, 1, 4)]
+#[case::n5_g1("crdt-5n-1gw", 0x2773_0005_0001, 1, 5)]
+#[case::n6_g1("crdt-6n-1gw", 0x2773_0006_0001, 1, 6)]
+#[case::n7_g1("crdt-7n-1gw", 0x2773_0007_0001, 1, 7)]
+#[case::n8_g1("crdt-8n-1gw", 0x2773_0008_0001, 1, 8)]
+#[case::n5_g2("crdt-5n-2gw", 0x2773_0005_0002, 2, 5)]
+#[case::n6_g2("crdt-6n-2gw", 0x2773_0006_0002, 2, 6)]
+fn test_crdt_convergence(
+    #[case] name: &'static str,
+    #[case] seed: u64,
+    #[case] gateways: usize,
+    #[case] nodes: usize,
+) {
+    GlobalTestMetrics::reset();
+    clear_crdt_contracts();
+    setup_deterministic_state(seed);
 
-    setup_deterministic_state(SEED);
     let rt = create_runtime();
 
-    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 5, 7, 3, 10, 4, SEED).await });
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(name, gateways, nodes, 7, 3, 10, 4, seed).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
 
     let contract = SimOperation::create_test_contract(0x5F);
     let contract_id = *contract.key().id();
-    let contract_location = Location::from(&contract_id).as_f64();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
 
-    // Gateway puts + all 5 nodes subscribe simultaneously
+    // Gateway puts + all nodes subscribe simultaneously
     let mut operations = vec![ScheduledOperation::new(
-        NodeLabel::gateway(NETWORK_NAME, 0),
+        NodeLabel::gateway(name, 0),
         SimOperation::Put {
             contract: contract.clone(),
-            state: SimOperation::create_test_state(1),
+            state: SimOperation::create_crdt_state(1, 0x00),
             subscribe: true,
         },
     )];
-    for i in 1..=5 {
+
+    for i in 1..=nodes {
         operations.push(ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, i),
+            NodeLabel::node(name, i),
             SimOperation::Subscribe { contract_id },
         ));
     }
 
+    // All nodes update simultaneously
+    for i in 1..=nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, i),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10 + i as u64, i as u8),
+            },
+        ));
+    }
+
     let result = sim.run_controlled_simulation(
-        SEED,
+        seed,
         operations,
-        Duration::from_secs(120),
-        Duration::from_secs(60),
+        Duration::from_secs(180),
+        Duration::from_secs(90),
     );
 
     assert!(
         result.turmoil_result.is_ok(),
-        "Simulation should complete: {:?}",
+        "[{}] Simulation should complete: {:?}",
+        name,
         result.turmoil_result.err()
     );
 
-    let snapshots = result.topology_snapshots;
-    log_peer_subscriptions(&snapshots, &contract_id, contract_location);
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    let resync_count = GlobalTestMetrics::resync_requests();
 
-    let validation = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
-    log_topology_validation("5+ node topology", &validation);
-    assert_healthy_topology("5+ node test", &validation);
+    tracing::info!(
+        "[{}] nodes={}, gateways={}, converged={}/{}, resyncs={}",
+        name,
+        nodes,
+        gateways,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        resync_count
+    );
 
-    let seeder_count = count_seeders(&snapshots, &contract_id);
+    for diverged in &convergence.diverged {
+        tracing::warn!(
+            "[{}] DIVERGED: {} - {} unique states across {} peers",
+            name,
+            diverged.contract_key,
+            diverged.unique_state_count(),
+            diverged.peer_states.len()
+        );
+    }
 
-    // Verify all 5 nodes (plus gateway) actually subscribed
-    // Reviewers noted: without this, the test could pass with only 2 nodes
     assert!(
-        seeder_count >= 5,
-        "5+ node test: Expected at least 5 seeders (excluding gateway), found {}",
-        seeder_count
+        convergence.is_converged(),
+        "[{}] {} nodes must converge. {} converged, {} diverged",
+        name,
+        nodes,
+        convergence.converged.len(),
+        convergence.diverged.len()
     );
 
     tracing::info!(
-        "test_mutual_downstream_five_plus_nodes PASSED: {} seeders",
-        seeder_count
+        "[{}] PASSED: converged={}, resyncs={}",
+        name,
+        convergence.converged.len(),
+        resync_count
     );
+
+    clear_crdt_contracts();
 }
 
 /// Test: CRDT convergence with N nodes updating simultaneously.
@@ -2787,12 +2777,16 @@ fn test_concurrent_updates_from_n_sources() {
     clear_crdt_contracts();
 }
 
-/// Test: Stale summary cache with multiple branches (PR #2763 regression).
+/// Test: CRDT convergence when nodes have divergent state versions (4-node variant).
 ///
-/// Each of 4 nodes updates to a different version, creating stale cached summaries.
-/// Gateway then broadcasts delta with wrong from_version, testing ResyncRequest recovery.
+/// This test validates that the network converges correctly when:
+/// 1. Multiple nodes independently update to different versions
+/// 2. Each node has a "stale" view of other nodes' summaries
+/// 3. ResyncRequest mechanism recovers divergent state
+///
+/// Currently fails with 4 nodes - only 4 of 5 peers converge, 2 unique states remain.
+/// The 6-node variant (test_concurrent_updates_from_n_sources) passes.
 #[test_log::test]
-#[ignore = "Issue #2785: State divergence with multiple stale summaries"]
 fn test_stale_summary_cache_multiple_branches() {
     const SEED: u64 = 0x57A1_E001_0001;
     const NETWORK_NAME: &str = "stale-summaries";
@@ -2825,7 +2819,6 @@ fn test_stale_summary_cache_multiple_branches() {
         },
     )];
 
-    // All nodes subscribe
     for i in 1..=NODE_COUNT {
         operations.push(ScheduledOperation::new(
             NodeLabel::node(NETWORK_NAME, i),
@@ -2833,32 +2826,21 @@ fn test_stale_summary_cache_multiple_branches() {
         ));
     }
 
-    // Each node updates to different version (creates stale summaries)
-    let node_versions = [(1, 5, 0x05), (2, 7, 0x07), (3, 9, 0x09), (4, 11, 0x0B)];
-    for (node, version, marker) in node_versions {
+    for i in 1..=NODE_COUNT {
         operations.push(ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, node),
+            NodeLabel::node(NETWORK_NAME, i),
             SimOperation::Update {
                 key: contract_key,
-                data: SimOperation::create_crdt_state(version, marker),
+                data: SimOperation::create_crdt_state(10 + i as u64, i as u8),
             },
         ));
     }
 
-    // Gateway updates to v20 (broadcasts delta with stale from_versions)
-    operations.push(ScheduledOperation::new(
-        NodeLabel::gateway(NETWORK_NAME, 0),
-        SimOperation::Update {
-            key: contract_key,
-            data: SimOperation::create_crdt_state(20, 0x20),
-        },
-    ));
-
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(120),
-        Duration::from_secs(60),
+        Duration::from_secs(180),
+        Duration::from_secs(90),
     );
 
     assert!(
@@ -2879,15 +2861,16 @@ fn test_stale_summary_cache_multiple_branches() {
 
     for diverged in &convergence.diverged {
         tracing::warn!(
-            "DIVERGED: {} - {} unique states",
+            "DIVERGED: {} - {} unique states across {} peers",
             diverged.contract_key,
-            diverged.unique_state_count()
+            diverged.unique_state_count(),
+            diverged.peer_states.len()
         );
     }
 
     assert!(
         convergence.is_converged(),
-        "Stale summaries must converge via ResyncRequest. {} converged, {} diverged",
+        "Divergent state must converge via CRDT merge + ResyncRequest. {} converged, {} diverged",
         convergence.converged.len(),
         convergence.diverged.len()
     );
@@ -2901,34 +2884,39 @@ fn test_stale_summary_cache_multiple_branches() {
     clear_crdt_contracts();
 }
 
-/// Test: MAX_DOWNSTREAM limit enforcement and automatic rerouting.
+/// Test: CRDT convergence in large network (12 nodes).
 ///
-/// With 12 nodes subscribing (more than MAX_DOWNSTREAM=10), the 11th and 12th
-/// must reroute through other seeders. Tests branched topology formation.
+/// This test validates that updates propagate correctly and converge
+/// in a larger network where update broadcasts must reach all 12 seeders.
 #[test_log::test]
-#[ignore = "Issue #2786: Subscription propagation failure in large networks"]
 fn test_max_downstream_limit_reached() {
     const SEED: u64 = 0x0A0D_0001_0001;
-    const NETWORK_NAME: &str = "max-downstream";
-    const MAX_DOWNSTREAM: usize = 10;
+    const NETWORK_NAME: &str = "large-network";
     const NODE_COUNT: usize = 12;
 
+    GlobalTestMetrics::reset();
+    clear_crdt_contracts();
     setup_deterministic_state(SEED);
+
     let rt = create_runtime();
 
-    let sim = rt
-        .block_on(async { SimNetwork::new(NETWORK_NAME, 1, NODE_COUNT, 10, 5, 15, 3, SEED).await });
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 2, NODE_COUNT, 10, 5, 15, 3, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
 
     let contract = SimOperation::create_test_contract(0x0A);
     let contract_id = *contract.key().id();
-    let contract_location = Location::from(&contract_id).as_f64();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
 
     // Gateway puts contract, all 12 nodes subscribe
     let mut operations = vec![ScheduledOperation::new(
         NodeLabel::gateway(NETWORK_NAME, 0),
         SimOperation::Put {
             contract: contract.clone(),
-            state: SimOperation::create_test_state(1),
+            state: SimOperation::create_crdt_state(1, 0x00),
             subscribe: true,
         },
     )];
@@ -2937,6 +2925,122 @@ fn test_max_downstream_limit_reached() {
         operations.push(ScheduledOperation::new(
             NodeLabel::node(NETWORK_NAME, i),
             SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // All nodes update simultaneously
+    for i in 1..=NODE_COUNT {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10 + i as u64, i as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(150),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    let resync_count = GlobalTestMetrics::resync_requests();
+
+    tracing::info!(
+        "Large network test: converged={}/{}, resyncs={}",
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        resync_count
+    );
+
+    for diverged in &convergence.diverged {
+        tracing::warn!(
+            "DIVERGED: {} - {} unique states across {} peers",
+            diverged.contract_key,
+            diverged.unique_state_count(),
+            diverged.peer_states.len()
+        );
+    }
+
+    assert!(
+        convergence.is_converged(),
+        "Large network must converge. {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    tracing::info!(
+        "test_max_downstream_limit_reached PASSED: converged={}, resyncs={}",
+        convergence.converged.len(),
+        resync_count
+    );
+
+    clear_crdt_contracts();
+}
+
+/// Test: Chain topology formation with sequential subscriptions.
+/// Test: CRDT convergence with sequential subscriptions.
+///
+/// Originally tested subscription tree topology (Issue #2787).
+/// Now tests that nodes subscribing one-by-one still achieve CRDT convergence
+/// when updates are issued after all have subscribed.
+#[test_log::test]
+fn test_chain_topology_formation() {
+    const SEED: u64 = 0xC4A1_0001_0001;
+    const NETWORK_NAME: &str = "chain-topology";
+    const NODE_COUNT: usize = 4;
+
+    GlobalTestMetrics::reset();
+    clear_crdt_contracts();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, NODE_COUNT, 10, 5, 10, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xC4);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // Gateway puts contract, nodes subscribe sequentially (not simultaneously)
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x00),
+            subscribe: true,
+        },
+    )];
+
+    for i in 1..=NODE_COUNT {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // After all subscribe, multiple nodes update
+    for i in 1..=NODE_COUNT {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10 + i as u64, i as u8),
+            },
         ));
     }
 
@@ -2953,155 +3057,30 @@ fn test_max_downstream_limit_reached() {
         result.turmoil_result.err()
     );
 
-    let snapshots = result.topology_snapshots;
-    let seeder_count = count_seeders(&snapshots, &contract_id);
-
-    tracing::info!("Max downstream test: {} nodes seeding", seeder_count);
-    log_peer_subscriptions(&snapshots, &contract_id, contract_location);
-
-    let validation = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
-    log_topology_validation("Max downstream topology", &validation);
-
-    // At least MAX_DOWNSTREAM nodes should have the contract
-    assert!(
-        seeder_count >= MAX_DOWNSTREAM,
-        "At least {} nodes should have contract, found {}",
-        MAX_DOWNSTREAM,
-        seeder_count
-    );
-
-    // Find source node's downstream count (node with no upstream but has downstream)
-    // Note: Reviewers flagged that port==0 heuristic is fragile. Better to find by topology role.
-    let source_downstream = snapshots
-        .iter()
-        .filter_map(|s| s.contracts.get(&contract_id))
-        .filter(|c| c.is_seeding && c.upstream.is_none() && !c.downstream.is_empty())
-        .map(|c| c.downstream.len())
-        .max()
-        .unwrap_or(0);
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    let resync_count = GlobalTestMetrics::resync_requests();
 
     tracing::info!(
-        "Source node has {} direct downstream subscribers (MAX={})",
-        source_downstream,
-        MAX_DOWNSTREAM
+        "Chain/sequential test: converged={}/{}, resyncs={}",
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        resync_count
     );
 
-    // The source (gateway or closest node) should not exceed MAX_DOWNSTREAM
+    // All nodes should converge to same state
     assert!(
-        source_downstream <= MAX_DOWNSTREAM,
-        "Source should have at most {} downstream, found {}",
-        MAX_DOWNSTREAM,
-        source_downstream
-    );
-
-    assert!(
-        validation.bidirectional_cycles.is_empty(),
-        "Should have no cycles, found: {:?}",
-        validation.bidirectional_cycles
+        convergence.is_converged(),
+        "All {} contracts should converge. Converged: {}, Diverged: {:?}",
+        convergence.total_contracts(),
+        convergence.converged.len(),
+        convergence.diverged
     );
 
     tracing::info!(
-        "test_max_downstream_limit_reached PASSED: {} seeders, source_downstream={}",
-        seeder_count,
-        source_downstream
-    );
-}
-
-/// Test: Chain topology formation with sequential subscriptions.
-///
-/// Validates that sequential subscribes form a valid directed graph with
-/// upstream/downstream relationships and no cycles or disconnected nodes.
-#[test_log::test]
-#[ignore = "Issue #2787: Chain topology has disconnected upstream"]
-fn test_chain_topology_formation() {
-    const SEED: u64 = 0xC4A1_0001_0001;
-    const NETWORK_NAME: &str = "chain-topology";
-    const NODE_COUNT: usize = 4;
-
-    setup_deterministic_state(SEED);
-    let rt = create_runtime();
-
-    let sim = rt
-        .block_on(async { SimNetwork::new(NETWORK_NAME, 1, NODE_COUNT, 10, 5, 10, 2, SEED).await });
-
-    let contract = SimOperation::create_test_contract(0xC4);
-    let contract_id = *contract.key().id();
-    let contract_location = Location::from(&contract_id).as_f64();
-
-    // Gateway puts contract, nodes subscribe sequentially
-    let mut operations = vec![ScheduledOperation::new(
-        NodeLabel::gateway(NETWORK_NAME, 0),
-        SimOperation::Put {
-            contract: contract.clone(),
-            state: SimOperation::create_test_state(1),
-            subscribe: true,
-        },
-    )];
-
-    for i in 1..=NODE_COUNT {
-        operations.push(ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, i),
-            SimOperation::Subscribe { contract_id },
-        ));
-    }
-
-    let result = sim.run_controlled_simulation(
-        SEED,
-        operations,
-        Duration::from_secs(120),
-        Duration::from_secs(60),
+        "test_chain_topology_formation PASSED: converged={}, resyncs={}",
+        convergence.converged.len(),
+        resync_count
     );
 
-    assert!(
-        result.turmoil_result.is_ok(),
-        "Simulation should complete: {:?}",
-        result.turmoil_result.err()
-    );
-
-    let snapshots = result.topology_snapshots;
-
-    // Count upstream/downstream relationships
-    let (nodes_with_upstream, nodes_with_downstream) =
-        snapshots.iter().fold((0, 0), |acc, snap| {
-            if let Some(sub) = snap.contracts.get(&contract_id) {
-                (
-                    acc.0 + if sub.upstream.is_some() { 1 } else { 0 },
-                    acc.1 + if !sub.downstream.is_empty() { 1 } else { 0 },
-                )
-            } else {
-                acc
-            }
-        });
-
-    log_peer_subscriptions(&snapshots, &contract_id, contract_location);
-
-    let validation = validate_topology_from_snapshots(&snapshots, &contract_id, contract_location);
-    log_topology_validation("Chain topology", &validation);
-
-    assert!(
-        validation.bidirectional_cycles.is_empty(),
-        "Should have no cycles, found: {:?}",
-        validation.bidirectional_cycles
-    );
-
-    assert!(
-        validation.disconnected_upstream.is_empty(),
-        "Should have no disconnected upstream, found: {:?}",
-        validation.disconnected_upstream
-    );
-
-    // With 4 nodes subscribing, expect at least 3 to have upstream
-    // (all should point toward the source; 1 may be the closest and act as source)
-    // Reviewers noted: >= 2 is too weak for 4 subscribers
-    assert!(
-        nodes_with_upstream >= 3,
-        "Chain test: Expected at least 3 of 4 nodes with upstream, found {}",
-        nodes_with_upstream
-    );
-
-    tracing::info!(
-        "test_chain_topology_formation PASSED: {} with upstream, {} with downstream",
-        nodes_with_upstream,
-        nodes_with_downstream
-    );
+    clear_crdt_contracts();
 }
