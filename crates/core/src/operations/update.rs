@@ -953,11 +953,14 @@ impl OpManager {
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
     ///   in proximity cache targets if we're seeding the contract
     ///
-    /// # Simplified Architecture (2026-01 Refactor)
+    /// # Hybrid Architecture (2026-01 Refactor)
     ///
-    /// Updates are propagated ONLY via the proximity cache. Each peer announces which contracts
-    /// it seeds, and updates broadcast to all connected proximity neighbors who have the contract.
-    /// The explicit subscription tree (upstream/downstream) has been removed.
+    /// Updates are propagated via TWO sources:
+    /// 1. Proximity cache: peers who have announced they seed this contract (fast, local knowledge)
+    /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
+    ///
+    /// This hybrid approach ensures updates reach all interested peers even if CacheAnnounce
+    /// messages haven't fully propagated yet.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -968,9 +971,11 @@ impl OpManager {
         let self_addr = self.ring.connection_manager.get_own_addr();
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
-        // Collect proximity neighbors (peers who have announced they seed this contract)
-        let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
+
+        // Source 1: Proximity cache (peers who announced they seed this contract)
+        let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
+        let proximity_count = proximity_addrs.len();
 
         for addr in proximity_addrs {
             // Skip sender to avoid echo (unless we're the originator)
@@ -984,12 +989,31 @@ impl OpManager {
             // Only include connected peers
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
                 targets.insert(pkl);
-            } else {
-                tracing::debug!(
-                    peer = %addr,
-                    contract = %key,
-                    "PROXIMITY_CACHE: Skipping disconnected neighbor in UPDATE targets"
-                );
+            }
+        }
+
+        // Source 2: Interest manager (peers who expressed interest via protocol)
+        let interested_peers = self.interest_manager.get_interested_peers(key);
+        let interest_count = interested_peers.len();
+
+        for (peer_key, _interest) in interested_peers {
+            // Look up peer by public key
+            if let Some(pkl) = self
+                .ring
+                .connection_manager
+                .get_peer_by_pub_key(&peer_key.0)
+            {
+                // Skip sender to avoid echo
+                if let Some(pkl_addr) = pkl.socket_addr() {
+                    if &pkl_addr == sender && !is_local_update_initiator {
+                        continue;
+                    }
+                    // Skip ourselves
+                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        continue;
+                    }
+                }
+                targets.insert(pkl);
             }
         }
 
@@ -1009,25 +1033,18 @@ impl OpManager {
                     .collect::<Vec<_>>()
                     .join(","),
                 count = result.len(),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
         } else {
-            let own_addr = self.ring.connection_manager.get_own_addr();
-            let skip_slice = std::slice::from_ref(sender);
-            let fallback_candidates = self
-                .ring
-                .k_closest_potentially_caching(key, skip_slice, 5)
-                .into_iter()
-                .filter_map(|candidate| candidate.socket_addr())
-                .map(|addr| format!("{:.8}", addr))
-                .collect::<Vec<_>>();
-
             tracing::warn!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
-                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
-                fallback_candidates = ?fallback_candidates,
+                self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
                 phase = "warning",
                 "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );

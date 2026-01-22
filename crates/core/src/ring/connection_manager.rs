@@ -424,6 +424,23 @@ impl ConnectionManager {
         None
     }
 
+    /// Look up a PeerKeyLocation by public key from connections_by_location.
+    /// Used for finding connected peers when we only have their public key (e.g., from interest manager).
+    pub fn get_peer_by_pub_key(
+        &self,
+        pub_key: &crate::transport::TransportPublicKey,
+    ) -> Option<PeerKeyLocation> {
+        let connections = self.connections_by_location.read();
+        for conns in connections.values() {
+            for conn in conns {
+                if &conn.location.pub_key == pub_key {
+                    return Some(conn.location.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
