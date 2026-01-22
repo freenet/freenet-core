@@ -218,6 +218,23 @@ impl<T: TimeSource> GetSubscriptionCache<T> {
     pub fn get(&self, key: &ContractKey) -> Option<&GetSubscriptionEntry> {
         self.entries.get(key)
     }
+
+    /// Check if a contract is in the cache.
+    #[cfg(test)]
+    pub fn contains(&self, key: &ContractKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Remove a contract from the cache (for testing).
+    #[cfg(test)]
+    pub fn remove(&mut self, key: &ContractKey) -> bool {
+        if self.entries.remove(key).is_some() {
+            self.lru_order.retain(|k| k != key);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
