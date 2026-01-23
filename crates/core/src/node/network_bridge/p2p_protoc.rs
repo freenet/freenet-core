@@ -1549,13 +1549,16 @@ impl P2pConnManager {
                                     },
                                 );
 
-                                for peer_addr in ctx.connections.keys() {
+                                // Send directly to peer connection channels to avoid self-deadlock.
+                                // Using ctx.bridge.send() would route through ev_listener_tx (the same
+                                // channel we're processing), which can deadlock if the channel backs up.
+                                for (peer_addr, conn) in ctx.connections.iter() {
                                     tracing::trace!(
                                         peer_addr = %peer_addr,
                                         phase = "broadcast",
                                         "Sending proximity cache to peer"
                                     );
-                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
+                                    if let Err(e) = conn.sender.send(Left(msg.clone())).await {
                                         tracing::warn!(
                                             peer_addr = %peer_addr,
                                             error = %e,
@@ -1583,8 +1586,11 @@ impl P2pConnManager {
                                     },
                                 );
 
-                                for peer_addr in ctx.connections.keys() {
-                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
+                                // Send directly to peer connection channels to avoid self-deadlock.
+                                // Using ctx.bridge.send() would route through ev_listener_tx (the same
+                                // channel we're processing), which can deadlock if the channel backs up.
+                                for (peer_addr, conn) in ctx.connections.iter() {
+                                    if let Err(e) = conn.sender.send(Left(msg.clone())).await {
                                         tracing::warn!(
                                             peer_addr = %peer_addr,
                                             error = %e,
@@ -1604,11 +1610,21 @@ impl P2pConnManager {
                                     crate::message::NetMessageV1::InterestSync { message },
                                 );
 
-                                if let Err(e) = ctx.bridge.send(target, msg).await {
+                                // Send directly to peer connection channel to avoid self-deadlock.
+                                // Using ctx.bridge.send() would route through ev_listener_tx (the same
+                                // channel we're processing), which can deadlock if the channel backs up.
+                                if let Some(conn) = ctx.connections.get(&target) {
+                                    if let Err(e) = conn.sender.send(Left(msg)).await {
+                                        tracing::warn!(
+                                            peer_addr = %target,
+                                            error = %e,
+                                            "Failed to send interest message to peer"
+                                        );
+                                    }
+                                } else {
                                     tracing::warn!(
                                         peer_addr = %target,
-                                        error = %e,
-                                        "Failed to send interest message to peer"
+                                        "Cannot send interest message - no connection to peer"
                                     );
                                 }
                             }
@@ -1779,7 +1795,19 @@ impl P2pConnManager {
                                             .unwrap_or_default(),
                                     };
 
-                                    if let Err(err) = ctx.bridge.send(peer_addr, msg.into()).await {
+                                    // Send directly to peer connection channel to avoid self-deadlock.
+                                    // Using ctx.bridge.send() would route through ev_listener_tx (the same
+                                    // channel we're processing), which can deadlock if the channel backs up.
+                                    let send_result =
+                                        if let Some(conn) = ctx.connections.get(&peer_addr) {
+                                            conn.sender
+                                                .send(Left(msg.into()))
+                                                .await
+                                                .map_err(|e| e.to_string())
+                                        } else {
+                                            Err(format!("no connection to peer {}", peer_addr))
+                                        };
+                                    if let Err(err) = send_result {
                                         tracing::warn!(
                                             tx = %update_tx,
                                             peer = %peer_addr,
