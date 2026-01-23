@@ -3084,3 +3084,193 @@ fn test_chain_topology_formation() {
 
     clear_crdt_contracts();
 }
+
+// =============================================================================
+// Subscription Broadcast Propagation Test
+// =============================================================================
+
+/// Test: Updates from gateway propagate to subscribers via broadcast.
+///
+/// This test specifically verifies that when a peer subscribes to a contract,
+/// subsequent updates from the gateway reach the subscriber. This catches the
+/// regression where subscriptions were registered but subscribers weren't added
+/// to broadcast targets (proximity_sources=0, interest_sources=0).
+///
+/// ## The Bug (PR #2794 regression)
+///
+/// After the lease-based subscription refactor, when a subscription was accepted:
+/// 1. The subscription was registered locally via `ring.subscribe()`
+/// 2. But `announce_contract_cached()` was NOT called
+/// 3. So the subscriber never announced to neighbors that it has the contract
+/// 4. When the gateway tried to broadcast updates, it had no targets
+/// 5. Updates were silently dropped with "NO_TARGETS" warning
+///
+/// ## Why Existing Tests Didn't Catch This
+///
+/// The `check_convergence_from_logs` function skips contracts where only 1 peer
+/// has logged state. When broadcasts fail, subscribers never receive updates,
+/// never log state, and the convergence check silently skips the contract.
+///
+/// ## What This Test Does
+///
+/// 1. Gateway PUTs a contract with initial state
+/// 2. A separate node SUBSCRIBES to the contract
+/// 3. Gateway sends an UPDATE
+/// 4. **Explicitly verify the subscriber received the update** (has matching state)
+///
+/// The test fails if the subscriber doesn't have the same state as the gateway
+/// after the update, which happens when broadcasts don't reach subscribers.
+#[test_log::test]
+fn test_subscription_broadcast_propagation() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xBCAD_C057_0001; // "broadcast" seed
+    const NETWORK_NAME: &str = "broadcast-test";
+
+    GlobalTestMetrics::reset();
+    clear_crdt_contracts();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        // Simple topology: 1 gateway, 2 nodes
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            2,  // 2 regular nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Create a CRDT contract for proper state merging
+    let contract = SimOperation::create_test_contract(0xBC);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // Test basic subscription->update broadcast flow:
+    // 1. Gateway PUTs the contract (announces to neighbors)
+    // 2. Node 1 subscribes (should result in contract being announced by Node 1)
+    // 3. Gateway sends an UPDATE (should broadcast to Node 1)
+    //
+    // The bug (PR #2794 regression): subscription acceptance doesn't call
+    // announce_contract_cached, so the gateway doesn't know Node 1 has the contract.
+    let operations = vec![
+        // Gateway puts with subscribe=true (so it seeds the contract)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0x01),
+                subscribe: true,
+            },
+        ),
+        // Node 1 subscribes - this should:
+        // 1. Get subscription accepted
+        // 2. Fetch contract via GET (if not present)
+        // 3. Announce to neighbors that it has the contract
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        // Gateway updates - should broadcast to Node 1 (the subscriber)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(100, 0xFF), // Distinctive update value
+            },
+        ),
+    ];
+
+    // Run simulation with enough time for subscription + update propagation
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120), // Total simulation time
+        Duration::from_secs(60),  // Post-operation wait for propagation
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Check convergence - but this alone won't catch the bug (it skips single-peer contracts)
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+
+    tracing::info!(
+        "Broadcast propagation test: converged={}, diverged={}",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    // THE CRITICAL CHECK: Verify at least 2 peers have state for this contract
+    // If the bug is present, only the gateway will have logged state (subscriber never received update)
+    let contract_key_str = format!("{:?}", contract_key);
+
+    // Extract peer states from logs for this specific contract
+    let peer_states: std::collections::BTreeMap<std::net::SocketAddr, String> =
+        rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut states = std::collections::BTreeMap::new();
+            for log in logs.iter() {
+                if let Some(key) = log.kind.contract_key() {
+                    if format!("{:?}", key) == contract_key_str {
+                        if let Some(hash) = log.kind.stored_state_hash() {
+                            states.insert(log.peer_id.addr, hash.to_string());
+                        }
+                    }
+                }
+            }
+            states
+        });
+
+    tracing::info!(
+        "Contract {} has state on {} peers: {:?}",
+        contract_key_str,
+        peer_states.len(),
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    // ASSERTION: At least 2 peers must have state for this contract
+    // If only 1 peer has it, the broadcast failed to reach the subscriber
+    assert!(
+        peer_states.len() >= 2,
+        "BUG: Update broadcast failed! Only {} peer(s) have state for contract {}. \
+         Expected at least 2 (gateway + subscriber). \
+         This indicates subscribers aren't receiving broadcasts (proximity_sources=0). \
+         Peers with state: {:?}",
+        peer_states.len(),
+        contract_key_str,
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    // Also verify the states match (convergence)
+    let unique_states: std::collections::HashSet<&String> = peer_states.values().collect();
+    assert!(
+        unique_states.len() == 1,
+        "BUG: State divergence! {} unique states across {} peers for contract {}. \
+         States: {:?}",
+        unique_states.len(),
+        peer_states.len(),
+        contract_key_str,
+        peer_states
+    );
+
+    tracing::info!(
+        "test_subscription_broadcast_propagation PASSED: {} peers converged to same state",
+        peer_states.len()
+    );
+
+    clear_crdt_contracts();
+}
