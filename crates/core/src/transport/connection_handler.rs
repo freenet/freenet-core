@@ -750,6 +750,12 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
                     {
                         entry.insert(ConnectionState::GatewayHandshake { packet_sender });
                         return true;
+                    } else {
+                        tracing::debug!(
+                            peer_addr = %addr,
+                            remaining_ms = (RECENTLY_CLOSED_DURATION.as_nanos() as u64 - now.saturating_sub(*closed_at_nanos)) / 1_000_000,
+                            "Rejecting gateway handshake - connection recently closed"
+                        );
                     }
                 }
                 false
@@ -790,41 +796,73 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }
     }
 
-    /// Start NAT traversal. Clears any existing established connection.
+    /// Start NAT traversal.
     fn start_nat_traversal(
         &mut self,
         addr: SocketAddr,
         packet_sender: FastSender<PacketData<UnknownEncryption>>,
         result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
     ) -> bool {
-        // Clear existing established connection if higher layer requests new one
-        if matches!(
-            self.states.get(&addr),
-            Some(ConnectionState::Established { .. })
-        ) {
-            self.last_asym_attempt.remove(&addr);
-            tracing::info!(
-                peer_addr = %addr,
-                "Clearing existing connection to allow fresh NAT traversal"
-            );
-        }
+        use std::collections::btree_map::Entry;
+        let now = self.time_source.now_nanos();
 
-        // Don't start if NAT traversal already in progress
-        if matches!(
-            self.states.get(&addr),
-            Some(ConnectionState::NatTraversal { .. })
-        ) {
-            return false;
+        match self.states.entry(addr) {
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionState::NatTraversal {
+                    packet_sender,
+                    result_sender,
+                });
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                match entry.get() {
+                    ConnectionState::Established { .. } => {
+                        // Higher layer requested new connection, clear existing one
+                        self.last_asym_attempt.remove(&addr);
+                        tracing::info!(
+                            peer_addr = %addr,
+                            "Clearing existing connection to allow fresh NAT traversal"
+                        );
+                        entry.insert(ConnectionState::NatTraversal {
+                            packet_sender,
+                            result_sender,
+                        });
+                        true
+                    }
+                    ConnectionState::NatTraversal { .. } => {
+                        // Already in progress, reject duplicate
+                        false
+                    }
+                    ConnectionState::GatewayHandshake { .. } => {
+                        // Don't overwrite ongoing gateway handshake to avoid orphaning its task
+                        tracing::debug!(
+                            peer_addr = %addr,
+                            "Rejecting NAT traversal - gateway handshake already in progress"
+                        );
+                        false
+                    }
+                    ConnectionState::RecentlyClosed { closed_at_nanos } => {
+                        // Allow if grace period expired
+                        if now.saturating_sub(*closed_at_nanos)
+                            >= RECENTLY_CLOSED_DURATION.as_nanos() as u64
+                        {
+                            entry.insert(ConnectionState::NatTraversal {
+                                packet_sender,
+                                result_sender,
+                            });
+                            true
+                        } else {
+                            tracing::debug!(
+                                peer_addr = %addr,
+                                remaining_ms = (RECENTLY_CLOSED_DURATION.as_nanos() as u64 - now.saturating_sub(*closed_at_nanos)) / 1_000_000,
+                                "Rejecting NAT traversal - connection recently closed"
+                            );
+                            false
+                        }
+                    }
+                }
+            }
         }
-
-        self.states.insert(
-            addr,
-            ConnectionState::NatTraversal {
-                packet_sender,
-                result_sender,
-            },
-        );
-        true
     }
 
     /// Complete NAT traversal atomically. Returns result_sender if state was NatTraversal.
@@ -869,7 +907,10 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         None
     }
 
-    /// Mark any connection state as recently closed.
+    /// Mark connection as recently closed, unconditionally overwriting any existing state.
+    /// This is intentional: when a connection closes (channel disconnected, timeout, etc.),
+    /// we always want to enter the grace period regardless of what state we were in.
+    /// The grace period prevents expensive asymmetric decryption on in-flight packets.
     fn mark_closed(&mut self, addr: &SocketAddr) {
         let now = self.time_source.now_nanos();
         self.states.insert(
