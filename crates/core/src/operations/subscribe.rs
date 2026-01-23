@@ -871,6 +871,13 @@ impl Operation for SubscribeOp {
                                 );
                             }
 
+                            // CRITICAL: Announce to neighbors that we cache this contract.
+                            // This ensures UPDATE broadcasts will reach us. Without this,
+                            // if the contract was already cached (fetch_contract_if_missing returned early),
+                            // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
+                            // See: https://github.com/freenet/freenet-core/issues/XXX
+                            super::announce_contract_cached(op_manager, key).await;
+
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
