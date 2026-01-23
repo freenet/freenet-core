@@ -907,18 +907,22 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         None
     }
 
-    /// Mark connection as recently closed, unconditionally overwriting any existing state.
-    /// This is intentional: when a connection closes (channel disconnected, timeout, etc.),
-    /// we always want to enter the grace period regardless of what state we were in.
-    /// The grace period prevents expensive asymmetric decryption on in-flight packets.
+    /// Mark connection as closed. Only established connections enter the grace period.
     fn mark_closed(&mut self, addr: &SocketAddr) {
-        let now = self.time_source.now_nanos();
-        self.states.insert(
-            *addr,
-            ConnectionState::RecentlyClosed {
-                closed_at_nanos: now,
-            },
-        );
+        match self.states.remove(addr) {
+            Some(ConnectionState::Established { .. }) => {
+                self.states.insert(
+                    *addr,
+                    ConnectionState::RecentlyClosed {
+                        closed_at_nanos: self.time_source.now_nanos(),
+                    },
+                );
+            }
+            Some(ConnectionState::NatTraversal { result_sender, .. }) => {
+                let _ = result_sender.send(Err(TransportError::ConnectionClosed(*addr)));
+            }
+            _ => {}
+        }
     }
 
     /// Remove established connection and return the packet sender (for detection purposes).
