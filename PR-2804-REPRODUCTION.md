@@ -50,6 +50,8 @@ The `unified-hosting` branch consolidates the fragmented caching systems into a 
 
 A regression test has been added: `crates/core/tests/test_subscription_renewal_bug.rs`
 
+This test uses **Turmoil** for deterministic simulation, ensuring reproducible results across runs. Unlike tokio-based smoke tests, Turmoil provides full control over time advancement and task scheduling.
+
 ### Running the Test
 
 The test is marked `#[ignore]` with `TODO-MUST-FIX` because it demonstrates the bug on `main`:
@@ -60,29 +62,46 @@ cargo test -p freenet --test test_subscription_renewal_bug \
   --features simulation_tests -- --ignored --nocapture
 ```
 
+**Note**: This uses Turmoil's deterministic scheduler, not tokio. Time advances deterministically via `tokio::time::sleep()` calls within the simulation closure.
+
 ### Test Scenarios
+
+All tests use **Turmoil** for deterministic simulation with reproducible time advancement.
 
 #### Test 1: `test_get_triggered_subscription_renewal`
 
-Simulates the full bug scenario:
-1. Creates network (1 gateway + 3 nodes)
-2. Triggers PUT and GET operations (creates contracts in GetSubscriptionCache)
-3. Advances virtual time past 2 minutes (renewal interval)
-4. Advances virtual time past 4 minutes (lease expiry)
-5. Verifies behavior after expiry
+Main bug reproduction test:
+1. Creates network (1 gateway + 3 nodes) using Turmoil
+2. Runs simulation for 5 minutes (exceeds 4-minute lease duration)
+3. Triggers 1 contract with 2 operations (PUT + GET)
+4. Sleeps 30s between operations (Turmoil advances time deterministically)
+5. Analyzes event logs for subscription renewal behavior
 
-**On main**: GET-triggered subscriptions are not renewed and expire
+**On main**: GET-triggered subscriptions are NOT renewed and expire after 4 minutes
 **On unified-hosting**: Subscriptions are properly renewed and remain active
 
 #### Test 2: `test_subscription_renewal_timing`
 
-Focused timing test:
-1. Creates minimal network (1 gateway + 2 nodes)
-2. Triggers one contract operation
-3. Advances time to renewal interval (2 minutes)
-4. Checks if renewal happens
-5. Advances to lease duration (4 minutes)
-6. Checks if subscription expired or remained active
+Focused timing verification:
+1. Creates minimal network (1 gateway + 2 nodes) with Turmoil
+2. Runs for 5 minutes with single contract operation
+3. Sleeps for SUBSCRIPTION_RENEWAL_INTERVAL (2 minutes) between operations
+4. Verifies renewal happens at correct intervals
+5. Confirms subscription doesn't expire at 4-minute mark
+
+**Expected**: Renewal events at T+120s, T+240s, subscription active at T+300s
+
+#### Test 3: `test_river_ui_subscription_expiry_scenario`
+
+Real-world River UI scenario:
+1. Simulates user opening River UI (1 gateway + 2 nodes with Turmoil)
+2. Performs single GET operation (UI loads contract)
+3. Runs for 5 minutes simulating user with UI open
+4. Sleeps 60s between cycles (simulating periodic UI activity)
+5. Verifies updates continue to be received throughout
+
+**Bug on main**: Subscription expires at T+240s, UI shows stale data
+**Expected after fix**: Subscription renewed, UI receives updates throughout 5 minutes
 
 ## Verifying the Fix
 
