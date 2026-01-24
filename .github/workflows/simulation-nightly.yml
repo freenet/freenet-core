@@ -7,18 +7,18 @@ name: Simulation Tests (Nightly)
 on:
   schedule:
     # Run at 3 AM UTC every day
-    - cron: '0 3 * * *'
+    - cron: "0 3 * * *"
   workflow_dispatch:
     # Allow manual triggering from any branch
     inputs:
       ref:
-        description: 'Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI.'
+        description: "Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI."
         required: false
-        default: ''
+        default: ""
       seed:
-        description: 'Simulation seed for reproducibility (hex, e.g., 0xDEADBEEF)'
+        description: "Simulation seed for reproducibility (hex, e.g., 0xDEADBEEF)"
         required: false
-        default: ''
+        default: ""
 
 # Cancel in-progress runs when a new run is triggered
 concurrency:
@@ -178,6 +178,18 @@ jobs:
             dense_network_replication -- \
             --ignored --test-threads=1 --nocapture
 
+      # Long-duration simulation test (1 hour virtual time)
+      # Uses Turmoil deterministic scheduler for reproducible results
+      # Uncovers time-dependent bugs that only manifest after extended operation
+      # Wall clock time: ~3 minutes (with 19.6x time acceleration)
+      - name: Long-running simulation (1 hour virtual time)
+        run: |
+          echo "Running 1-hour long-running deterministic simulation test"
+          echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
+          cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
+            test_long_running_1h_deterministic -- \
+            --test-threads=1 --nocapture
+
       # Large network test - requires riverctl, skipped if not available
       - name: Run large network test (50+ nodes)
         run: |
@@ -232,4 +244,3 @@ jobs:
             exit 1
           fi
           echo "Message sent successfully"
-

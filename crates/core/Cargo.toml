@@ -175,6 +175,8 @@ bench = []  # Exposes internal test infrastructure for benchmarking
 bench_full = []  # Enables full benchmark suite (slow, ~78 min)
 # Feature to enable simulation integration tests (run separately with --test-threads=1)
 simulation_tests = []
+# Feature to enable nightly-only tests (long-running, resource-intensive)
+nightly_tests = []
 
 # ==============================================================================
 # Lint Configuration
