@@ -112,16 +112,11 @@ impl<T: TimeSource> HostingCache<T> {
         if let Some(existing) = self.contracts.get_mut(&key) {
             // Already cached - update size if changed and refresh position
             if existing.size_bytes != size_bytes {
-                // Adjust byte accounting for size change
-                if size_bytes > existing.size_bytes {
-                    self.current_bytes = self
-                        .current_bytes
-                        .saturating_add(size_bytes - existing.size_bytes);
-                } else {
-                    self.current_bytes = self
-                        .current_bytes
-                        .saturating_sub(existing.size_bytes - size_bytes);
-                }
+                // Adjust byte accounting: add new size, subtract old size
+                self.current_bytes = self
+                    .current_bytes
+                    .saturating_add(size_bytes)
+                    .saturating_sub(existing.size_bytes);
                 existing.size_bytes = size_bytes;
             }
             existing.last_accessed = now;

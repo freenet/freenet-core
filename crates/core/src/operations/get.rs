@@ -1601,23 +1601,10 @@ impl Operation for GetOp {
                             }
 
                             // Auto-subscribe to receive updates for this contract
-                            // BUG FIX: ALWAYS refresh subscription tracking, not just when newly hosting
+                            // record_get_access already refreshed the hosting cache above
                             if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                // Track in hosting cache for auto-subscription lifecycle.
-                                // Note: We do NOT remove subscription state for evicted contracts here,
-                                // as they may still have active client subscriptions. The background
-                                // sweep task handles proper cleanup with client subscription checks.
-                                let evicted = op_manager.ring.record_get_subscription(key);
-                                if !evicted.is_empty() {
-                                    tracing::debug!(
-                                        evicted_count = evicted.len(),
-                                        "Hosting cache evicted contracts (cleanup handled by background task)"
-                                    );
-                                }
-
                                 // Only start new subscription if not already subscribed
                                 if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
-                                    // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                     let child_tx = super::start_subscription_request(
                                         op_manager, id, key, false,
                                     );
@@ -1688,20 +1675,10 @@ impl Operation for GetOp {
                                         }
 
                                         // Auto-subscribe to receive updates for this contract
-                                        // BUG FIX: ALWAYS refresh subscription tracking
+                                        // record_get_access already refreshed the hosting cache above
                                         if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                            // Track in hosting cache for auto-subscription lifecycle.
-                                            let evicted = op_manager.ring.record_get_subscription(key);
-                                            if !evicted.is_empty() {
-                                                tracing::debug!(
-                                                    evicted_count = evicted.len(),
-                                                    "Hosting cache evicted contracts (cleanup handled by background task)"
-                                                );
-                                            }
-
                                             // Only start new subscription if not already subscribed
                                             if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
-                                                // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                                 let child_tx =
                                                     super::start_subscription_request(op_manager, id, key, false);
                                                 tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");

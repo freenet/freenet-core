@@ -918,14 +918,6 @@ impl Ring {
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
 
-    /// Record a GET access for auto-subscription tracking.
-    ///
-    /// Now delegated to the unified hosting cache. Returns contracts evicted from cache.
-    pub fn record_get_subscription(&self, key: ContractKey) -> Vec<ContractKey> {
-        // Delegate to hosting cache - GET access is now tracked there
-        self.record_get_access(key, 0) // Size will be updated on actual cache
-    }
-
     /// Refresh a contract's access time in the hosting cache.
     ///
     /// Called when UPDATE is received for an auto-subscribed contract.

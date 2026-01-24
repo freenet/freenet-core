@@ -560,12 +560,6 @@ impl HostingManager {
         // Add all hosted contracts
         let hosting_cache = self.hosting_cache.read();
         for contract_key in hosting_cache.iter() {
-            let is_subscribed = self
-                .active_subscriptions
-                .get(&contract_key)
-                .map(|exp| *exp > now)
-                .unwrap_or(false);
-
             let has_client_subscriptions =
                 self.client_subscriptions.contains_key(contract_key.id());
 
@@ -579,11 +573,6 @@ impl HostingManager {
                     has_client_subscriptions,
                 },
             );
-
-            // If subscribed but not hosting, add that too
-            if !is_subscribed && has_client_subscriptions {
-                // Already added above
-            }
         }
 
         // Add subscribed contracts that might not be in hosting cache yet
