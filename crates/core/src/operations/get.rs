@@ -1566,21 +1566,21 @@ impl Operation for GetOp {
                             let evicted =
                                 op_manager.ring.record_get_access(key, value.size() as u64);
 
+                            // Clean up interest tracking for evicted contracts (always, even if already hosting)
+                            let mut removed_contracts = Vec::new();
+                            for evicted_key in &evicted {
+                                if op_manager
+                                    .interest_manager
+                                    .unregister_local_seeding(evicted_key)
+                                {
+                                    removed_contracts.push(*evicted_key);
+                                }
+                            }
+
                             // Only do first-time hosting setup if newly hosting
                             if !was_already_hosting {
                                 tracing::debug!(tx = %id, %key, "Contract newly hosted");
                                 super::announce_contract_cached(op_manager, &key).await;
-
-                                // Clean up interest tracking for evicted contracts
-                                let mut removed_contracts = Vec::new();
-                                for evicted_key in evicted {
-                                    if op_manager
-                                        .interest_manager
-                                        .unregister_local_seeding(&evicted_key)
-                                    {
-                                        removed_contracts.push(evicted_key);
-                                    }
-                                }
 
                                 // Register local interest for delta-based sync
                                 let became_interested =
@@ -1598,6 +1598,15 @@ impl Operation for GetOp {
                                 }
                             } else {
                                 tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                                // Still broadcast eviction changes if any contracts were evicted
+                                if !removed_contracts.is_empty() {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        vec![],
+                                        removed_contracts,
+                                    )
+                                    .await;
+                                }
                             }
 
                             // Auto-subscribe to receive updates for this contract
@@ -1639,20 +1648,20 @@ impl Operation for GetOp {
                                             .ring
                                             .record_get_access(key, value.size() as u64);
 
+                                        // Clean up interest tracking for evicted contracts (always, even if already hosting)
+                                        let mut removed_contracts = Vec::new();
+                                        for evicted_key in &evicted {
+                                            if op_manager
+                                                .interest_manager
+                                                .unregister_local_seeding(evicted_key)
+                                            {
+                                                removed_contracts.push(*evicted_key);
+                                            }
+                                        }
+
                                         // Only do first-time hosting setup if newly hosting
                                         if !was_already_hosting {
                                             super::announce_contract_cached(op_manager, &key).await;
-
-                                            // Clean up interest tracking for evicted contracts
-                                            let mut removed_contracts = Vec::new();
-                                            for evicted_key in evicted {
-                                                if op_manager
-                                                    .interest_manager
-                                                    .unregister_local_seeding(&evicted_key)
-                                                {
-                                                    removed_contracts.push(evicted_key);
-                                                }
-                                            }
 
                                             // Register local interest for delta-based sync
                                             let became_interested = op_manager
@@ -1672,6 +1681,15 @@ impl Operation for GetOp {
                                             }
                                         } else {
                                             tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                                            // Still broadcast eviction changes if any contracts were evicted
+                                            if !removed_contracts.is_empty() {
+                                                super::broadcast_change_interests(
+                                                    op_manager,
+                                                    vec![],
+                                                    removed_contracts,
+                                                )
+                                                .await;
+                                            }
                                         }
 
                                         // Auto-subscribe to receive updates for this contract
