@@ -58,6 +58,10 @@ const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// Allows in-flight packets to drain without triggering asymmetric decryption.
 const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
 
+/// Duration to keep outdated peer entries before cleanup.
+/// Peers with incompatible protocol versions are ignored for this duration.
+const OUTDATED_PEER_EXPIRY: Duration = Duration::from_secs(600);
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S, T> = BoxFuture<
@@ -1051,7 +1055,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         Ok((size, remote_addr)) => {
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
-                                if now_nanos.saturating_sub(*time_nanos) < Duration::from_secs(60 * 10).as_nanos() as u64 {
+                                if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
                                     let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
                                     if packet_data.is_intro_packet() {
                                         if self.connections.is_rate_limited(&remote_addr) {
@@ -1178,6 +1182,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     }
 
                                     ConnectionState::NatTraversal { .. } => {
+                                        // Rate limit intro packets to prevent decryption storms
+                                        // during NAT traversal handshake
+                                        if packet_data.is_intro_packet() {
+                                            if self.connections.is_rate_limited(&remote_addr) {
+                                                tracing::trace!(peer_addr = %remote_addr, "Rate limiting NAT traversal intro packet");
+                                                continue;
+                                            }
+                                            self.connections.record_asym_attempt(remote_addr);
+                                        }
                                         let _ = self.connections.send_nat_traversal(&remote_addr, packet_data).await;
                                         continue;
                                     }
@@ -1404,7 +1417,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     now_nanos.saturating_sub(last_cleanup_nanos) >= RATE_LIMIT_CLEANUP_INTERVAL.as_nanos() as u64
                 } => {
                     self.connections.cleanup_expired();
-                    last_cleanup_nanos = self.time_source.now_nanos();
+                    let now_nanos = self.time_source.now_nanos();
+                    last_cleanup_nanos = now_nanos;
+
+                    let outdated_cutoff = now_nanos.saturating_sub(OUTDATED_PEER_EXPIRY.as_nanos() as u64);
+                    outdated_peer.retain(|_, timestamp| *timestamp > outdated_cutoff);
                 }
             }
         }

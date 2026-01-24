@@ -7,18 +7,18 @@ name: Simulation Tests (Nightly)
 on:
   schedule:
     # Run at 3 AM UTC every day
-    - cron: '0 3 * * *'
+    - cron: "0 3 * * *"
   workflow_dispatch:
     # Allow manual triggering from any branch
     inputs:
       ref:
-        description: 'Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI.'
+        description: "Git ref to checkout (branch, tag, or SHA). Leave empty to use the branch selected in the UI."
         required: false
-        default: ''
+        default: ""
       seed:
-        description: 'Simulation seed for reproducibility (hex, e.g., 0xDEADBEEF)'
+        description: "Simulation seed for reproducibility (hex, e.g., 0xDEADBEEF)"
         required: false
-        default: ''
+        default: ""
 
 # Cancel in-progress runs when a new run is triggered
 concurrency:
@@ -68,72 +68,87 @@ jobs:
       - name: Build fdev
         run: cargo build -p fdev --release
 
-      # Medium scale test (50 nodes) - scaled up from 20 for better coverage
-      # Expects 100% success rate and 100% convergence - no fault injection
-      - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
+      # Medium scale test (50 nodes) - 1 hour virtual time with realistic jitter
+      # Expects 100% success rate and 100% convergence
+      # Virtual time: 2000 events × 1800ms = 3600s (1 hour)
+      - name: Medium scale test (50 nodes, 1h, seed 0xDEADBEEF)
         run: |
-          echo "Running medium scale simulation (50 nodes, 2000 events)"
+          echo "Running medium scale simulation (50 nodes, 2000 events, 1 hour virtual time)"
           cargo run -p fdev --release -- test \
-            --name "nightly-medium-50" \
+            --name "nightly-medium-50-1h" \
             --seed 0xDEADBEEF \
             --gateways 4 \
             --nodes 46 \
             --events 2000 \
+            --event-wait-ms 1800 \
             --ring-max-htl 12 \
             --max-connections 20 \
             --min-connections 6 \
+            --latency-min 10 \
+            --latency-max 50 \
             --min-success-rate 1.0 \
             --print-summary \
+            --print-network-stats \
             single-process
 
       # Medium scale with different seed (explores different code paths)
-      # Expects 100% success rate and 100% convergence - no fault injection
-      - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
+      # 1 hour virtual time with realistic jitter
+      # Virtual time: 2000 events × 1800ms = 3600s (1 hour)
+      - name: Medium scale test (50 nodes, 1h, seed 0xCAFEBABE)
         run: |
-          echo "Running medium scale simulation with alternate seed (2000 events)"
+          echo "Running medium scale simulation with alternate seed (2000 events, 1 hour virtual time)"
           cargo run -p fdev --release -- test \
-            --name "nightly-medium-50-alt" \
+            --name "nightly-medium-50-1h-alt" \
             --seed 0xCAFEBABE \
             --gateways 4 \
             --nodes 46 \
             --events 2000 \
+            --event-wait-ms 1800 \
             --ring-max-htl 12 \
             --max-connections 20 \
             --min-connections 6 \
+            --latency-min 10 \
+            --latency-max 50 \
             --min-success-rate 1.0 \
             --print-summary \
+            --print-network-stats \
             single-process
 
-      # Fault tolerance test with aggressive message loss
+      # Fault tolerance test with aggressive message loss + realistic jitter
+      # 1 hour virtual time to catch time-dependent issues under load
       # Success rate can be <100% due to message loss, but convergence must be 100%
-      # (all contracts that DO get created must have consistent state)
-      - name: Fault tolerance test (15% message loss)
+      # Virtual time: 1000 events × 3600ms = 3600s (1 hour)
+      - name: Fault tolerance test (15% message loss, 1h)
         run: |
-          echo "Running fault tolerance simulation with 15% message loss (1000 events)"
+          echo "Running fault tolerance simulation with 15% message loss (1000 events, 1 hour virtual time)"
           cargo run -p fdev --release -- test \
-            --name "nightly-fault-loss" \
+            --name "nightly-fault-loss-1h" \
             --seed 0xFA017001 \
             --gateways 3 \
             --nodes 27 \
             --events 1000 \
+            --event-wait-ms 3600 \
             --message-loss 0.15 \
+            --latency-min 10 \
+            --latency-max 50 \
             --min-success-rate 0.80 \
             --print-summary \
             --print-network-stats \
             single-process
 
-      # High latency test
-      # Latency adds delay but shouldn't cause message loss, so success rate should be high
-      # Allow 95% to account for potential timeout edge cases
-      - name: High latency test (50-200ms latency)
+      # High latency test - 1 hour virtual time
+      # Tests behavior under sustained high latency conditions
+      # Virtual time: 500 events × 7200ms = 3600s (1 hour)
+      - name: High latency test (50-200ms latency, 1h)
         run: |
-          echo "Running high latency simulation (500 events)"
+          echo "Running high latency simulation (500 events, 1 hour virtual time)"
           cargo run -p fdev --release -- test \
-            --name "nightly-high-latency" \
+            --name "nightly-high-latency-1h" \
             --seed 0x1A7E0C71 \
             --gateways 2 \
             --nodes 12 \
             --events 500 \
+            --event-wait-ms 7200 \
             --latency-min 50 \
             --latency-max 200 \
             --min-success-rate 0.95 \
@@ -141,22 +156,27 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Large scale test (500 nodes) - stress test with many events
-      # Expects 100% success rate and 100% convergence - no fault injection
-      - name: Large scale test (500 nodes)
+      # Large scale test (500 nodes) - 3 hour virtual time with realistic jitter
+      # Extended duration stress test to catch time-dependent scaling issues
+      # Virtual time: 10000 events × 1080ms = 10800s (3 hours)
+      - name: Large scale test (500 nodes, 3h)
         run: |
-          echo "Running large scale simulation (500 nodes, 10000 events)"
+          echo "Running large scale simulation (500 nodes, 10000 events, 3 hours virtual time)"
           cargo run -p fdev --release -- test \
-            --name "nightly-large-500" \
+            --name "nightly-large-500-3h" \
             --seed 0x500BEEF \
             --gateways 10 \
             --nodes 490 \
             --events 10000 \
+            --event-wait-ms 1080 \
             --ring-max-htl 15 \
             --max-connections 30 \
             --min-connections 10 \
+            --latency-min 10 \
+            --latency-max 50 \
             --min-success-rate 1.0 \
             --print-summary \
+            --print-network-stats \
             single-process
 
       # Replica validation with step-by-step consistency checking
@@ -177,6 +197,18 @@ jobs:
           cargo test -p freenet --features simulation_tests --test sim_network \
             dense_network_replication -- \
             --ignored --test-threads=1 --nocapture
+
+      # Long-duration simulation test (1 hour virtual time)
+      # Uses Turmoil deterministic scheduler for reproducible results
+      # Uncovers time-dependent bugs that only manifest after extended operation
+      # Wall clock time: ~3 minutes (with 19.6x time acceleration)
+      - name: Long-running simulation (1 hour virtual time)
+        run: |
+          echo "Running 1-hour long-running deterministic simulation test"
+          echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
+          cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
+            test_long_running_1h_deterministic -- \
+            --test-threads=1 --nocapture
 
       # Large network test - requires riverctl, skipped if not available
       - name: Run large network test (50+ nodes)
@@ -232,4 +264,3 @@ jobs:
             exit 1
           fi
           echo "Message sent successfully"
-
