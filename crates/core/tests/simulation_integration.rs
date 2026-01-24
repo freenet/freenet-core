@@ -2998,11 +2998,12 @@ fn test_long_running_1h_deterministic() {
 /// Note: GET operations don't emit Subscribe events directly - they only store
 /// in GetSubscriptionCache. Renewal is what should trigger Subscribe operations.
 ///
-/// NOTE: This full simulation test can't reliably verify the bug because
-/// Subscribe events aren't emitted in controlled simulations (MemoryEventsGen).
-/// See test_get_subscription_cache_not_checked_for_renewal() for direct verification.
+/// **SIMULATION TEST NOW WORKS** - After adding subscription_listener to MemoryEventsGen,
+/// this test now properly emits Subscribe events and verifies the renewal bug.
+///
+/// **TEST FAILS** - demonstrating that initial Subscribe events appear but no renewal.
 #[test_log::test]
-#[ignore = "Subscribe events not emitted in controlled sims - use unit test instead"]
+#[ignore = "TODO-MUST-FIX: Fails until contracts_needing_renewal() checks GetSubscriptionCache (PR #2804)"]
 fn test_get_only_subscription_renewal_full_simulation() {
     // Subscription constants from crates/core/src/ring/seeding.rs (not publicly exported):
     // - SUBSCRIPTION_LEASE_DURATION: 240s (4 minutes) - subscriptions expire after this
