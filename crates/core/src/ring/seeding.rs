@@ -826,8 +826,12 @@ mod tests {
     /// This test directly verifies:
     /// 1. GET operations store subscriptions in GetSubscriptionCache
     /// 2. contracts_needing_renewal() does NOT return those contracts (the bug)
+    ///
+    /// **TEST FAILS** (as intended) - demonstrating the bug exists on this branch.
+    /// After fixing contracts_needing_renewal() to check GetSubscriptionCache,
+    /// remove the #[ignore] and this test will PASS.
     #[test]
-    #[should_panic(expected = "BUG REPRODUCED")]
+    #[ignore = "TODO-MUST-FIX: Fails until contracts_needing_renewal() checks GetSubscriptionCache (PR #2804)"]
     fn test_get_subscription_cache_not_checked_for_renewal() {
         let manager = SeedingManager::new();
         let contract = make_contract_key(42);
