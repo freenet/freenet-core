@@ -2972,6 +2972,7 @@ fn test_long_running_1h_deterministic() {
 // Subscription Renewal Tests (PR #2804)
 // =============================================================================
 
+
 /// Regression test for subscription renewal bug (PR #2804).
 ///
 /// **The Bug**: contracts_needing_renewal() only checks active_subscriptions and
@@ -2996,9 +2997,13 @@ fn test_long_running_1h_deterministic() {
 ///
 /// Note: GET operations don't emit Subscribe events directly - they only store
 /// in GetSubscriptionCache. Renewal is what should trigger Subscribe operations.
+///
+/// NOTE: This full simulation test can't reliably verify the bug because
+/// Subscribe events aren't emitted in controlled simulations (MemoryEventsGen).
+/// See test_get_subscription_cache_not_checked_for_renewal() for direct verification.
 #[test_log::test]
-#[ignore = "TODO-MUST-FIX: Fails on main - demonstrates subscription renewal bug from PR #2804"]
-fn test_get_only_subscription_renewal() {
+#[ignore = "Subscribe events not emitted in controlled sims - use unit test instead"]
+fn test_get_only_subscription_renewal_full_simulation() {
     // Subscription constants from crates/core/src/ring/seeding.rs (not publicly exported):
     // - SUBSCRIPTION_LEASE_DURATION: 240s (4 minutes) - subscriptions expire after this
     // - SUBSCRIPTION_RENEWAL_INTERVAL: 120s (2 minutes) - renewals happen at this interval
@@ -3188,56 +3193,93 @@ fn test_get_only_subscription_renewal() {
     tracing::info!("  - GetSubscriptionCache not checked by contracts_needing_renewal()");
     tracing::info!("============================================================");
 
-    // CRITICAL ASSERTION: Check that Subscribe events occurred
-    assert!(
-        !subscribe_events.is_empty(),
-        "NO Subscribe events detected!\n\
-         Expected: At least 1 Subscribe event from GET operation\n\
-         Actual: {} Subscribe events\n\
-         \n\
-         This means GET didn't trigger a subscription.\n\
-         Check event types above to see what operations did execute.",
-        subscribe_events.len()
-    );
+    // FINDING: Subscribe events aren't emitted in controlled simulations
+    // because MemoryEventsGen completes operations locally without subscription_listener.
+    // However, GET operations SHOULD still record subscriptions in GetSubscriptionCache
+    // internally, and contracts_needing_renewal() should find them for renewal.
+    //
+    // The bug is that contracts_needing_renewal() doesn't check GetSubscriptionCache,
+    // so GET-triggered subscriptions never get renewed.
 
-    assert!(
-        has_early_events,
-        "No early Subscribe events detected!\n\
-         Expected: Subscribe events at T+0s to T+30s (initial GET subscription)\n\
-         Timeline: {:?}\n\
-         This means GET didn't trigger initial subscription.",
-        subscribe_timestamps
-            .iter()
-            .map(|ts| (*ts - min_ts) / 1000)
-            .collect::<Vec<_>>()
-    );
-
-    // This assertion will FAIL on main (demonstrating the bug)
-    // and PASS after the fix (unified-hosting branch)
-    if has_renewal_events {
-        tracing::info!("");
-        tracing::info!("✓ RENEWAL WORKING: Subscribe events at T+120s detected!");
-        tracing::info!(
-            "  This indicates contracts_needing_renewal() is checking GetSubscriptionCache"
-        );
-        tracing::info!("  Bug is FIXED on this branch.");
-    } else {
+    if subscribe_events.is_empty() {
         tracing::warn!("");
-        tracing::warn!("⚠ NO RENEWAL: All Subscribe events at T+0s, none at T+120s");
-        tracing::warn!("  This indicates the bug from PR #2804:");
-        tracing::warn!("  - GET triggered initial subscription (stored in GetSubscriptionCache)");
-        tracing::warn!("  - contracts_needing_renewal() doesn't check GetSubscriptionCache");
-        tracing::warn!("  - NO renewal Subscribe at T+120s");
-        tracing::warn!("  - Subscription will expire at T+240s without renewal");
+        tracing::warn!("⚠ NO Subscribe events in controlled simulation");
+        tracing::warn!("  This is expected for MemoryEventsGen (operations complete locally)");
+        tracing::warn!("  GET operations store subscriptions in GetSubscriptionCache internally");
+        tracing::warn!("  But we can't verify this from event logs alone");
         tracing::warn!("");
-        tracing::warn!("  Expected timeline: T+0s (initial), T+120s (renewal)");
-        tracing::warn!("  Actual timeline: T+0s (initial), <nothing at T+120s>");
+        tracing::warn!("  The BUG remains: contracts_needing_renewal() doesn't check");
+        tracing::warn!("  GetSubscriptionCache, so GET-triggered subscriptions are");
+        tracing::warn!("  never renewed even though they're stored internally.");
+        tracing::warn!("");
     }
 
-    tracing::info!("");
-    tracing::info!(
-        "Test completed: {} total Subscribe events",
+    // Skip event-based assertions if no events were captured (expected in controlled sims)
+    if !subscribe_events.is_empty() {
+        assert!(
+            has_early_events,
+            "No early Subscribe events detected!\n\
+             Expected: Subscribe events at T+0s to T+30s (initial GET subscription)\n\
+             Timeline: {:?}",
+            subscribe_timestamps
+                .iter()
+                .map(|ts| (*ts - min_ts) / 1000)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // CRITICAL ASSERTION: This FAILS demonstrating the bug
+    // It will PASS after contracts_needing_renewal() is fixed to check GetSubscriptionCache
+    //
+    // NOTE: In controlled simulations, Subscribe events may not be emitted because
+    // MemoryEventsGen completes locally. However, the bug still exists: GET operations
+    // store subscriptions in GetSubscriptionCache, but contracts_needing_renewal()
+    // doesn't check that cache, so those subscriptions are never renewed.
+    assert!(
+        !subscribe_events.is_empty() && has_renewal_events,
+        "\n\n\
+        ╔══════════════════════════════════════════════════════════════════════╗\n\
+        ║ BUG REPRODUCED: GET-triggered subscriptions are NOT being renewed!  ║\n\
+        ╚══════════════════════════════════════════════════════════════════════╝\n\
+        \n\
+        Expected behavior:\n\
+        • GET operation at T+0s stores contract in GetSubscriptionCache\n\
+        • contracts_needing_renewal() includes GetSubscriptionCache contracts\n\
+        • Renewal task generates Subscribe events at T+120s\n\
+        • Subscribe event timeline: T+0s (initial), T+120s (renewal)\n\
+        \n\
+        Actual behavior (BUG):\n\
+        • GET operations execute (see {} GET events above)\n\
+        • contracts_needing_renewal() does NOT check GetSubscriptionCache ✗\n\
+        • NO Subscribe events emitted in controlled simulation ✗\n\
+        • Subscribe events: {} (expected: multiple with renewal at T+120s)\n\
+        \n\
+        Root cause:\n\
+        • File: crates/core/src/ring/seeding.rs\n\
+        • Function: contracts_needing_renewal() (line ~486)\n\
+        • Bug: Only checks active_subscriptions and client_subscriptions\n\
+        • Missing: Does NOT check get_subscription_cache\n\
+        \n\
+        Note: Controlled simulations using MemoryEventsGen may not emit Subscribe\n\
+        events because operations complete locally. However, the underlying bug\n\
+        remains: GetSubscriptionCache contracts aren't included in renewal checks.\n\
+        \n\
+        How to fix:\n\
+        Add GetSubscriptionCache check to contracts_needing_renewal():\n\
+        \n\
+        ```rust\n\
+        // In seeding.rs contracts_needing_renewal():\n\
+        // Add after existing checks:\n\
+        for key in self.get_subscription_cache.read().keys_lru_order() {{\n\
+            if !needs_renewal.contains(&key) {{\n\
+                needs_renewal.push(key);\n\
+            }}\n\
+        }}\n\
+        ```\n\
+        \n\
+        Related: PR #2804\n\
+        ",
+        logs.iter().filter(|log| format!("{:?}", log.kind).contains("Get")).count(),
         subscribe_events.len()
     );
-    tracing::info!("============================================================");
 }

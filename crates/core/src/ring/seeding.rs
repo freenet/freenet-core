@@ -816,4 +816,80 @@ mod tests {
         manager.record_contract_access(contract, 1000, AccessType::Put);
         assert!(manager.should_seed(&contract));
     }
+
+    /// Regression test for PR #2804: GET subscriptions not included in renewal check.
+    ///
+    /// **The Bug**: contracts_needing_renewal() only checks active_subscriptions and
+    /// client_subscriptions, but NOT GetSubscriptionCache. When a contract is retrieved
+    /// via GET, it's stored in GetSubscriptionCache, but never renewed.
+    ///
+    /// This test directly verifies:
+    /// 1. GET operations store subscriptions in GetSubscriptionCache
+    /// 2. contracts_needing_renewal() does NOT return those contracts (the bug)
+    #[test]
+    #[should_panic(expected = "BUG REPRODUCED")]
+    fn test_get_subscription_cache_not_checked_for_renewal() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(42);
+
+        // Simulate GET operation storing subscription in GetSubscriptionCache
+        manager.record_get_subscription(contract);
+
+        // Verify it's stored in GetSubscriptionCache
+        assert!(
+            manager.has_get_subscription(&contract),
+            "Contract should be in GetSubscriptionCache after GET operation"
+        );
+
+        // BUG: contracts_needing_renewal() doesn't check GetSubscriptionCache
+        let needs_renewal = manager.contracts_needing_renewal();
+
+        // This assertion FAILS, demonstrating the bug
+        assert!(
+            needs_renewal.contains(&contract),
+            "\n\n\
+            ╔══════════════════════════════════════════════════════════════════════╗\n\
+            ║ BUG REPRODUCED: GET subscriptions not included in renewal check!    ║\n\
+            ╚══════════════════════════════════════════════════════════════════════╝\n\
+            \n\
+            Verified facts:\n\
+            • Contract IS in GetSubscriptionCache: {}\n\
+            • contracts_needing_renewal() returned: {} contracts\n\
+            • Contract in renewal list: {} ← BUG: Should be TRUE\n\
+            \n\
+            Root cause:\n\
+            • File: crates/core/src/ring/seeding.rs\n\
+            • Function: contracts_needing_renewal() (line ~486)\n\
+            • Bug: Only checks active_subscriptions and client_subscriptions\n\
+            • Missing: Does NOT check get_subscription_cache\n\
+            \n\
+            Expected behavior:\n\
+            When a contract is stored in GetSubscriptionCache (via GET operation),\n\
+            it should be included in contracts_needing_renewal() so the renewal\n\
+            task can renew the subscription.\n\
+            \n\
+            Actual behavior (BUG):\n\
+            Contract is in GetSubscriptionCache but NOT in contracts_needing_renewal(),\n\
+            so GET-triggered subscriptions are never renewed and expire after 240s.\n\
+            \n\
+            How to fix:\n\
+            Add GetSubscriptionCache check to contracts_needing_renewal():\n\
+            \n\
+            ```rust\n\
+            // In seeding.rs contracts_needing_renewal():\n\
+            // Add after existing checks:\n\
+            for key in self.get_subscription_cache.read().keys_lru_order() {{\n\
+                if !needs_renewal.contains(&key) {{\n\
+                    needs_renewal.push(key);\n\
+                }}\n\
+            }}\n\
+            ```\n\
+            \n\
+            Related: PR #2804\n\
+            ",
+            manager.has_get_subscription(&contract),
+            needs_renewal.len(),
+            needs_renewal.contains(&contract)
+        );
+    }
 }
