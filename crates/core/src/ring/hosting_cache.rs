@@ -26,14 +26,13 @@ pub const DEFAULT_MIN_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Type of access that adds/refreshes a contract in the hosting cache.
 ///
-/// These operations refresh the LRU position:
+/// Only certain operations should refresh the LRU position to prevent manipulation:
 /// - GET: User requesting the contract
 /// - PUT: User writing new state
 /// - SUBSCRIBE: User subscribing to updates
-/// - Local-initiated UPDATE: User modifying state (handled via touch_hosting)
 ///
-/// Remote-initiated UPDATEs do NOT refresh TTL because contract creators control
-/// when updates happen, which could be abused to keep contracts cached indefinitely.
+/// UPDATE is explicitly excluded because contract creators control when updates happen,
+/// which could be abused to keep contracts cached indefinitely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
     Get,
