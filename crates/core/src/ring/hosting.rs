@@ -1,35 +1,35 @@
-//! Simplified seeding and subscription management.
+//! Unified hosting and subscription management.
 //!
 //! # Architecture Overview
 //!
-//! This module manages contract seeding (which contracts a peer keeps available) and
+//! This module manages contract hosting (which contracts a peer keeps available) and
 //! subscription state (which contracts a peer is actively interested in).
 //!
-//! ## Key Simplification (2026-01 Refactor)
+//! ## Key Design (2026-01 Unified Hosting Refactor)
 //!
-//! Previously, this module maintained an explicit subscription tree with upstream/downstream
-//! relationships. This was complex and prone to race conditions. The new architecture:
+//! This module unifies the previously separate "seeding" and "GET subscription" caches
+//! into a single `HostingCache` that serves as the source of truth for which contracts
+//! this peer is hosting.
 //!
-//! 1. **Subscriptions are lease-based**: Active subscriptions have a lease that expires
+//! 1. **Hosting = subscription renewal**: All hosted contracts automatically get
+//!    their subscriptions renewed. This fixes the bug where GET-triggered subscriptions
+//!    would expire and never be renewed.
+//!
+//! 2. **Subscriptions are lease-based**: Active subscriptions have a lease that expires
 //!    unless renewed. Clients must re-subscribe periodically (every ~2 minutes).
 //!
-//! 2. **Update propagation uses proximity cache only**: Updates propagate via the proximity
-//!    cache mechanism, not an explicit subscription tree. Peers announce which contracts
-//!    they're seeding, and updates are broadcast to nearby seeders.
-//!
-//! 3. **Tree structure is implicit**: The subscription tree emerges from routing behavior
-//!    and seeding patterns, rather than being explicitly tracked.
+//! 3. **Single cache**: One `HostingCache` with byte-budget LRU and TTL protection.
 //!
 //! ## Data Flow
 //!
-//! - Subscribe request routes toward contract location
-//! - Peers along the route cache the contract (seeding)
-//! - Each seeding peer announces via proximity cache
-//! - Updates broadcast to all proximity neighbors with the contract
-//! - Subscriptions expire without renewal, triggering LRU-based eviction
+//! - GET/PUT/SUBSCRIBE operations add contracts to the hosting cache
+//! - All hosted contracts get subscription renewal via `contracts_needing_renewal()`
+//! - Active subscriptions prevent eviction from the hosting cache
+//! - TTL protects recently accessed contracts from premature eviction
 
-use super::get_subscription_cache::{GetSubscriptionCache, DEFAULT_MAX_ENTRIES, DEFAULT_MIN_TTL};
-use super::seeding_cache::{AccessType, SeedingCache};
+use super::hosting_cache::{
+    AccessType, HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL,
+};
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::InstantTimeSrc;
 use dashmap::{DashMap, DashSet};
@@ -43,9 +43,6 @@ use tracing::{debug, info};
 // =============================================================================
 // Constants
 // =============================================================================
-
-/// Default seeding cache budget: 100MB
-const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Subscription lease duration.
 /// Subscriptions automatically expire after this duration unless renewed.
@@ -93,10 +90,10 @@ pub struct SubscribeResult {
 }
 
 // =============================================================================
-// SeedingManager
+// HostingManager
 // =============================================================================
 
-/// Manages contract seeding and subscription state.
+/// Manages contract hosting and subscription state.
 ///
 /// # Subscription Model
 ///
@@ -106,26 +103,25 @@ pub struct SubscribeResult {
 /// - Clients must call `renew_subscription()` every `SUBSCRIPTION_RENEWAL_INTERVAL` (2 minutes)
 /// - Expired subscriptions are removed by `expire_stale_subscriptions()`
 ///
-/// # Seeding Model
+/// # Hosting Model
 ///
-/// Contracts are seeded based on access patterns:
-/// - GET, PUT, SUBSCRIBE operations add contracts to the seeding cache
-/// - Active subscriptions prevent eviction from the seeding cache
-/// - Inactive (expired) subscriptions allow LRU eviction
-pub(crate) struct SeedingManager {
+/// Contracts are hosted based on access patterns:
+/// - GET, PUT, SUBSCRIBE operations add contracts to the hosting cache
+/// - **All hosted contracts get subscription renewal** (the key fix)
+/// - Active subscriptions and client subscriptions prevent eviction
+/// - TTL protects recently accessed contracts from premature eviction
+pub(crate) struct HostingManager {
     /// Active subscriptions with lease expiry timestamps.
     /// Key: ContractKey, Value: expiry timestamp
     active_subscriptions: DashMap<ContractKey, Instant>,
 
     /// Contracts where a local client (WebSocket) is actively subscribed.
-    /// Prevents seeding cache eviction while client subscriptions exist.
+    /// Prevents hosting cache eviction while client subscriptions exist.
     client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
-    /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
-    seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
-
-    /// LRU+TTL cache of contracts we should auto-subscribe to based on GET access.
-    get_subscription_cache: RwLock<GetSubscriptionCache<InstantTimeSrc>>,
+    /// Unified hosting cache with byte-budget LRU and TTL protection.
+    /// This is the single source of truth for which contracts we're hosting.
+    hosting_cache: RwLock<HostingCache<InstantTimeSrc>>,
 
     /// Contracts with subscription requests currently in-flight.
     pending_subscription_requests: DashSet<ContractKey>,
@@ -134,19 +130,15 @@ pub(crate) struct SeedingManager {
     subscription_backoff: RwLock<TrackedBackoff<ContractKey>>,
 }
 
-impl SeedingManager {
+impl HostingManager {
     pub fn new() -> Self {
         let backoff_config =
             ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
-            seeding_cache: RwLock::new(SeedingCache::new(
-                DEFAULT_SEEDING_BUDGET_BYTES,
-                InstantTimeSrc::new(),
-            )),
-            get_subscription_cache: RwLock::new(GetSubscriptionCache::new(
-                DEFAULT_MAX_ENTRIES,
+            hosting_cache: RwLock::new(HostingCache::new(
+                DEFAULT_HOSTING_BUDGET_BYTES,
                 DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
@@ -202,8 +194,8 @@ impl SeedingManager {
 
     /// Unsubscribe from a contract.
     ///
-    /// Removes the active subscription. The contract may still be seeded
-    /// (in the seeding cache) until evicted by LRU.
+    /// Removes the active subscription. The contract may still be hosted
+    /// (in the hosting cache) until evicted by LRU.
     pub fn unsubscribe(&self, contract: &ContractKey) {
         if self.active_subscriptions.remove(contract).is_some() {
             debug!(%contract, "unsubscribe: removed active subscription");
@@ -365,10 +357,13 @@ impl SeedingManager {
     }
 
     // =========================================================================
-    // Seeding Cache Management
+    // Hosting Cache Management
     // =========================================================================
 
-    /// Record a contract access in the seeding cache.
+    /// Record a contract access in the hosting cache.
+    ///
+    /// This is the main entry point for adding contracts to the hosting cache.
+    /// ALL contracts in the hosting cache will have their subscriptions renewed.
     ///
     /// Returns contracts evicted from the cache (if any).
     pub fn record_contract_access(
@@ -377,50 +372,46 @@ impl SeedingManager {
         size_bytes: u64,
         access_type: AccessType,
     ) -> Vec<ContractKey> {
-        self.seeding_cache
+        self.hosting_cache
             .write()
             .record_access(key, size_bytes, access_type)
     }
 
-    /// Check if a contract is in the seeding cache.
-    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_cache.read().contains(key)
+    /// Check if a contract is in the hosting cache.
+    pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
+        self.hosting_cache.read().contains(key)
     }
 
-    /// Get the number of contracts in the seeding cache.
-    pub fn seeding_contracts_count(&self) -> usize {
-        self.seeding_cache.read().len()
+    /// Get the number of contracts in the hosting cache.
+    pub fn hosting_contracts_count(&self) -> usize {
+        self.hosting_cache.read().len()
     }
 
-    /// Check if we should continue seeding a contract.
+    /// Check if we should continue hosting a contract.
     ///
     /// Returns true if:
     /// - We have an active subscription, OR
     /// - We have client subscriptions, OR
-    /// - The contract is in our seeding cache
-    pub fn should_seed(&self, contract: &ContractKey) -> bool {
+    /// - The contract is in our hosting cache
+    pub fn should_host(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract)
             || self.has_client_subscriptions(contract.id())
-            || self.is_seeding_contract(contract)
+            || self.is_hosting_contract(contract)
     }
 
-    // =========================================================================
-    // GET Auto-Subscription Cache
-    // =========================================================================
-
-    /// Record a GET access for auto-subscription tracking.
-    pub fn record_get_subscription(&self, key: ContractKey) -> Vec<ContractKey> {
-        self.get_subscription_cache.write().record_access(key)
+    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    ///
+    /// Called when UPDATE is received for a hosted contract.
+    pub fn touch_hosting(&self, key: &ContractKey) {
+        self.hosting_cache.write().touch(key);
     }
 
-    /// Refresh a contract's access time in the GET subscription cache.
-    pub fn touch_get_subscription(&self, key: &ContractKey) {
-        self.get_subscription_cache.write().touch(key);
-    }
-
-    /// Sweep for expired entries in the GET subscription cache.
-    pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
-        self.get_subscription_cache.write().sweep_expired()
+    /// Sweep for expired entries in the hosting cache.
+    ///
+    /// Returns contracts evicted from this cache. Callers should check
+    /// `has_client_subscriptions()` before removing subscription state.
+    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
+        self.hosting_cache.write().sweep_expired()
     }
 
     // =========================================================================
@@ -482,21 +473,25 @@ impl SeedingManager {
     ///
     /// Returns contracts where:
     /// - We have an active subscription that will expire soon, OR
-    /// - We have client subscriptions but no active network subscription
+    /// - We have client subscriptions but no active network subscription, OR
+    /// - We have hosted contracts without active subscriptions (THE FIX)
+    ///
+    /// This is the key fix: ALL hosted contracts get subscription renewal,
+    /// not just those with client subscriptions or soon-to-expire subscriptions.
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
         let now = Instant::now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
 
         let mut needs_renewal = Vec::new();
 
-        // Contracts with soon-to-expire subscriptions
+        // 1. Contracts with soon-to-expire subscriptions
         for entry in self.active_subscriptions.iter() {
             if *entry.value() <= renewal_threshold && *entry.value() > now {
                 needs_renewal.push(*entry.key());
             }
         }
 
-        // Contracts with client subscriptions but no active network subscription
+        // 2. Contracts with client subscriptions but no active network subscription
         for entry in self.client_subscriptions.iter() {
             let instance_id = entry.key();
             // Find if we have an active subscription for this contract
@@ -505,9 +500,9 @@ impl SeedingManager {
                 .iter()
                 .any(|sub| sub.key().id() == instance_id && *sub.value() > now);
             if !has_active {
-                // Need to find the ContractKey - check seeding cache
+                // Need to find the ContractKey - check hosting cache
                 if let Some(contract) = self
-                    .seeding_cache
+                    .hosting_cache
                     .read()
                     .iter()
                     .find(|k| k.id() == instance_id)
@@ -517,6 +512,26 @@ impl SeedingManager {
                     }
                 }
             }
+        }
+
+        // 3. THE FIX: All hosted contracts should have subscriptions renewed
+        // This ensures GET-triggered subscriptions don't expire without renewal
+        for contract in self.hosting_cache.read().iter() {
+            // Skip if already in list
+            if needs_renewal.contains(&contract) {
+                continue;
+            }
+            // Skip if has active subscription that's not expiring soon
+            if self
+                .active_subscriptions
+                .get(&contract)
+                .map(|exp| *exp > renewal_threshold)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // This hosted contract needs subscription renewal
+            needs_renewal.push(contract);
         }
 
         needs_renewal
@@ -530,7 +545,7 @@ impl SeedingManager {
     ///
     /// In the simplified lease-based model (2026-01 refactor), we don't track
     /// upstream/downstream relationships. The snapshot shows which contracts
-    /// we're seeding and which have client subscriptions.
+    /// we're hosting and which have client subscriptions.
     #[allow(dead_code)] // Called from Ring methods that may be behind feature gates
     pub fn generate_topology_snapshot(
         &self,
@@ -542,9 +557,9 @@ impl SeedingManager {
         let mut snapshot = TopologySnapshot::new(peer_addr, location);
         let now = tokio::time::Instant::now();
 
-        // Add all seeded contracts
-        let seeding_cache = self.seeding_cache.read();
-        for contract_key in seeding_cache.iter() {
+        // Add all hosted contracts
+        let hosting_cache = self.hosting_cache.read();
+        for contract_key in hosting_cache.iter() {
             let is_subscribed = self
                 .active_subscriptions
                 .get(&contract_key)
@@ -560,22 +575,22 @@ impl SeedingManager {
                     contract_key,
                     upstream: None,     // No upstream tracking in lease-based model
                     downstream: vec![], // No downstream tracking in lease-based model
-                    is_seeding: true,
+                    is_seeding: true,   // TODO: Rename to is_hosting in topology_registry
                     has_client_subscriptions,
                 },
             );
 
-            // If subscribed but not seeding, add that too
+            // If subscribed but not hosting, add that too
             if !is_subscribed && has_client_subscriptions {
                 // Already added above
             }
         }
 
-        // Add subscribed contracts that might not be in seeding cache yet
+        // Add subscribed contracts that might not be in hosting cache yet
         for entry in self.active_subscriptions.iter() {
             if *entry.value() > now {
                 let contract_key = *entry.key();
-                if !seeding_cache.contains(&contract_key) {
+                if !hosting_cache.contains(&contract_key) {
                     let has_client_subscriptions =
                         self.client_subscriptions.contains_key(contract_key.id());
 
@@ -585,7 +600,7 @@ impl SeedingManager {
                             contract_key,
                             upstream: None,
                             downstream: vec![],
-                            is_seeding: false,
+                            is_seeding: false, // TODO: Rename to is_hosting
                             has_client_subscriptions,
                         },
                     );
@@ -602,7 +617,7 @@ impl SeedingManager {
     }
 }
 
-impl Default for SeedingManager {
+impl Default for HostingManager {
     fn default() -> Self {
         Self::new()
     }
@@ -626,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_creates_new_subscription() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         let result = manager.subscribe(contract);
@@ -637,7 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_renews_existing() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         let first = manager.subscribe(contract);
@@ -650,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscription() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         manager.subscribe(contract);
@@ -662,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_renew_subscription() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         // Renew non-existent subscription fails
@@ -675,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_subscribed_contracts() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let c1 = make_contract_key(1);
         let c2 = make_contract_key(2);
         let c3 = make_contract_key(3);
@@ -694,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_subscription_count() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
 
         assert_eq!(manager.active_subscription_count(), 0);
 
@@ -708,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_basic() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let instance_id = ContractInstanceId::new([1; 32]);
         let client_id = crate::client_events::ClientId::next();
 
@@ -723,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_multiple_clients() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let instance_id = ContractInstanceId::new([1; 32]);
         let client1 = crate::client_events::ClientId::next();
         let client2 = crate::client_events::ClientId::next();
@@ -742,22 +757,22 @@ mod tests {
     }
 
     #[test]
-    fn test_seeding_cache_basic() {
-        let manager = SeedingManager::new();
+    fn test_hosting_cache_basic() {
+        let manager = HostingManager::new();
         let key = make_contract_key(1);
 
-        assert!(!manager.is_seeding_contract(&key));
-        assert_eq!(manager.seeding_contracts_count(), 0);
+        assert!(!manager.is_hosting_contract(&key));
+        assert_eq!(manager.hosting_contracts_count(), 0);
 
         manager.record_contract_access(key, 1000, AccessType::Put);
 
-        assert!(manager.is_seeding_contract(&key));
-        assert_eq!(manager.seeding_contracts_count(), 1);
+        assert!(manager.is_hosting_contract(&key));
+        assert_eq!(manager.hosting_contracts_count(), 1);
     }
 
     #[test]
     fn test_subscription_backoff() {
-        let manager = SeedingManager::new();
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         // Initially can request
@@ -777,15 +792,33 @@ mod tests {
     }
 
     #[test]
-    fn test_should_seed() {
-        let manager = SeedingManager::new();
+    fn test_should_host() {
+        let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
-        // Not seeding initially
-        assert!(!manager.should_seed(&contract));
+        // Not hosting initially
+        assert!(!manager.should_host(&contract));
 
-        // Add to seeding cache
+        // Add to hosting cache
         manager.record_contract_access(contract, 1000, AccessType::Put);
-        assert!(manager.should_seed(&contract));
+        assert!(manager.should_host(&contract));
+    }
+
+    #[test]
+    fn test_contracts_needing_renewal_includes_hosted() {
+        // This is the key test for the bug fix
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        // Add to hosting cache (simulating GET operation)
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+
+        // Contract should need renewal even without active subscription
+        // (this is the bug fix - previously hosted contracts weren't included)
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            needs_renewal.contains(&contract),
+            "Hosted contracts should need subscription renewal"
+        );
     }
 }

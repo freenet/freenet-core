@@ -1554,11 +1554,21 @@ impl Operation for GetOp {
                                 %key,
                                 "Local state matches network state, skipping redundant cache"
                             );
-                            // State already cached and identical, mark as seeded if needed
-                            if !op_manager.ring.is_seeding_contract(&key) {
-                                tracing::debug!(tx = %id, %key, "Marking contract as seeded");
-                                let evicted =
-                                    op_manager.ring.record_get_access(key, value.size() as u64);
+
+                            // Check if already hosting BEFORE calling record_get_access
+                            // (which will add it to the cache)
+                            let was_already_hosting = op_manager.ring.is_hosting_contract(&key);
+
+                            // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                            // Previously, we only recorded access if !is_seeding_contract(),
+                            // which meant re-GETs on cached contracts wouldn't refresh the
+                            // hosting cache's TTL/LRU position, causing subscriptions to expire.
+                            let evicted =
+                                op_manager.ring.record_get_access(key, value.size() as u64);
+
+                            // Only do first-time hosting setup if newly hosting
+                            if !was_already_hosting {
+                                tracing::debug!(tx = %id, %key, "Contract newly hosted");
                                 super::announce_contract_cached(op_manager, &key).await;
 
                                 // Clean up interest tracking for evicted contracts
@@ -1586,21 +1596,27 @@ impl Operation for GetOp {
                                     )
                                     .await;
                                 }
+                            } else {
+                                tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                            }
 
-                                // Auto-subscribe to receive updates for this contract
-                                if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                    // Track in GET subscription cache for auto-subscription lifecycle.
-                                    // Note: We do NOT remove subscription state for evicted contracts here,
-                                    // as they may still have active client subscriptions. The background
-                                    // sweep task handles proper cleanup with client subscription checks.
-                                    let evicted = op_manager.ring.record_get_subscription(key);
-                                    if !evicted.is_empty() {
-                                        tracing::debug!(
-                                            evicted_count = evicted.len(),
-                                            "GET subscription cache evicted contracts (cleanup handled by background task)"
-                                        );
-                                    }
+                            // Auto-subscribe to receive updates for this contract
+                            // BUG FIX: ALWAYS refresh subscription tracking, not just when newly hosting
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                // Track in hosting cache for auto-subscription lifecycle.
+                                // Note: We do NOT remove subscription state for evicted contracts here,
+                                // as they may still have active client subscriptions. The background
+                                // sweep task handles proper cleanup with client subscription checks.
+                                let evicted = op_manager.ring.record_get_subscription(key);
+                                if !evicted.is_empty() {
+                                    tracing::debug!(
+                                        evicted_count = evicted.len(),
+                                        "Hosting cache evicted contracts (cleanup handled by background task)"
+                                    );
+                                }
 
+                                // Only start new subscription if not already subscribed
+                                if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
                                     // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                     let child_tx = super::start_subscription_request(
                                         op_manager, id, key, false,
@@ -1625,15 +1641,19 @@ impl Operation for GetOp {
                                 match res {
                                     ContractHandlerEvent::PutResponse { new_value: Ok(_), .. } => {
                                         tracing::debug!(tx = %id, %key, "Contract put at executor");
-                                        let is_subscribed_contract =
-                                            op_manager.ring.is_seeding_contract(&key);
 
-                                        // Start subscription if not already seeding
-                                        if !is_subscribed_contract {
-                                            tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
-                                            let evicted = op_manager
-                                                .ring
-                                                .record_get_access(key, value.size() as u64);
+                                        // Check if already hosting BEFORE calling record_get_access
+                                        let was_already_hosting = op_manager.ring.is_hosting_contract(&key);
+
+                                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                                        // This ensures re-GETs keep the hosting cache's TTL/LRU fresh.
+                                        tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Recording contract access in hosting cache");
+                                        let evicted = op_manager
+                                            .ring
+                                            .record_get_access(key, value.size() as u64);
+
+                                        // Only do first-time hosting setup if newly hosting
+                                        if !was_already_hosting {
                                             super::announce_contract_cached(op_manager, &key).await;
 
                                             // Clean up interest tracking for evicted contracts
@@ -1663,21 +1683,24 @@ impl Operation for GetOp {
                                                 )
                                                 .await;
                                             }
+                                        } else {
+                                            tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                                        }
 
-                                            // Auto-subscribe to receive updates for this contract
-                                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                                // Track in GET subscription cache for auto-subscription lifecycle.
-                                                // Note: We do NOT remove subscription state for evicted contracts here,
-                                                // as they may still have active client subscriptions. The background
-                                                // sweep task handles proper cleanup with client subscription checks.
-                                                let evicted = op_manager.ring.record_get_subscription(key);
-                                                if !evicted.is_empty() {
-                                                    tracing::debug!(
-                                                        evicted_count = evicted.len(),
-                                                        "GET subscription cache evicted contracts (cleanup handled by background task)"
-                                                    );
-                                                }
+                                        // Auto-subscribe to receive updates for this contract
+                                        // BUG FIX: ALWAYS refresh subscription tracking
+                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                            // Track in hosting cache for auto-subscription lifecycle.
+                                            let evicted = op_manager.ring.record_get_subscription(key);
+                                            if !evicted.is_empty() {
+                                                tracing::debug!(
+                                                    evicted_count = evicted.len(),
+                                                    "Hosting cache evicted contracts (cleanup handled by background task)"
+                                                );
+                                            }
 
+                                            // Only start new subscription if not already subscribed
+                                            if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
                                                 // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                                 let child_tx =
                                                     super::start_subscription_request(op_manager, id, key, false);
@@ -1967,9 +1990,9 @@ impl Operation for GetOp {
                         };
 
                         // Check if we already have this contract
-                        let should_cache = !op_manager.ring.is_seeding_contract(&key);
+                        let already_hosting = op_manager.ring.is_hosting_contract(&key);
 
-                        if should_cache {
+                        if !already_hosting {
                             // Use put_query to cache the contract
                             let _ = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
@@ -1979,10 +2002,11 @@ impl Operation for GetOp {
                                     contract: contract_to_cache,
                                 })
                                 .await;
-
-                            // Record get access for LRU cache management
-                            op_manager.ring.record_get_access(key, state.size() as u64);
                         }
+
+                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                        // This keeps the TTL/LRU position fresh for already-hosted contracts.
+                        op_manager.ring.record_get_access(key, state.size() as u64);
                     }
 
                     // Step 6: Emit telemetry

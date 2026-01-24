@@ -15,7 +15,7 @@ use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 
-pub use seeding::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
+pub use hosting::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -36,16 +36,20 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
-mod get_subscription_cache;
-pub use get_subscription_cache::AUTO_SUBSCRIBE_ON_GET;
+mod hosting;
+mod hosting_cache;
+pub use hosting_cache::AccessType;
 pub mod interest;
 mod live_tx;
 mod location;
 mod peer_connection_backoff;
 mod peer_key_location;
-mod seeding;
-mod seeding_cache;
 pub mod topology_registry;
+
+/// Whether to auto-subscribe to contracts on GET.
+/// When true, GET operations will automatically subscribe to the contract
+/// to receive updates. This is controlled by hosting cache eviction.
+pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
 
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
@@ -68,7 +72,7 @@ pub(crate) struct Ring {
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
-    seeding_manager: seeding::SeedingManager,
+    hosting_manager: hosting::HostingManager,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -189,7 +193,7 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            seeding_manager: seeding::SeedingManager::new(),
+            hosting_manager: hosting::HostingManager::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
@@ -516,7 +520,7 @@ impl Ring {
                 // Skip if there's still a client subscription - don't unsubscribe.
                 // We don't re-add to GET cache because the client subscription
                 // already protects this contract from cleanup.
-                if ring.seeding_manager.has_client_subscriptions(key.id()) {
+                if ring.hosting_manager.has_client_subscriptions(key.id()) {
                     tracing::debug!(
                         %key,
                         "Skipping cleanup for expired GET subscription - has client subscription"
@@ -578,7 +582,7 @@ impl Ring {
                 .unwrap_or(0.0);
 
             let snapshot = ring
-                .seeding_manager
+                .hosting_manager
                 .generate_topology_snapshot(peer_addr, location);
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
@@ -593,24 +597,41 @@ impl Ring {
         }
     }
 
-    /// Record a PUT access to a contract in the seeding cache.
+    /// Record a PUT access to a contract in the hosting cache.
+    /// Alias for host_contract with Put access type.
     pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
-        use seeding_cache::AccessType;
-        self.seeding_manager
-            .record_contract_access(key, size_bytes, AccessType::Put)
+        self.host_contract(key, size_bytes, AccessType::Put)
     }
 
-    /// Record a GET access to a contract in the seeding cache.
+    /// Record an access to a contract in the hosting cache.
+    ///
+    /// This adds or refreshes the contract in the unified hosting cache.
+    /// ALL contracts in the hosting cache get subscription renewal.
+    pub fn host_contract(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+        access_type: AccessType,
+    ) -> Vec<ContractKey> {
+        self.hosting_manager
+            .record_contract_access(key, size_bytes, access_type)
+    }
+
+    /// Record a GET access to a contract in the hosting cache.
     pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
-        use seeding_cache::AccessType;
-        self.seeding_manager
-            .record_contract_access(key, size_bytes, AccessType::Get)
+        self.host_contract(key, size_bytes, AccessType::Get)
     }
 
-    /// Whether this node already is seeding this contract (has it in cache).
+    /// Whether this node is hosting this contract (has it in cache).
+    #[inline]
+    pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.is_hosting_contract(key)
+    }
+
+    /// Alias for backwards compatibility - use is_hosting_contract instead.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_manager.is_seeding_contract(key)
+        self.is_hosting_contract(key)
     }
 
     pub fn record_request(
@@ -762,49 +783,55 @@ impl Ring {
     /// Creates a new subscription or renews an existing one. The subscription
     /// will expire after `SUBSCRIPTION_LEASE_DURATION` unless renewed.
     pub fn subscribe(&self, contract: ContractKey) -> SubscribeResult {
-        self.seeding_manager.subscribe(contract)
+        self.hosting_manager.subscribe(contract)
     }
 
     /// Unsubscribe from a contract.
     ///
-    /// Removes the active subscription. The contract may still be seeded
-    /// (in the seeding cache) until evicted by LRU.
+    /// Removes the active subscription. The contract may still be hosted
+    /// (in the hosting cache) until evicted by LRU.
     pub fn unsubscribe(&self, contract: &ContractKey) {
-        self.seeding_manager.unsubscribe(contract)
+        self.hosting_manager.unsubscribe(contract)
     }
 
     /// Check if we have an active (non-expired) subscription to a contract.
     pub fn is_subscribed(&self, contract: &ContractKey) -> bool {
-        self.seeding_manager.is_subscribed(contract)
+        self.hosting_manager.is_subscribed(contract)
     }
 
     /// Get all contracts with active subscriptions.
     pub fn get_subscribed_contracts(&self) -> Vec<ContractKey> {
-        self.seeding_manager.get_subscribed_contracts()
+        self.hosting_manager.get_subscribed_contracts()
     }
 
     /// Expire stale subscriptions and return the contracts that were expired.
     ///
     /// Should be called periodically by a background task.
     pub fn expire_stale_subscriptions(&self) -> Vec<ContractKey> {
-        self.seeding_manager.expire_stale_subscriptions()
+        self.hosting_manager.expire_stale_subscriptions()
     }
 
-    /// Check if we should continue seeding a contract.
+    /// Check if we should continue hosting a contract.
     ///
     /// Returns true if we have an active subscription, client subscriptions,
-    /// or the contract is in our seeding cache.
+    /// or the contract is in our hosting cache.
+    pub fn should_host(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.should_host(contract)
+    }
+
+    /// Alias for backwards compatibility - use should_host instead.
     pub fn should_seed(&self, contract: &ContractKey) -> bool {
-        self.seeding_manager.should_seed(contract)
+        self.should_host(contract)
     }
 
     /// Get contracts that need subscription renewal.
     ///
     /// Returns contracts where:
     /// - We have an active subscription that will expire soon, OR
-    /// - We have client subscriptions but no active network subscription
+    /// - We have client subscriptions but no active network subscription, OR
+    /// - We have hosted contracts without active subscriptions (THE FIX)
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
-        self.seeding_manager.contracts_needing_renewal()
+        self.hosting_manager.contracts_needing_renewal()
     }
 
     // ==================== Client Subscription Management ====================
@@ -817,7 +844,7 @@ impl Ring {
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
-        self.seeding_manager
+        self.hosting_manager
             .add_client_subscription(instance_id, client_id)
     }
 
@@ -829,21 +856,26 @@ impl Ring {
         &self,
         client_id: crate::client_events::ClientId,
     ) -> ClientDisconnectResult {
-        self.seeding_manager
+        self.hosting_manager
             .remove_client_from_all_subscriptions(client_id)
     }
 
-    /// Get the number of contracts in the seeding cache.
-    /// This is the actual count of contracts this node is caching/seeding.
+    /// Get the number of contracts in the hosting cache.
+    /// This is the actual count of contracts this node is caching/hosting.
+    pub fn hosting_contracts_count(&self) -> usize {
+        self.hosting_manager.hosting_contracts_count()
+    }
+
+    /// Alias for backwards compatibility - use hosting_contracts_count instead.
     pub fn seeding_contracts_count(&self) -> usize {
-        self.seeding_manager.seeding_contracts_count()
+        self.hosting_contracts_count()
     }
 
     /// Get subscription state for all contracts (for telemetry).
     ///
     /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
     pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
-        self.seeding_manager.get_subscription_states()
+        self.hosting_manager.get_subscription_states()
     }
 
     // ==================== Subscription Retry Spam Prevention ====================
@@ -851,47 +883,64 @@ impl Ring {
     /// Check if a subscription request can be made for a contract.
     /// Returns false if request is already pending or in backoff period.
     pub fn can_request_subscription(&self, contract: &ContractKey) -> bool {
-        self.seeding_manager.can_request_subscription(contract)
+        self.hosting_manager.can_request_subscription(contract)
     }
 
     /// Mark a subscription request as in-flight.
     /// Returns false if already pending.
     pub fn mark_subscription_pending(&self, contract: ContractKey) -> bool {
-        self.seeding_manager.mark_subscription_pending(contract)
+        self.hosting_manager.mark_subscription_pending(contract)
     }
 
     /// Mark a subscription request as completed.
     /// If success is false, applies exponential backoff.
     pub fn complete_subscription_request(&self, contract: &ContractKey, success: bool) {
-        self.seeding_manager
+        self.hosting_manager
             .complete_subscription_request(contract, success)
     }
 
-    // ==================== GET Auto-Subscription ====================
+    // ==================== Hosting Cache Management ====================
+
+    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    ///
+    /// Called when UPDATE is received for a hosted contract.
+    pub fn touch_hosting(&self, key: &ContractKey) {
+        self.hosting_manager.touch_hosting(key)
+    }
+
+    /// Sweep for expired entries in the hosting cache.
+    ///
+    /// Returns contracts evicted from this cache. Callers should check
+    /// `has_client_subscriptions()` before removing subscription state.
+    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
+        self.hosting_manager.sweep_expired_hosting()
+    }
+
+    // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
 
     /// Record a GET access for auto-subscription tracking.
     ///
-    /// Returns contracts evicted from this local cache. Callers should NOT automatically
-    /// remove subscription state for evicted contracts, as they may have active client
-    /// subscriptions. The background sweep task handles proper cleanup.
-    /// Called after successful GET to ensure we stay subscribed to accessed contracts.
+    /// Now delegated to the unified hosting cache. Returns contracts evicted from cache.
     pub fn record_get_subscription(&self, key: ContractKey) -> Vec<ContractKey> {
-        self.seeding_manager.record_get_subscription(key)
+        // Delegate to hosting cache - GET access is now tracked there
+        self.record_get_access(key, 0) // Size will be updated on actual cache
     }
 
-    /// Refresh a contract's access time in the GET subscription cache.
+    /// Refresh a contract's access time in the hosting cache.
     ///
     /// Called when UPDATE is received for an auto-subscribed contract.
     pub fn touch_get_subscription(&self, key: &ContractKey) {
-        self.seeding_manager.touch_get_subscription(key)
+        // Delegate to hosting cache
+        self.touch_hosting(key)
     }
 
-    /// Sweep for expired entries in the GET subscription cache.
+    /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns contracts evicted from this local cache. Callers should check
+    /// Returns contracts evicted from the cache. Callers should check
     /// `has_client_subscriptions()` before removing subscription state.
     pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
-        self.seeding_manager.sweep_expired_get_subscriptions()
+        // Delegate to hosting cache
+        self.sweep_expired_hosting()
     }
 
     // ==================== Connection Pruning ====================
@@ -1320,7 +1369,7 @@ impl Ring {
             .unwrap_or(0.0);
 
         let snapshot = self
-            .seeding_manager
+            .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
@@ -1338,7 +1387,7 @@ impl Ring {
             .unwrap_or(0.0);
 
         Some(
-            self.seeding_manager
+            self.hosting_manager
                 .generate_topology_snapshot(peer_addr, location),
         )
     }
