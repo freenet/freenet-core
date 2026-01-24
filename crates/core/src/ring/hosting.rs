@@ -719,17 +719,28 @@ impl HostingManager {
     /// This restores the hosting cache from persisted data, allowing the peer
     /// to continue hosting contracts after a restart without losing LRU state.
     ///
+    /// Also migrates legacy contracts that have state but no hosting metadata.
+    /// This is critical for network upgrades - without migration, all peers would
+    /// "forget" legacy contracts after upgrading.
+    ///
     /// # Arguments
     /// * `storage` - The storage backend (ReDb or SqlitePool)
+    /// * `code_hash_lookup` - Function to look up CodeHash from ContractInstanceId.
+    ///   Uses ContractStore which has the id->code_hash mapping.
     ///
     /// # Returns
-    /// The number of contracts loaded from storage.
+    /// The number of contracts loaded from storage (including migrated legacy contracts).
     #[cfg(feature = "redb")]
-    pub fn load_from_storage(
+    pub fn load_from_storage<F>(
         &self,
         storage: &crate::contract::storages::Storage,
-    ) -> Result<usize, redb::Error> {
+        code_hash_lookup: F,
+    ) -> Result<usize, redb::Error>
+    where
+        F: Fn(&ContractInstanceId) -> Option<freenet_stdlib::prelude::CodeHash>,
+    {
         use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        use std::collections::HashSet;
 
         let metadata_entries = storage.load_all_hosting_metadata()?;
         let now_ms = std::time::SystemTime::now()
@@ -740,6 +751,9 @@ impl HostingManager {
         let mut cache = self.hosting_cache.write();
         let mut loaded = 0;
 
+        // Track which instance IDs we've loaded (for legacy detection)
+        let mut loaded_instance_ids: HashSet<[u8; 32]> = HashSet::new();
+
         for (key_bytes, metadata) in metadata_entries {
             // Reconstruct ContractKey from instance ID bytes and code hash from metadata
             // key_bytes contains the ContractInstanceId (32 bytes)
@@ -747,6 +761,7 @@ impl HostingManager {
             if key_bytes.len() == 32 {
                 let mut instance_id_bytes = [0u8; 32];
                 instance_id_bytes.copy_from_slice(&key_bytes);
+                loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
                 let code_hash = CodeHash::new(metadata.code_hash);
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
@@ -766,25 +781,111 @@ impl HostingManager {
             }
         }
 
+        // Migrate legacy contracts: contracts in states table but without hosting metadata
+        // This ensures the network doesn't "forget" contracts after upgrading
+        let all_state_keys = storage.iter_all_state_keys().unwrap_or_default();
+        let mut migrated = 0;
+        let mut migration_failures = 0;
+
+        for key_bytes in all_state_keys {
+            if key_bytes.len() != 32 {
+                continue;
+            }
+
+            let mut instance_id_bytes = [0u8; 32];
+            instance_id_bytes.copy_from_slice(&key_bytes);
+
+            // Skip if already loaded with metadata
+            if loaded_instance_ids.contains(&instance_id_bytes) {
+                continue;
+            }
+
+            // Legacy contract: has state but no hosting metadata
+            let instance_id = ContractInstanceId::new(instance_id_bytes);
+
+            // Look up code_hash from ContractStore
+            if let Some(code_hash) = code_hash_lookup(&instance_id) {
+                let key = ContractKey::from_id_and_code(instance_id, code_hash);
+
+                // Get state size for the hosting cache
+                let size_bytes = storage.get_state_size(&key).unwrap_or(Some(0)).unwrap_or(0);
+
+                // Add to hosting cache as if it was just accessed via GET
+                // Use current time as last_access since we don't have historical data
+                cache.load_persisted_entry(
+                    key,
+                    size_bytes,
+                    super::hosting_cache::AccessType::Get,
+                    std::time::Duration::ZERO,
+                );
+
+                // Persist hosting metadata so future restarts don't need migration
+                let code_hash_bytes: [u8; 32] = *code_hash;
+                let metadata = crate::contract::storages::HostingMetadata::new(
+                    now_ms,
+                    0, // GET access type
+                    size_bytes,
+                    code_hash_bytes,
+                );
+                if let Err(e) = storage.store_hosting_metadata(&key, metadata) {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to persist hosting metadata for migrated legacy contract"
+                    );
+                }
+
+                migrated += 1;
+            } else {
+                // ContractStore doesn't know about this contract
+                // This shouldn't happen normally - means WASM code is missing
+                migration_failures += 1;
+                tracing::warn!(
+                    instance_id = %instance_id,
+                    "Legacy contract has state but no WASM code - cannot migrate"
+                );
+            }
+        }
+
         // Sort LRU order by last_accessed time
         cache.finalize_loading();
 
-        tracing::info!(
-            loaded_contracts = loaded,
-            total_bytes = cache.current_bytes(),
-            "Loaded hosting cache from storage"
-        );
+        let total_loaded = loaded + migrated;
 
-        Ok(loaded)
+        if migrated > 0 || migration_failures > 0 {
+            tracing::info!(
+                loaded_with_metadata = loaded,
+                migrated_legacy = migrated,
+                migration_failures = migration_failures,
+                total_contracts = total_loaded,
+                total_bytes = cache.current_bytes(),
+                "Loaded hosting cache from storage (with legacy migration)"
+            );
+        } else {
+            tracing::info!(
+                loaded_contracts = total_loaded,
+                total_bytes = cache.current_bytes(),
+                "Loaded hosting cache from storage"
+            );
+        }
+
+        Ok(total_loaded)
     }
 
     /// Load hosting metadata from storage during startup (sqlite version).
+    ///
+    /// Also migrates legacy contracts that have state but no hosting metadata.
     #[cfg(all(feature = "sqlite", not(feature = "redb")))]
-    pub async fn load_from_storage(
+    pub async fn load_from_storage<F>(
         &self,
         storage: &crate::contract::storages::Storage,
-    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError> {
+        code_hash_lookup: F,
+    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError>
+    where
+        F: Fn(&ContractInstanceId) -> Option<freenet_stdlib::prelude::CodeHash>,
+    {
         use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        use std::collections::HashSet;
 
         let metadata_entries = storage.load_all_hosting_metadata().await?;
         let now_ms = std::time::SystemTime::now()
@@ -795,6 +896,9 @@ impl HostingManager {
         let mut cache = self.hosting_cache.write();
         let mut loaded = 0;
 
+        // Track which instance IDs we've loaded (for legacy detection)
+        let mut loaded_instance_ids: HashSet<[u8; 32]> = HashSet::new();
+
         for (key_bytes, metadata) in metadata_entries {
             // Reconstruct ContractKey from instance ID bytes and code hash from metadata
             // key_bytes contains the ContractInstanceId (32 bytes)
@@ -802,6 +906,7 @@ impl HostingManager {
             if key_bytes.len() == 32 {
                 let mut instance_id_bytes = [0u8; 32];
                 instance_id_bytes.copy_from_slice(&key_bytes);
+                loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
                 let code_hash = CodeHash::new(metadata.code_hash);
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
@@ -821,16 +926,95 @@ impl HostingManager {
             }
         }
 
+        // Migrate legacy contracts: contracts in states table but without hosting metadata
+        let all_state_keys = storage.iter_all_state_keys().await.unwrap_or_default();
+        let mut migrated = 0;
+        let mut migration_failures = 0;
+
+        for key_bytes in all_state_keys {
+            if key_bytes.len() != 32 {
+                continue;
+            }
+
+            let mut instance_id_bytes = [0u8; 32];
+            instance_id_bytes.copy_from_slice(&key_bytes);
+
+            // Skip if already loaded with metadata
+            if loaded_instance_ids.contains(&instance_id_bytes) {
+                continue;
+            }
+
+            // Legacy contract: has state but no hosting metadata
+            let instance_id = ContractInstanceId::new(instance_id_bytes);
+
+            // Look up code_hash from ContractStore
+            if let Some(code_hash) = code_hash_lookup(&instance_id) {
+                let key = ContractKey::from_id_and_code(instance_id, code_hash);
+
+                // Get state size for the hosting cache
+                let size_bytes = storage
+                    .get_state_size(&key)
+                    .await
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+
+                // Add to hosting cache as if it was just accessed via GET
+                cache.load_persisted_entry(
+                    key,
+                    size_bytes,
+                    super::hosting_cache::AccessType::Get,
+                    std::time::Duration::ZERO,
+                );
+
+                // Persist hosting metadata so future restarts don't need migration
+                let code_hash_bytes: [u8; 32] = *code_hash;
+                let metadata = crate::contract::storages::sqlite::HostingMetadata::new(
+                    now_ms,
+                    0, // GET access type
+                    size_bytes,
+                    code_hash_bytes,
+                );
+                if let Err(e) = storage.store_hosting_metadata(&key, metadata).await {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to persist hosting metadata for migrated legacy contract"
+                    );
+                }
+
+                migrated += 1;
+            } else {
+                migration_failures += 1;
+                tracing::warn!(
+                    instance_id = %instance_id,
+                    "Legacy contract has state but no WASM code - cannot migrate"
+                );
+            }
+        }
+
         // Sort LRU order by last_accessed time
         cache.finalize_loading();
 
-        tracing::info!(
-            loaded_contracts = loaded,
-            total_bytes = cache.current_bytes(),
-            "Loaded hosting cache from storage"
-        );
+        let total_loaded = loaded + migrated;
 
-        Ok(loaded)
+        if migrated > 0 || migration_failures > 0 {
+            tracing::info!(
+                loaded_with_metadata = loaded,
+                migrated_legacy = migrated,
+                migration_failures = migration_failures,
+                total_contracts = total_loaded,
+                total_bytes = cache.current_bytes(),
+                "Loaded hosting cache from storage (with legacy migration)"
+            );
+        } else {
+            tracing::info!(
+                loaded_contracts = total_loaded,
+                total_bytes = cache.current_bytes(),
+                "Loaded hosting cache from storage"
+            );
+        }
+
+        Ok(total_loaded)
     }
 }
 

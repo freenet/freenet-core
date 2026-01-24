@@ -645,22 +645,45 @@ impl Ring {
     /// Load hosting cache from persisted storage.
     ///
     /// Call this during startup after storage is available to restore
-    /// the hosting cache from the previous run.
+    /// the hosting cache from the previous run. Also migrates legacy contracts
+    /// that have state but no hosting metadata.
+    ///
+    /// # Arguments
+    /// * `storage` - The storage backend
+    /// * `code_hash_lookup` - Function to look up CodeHash from ContractInstanceId.
+    ///   Uses ContractStore which has the id->code_hash mapping.
     #[cfg(feature = "redb")]
-    pub fn load_hosting_cache(
+    pub fn load_hosting_cache<F>(
         &self,
         storage: &crate::contract::storages::Storage,
-    ) -> Result<usize, redb::Error> {
-        self.hosting_manager.load_from_storage(storage)
+        code_hash_lookup: F,
+    ) -> Result<usize, redb::Error>
+    where
+        F: Fn(
+            &freenet_stdlib::prelude::ContractInstanceId,
+        ) -> Option<freenet_stdlib::prelude::CodeHash>,
+    {
+        self.hosting_manager
+            .load_from_storage(storage, code_hash_lookup)
     }
 
     /// Load hosting cache from persisted storage (sqlite version).
+    ///
+    /// Also migrates legacy contracts that have state but no hosting metadata.
     #[cfg(all(feature = "sqlite", not(feature = "redb")))]
-    pub async fn load_hosting_cache(
+    pub async fn load_hosting_cache<F>(
         &self,
         storage: &crate::contract::storages::Storage,
-    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError> {
-        self.hosting_manager.load_from_storage(storage).await
+        code_hash_lookup: F,
+    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError>
+    where
+        F: Fn(
+            &freenet_stdlib::prelude::ContractInstanceId,
+        ) -> Option<freenet_stdlib::prelude::CodeHash>,
+    {
+        self.hosting_manager
+            .load_from_storage(storage, code_hash_lookup)
+            .await
     }
 
     pub fn record_request(

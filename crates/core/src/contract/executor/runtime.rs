@@ -292,6 +292,18 @@ impl RuntimePool {
     pub fn state_store(&self) -> &StateStore<Storage> {
         &self.shared_state_store
     }
+
+    /// Look up a code hash from an instance ID.
+    /// Used for legacy contract migration during startup.
+    pub fn code_hash_from_id(&self, instance_id: &ContractInstanceId) -> Option<CodeHash> {
+        // Try to find the code hash in any available executor
+        self.runtimes.iter().flatten().find_map(|executor| {
+            executor
+                .runtime
+                .contract_store
+                .code_hash_from_id(instance_id)
+        })
+    }
 }
 
 impl ContractExecutor for RuntimePool {
