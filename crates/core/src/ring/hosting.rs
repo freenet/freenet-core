@@ -45,13 +45,19 @@ use tracing::{debug, info};
 // Constants
 // =============================================================================
 
-/// Subscription lease duration.
-/// Subscriptions automatically expire after this duration unless renewed.
-pub const SUBSCRIPTION_LEASE_DURATION: Duration = Duration::from_secs(240); // 4 minutes
-
-/// Recommended renewal interval for subscriptions.
+/// Renewal interval for subscriptions.
 /// Clients should renew subscriptions at this interval to prevent expiry.
 pub const SUBSCRIPTION_RENEWAL_INTERVAL: Duration = Duration::from_secs(120); // 2 minutes
+
+/// Multiplier for lease duration relative to renewal interval.
+/// Gives this many renewal attempts before subscription expires.
+pub const LEASE_RENEWAL_MULTIPLIER: u32 = 4;
+
+/// Subscription lease duration.
+/// Subscriptions automatically expire after this duration unless renewed.
+/// Computed as LEASE_RENEWAL_MULTIPLIER × SUBSCRIPTION_RENEWAL_INTERVAL.
+pub const SUBSCRIPTION_LEASE_DURATION: Duration =
+    Duration::from_secs(SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * LEASE_RENEWAL_MULTIPLIER as u64); // 8 minutes
 
 /// Initial backoff duration for subscription retries.
 const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(30);
@@ -100,7 +106,7 @@ pub struct SubscribeResult {
 ///
 /// Subscriptions are lease-based with automatic expiry:
 /// - `subscribe()` creates or renews a subscription with a lease
-/// - Subscriptions expire after `SUBSCRIPTION_LEASE_DURATION` (4 minutes)
+/// - Subscriptions expire after `SUBSCRIPTION_LEASE_DURATION` (8 minutes)
 /// - Clients must call `renew_subscription()` every `SUBSCRIPTION_RENEWAL_INTERVAL` (2 minutes)
 /// - Expired subscriptions are removed by `expire_stale_subscriptions()`
 ///
