@@ -1345,12 +1345,14 @@ impl Ring {
 
     /// Test-only: Check if a contract is in the GET subscription cache.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn has_get_subscription(&self, key: &ContractKey) -> bool {
         self.seeding_manager.has_get_subscription(key)
     }
 
     /// Test-only: Get all contracts in the GET subscription cache.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn get_subscription_cache_keys(&self) -> Vec<ContractKey> {
         self.seeding_manager.get_subscription_cache_keys()
     }

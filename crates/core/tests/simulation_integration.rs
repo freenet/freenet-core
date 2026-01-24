@@ -197,6 +197,7 @@ impl TestConfig {
     }
 
     /// Add latency jitter simulation.
+    #[allow(dead_code)]
     fn with_latency(mut self, min: Duration, max: Duration) -> Self {
         self.latency_range = Some(min..max);
         self
@@ -1554,7 +1555,7 @@ fn test_topology_single_seeder() {
 fn test_concurrent_updates_convergence() {
     // Use a specific seed for reproducibility
     // This seed was chosen to produce good coverage of concurrent update scenarios
-    TestConfig::medium("concurrent-updates-convergence", 0xC0_C0_BEEF_1234)
+    TestConfig::medium("concurrent-updates-convergence", 0xC0C0_BEEF_1234)
         .with_gateways(2) // Multiple gateways for richer topology
         .with_nodes(6) // 6 regular nodes for concurrent updates
         .with_max_contracts(3) // Few contracts = more updates per contract
@@ -2968,10 +2969,11 @@ fn test_long_running_1h_deterministic() {
     );
 
     tracing::info!("test_long_running_1h_deterministic PASSED");
+}
 
+// =============================================================================
 // Subscription Renewal Tests (PR #2804)
 // =============================================================================
-
 
 /// Regression test for subscription renewal bug (PR #2804).
 ///
@@ -3280,7 +3282,9 @@ fn test_get_only_subscription_renewal_full_simulation() {
         \n\
         Related: PR #2804\n\
         ",
-        logs.iter().filter(|log| format!("{:?}", log.kind).contains("Get")).count(),
+        logs.iter()
+            .filter(|log| format!("{:?}", log.kind).contains("Get"))
+            .count(),
         subscribe_events.len()
     );
 }

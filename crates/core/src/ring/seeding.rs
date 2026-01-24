@@ -631,6 +631,7 @@ impl SeedingManager {
     }
 
     /// Test-only: Get all contracts in the GET subscription cache.
+    #[allow(dead_code)]
     pub fn get_subscription_cache_keys(&self) -> Vec<ContractKey> {
         self.get_subscription_cache.read().keys_lru_order()
     }
