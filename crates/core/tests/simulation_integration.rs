@@ -3003,12 +3003,14 @@ fn test_get_only_subscription_renewal() {
 
     let rt = create_runtime();
 
-    // Create SimNetwork
+    // Create SimNetwork with more nodes to force network subscription path
+    // With only 1-2 nodes, subscriptions complete locally without network registration
+    // More nodes ensures Subscribe goes through network path -> calls ring.subscribe()
     let (sim, logs_handle) = rt.block_on(async {
         let sim = SimNetwork::new(
             "get-only-renewal",
             1,  // gateways
-            2,  // nodes - minimal for testing
+            6,  // nodes - larger network to force network subscription path
             7,  // ring_max_htl
             3,  // rnd_if_htl_above
             10, // max_connections
@@ -3025,13 +3027,18 @@ fn test_get_only_subscription_renewal() {
     let state = SimOperation::create_test_state(42);
     let contract_id = *contract.key().id();
 
-    // Create controlled operations:
-    // 1. PUT at gateway without subscribe (creates the contract)
-    // 2. Explicit Subscribe at node (tests subscription renewal logic)
+    // Create controlled operations with delays to ensure network discovery:
+    // 1. PUT at gateway (creates the contract)
+    // 2. DELAY - allow network discovery and contract propagation
+    // 3. Subscribe at a different node (should go through network path)
     //
-    // Note: We now use explicit Subscribe after fixing the notification_channel issue
-    // Previously, Subscribe operations silently failed without notification_channel
-    // Fix: client_events/mod.rs now creates a dummy channel if notification_channel is missing
+    // The delay ensures:
+    // - Nodes have discovered each other (Connect messages exchanged)
+    // - Contract has propagated through the network
+    // - Subscribe operation can't complete locally (forces network path)
+    //
+    // Network path calls ring.subscribe() which registers in active_subscriptions
+    // This subscription is then subject to renewal via contracts_needing_renewal()
     let operations = vec![
         ScheduledOperation::new(
             NodeLabel::gateway("get-only-renewal", 0),
@@ -3041,28 +3048,34 @@ fn test_get_only_subscription_renewal() {
                 subscribe: false, // Gateway just creates the contract
             },
         ),
+        // Note: We don't add explicit delay operation - the simulation duration
+        // and post-operation wait ensure enough time for network discovery
         ScheduledOperation::new(
-            NodeLabel::node("get-only-renewal", 0),
-            SimOperation::Subscribe { contract_id }, // Explicit Subscribe for renewal testing
+            NodeLabel::node("get-only-renewal", 3), // Use node 3 (not 0) for diversity
+            SimOperation::Subscribe { contract_id }, // Should go through network path
         ),
     ];
 
     tracing::info!("============================================================");
     tracing::info!("Starting controlled simulation - subscription renewals");
+    tracing::info!("Network: 1 gateway + 6 nodes (forces network subscription path)");
     tracing::info!("Operations scheduled:");
-    tracing::info!("  1. PUT contract at gateway (no subscribe)");
-    tracing::info!("  2. Subscribe at node (tests renewal logic)");
+    tracing::info!("  1. PUT contract at gateway-0 (no subscribe)");
+    tracing::info!("  2. Subscribe at node-3 (forces network path -> ring.subscribe())");
     tracing::info!("Duration: 5 minutes (exceeds {SUBSCRIPTION_LEASE_DURATION:?} lease)");
     tracing::info!("Expected: Subscribe events at T+0s, renewals at T+120s, T+240s");
     tracing::info!("============================================================");
 
     // Run simulation for 5 minutes with controlled operations
-    // Wait time after operations allows the network to process and for renewals to occur
+    // Longer post-operation wait ensures:
+    // - Network discovery completes (Connect messages)
+    // - Subscribe goes through network path (not local completion)
+    // - Renewal task has time to run (30-60s initial delay + 30s intervals)
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
         Duration::from_secs(300), // 5 minutes total
-        Duration::from_secs(290), // Wait 290s after operations complete
+        Duration::from_secs(295), // Wait 295s after operations (almost the full duration)
     );
 
     assert!(

@@ -489,11 +489,12 @@ async fn complete_local_subscription(
 
     // Emit telemetry for local subscribe completion
     // This allows testing/observability of local subscriptions (e.g., in controlled simulations)
+    let own_loc = op_manager.ring.connection_manager.own_location();
     if let Some(event) = NetEventLog::subscribe_success(
         &id,
         &op_manager.ring,
         key,
-        op_manager.ring.own_location(),
+        own_loc,
         Some(0), // hop_count = 0 for local subscriptions
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
