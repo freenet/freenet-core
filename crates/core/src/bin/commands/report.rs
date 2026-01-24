@@ -22,6 +22,10 @@ use tokio_tungstenite::connect_async;
 const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
 /// Only include log entries from the last 30 minutes
 const LOG_RETENTION_MINUTES: i64 = 30;
+/// Maximum size for all logs combined in the report (2 MB)
+const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum length for a single log line (10 KB) - longer lines are truncated
+const MAX_LINE_LENGTH: usize = 10 * 1024;
 /// Default WebSocket API port
 const DEFAULT_WS_API_PORT: u16 = 7509;
 /// Timeout for WebSocket connection and queries
@@ -429,6 +433,7 @@ fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
 
 /// Read and merge multiple log files, filtering to the last 30 minutes.
 /// Returns (merged_content, total_original_size).
+/// Applies MAX_TOTAL_LOG_SIZE limit, keeping most recent entries if exceeded.
 fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
     if files.is_empty() {
         return (None, 0);
@@ -446,10 +451,29 @@ fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
     }
 
     if all_lines.is_empty() {
-        (None, total_original_size)
-    } else {
-        (Some(all_lines.join("\n")), total_original_size)
+        return (None, total_original_size);
     }
+
+    let merged = all_lines.join("\n");
+
+    // If total size exceeds limit, truncate from beginning to keep most recent logs
+    let result = if merged.len() > MAX_TOTAL_LOG_SIZE {
+        let skip_bytes = merged.len() - MAX_TOTAL_LOG_SIZE;
+        // Find next newline to avoid cutting mid-line
+        let truncate_at = merged[skip_bytes..]
+            .find('\n')
+            .map(|pos| skip_bytes + pos + 1)
+            .unwrap_or(skip_bytes);
+        format!(
+            "[... {} bytes truncated to fit size limit ...]\n{}",
+            truncate_at,
+            &merged[truncate_at..]
+        )
+    } else {
+        merged
+    };
+
+    (Some(result), total_original_size)
 }
 
 /// Read log file, filtering to entries from the last 30 minutes.
@@ -492,6 +516,16 @@ fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
         // Include this line if we're within the time window
         // (lines without timestamps inherit the state from the previous timestamped line)
         if include_line {
+            // Truncate very long lines (e.g., delegates logging full state as byte arrays)
+            let line = if line.len() > MAX_LINE_LENGTH {
+                format!(
+                    "{}... [truncated, {} total bytes]",
+                    &line[..MAX_LINE_LENGTH],
+                    line.len()
+                )
+            } else {
+                line
+            };
             filtered_lines.push(line);
         }
     }
