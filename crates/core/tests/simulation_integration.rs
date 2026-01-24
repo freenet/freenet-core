@@ -3026,17 +3026,12 @@ fn test_get_only_subscription_renewal() {
     let contract_id = *contract.key().id();
 
     // Create controlled operations:
-    // 1. PUT at gateway without subscribe
-    // 2. PUT at node with subscribe=true (creates subscription for renewal testing)
+    // 1. PUT at gateway without subscribe (creates the contract)
+    // 2. Explicit Subscribe at node (tests subscription renewal logic)
     //
-    // Note: We use PUT with subscribe=true instead of explicit Subscribe because:
-    // - MemoryEventsGen doesn't provide notification_channel for Subscribe requests
-    // - Without notification_channel, Subscribe operations silently fail (return Ok(None))
-    // - PUT with subscribe=true only logs a warning but continues the operation
-    // - This allows us to test subscription renewal logic
-    //
-    // See: crates/core/src/client_events/mod.rs:1433-1441 (Subscribe requires notification_channel)
-    //      crates/core/src/client_events/mod.rs:814-832 (PUT warns but continues)
+    // Note: We now use explicit Subscribe after fixing the notification_channel issue
+    // Previously, Subscribe operations silently failed without notification_channel
+    // Fix: client_events/mod.rs now creates a dummy channel if notification_channel is missing
     let operations = vec![
         ScheduledOperation::new(
             NodeLabel::gateway("get-only-renewal", 0),
@@ -3048,11 +3043,7 @@ fn test_get_only_subscription_renewal() {
         ),
         ScheduledOperation::new(
             NodeLabel::node("get-only-renewal", 0),
-            SimOperation::Put {
-                contract: contract.clone(),
-                state: state.clone(),
-                subscribe: true, // Node creates subscription for renewal testing
-            },
+            SimOperation::Subscribe { contract_id }, // Explicit Subscribe for renewal testing
         ),
     ];
 
@@ -3060,7 +3051,7 @@ fn test_get_only_subscription_renewal() {
     tracing::info!("Starting controlled simulation - subscription renewals");
     tracing::info!("Operations scheduled:");
     tracing::info!("  1. PUT contract at gateway (no subscribe)");
-    tracing::info!("  2. PUT contract at node (with subscribe=true)");
+    tracing::info!("  2. Subscribe at node (tests renewal logic)");
     tracing::info!("Duration: 5 minutes (exceeds {SUBSCRIPTION_LEASE_DURATION:?} lease)");
     tracing::info!("Expected: Subscribe events at T+0s, renewals at T+120s, T+240s");
     tracing::info!("============================================================");

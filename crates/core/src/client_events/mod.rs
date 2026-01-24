@@ -1430,14 +1430,22 @@ async fn process_open_request(
                             "Received SUBSCRIBE request from client"
                         );
 
-                        let Some(subscriber_listener) = subscription_listener else {
-                            tracing::error!(
+                        // For Subscribe, notification_channel is optional in controlled/internal scenarios
+                        // (e.g., simulation tests, internal operations)
+                        let subscriber_listener = if let Some(listener) = subscription_listener {
+                            listener
+                        } else {
+                            tracing::warn!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 contract = %key,
-                                "No subscriber listener for SUBSCRIBE request"
+                                "No notification channel available for SUBSCRIBE - using dummy channel (testing/internal operation)"
                             );
-                            return Ok(None);
+                            // Create a dummy channel that discards updates
+                            // This allows Subscribe operations to proceed in testing scenarios
+                            // while maintaining consistency with PUT behavior
+                            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                            tx
                         };
 
                         let register_listener = op_manager
