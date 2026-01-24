@@ -483,7 +483,7 @@ impl HostingManager {
 
     /// Touch a contract in the hosting cache (refresh TTL without adding).
     ///
-    /// Called when UPDATE is received for a hosted contract.
+    /// Called when GET or SUBSCRIBE refreshes a hosted contract's TTL.
     pub fn touch_hosting(&self, key: &ContractKey) {
         self.hosting_cache.write().touch(key);
     }
