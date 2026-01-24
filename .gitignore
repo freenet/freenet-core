@@ -69,3 +69,4 @@ test-results/
 .worktrees/
 worktrees/
 logs/
+.grepai/

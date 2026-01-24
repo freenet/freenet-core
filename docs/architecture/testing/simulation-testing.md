@@ -241,15 +241,16 @@ This configuration:
 
 ## Nightly Test Suite
 
-The nightly workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios:
+The nightly workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios.
+All fdev tests include realistic network conditions (10-50ms jitter) and run for 1+ hours of virtual time.
 
-| Test | Nodes | Virtual Time | Wall Clock | Fault Injection |
-|------|-------|--------------|------------|-----------------|
-| Medium scale | 50 | ~400s (2000 events) | ~30s | None |
-| Large scale | 500 | ~2000s (10000 events) | ~5min | None |
-| Fault tolerance | 30 | ~200s (1000 events) | ~20s | 15% message loss |
-| High latency | 14 | ~100s (500 events) | ~15s | 50-200ms latency |
-| **Long-running 1h** | 8 | **3600s (1 hour)** | **~3 min** | 10-50ms jitter |
+| Test | Nodes | Virtual Time | Fault Injection |
+|------|-------|--------------|-----------------|
+| Medium scale (×2 seeds) | 50 | 1 hour | 10-50ms jitter |
+| Large scale | 500 | **3 hours** | 10-50ms jitter |
+| Fault tolerance | 30 | 1 hour | 15% loss + 10-50ms jitter |
+| High latency | 14 | 1 hour | 50-200ms latency |
+| Long-running (Rust test) | 8 | 1 hour | 10-50ms jitter |
 
 All tests require convergence (eventual consistency).
 
