@@ -3026,36 +3026,43 @@ fn test_get_only_subscription_renewal() {
     let contract_id = *contract.key().id();
 
     // Create controlled operations:
-    // 1. PUT without subscribe (gateway creates the contract)
-    // 2. Explicit Subscribe (tests renewal logic)
+    // 1. PUT at gateway without subscribe
+    // 2. PUT at node with subscribe=true (creates subscription for renewal testing)
     //
-    // Note: We use explicit Subscribe instead of relying on GET auto-subscription because:
-    // - GET auto-subscription has complex preconditions (successful routing, local caching, etc.)
-    // - In a minimal network (1 gateway, 2 nodes), GET may not complete successfully
-    // - The bug we're testing is about renewal logic in contracts_needing_renewal()
-    // - An explicit Subscribe still goes through the same renewal code path
+    // Note: We use PUT with subscribe=true instead of explicit Subscribe because:
+    // - MemoryEventsGen doesn't provide notification_channel for Subscribe requests
+    // - Without notification_channel, Subscribe operations silently fail (return Ok(None))
+    // - PUT with subscribe=true only logs a warning but continues the operation
+    // - This allows us to test subscription renewal logic
+    //
+    // See: crates/core/src/client_events/mod.rs:1433-1441 (Subscribe requires notification_channel)
+    //      crates/core/src/client_events/mod.rs:814-832 (PUT warns but continues)
     let operations = vec![
         ScheduledOperation::new(
             NodeLabel::gateway("get-only-renewal", 0),
             SimOperation::Put {
                 contract: contract.clone(),
                 state: state.clone(),
-                subscribe: false, // No subscription on PUT
+                subscribe: false, // Gateway just creates the contract
             },
         ),
         ScheduledOperation::new(
             NodeLabel::node("get-only-renewal", 0),
-            SimOperation::Subscribe { contract_id }, // Explicit subscribe to test renewals
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true, // Node creates subscription for renewal testing
+            },
         ),
     ];
 
     tracing::info!("============================================================");
     tracing::info!("Starting controlled simulation - subscription renewals");
     tracing::info!("Operations scheduled:");
-    tracing::info!("  1. PUT contract (no subscribe)");
-    tracing::info!("  2. Subscribe to contract (tests renewal logic)");
+    tracing::info!("  1. PUT contract at gateway (no subscribe)");
+    tracing::info!("  2. PUT contract at node (with subscribe=true)");
     tracing::info!("Duration: 5 minutes (exceeds {SUBSCRIPTION_LEASE_DURATION:?} lease)");
-    tracing::info!("Expected: Renewal Subscribe events at T+120s, T+240s");
+    tracing::info!("Expected: Subscribe events at T+0s, renewals at T+120s, T+240s");
     tracing::info!("============================================================");
 
     // Run simulation for 5 minutes with controlled operations
