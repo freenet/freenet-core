@@ -856,7 +856,8 @@ impl Operation for SubscribeOp {
 
                             // Refresh hosting TTL on subscription success.
                             // This extends the hosting lifetime for contracts we're actively subscribed to.
-                            // (Unlike UPDATE, SUBSCRIBE is user-initiated so safe to extend TTL)
+                            // (Local-initiated GET/SUBSCRIBE/UPDATE all extend TTL; remote-initiated
+                            // UPDATEs do not, to prevent manipulation by contract creators)
                             op_manager.ring.touch_hosting(key);
 
                             tracing::info!(

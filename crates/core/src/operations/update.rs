@@ -321,6 +321,11 @@ impl Operation for UpdateOp {
                             // event emitted by the executor when state changes.
                             // Use upstream_addr to determine if we're the originator
                             if self.upstream_addr.is_none() {
+                                // Local-initiated UPDATE: refresh hosting TTL since user is
+                                // actively using this contract. Remote-initiated UPDATEs don't
+                                // refresh TTL to prevent manipulation by contract creators.
+                                op_manager.ring.touch_hosting(key);
+
                                 new_state = Some(UpdateState::Finished {
                                     key: *key,
                                     summary: summary.clone(),
@@ -732,6 +737,10 @@ impl Operation for UpdateOp {
 
                     // Network propagation is automatic via BroadcastStateChange
                     if self.upstream_addr.is_none() {
+                        // Local-initiated UPDATE: refresh hosting TTL since user is
+                        // actively using this contract.
+                        op_manager.ring.touch_hosting(key);
+
                         new_state = Some(UpdateState::Finished {
                             key: *key,
                             summary: summary.clone(),
