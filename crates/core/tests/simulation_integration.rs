@@ -2999,9 +2999,9 @@ fn test_long_running_1h_deterministic() {
 #[test_log::test]
 #[ignore = "TODO-MUST-FIX: Fails on main - demonstrates subscription renewal bug from PR #2804"]
 fn test_get_only_subscription_renewal() {
-    // These constants are from crates/core/src/ring/seeding.rs (not publicly exported)
-    const SUBSCRIPTION_LEASE_DURATION: Duration = Duration::from_secs(240); // 4 minutes
-    const SUBSCRIPTION_RENEWAL_INTERVAL: Duration = Duration::from_secs(120); // 2 minutes
+    // Subscription constants from crates/core/src/ring/seeding.rs (not publicly exported):
+    // - SUBSCRIPTION_LEASE_DURATION: 240s (4 minutes) - subscriptions expire after this
+    // - SUBSCRIPTION_RENEWAL_INTERVAL: 120s (2 minutes) - renewals happen at this interval
     const SEED: u64 = 0x2804_0001;
 
     setup_deterministic_state(SEED);
@@ -3173,7 +3173,7 @@ fn test_get_only_subscription_renewal() {
     let has_early_events = subscribe_timestamps.iter().any(|ts| (*ts - min_ts) < 30000); // Within 30s
     let has_renewal_events = subscribe_timestamps.iter().any(|ts| {
         let elapsed = (*ts - min_ts) / 1000;
-        elapsed >= 100 && elapsed <= 150 // Around 120s ± 30s
+        (100..=150).contains(&elapsed) // Around 120s ± 30s
     });
 
     tracing::info!("");
@@ -3190,7 +3190,7 @@ fn test_get_only_subscription_renewal() {
 
     // CRITICAL ASSERTION: Check that Subscribe events occurred
     assert!(
-        subscribe_events.len() >= 1,
+        !subscribe_events.is_empty(),
         "NO Subscribe events detected!\n\
          Expected: At least 1 Subscribe event from GET operation\n\
          Actual: {} Subscribe events\n\
@@ -3206,7 +3206,10 @@ fn test_get_only_subscription_renewal() {
          Expected: Subscribe events at T+0s to T+30s (initial GET subscription)\n\
          Timeline: {:?}\n\
          This means GET didn't trigger initial subscription.",
-        subscribe_timestamps.iter().map(|ts| (*ts - min_ts) / 1000).collect::<Vec<_>>()
+        subscribe_timestamps
+            .iter()
+            .map(|ts| (*ts - min_ts) / 1000)
+            .collect::<Vec<_>>()
     );
 
     // This assertion will FAIL on main (demonstrating the bug)
@@ -3214,7 +3217,9 @@ fn test_get_only_subscription_renewal() {
     if has_renewal_events {
         tracing::info!("");
         tracing::info!("✓ RENEWAL WORKING: Subscribe events at T+120s detected!");
-        tracing::info!("  This indicates contracts_needing_renewal() is checking GetSubscriptionCache");
+        tracing::info!(
+            "  This indicates contracts_needing_renewal() is checking GetSubscriptionCache"
+        );
         tracing::info!("  Bug is FIXED on this branch.");
     } else {
         tracing::warn!("");
@@ -3230,6 +3235,9 @@ fn test_get_only_subscription_renewal() {
     }
 
     tracing::info!("");
-    tracing::info!("Test completed: {} total Subscribe events", subscribe_events.len());
+    tracing::info!(
+        "Test completed: {} total Subscribe events",
+        subscribe_events.len()
+    );
     tracing::info!("============================================================");
 }
