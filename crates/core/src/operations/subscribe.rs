@@ -487,19 +487,6 @@ async fn complete_local_subscription(
         "Local subscription completed - client will receive updates via executor notification channel"
     );
 
-    // Emit telemetry for local subscribe completion
-    // This allows testing/observability of local subscriptions (e.g., in controlled simulations)
-    let own_loc = op_manager.ring.connection_manager.own_location();
-    if let Some(event) = NetEventLog::subscribe_success(
-        &id,
-        &op_manager.ring,
-        key,
-        own_loc,
-        Some(0), // hop_count = 0 for local subscriptions
-    ) {
-        op_manager.ring.register_events(Either::Left(event)).await;
-    }
-
     // Notify client layer that subscription is complete.
     // The actual update delivery happens through the executor's update_notifications
     // when contract state changes, not through network broadcast targets.
