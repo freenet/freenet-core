@@ -490,11 +490,13 @@ impl HostingManager {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns contracts evicted from this cache. Callers should check
-    /// `has_client_subscriptions()` before removing subscription state.
+    /// Contracts with client subscriptions are protected from eviction.
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
-        let expired = self.hosting_cache.write().sweep_expired();
+        let expired = self.hosting_cache.write().sweep_expired(|key| {
+            // Retain contracts with client subscriptions - they need updates
+            self.has_client_subscriptions(key.id())
+        });
 
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {

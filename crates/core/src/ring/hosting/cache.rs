@@ -236,11 +236,18 @@ impl<T: TimeSource> HostingCache<T> {
 
     /// Sweep for contracts that are over budget and past TTL.
     ///
-    /// Returns contracts evicted from this cache. Callers should check
-    /// `has_client_subscriptions()` before removing subscription state.
-    pub fn sweep_expired(&mut self) -> Vec<ContractKey> {
+    /// The `should_retain` predicate is called for each candidate contract before eviction.
+    /// If it returns `true`, the contract is skipped (kept in cache) even if over TTL.
+    /// This allows protecting contracts with client subscriptions from eviction.
+    ///
+    /// Returns contracts evicted from this cache.
+    pub fn sweep_expired<F>(&mut self, should_retain: F) -> Vec<ContractKey>
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
+        let mut skipped_keys = Vec::new();
 
         // Only sweep if we're over budget
         while self.current_bytes > self.budget_bytes && !self.lru_order.is_empty() {
@@ -248,6 +255,13 @@ impl<T: TimeSource> HostingCache<T> {
                 if let Some(oldest) = self.contracts.get(&oldest_key) {
                     let age = now.saturating_duration_since(oldest.last_accessed);
                     if age >= self.min_ttl {
+                        // Check if caller wants to retain this contract
+                        if should_retain(&oldest_key) {
+                            // Move to back of LRU (treat as recently accessed)
+                            self.lru_order.pop_front();
+                            skipped_keys.push(oldest_key);
+                            continue;
+                        }
                         if let Some(removed) = self.contracts.remove(&oldest_key) {
                             self.current_bytes =
                                 self.current_bytes.saturating_sub(removed.size_bytes);
@@ -264,6 +278,11 @@ impl<T: TimeSource> HostingCache<T> {
             } else {
                 break;
             }
+        }
+
+        // Re-add skipped keys to back of LRU order
+        for key in skipped_keys {
+            self.lru_order.push_back(key);
         }
 
         evicted
@@ -552,7 +571,7 @@ mod tests {
         assert_eq!(cache.current_bytes(), 300);
 
         // Sweep immediately - nothing should be evicted (all under TTL)
-        let evicted = cache.sweep_expired();
+        let evicted = cache.sweep_expired(|_| false);
         assert!(evicted.is_empty());
         assert_eq!(cache.len(), 3);
 
@@ -560,8 +579,36 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
 
         // Sweep should evict oldest entry to get back under budget
-        let evicted = cache.sweep_expired();
+        let evicted = cache.sweep_expired(|_| false);
         assert_eq!(evicted, vec![key1]);
+        assert_eq!(cache.current_bytes(), 200);
+    }
+
+    #[test]
+    fn test_sweep_respects_should_retain() {
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        // Add three entries (exceeds budget)
+        cache.record_access(key1, 100, AccessType::Get);
+        cache.record_access(key2, 100, AccessType::Get);
+        cache.record_access(key3, 100, AccessType::Get);
+
+        // Advance past TTL
+        time.advance_time(Duration::from_secs(61));
+
+        // Sweep with predicate that retains key1
+        let evicted = cache.sweep_expired(|k| *k == key1);
+
+        // key1 should be retained, key2 evicted to get under budget
+        assert_eq!(evicted, vec![key2]);
+        assert!(cache.contains(&key1));
+        assert!(!cache.contains(&key2));
+        assert!(cache.contains(&key3));
+
+        // key1 should now be at back of LRU (moved there when retained)
         assert_eq!(cache.current_bytes(), 200);
     }
 

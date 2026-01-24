@@ -514,26 +514,14 @@ impl Ring {
                 "GET subscription cache sweep found expired entries"
             );
 
-            // Clean up local subscription state for each expired contract
+            // Clean up local subscription state for each expired contract.
+            // Note: contracts with client subscriptions are protected from eviction
+            // by the should_retain predicate in sweep_expired_hosting().
             for key in expired {
-                // Skip if there's still a client subscription - don't unsubscribe.
-                // We don't re-add to GET cache because the client subscription
-                // already protects this contract from cleanup.
-                if ring.hosting_manager.has_client_subscriptions(key.id()) {
-                    tracing::debug!(
-                        %key,
-                        "Skipping cleanup for expired GET subscription - has client subscription"
-                    );
-                    continue;
-                }
-
-                // In the lease-based model, just unsubscribe from the contract.
-                // The lease will naturally expire if not renewed.
                 ring.unsubscribe(&key);
-
                 tracing::info!(
                     %key,
-                    "Cleaned up expired GET subscription from local state"
+                    "Cleaned up expired hosting subscription from local state"
                 );
             }
         }
@@ -961,8 +949,8 @@ impl Ring {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns contracts evicted from this cache. Callers should check
-    /// `has_client_subscriptions()` before removing subscription state.
+    /// Returns contracts evicted from this cache. Contracts with client
+    /// subscriptions are protected from eviction.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
         self.hosting_manager.sweep_expired_hosting()
     }
@@ -970,8 +958,8 @@ impl Ring {
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
     /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns contracts evicted from the cache. Callers should check
-    /// `has_client_subscriptions()` before removing subscription state.
+    /// Returns contracts evicted from the cache. Contracts with client
+    /// subscriptions are protected from eviction.
     pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
         // Delegate to hosting cache
         self.sweep_expired_hosting()
