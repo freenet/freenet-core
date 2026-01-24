@@ -199,37 +199,106 @@ if let Some(stats) = sim.get_network_stats() {
 
 | File | Purpose |
 |------|---------|
-| `simulation_integration.rs` | Deterministic replay, fault injection, convergence |
+| `simulation_integration.rs` | Deterministic replay, fault injection, convergence, long-duration tests |
+| `simulation_smoke.rs` | Quick smoke tests using plain tokio (non-deterministic) |
 | `simulation_determinism.rs` | Unit tests for simulation primitives |
 | `sim_network.rs` | CI-focused tests with strict assertions |
 
+## Simulated Time Durations
+
+The simulation framework supports testing across different time scales:
+
+| Test Category | Virtual Time | Wall Clock | Use Case |
+|--------------|--------------|------------|----------|
+| Quick CI tests | 10-60 seconds | 1-5 seconds | Basic functionality, fast iteration |
+| Medium tests | 2-5 minutes | 10-30 seconds | Convergence, fault tolerance |
+| Long-duration | **1 hour** | **~3 minutes** | Time-dependent bugs, connection lifecycle |
+| Extended nightly | 8+ hours | 1+ hours | Stress testing, resource exhaustion |
+
+### Time Acceleration
+
+Virtual time runs significantly faster than wall clock time due to Turmoil's scheduler:
+- **~20x acceleration** for long-duration idle tests (1 hour in ~3 minutes)
+- **~100-1000x acceleration** for event-driven tests with minimal idle time
+
+### Long-Duration Test Configuration
+
+For tests simulating extended periods (hours/days), use the `long_running_1h` configuration:
+
+```rust
+TestConfig::long_running_1h("my-long-test", SEED)
+    .run()
+    .assert_ok()
+    .verify_operation_coverage()
+    .check_convergence();
+```
+
+This configuration:
+- 2 gateways, 6 nodes
+- 1 hour (3600 seconds) virtual time
+- 200 contract operations spread across the hour
+- Tests for: connection timeout handling, state drift, timer edge cases
+
 ## Nightly Test Suite
 
-The nightly workflow runs these simulation scenarios:
+The nightly workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios.
+All fdev tests include realistic network conditions (10-50ms jitter) and run for 1+ hours of virtual time.
 
-| Test | Nodes | Events | Fault Injection | Success Rate |
-|------|-------|--------|-----------------|--------------|
-| Medium scale | 50 | 2000 | None | 100% |
-| Large scale | 500 | 10000 | None | 100% |
-| Fault tolerance | 30 | 1000 | 15% message loss | 80% |
-| High latency | 14 | 500 | 50-200ms latency | 95% |
+| Test | Nodes | Virtual Time | Fault Injection |
+|------|-------|--------------|-----------------|
+| Medium scale (×2 seeds) | 50 | 1 hour | 10-50ms jitter |
+| Large scale | 500 | **3 hours** | 10-50ms jitter |
+| Fault tolerance | 30 | 1 hour | 15% loss + 10-50ms jitter |
+| High latency | 14 | 1 hour | 50-200ms latency |
+| Long-running (Rust test) | 8 | 1 hour | 10-50ms jitter |
 
-All tests require 100% convergence (eventual consistency).
+All tests require convergence (eventual consistency).
+
+### Long-Running Test Details
+
+The `test_long_running_1h_deterministic` test specifically targets time-dependent bugs:
+
+```bash
+# Run manually (requires nightly_tests feature)
+cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
+  test_long_running_1h_deterministic -- --nocapture --test-threads=1
+```
+
+**What it tests:**
+- Connection timeout handling over 1 hour of virtual time
+- Keep-alive and heartbeat mechanisms
+- Long-lived contract state consistency
+- Timer edge cases (wraparound, scheduling)
+- Network partition recovery over time
 
 ## Future Work
 
-### Missing Nightly Tests
+### Extended Duration Testing
 
-The following test scenarios exist in `simulation_integration.rs` but are **not yet in the nightly workflow**:
+Future improvements for long-duration testing:
 
-| Test | File | What it does |
-|------|------|-------------|
-| `test_partition_injection_bridge` | simulation_integration.rs | Partition network, verify messages blocked |
-| `test_node_crash_recovery` | simulation_integration.rs | Crash node, verify network handles it |
-| `test_node_restart` | simulation_integration.rs | Restart crashed node |
-| `test_node_restart_with_state_recovery` | simulation_integration.rs | Restart with MockStateStorage preservation |
+| Enhancement | Description | Priority |
+|-------------|-------------|----------|
+| **24-hour simulation** | Simulate full day of operation | High |
+| **Multi-day via checkpoints** | Save/restore simulation state for extended runs | Medium |
+| **Adaptive time stepping** | Faster advancement during idle periods | Medium |
+| **Memory profiling** | Track resource usage over long simulations | Medium |
 
-### Missing Test Scenarios (not implemented)
+### Test Coverage Notes
+
+The following fault injection tests run in **regular CI** (not nightly) via `simulation_smoke.rs`:
+
+| Test | What it tests |
+|------|---------------|
+| `test_partition_injection_bridge` | Network partitions, verify messages blocked |
+| `test_node_crash_recovery` | Crash node, verify network handles it |
+| `test_node_restart` | Restart crashed node, verify address preserved |
+| `test_fault_injection_bridge` | Message loss injection (50% loss) |
+| `test_latency_injection` | Latency injection (100-200ms) |
+
+These run with every PR and don't need nightly scheduling.
+
+### Missing Test Scenarios (not yet implemented)
 
 | Scenario | Description | Priority |
 |----------|-------------|----------|

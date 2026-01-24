@@ -45,6 +45,8 @@ struct TestConfig {
     duration: Duration,
     sleep_between_ops: Duration,
     require_convergence: bool,
+    /// Optional latency range for jitter simulation (min..max)
+    latency_range: Option<std::ops::Range<Duration>>,
 }
 
 impl TestConfig {
@@ -64,6 +66,7 @@ impl TestConfig {
             duration: Duration::from_secs(20),
             sleep_between_ops: Duration::from_secs(1),
             require_convergence: false,
+            latency_range: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl TestConfig {
             duration: Duration::from_secs(120),
             sleep_between_ops: Duration::from_secs(3),
             require_convergence: false,
+            latency_range: None,
         }
     }
 
@@ -102,6 +106,45 @@ impl TestConfig {
             duration: Duration::from_secs(300),
             sleep_between_ops: Duration::from_secs(10),
             require_convergence: false,
+            latency_range: None,
+        }
+    }
+
+    /// Create a long-running test configuration (1 hour virtual time).
+    ///
+    /// Designed to uncover time-dependent bugs:
+    /// - Connection timeout handling over extended periods
+    /// - State drift in long-lived contracts
+    /// - Timer edge cases (keep-alive, connection idle timeout)
+    /// - Resource exhaustion patterns
+    ///
+    /// Wall clock time: ~30-60 seconds (with Turmoil's time acceleration)
+    ///
+    /// Includes 10-50ms latency jitter to simulate realistic network conditions.
+    ///
+    /// # Virtual Time Breakdown
+    /// - Events phase: 200 iterations × 200ms = 40 seconds
+    /// - Idle phase: 3556 seconds (tests timeout handling, keep-alive)
+    /// - Total: ~3600 seconds (1 hour)
+    fn long_running_1h(name: &'static str, seed: u64) -> Self {
+        Self {
+            name,
+            seed,
+            gateways: 2,
+            nodes: 6,
+            ring_max_htl: 10,
+            rnd_if_htl_above: 5,
+            max_connections: 15,
+            min_connections: 3,
+            max_contracts: 8,
+            iterations: 200,                     // Contract operations
+            duration: Duration::from_secs(3700), // Max simulation time (buffer)
+            // Sleep after events to reach ~1 hour total virtual time
+            // Events take ~44s (200×200ms + setup), so sleep for ~3556s
+            sleep_between_ops: Duration::from_secs(3556),
+            require_convergence: true, // Must converge after 1 hour
+            // Realistic latency jitter (10-50ms) to uncover timing issues
+            latency_range: Some(Duration::from_millis(10)..Duration::from_millis(50)),
         }
     }
 
@@ -153,13 +196,21 @@ impl TestConfig {
         self
     }
 
+    /// Add latency jitter simulation.
+    fn with_latency(mut self, min: Duration, max: Duration) -> Self {
+        self.latency_range = Some(min..max);
+        self
+    }
+
     /// Run the simulation and return results.
     fn run(self) -> TestResult {
+        use freenet::simulation::FaultConfig;
+
         setup_deterministic_state(self.seed);
         let rt = create_runtime();
 
         let (sim, logs_handle) = rt.block_on(async {
-            let sim = SimNetwork::new(
+            let mut sim = SimNetwork::new(
                 self.name,
                 self.gateways,
                 self.nodes,
@@ -170,6 +221,20 @@ impl TestConfig {
                 self.seed,
             )
             .await;
+
+            // Apply latency jitter if configured
+            if let Some(ref latency) = self.latency_range {
+                let fault_config = FaultConfig::builder()
+                    .latency_range(latency.clone())
+                    .build();
+                sim.with_fault_injection(fault_config);
+                tracing::info!(
+                    "Latency jitter enabled: {:?} - {:?}",
+                    latency.start,
+                    latency.end
+                );
+            }
+
             let logs_handle = sim.event_logs_handle();
             (sim, logs_handle)
         });
@@ -2846,4 +2911,60 @@ fn test_subscription_broadcast_propagation() {
     );
 
     clear_crdt_contracts();
+}
+
+// =============================================================================
+// Long-Duration Simulation Tests (1 Hour Virtual Time)
+// =============================================================================
+
+/// Long-running deterministic simulation test for 1 hour of virtual time.
+///
+/// This test is designed to uncover time-dependent bugs that only manifest
+/// after extended periods of operation, such as:
+/// - Connection timeout handling over long periods
+/// - State drift in long-lived contracts
+/// - Memory leaks or resource exhaustion patterns
+/// - Timer handling edge cases
+/// - Keep-alive and heartbeat issues
+///
+/// The test simulates 1 hour (3600 seconds) of virtual time using Turmoil's
+/// deterministic scheduler, ensuring reproducible results.
+///
+/// # Runtime
+/// Wall clock time: ~3 minutes (with Turmoil's 19.6x time acceleration).
+/// Too slow for regular CI, runs in nightly.
+///
+/// # Virtual Time Breakdown
+/// - Events phase: 200 operations × 200ms = 40 seconds
+/// - Idle phase: ~3556 seconds (tests timeout handling, keep-alive)
+/// - Total: ~3600 seconds (1 hour)
+#[test_log::test]
+#[cfg(feature = "nightly_tests")]
+fn test_long_running_1h_deterministic() {
+    const SEED: u64 = 0x1A00_2C00_72AC; // "1h contract" seed
+
+    tracing::info!("=== Starting 1-Hour Deterministic Simulation ===");
+    tracing::info!("Seed: 0x{:X}", SEED);
+    tracing::info!("Virtual time target: 3600 seconds (1 hour)");
+
+    let start_time = std::time::Instant::now();
+
+    // Run the 1-hour simulation using the standard test pattern
+    TestConfig::long_running_1h("long-running-1h", SEED)
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence();
+
+    let wall_clock = start_time.elapsed();
+
+    // Log performance metrics
+    tracing::info!("=== 1-Hour Simulation Complete ===");
+    tracing::info!("Wall clock time: {:.1} seconds", wall_clock.as_secs_f64());
+    tracing::info!(
+        "Time acceleration: {:.1}x",
+        3600.0 / wall_clock.as_secs_f64()
+    );
+
+    tracing::info!("test_long_running_1h_deterministic PASSED");
 }
