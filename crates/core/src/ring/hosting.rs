@@ -380,7 +380,8 @@ impl HostingManager {
     /// ALL contracts in the hosting cache will have their subscriptions renewed.
     ///
     /// Returns contracts evicted from the cache (if any).
-    /// Automatically removes persisted metadata for evicted contracts.
+    /// Automatically persists hosting metadata for the accessed contract and
+    /// removes persisted metadata for evicted contracts.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
@@ -392,30 +393,58 @@ impl HostingManager {
             .write()
             .record_access(key, size_bytes, access_type);
 
-        // Clean up persisted metadata for evicted contracts
-        if !evicted.is_empty() {
-            if let Some(storage) = self.storage.read().as_ref() {
-                for evicted_key in &evicted {
-                    #[cfg(feature = "redb")]
-                    {
-                        if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
-                            tracing::warn!(
-                                contract = %evicted_key,
-                                error = %e,
-                                "Failed to remove persisted hosting metadata for evicted contract"
-                            );
-                        }
-                    }
-                    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
-                    {
-                        // For sqlite, we can't easily run async from a sync context
-                        // The metadata will be cleaned up on next startup via reconciliation
-                        // TODO: Consider using a background task for sqlite cleanup
-                        tracing::debug!(
+        // Persist hosting metadata for the accessed contract
+        if let Some(storage) = self.storage.read().as_ref() {
+            #[cfg(feature = "redb")]
+            {
+                use crate::contract::storages::HostingMetadata;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let access_type_u8 = match access_type {
+                    AccessType::Get => 0,
+                    AccessType::Put => 1,
+                    AccessType::Subscribe => 2,
+                };
+                let code_hash: [u8; 32] = **key.code_hash();
+                let metadata = HostingMetadata::new(now_ms, access_type_u8, size_bytes, code_hash);
+                if let Err(e) = storage.store_hosting_metadata(&key, metadata) {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to persist hosting metadata for accessed contract"
+                    );
+                }
+            }
+            #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+            {
+                // For sqlite, we can't easily run async from a sync context
+                // The metadata is persisted via StateStorage::store() when state is stored
+                tracing::trace!(
+                    contract = %key,
+                    "Sqlite hosting metadata update deferred to state store"
+                );
+            }
+
+            // Clean up persisted metadata for evicted contracts
+            for evicted_key in &evicted {
+                #[cfg(feature = "redb")]
+                {
+                    if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
+                        tracing::warn!(
                             contract = %evicted_key,
-                            "Evicted contract - sqlite metadata cleanup deferred"
+                            error = %e,
+                            "Failed to remove persisted hosting metadata for evicted contract"
                         );
                     }
+                }
+                #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+                {
+                    tracing::debug!(
+                        contract = %evicted_key,
+                        "Evicted contract - sqlite metadata cleanup deferred"
+                    );
                 }
             }
         }
