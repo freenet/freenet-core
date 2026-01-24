@@ -27,11 +27,12 @@
 //! - Active subscriptions prevent eviction from the hosting cache
 //! - TTL protects recently accessed contracts from premature eviction
 
-use super::hosting_cache::{
-    AccessType, HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL,
-};
+mod cache;
+
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::InstantTimeSrc;
+pub use cache::AccessType;
+use cache::{HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
@@ -767,9 +768,9 @@ impl HostingManager {
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
-                    1 => super::hosting_cache::AccessType::Put,
-                    2 => super::hosting_cache::AccessType::Subscribe,
-                    _ => super::hosting_cache::AccessType::Get,
+                    1 => cache::AccessType::Put,
+                    2 => cache::AccessType::Subscribe,
+                    _ => cache::AccessType::Get,
                 };
 
                 // Calculate age from persisted timestamp
@@ -815,7 +816,7 @@ impl HostingManager {
                 cache.load_persisted_entry(
                     key,
                     size_bytes,
-                    super::hosting_cache::AccessType::Get,
+                    cache::AccessType::Get,
                     std::time::Duration::ZERO,
                 );
 
@@ -912,9 +913,9 @@ impl HostingManager {
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
-                    1 => super::hosting_cache::AccessType::Put,
-                    2 => super::hosting_cache::AccessType::Subscribe,
-                    _ => super::hosting_cache::AccessType::Get,
+                    1 => cache::AccessType::Put,
+                    2 => cache::AccessType::Subscribe,
+                    _ => cache::AccessType::Get,
                 };
 
                 // Calculate age from persisted timestamp
@@ -962,7 +963,7 @@ impl HostingManager {
                 cache.load_persisted_entry(
                     key,
                     size_bytes,
-                    super::hosting_cache::AccessType::Get,
+                    cache::AccessType::Get,
                     std::time::Duration::ZERO,
                 );
 

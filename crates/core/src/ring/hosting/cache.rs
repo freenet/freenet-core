@@ -28,7 +28,7 @@ pub const TTL_RENEWAL_MULTIPLIER: u32 = 4;
 /// Default minimum TTL before a hosted contract can be evicted.
 /// Computed as TTL_RENEWAL_MULTIPLIER × SUBSCRIPTION_RENEWAL_INTERVAL.
 pub const DEFAULT_MIN_TTL: Duration = Duration::from_secs(
-    super::hosting::SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * TTL_RENEWAL_MULTIPLIER as u64,
+    super::SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * TTL_RENEWAL_MULTIPLIER as u64,
 );
 
 /// Type of access that adds/refreshes a contract in the hosting cache.
