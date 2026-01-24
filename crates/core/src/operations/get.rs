@@ -1594,6 +1594,11 @@ impl Operation for GetOp {
                                     // as they may still have active client subscriptions. The background
                                     // sweep task handles proper cleanup with client subscription checks.
                                     let evicted = op_manager.ring.record_get_subscription(key);
+                                    tracing::info!(
+                                        tx = %id,
+                                        %key,
+                                        "GET: Recorded subscription in GetSubscriptionCache for auto-renewal"
+                                    );
                                     if !evicted.is_empty() {
                                         tracing::debug!(
                                             evicted_count = evicted.len(),

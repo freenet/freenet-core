@@ -483,6 +483,10 @@ impl SeedingManager {
     /// Returns contracts where:
     /// - We have an active subscription that will expire soon, OR
     /// - We have client subscriptions but no active network subscription
+    ///
+    /// BUG: This does NOT check GetSubscriptionCache for GET-triggered subscriptions
+    /// that need renewal. GET subscriptions are stored in get_subscription_cache but
+    /// aren't included in the renewal check.
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
         let now = Instant::now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
@@ -518,6 +522,13 @@ impl SeedingManager {
                 }
             }
         }
+
+        // BUG: Missing check for get_subscription_cache contracts
+        // Should iterate over get_subscription_cache.keys_lru_order() and add them to needs_renewal
+        tracing::debug!(
+            renewal_count = needs_renewal.len(),
+            "contracts_needing_renewal: checked active_subscriptions and client_subscriptions (NOT GetSubscriptionCache)"
+        );
 
         needs_renewal
     }
@@ -605,6 +616,23 @@ impl SeedingManager {
 impl Default for SeedingManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// =============================================================================
+// Test Accessors
+// =============================================================================
+
+#[cfg(test)]
+impl SeedingManager {
+    /// Test-only: Check if a contract is in the GET subscription cache.
+    pub fn has_get_subscription(&self, key: &ContractKey) -> bool {
+        self.get_subscription_cache.read().contains(key)
+    }
+
+    /// Test-only: Get all contracts in the GET subscription cache.
+    pub fn get_subscription_cache_keys(&self) -> Vec<ContractKey> {
+        self.get_subscription_cache.read().keys_lru_order()
     }
 }
 

@@ -1342,6 +1342,18 @@ impl Ring {
                 .generate_topology_snapshot(peer_addr, location),
         )
     }
+
+    /// Test-only: Check if a contract is in the GET subscription cache.
+    #[cfg(test)]
+    pub fn has_get_subscription(&self, key: &ContractKey) -> bool {
+        self.seeding_manager.has_get_subscription(key)
+    }
+
+    /// Test-only: Get all contracts in the GET subscription cache.
+    #[cfg(test)]
+    pub fn get_subscription_cache_keys(&self) -> Vec<ContractKey> {
+        self.seeding_manager.get_subscription_cache_keys()
+    }
 }
 
 fn calculate_allowed_connection_additions(

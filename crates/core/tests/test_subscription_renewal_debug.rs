@@ -120,8 +120,14 @@ fn debug_subscription_renewal_mechanism() {
 
     tracing::info!("");
     tracing::info!("╔════════════════════════════════════════════════════════════════╗");
-    tracing::info!("║ EVENT LOG ANALYSIS                                              ║");
+    tracing::info!("║ TRACE LOG ANALYSIS - Searching for GetSubscriptionCache logs   ║");
     tracing::info!("╚════════════════════════════════════════════════════════════════╝");
+    tracing::info!("");
+    tracing::info!("Looking for key log messages:");
+    tracing::info!("  1. 'Recorded subscription in GetSubscriptionCache' (GET operation)");
+    tracing::info!("  2. 'checked active_subscriptions and client_subscriptions' (renewal)");
+    tracing::info!("  3. Absence of GET contracts in renewal checks (demonstrates bug)");
+    tracing::info!("");
 
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
 
@@ -220,6 +226,26 @@ fn debug_subscription_renewal_mechanism() {
 
     tracing::info!("");
     tracing::info!("╔════════════════════════════════════════════════════════════════╗");
-    tracing::info!("║ Test complete - check logs above for detailed trace            ║");
+    tracing::info!("║ SUMMARY - What to Look For in Logs Above                       ║");
+    tracing::info!("╚════════════════════════════════════════════════════════════════╝");
+    tracing::info!("");
+    tracing::info!("To verify GetSubscriptionCache is being used:");
+    tracing::info!("  ✓ Search for: 'Recorded subscription in GetSubscriptionCache'");
+    tracing::info!("    → This confirms GET operation stored subscription");
+    tracing::info!("");
+    tracing::info!("To verify the bug (renewal doesn't check GetSubscriptionCache):");
+    tracing::info!("  ✓ Search for: 'contracts_needing_renewal: checked active_subscriptions'");
+    tracing::info!("    → This message confirms the function doesn't check GetSubscriptionCache");
+    tracing::info!("  ✓ Look for: renewal_count=0 in above message");
+    tracing::info!("    → Zero contracts found for renewal (bug: GET subscriptions ignored)");
+    tracing::info!("");
+    tracing::info!("Expected behavior:");
+    tracing::info!("  • GET operation at T+0s stores contract in GetSubscriptionCache");
+    tracing::info!("  • Renewal task runs every 30s after initial delay");
+    tracing::info!("  • BUT renewal task doesn't find GET subscriptions (the bug)");
+    tracing::info!("  • Result: No renewal Subscribe events appear");
+    tracing::info!("");
+    tracing::info!("╔════════════════════════════════════════════════════════════════╗");
+    tracing::info!("║ Test complete - analyze logs above                             ║");
     tracing::info!("╚════════════════════════════════════════════════════════════════╝");
 }
