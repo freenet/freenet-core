@@ -17,7 +17,7 @@ use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
@@ -1824,9 +1824,6 @@ pub(crate) mod test {
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
-        /// Notification channel for subscription updates (testing support)
-        subscription_notifier: Option<UnboundedSender<HostResult>>,
-        subscription_receiver: Option<UnboundedReceiver<HostResult>>,
     }
 
     impl<R> MemoryEventsGen<R>
@@ -1838,15 +1835,12 @@ pub(crate) mod test {
             key: TransportPublicKey,
             seed: u64,
         ) -> Self {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             Self {
                 signal,
                 key,
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
-                subscription_notifier: Some(tx),
-                subscription_receiver: Some(rx),
             }
         }
 
@@ -1891,15 +1885,12 @@ pub(crate) mod test {
             signal: Receiver<(EventId, TransportPublicKey)>,
             key: TransportPublicKey,
         ) -> Self {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             Self {
                 signal,
                 key,
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
-                subscription_notifier: Some(tx),
-                subscription_receiver: Some(rx),
             }
         }
     }
@@ -1927,8 +1918,6 @@ pub(crate) mod test {
                 loop {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
-                        let notification_channel = self.subscription_notifier.clone();
-
                         if self.rng.is_some() && pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
@@ -1938,7 +1927,7 @@ pub(crate) mod test {
                                     .await
                                     .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
                                     .into(),
-                                notification_channel,
+                                notification_channel: None,
                                 token: None,
                                 attested_contract: None,
                             };
@@ -1951,7 +1940,7 @@ pub(crate) mod test {
                                     .generate_deterministic_event(&ev_id)
                                     .expect("event not found")
                                     .into(),
-                                notification_channel,
+                                notification_channel: None,
                                 token: None,
                                 attested_contract: None,
                             };
@@ -1982,18 +1971,6 @@ pub(crate) mod test {
                     .owns_contracts
                     .insert(key);
             }
-
-            // Drain subscription notifications (for testing, we just log/discard them)
-            if let Some(rx) = &mut self.subscription_receiver {
-                while let Ok(notification) = rx.try_recv() as Result<HostResult, _> {
-                    tracing::debug!(
-                        peer = %self.key,
-                        "MemoryEventsGen: received subscription notification: {:?}",
-                        notification
-                    );
-                }
-            }
-
             async { Ok(()) }.boxed()
         }
     }
