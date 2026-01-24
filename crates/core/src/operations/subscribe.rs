@@ -853,6 +853,12 @@ impl Operation for SubscribeOp {
                             // our subscription locally. No upstream/downstream tree tracking.
                             op_manager.ring.subscribe(*key);
                             op_manager.ring.complete_subscription_request(key, true);
+
+                            // Refresh hosting TTL on subscription success.
+                            // This extends the hosting lifetime for contracts we're actively subscribed to.
+                            // (Unlike UPDATE, SUBSCRIBE is user-initiated so safe to extend TTL)
+                            op_manager.ring.touch_hosting(key);
+
                             tracing::info!(
                                 tx = %msg_id,
                                 contract = %format!("{:.8}", key),

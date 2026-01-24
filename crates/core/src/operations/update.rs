@@ -527,9 +527,10 @@ impl Operation for UpdateOp {
                     };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    // Refresh GET subscription cache TTL when receiving updates
-                    // This keeps actively-updated contracts from being evicted
-                    op_manager.ring.touch_get_subscription(key);
+                    // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
+                    // Only GET and SUBSCRIBE should extend hosting lifetime.
+                    // If UPDATE refreshed TTL, a malicious contract author could spam
+                    // updates to keep their contract hosted everywhere, draining resources.
 
                     // Emit telemetry: broadcast applied with resulting state
                     if let Some(event) = NetEventLog::update_broadcast_applied(
@@ -892,8 +893,8 @@ impl Operation for UpdateOp {
 
                     tracing::debug!("Contract successfully updated - BroadcastToStreaming");
 
-                    // Refresh GET subscription cache TTL
-                    op_manager.ring.touch_get_subscription(key);
+                    // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
+                    // Only GET and SUBSCRIBE should extend hosting lifetime.
 
                     // Emit telemetry: broadcast applied
                     if let Some(event) = NetEventLog::update_broadcast_applied(

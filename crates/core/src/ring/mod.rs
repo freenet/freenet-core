@@ -917,15 +917,6 @@ impl Ring {
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
-
-    /// Refresh a contract's access time in the hosting cache.
-    ///
-    /// Called when UPDATE is received for an auto-subscribed contract.
-    pub fn touch_get_subscription(&self, key: &ContractKey) {
-        // Delegate to hosting cache
-        self.touch_hosting(key)
-    }
-
     /// Sweep for expired entries (delegated to hosting cache).
     ///
     /// Returns contracts evicted from the cache. Callers should check
