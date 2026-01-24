@@ -21,8 +21,15 @@ use crate::util::time_source::TimeSource;
 /// Default hosting cache budget: 100MB
 pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Default minimum TTL before a hosted contract can be evicted (30 minutes).
-pub const DEFAULT_MIN_TTL: Duration = Duration::from_secs(30 * 60);
+/// Multiplier for TTL relative to subscription renewal interval.
+/// Gives this many renewal attempts before eviction if renewals keep failing.
+pub const TTL_RENEWAL_MULTIPLIER: u32 = 4;
+
+/// Default minimum TTL before a hosted contract can be evicted.
+/// Computed as TTL_RENEWAL_MULTIPLIER × SUBSCRIPTION_RENEWAL_INTERVAL.
+pub const DEFAULT_MIN_TTL: Duration = Duration::from_secs(
+    super::hosting::SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * TTL_RENEWAL_MULTIPLIER as u64,
+);
 
 /// Type of access that adds/refreshes a contract in the hosting cache.
 ///
