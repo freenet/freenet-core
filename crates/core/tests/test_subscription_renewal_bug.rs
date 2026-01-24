@@ -5,14 +5,12 @@
 //! after 4 minutes (SUBSCRIPTION_LEASE_DURATION).
 //!
 //! The bug exists on `main` branch and should be fixed in the `unified-hosting` branch.
-//!
-//! NOTE: This test is marked as #[ignore] because it FAILS on main (reproducing the bug).
-//! Once the fix is merged, the #[ignore] should be removed.
 
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::{GlobalRng, GlobalSimulationTime};
 use freenet::dev_tool::{reset_all_simulation_state, SimNetwork};
+use std::collections::HashMap;
 use std::time::Duration;
 
 // These constants are from crates/core/src/ring/seeding.rs
@@ -39,23 +37,14 @@ fn create_runtime() -> tokio::runtime::Runtime {
 
 /// Test that contracts accessed via GET operations have their subscriptions renewed.
 ///
-/// This test reproduces the bug where:
-/// 1. A contract is fetched via GET operation
-/// 2. The contract is cached and auto-subscribed (via GetSubscriptionCache)
-/// 3. Time advances past the subscription renewal interval (2 minutes)
-/// 4. The subscription is NOT renewed (BUG on main)
-/// 5. After 4 minutes (SUBSCRIPTION_LEASE_DURATION), the subscription expires
-/// 6. Updates stop being received, UI shows stale data
+/// This test reproduces the bug by running a simulation long enough to:
+/// 1. Trigger GET operations that create auto-subscriptions
+/// 2. Advance time past the renewal interval (2 minutes)
+/// 3. Advance time past the lease duration (4 minutes)
+/// 4. Check if Subscribe renewal events occurred
 ///
-/// Expected behavior (after fix):
-/// - Contracts in GetSubscriptionCache should be included in contracts_needing_renewal()
-/// - Their subscriptions should be renewed before expiry
-/// - The contract should remain subscribed beyond 4 minutes
-///
-/// NOTE: This test uses Turmoil for deterministic simulation, ensuring reproducible results.
-///
-/// This test is #[ignore] because it FAILS on main branch (reproducing the bug).
-/// Remove #[ignore] after PR #2804 is merged.
+/// On main (with bug): GET-triggered subscriptions are NOT renewed
+/// After fix: All hosted contracts should have Subscribe renewal events
 #[test_log::test]
 #[ignore = "TODO-MUST-FIX: Fails on main - demonstrates subscription renewal bug from PR #2804"]
 fn test_get_triggered_subscription_renewal() {
@@ -70,6 +59,200 @@ fn test_get_triggered_subscription_renewal() {
         let sim = SimNetwork::new(
             "subscription-renewal-bug",
             1,  // gateways
+            4,  // nodes - more nodes for better contract distribution
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Run simulation with enough operations to trigger GETs
+    // Increase iterations to ensure we get both PUT and GET operations
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        3,   // max_contracts - multiple contracts
+        50,  // iterations - enough to trigger various operations
+        Duration::from_secs(300), // 5 minutes - exceeds lease duration
+        || async {
+            // Sleep to advance time and trigger renewals
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Simulation failed: {:?}",
+        result.err()
+    );
+
+    // Analyze the event logs
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+
+    tracing::info!("============================================================");
+    tracing::info!("SUBSCRIPTION RENEWAL TEST RESULTS");
+    tracing::info!("============================================================");
+    tracing::info!("Total events captured: {}", logs.len());
+
+    // Count different operation types
+    let get_count = logs.iter().filter(|log| {
+        format!("{:?}", log.kind).contains("Get")
+    }).count();
+
+    let put_count = logs.iter().filter(|log| {
+        format!("{:?}", log.kind).contains("Put")
+    }).count();
+
+    let subscribe_count = logs.iter().filter(|log| {
+        format!("{:?}", log.kind).contains("Subscribe")
+    }).count();
+
+    tracing::info!("Operation counts:");
+    tracing::info!("  GET operations: {}", get_count);
+    tracing::info!("  PUT operations: {}", put_count);
+    tracing::info!("  Subscribe events: {}", subscribe_count);
+
+    // Verify we had some GET operations to test the bug
+    assert!(
+        get_count > 0,
+        "Test needs GET operations to reproduce the bug. \
+         Got {} GETs. Try increasing iterations or contracts.",
+        get_count
+    );
+
+    // Extract Subscribe events with timestamps
+    // Subscribe events should occur:
+    // 1. Initially when contract is first accessed
+    // 2. At T+120s (renewal interval)
+    // 3. At T+240s (another renewal)
+    // etc.
+    let subscribe_events: Vec<_> = logs
+        .iter()
+        .filter(|log| format!("{:?}", log.kind).contains("Subscribe"))
+        .collect();
+
+    // Group Subscribe events by contract
+    let mut subscribes_by_contract: HashMap<String, Vec<&freenet::tracing::NetLogMessage>> = HashMap::new();
+    for event in subscribe_events {
+        // Try to extract contract identifier from the event
+        // The exact format depends on how EventKind::Subscribe is formatted
+        let event_str = format!("{:?}", event.kind);
+        if let Some(contract_id) = extract_contract_id(&event_str) {
+            subscribes_by_contract
+                .entry(contract_id)
+                .or_default()
+                .push(event);
+        }
+    }
+
+    tracing::info!("");
+    tracing::info!("Subscribe events by contract:");
+    for (contract, events) in &subscribes_by_contract {
+        tracing::info!("  Contract {}: {} Subscribe events", contract, events.len());
+    }
+
+    // The bug manifests as: contracts that were GET-ed don't get renewed
+    // So we expect to see multiple Subscribe events per contract (initial + renewals)
+    // If the bug exists, some contracts will only have 1 Subscribe event
+
+    if !subscribes_by_contract.is_empty() {
+        let contracts_with_single_subscribe = subscribes_by_contract
+            .iter()
+            .filter(|(_, events)| events.len() == 1)
+            .count();
+
+        let contracts_with_renewals = subscribes_by_contract
+            .iter()
+            .filter(|(_, events)| events.len() > 1)
+            .count();
+
+        tracing::info!("");
+        tracing::info!("Subscription renewal analysis:");
+        tracing::info!("  Contracts with renewals: {}", contracts_with_renewals);
+        tracing::info!("  Contracts without renewals: {}", contracts_with_single_subscribe);
+
+        // ASSERTION: After the fix, ALL contracts that had GET operations should have renewals
+        // With a 5-minute simulation and 2-minute renewal interval, we should see at least
+        // 2-3 Subscribe events per contract (initial + renewals)
+        //
+        // On main (with bug): Some contracts will have only 1 Subscribe event
+        // After fix: All contracts should have multiple Subscribe events
+
+        assert!(
+            contracts_with_renewals > 0,
+            "BUG DETECTED: No contracts had subscription renewals! \
+             All {} contracts have single Subscribe events. \
+             Expected: Multiple Subscribe events per contract (initial + renewals at T+120s, T+240s). \
+             This indicates GET-triggered subscriptions are NOT being renewed.",
+            contracts_with_single_subscribe
+        );
+
+        // A stricter assertion for after the fix is merged:
+        // ALL contracts should have renewals, not just some
+        // Uncomment this after PR #2804 is merged:
+        /*
+        assert_eq!(
+            contracts_with_single_subscribe, 0,
+            "Some contracts still lack renewals: {} contracts have only 1 Subscribe event. \
+             All contracts should be renewed at {SUBSCRIPTION_RENEWAL_INTERVAL:?} intervals.",
+        );
+        */
+    } else {
+        panic!(
+            "No Subscribe events found in logs. Cannot test subscription renewal. \
+             This may indicate the simulation didn't create any contracts."
+        );
+    }
+
+    tracing::info!("============================================================");
+}
+
+/// Helper to extract contract ID from Subscribe event debug string
+fn extract_contract_id(event_str: &str) -> Option<String> {
+    // Subscribe events contain instance_id or contract key
+    // Example: "Subscribe(Request { instance_id: ContractInstanceId(...), ... })"
+    // We'll extract a simple identifier for grouping
+
+    // Try to find instance_id pattern
+    if let Some(start) = event_str.find("instance_id:") {
+        let after_id = &event_str[start + 12..];
+        if let Some(end) = after_id.find(|c: char| c == ',' || c == ')' || c == '}') {
+            let id_str = &after_id[..end].trim();
+            return Some(id_str.to_string());
+        }
+    }
+
+    // Try to find key pattern
+    if let Some(start) = event_str.find("key:") {
+        let after_key = &event_str[start + 4..];
+        if let Some(end) = after_key.find(|c: char| c == ',' || c == ')' || c == '}') {
+            let key_str = &after_key[..end].trim();
+            return Some(key_str.to_string());
+        }
+    }
+
+    None
+}
+
+/// Simpler test that just verifies the simulation runs for long enough
+/// to observe subscription behavior.
+#[test_log::test]
+fn test_subscription_simulation_baseline() {
+    const SEED: u64 = 0x2804_0000; // Baseline test
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            "subscription-baseline",
+            1,  // gateways
             3,  // nodes
             7,  // ring_max_htl
             3,  // rnd_if_htl_above
@@ -82,220 +265,24 @@ fn test_get_triggered_subscription_renewal() {
         (sim, logs_handle)
     });
 
-    // Run simulation using Turmoil for deterministic execution
-    // The simulation will:
-    // 1. Create 1 contract with 2 operations (PUT + GET)
-    // 2. Run for total duration that exceeds subscription lease (4+ minutes)
-    // 3. Sleep between operations to allow time advancement
+    // Run for the lease duration to see what happens
     let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
         SEED,
-        1,  // max_contracts - single contract to track
-        2,  // iterations - minimal ops (PUT + GET)
-        Duration::from_secs(300), // 5 minutes - exceeds SUBSCRIPTION_LEASE_DURATION
+        2,   // max_contracts
+        30,  // iterations
+        SUBSCRIPTION_LEASE_DURATION + Duration::from_secs(60), // Just past lease duration
         || async {
-            // Sleep to advance Turmoil's virtual time
-            // This simulates time passing in the network
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             Ok(())
         },
     );
 
-    // Verify simulation completed successfully
-    if let Err(e) = &result {
-        tracing::error!("============================================================");
-        tracing::error!("SIMULATION FAILED: subscription-renewal-bug");
-        tracing::error!("============================================================");
-        tracing::error!("Seed for reproduction: 0x{:X}", SEED);
-        tracing::error!("Error: {:?}", e);
-        tracing::error!("============================================================");
-    }
-    assert!(
-        result.is_ok(),
-        "Simulation failed: {:?}",
-        result.err()
-    );
-
-    // Analyze the event logs to understand subscription behavior
-    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
-
-    tracing::info!("============================================================");
-    tracing::info!("SUBSCRIPTION RENEWAL TEST RESULTS");
-    tracing::info!("============================================================");
-    tracing::info!("Total events captured: {}", logs.len());
-
-    // Count GET operations to verify the scenario triggered
-    let get_count = logs.iter().filter(|log| {
-        format!("{:?}", log.kind).contains("Get")
-    }).count();
-
-    tracing::info!("GET operations: {}", get_count);
-    tracing::info!("Expected behavior:");
-    tracing::info!("  - GET operations should trigger auto-subscriptions");
-    tracing::info!("  - Subscriptions should be renewed at ~{}s", SUBSCRIPTION_RENEWAL_INTERVAL.as_secs());
-    tracing::info!("  - Subscriptions should NOT expire at {}s", SUBSCRIPTION_LEASE_DURATION.as_secs());
-    tracing::info!("");
-    tracing::info!("BUG on main:");
-    tracing::info!("  - GET-triggered subscriptions are NOT in contracts_needing_renewal()");
-    tracing::info!("  - They expire after {}s without renewal", SUBSCRIPTION_LEASE_DURATION.as_secs());
-    tracing::info!("============================================================");
-
-    // On main: This test passes but the bug exists (subscriptions expire silently)
-    // On fixed branch: Subscriptions should be renewed and remain active
-    //
-    // TODO after merge: Add assertions to verify subscriptions are renewed
-    // For example, check that subscription renewal messages appear in logs
-    // at the expected times (T+120s, T+240s, etc.)
-}
-
-/// Test that explicitly verifies the subscription renewal interval.
-///
-/// This is a more focused test that checks if subscriptions are renewed
-/// at the expected interval (2 minutes) to prevent expiry at 4 minutes.
-///
-/// Uses Turmoil for deterministic time advancement and reproducible results.
-///
-/// NOTE: This test is #[ignore] because it demonstrates the bug on main.
-#[test_log::test]
-#[ignore = "TODO-MUST-FIX: Demonstrates subscription renewal timing bug - remove ignore after fix"]
-fn test_subscription_renewal_timing() {
-    const SEED: u64 = 0x2804_0002;
-
-    setup_deterministic_state(SEED);
-
-    let rt = create_runtime();
-
-    // Create minimal network
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "renewal-timing-test",
-            1,  // gateways
-            2,  // nodes
-            7,  // ring_max_htl
-            3,  // rnd_if_htl_above
-            10, // max_connections
-            2,  // min_connections
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    // Run simulation with specific timing to observe renewal behavior
-    // Duration extends beyond lease duration to see if subscriptions expire
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        1,  // max_contracts
-        1,  // iterations - single operation
-        Duration::from_secs(300), // 5 minutes - well past lease duration
-        || async {
-            // Sleep for renewal interval duration to trigger renewal checks
-            tokio::time::sleep(SUBSCRIPTION_RENEWAL_INTERVAL).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "Renewal timing simulation failed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "Baseline simulation failed: {:?}", result.err());
 
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
 
-    tracing::info!("============================================================");
-    tracing::info!("RENEWAL TIMING TEST RESULTS");
-    tracing::info!("============================================================");
-    tracing::info!("Total events: {}", logs.len());
-    tracing::info!("Renewal interval: {}s", SUBSCRIPTION_RENEWAL_INTERVAL.as_secs());
-    tracing::info!("Lease duration: {}s", SUBSCRIPTION_LEASE_DURATION.as_secs());
-    tracing::info!("");
-    tracing::info!("Expected timeline:");
-    tracing::info!("  T+0s   : GET operation creates subscription");
-    tracing::info!("  T+120s : Renewal should occur (if bug is fixed)");
-    tracing::info!("  T+240s : Without renewal, subscription expires (BUG)");
-    tracing::info!("  T+300s : Test completes");
-    tracing::info!("============================================================");
+    tracing::info!("Baseline test completed: {} events captured", logs.len());
 
-    // TODO after merge: Add assertions that verify:
-    // 1. Subscription renewal events appear at T+120s intervals
-    // 2. No subscription expiry events occur for active contracts
-    // 3. Contracts remain subscribed beyond T+240s
-}
-
-/// Test that simulates the real-world River UI scenario.
-///
-/// This test specifically reproduces the River UI bug where:
-/// - User opens River UI, which GETs a contract
-/// - User leaves the UI open (expecting live updates)
-/// - After 4 minutes, subscription expires silently
-/// - UI stops receiving updates and shows stale data
-///
-/// Uses Turmoil for deterministic simulation.
-#[test_log::test]
-#[ignore = "TODO-MUST-FIX: Reproduces River UI subscription expiry bug - remove ignore after fix"]
-fn test_river_ui_subscription_expiry_scenario() {
-    const SEED: u64 = 0x2804_0003; // River UI scenario
-
-    setup_deterministic_state(SEED);
-
-    let rt = create_runtime();
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
-            "river-ui-scenario",
-            1,  // gateway (simulating user's local gateway)
-            2,  // nodes (minimal network)
-            7, 3, 10, 2,
-            SEED,
-        )
-        .await;
-        let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
-    });
-
-    // Simulate River UI workflow:
-    // 1. Initial GET when UI loads (iteration 1)
-    // 2. Wait for 5 minutes with UI open
-    // 3. Expect to continue receiving updates
-    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
-        SEED,
-        1,  // Single contract (e.g., a River channel)
-        1,  // Single GET operation (UI loads contract)
-        Duration::from_secs(300), // 5 minutes - user has UI open
-        || async {
-            // Simulate periodic UI activity (doesn't trigger renewal on main)
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            Ok(())
-        },
-    );
-
-    assert!(
-        result.is_ok(),
-        "River UI scenario simulation failed: {:?}",
-        result.err()
-    );
-
-    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
-
-    tracing::info!("============================================================");
-    tracing::info!("RIVER UI SCENARIO TEST");
-    tracing::info!("============================================================");
-    tracing::info!("Scenario: User opens River UI, expects live updates");
-    tracing::info!("Total events: {}", logs.len());
-    tracing::info!("");
-    tracing::info!("BUG on main:");
-    tracing::info!("  T+0s   : UI GETs contract, auto-subscription created");
-    tracing::info!("  T+240s : Subscription expires (NOT renewed)");
-    tracing::info!("  T+240s+: UI stops receiving updates, shows stale data");
-    tracing::info!("");
-    tracing::info!("Expected after fix:");
-    tracing::info!("  T+0s   : UI GETs contract, auto-subscription created");
-    tracing::info!("  T+120s : Subscription renewed");
-    tracing::info!("  T+240s : Subscription renewed again");
-    tracing::info!("  T+300s : Subscription still active, UI receives updates");
-    tracing::info!("============================================================");
-
-    // TODO after merge: Add assertion that subscription remains active
-    // and updates continue to be received throughout the 5-minute window
+    // Just verify we captured events - this is a sanity check
+    assert!(logs.len() > 0, "Should have captured some events");
 }
