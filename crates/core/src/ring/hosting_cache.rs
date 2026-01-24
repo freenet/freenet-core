@@ -261,6 +261,61 @@ impl<T: TimeSource> HostingCache<T> {
 
         evicted
     }
+
+    /// Load a contract entry from persisted data during startup.
+    ///
+    /// Unlike `record_access`, this uses a pre-computed last_accessed time
+    /// and doesn't evict other contracts (we may be over budget after loading).
+    ///
+    /// # Arguments
+    /// * `key` - The contract key
+    /// * `size_bytes` - Size of the contract state
+    /// * `access_type` - How the contract was last accessed (GET/PUT/SUBSCRIBE)
+    /// * `last_access_age` - How long ago the contract was last accessed
+    pub fn load_persisted_entry(
+        &mut self,
+        key: ContractKey,
+        size_bytes: u64,
+        access_type: AccessType,
+        last_access_age: Duration,
+    ) {
+        // Skip if already loaded (shouldn't happen, but defensive)
+        if self.contracts.contains_key(&key) {
+            return;
+        }
+
+        // Calculate the last_accessed time from age
+        let now = self.time_source.now();
+        let last_accessed = now.checked_sub(last_access_age).unwrap_or(now);
+
+        let contract = HostedContract {
+            size_bytes,
+            last_accessed,
+            access_type,
+        };
+
+        self.contracts.insert(key, contract);
+        self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+        // Note: LRU order will be sorted after all entries are loaded
+    }
+
+    /// Sort the LRU order by last_accessed time after bulk loading.
+    ///
+    /// Call this after `load_persisted_entry` calls are complete.
+    pub fn finalize_loading(&mut self) {
+        // Build LRU order from contracts sorted by last_accessed (oldest first)
+        let mut entries: Vec<_> = self
+            .contracts
+            .iter()
+            .map(|(k, v)| (*k, v.last_accessed))
+            .collect();
+        entries.sort_by_key(|(_, last_accessed)| *last_accessed);
+
+        self.lru_order.clear();
+        for (key, _) in entries {
+            self.lru_order.push_back(key);
+        }
+    }
 }
 
 #[cfg(test)]

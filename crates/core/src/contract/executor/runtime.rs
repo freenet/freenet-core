@@ -286,6 +286,12 @@ impl RuntimePool {
 
         Ok(executor)
     }
+
+    /// Get a reference to the shared state store.
+    /// Used for hosting metadata persistence operations during startup.
+    pub fn state_store(&self) -> &StateStore<Storage> {
+        &self.shared_state_store
+    }
 }
 
 impl ContractExecutor for RuntimePool {

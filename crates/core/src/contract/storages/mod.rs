@@ -2,6 +2,8 @@
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+pub use sqlite::HostingMetadata;
+#[cfg(all(feature = "sqlite", not(feature = "redb")))]
 pub use sqlite::Pool as SqlitePool;
 
 #[cfg(all(feature = "sqlite", not(feature = "redb")))]
@@ -10,6 +12,8 @@ pub type Storage = SqlitePool;
 /// State storage implementation based on the [`redb`]
 #[cfg(feature = "redb")]
 pub mod redb;
+#[cfg(feature = "redb")]
+pub use self::redb::HostingMetadata;
 #[cfg(feature = "redb")]
 pub use self::redb::ReDb;
 

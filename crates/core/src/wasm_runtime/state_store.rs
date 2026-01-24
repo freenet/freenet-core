@@ -168,6 +168,12 @@ where
         let r = self.store.get_params(key).await.map_err(Into::into)?;
         Ok(r)
     }
+
+    /// Get a reference to the underlying storage backend.
+    /// Used for hosting metadata persistence operations.
+    pub fn inner(&self) -> &S {
+        &self.store
+    }
 }
 
 #[cfg(test)]

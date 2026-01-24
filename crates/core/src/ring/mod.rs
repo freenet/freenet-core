@@ -634,6 +634,35 @@ impl Ring {
         self.is_hosting_contract(key)
     }
 
+    /// Set the storage reference for hosting metadata persistence.
+    ///
+    /// Must be called after executor creation. This enables automatic
+    /// cleanup of persisted metadata when contracts are evicted.
+    pub fn set_hosting_storage(&self, storage: crate::contract::storages::Storage) {
+        self.hosting_manager.set_storage(storage);
+    }
+
+    /// Load hosting cache from persisted storage.
+    ///
+    /// Call this during startup after storage is available to restore
+    /// the hosting cache from the previous run.
+    #[cfg(feature = "redb")]
+    pub fn load_hosting_cache(
+        &self,
+        storage: &crate::contract::storages::Storage,
+    ) -> Result<usize, redb::Error> {
+        self.hosting_manager.load_from_storage(storage)
+    }
+
+    /// Load hosting cache from persisted storage (sqlite version).
+    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+    pub async fn load_hosting_cache(
+        &self,
+        storage: &crate::contract::storages::Storage,
+    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError> {
+        self.hosting_manager.load_from_storage(storage).await
+    }
+
     pub fn record_request(
         &self,
         recipient: PeerKeyLocation,

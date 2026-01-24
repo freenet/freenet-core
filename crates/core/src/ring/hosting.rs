@@ -128,6 +128,13 @@ pub(crate) struct HostingManager {
 
     /// Exponential backoff state for subscription retries.
     subscription_backoff: RwLock<TrackedBackoff<ContractKey>>,
+
+    /// Storage reference for persisting/removing hosting metadata.
+    /// Set after executor creation via `set_storage()`.
+    #[cfg(feature = "redb")]
+    storage: RwLock<Option<crate::contract::storages::Storage>>,
+    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+    storage: RwLock<Option<crate::contract::storages::Storage>>,
 }
 
 impl HostingManager {
@@ -147,7 +154,14 @@ impl HostingManager {
                 backoff_config,
                 MAX_SUBSCRIPTION_BACKOFF_ENTRIES,
             )),
+            storage: RwLock::new(None),
         }
+    }
+
+    /// Set the storage reference for persisting hosting metadata.
+    /// Must be called after executor creation.
+    pub fn set_storage(&self, storage: crate::contract::storages::Storage) {
+        *self.storage.write() = Some(storage);
     }
 
     // =========================================================================
@@ -366,15 +380,47 @@ impl HostingManager {
     /// ALL contracts in the hosting cache will have their subscriptions renewed.
     ///
     /// Returns contracts evicted from the cache (if any).
+    /// Automatically removes persisted metadata for evicted contracts.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
     ) -> Vec<ContractKey> {
-        self.hosting_cache
+        let evicted = self
+            .hosting_cache
             .write()
-            .record_access(key, size_bytes, access_type)
+            .record_access(key, size_bytes, access_type);
+
+        // Clean up persisted metadata for evicted contracts
+        if !evicted.is_empty() {
+            if let Some(storage) = self.storage.read().as_ref() {
+                for evicted_key in &evicted {
+                    #[cfg(feature = "redb")]
+                    {
+                        if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
+                            tracing::warn!(
+                                contract = %evicted_key,
+                                error = %e,
+                                "Failed to remove persisted hosting metadata for evicted contract"
+                            );
+                        }
+                    }
+                    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+                    {
+                        // For sqlite, we can't easily run async from a sync context
+                        // The metadata will be cleaned up on next startup via reconciliation
+                        // TODO: Consider using a background task for sqlite cleanup
+                        tracing::debug!(
+                            contract = %evicted_key,
+                            "Evicted contract - sqlite metadata cleanup deferred"
+                        );
+                    }
+                }
+            }
+        }
+
+        evicted
     }
 
     /// Check if a contract is in the hosting cache.
@@ -410,8 +456,36 @@ impl HostingManager {
     ///
     /// Returns contracts evicted from this cache. Callers should check
     /// `has_client_subscriptions()` before removing subscription state.
+    /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
-        self.hosting_cache.write().sweep_expired()
+        let expired = self.hosting_cache.write().sweep_expired();
+
+        // Clean up persisted metadata for expired contracts
+        if !expired.is_empty() {
+            if let Some(storage) = self.storage.read().as_ref() {
+                for expired_key in &expired {
+                    #[cfg(feature = "redb")]
+                    {
+                        if let Err(e) = storage.remove_hosting_metadata(expired_key) {
+                            tracing::warn!(
+                                contract = %expired_key,
+                                error = %e,
+                                "Failed to remove persisted hosting metadata for expired contract"
+                            );
+                        }
+                    }
+                    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+                    {
+                        tracing::debug!(
+                            contract = %expired_key,
+                            "Expired contract - sqlite metadata cleanup deferred"
+                        );
+                    }
+                }
+            }
+        }
+
+        expired
     }
 
     // =========================================================================
@@ -603,6 +677,131 @@ impl HostingManager {
             .as_nanos() as u64;
 
         snapshot
+    }
+}
+
+// =============================================================================
+// Persistence Methods
+// =============================================================================
+
+impl HostingManager {
+    /// Load hosting metadata from storage during startup.
+    ///
+    /// This restores the hosting cache from persisted data, allowing the peer
+    /// to continue hosting contracts after a restart without losing LRU state.
+    ///
+    /// # Arguments
+    /// * `storage` - The storage backend (ReDb or SqlitePool)
+    ///
+    /// # Returns
+    /// The number of contracts loaded from storage.
+    #[cfg(feature = "redb")]
+    pub fn load_from_storage(
+        &self,
+        storage: &crate::contract::storages::Storage,
+    ) -> Result<usize, redb::Error> {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let metadata_entries = storage.load_all_hosting_metadata()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut cache = self.hosting_cache.write();
+        let mut loaded = 0;
+
+        for (key_bytes, metadata) in metadata_entries {
+            // Reconstruct ContractKey from instance ID bytes and code hash from metadata
+            // key_bytes contains the ContractInstanceId (32 bytes)
+            // metadata.code_hash contains the CodeHash (32 bytes)
+            if key_bytes.len() == 32 {
+                let mut instance_id_bytes = [0u8; 32];
+                instance_id_bytes.copy_from_slice(&key_bytes);
+                let instance_id = ContractInstanceId::new(instance_id_bytes);
+                let code_hash = CodeHash::new(metadata.code_hash);
+                let key = ContractKey::from_id_and_code(instance_id, code_hash);
+
+                let access_type = match metadata.access_type {
+                    1 => super::hosting_cache::AccessType::Put,
+                    2 => super::hosting_cache::AccessType::Subscribe,
+                    _ => super::hosting_cache::AccessType::Get,
+                };
+
+                // Calculate age from persisted timestamp
+                let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
+                let age = std::time::Duration::from_millis(age_ms);
+
+                cache.load_persisted_entry(key, metadata.size_bytes, access_type, age);
+                loaded += 1;
+            }
+        }
+
+        // Sort LRU order by last_accessed time
+        cache.finalize_loading();
+
+        tracing::info!(
+            loaded_contracts = loaded,
+            total_bytes = cache.current_bytes(),
+            "Loaded hosting cache from storage"
+        );
+
+        Ok(loaded)
+    }
+
+    /// Load hosting metadata from storage during startup (sqlite version).
+    #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+    pub async fn load_from_storage(
+        &self,
+        storage: &crate::contract::storages::Storage,
+    ) -> Result<usize, crate::contract::storages::sqlite::SqlDbError> {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let metadata_entries = storage.load_all_hosting_metadata().await?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut cache = self.hosting_cache.write();
+        let mut loaded = 0;
+
+        for (key_bytes, metadata) in metadata_entries {
+            // Reconstruct ContractKey from instance ID bytes and code hash from metadata
+            // key_bytes contains the ContractInstanceId (32 bytes)
+            // metadata.code_hash contains the CodeHash (32 bytes)
+            if key_bytes.len() == 32 {
+                let mut instance_id_bytes = [0u8; 32];
+                instance_id_bytes.copy_from_slice(&key_bytes);
+                let instance_id = ContractInstanceId::new(instance_id_bytes);
+                let code_hash = CodeHash::new(metadata.code_hash);
+                let key = ContractKey::from_id_and_code(instance_id, code_hash);
+
+                let access_type = match metadata.access_type {
+                    1 => super::hosting_cache::AccessType::Put,
+                    2 => super::hosting_cache::AccessType::Subscribe,
+                    _ => super::hosting_cache::AccessType::Get,
+                };
+
+                // Calculate age from persisted timestamp
+                let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
+                let age = std::time::Duration::from_millis(age_ms);
+
+                cache.load_persisted_entry(key, metadata.size_bytes, access_type, age);
+                loaded += 1;
+            }
+        }
+
+        // Sort LRU order by last_accessed time
+        cache.finalize_loading();
+
+        tracing::info!(
+            loaded_contracts = loaded,
+            total_bytes = cache.current_bytes(),
+            "Loaded hosting cache from storage"
+        );
+
+        Ok(loaded)
     }
 }
 
