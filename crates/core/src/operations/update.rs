@@ -105,20 +105,6 @@ impl UpdateOp {
         Ok(())
     }
 
-    /// Create a new outbound UpdateOp targeting a specific peer.
-    ///
-    /// Used when sending state to a specific subscriber (e.g., after they join
-    /// and need to receive the current state they may have missed).
-    pub(crate) fn new_outbound(id: Transaction, target: PeerKeyLocation) -> Self {
-        Self {
-            id,
-            state: Some(UpdateState::ReceivedRequest),
-            stats: Some(UpdateStats {
-                target: Some(target),
-            }),
-            upstream_addr: None, // We're the originator
-        }
-    }
 }
 
 struct UpdateStats {
