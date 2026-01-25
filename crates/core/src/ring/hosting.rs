@@ -728,27 +728,26 @@ impl HostingManager {
         active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
         for (contract_key, expires_at) in active_subs {
-            if expires_at > now {
-                if !hosting_cache.contains(&contract_key) {
-                    let has_client_subscriptions =
-                        self.client_subscriptions.contains_key(contract_key.id());
+            if expires_at > now && !hosting_cache.contains(&contract_key) {
+                let has_client_subscriptions =
+                    self.client_subscriptions.contains_key(contract_key.id());
 
-                    snapshot.set_contract(
-                        *contract_key.id(),
-                        ContractSubscription {
-                            contract_key,
-                            upstream: None,
-                            downstream: vec![],
-                            is_seeding: false, // TODO: Rename to is_hosting
-                            has_client_subscriptions,
-                        },
-                    );
-                }
+                snapshot.set_contract(
+                    *contract_key.id(),
+                    ContractSubscription {
+                        contract_key,
+                        upstream: None,
+                        downstream: vec![],
+                        is_seeding: false, // TODO: Rename to is_hosting
+                        has_client_subscriptions,
+                    },
+                );
             }
         }
 
         // Use GlobalSimulationTime for deterministic timestamps in simulation tests
-        snapshot.timestamp_nanos = crate::config::GlobalSimulationTime::current_time_ms() * 1_000_000;
+        snapshot.timestamp_nanos =
+            crate::config::GlobalSimulationTime::current_time_ms() * 1_000_000;
 
         snapshot
     }

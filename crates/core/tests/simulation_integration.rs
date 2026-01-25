@@ -197,6 +197,7 @@ impl TestConfig {
     }
 
     /// Add latency jitter simulation.
+    #[allow(dead_code)]
     fn with_latency(mut self, min: Duration, max: Duration) -> Self {
         self.latency_range = Some(min..max);
         self
@@ -559,8 +560,7 @@ fn test_strict_determinism_exact_event_equality() {
         // Create SimNetwork and get event logs handle before run_simulation consumes it
         let (sim, logs_handle) = rt.block_on(async {
             let sim = SimNetwork::new(
-                name,
-                2,  // gateways - multi-gateway to test more code paths
+                name, 2,  // gateways - multi-gateway to test more code paths
                 18, // nodes - increased to trigger DashMap iteration issues
                 10, // ring_max_htl
                 3,  // rnd_if_htl_above
@@ -1558,7 +1558,7 @@ fn test_topology_single_seeder() {
 fn test_concurrent_updates_convergence() {
     // Use a specific seed for reproducibility
     // This seed was chosen to produce good coverage of concurrent update scenarios
-    TestConfig::medium("concurrent-updates-convergence", 0xC0_C0_BEEF_1234)
+    TestConfig::medium("concurrent-updates-convergence", 0xC0C0_BEEF_1234)
         .with_gateways(2) // Multiple gateways for richer topology
         .with_nodes(6) // 6 regular nodes for concurrent updates
         .with_max_contracts(3) // Few contracts = more updates per contract

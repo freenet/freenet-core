@@ -150,7 +150,10 @@ pub fn get_all_topology_snapshots(network_name: &str) -> Vec<TopologySnapshot> {
         let addr_b = format!("{}", b.0);
         addr_a.cmp(&addr_b)
     });
-    snapshots.into_iter().map(|(_, snapshot)| snapshot).collect()
+    snapshots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .collect()
 }
 
 /// Clear all topology snapshots for a network.
