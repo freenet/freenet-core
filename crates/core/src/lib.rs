@@ -65,8 +65,8 @@ pub mod dev_tool {
     use super::*;
     pub use crate::config::{Config, GlobalTestMetrics};
     pub use client_events::{
-        test::MemoryEventsGen, test::NetworkEventGenerator, AuthToken, ClientEventsProxy, ClientId,
-        OpenRequest,
+        test::MemoryEventsGen, test::NetworkEventGenerator, test::SubscriptionNotificationMode,
+        AuthToken, ClientEventsProxy, ClientId, OpenRequest,
     };
     pub use contract::{
         clear_crdt_contracts, is_crdt_contract, register_crdt_contract, storages::Storage,
