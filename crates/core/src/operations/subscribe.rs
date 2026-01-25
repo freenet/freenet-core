@@ -1,19 +1,13 @@
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 
 use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
-use super::{
-    get, update, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
-};
-use crate::config::GlobalExecutor;
+use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::node::IsOperationCompleted;
-use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
-use crate::util::backoff::ExponentialBackoff;
 use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
@@ -30,15 +24,6 @@ use tokio::time::{sleep, Duration};
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
-
-/// Maximum number of retries for peer location lookup.
-/// Used when a Subscribe message arrives before the connection is fully established.
-const PEER_LOOKUP_MAX_RETRIES: u32 = 5;
-
-/// Backoff configuration for peer location lookup retries.
-/// Base delay of 100ms, max delay of 2s (capped to prevent excessive waiting).
-const PEER_LOOKUP_BACKOFF: ExponentialBackoff =
-    ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(2));
 
 /// Wait for a contract to become available, using channel-based notification.
 ///
@@ -94,170 +79,14 @@ async fn fetch_contract_if_missing(
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
 
-/// Wait for peer location to be available, with exponential backoff retry.
-///
-/// This handles the race condition where a Subscribe message arrives before
-/// the connection is fully established (peer is still in transient state).
-/// Returns None only after all retries are exhausted.
-async fn wait_for_peer_location(
-    op_manager: &OpManager,
-    addr: SocketAddr,
-    tx_id: &Transaction,
-) -> Option<PeerKeyLocation> {
-    // Fast path - peer already fully connected
-    if let Some(peer) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_location_by_addr(addr)
-    {
-        return Some(peer);
-    }
-
-    // Retry with exponential backoff
-    for attempt in 1..=PEER_LOOKUP_MAX_RETRIES {
-        let delay = PEER_LOOKUP_BACKOFF.delay(attempt - 1);
-        tracing::debug!(
-            tx = %tx_id,
-            %addr,
-            attempt,
-            delay_ms = delay.as_millis(),
-            "subscribe: peer not found, retrying after delay"
-        );
-
-        sleep(delay).await;
-
-        if let Some(peer) = op_manager
-            .ring
-            .connection_manager
-            .get_peer_location_by_addr(addr)
-        {
-            tracing::debug!(
-                tx = %tx_id,
-                %addr,
-                attempt,
-                "subscribe: peer found after retry"
-            );
-            return Some(peer);
-        }
-    }
-
-    tracing::warn!(
-        tx = %tx_id,
-        %addr,
-        retries = PEER_LOOKUP_MAX_RETRIES,
-        "subscribe: peer lookup failed after all retries, connection may be transient"
-    );
-    None
-}
-
-/// Send the current contract state to a newly subscribed peer.
-///
-/// When a peer subscribes to a contract, they become a downstream subscriber and will
-/// receive future Updates. However, they may have missed Updates that were broadcast
-/// before they subscribed. This function ensures new subscribers receive the current
-/// state immediately after subscribing.
-///
-/// This is spawned as a background task to avoid blocking the Subscribe response.
-fn send_state_to_new_subscriber(
-    op_manager: OpManager,
-    key: ContractKey,
-    subscriber: PeerKeyLocation,
-    subscribe_tx: Transaction,
-) {
-    GlobalExecutor::spawn(async move {
-        // Yield first to let the Subscribe response go out
-        tokio::task::yield_now().await;
-
-        let subscriber_addr = match subscriber.socket_addr() {
-            Some(addr) => addr,
-            None => {
-                tracing::warn!(
-                    tx = %subscribe_tx,
-                    %key,
-                    "send_state_to_new_subscriber: subscriber has no socket address"
-                );
-                return;
-            }
-        };
-
-        // Fetch the current state from our local store
-        let state = match op_manager
-            .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                instance_id: *key.id(),
-                return_contract_code: false,
-            })
-            .await
-        {
-            Ok(ContractHandlerEvent::GetResponse {
-                key: Some(_),
-                response:
-                    Ok(StoreResponse {
-                        state: Some(state), ..
-                    }),
-            }) => state,
-            Ok(_) => {
-                tracing::debug!(
-                    tx = %subscribe_tx,
-                    %key,
-                    "send_state_to_new_subscriber: no state found for contract"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    tx = %subscribe_tx,
-                    %key,
-                    error = %e,
-                    "send_state_to_new_subscriber: failed to get contract state"
-                );
-                return;
-            }
-        };
-
-        // Create a new Update transaction for this state sync
-        let update_tx = Transaction::new::<update::UpdateMsg>();
-
-        tracing::debug!(
-            tx = %update_tx,
-            subscribe_tx = %subscribe_tx,
-            %key,
-            subscriber = %subscriber_addr,
-            "Sending current state to new subscriber"
-        );
-
-        // Create the Update message targeting the specific subscriber
-        let msg = update::UpdateMsg::RequestUpdate {
-            id: update_tx,
-            key,
-            related_contracts: RelatedContracts::default(),
-            value: state,
-        };
-
-        // Create operation state with the subscriber as the target
-        let op_state = update::UpdateOp::new_outbound(update_tx, subscriber.clone());
-
-        // Send the Update to the new subscriber
-        if let Err(e) = op_manager
-            .notify_op_change(NetMessage::from(msg), OpEnum::Update(op_state))
-            .await
-        {
-            tracing::warn!(
-                tx = %update_tx,
-                %key,
-                subscriber = %subscriber_addr,
-                error = %e,
-                "Failed to send state to new subscriber"
-            );
-        }
-    });
-}
-
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
     PrepareRequest {
         id: Transaction,
         instance_id: ContractInstanceId,
+        /// Whether this is a renewal (requester already has contract).
+        is_renewal: bool,
     },
     /// Awaiting response from downstream peer.
     AwaitingResponse {
@@ -282,23 +111,41 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
     }
 }
 
-pub(crate) fn start_op(instance_id: ContractInstanceId) -> SubscribeOp {
+/// Start a new subscription operation.
+///
+/// `is_renewal` indicates whether this is a renewal (requester already has the contract).
+/// If true, the responder will skip sending state to save bandwidth.
+pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
-    let state = Some(SubscribeState::PrepareRequest { id, instance_id });
+    let state = Some(SubscribeState::PrepareRequest {
+        id,
+        instance_id,
+        is_renewal,
+    });
     SubscribeOp {
         id,
         state,
         requester_addr: None, // Local operation, we are the originator
+        is_renewal,
     }
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
-pub(crate) fn start_op_with_id(instance_id: ContractInstanceId, id: Transaction) -> SubscribeOp {
-    let state = Some(SubscribeState::PrepareRequest { id, instance_id });
+pub(crate) fn start_op_with_id(
+    instance_id: ContractInstanceId,
+    id: Transaction,
+    is_renewal: bool,
+) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest {
+        id,
+        instance_id,
+        is_renewal,
+    });
     SubscribeOp {
         id,
         state,
         requester_addr: None, // Local operation, we are the originator
+        is_renewal,
     }
 }
 
@@ -316,11 +163,17 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let Some(SubscribeState::PrepareRequest { id, instance_id }) = &sub_op.state else {
+    let Some(SubscribeState::PrepareRequest {
+        id,
+        instance_id,
+        is_renewal,
+    }) = &sub_op.state
+    else {
         return Err(OpError::UnexpectedOpState);
     };
+    let is_renewal = *is_renewal;
 
-    tracing::debug!(tx = %id, contract = %instance_id, "subscribe: request_subscribe invoked");
+    tracing::debug!(tx = %id, contract = %instance_id, is_renewal, "subscribe: request_subscribe invoked");
 
     let own_addr = match op_manager.ring.connection_manager.peer_addr() {
         Ok(addr) => addr,
@@ -436,6 +289,7 @@ pub(crate) async fn request_subscribe(
         instance_id: *instance_id,
         htl: op_manager.ring.max_hops_to_live,
         visited,
+        is_renewal,
     };
 
     // Emit telemetry for subscribe request initiation
@@ -455,6 +309,7 @@ pub(crate) async fn request_subscribe(
             next_hop: Some(target_addr),
         }),
         requester_addr: None, // We're the originator
+        is_renewal,
     };
 
     op_manager
@@ -508,6 +363,9 @@ pub(crate) struct SubscribeOp {
     /// The address of the peer that requested this subscription.
     /// Used for routing responses back and registering them as downstream subscribers.
     requester_addr: Option<std::net::SocketAddr>,
+    /// Whether this is a renewal (requester already has the contract).
+    /// Preserved across request/response to avoid sending state to renewals.
+    is_renewal: bool,
 }
 
 impl SubscribeOp {
@@ -633,6 +491,11 @@ impl Operation for SubscribeOp {
                 }
 
                 // New request from another peer - we're an intermediate/terminal node
+                // Extract is_renewal from the Request message
+                let is_renewal = match msg {
+                    SubscribeMsg::Request { is_renewal, .. } => *is_renewal,
+                    _ => false, // Response case handled above
+                };
                 Ok(OpInitialization {
                     op: Self {
                         id,
@@ -640,6 +503,7 @@ impl Operation for SubscribeOp {
                             next_hop: None, // Will be determined during processing
                         }),
                         requester_addr: source_addr, // Store who sent us this request
+                        is_renewal,
                     },
                     source_addr,
                 })
@@ -668,37 +532,25 @@ impl Operation for SubscribeOp {
                     instance_id,
                     htl,
                     visited,
+                    is_renewal,
                 } => {
                     tracing::debug!(
                         tx = %id,
                         %instance_id,
                         htl,
+                        is_renewal,
                         requester_addr = ?self.requester_addr,
                         "subscribe: processing Request"
                     );
 
                     // Check if we have the contract
                     if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
-                        // We have the contract - register upstream as subscriber and respond
+                        // We have the contract - respond to confirm subscription
+                        // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
+                        // In the lease-based model (2026-01), we just confirm we have the contract.
+                        // Updates propagate via proximity cache, not explicit tree.
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the upstream peer as downstream subscriber (they want updates FROM us)
-                            // In the simplified lease-based model (2026-01), we just confirm
-                            // we have the contract. The requester will register their own subscription.
-                            // Updates propagate via proximity cache, not explicit tree.
-
-                            // Send state to the subscriber so they have initial data
-                            if let Some(upstream_peer) =
-                                wait_for_peer_location(op_manager, requester_addr, id).await
-                            {
-                                send_state_to_new_subscriber(
-                                    op_manager.clone(),
-                                    key,
-                                    upstream_peer,
-                                    *id,
-                                );
-                            }
-
-                            tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
+                            tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -718,6 +570,7 @@ impl Operation for SubscribeOp {
                                     id: *id,
                                     state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
+                                    is_renewal: self.is_renewal,
                                 })),
                             });
                         }
@@ -731,20 +584,9 @@ impl Operation for SubscribeOp {
                     )
                     .await?
                     {
-                        // Contract arrived - simplified lease-based model
+                        // Contract arrived - respond to confirm subscription
+                        // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
-                            // Send state to the subscriber
-                            if let Some(upstream_peer) =
-                                wait_for_peer_location(op_manager, requester_addr, id).await
-                            {
-                                send_state_to_new_subscriber(
-                                    op_manager.clone(),
-                                    key,
-                                    upstream_peer,
-                                    *id,
-                                );
-                            }
-
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -763,6 +605,7 @@ impl Operation for SubscribeOp {
                                     id: *id,
                                     state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
+                                    is_renewal: self.is_renewal,
                                 })),
                             });
                         }
@@ -807,7 +650,7 @@ impl Operation for SubscribeOp {
                     let next_addr = next_hop_known.socket_addr();
                     new_visited.mark_visited(next_addr);
 
-                    tracing::debug!(tx = %id, %instance_id, next = %next_addr, "Forwarding subscribe request");
+                    tracing::debug!(tx = %id, %instance_id, next = %next_addr, is_renewal, "Forwarding subscribe request");
 
                     Ok(OperationResult {
                         return_msg: Some(NetMessage::from(SubscribeMsg::Request {
@@ -815,6 +658,7 @@ impl Operation for SubscribeOp {
                             instance_id: *instance_id,
                             htl: htl.saturating_sub(1),
                             visited: new_visited,
+                            is_renewal: *is_renewal,
                         })),
                         next_hop: Some(next_addr),
                         state: Some(OpEnum::Subscribe(SubscribeOp {
@@ -823,6 +667,7 @@ impl Operation for SubscribeOp {
                                 next_hop: None, // Already routing via next_hop in OperationResult
                             }),
                             requester_addr: self.requester_addr,
+                            is_renewal: self.is_renewal,
                         })),
                     })
                 }
@@ -853,6 +698,12 @@ impl Operation for SubscribeOp {
                             // our subscription locally. No upstream/downstream tree tracking.
                             op_manager.ring.subscribe(*key);
                             op_manager.ring.complete_subscription_request(key, true);
+
+                            // Refresh hosting TTL on subscription success.
+                            // This extends the hosting lifetime for contracts we're actively subscribed to.
+                            // (Unlike UPDATE, SUBSCRIBE is user-initiated so safe to extend TTL)
+                            op_manager.ring.touch_hosting(key);
+
                             tracing::info!(
                                 tx = %msg_id,
                                 contract = %format!("{:.8}", key),
@@ -881,53 +732,17 @@ impl Operation for SubscribeOp {
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
-                                // In the lease-based model (2026-01), we don't track downstream
-                                // subscribers. Just send state and forward the response.
-                                if let Some(requester_peer) =
-                                    wait_for_peer_location(op_manager, requester_addr, msg_id).await
-                                {
-                                    // Send current state so they don't miss updates
-                                    send_state_to_new_subscriber(
-                                        op_manager.clone(),
-                                        *key,
-                                        requester_peer,
-                                        *msg_id,
-                                    );
-
-                                    tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
-                                    Ok(OperationResult {
-                                        return_msg: Some(NetMessage::from(
-                                            SubscribeMsg::Response {
-                                                id: *msg_id,
-                                                instance_id: *instance_id,
-                                                result: SubscribeMsgResult::Subscribed {
-                                                    key: *key,
-                                                },
-                                            },
-                                        )),
-                                        next_hop: Some(requester_addr),
-                                        state: None,
-                                    })
-                                } else {
-                                    // Peer lookup failed after retries - return NotFound
-                                    tracing::warn!(
-                                        tx = %msg_id,
-                                        %key,
-                                        requester = %requester_addr,
-                                        "subscribe: peer lookup failed after retries, returning NotFound"
-                                    );
-                                    Ok(OperationResult {
-                                        return_msg: Some(NetMessage::from(
-                                            SubscribeMsg::Response {
-                                                id: *msg_id,
-                                                instance_id: *instance_id,
-                                                result: SubscribeMsgResult::NotFound,
-                                            },
-                                        )),
-                                        next_hop: Some(requester_addr),
-                                        state: None,
-                                    })
-                                }
+                                // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
+                                tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
+                                Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *msg_id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::Subscribed { key: *key },
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: None,
+                                })
                             } else {
                                 // We're the originator - return completed state for handle_op_result
                                 tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
@@ -951,6 +766,7 @@ impl Operation for SubscribeOp {
                                         id,
                                         state: Some(SubscribeState::Completed { key: *key }),
                                         requester_addr: None,
+                                        is_renewal: self.is_renewal,
                                     })),
                                 })
                             }
@@ -1053,6 +869,7 @@ impl Operation for SubscribeOp {
                                             id,
                                             state: Some(SubscribeState::Completed { key }),
                                             requester_addr: None,
+                                            is_renewal: self.is_renewal,
                                         })),
                                     })
                                 } else {
@@ -1077,6 +894,7 @@ impl Operation for SubscribeOp {
                                             id,
                                             state: None,
                                             requester_addr: None,
+                                            is_renewal: self.is_renewal,
                                         })),
                                     })
                                 }
@@ -1130,6 +948,9 @@ mod messages {
             htl: usize,
             /// Bloom filter tracking visited peers to prevent loops
             visited: super::super::VisitedPeers,
+            /// Whether this is a renewal (requester already has contract state).
+            /// If true, responder skips sending state to save bandwidth.
+            is_renewal: bool,
         },
         /// Response for a SUBSCRIBE operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).

@@ -956,21 +956,6 @@ where
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed {
-                ref key,
-                ref from,
-                transaction: _,
-            } => {
-                // In the simplified architecture (2026-01 refactor), subscriptions are lease-based
-                // and expire automatically. Unsubscribed messages are no longer propagated through
-                // an explicit subscription tree. We just log this for debugging.
-                tracing::debug!(
-                    %key,
-                    %from,
-                    "Received Unsubscribed (no-op in lease-based model)"
-                );
-                break;
-            }
             NetMessageV1::ProximityCache { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!(
@@ -1484,19 +1469,24 @@ pub async fn subscribe(
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    subscribe_with_id(op_manager, instance_id, client_id, None).await
+    // Client-initiated subscriptions are never renewals
+    subscribe_with_id(op_manager, instance_id, client_id, None, false).await
 }
 
 /// Attempts to subscribe to a contract with a specific transaction ID (for deduplication)
+///
+/// `is_renewal` indicates whether this is a renewal (requester already has the contract).
+/// If true, the responder will skip sending state to save bandwidth.
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
     transaction_id: Option<Transaction>,
+    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
     let op = match transaction_id {
-        Some(id) => subscribe::start_op_with_id(instance_id, id),
-        None => subscribe::start_op(instance_id),
+        Some(id) => subscribe::start_op_with_id(instance_id, id, is_renewal),
+        None => subscribe::start_op(instance_id, is_renewal),
     };
     let id = op.id;
     if let Some(client_id) = client_id {

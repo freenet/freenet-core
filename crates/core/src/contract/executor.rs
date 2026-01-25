@@ -608,7 +608,8 @@ struct SubscribeContract {
 
 impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::subscribe::SubscribeOp {
-        operations::subscribe::start_op(self.instance_id)
+        // is_renewal: false - client-initiated subscriptions are always new
+        operations::subscribe::start_op(self.instance_id, false)
     }
 
     async fn resume_op(

@@ -113,7 +113,40 @@ impl ContractHandler for NetworkContractHandler {
 
         tracing::info!(pool_size = %pool_size, "Creating RuntimePool");
 
-        let executor = RuntimePool::new(config.clone(), op_sender, op_manager, pool_size).await?;
+        let executor =
+            RuntimePool::new(config.clone(), op_sender, op_manager.clone(), pool_size).await?;
+
+        // Set up hosting storage reference for eviction cleanup
+        // This must be done before loading the cache so evictions work correctly
+        let storage = executor.state_store().inner().clone();
+        op_manager.ring.set_hosting_storage(storage.clone());
+
+        // Load hosting cache from persisted storage
+        // This restores contracts that were hosted before restart, and also
+        // migrates legacy contracts (state exists but no hosting metadata).
+        // We pass a closure that uses RuntimePool's code_hash_from_id for
+        // looking up CodeHash from ContractInstanceId during legacy migration.
+        #[cfg(feature = "redb")]
+        {
+            if let Err(e) = op_manager.ring.load_hosting_cache(&storage, |instance_id| {
+                executor.code_hash_from_id(instance_id)
+            }) {
+                tracing::warn!(error = %e, "Failed to load hosting cache from storage");
+            }
+        }
+        #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+        {
+            if let Err(e) = op_manager
+                .ring
+                .load_hosting_cache(&storage, |instance_id| {
+                    executor.code_hash_from_id(instance_id)
+                })
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to load hosting cache from storage");
+            }
+        }
+
         Ok(Self { executor, channel })
     }
 

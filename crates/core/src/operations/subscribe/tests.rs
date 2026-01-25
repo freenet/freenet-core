@@ -101,7 +101,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     );
 
     // 1. Test start_op function - this should always work now (validates no early return bug)
-    let sub_op = start_op(*contract_key.id());
+    let sub_op = start_op(*contract_key.id(), false);
     assert!(matches!(
         sub_op.state,
         Some(SubscribeState::PrepareRequest { .. })
@@ -261,7 +261,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     );
 
     // Test 1: Validate that start_op creates correct initial state
-    let sub_op = start_op(*contract_key.id());
+    let sub_op = start_op(*contract_key.id(), false);
     assert!(matches!(
         sub_op.state,
         Some(SubscribeState::PrepareRequest { .. })
@@ -469,6 +469,7 @@ async fn test_subscription_validates_k_closest_usage() {
             id: transaction_id,
             state: Some(SubscribeState::AwaitingResponse { next_hop: None }),
             requester_addr: None,
+            is_renewal: false,
         };
 
         // State is simplified - skip list is now in the Request message, not state
@@ -486,13 +487,13 @@ async fn test_subscription_validates_k_closest_usage() {
 fn test_start_op_creates_prepare_request_state() {
     let instance_id = ContractInstanceId::new([42u8; 32]);
 
-    let sub_op = start_op(instance_id);
+    let sub_op = start_op(instance_id, false);
 
     // Verify the operation is initialized correctly
     assert!(
         matches!(
             sub_op.state,
-            Some(SubscribeState::PrepareRequest { id, instance_id: iid })
+            Some(SubscribeState::PrepareRequest { id, instance_id: iid, .. })
             if iid == instance_id && id == sub_op.id
         ),
         "start_op should create PrepareRequest state with correct instance_id"
@@ -521,7 +522,7 @@ fn test_start_op_with_id_uses_provided_transaction() {
     let instance_id = ContractInstanceId::new([99u8; 32]);
     let custom_tx = Transaction::new::<SubscribeMsg>();
 
-    let sub_op = start_op_with_id(instance_id, custom_tx);
+    let sub_op = start_op_with_id(instance_id, custom_tx, false);
 
     // Verify the operation uses the provided transaction ID
     assert_eq!(
@@ -533,7 +534,7 @@ fn test_start_op_with_id_uses_provided_transaction() {
     assert!(
         matches!(
             sub_op.state,
-            Some(SubscribeState::PrepareRequest { id, instance_id: iid })
+            Some(SubscribeState::PrepareRequest { id, instance_id: iid, .. })
             if iid == instance_id && id == custom_tx
         ),
         "PrepareRequest state should have provided transaction ID"
@@ -563,8 +564,10 @@ fn test_subscribe_op_state_lifecycle() {
         state: Some(SubscribeState::PrepareRequest {
             id: tx_id,
             instance_id,
+            is_renewal: false,
         }),
         requester_addr: None,
+        is_renewal: false,
     };
 
     assert!(
@@ -583,6 +586,7 @@ fn test_subscribe_op_state_lifecycle() {
             next_hop: Some(peer_addr),
         }),
         requester_addr: None,
+        is_renewal: false,
     };
 
     assert!(
@@ -604,6 +608,7 @@ fn test_subscribe_op_state_lifecycle() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        is_renewal: false,
     };
 
     assert!(
@@ -635,6 +640,7 @@ fn test_subscribe_op_failed_state_returns_error() {
         id: tx_id,
         state: None,
         requester_addr: None,
+        is_renewal: false,
     };
 
     // Verify to_host_result returns error
@@ -667,6 +673,7 @@ fn test_local_subscription_completion_state() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None, // Local subscription, no network requester
+        is_renewal: false,
     };
 
     // Verify operation is in completed state

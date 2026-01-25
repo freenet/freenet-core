@@ -2,13 +2,70 @@ use std::path::Path;
 use std::sync::Arc;
 
 use freenet_stdlib::prelude::*;
-use redb::{Database, DatabaseError, ReadableDatabase, TableDefinition};
+use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::wasm_runtime::StateStorage;
 
 const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
+
+/// Table for persisting hosting metadata across restarts.
+/// Key: ContractKey bytes
+/// Value: HostingMetadata serialized (last_access_ms, access_type, size_bytes)
+const HOSTING_METADATA_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("hosting_metadata");
+
+/// Metadata about a hosted contract, persisted to survive restarts.
+#[derive(Debug, Clone, Copy)]
+pub struct HostingMetadata {
+    /// Milliseconds since UNIX epoch when contract was last accessed
+    pub last_access_ms: u64,
+    /// How the contract was accessed (0=Get, 1=Put, 2=Subscribe)
+    pub access_type: u8,
+    /// Size of the contract state in bytes
+    pub size_bytes: u64,
+    /// Code hash of the contract (needed to reconstruct ContractKey)
+    pub code_hash: [u8; 32],
+}
+
+impl HostingMetadata {
+    pub fn new(last_access_ms: u64, access_type: u8, size_bytes: u64, code_hash: [u8; 32]) -> Self {
+        Self {
+            last_access_ms,
+            access_type,
+            size_bytes,
+            code_hash,
+        }
+    }
+
+    /// Serialize to bytes: [last_access_ms: 8][access_type: 1][size_bytes: 8][code_hash: 32] = 49 bytes
+    pub fn to_bytes(&self) -> [u8; 49] {
+        let mut buf = [0u8; 49];
+        buf[0..8].copy_from_slice(&self.last_access_ms.to_le_bytes());
+        buf[8] = self.access_type;
+        buf[9..17].copy_from_slice(&self.size_bytes.to_le_bytes());
+        buf[17..49].copy_from_slice(&self.code_hash);
+        buf
+    }
+
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 49 {
+            return None;
+        }
+        let last_access_ms = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let access_type = bytes[8];
+        let size_bytes = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
+        let code_hash: [u8; 32] = bytes[17..49].try_into().ok()?;
+        Some(Self {
+            last_access_ms,
+            access_type,
+            size_bytes,
+            code_hash,
+        })
+    }
+}
 
 /// ReDb wraps a redb Database in Arc for thread-safe sharing.
 /// redb supports MVCC (multiple concurrent readers, single writer) internally,
@@ -82,6 +139,16 @@ impl ReDb {
                 );
                 e
             })?;
+
+            txn.open_table(HOSTING_METADATA_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "HOSTING_METADATA_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open HOSTING_METADATA_TABLE"
+                );
+                e
+            })?;
         }
         txn.commit()?;
         Ok(db)
@@ -149,18 +216,117 @@ impl ReDb {
             }
         }
     }
+
+    // ==================== Hosting Metadata Methods ====================
+
+    /// Store hosting metadata for a contract.
+    pub fn store_hosting_metadata(
+        &self,
+        key: &ContractKey,
+        metadata: HostingMetadata,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+            tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get hosting metadata for a contract.
+    pub fn get_hosting_metadata(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<HostingMetadata>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+        match tbl.get(key.as_bytes())? {
+            Some(v) => Ok(HostingMetadata::from_bytes(v.value())),
+            None => Ok(None),
+        }
+    }
+
+    /// Remove hosting metadata for a contract.
+    pub fn remove_hosting_metadata(&self, key: &ContractKey) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+            tbl.remove(key.as_bytes())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all hosting metadata from the database.
+    /// Returns a vector of (ContractKey bytes, HostingMetadata) pairs.
+    /// The caller must reconstruct ContractKey from the bytes.
+    pub fn load_all_hosting_metadata(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, HostingMetadata)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            if let Some(metadata) = HostingMetadata::from_bytes(value.value()) {
+                result.push((key.value().to_vec(), metadata));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get the size of a contract's state (for populating hosting cache).
+    pub fn get_state_size(&self, key: &ContractKey) -> Result<Option<u64>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(STATE_TABLE)?;
+        match tbl.get(key.as_bytes())? {
+            Some(v) => Ok(Some(v.value().len() as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Iterate all contract keys that have stored state.
+    /// Returns the raw key bytes - caller must reconstruct ContractKey.
+    pub fn iter_all_state_keys(&self) -> Result<Vec<Vec<u8>>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(STATE_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, _) = entry?;
+            result.push(key.value().to_vec());
+        }
+        Ok(result)
+    }
 }
 
 impl StateStorage for ReDb {
     type Error = redb::Error;
 
     async fn store(&self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
+        let state_size = state.size() as u64;
         let txn = self.0.begin_write()?;
 
         {
             let mut tbl = txn.open_table(STATE_TABLE)?;
             tbl.insert(key.as_bytes(), state.as_ref())?;
         }
+
+        // Also update hosting metadata to track this contract
+        // This ensures the contract is reloaded into hosting cache on restart
+        {
+            let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            // Default to PUT access type (1) since we're storing state
+            // Store the code hash so we can reconstruct ContractKey on load
+            let code_hash: [u8; 32] = **key.code_hash();
+            let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash);
+            tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
+        }
+
         txn.commit().map_err(Into::into)
     }
 
