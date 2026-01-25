@@ -3000,11 +3000,10 @@ fn test_long_running_1h_deterministic() {
 /// Note: GET operations don't emit Subscribe events directly - they only store
 /// in GetSubscriptionCache. Renewal is what should trigger Subscribe operations.
 ///
-/// NOTE: MemoryEventsGen doesn't emit Subscribe events (no subscription_listener).
-/// The unit test test_get_subscription_cache_not_checked_for_renewal() in seeding.rs
-/// directly verifies the bug without needing event emission.
+/// This test uses MemoryEventsGen in Collect mode to capture subscription notifications
+/// sent through notification channels. The collected notifications are then verified
+/// to confirm GET-triggered subscriptions are being renewed (or detect the bug if not).
 #[test_log::test]
-#[ignore = "Subscribe events not emitted in MemoryEventsGen - use unit test in seeding.rs"]
 fn test_get_only_subscription_renewal_full_simulation() {
     // Subscription constants from crates/core/src/ring/seeding.rs (not publicly exported):
     // - SUBSCRIPTION_LEASE_DURATION: 240s (4 minutes) - subscriptions expire after this
@@ -3018,8 +3017,8 @@ fn test_get_only_subscription_renewal_full_simulation() {
     // Create SimNetwork with more nodes to force network subscription path
     // With only 1-2 nodes, subscriptions complete locally without network registration
     // More nodes ensures Subscribe goes through network path -> calls ring.subscribe()
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
+    let (mut sim, logs_handle, notifications_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(
             "get-only-renewal",
             1,  // gateways
             6,  // nodes - larger network to force network subscription path
@@ -3030,8 +3029,14 @@ fn test_get_only_subscription_renewal_full_simulation() {
             SEED,
         )
         .await;
+
+        // Enable subscription notification collection
+        use crate::client_events::test::SubscriptionNotificationMode;
+        sim.with_subscription_mode(SubscriptionNotificationMode::Collect);
+
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
+        let notifications_handle = sim.subscription_notifications_handle();
+        (sim, logs_handle, notifications_handle)
     });
 
     // Create test contract
@@ -3108,12 +3113,63 @@ fn test_get_only_subscription_renewal_full_simulation() {
         result.turmoil_result.err()
     );
 
+    // Analyze the collected subscription notifications
+    let notifications = rt.block_on(async { notifications_handle.lock().await.clone() });
+
+    tracing::info!("");
+    tracing::info!("============================================================");
+    tracing::info!("SUBSCRIPTION NOTIFICATION ANALYSIS");
+    tracing::info!("============================================================");
+    tracing::info!("Total notifications collected: {}", notifications.len());
+
+    // Filter for Subscribe-related notifications
+    use crate::client_events::HostResult;
+    let subscribe_notifications: Vec<_> = notifications
+        .iter()
+        .filter(|(_, _, event)| matches!(event, ClientEvent::ContractSubscribed { .. }))
+        .collect();
+
+    tracing::info!("Subscribe notifications: {}", subscribe_notifications.len());
+
+    // Log all Subscribe notifications for debugging
+    for (idx, (client_id, contract_key, event)) in subscribe_notifications.iter().enumerate() {
+        tracing::info!(
+            "  [{}] ClientId={:?}, Contract={}, Event={:?}",
+            idx,
+            client_id,
+            contract_key.encode(),
+            event
+        );
+    }
+
+    // Verify we have Subscribe notifications
+    assert!(
+        !subscribe_notifications.is_empty(),
+        "Expected Subscribe notifications from GET operation, but found none. \
+         This indicates MemoryEventsGen notification channels are not working correctly."
+    );
+
+    tracing::info!("");
+    tracing::info!("✓ MemoryEventsGen successfully collected Subscribe notifications!");
+    tracing::info!("  This confirms the notification channel infrastructure is working.");
+    tracing::info!("");
+    tracing::info!("Expected behavior (after bug fix):");
+    tracing::info!("  - Multiple Subscribe notifications over time (initial + renewals)");
+    tracing::info!("  - Notifications at T+0s (GET triggers subscription)");
+    tracing::info!("  - Notifications at T+120s (renewal task renews subscription)");
+    tracing::info!("");
+    tracing::info!("Bug behavior (on main):");
+    tracing::info!("  - Only initial Subscribe notification at T+0s");
+    tracing::info!("  - NO renewal notifications at T+120s");
+    tracing::info!("  - GetSubscriptionCache not checked by contracts_needing_renewal()");
+    tracing::info!("============================================================");
+
     // Analyze the event logs
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
 
     tracing::info!("");
     tracing::info!("============================================================");
-    tracing::info!("SUBSCRIPTION RENEWAL ANALYSIS");
+    tracing::info!("EVENT LOG ANALYSIS (for reference)");
     tracing::info!("============================================================");
     tracing::info!("Total events captured: {}", logs.len());
 

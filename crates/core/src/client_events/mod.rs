@@ -1799,6 +1799,10 @@ async fn process_open_request(
 pub(crate) mod test {
     use std::{
         collections::{HashMap, HashSet},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::Duration,
     };
 
@@ -1810,7 +1814,10 @@ pub(crate) mod test {
     use rand::SeedableRng;
     use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
-    use tokio::sync::Mutex;
+    use tokio::sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        Mutex,
+    };
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -1818,12 +1825,33 @@ pub(crate) mod test {
 
     use super::*;
 
+    /// Controls how MemoryEventsGen handles subscription notifications.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum SubscriptionNotificationMode {
+        /// Don't create notification channels. Used by CRDT convergence tests that rely on
+        /// network UPDATE propagation rather than client notification channels.
+        #[default]
+        Disabled,
+        /// Create unique notification channels per subscription and collect notifications
+        /// for test inspection. Used by subscription renewal tests.
+        Collect,
+    }
+
     pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
         key: TransportPublicKey,
         signal: Receiver<(EventId, TransportPublicKey)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
+        /// How to handle subscription notifications
+        mode: SubscriptionNotificationMode,
+        /// Counter for generating unique ClientIds per subscription (in Collect mode)
+        next_client_id: Arc<AtomicU64>,
+        /// Map of active notification channels by (ClientId, ContractInstanceId)
+        subscription_channels:
+            Arc<Mutex<HashMap<(ClientId, ContractInstanceId), UnboundedReceiver<HostResult>>>>,
+        /// Collected notifications for test inspection
+        collected_notifications: Arc<Mutex<Vec<(ClientId, ContractInstanceId, HostResult)>>>,
     }
 
     impl<R> MemoryEventsGen<R>
@@ -1841,7 +1869,27 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
+                mode: SubscriptionNotificationMode::default(),
+                next_client_id: Arc::new(AtomicU64::new(1)),
+                subscription_channels: Arc::new(Mutex::new(HashMap::new())),
+                collected_notifications: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Set the subscription notification mode (builder pattern).
+        pub fn with_subscription_mode(mut self, mode: SubscriptionNotificationMode) -> Self {
+            self.mode = mode;
+            self
+        }
+
+        /// Set a shared collection for subscription notifications (builder pattern).
+        /// This allows multiple MemoryEventsGen instances to share a single notification collection.
+        pub fn with_shared_notification_collection(
+            mut self,
+            collection: Arc<Mutex<Vec<(ClientId, ContractInstanceId, HostResult)>>>,
+        ) -> Self {
+            self.collected_notifications = collection;
+            self
         }
 
         pub fn rng_params(
@@ -1891,6 +1939,10 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
+                mode: SubscriptionNotificationMode::default(),
+                next_client_id: Arc::new(AtomicU64::new(1)),
+                subscription_channels: Arc::new(Mutex::new(HashMap::new())),
+                collected_notifications: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1904,8 +1956,31 @@ pub(crate) mod test {
             self.events_to_gen.extend(events)
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'_>> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'static>> {
             self.events_to_gen.remove(id)
+        }
+
+        /// Get all collected subscription notifications for test inspection.
+        #[cfg(any(test, feature = "testing"))]
+        pub async fn collected_notifications(
+            &self,
+        ) -> Vec<(ClientId, ContractInstanceId, HostResult)> {
+            self.collected_notifications.lock().await.clone()
+        }
+
+        /// Get subscription notifications for a specific contract.
+        #[cfg(any(test, feature = "testing"))]
+        pub async fn notifications_for_contract(
+            &self,
+            contract: &ContractInstanceId,
+        ) -> Vec<HostResult> {
+            self.collected_notifications
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, key, _)| key == contract)
+                .map(|(_, _, event)| event.clone())
+                .collect()
         }
     }
 
@@ -1919,28 +1994,54 @@ pub(crate) mod test {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
                         if self.rng.is_some() && pk == self.key {
-                            let res = OpenRequest {
-                                client_id: ClientId::FIRST,
-                                request_id: RequestId::new(),
-                                request: self
-                                    .generate_rand_event()
+                            let request = self
+                                .generate_rand_event()
+                                .await
+                                .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?;
+
+                            let (client_id, notification_channel, to_insert) =
+                                self.create_notification_channel(&request);
+
+                            // Insert subscription channel if needed
+                            if let Some((cid, key, rx)) = to_insert {
+                                self.subscription_channels
+                                    .lock()
                                     .await
-                                    .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
-                                    .into(),
-                                notification_channel: None,
+                                    .insert((cid, key), rx);
+                            }
+
+                            let res = OpenRequest {
+                                client_id,
+                                request_id: RequestId::new(),
+                                request: request.into(),
+                                notification_channel,
                                 token: None,
                                 attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         } else if pk == self.key {
+                            // Generate event first (requires &mut self)
+                            let request = self
+                                .generate_deterministic_event(&ev_id)
+                                .expect("event not found");
+
+                            // Create notification channel (synchronous, no borrow conflicts)
+                            let (client_id, notification_channel, to_insert) =
+                                self.create_notification_channel(&request);
+
+                            // Insert subscription channel if needed
+                            if let Some((cid, key, rx)) = to_insert {
+                                self.subscription_channels
+                                    .lock()
+                                    .await
+                                    .insert((cid, key), rx);
+                            }
+
                             let res = OpenRequest {
-                                client_id: ClientId::FIRST,
+                                client_id,
                                 request_id: RequestId::new(),
-                                request: self
-                                    .generate_deterministic_event(&ev_id)
-                                    .expect("event not found")
-                                    .into(),
-                                notification_channel: None,
+                                request: request.into(),
+                                notification_channel,
                                 token: None,
                                 attested_contract: None,
                             };
@@ -1961,17 +2062,80 @@ pub(crate) mod test {
             _id: ClientId,
             response: Result<HostResponse, ClientError>,
         ) -> BoxFuture<'_, Result<(), ClientError>> {
+            // Update internal state for GET responses (needed for RandomEventGenerator tests)
             if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, ..
-            })) = response
+            })) = &response
             {
-                self.internal_state
-                    .as_mut()
-                    .expect("state should be set")
-                    .owns_contracts
-                    .insert(key);
+                if let Some(state) = self.internal_state.as_mut() {
+                    state.owns_contracts.insert(*key);
+                }
             }
-            async { Ok(()) }.boxed()
+
+            let collect_notifications = self.mode == SubscriptionNotificationMode::Collect;
+            let notification_collector = if collect_notifications {
+                Some(self.subscription_channels.clone())
+            } else {
+                None
+            };
+            let collected_notifications = self.collected_notifications.clone();
+
+            async move {
+                // Collect pending notifications if in Collect mode
+                if let Some(channels) = notification_collector {
+                    let mut channels_guard = channels.lock().await;
+                    let mut collected = collected_notifications.lock().await;
+
+                    for ((client_id, contract_key), rx) in channels_guard.iter_mut() {
+                        while let Ok(event) = rx.try_recv() {
+                            collected.push((*client_id, *contract_key, event));
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+
+    impl<R> MemoryEventsGen<R> {
+        /// Create a notification channel for a request if in Collect mode and request is subscription-related.
+        /// Returns (ClientId, Option<Sender>, Option<(ClientId, ContractInstanceId, Receiver)>)
+        /// The last element should be inserted into subscription_channels by the caller.
+        fn create_notification_channel(
+            &self,
+            request: &ClientRequest<'_>,
+        ) -> (
+            ClientId,
+            Option<UnboundedSender<HostResult>>,
+            Option<(ClientId, ContractInstanceId, UnboundedReceiver<HostResult>)>,
+        ) {
+            match self.mode {
+                SubscriptionNotificationMode::Disabled => (ClientId::FIRST, None, None),
+                SubscriptionNotificationMode::Collect => {
+                    // Check if this request creates/updates a subscription
+                    let contract_key = match request {
+                        ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. })
+                        | ClientRequest::ContractOp(ContractRequest::Get { key, .. }) => Some(*key),
+                        _ => None,
+                    };
+
+                    if let Some(contract_key) = contract_key {
+                        // Generate unique ClientId for this subscription
+                        let client_id_raw = self.next_client_id.fetch_add(1, Ordering::SeqCst);
+                        let client_id = ClientId(client_id_raw as usize);
+
+                        // Create notification channel
+                        let (tx, rx) = unbounded_channel();
+
+                        (client_id, Some(tx), Some((client_id, contract_key, rx)))
+                    } else {
+                        // Not a subscription request, use default ClientId and no channel
+                        (ClientId::FIRST, None, None)
+                    }
+                }
+            }
         }
     }
 

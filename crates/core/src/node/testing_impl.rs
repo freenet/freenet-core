@@ -73,13 +73,16 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::info;
 
 #[cfg(feature = "trace-ot")]
 use crate::tracing::CombinedRegister;
 use crate::{
-    client_events::test::{MemoryEventsGen, RandomEventGenerator},
+    client_events::{
+        test::{MemoryEventsGen, RandomEventGenerator},
+        ClientId,
+    },
     config::{ConfigArgs, GlobalExecutor, GlobalRng},
     dev_tool::TransportKeypair,
     node::{InitPeerNode, NetEventRegister, NodeConfig},
@@ -735,6 +738,18 @@ pub struct SimNetwork {
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
     all_gateway_configs: Vec<GatewayConfig>,
+    /// Controls how MemoryEventsGen handles subscription notifications
+    subscription_notification_mode: crate::client_events::test::SubscriptionNotificationMode,
+    /// Shared collection of subscription notifications from all MemoryEventsGen instances
+    subscription_notifications: Arc<
+        Mutex<
+            Vec<(
+                ClientId,
+                freenet_stdlib::prelude::ContractInstanceId,
+                crate::client_events::HostResult,
+            )>,
+        >,
+    >,
 }
 
 impl SimNetwork {
@@ -790,6 +805,9 @@ impl SimNetwork {
             node_addresses: HashMap::new(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
+            subscription_notification_mode:
+                crate::client_events::test::SubscriptionNotificationMode::default(),
+            subscription_notifications: Arc::new(Mutex::new(Vec::new())),
         };
         net.config_gateways(
             gateways
@@ -836,6 +854,32 @@ impl SimNetwork {
 impl SimNetwork {
     pub fn with_start_backoff(&mut self, value: Duration) {
         self.start_backoff = value;
+    }
+
+    /// Set the subscription notification mode for MemoryEventsGen instances.
+    /// Default is Disabled (for CRDT convergence tests).
+    /// Set to Collect for subscription renewal tests that need to inspect Subscribe events.
+    pub fn with_subscription_mode(
+        &mut self,
+        mode: crate::client_events::test::SubscriptionNotificationMode,
+    ) {
+        self.subscription_notification_mode = mode;
+    }
+
+    /// Get a handle to the subscription notifications collection.
+    /// Use this after a simulation completes to inspect collected Subscribe events.
+    pub fn subscription_notifications_handle(
+        &self,
+    ) -> Arc<
+        Mutex<
+            Vec<(
+                ClientId,
+                freenet_stdlib::prelude::ContractInstanceId,
+                crate::client_events::HostResult,
+            )>,
+        >,
+    > {
+        self.subscription_notifications.clone()
     }
 
     /// Returns the VirtualTime instance for this simulation.
@@ -1711,7 +1755,9 @@ impl SimNetwork {
             let mut user_events = MemoryEventsGen::new(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
-            );
+            )
+            .with_subscription_mode(self.subscription_notification_mode)
+            .with_shared_notification_collection(self.subscription_notifications.clone());
 
             // Populate events for this node
             if let Some(node_ops) = operations_by_node.remove(&label) {
@@ -1815,7 +1861,9 @@ impl SimNetwork {
             let mut user_events = MemoryEventsGen::new(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
-            );
+            )
+            .with_subscription_mode(self.subscription_notification_mode)
+            .with_shared_notification_collection(self.subscription_notifications.clone());
 
             // Populate events for this node
             if let Some(node_ops) = operations_by_node.remove(&label) {
@@ -3090,8 +3138,12 @@ impl SimNetwork {
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
+            let subscription_notifications = self.subscription_notifications.clone();
+            let subscription_mode = self.subscription_notification_mode;
             let mut user_events =
-                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone())
+                    .with_subscription_mode(subscription_mode)
+                    .with_shared_notification_collection(subscription_notifications);
 
             // Populate events for this node
             if let Some(node_ops) = operations_by_node.remove(&label) {
@@ -3163,8 +3215,12 @@ impl SimNetwork {
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
+            let subscription_notifications = self.subscription_notifications.clone();
+            let subscription_mode = self.subscription_notification_mode;
             let mut user_events =
-                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone())
+                    .with_subscription_mode(subscription_mode)
+                    .with_shared_notification_collection(subscription_notifications);
 
             // Populate events for this node
             if let Some(node_ops) = operations_by_node.remove(&label) {
