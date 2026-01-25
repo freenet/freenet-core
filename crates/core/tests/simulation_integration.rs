@@ -197,6 +197,7 @@ impl TestConfig {
     }
 
     /// Add latency jitter simulation.
+    #[allow(dead_code)]
     fn with_latency(mut self, min: Duration, max: Duration) -> Self {
         self.latency_range = Some(min..max);
         self
@@ -532,10 +533,13 @@ fn create_runtime() -> tokio::runtime::Runtime {
 /// 3. Exact same event sequence (order, content)
 ///
 /// If this test fails, it indicates non-determinism in the simulation that Turmoil
-/// doesn't control (e.g., HashMap iteration order, external I/O, real time usage).
+/// doesn't control (e.g., DashMap/HashMap iteration order, external I/O, real time usage).
 ///
 /// The test runs the simulation 3 times with the same seed and compares traces.
 /// All three runs must produce identical results.
+///
+/// **Scale:** Uses 2 gateways + 18 nodes to catch DashMap iteration non-determinism
+/// that only manifests at scale (e.g., in subscription/interest management).
 #[test_log::test]
 fn test_strict_determinism_exact_event_equality() {
     const SEED: u64 = 0xDE7E_2A1E_1234;
@@ -556,12 +560,12 @@ fn test_strict_determinism_exact_event_equality() {
         // Create SimNetwork and get event logs handle before run_simulation consumes it
         let (sim, logs_handle) = rt.block_on(async {
             let sim = SimNetwork::new(
-                name, 1,  // gateways - single gateway for determinism
-                6,  // nodes
-                7,  // ring_max_htl
+                name, 2,  // gateways - multi-gateway to test more code paths
+                18, // nodes - increased to trigger DashMap iteration issues
+                10, // ring_max_htl
                 3,  // rnd_if_htl_above
-                10, // max_connections
-                2,  // min_connections
+                15, // max_connections - higher to create more subscription operations
+                5,  // min_connections
                 seed,
             )
             .await;
@@ -572,8 +576,8 @@ fn test_strict_determinism_exact_event_equality() {
         // Run simulation with Turmoil's deterministic scheduler
         let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
             seed,
-            5,                       // max_contract_num
-            20,                      // iterations
+            10, // max_contract_num - more contracts = more subscription operations
+            40, // iterations - more iterations to trigger DashMap operations
             Duration::from_secs(30), // simulation_duration
             || async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1554,7 +1558,7 @@ fn test_topology_single_seeder() {
 fn test_concurrent_updates_convergence() {
     // Use a specific seed for reproducibility
     // This seed was chosen to produce good coverage of concurrent update scenarios
-    TestConfig::medium("concurrent-updates-convergence", 0xC0_C0_BEEF_1234)
+    TestConfig::medium("concurrent-updates-convergence", 0xC0C0_BEEF_1234)
         .with_gateways(2) // Multiple gateways for richer topology
         .with_nodes(6) // 6 regular nodes for concurrent updates
         .with_max_contracts(3) // Few contracts = more updates per contract

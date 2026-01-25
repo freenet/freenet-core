@@ -139,10 +139,20 @@ pub fn get_topology_snapshot(
 
 /// Get all topology snapshots for a network.
 pub fn get_all_topology_snapshots(network_name: &str) -> Vec<TopologySnapshot> {
-    TOPOLOGY_REGISTRY
+    let mut snapshots: Vec<_> = TOPOLOGY_REGISTRY
         .iter()
         .filter(|entry| entry.key().0 == network_name)
-        .map(|entry| entry.value().clone())
+        .map(|entry| (entry.key().1, entry.value().clone()))
+        .collect();
+    // Sort by socket address for deterministic ordering (critical for simulation tests)
+    snapshots.sort_by(|a, b| {
+        let addr_a = format!("{}", a.0);
+        let addr_b = format!("{}", b.0);
+        addr_a.cmp(&addr_b)
+    });
+    snapshots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
         .collect()
 }
 

@@ -186,17 +186,17 @@ jobs:
         run: |
           echo "Running replica validation with step-by-step consistency"
           echo "NOTE: This test may fail due to known convergence issues being investigated"
-          cargo test -p freenet --features simulation_tests --test sim_network \
+          cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration \
             replica_validation_and_stepwise_consistency -- \
-            --ignored --test-threads=1 --nocapture || echo "Test failed - convergence issues detected (expected)"
+            --test-threads=1 --nocapture || echo "Test failed - convergence issues detected (expected)"
 
       # Dense network replication test (higher connectivity)
       - name: Dense network replication test
         run: |
           echo "Running dense network replication test"
-          cargo test -p freenet --features simulation_tests --test sim_network \
+          cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration \
             dense_network_replication -- \
-            --ignored --test-threads=1 --nocapture
+            --test-threads=1 --nocapture
 
       # Long-duration simulation test (1 hour virtual time)
       # Uses Turmoil deterministic scheduler for reproducible results

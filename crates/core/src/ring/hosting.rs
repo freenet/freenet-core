@@ -234,11 +234,15 @@ impl HostingManager {
     /// Get all contracts with active subscriptions.
     pub fn get_subscribed_contracts(&self) -> Vec<ContractKey> {
         let now = Instant::now();
-        self.active_subscriptions
+        let mut contracts: Vec<ContractKey> = self
+            .active_subscriptions
             .iter()
             .filter(|entry| *entry.value() > now)
             .map(|entry| *entry.key())
-            .collect()
+            .collect();
+        // Sort for deterministic ordering (critical for simulation tests)
+        contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        contracts
     }
 
     /// Expire stale subscriptions and return the contracts that were expired.
@@ -347,12 +351,14 @@ impl HostingManager {
         let mut affected_contracts = Vec::new();
 
         // Find all contracts where this client is subscribed
-        let instance_ids_with_client: Vec<ContractInstanceId> = self
+        // Sort for deterministic iteration order
+        let mut instance_ids_with_client: Vec<ContractInstanceId> = self
             .client_subscriptions
             .iter()
             .filter(|entry| entry.value().contains(&client_id))
             .map(|entry| *entry.key())
             .collect();
+        instance_ids_with_client.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         for instance_id in instance_ids_with_client {
             self.remove_client_subscription(&instance_id, client_id);
@@ -572,7 +578,8 @@ impl HostingManager {
     /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
     pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
         let now = Instant::now();
-        self.active_subscriptions
+        let mut states: Vec<_> = self
+            .active_subscriptions
             .iter()
             .map(|entry| {
                 let contract = *entry.key();
@@ -581,7 +588,10 @@ impl HostingManager {
                 let has_client = self.has_client_subscriptions(contract.id());
                 (contract, has_client, is_active, Some(expires_at))
             })
-            .collect()
+            .collect();
+        // Sort by contract key for deterministic ordering (critical for simulation tests)
+        states.sort_by(|(a, _, _, _), (b, _, _, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+        states
     }
 
     /// Get contracts that need subscription renewal.
@@ -601,27 +611,39 @@ impl HostingManager {
         let mut needs_renewal_set = HashSet::new();
 
         // 1. Contracts with soon-to-expire subscriptions
-        for entry in self.active_subscriptions.iter() {
-            if *entry.value() <= renewal_threshold && *entry.value() > now {
-                needs_renewal_set.insert(*entry.key());
+        // Collect and sort for deterministic iteration order
+        let mut active_subs: Vec<_> = self
+            .active_subscriptions
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+        active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        for (key, expires_at) in active_subs {
+            if expires_at <= renewal_threshold && expires_at > now {
+                needs_renewal_set.insert(key);
             }
         }
 
         // 2. Contracts with client subscriptions but no active network subscription
-        for entry in self.client_subscriptions.iter() {
-            let instance_id = entry.key();
+        // Collect and sort for deterministic iteration order
+        let mut client_instance_ids: Vec<_> =
+            self.client_subscriptions.iter().map(|e| *e.key()).collect();
+        client_instance_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        for instance_id in client_instance_ids {
             // Find if we have an active subscription for this contract
             let has_active = self
                 .active_subscriptions
                 .iter()
-                .any(|sub| sub.key().id() == instance_id && *sub.value() > now);
+                .any(|sub| sub.key().id() == &instance_id && *sub.value() > now);
             if !has_active {
                 // Need to find the ContractKey - check hosting cache
                 if let Some(contract) = self
                     .hosting_cache
                     .read()
                     .iter()
-                    .find(|k| k.id() == instance_id)
+                    .find(|k| k.id() == &instance_id)
                 {
                     needs_renewal_set.insert(contract);
                 }
@@ -630,7 +652,11 @@ impl HostingManager {
 
         // 3. THE FIX: All hosted contracts should have subscriptions renewed
         // This ensures GET-triggered subscriptions don't expire without renewal
-        for contract in self.hosting_cache.read().iter() {
+        // Collect and sort for deterministic iteration order
+        let mut hosted_contracts: Vec<_> = self.hosting_cache.read().iter().collect();
+        hosted_contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        for contract in hosted_contracts {
             // Skip if has active subscription that's not expiring soon
             if self
                 .active_subscriptions
@@ -644,7 +670,10 @@ impl HostingManager {
             needs_renewal_set.insert(contract);
         }
 
-        needs_renewal_set.into_iter().collect()
+        // Convert set to vec and sort for deterministic return order
+        let mut result: Vec<ContractKey> = needs_renewal_set.into_iter().collect();
+        result.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        result
     }
 
     // =========================================================================
@@ -668,8 +697,12 @@ impl HostingManager {
         let now = tokio::time::Instant::now();
 
         // Add all hosted contracts
+        // Collect and sort for deterministic iteration order
         let hosting_cache = self.hosting_cache.read();
-        for contract_key in hosting_cache.iter() {
+        let mut hosted_contracts: Vec<_> = hosting_cache.iter().collect();
+        hosted_contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        for contract_key in hosted_contracts {
             let has_client_subscriptions =
                 self.client_subscriptions.contains_key(contract_key.id());
 
@@ -686,31 +719,35 @@ impl HostingManager {
         }
 
         // Add subscribed contracts that might not be in hosting cache yet
-        for entry in self.active_subscriptions.iter() {
-            if *entry.value() > now {
-                let contract_key = *entry.key();
-                if !hosting_cache.contains(&contract_key) {
-                    let has_client_subscriptions =
-                        self.client_subscriptions.contains_key(contract_key.id());
+        // Collect and sort for deterministic iteration order
+        let mut active_subs: Vec<_> = self
+            .active_subscriptions
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+        active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-                    snapshot.set_contract(
-                        *contract_key.id(),
-                        ContractSubscription {
-                            contract_key,
-                            upstream: None,
-                            downstream: vec![],
-                            is_seeding: false, // TODO: Rename to is_hosting
-                            has_client_subscriptions,
-                        },
-                    );
-                }
+        for (contract_key, expires_at) in active_subs {
+            if expires_at > now && !hosting_cache.contains(&contract_key) {
+                let has_client_subscriptions =
+                    self.client_subscriptions.contains_key(contract_key.id());
+
+                snapshot.set_contract(
+                    *contract_key.id(),
+                    ContractSubscription {
+                        contract_key,
+                        upstream: None,
+                        downstream: vec![],
+                        is_seeding: false, // TODO: Rename to is_hosting
+                        has_client_subscriptions,
+                    },
+                );
             }
         }
 
-        snapshot.timestamp_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        // Use GlobalSimulationTime for deterministic timestamps in simulation tests
+        snapshot.timestamp_nanos =
+            crate::config::GlobalSimulationTime::current_time_ms() * 1_000_000;
 
         snapshot
     }
