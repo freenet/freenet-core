@@ -1,25 +1,36 @@
 use std::time::Duration;
 
 pub(super) fn run(config: &super::TestConfig) -> anyhow::Result<(), super::Error> {
-    // Create a tokio runtime for the async setup phase
+    // Create runtime to build SimNetwork
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    // Set up the SimNetwork asynchronously
     let simulated_network = rt.block_on(super::config_sim_network(config))?;
 
-    // Now drop the tokio runtime before calling Turmoil
+    // Drop runtime before Turmoil execution
     drop(rt);
 
-    // Run the simulation using Turmoil for deterministic execution
-    // This MUST be called outside of any async/tokio context
-    simulated_network
-        .run_fdev_test::<rand::rngs::SmallRng>(
-            config.seed(),
-            config.max_contract_number.unwrap_or(config.nodes * 10),
-            config.events as usize,
+    // Spawn a NEW thread with no tokio context for Turmoil execution.
+    // This is critical because:
+    // 1. Turmoil creates its own tokio runtime internally
+    // 2. Tokio panics if you try to create a runtime when thread-local context exists
+    // 3. Even after dropping a runtime, the thread-local context persists
+    // 4. Solution: spawn a fresh thread with no tokio history
+    let seed = config.seed();
+    let max_contract_num = config.max_contract_number.unwrap_or(config.nodes * 10);
+    let iterations = config.events as usize;
+
+    std::thread::spawn(move || {
+        simulated_network.run_fdev_test::<rand::rngs::SmallRng>(
+            seed,
+            max_contract_num,
+            iterations,
             Duration::from_secs(300), // 5 minute simulation timeout
         )
-        .map_err(super::Error::from)
+    })
+    .join()
+    .map_err(|e| anyhow::anyhow!("Turmoil thread panicked: {:?}", e))??;
+
+    Ok(())
 }
