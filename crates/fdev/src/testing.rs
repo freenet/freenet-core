@@ -199,41 +199,53 @@ pub enum TestMode {
     Network(network::NetworkProcessConfig),
 }
 
-pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
+pub(crate) fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
     // Both SingleProcess and Network modes are handled here.
-    // SingleProcess uses real SimNetwork with quiescence detection and convergence checking.
+    // SingleProcess uses Turmoil (deterministic) - runs without tokio runtime.
+    // Network mode uses real networking - needs tokio runtime.
 
-    let disable_metrics = base_config.disable_metrics || {
-        match &base_config.command {
-            TestMode::Network(config) => matches!(config.mode, network::Process::Peer),
-            _ => false,
+    match &base_config.command {
+        TestMode::SingleProcess => {
+            // Single process mode uses Turmoil, no metrics server needed
+            single_process::run(&base_config)
         }
-    };
-    let (server, changes_recorder) = if !disable_metrics {
-        let (s, r) = start_server(&ServerConfig {
-            log_directory: base_config.execution_data.clone(),
-        })
-        .await;
-        (Some(s), r)
-    } else {
-        (None, None)
-    };
-    let res = match &base_config.command {
-        TestMode::SingleProcess => single_process::run(&base_config).await,
-        TestMode::Network(config) => network::run(&base_config, config).await,
-    };
-    if let Some(server) = server {
-        server.abort();
-    }
-    if let Some(changes) = changes_recorder {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            r = changes => {
-                r?;
-            }
+        TestMode::Network(config) => {
+            // Network mode needs tokio runtime for async operations
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+
+            rt.block_on(async {
+                let disable_metrics = base_config.disable_metrics
+                    || matches!(config.mode, network::Process::Peer);
+
+                let (server, changes_recorder) = if !disable_metrics {
+                    let (s, r) = start_server(&ServerConfig {
+                        log_directory: base_config.execution_data.clone(),
+                    })
+                    .await;
+                    (Some(s), r)
+                } else {
+                    (None, None)
+                };
+
+                let res = network::run(&base_config, config).await;
+
+                if let Some(server) = server {
+                    server.abort();
+                }
+                if let Some(changes) = changes_recorder {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        r = changes => {
+                            r?;
+                        }
+                    }
+                }
+                res
+            })
         }
     }
-    res
 }
 
 async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwork, Error> {

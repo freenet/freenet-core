@@ -41,10 +41,15 @@ fn main() -> anyhow::Result<()> {
         freenet::config::set_logger(None, None);
     }
 
-    // SingleProcess mode now uses real SimNetwork simulation via test_framework()
-    // which provides proper event generation, quiescence detection, and convergence checking.
-    // The old Turmoil stub has been removed in favor of the real simulation path.
+    // Test subcommand uses Turmoil which requires running outside of any tokio runtime
+    if matches!(config.sub_command, SubCommand::Test(_)) {
+        if let SubCommand::Test(test_config) = config.sub_command {
+            return testing::test_framework(test_config)
+                .map_err(|e| anyhow::format_err!(e));
+        }
+    }
 
+    // All other commands use regular tokio runtime
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -68,7 +73,7 @@ fn main() -> anyhow::Result<()> {
                     commands::get_contract_id(get_contract_id_config).await
                 }
             },
-            SubCommand::Test(test_config) => testing::test_framework(test_config).await,
+            SubCommand::Test(_) => unreachable!("Test handled above"),
             SubCommand::NetworkMetricsServer(server_config) => {
                 let (server, _) = crate::network_metrics_server::start_server(&server_config).await;
                 tokio::select! {
