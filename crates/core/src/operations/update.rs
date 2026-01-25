@@ -104,7 +104,6 @@ impl UpdateOp {
         op_manager.completed(self.id);
         Ok(())
     }
-
 }
 
 struct UpdateStats {
