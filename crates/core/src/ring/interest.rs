@@ -597,13 +597,22 @@ impl<T: TimeSource> InterestManager<T> {
         let now = self.time_source.now();
         let mut expired = Vec::new();
 
-        for entry in self.interested_peers.iter() {
-            let contract = *entry.key();
-            let peers_to_remove: Vec<PeerKey> = entry
+        // Collect and sort contracts for deterministic iteration order
+        let mut contracts: Vec<_> = self
+            .interested_peers
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        contracts.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        for (contract, peers_map) in contracts {
+            // Collect and sort peers for deterministic iteration order
+            let mut peers_to_remove: Vec<PeerKey> = peers_map
                 .iter()
                 .filter(|(_, interest)| interest.is_expired_at(now))
                 .map(|(peer, _)| peer.clone())
                 .collect();
+            peers_to_remove.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
             for peer in peers_to_remove {
                 expired.push((contract, peer));

@@ -351,12 +351,14 @@ impl HostingManager {
         let mut affected_contracts = Vec::new();
 
         // Find all contracts where this client is subscribed
-        let instance_ids_with_client: Vec<ContractInstanceId> = self
+        // Sort for deterministic iteration order
+        let mut instance_ids_with_client: Vec<ContractInstanceId> = self
             .client_subscriptions
             .iter()
             .filter(|entry| entry.value().contains(&client_id))
             .map(|entry| *entry.key())
             .collect();
+        instance_ids_with_client.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         for instance_id in instance_ids_with_client {
             self.remove_client_subscription(&instance_id, client_id);
