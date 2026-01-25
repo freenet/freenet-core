@@ -1555,20 +1555,19 @@ impl Operation for GetOp {
                                 "Local state matches network state, skipping redundant cache"
                             );
 
-                            // Check if already hosting BEFORE calling record_get_access
-                            // (which will add it to the cache)
-                            let was_already_hosting = op_manager.ring.is_hosting_contract(&key);
-
                             // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
                             // Previously, we only recorded access if !is_seeding_contract(),
                             // which meant re-GETs on cached contracts wouldn't refresh the
                             // hosting cache's TTL/LRU position, causing subscriptions to expire.
-                            let evicted =
+                            //
+                            // record_get_access now returns is_new atomically, eliminating the
+                            // TOCTOU race that existed when checking is_hosting_contract() first.
+                            let access_result =
                                 op_manager.ring.record_get_access(key, value.size() as u64);
 
                             // Clean up interest tracking for evicted contracts (always, even if already hosting)
                             let mut removed_contracts = Vec::new();
-                            for evicted_key in &evicted {
+                            for evicted_key in &access_result.evicted {
                                 if op_manager
                                     .interest_manager
                                     .unregister_local_seeding(evicted_key)
@@ -1578,7 +1577,7 @@ impl Operation for GetOp {
                             }
 
                             // Only do first-time hosting setup if newly hosting
-                            if !was_already_hosting {
+                            if access_result.is_new {
                                 tracing::debug!(tx = %id, %key, "Contract newly hosted");
                                 super::announce_contract_cached(op_manager, &key).await;
 
@@ -1613,7 +1612,7 @@ impl Operation for GetOp {
                             // record_get_access already refreshed the hosting cache above
                             if crate::ring::AUTO_SUBSCRIBE_ON_GET {
                                 // Only start new subscription if not already subscribed
-                                if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
+                                if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                     let child_tx = super::start_subscription_request(
                                         op_manager, id, key, false,
                                     );
@@ -1638,19 +1637,19 @@ impl Operation for GetOp {
                                     ContractHandlerEvent::PutResponse { new_value: Ok(_), .. } => {
                                         tracing::debug!(tx = %id, %key, "Contract put at executor");
 
-                                        // Check if already hosting BEFORE calling record_get_access
-                                        let was_already_hosting = op_manager.ring.is_hosting_contract(&key);
-
                                         // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
                                         // This ensures re-GETs keep the hosting cache's TTL/LRU fresh.
+                                        //
+                                        // record_get_access now returns is_new atomically, eliminating the
+                                        // TOCTOU race that existed when checking is_hosting_contract() first.
                                         tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Recording contract access in hosting cache");
-                                        let evicted = op_manager
+                                        let access_result = op_manager
                                             .ring
                                             .record_get_access(key, value.size() as u64);
 
                                         // Clean up interest tracking for evicted contracts (always, even if already hosting)
                                         let mut removed_contracts = Vec::new();
-                                        for evicted_key in &evicted {
+                                        for evicted_key in &access_result.evicted {
                                             if op_manager
                                                 .interest_manager
                                                 .unregister_local_seeding(evicted_key)
@@ -1660,7 +1659,7 @@ impl Operation for GetOp {
                                         }
 
                                         // Only do first-time hosting setup if newly hosting
-                                        if !was_already_hosting {
+                                        if access_result.is_new {
                                             super::announce_contract_cached(op_manager, &key).await;
 
                                             // Register local interest for delta-based sync
@@ -1696,7 +1695,7 @@ impl Operation for GetOp {
                                         // record_get_access already refreshed the hosting cache above
                                         if crate::ring::AUTO_SUBSCRIBE_ON_GET {
                                             // Only start new subscription if not already subscribed
-                                            if !was_already_hosting || !op_manager.ring.is_subscribed(&key) {
+                                            if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                                 let child_tx =
                                                     super::start_subscription_request(op_manager, id, key, false);
                                                 tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");

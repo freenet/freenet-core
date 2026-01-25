@@ -37,7 +37,7 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
-pub use hosting::AccessType;
+pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
 mod location;
@@ -178,8 +178,8 @@ impl Ring {
         // but failed to establish subscription (no upstream in subscription tree)
         const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
-        // Interval for GET subscription cache sweep (60 seconds)
-        // Cleans up expired GET-triggered subscriptions and sends Unsubscribed messages
+        // Interval for hosting cache sweep (60 seconds)
+        // Cleans up expired hosted contracts
         //
         // Interval for topology snapshot registration (1 second in test mode)
         // Registers subscription topology with the global registry for validation
@@ -448,7 +448,8 @@ impl Ring {
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
-                        let sub_op = crate::operations::subscribe::start_op(instance_id);
+                        // is_renewal: true - this is a subscription renewal, skip sending state
+                        let sub_op = crate::operations::subscribe::start_op(instance_id, true);
                         let result = crate::operations::subscribe::request_subscribe(
                             &op_manager_clone,
                             sub_op,
@@ -586,26 +587,35 @@ impl Ring {
 
     /// Record a PUT access to a contract in the hosting cache.
     /// Alias for host_contract with Put access type.
+    ///
+    /// Returns only the evicted contracts for backwards compatibility.
     pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
-        self.host_contract(key, size_bytes, AccessType::Put)
+        self.host_contract(key, size_bytes, AccessType::Put).evicted
     }
 
     /// Record an access to a contract in the hosting cache.
     ///
     /// This adds or refreshes the contract in the unified hosting cache.
     /// ALL contracts in the hosting cache get subscription renewal.
+    ///
+    /// Returns a `RecordAccessResult` containing:
+    /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
+    /// - `evicted`: Contracts that were evicted to make room
     pub fn host_contract(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
-    ) -> Vec<ContractKey> {
+    ) -> RecordAccessResult {
         self.hosting_manager
             .record_contract_access(key, size_bytes, access_type)
     }
 
     /// Record a GET access to a contract in the hosting cache.
-    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+    ///
+    /// Returns a `RecordAccessResult` indicating whether this was a new addition
+    /// and which contracts were evicted (if any).
+    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> RecordAccessResult {
         self.host_contract(key, size_bytes, AccessType::Get)
     }
 

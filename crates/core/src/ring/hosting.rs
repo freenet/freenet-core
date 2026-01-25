@@ -31,7 +31,7 @@ mod cache;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::InstantTimeSrc;
-pub use cache::AccessType;
+pub use cache::{AccessType, RecordAccessResult};
 use cache::{HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
@@ -386,7 +386,10 @@ impl HostingManager {
     /// This is the main entry point for adding contracts to the hosting cache.
     /// ALL contracts in the hosting cache will have their subscriptions renewed.
     ///
-    /// Returns contracts evicted from the cache (if any).
+    /// Returns a `RecordAccessResult` containing:
+    /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
+    /// - `evicted`: Contracts that were evicted to make room
+    ///
     /// Automatically persists hosting metadata for the accessed contract and
     /// removes persisted metadata for evicted contracts.
     pub fn record_contract_access(
@@ -394,8 +397,8 @@ impl HostingManager {
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
-    ) -> Vec<ContractKey> {
-        let evicted = self
+    ) -> RecordAccessResult {
+        let result = self
             .hosting_cache
             .write()
             .record_access(key, size_bytes, access_type);
@@ -435,7 +438,7 @@ impl HostingManager {
             }
 
             // Clean up persisted metadata for evicted contracts
-            for evicted_key in &evicted {
+            for evicted_key in &result.evicted {
                 #[cfg(feature = "redb")]
                 {
                     if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
@@ -456,7 +459,7 @@ impl HostingManager {
             }
         }
 
-        evicted
+        result
     }
 
     /// Check if a contract is in the hosting cache.
@@ -594,12 +597,13 @@ impl HostingManager {
         let now = Instant::now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
 
-        let mut needs_renewal = Vec::new();
+        // Use HashSet for O(1) deduplication instead of O(n) Vec::contains
+        let mut needs_renewal_set = HashSet::new();
 
         // 1. Contracts with soon-to-expire subscriptions
         for entry in self.active_subscriptions.iter() {
             if *entry.value() <= renewal_threshold && *entry.value() > now {
-                needs_renewal.push(*entry.key());
+                needs_renewal_set.insert(*entry.key());
             }
         }
 
@@ -619,9 +623,7 @@ impl HostingManager {
                     .iter()
                     .find(|k| k.id() == instance_id)
                 {
-                    if !needs_renewal.contains(&contract) {
-                        needs_renewal.push(contract);
-                    }
+                    needs_renewal_set.insert(contract);
                 }
             }
         }
@@ -629,10 +631,6 @@ impl HostingManager {
         // 3. THE FIX: All hosted contracts should have subscriptions renewed
         // This ensures GET-triggered subscriptions don't expire without renewal
         for contract in self.hosting_cache.read().iter() {
-            // Skip if already in list
-            if needs_renewal.contains(&contract) {
-                continue;
-            }
             // Skip if has active subscription that's not expiring soon
             if self
                 .active_subscriptions
@@ -643,10 +641,10 @@ impl HostingManager {
                 continue;
             }
             // This hosted contract needs subscription renewal
-            needs_renewal.push(contract);
+            needs_renewal_set.insert(contract);
         }
 
-        needs_renewal
+        needs_renewal_set.into_iter().collect()
     }
 
     // =========================================================================

@@ -1531,11 +1531,13 @@ async fn process_open_request(
                                 })?;
 
                             // Start dedicated operation for this client AFTER registration
+                            // is_renewal: false - client-initiated subscriptions are new
                             let _result_tx = crate::node::subscribe_with_id(
                                 op_manager.clone(),
                                 key,
                                 None, // No legacy registration
                                 Some(tx),
+                                false,
                             )
                             .await
                             .inspect_err(|err| {
@@ -1579,19 +1581,26 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %tx,
-                                        contract = %key,
-                                        error = %err,
-                                        phase = "error",
-                                        "SUBSCRIBE operation failed"
-                                    );
-                                })?;
+                            // is_renewal: false - client-initiated subscriptions are new
+                            crate::node::subscribe_with_id(
+                                op_manager.clone(),
+                                key,
+                                None,
+                                Some(tx),
+                                false,
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %tx,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "SUBSCRIBE operation failed"
+                                );
+                            })?;
 
                             tracing::debug!(
                                 request_id = %request_id,

@@ -524,7 +524,8 @@ fn start_subscription_request_internal(
     GlobalExecutor::spawn(async move {
         tokio::task::yield_now().await;
 
-        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx);
+        // is_renewal: false - GET-triggered subscription is a new subscription
+        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx, false);
 
         match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
             Ok(_) => {

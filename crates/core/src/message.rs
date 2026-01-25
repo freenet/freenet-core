@@ -331,11 +331,6 @@ pub(crate) enum NetMessageV1 {
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
-    Unsubscribed {
-        transaction: Transaction,
-        key: ContractKey,
-        from: PeerKeyLocation,
-    },
     Update(UpdateMsg),
     Aborted(Transaction),
     /// Proximity cache protocol message for tracking which neighbors cache which contracts.
@@ -556,7 +551,6 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
-            NetMessageV1::Unsubscribed { .. } => semver::Version::new(1, 0, 0),
             // Version 2.0.0 for delta-based BroadcastTo format
             NetMessageV1::Update(_) => semver::Version::new(2, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
@@ -782,7 +776,6 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Subscribe(op) => op.id(),
             NetMessageV1::Update(op) => op.id(),
             NetMessageV1::Aborted(tx) => tx,
-            NetMessageV1::Unsubscribed { transaction, .. } => transaction,
             NetMessageV1::ProximityCache { .. } => Transaction::NULL,
             NetMessageV1::InterestSync { .. } => Transaction::NULL,
         }
@@ -796,7 +789,6 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Subscribe(op) => op.requested_location(),
             NetMessageV1::Update(op) => op.requested_location(),
             NetMessageV1::Aborted(_) => None,
-            NetMessageV1::Unsubscribed { .. } => None,
             NetMessageV1::ProximityCache { .. } => None,
             NetMessageV1::InterestSync { .. } => None,
         }
@@ -815,9 +807,6 @@ impl Display for NetMessage {
                 Subscribe(msg) => msg.fmt(f)?,
                 Update(msg) => msg.fmt(f)?,
                 Aborted(msg) => msg.fmt(f)?,
-                Unsubscribed { key, from, .. } => {
-                    write!(f, "Unsubscribed {{  key: {key}, from: {from} }}")?;
-                }
                 ProximityCache { message } => {
                     write!(f, "ProximityCache {{ {message:?} }}")?;
                 }
