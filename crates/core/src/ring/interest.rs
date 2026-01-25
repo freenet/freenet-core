@@ -408,10 +408,14 @@ impl<T: TimeSource> InterestManager<T> {
 
     /// Get all peers interested in a contract.
     pub fn get_interested_peers(&self, contract: &ContractKey) -> Vec<(PeerKey, PeerInterest)> {
-        self.interested_peers
+        let mut peers: Vec<(PeerKey, PeerInterest)> = self
+            .interested_peers
             .get(contract)
             .map(|entry| entry.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Sort by PeerKey bytes for deterministic ordering (critical for simulation tests)
+        peers.sort_by(|(a, _), (b, _)| a.0.as_bytes().cmp(b.0.as_bytes()));
+        peers
     }
 
     /// Get a specific peer's interest info for a contract.
@@ -709,18 +713,25 @@ impl<T: TimeSource> InterestManager<T> {
     ///
     /// Uses the existing hash index for O(1) access - no rehashing needed.
     pub fn get_all_interest_hashes(&self) -> Vec<u32> {
-        self.contract_hash_index.iter().map(|e| *e.key()).collect()
+        let mut hashes: Vec<u32> = self.contract_hash_index.iter().map(|e| *e.key()).collect();
+        // Sort for deterministic ordering (critical for simulation tests)
+        hashes.sort_unstable();
+        hashes
     }
 
     /// Get contracts we're interested in that match the given hashes.
     pub fn get_matching_contracts(&self, hashes: &[u32]) -> Vec<ContractKey> {
         let hash_set: std::collections::HashSet<u32> = hashes.iter().copied().collect();
 
-        self.contract_hash_index
+        let mut contracts: Vec<ContractKey> = self
+            .contract_hash_index
             .iter()
             .filter(|entry| hash_set.contains(entry.key()))
             .flat_map(|entry| entry.value().clone())
-            .collect()
+            .collect();
+        // Sort by contract ID bytes for deterministic ordering (critical for simulation tests)
+        contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        contracts
     }
 
     /// Cache a computed delta for reuse.
