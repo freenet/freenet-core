@@ -14,6 +14,7 @@ const TOMBSTONE_MARKER: usize = 1;
 
 pub(super) struct SafeWriter<S> {
     file: BufWriter<File>,
+    #[allow(dead_code)] // Used for reopen() which is needed for compaction
     key_file_path: PathBuf,
     lock_file_path: PathBuf,
     compact: bool,
@@ -54,6 +55,7 @@ impl<S: StoreFsManagement> SafeWriter<S> {
     /// This MUST be called after compaction replaces the file via rename.
     /// Without this, the file handle points to the old (deleted) file and
     /// new writes are lost.
+    #[allow(dead_code)] // Used by run_compaction() for safe compaction with handle refresh
     pub fn reopen(&mut self) -> std::io::Result<()> {
         // Flush any buffered data first (though it goes to the old file)
         let _ = self.file.flush();
@@ -198,6 +200,10 @@ enum KeyType {
     Delegate = 1,
 }
 
+// Note: Some methods in this trait are unused after migration to ReDb.
+// They are kept for migration code compatibility (load_from_file, insert)
+// and potential future use (watch_changes, run_compaction, remove).
+#[allow(dead_code)]
 pub(super) trait StoreFsManagement: Sized {
     type MemContainer: Send + Sync + 'static;
     type Key: Clone + TryFrom<StoreKey, Error = StoreKeyMismatch>;

@@ -181,7 +181,7 @@ impl SecretsStore {
         // Batch insert into ReDb (single transaction)
         db.store_secrets_index_batch(&entries).map_err(|e| {
             tracing::error!("Failed to migrate secrets index entries: {e}");
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            std::io::Error::other(e.to_string())
         })?;
 
         // Update in-memory map
@@ -192,7 +192,7 @@ impl SecretsStore {
         // Verify migration succeeded by reading back from ReDb
         let verified = db.load_all_secrets_index().map_err(|e| {
             tracing::error!("Failed to verify migration: {e}");
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            std::io::Error::other(e.to_string())
         })?;
 
         if verified.len() != count {
@@ -202,7 +202,7 @@ impl SecretsStore {
                 verified.len()
             );
             tracing::error!("{msg}");
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
+            return Err(std::io::Error::other(msg).into());
         }
 
         tracing::info!("Migrated and verified {count} secrets index entries to ReDb");

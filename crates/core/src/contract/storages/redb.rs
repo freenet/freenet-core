@@ -636,6 +636,7 @@ impl ReDb {
     }
 
     /// Load all secrets index entries
+    #[allow(clippy::type_complexity)]
     pub fn load_all_secrets_index(&self) -> Result<Vec<(DelegateKey, Vec<[u8; 32]>)>, redb::Error> {
         let txn = self.0.begin_read()?;
         let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
