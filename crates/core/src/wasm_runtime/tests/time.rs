@@ -4,15 +4,15 @@ use wasmer::TypedFunction;
 
 use super::{super::Runtime, TestSetup};
 
-#[test]
-fn now() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn now() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract("test_contract_2")?;
+    } = super::setup_test_contract("test_contract_2").await?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let module = runtime.prepare_contract_call(&contract_key, &vec![].into(), 1_000)?;

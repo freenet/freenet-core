@@ -4,66 +4,138 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 use stretto::Cache;
 
-use super::{
-    store::{SafeWriter, StoreFsManagement},
-    RuntimeResult,
-};
+use crate::contract::storages::Storage;
+
+use super::RuntimeResult;
 
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    key_file: PathBuf,
     contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
-    key_to_code_part: Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>,
-    index_file: SafeWriter<Self>,
+    /// In-memory index: ContractInstanceId -> CodeHash
+    /// This is populated from ReDb on startup and kept in sync
+    key_to_code_part: Arc<DashMap<ContractInstanceId, CodeHash>>,
+    /// ReDb storage for persistent index
+    db: Storage,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total space used under a configured threshold
 
-impl StoreFsManagement for ContractStore {
-    type MemContainer = Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>;
-    type Key = ContractInstanceId;
-    type Value = CodeHash;
-
-    fn insert_in_container(
-        container: &mut Self::MemContainer,
-        (key, offset): (Self::Key, u64),
-        value: Self::Value,
-    ) {
-        container.insert(key, (offset, value));
-    }
-
-    fn clear_container(container: &mut Self::MemContainer) {
-        container.clear();
-    }
-}
-
 impl ContractStore {
     /// # Arguments
+    /// - contracts_dir: directory where contract WASM files are stored
     /// - max_size: max size in bytes of the contracts being cached
-    pub fn new(contracts_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
+    /// - db: ReDb storage for persistent index
+    pub fn new(contracts_dir: PathBuf, max_size: i64, db: Storage) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
-        let mut key_to_code_part = Arc::new(DashMap::new());
-        let key_file = contracts_dir.join("KEY_DATA");
-        if !key_file.exists() {
-            std::fs::create_dir_all(&contracts_dir).map_err(|err| {
-                tracing::error!("error creating contract dir: {err}");
-                err
-            })?;
-            File::create(contracts_dir.join("KEY_DATA"))?;
-        } else {
-            Self::load_from_file(&key_file, &mut key_to_code_part)?;
-        }
-        Self::watch_changes(key_to_code_part.clone(), &key_file)?;
 
-        let index_file = SafeWriter::new(&key_file, false)?;
+        std::fs::create_dir_all(&contracts_dir).map_err(|err| {
+            tracing::error!("error creating contract dir: {err}");
+            err
+        })?;
+
+        // Load index from ReDb
+        let key_to_code_part = Arc::new(DashMap::new());
+        match db.load_all_contract_index() {
+            Ok(entries) => {
+                for (instance_id, code_hash) in entries {
+                    key_to_code_part.insert(instance_id, code_hash);
+                }
+                tracing::debug!(
+                    "Loaded {} contract index entries from ReDb",
+                    key_to_code_part.len()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load contract index from ReDb: {e}");
+            }
+        }
+
+        // Migrate from legacy KEY_DATA file if it exists
+        let key_file = contracts_dir.join("KEY_DATA");
+        if key_file.exists() {
+            if let Err(e) = Self::migrate_from_legacy(&key_file, &db, &key_to_code_part) {
+                tracing::warn!("Failed to migrate legacy KEY_DATA: {e}");
+            }
+        }
+
         Ok(Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
-            key_file,
             key_to_code_part,
-            index_file,
+            db,
         })
+    }
+
+    /// Migrate data from the legacy KEY_DATA file to ReDb.
+    /// After successful migration, renames the file to KEY_DATA.migrated.
+    fn migrate_from_legacy(
+        key_file: &PathBuf,
+        db: &Storage,
+        key_to_code_part: &DashMap<ContractInstanceId, CodeHash>,
+    ) -> RuntimeResult<()> {
+        use super::store::StoreFsManagement;
+
+        tracing::info!("Migrating contract index from legacy KEY_DATA to ReDb");
+
+        // Use a temporary DashMap for the legacy loader
+        let mut legacy_container: Arc<DashMap<ContractInstanceId, (u64, CodeHash)>> =
+            Arc::new(DashMap::new());
+
+        // Load from legacy file format
+        // Note: We're using a helper struct to access the static load_from_file method
+        struct LegacyLoader;
+        impl super::store::StoreFsManagement for LegacyLoader {
+            type MemContainer = Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>;
+            type Key = ContractInstanceId;
+            type Value = CodeHash;
+
+            fn insert_in_container(
+                container: &mut Self::MemContainer,
+                (key, offset): (Self::Key, u64),
+                value: Self::Value,
+            ) {
+                container.insert(key, (offset, value));
+            }
+
+            fn clear_container(container: &mut Self::MemContainer) {
+                container.clear();
+            }
+        }
+
+        LegacyLoader::load_from_file(key_file, &mut legacy_container)?;
+
+        let count = legacy_container.len();
+        tracing::info!("Found {count} entries in legacy KEY_DATA file");
+
+        // Migrate each entry to ReDb
+        let mut migrated = 0;
+        for entry in legacy_container.iter() {
+            let instance_id = entry.key();
+            let code_hash = &entry.value().1;
+
+            // Store in ReDb
+            if let Err(e) = db.store_contract_index(instance_id, code_hash) {
+                tracing::warn!("Failed to migrate contract index entry: {e}");
+                continue;
+            }
+
+            // Update in-memory map
+            key_to_code_part.insert(*instance_id, *code_hash);
+            migrated += 1;
+        }
+
+        tracing::info!("Migrated {migrated}/{count} contract index entries to ReDb");
+
+        // Rename the legacy file to mark it as migrated
+        let migrated_path = key_file.with_extension("migrated");
+        if let Err(e) = std::fs::rename(key_file, &migrated_path) {
+            tracing::warn!("Failed to rename KEY_DATA to .migrated: {e}");
+        } else {
+            tracing::info!("Renamed legacy KEY_DATA to {migrated_path:?}");
+        }
+
+        Ok(())
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
@@ -80,8 +152,8 @@ impl ContractStore {
             )));
         }
 
-        self.key_to_code_part.get(key.id()).and_then(|key| {
-            let code_hash = key.value().1;
+        self.key_to_code_part.get(key.id()).and_then(|entry| {
+            let code_hash = *entry.value();
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract {
@@ -147,25 +219,15 @@ impl ContractStore {
         file.write_all(output.as_slice())?;
         file.sync_all()?; // Ensure durability before updating index
 
-        // Step 2: Update index (enables disk fallback lookup in fetch_contract)
-        let keys = self.key_to_code_part.entry(*key.id());
-        match keys {
-            dashmap::mapref::entry::Entry::Occupied(mut v) => {
-                let current_version_offset = v.get().0;
-                let prev_val = &mut v.get_mut().1;
-                // first mark the old entry (if it exists) as removed
-                Self::remove(&self.key_file, current_version_offset)?;
-                let new_offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
-                *prev_val = *code_hash;
-                v.get_mut().0 = new_offset;
-            }
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
-                v.insert((offset, *code_hash));
-            }
-        }
+        // Step 2: Update index in ReDb (persistent, crash-safe)
+        self.db
+            .store_contract_index(key.id(), code_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to store contract index: {e}"))?;
 
-        // Step 3: Insert into memory cache (best-effort, may be rejected by TinyLFU)
+        // Step 3: Update in-memory index
+        self.key_to_code_part.insert(*key.id(), *code_hash);
+
+        // Step 4: Insert into memory cache (best-effort, may be rejected by TinyLFU)
         let size = code.data().len() as i64;
         let data = code.data().to_vec();
         self.contract_cache
@@ -185,9 +247,15 @@ impl ContractStore {
 
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
-        if let Some((_, (offset, _))) = self.key_to_code_part.remove(key.id()) {
-            Self::remove(&self.key_file, offset)?;
-        }
+
+        // Remove from ReDb index
+        self.db
+            .remove_contract_index(key.id())
+            .map_err(|e| anyhow::anyhow!("Failed to remove contract index: {e}"))?;
+
+        // Remove from in-memory index
+        self.key_to_code_part.remove(key.id());
+
         let key_path = self
             .contracts_dir
             .join(contract_hash.encode())
@@ -197,13 +265,13 @@ impl ContractStore {
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
-        self.key_to_code_part.get(key.id()).map(|r| r.value().1)
+        self.key_to_code_part.get(key.id()).map(|r| *r.value())
     }
 
     /// Look up the code hash for a contract given only its instance ID.
     /// Used when clients request contracts without knowing the code hash.
     pub fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash> {
-        self.key_to_code_part.get(id).map(|r| r.value().1)
+        self.key_to_code_part.get(id).map(|r| *r.value())
     }
 
     /// Ensures the key_to_code_part mapping exists for the given contract key.
@@ -213,9 +281,15 @@ impl ContractStore {
     /// See issue #2380.
     pub fn ensure_key_indexed(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let code_hash = key.code_hash();
-        if let dashmap::mapref::entry::Entry::Vacant(v) = self.key_to_code_part.entry(*key.id()) {
-            let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
-            v.insert((offset, *code_hash));
+        if !self.key_to_code_part.contains_key(key.id()) {
+            // Store in ReDb
+            self.db
+                .store_contract_index(key.id(), code_hash)
+                .map_err(|e| anyhow::anyhow!("Failed to store contract index: {e}"))?;
+
+            // Update in-memory map
+            self.key_to_code_part.insert(*key.id(), *code_hash);
+
             tracing::debug!(
                 contract = %key,
                 instance_id = %key.id(),
@@ -236,11 +310,16 @@ mod test {
     //! uses this to reconstruct ContractKey from just an instance ID.
     use super::*;
 
-    #[test]
-    fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
+    async fn create_test_db(path: &std::path::Path) -> Storage {
+        Storage::new(path).await.expect("failed to create test db")
+    }
+
+    #[tokio::test]
+    async fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
-        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),
@@ -254,13 +333,14 @@ mod test {
 
     /// Test that simulates the actual contract store flow to see if
     /// contracts can be "lost" between store and fetch
-    #[test]
-    fn test_contract_store_fetch_reliability() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_contract_store_fetch_reliability() -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
 
         // Use realistic-ish cache size
-        let mut store = ContractStore::new(contract_dir.path().into(), 100_000)?;
+        let mut store = ContractStore::new(contract_dir.path().into(), 100_000, db)?;
 
         // Store multiple contracts with varying sizes, track their keys
         let mut keys = Vec::new();
@@ -298,8 +378,8 @@ mod test {
     /// Test for issue #2344: Contract store index must be persisted to disk.
     /// This test simulates a node restart by creating a new ContractStore from
     /// the same directory, then verifies contracts are still fetchable.
-    #[test]
-    fn test_index_persistence_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_index_persistence_after_restart() -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
 
@@ -312,7 +392,8 @@ mod test {
 
         // Store the contract
         {
-            let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+            let db = create_test_db(contract_dir.path()).await;
+            let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
             let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
             store.store_contract(container)?;
 
@@ -326,11 +407,12 @@ mod test {
 
         // Create a NEW ContractStore from the same directory - simulates node restart
         {
-            let store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+            let db = create_test_db(contract_dir.path()).await;
+            let store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
 
             // The contract should be fetchable because both:
             // 1. The WASM file was persisted to disk
-            // 2. The index (KEY_DATA) was persisted to disk
+            // 2. The index (ReDb) was persisted to disk
             // Issue #2344: Before the fix, the index wasn't synced, so the contract
             // would not be found after restart.
             let fetched = store.fetch_contract(&key, &params);
@@ -345,8 +427,8 @@ mod test {
 
     /// Test for issue #2344: When WASM file exists but index entry is missing
     /// (e.g., after a crash), store_contract should add the missing index entry.
-    #[test]
-    fn test_wasm_exists_but_index_missing() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_wasm_exists_but_index_missing() -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
         let contract_dir = crate::util::tests::get_temp_dir();
@@ -376,8 +458,9 @@ mod test {
             file.sync_all()?;
         }
 
-        // Create a ContractStore - the KEY_DATA file will be empty (no index entries)
-        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+        // Create a ContractStore - the ReDb will be empty (no index entries)
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
 
         // The contract is NOT fetchable yet because the index doesn't have the entry
         // and it's not in cache
@@ -393,7 +476,8 @@ mod test {
 
         // Drop the store and create a new one to verify the index was persisted
         drop(store);
-        let store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+        let db = create_test_db(contract_dir.path()).await;
+        let store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
 
         // Now the contract should be fetchable because the fix adds the index entry
         let fetched = store.fetch_contract(&key, &params);
@@ -413,13 +497,14 @@ mod test {
     /// - Different parameters (owner key) create different ContractInstanceIds
     /// - Only the first room's instance_id was indexed
     /// - Subscribe to 2nd+ rooms failed because lookup_key() returned None
-    #[test]
-    fn test_multiple_contracts_same_code_different_params() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[tokio::test]
+    async fn test_multiple_contracts_same_code_different_params(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
 
-        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
 
         // Same WASM code for all contracts (like River's room-contract)
         let shared_code = vec![1, 2, 3, 4, 5];

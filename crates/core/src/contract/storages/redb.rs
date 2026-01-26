@@ -16,6 +16,27 @@ const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state")
 const HOSTING_METADATA_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("hosting_metadata");
 
+/// Index table mapping ContractInstanceId to CodeHash.
+/// This replaces the legacy KEY_DATA file in the contracts directory.
+/// Key: ContractInstanceId (32 bytes)
+/// Value: CodeHash (32 bytes)
+pub(crate) const CONTRACT_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("contract_index");
+
+/// Index table mapping DelegateKey to CodeHash.
+/// This replaces the legacy KEY_DATA file in the delegates directory.
+/// Key: DelegateKey (32 bytes key + 32 bytes code_hash = 64 bytes)
+/// Value: CodeHash (32 bytes)
+pub(crate) const DELEGATE_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_index");
+
+/// Index table mapping DelegateKey to secret key hashes.
+/// This replaces the legacy KEY_DATA file in the secrets directory.
+/// Key: DelegateKey (64 bytes)
+/// Value: Concatenated secret key hashes (N * 32 bytes)
+pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("secrets_index");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -146,6 +167,38 @@ impl ReDb {
                     table = "HOSTING_METADATA_TABLE",
                     phase = "table_init_failed",
                     "Failed to open HOSTING_METADATA_TABLE"
+                );
+                e
+            })?;
+
+            // Index tables for contract/delegate/secrets stores
+            // These replace the legacy KEY_DATA files
+            txn.open_table(CONTRACT_INDEX_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "CONTRACT_INDEX_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open CONTRACT_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            txn.open_table(DELEGATE_INDEX_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_INDEX_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            txn.open_table(SECRETS_INDEX_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "SECRETS_INDEX_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open SECRETS_INDEX_TABLE"
                 );
                 e
             })?;
@@ -295,6 +348,280 @@ impl ReDb {
         for entry in tbl.iter()? {
             let (key, _) = entry?;
             result.push(key.value().to_vec());
+        }
+        Ok(result)
+    }
+
+    // ==================== Contract Index Methods ====================
+    // These replace the legacy KEY_DATA file in contracts directory
+
+    /// Store a contract index entry: ContractInstanceId → CodeHash
+    pub fn store_contract_index(
+        &self,
+        instance_id: &ContractInstanceId,
+        code_hash: &CodeHash,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+            tbl.insert(instance_id.as_ref(), code_hash.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get the CodeHash for a ContractInstanceId
+    pub fn get_contract_index(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<Option<CodeHash>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+        match tbl.get(instance_id.as_ref())? {
+            Some(v) => {
+                let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
+                    redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid CodeHash length",
+                    ))
+                })?;
+                Ok(Some(CodeHash::from(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a contract index entry
+    pub fn remove_contract_index(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+            tbl.remove(instance_id.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all contract index entries
+    pub fn load_all_contract_index(
+        &self,
+    ) -> Result<Vec<(ContractInstanceId, CodeHash)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes: [u8; 32] = key.value().try_into().map_err(|_| {
+                redb::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid ContractInstanceId length",
+                ))
+            })?;
+            let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                redb::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid CodeHash length",
+                ))
+            })?;
+            result.push((
+                ContractInstanceId::new(key_bytes),
+                CodeHash::from(&value_bytes),
+            ));
+        }
+        Ok(result)
+    }
+
+    // ==================== Delegate Index Methods ====================
+    // These replace the legacy KEY_DATA file in delegates directory
+
+    /// Store a delegate index entry: DelegateKey → CodeHash
+    /// DelegateKey is serialized as 64 bytes (32 byte key + 32 byte code_hash)
+    pub fn store_delegate_index(
+        &self,
+        delegate_key: &DelegateKey,
+        code_hash: &CodeHash,
+    ) -> Result<(), redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), code_hash.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get the CodeHash for a DelegateKey
+    pub fn get_delegate_index(
+        &self,
+        delegate_key: &DelegateKey,
+    ) -> Result<Option<CodeHash>, redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+        match tbl.get(key_bytes.as_slice())? {
+            Some(v) => {
+                let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
+                    redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid CodeHash length",
+                    ))
+                })?;
+                Ok(Some(CodeHash::from(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a delegate index entry
+    pub fn remove_delegate_index(&self, delegate_key: &DelegateKey) -> Result<(), redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+            tbl.remove(key_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all delegate index entries
+    pub fn load_all_delegate_index(&self) -> Result<Vec<(DelegateKey, CodeHash)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            if key_bytes.len() != 64 {
+                continue; // Skip malformed entries
+            }
+            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+            let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
+            let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                redb::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid CodeHash length",
+                ))
+            })?;
+
+            let delegate_key =
+                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+            result.push((delegate_key, CodeHash::from(&value_bytes)));
+        }
+        Ok(result)
+    }
+
+    // ==================== Secrets Index Methods ====================
+    // These replace the legacy KEY_DATA file in secrets directory
+
+    /// Store a secrets index entry: DelegateKey → concatenated secret key hashes
+    pub fn store_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        secret_keys: &[[u8; 32]],
+    ) -> Result<(), redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        // Concatenate all secret keys
+        let mut value_bytes = Vec::with_capacity(secret_keys.len() * 32);
+        for sk in secret_keys {
+            value_bytes.extend_from_slice(sk);
+        }
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get the secret key hashes for a DelegateKey
+    pub fn get_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+    ) -> Result<Option<Vec<[u8; 32]>>, redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+        match tbl.get(key_bytes.as_slice())? {
+            Some(v) => {
+                let value = v.value();
+                if value.len() % 32 != 0 {
+                    return Err(redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid secrets index value length",
+                    )));
+                }
+                let mut result = Vec::with_capacity(value.len() / 32);
+                for chunk in value.chunks(32) {
+                    let arr: [u8; 32] = chunk.try_into().unwrap();
+                    result.push(arr);
+                }
+                Ok(Some(result))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a secrets index entry
+    pub fn remove_secrets_index(&self, delegate_key: &DelegateKey) -> Result<(), redb::Error> {
+        let mut key_bytes = [0u8; 64];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+            tbl.remove(key_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all secrets index entries
+    pub fn load_all_secrets_index(&self) -> Result<Vec<(DelegateKey, Vec<[u8; 32]>)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            if key_bytes.len() != 64 {
+                continue; // Skip malformed entries
+            }
+            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+            let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
+
+            let value_bytes = value.value();
+            if value_bytes.len() % 32 != 0 {
+                continue; // Skip malformed entries
+            }
+            let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
+            for chunk in value_bytes.chunks(32) {
+                let arr: [u8; 32] = chunk.try_into().unwrap();
+                secret_keys.push(arr);
+            }
+
+            let delegate_key =
+                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+            result.push((delegate_key, secret_keys));
         }
         Ok(result)
     }

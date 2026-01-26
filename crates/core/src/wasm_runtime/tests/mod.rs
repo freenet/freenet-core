@@ -61,13 +61,18 @@ pub(crate) struct TestSetup {
     contract_key: ContractKey,
 }
 
-pub(crate) fn setup_test_contract(name: &str) -> Result<TestSetup, Box<dyn std::error::Error>> {
+pub(crate) async fn setup_test_contract(
+    name: &str,
+) -> Result<TestSetup, Box<dyn std::error::Error>> {
+    use crate::contract::storages::Storage;
     // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let temp_dir = get_temp_dir();
 
-    let mut contract_store = ContractStore::new(temp_dir.path().join("contract"), 10_000)?;
-    let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000)?;
-    let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"), Default::default())?;
+    let db = Storage::new(temp_dir.path()).await?;
+    let mut contract_store =
+        ContractStore::new(temp_dir.path().join("contract"), 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())?;
+    let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),

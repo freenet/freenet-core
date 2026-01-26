@@ -1226,8 +1226,10 @@ impl Executor<Runtime> {
         op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
+        // Get the shared storage from the state store to share with runtime stores
+        let db = shared_state_store.storage();
         // Create only the Runtime stores (contract, delegate, secrets) - NOT StateStore
-        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(&config)?;
+        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(&config, db)?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         Executor::new(
             shared_state_store,

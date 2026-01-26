@@ -14,6 +14,7 @@ const TOMBSTONE_MARKER: usize = 1;
 
 pub(super) struct SafeWriter<S> {
     file: BufWriter<File>,
+    key_file_path: PathBuf,
     lock_file_path: PathBuf,
     compact: bool,
     _marker: std::marker::PhantomData<fn(S) -> S>,
@@ -40,11 +41,30 @@ impl<S: StoreFsManagement> SafeWriter<S> {
         };
         let s = Self {
             file: BufWriter::new(file),
-            compact,
+            key_file_path: path.to_path_buf(),
             lock_file_path: path.with_extension("lock"),
+            compact,
             _marker: std::marker::PhantomData,
         };
         Ok(s)
+    }
+
+    /// Reopen the underlying file handle.
+    ///
+    /// This MUST be called after compaction replaces the file via rename.
+    /// Without this, the file handle points to the old (deleted) file and
+    /// new writes are lost.
+    pub fn reopen(&mut self) -> std::io::Result<()> {
+        // Flush any buffered data first (though it goes to the old file)
+        let _ = self.file.flush();
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.key_file_path)?;
+        self.file = BufWriter::new(file);
+        Ok(())
     }
 
     /// Inserts a new record and returns the offset
@@ -197,8 +217,7 @@ pub(super) trait StoreFsManagement: Sized {
         mut container: Self::MemContainer,
         key_file_path: &Path,
     ) -> anyhow::Result<()> {
-        let key_path = key_file_path.to_path_buf();
-        let key_path_cp = key_path.clone();
+        let key_path_cp = key_file_path.to_path_buf();
         let mut watcher = notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(ev) => {
@@ -213,14 +232,50 @@ pub(super) trait StoreFsManagement: Sized {
                 Err(err) => tracing::error!("{err}"),
             },
         )?;
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(5 * 60));
-            if let Err(err) = compact_index_file::<Self>(&key_path) {
-                tracing::warn!("Failed index file ({key_path:?}) compaction: {err}");
-            }
-        });
+        // NOTE: Background compaction was removed because it caused data loss.
+        // The compaction would rename a new file over KEY_DATA, but the store's
+        // SafeWriter file handle still pointed to the old (deleted) file. New
+        // writes after compaction would go to the orphaned file handle and be lost.
+        //
+        // Compaction is now triggered explicitly via run_compaction() which
+        // properly updates both the file handle and in-memory state.
         watcher.watch(key_file_path, notify::RecursiveMode::NonRecursive)?;
         Ok(())
+    }
+
+    /// Run compaction on the index file, updating the file handle and in-memory state.
+    ///
+    /// This is safe to call because it:
+    /// 1. Runs compaction (writes to temp file, renames over original)
+    /// 2. Reopens the file handle to point to the new file
+    /// 3. Reloads the in-memory container with correct offsets
+    ///
+    /// Returns true if compaction was performed, false if skipped (no deleted records).
+    fn run_compaction(
+        index_file: &mut SafeWriter<Self>,
+        container: &mut Self::MemContainer,
+        key_file_path: &Path,
+    ) -> std::io::Result<bool> {
+        let compacted = compact_index_file::<Self>(key_file_path)?;
+
+        if compacted {
+            // CRITICAL: Reopen the file handle after compaction.
+            // The compaction renamed a new file over the original path.
+            // Without reopening, our file handle points to the old (deleted) file.
+            index_file.reopen()?;
+
+            // Reload the in-memory container to get correct offsets.
+            // After compaction, all offsets change because deleted records are removed.
+            Self::clear_container(container);
+            Self::load_from_file(key_file_path, container)?;
+
+            tracing::info!(
+                path = ?key_file_path,
+                "Compaction completed: file handle reopened and offsets reloaded"
+            );
+        }
+
+        Ok(compacted)
     }
 
     /// Insert in index file and returns the offset at which this record resides.
@@ -302,65 +357,75 @@ pub(super) trait StoreFsManagement: Sized {
             );
             // Drop the file handle before compaction
             drop(file);
-            if let Err(e) = compact_index_file::<Self>(key_file_path) {
-                tracing::error!(
-                    path = ?key_file_path,
-                    error = %e,
-                    "Failed to rewrite index file after detecting corruption"
-                );
-            } else {
-                // Compaction succeeded - the file has been rewritten with new offsets.
-                // Clear the container and reload to get correct offsets.
-                // Without this, the container would have stale offsets from the old file
-                // layout, which could cause data corruption when writing new records
-                // (tombstoning wrong entries) or identity confusion (reading wrong data).
-                tracing::info!(
-                    path = ?key_file_path,
-                    "Reloading index after compaction to fix stale offsets"
-                );
-                Self::clear_container(container);
+            match compact_index_file::<Self>(key_file_path) {
+                Err(e) => {
+                    tracing::error!(
+                        path = ?key_file_path,
+                        error = %e,
+                        "Failed to rewrite index file after detecting corruption"
+                    );
+                }
+                Ok(false) => {
+                    // Another compaction is in progress, skip reload
+                    tracing::debug!(
+                        path = ?key_file_path,
+                        "Skipping reload - compaction already in progress"
+                    );
+                }
+                Ok(true) => {
+                    // Compaction succeeded - the file has been rewritten with new offsets.
+                    // Clear the container and reload to get correct offsets.
+                    // Without this, the container would have stale offsets from the old file
+                    // layout, which could cause data corruption when writing new records
+                    // (tombstoning wrong entries) or identity confusion (reading wrong data).
+                    tracing::info!(
+                        path = ?key_file_path,
+                        "Reloading index after compaction to fix stale offsets"
+                    );
+                    Self::clear_container(container);
 
-                // Reload from the newly compacted file
-                let mut file = BufReader::new(File::open(key_file_path)?);
-                let mut key_cursor = 0;
-                while let Ok(rec) = process_record(&mut file) {
-                    if let Some((store_key, value)) = rec {
-                        // After compaction, all records should be valid. Any failure to
-                        // convert the key type here indicates a serious bug in the
-                        // compaction logic or unexpected data corruption.
-                        let store_key = match store_key.try_into() {
-                            Ok(key) => key,
-                            Err(mismatch) => {
+                    // Reload from the newly compacted file
+                    let mut file = BufReader::new(File::open(key_file_path)?);
+                    let mut key_cursor = 0;
+                    while let Ok(rec) = process_record(&mut file) {
+                        if let Some((store_key, value)) = rec {
+                            // After compaction, all records should be valid. Any failure to
+                            // convert the key type here indicates a serious bug in the
+                            // compaction logic or unexpected data corruption.
+                            let store_key = match store_key.try_into() {
+                                Ok(key) => key,
+                                Err(mismatch) => {
+                                    tracing::error!(
+                                        path = ?key_file_path,
+                                        offset = key_cursor,
+                                        error = %mismatch,
+                                        "Invalid record after compaction (key type mismatch) - \
+                                         container has been cleared but reload failed"
+                                    );
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("Invalid record after compaction: {}", mismatch),
+                                    ));
+                                }
+                            };
+                            let value = match value {
+                                Either::Left(v) => Self::Value::try_from(&v),
+                                Either::Right(v) => Self::Value::try_from(&v),
+                            }
+                            .map_err(|e| {
                                 tracing::error!(
                                     path = ?key_file_path,
                                     offset = key_cursor,
-                                    error = %mismatch,
-                                    "Invalid record after compaction (key type mismatch) - \
+                                    error = %e,
+                                    "Failed to convert value while reloading after compaction - \
                                      container has been cleared but reload failed"
                                 );
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Invalid record after compaction: {}", mismatch),
-                                ));
-                            }
-                        };
-                        let value = match value {
-                            Either::Left(v) => Self::Value::try_from(&v),
-                            Either::Right(v) => Self::Value::try_from(&v),
+                                e
+                            })?;
+                            Self::insert_in_container(container, (store_key, key_cursor), value);
                         }
-                        .map_err(|e| {
-                            tracing::error!(
-                                path = ?key_file_path,
-                                offset = key_cursor,
-                                error = %e,
-                                "Failed to convert value while reloading after compaction - \
-                                 container has been cleared but reload failed"
-                            );
-                            e
-                        })?;
-                        Self::insert_in_container(container, (store_key, key_cursor), value);
+                        key_cursor = file.stream_position()?;
                     }
-                    key_cursor = file.stream_position()?;
                 }
             }
         }
@@ -435,7 +500,11 @@ where
     }
 }
 
-fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Result<()> {
+/// Run compaction on the index file.
+///
+/// Returns Ok(true) if compaction was performed, Ok(false) if skipped
+/// (no deleted records or another compaction is in progress).
+fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Result<bool> {
     // Define the path to the lock file
     let lock_file_path = key_file_path.with_extension("lock");
 
@@ -448,7 +517,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // The lock file already exists, so a compaction is in progress
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => {
             // An unexpected error occurred
@@ -528,7 +597,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // Check if any deleted records were found; if not, skip compaction
     if !any_deleted {
         cleanup_files(&temp_file_path, &lock_file_path);
-        return Ok(());
+        return Ok(false);
     }
 
     // Clean up and finalize the compaction process.
@@ -552,7 +621,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
         e
     })?;
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1009,6 +1078,78 @@ mod tests {
             container2.len(),
             1,
             "Second load should still have exactly 1 record"
+        );
+    }
+
+    /// Regression test for stale file handle bug.
+    ///
+    /// Before the fix, the background compaction thread would:
+    /// 1. Create a new compacted file
+    /// 2. Rename it over the original KEY_DATA
+    /// 3. But the store's SafeWriter still had a handle to the OLD file
+    ///
+    /// This caused:
+    /// - New writes to go to the orphaned file (data loss)
+    /// - In-memory offsets to become stale (corruption when using remove())
+    ///
+    /// This test verifies that run_compaction properly reopens the file handle
+    /// and reloads offsets so writes go to the correct file.
+    #[test]
+    fn test_compaction_reopens_file_handle() {
+        let temp_dir = get_temp_dir();
+        let key_file_path = temp_dir.path().join("data.dat");
+
+        // Step 1: Create initial records
+        let mut container = <TestStore1 as StoreFsManagement>::MemContainer::default();
+        let mut file = SafeWriter::<TestStore1>::new(&key_file_path, false).expect("failed");
+
+        let key1 = ContractInstanceId::new([1; 32]);
+        let value1 = CodeHash::new([11; 32]);
+        let offset1 = TestStore1::insert(&mut file, key1, &value1).expect("insert failed");
+        container.insert(key1, (offset1, value1));
+
+        let key2 = ContractInstanceId::new([2; 32]);
+        let value2 = CodeHash::new([22; 32]);
+        let offset2 = TestStore1::insert(&mut file, key2, &value2).expect("insert failed");
+        container.insert(key2, (offset2, value2));
+
+        // Step 2: Delete a record (marks it as tombstone, triggers compaction need)
+        TestStore1::remove(&key_file_path, offset1).expect("remove failed");
+        container.remove(&key1);
+
+        // Step 3: Run compaction using the safe method that reopens the handle
+        let compacted = TestStore1::run_compaction(&mut file, &mut container, &key_file_path)
+            .expect("compaction failed");
+        assert!(compacted, "Compaction should have been performed");
+
+        // Step 4: Write a new record AFTER compaction
+        // Before the fix, this would go to the old orphaned file and be lost
+        let key3 = ContractInstanceId::new([3; 32]);
+        let value3 = CodeHash::new([33; 32]);
+        let offset3 =
+            TestStore1::insert(&mut file, key3, &value3).expect("insert after compaction failed");
+        container.insert(key3, (offset3, value3));
+
+        // Step 5: Reload from disk and verify the new record persisted
+        let mut fresh_container = <TestStore1 as StoreFsManagement>::MemContainer::default();
+        TestStore1::load_from_file(&key_file_path, &mut fresh_container).expect("reload failed");
+
+        assert_eq!(
+            fresh_container.len(),
+            2,
+            "Should have 2 records: key2 (survived compaction) and key3 (written after)"
+        );
+        assert!(
+            fresh_container.contains_key(&key2),
+            "key2 should exist after reload"
+        );
+        assert!(
+            fresh_container.contains_key(&key3),
+            "key3 (written after compaction) should exist - this would fail with stale handle"
+        );
+        assert!(
+            !fresh_container.contains_key(&key1),
+            "key1 should have been removed by compaction"
         );
     }
 }

@@ -174,6 +174,16 @@ where
     pub fn inner(&self) -> &S {
         &self.store
     }
+
+    /// Get a clone of the underlying storage backend.
+    /// Used when the storage needs to be shared with other components
+    /// (e.g., ContractStore, DelegateStore, SecretsStore).
+    pub fn storage(&self) -> S
+    where
+        S: Clone,
+    {
+        self.store.clone()
+    }
 }
 
 #[cfg(test)]
