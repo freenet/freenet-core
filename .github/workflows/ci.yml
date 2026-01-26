@@ -81,11 +81,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Pin to 1.91.0 to avoid rustc 1.92.0 ICE in monomorphization
-      # See: https://github.com/rust-lang/rust/issues/147164
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
           components: rustfmt
 
       - name: Check code formatting
@@ -113,7 +110,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
           components: clippy
           targets: wasm32-unknown-unknown
 
@@ -156,7 +152,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
@@ -243,8 +238,6 @@ jobs:
           path: river-src
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
 
       - uses: Swatinem/rust-cache@v2
         with:
