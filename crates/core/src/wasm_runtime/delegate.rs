@@ -525,18 +525,20 @@ mod test {
         MessageSigned(Vec<u8>),
     }
 
-    fn setup_runtime(
+    async fn setup_runtime(
         name: &str,
     ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
         // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let temp_dir = get_temp_dir();
         let contracts_dir = temp_dir.path().join("contracts");
         let delegates_dir = temp_dir.path().join("delegates");
         let secrets_dir = temp_dir.path().join("secrets");
 
-        let contract_store = ContractStore::new(contracts_dir, 10_000)?;
-        let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
-        let secret_store = SecretsStore::new(secrets_dir, Default::default())?;
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db)?;
 
         let mut runtime =
             Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
@@ -560,13 +562,13 @@ mod test {
         Ok((delegate, runtime, temp_dir))
     }
 
-    #[test]
-    fn validate_process() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_process() -> Result<(), Box<dyn std::error::Error>> {
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_1)?;
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_1).await?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts

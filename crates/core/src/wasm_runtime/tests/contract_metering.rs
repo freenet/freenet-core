@@ -18,15 +18,15 @@ struct TestConditions {
     pub iterations: u64,
 }
 
-#[test]
-fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_METERING)?;
+    } = super::setup_test_contract(TEST_CONTRACT_METERING).await?;
 
     let config = RuntimeConfig {
         max_execution_seconds: 5.0,
@@ -70,15 +70,15 @@ fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_METERING)?;
+    } = super::setup_test_contract(TEST_CONTRACT_METERING).await?;
 
     let config = RuntimeConfig {
         max_execution_seconds: 5.0,
@@ -123,15 +123,15 @@ fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_METERING)?;
+    } = super::setup_test_contract(TEST_CONTRACT_METERING).await?;
 
     let config = RuntimeConfig {
         max_execution_seconds: 5.0,
@@ -171,15 +171,15 @@ fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_METERING)?;
+    } = super::setup_test_contract(TEST_CONTRACT_METERING).await?;
 
     let config = RuntimeConfig {
         max_execution_seconds: 5.0,
@@ -224,15 +224,15 @@ fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn test_timeout_metering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_timeout_metering() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_METERING)?;
+    } = super::setup_test_contract(TEST_CONTRACT_METERING).await?;
 
     let config = RuntimeConfig {
         max_execution_seconds: 5.0,
