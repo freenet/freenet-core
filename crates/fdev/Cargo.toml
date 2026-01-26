@@ -44,11 +44,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 http = "1.4"
 
 # internal
-freenet = { path = "../core", version = "0.1.106" }
+freenet = { path = "../core", version = "0.1.106", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [features]
-default = ["testing"]
 trace-ot = ["freenet/trace-ot"]
-# testing feature enables Turmoil-based deterministic simulation tests
-testing = ["freenet/testing"]
+# testing feature is always enabled for fdev (it's a development tool)
