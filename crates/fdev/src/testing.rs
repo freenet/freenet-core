@@ -216,8 +216,8 @@ pub(crate) fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Erro
                 .build()?;
 
             rt.block_on(async {
-                let disable_metrics = base_config.disable_metrics
-                    || matches!(config.mode, network::Process::Peer);
+                let disable_metrics =
+                    base_config.disable_metrics || matches!(config.mode, network::Process::Peer);
 
                 let (server, changes_recorder) = if !disable_metrics {
                     let (s, r) = start_server(&ServerConfig {

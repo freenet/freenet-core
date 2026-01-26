@@ -3527,7 +3527,10 @@ impl SimNetwork {
             };
 
             if subscribed_count > 0 {
-                tracing::info!("Found {} subscribed contracts, checking convergence...", subscribed_count);
+                tracing::info!(
+                    "Found {} subscribed contracts, checking convergence...",
+                    subscribed_count
+                );
 
                 // Simple convergence check within Turmoil
                 // We'll just wait a bit and then check final state
@@ -3541,7 +3544,8 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run().map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
+        sim.run()
+            .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
     }
 
     // =========================================================================

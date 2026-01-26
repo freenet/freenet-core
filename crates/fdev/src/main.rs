@@ -44,8 +44,7 @@ fn main() -> anyhow::Result<()> {
     // Test subcommand uses Turmoil which requires running outside of any tokio runtime
     if matches!(config.sub_command, SubCommand::Test(_)) {
         if let SubCommand::Test(test_config) = config.sub_command {
-            return testing::test_framework(test_config)
-                .map_err(|e| anyhow::format_err!(e));
+            return testing::test_framework(test_config).map_err(|e| anyhow::format_err!(e));
         }
     }
 
