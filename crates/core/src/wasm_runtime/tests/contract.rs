@@ -7,15 +7,15 @@ use super::super::Runtime;
 
 const TEST_CONTRACT_1: &str = "test_contract_1";
 
-#[test]
-fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_1)?;
+    } = super::setup_test_contract(TEST_CONTRACT_1).await?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let is_valid = runtime.validate_state(
@@ -37,15 +37,15 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn update_state() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_1)?;
+    } = super::setup_test_contract(TEST_CONTRACT_1).await?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let new_state = runtime
@@ -62,15 +62,15 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_1)?;
+    } = super::setup_test_contract(TEST_CONTRACT_1).await?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let summary = runtime.summarize_state(
@@ -83,15 +83,15 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_1)?;
+    } = super::setup_test_contract(TEST_CONTRACT_1).await?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let delta = runtime.get_state_delta(

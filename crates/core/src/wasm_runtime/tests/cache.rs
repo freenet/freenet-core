@@ -7,8 +7,8 @@ use super::{setup_test_contract, TestSetup};
 use freenet_stdlib::prelude::*;
 
 /// Test that the module cache respects capacity limits and evicts LRU entries.
-#[test]
-fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> {
     // Create runtime with very small cache (capacity 2)
     let TestSetup {
         contract_store,
@@ -16,7 +16,7 @@ fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> {
         secrets_store,
         contract_key: contract_key_1,
         temp_dir,
-    } = setup_test_contract("test_contract_1")?;
+    } = setup_test_contract("test_contract_1").await?;
 
     let config = RuntimeConfig {
         module_cache_capacity: 2,
@@ -66,15 +66,15 @@ fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Test that zero capacity is handled gracefully (falls back to 1).
-#[test]
-fn test_module_cache_zero_capacity() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_module_cache_zero_capacity() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         temp_dir,
         ..
-    } = setup_test_contract("test_contract_1")?;
+    } = setup_test_contract("test_contract_1").await?;
 
     // Create runtime with zero capacity - should fall back to 1
     let config = RuntimeConfig {
@@ -103,15 +103,15 @@ fn test_module_cache_zero_capacity() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Test that cache capacity of 1 works correctly.
-#[test]
-fn test_module_cache_capacity_one() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_module_cache_capacity_one() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
         delegate_store,
         secrets_store,
         contract_key,
         temp_dir,
-    } = setup_test_contract("test_contract_1")?;
+    } = setup_test_contract("test_contract_1").await?;
 
     let config = RuntimeConfig {
         module_cache_capacity: 1,

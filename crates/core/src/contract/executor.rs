@@ -838,23 +838,25 @@ where
     > {
         const MAX_MEM_CACHE: u32 = 10_000_000;
 
-        let state_store =
-            StateStore::new(Storage::new(&config.db_dir()).await?, MAX_MEM_CACHE).unwrap();
-        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(config)?;
+        let db = Storage::new(&config.db_dir()).await?;
+        let state_store = StateStore::new(db.clone(), MAX_MEM_CACHE).unwrap();
+        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(config, db)?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
     }
 
     /// Create only the Runtime stores (contract, delegate, secrets) without StateStore.
     /// Used by RuntimePool to create executors that share a StateStore.
+    /// The Storage (ReDb) is shared across all stores for index persistence.
     pub(crate) fn get_runtime_stores(
         config: &Config,
+        db: Storage,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
 
-        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
-        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
-        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?;
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone(), db)?;
 
         Ok((contract_store, delegate_store, secret_store))
     }
