@@ -355,6 +355,13 @@ impl OpManager {
             );
         }
 
+        // Create orphan stream registry (always created for transport layer)
+        // GC task only started when streaming is enabled
+        let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
+        if streaming_enabled {
+            OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
+        }
+
         Ok(Self {
             ring,
             ops,
@@ -370,7 +377,7 @@ impl OpManager {
             proximity_cache,
             interest_manager,
             request_router,
-            orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
+            orphan_stream_registry,
             streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
@@ -518,16 +525,16 @@ impl OpManager {
             })
     }
 
-    /// Get all network subscription information
-    /// Returns a map of contract keys to lists of subscribing peers (as PeerKeyLocations)
+    /// Get all active subscriptions.
+    /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
+    /// Note: We no longer track per-contract subscriber lists.
     pub fn get_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
+        // Return contracts we're subscribed to with an empty peer list
+        // (no longer tracking individual subscribers in the new model)
         self.ring
-            .all_network_subscriptions()
+            .get_subscribed_contracts()
             .into_iter()
-            .map(|(contract_key, subscribers)| {
-                let peers: Vec<PeerKeyLocation> = subscribers.into_iter().collect();
-                (contract_key, peers)
-            })
+            .map(|contract_key| (contract_key, Vec::new()))
             .collect()
     }
 

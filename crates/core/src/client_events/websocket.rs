@@ -524,14 +524,6 @@ async fn websocket_interface(
         };
 
         tokio::select! { biased;
-            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut server_sink).await } => {
-                let active_listeners = contract_updates.clone();
-                if let Some(NewSubscription { key, callback }) = msg? {
-                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
-                    let active_listeners = &mut *active_listeners.lock().await;
-                    active_listeners.push_back((key, callback));
-                }
-            }
             process_client_request = client_req_task => {
                 match process_client_request {
                     Ok(Some(error)) => {
@@ -567,6 +559,14 @@ async fn websocket_interface(
                             .await;
                         return Err(err)
                     },
+                }
+            }
+            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut server_sink).await } => {
+                let active_listeners = contract_updates.clone();
+                if let Some(NewSubscription { key, callback }) = msg? {
+                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
+                    let active_listeners = &mut *active_listeners.lock().await;
+                    active_listeners.push_back((key, callback));
                 }
             }
             response = listeners_task => {

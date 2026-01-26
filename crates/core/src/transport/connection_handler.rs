@@ -54,6 +54,14 @@ const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 /// This prevents unbounded growth of the last_asym_attempt HashMap.
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Duration to keep connections in RecentlyClosed state.
+/// Allows in-flight packets to drain without triggering asymmetric decryption.
+const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
+
+/// Duration to keep outdated peer entries before cleanup.
+/// Peers with incompatible protocol versions are ignored for this duration.
+const OUTDATED_PEER_EXPIRY: Duration = Duration::from_secs(600);
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S, T> = BoxFuture<
@@ -225,7 +233,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
-            remote_connections: BTreeMap::new(),
+            connections: ConnectionStateManager::new(time_source.clone()),
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
             this_addr: socket_addr,
@@ -235,11 +243,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
-            last_asym_attempt: HashMap::new(),
             time_source,
-            // Use provided config or default to FixedRate (100 Mbps).
-            // Congestion control settings are now centralized in config/mod.rs and can be
-            // configured via FREENET_CONGESTION_CONTROL env var or config file.
             congestion_config: Some(congestion_config.unwrap_or_default()),
         };
         let connection_handler = OutboundConnectionHandler {
@@ -418,7 +422,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
-            remote_connections: BTreeMap::new(),
+            connections: ConnectionStateManager::new(time_source.clone()),
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
             this_addr: socket_addr,
@@ -428,7 +432,6 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
-            last_asym_attempt: HashMap::new(),
             time_source,
             congestion_config,
         };
@@ -551,14 +554,22 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
-    remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
+    /// Unified state manager for all remote connections.
+    /// Ensures atomic state transitions during connection lifecycle
+    /// (handshake → established → closed) to prevent race conditions.
+    connections: ConnectionStateManager<S, T>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S, T>)>,
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection<S, T>>,
     this_addr: SocketAddr,
+    /// Tracks dropped packet counts per remote address for congestion diagnostics.
+    /// Used with `last_drop_warning_nanos` to rate-limit warning logs.
     dropped_packets: HashMap<SocketAddr, u64>,
+    /// Timestamp (nanos) of last drop warning to prevent log spam.
     last_drop_warning_nanos: u64,
+    /// Per-connection bandwidth limit in bytes/sec.
+    /// For global fair-share limiting, use `global_bandwidth` instead.
     bandwidth_limit: Option<usize>,
     /// Global bandwidth manager for fair sharing across all connections.
     /// When set, per-connection rates are derived from total_limit / active_connections.
@@ -566,19 +577,14 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Minimum ssthresh floor for LEDBAT timeout recovery.
     /// Prevents ssthresh death spiral on high-latency paths.
     ledbat_min_ssthresh: Option<usize>,
+    /// IPs expected to connect as regular peers (not gateways).
+    /// Used to validate connection attempts and prevent gateway impersonation.
     expected_non_gateway: Arc<DashSet<IpAddr>>,
-    /// Rate limiting for asymmetric decryption attempts to prevent DoS (issue #2277).
-    last_asym_attempt: HashMap<SocketAddr, u64>,
     time_source: T,
     /// Congestion control configuration for new connections.
     /// When None, uses the default configuration (BBR).
     congestion_config: Option<CongestionControlConfig>,
 }
-
-type OngoingConnection<S, T> = (
-    FastSender<PacketData<UnknownEncryption>>,
-    oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
-);
 
 type OngoingConnectionResult<S, T> = Option<
     Result<
@@ -600,6 +606,416 @@ type GwOngoingConnectionResult<S, T> = Option<
         tokio::task::JoinError,
     >,
 >;
+
+/// Unified connection state for a remote peer.
+enum ConnectionState<S, T: TimeSource> {
+    /// Gateway is performing asymmetric handshake with a connecting peer.
+    GatewayHandshake {
+        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    },
+    /// Outbound NAT traversal handshake in progress.
+    NatTraversal {
+        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
+    },
+    /// Connection fully established with symmetric encryption.
+    Established {
+        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    },
+    /// Connection recently closed - drains in-flight packets.
+    /// Allows new intro packets for reconnection.
+    RecentlyClosed { closed_at_nanos: u64 },
+}
+
+/// Manages connection state with atomic transitions.
+/// Single source of truth for all connection states per address.
+struct ConnectionStateManager<S, T: TimeSource> {
+    states: BTreeMap<SocketAddr, ConnectionState<S, T>>,
+    last_asym_attempt: HashMap<SocketAddr, u64>,
+    time_source: T,
+}
+
+impl<S, T: TimeSource> ConnectionStateManager<S, T> {
+    fn new(time_source: T) -> Self {
+        Self {
+            states: BTreeMap::new(),
+            last_asym_attempt: HashMap::new(),
+            time_source,
+        }
+    }
+
+    /// Get immutable reference to current state for routing decisions.
+    fn get_state(&self, addr: &SocketAddr) -> Option<&ConnectionState<S, T>> {
+        self.states.get(addr)
+    }
+
+    /// Check if connection is established for the given address.
+    fn is_established(&self, addr: &SocketAddr) -> bool {
+        matches!(
+            self.get_state(addr),
+            Some(ConnectionState::Established { .. })
+        )
+    }
+
+    /// Check if a gateway handshake is in progress for the given address.
+    fn has_gateway_handshake(&self, addr: &SocketAddr) -> bool {
+        matches!(
+            self.get_state(addr),
+            Some(ConnectionState::GatewayHandshake { .. })
+        )
+    }
+
+    /// Check if a NAT traversal handshake is in progress for the given address.
+    fn has_nat_traversal(&self, addr: &SocketAddr) -> bool {
+        matches!(
+            self.get_state(addr),
+            Some(ConnectionState::NatTraversal { .. })
+        )
+    }
+
+    /// Try to send a packet to an established connection.
+    /// Returns Ok(true) if sent, Ok(false) if channel full, Err if disconnected.
+    fn try_send_established(
+        &mut self,
+        addr: &SocketAddr,
+        packet: PacketData<UnknownEncryption>,
+    ) -> Result<bool, ()> {
+        if let Some(ConnectionState::Established {
+            inbound_packet_sender,
+        }) = self.states.get(addr)
+        {
+            match inbound_packet_sender.try_send(packet) {
+                Ok(()) => Ok(true),
+                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
+                Err(fast_channel::TrySendError::Disconnected(_)) => {
+                    self.mark_closed(addr);
+                    Err(())
+                }
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    /// Try to send a packet to an ongoing gateway handshake.
+    /// Returns Ok(true) if sent, Ok(false) if channel full/should drop.
+    fn try_send_gateway_handshake(
+        &self,
+        addr: &SocketAddr,
+        packet: PacketData<UnknownEncryption>,
+    ) -> Result<bool, ()> {
+        if let Some(ConnectionState::GatewayHandshake { packet_sender, .. }) = self.states.get(addr)
+        {
+            match packet_sender.try_send(packet) {
+                Ok(()) => Ok(true),
+                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
+                Err(fast_channel::TrySendError::Disconnected(_)) => Ok(false), // Handshake completing
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    /// Try to send a packet to an ongoing NAT traversal.
+    /// Returns Ok(true) if sent, Ok(false) if channel closed.
+    async fn send_nat_traversal(
+        &self,
+        addr: &SocketAddr,
+        packet: PacketData<UnknownEncryption>,
+    ) -> Result<bool, ()> {
+        if let Some(ConnectionState::NatTraversal { packet_sender, .. }) = self.states.get(addr) {
+            match packet_sender.send_async(packet).await {
+                Ok(()) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    /// Start a gateway handshake. Only succeeds if no active state exists.
+    fn start_gateway_handshake(
+        &mut self,
+        addr: SocketAddr,
+        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    ) -> bool {
+        use std::collections::btree_map::Entry;
+        let now = self.time_source.now_nanos();
+
+        match self.states.entry(addr) {
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionState::GatewayHandshake { packet_sender });
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                if let ConnectionState::RecentlyClosed { closed_at_nanos } = entry.get() {
+                    if now.saturating_sub(*closed_at_nanos)
+                        >= RECENTLY_CLOSED_DURATION.as_nanos() as u64
+                    {
+                        entry.insert(ConnectionState::GatewayHandshake { packet_sender });
+                        return true;
+                    } else {
+                        tracing::debug!(
+                            peer_addr = %addr,
+                            remaining_ms = (RECENTLY_CLOSED_DURATION.as_nanos() as u64 - now.saturating_sub(*closed_at_nanos)) / 1_000_000,
+                            "Rejecting gateway handshake - connection recently closed"
+                        );
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Complete gateway handshake atomically. Returns true if state was GatewayHandshake.
+    fn complete_gateway_handshake(
+        &mut self,
+        addr: SocketAddr,
+        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    ) -> bool {
+        use std::collections::btree_map::Entry;
+
+        match self.states.entry(addr) {
+            Entry::Occupied(mut entry) => {
+                if matches!(entry.get(), ConnectionState::GatewayHandshake { .. }) {
+                    entry.insert(ConnectionState::Established {
+                        inbound_packet_sender,
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        }
+    }
+
+    /// Fail a gateway handshake - remove state.
+    fn fail_gateway_handshake(&mut self, addr: &SocketAddr) {
+        if matches!(
+            self.states.get(addr),
+            Some(ConnectionState::GatewayHandshake { .. })
+        ) {
+            self.states.remove(addr);
+        }
+    }
+
+    /// Start NAT traversal.
+    fn start_nat_traversal(
+        &mut self,
+        addr: SocketAddr,
+        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
+    ) -> bool {
+        use std::collections::btree_map::Entry;
+        let now = self.time_source.now_nanos();
+
+        match self.states.entry(addr) {
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionState::NatTraversal {
+                    packet_sender,
+                    result_sender,
+                });
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                match entry.get() {
+                    ConnectionState::Established { .. } => {
+                        // Higher layer requested new connection, clear existing one
+                        self.last_asym_attempt.remove(&addr);
+                        tracing::info!(
+                            peer_addr = %addr,
+                            "Clearing existing connection to allow fresh NAT traversal"
+                        );
+                        entry.insert(ConnectionState::NatTraversal {
+                            packet_sender,
+                            result_sender,
+                        });
+                        true
+                    }
+                    ConnectionState::NatTraversal { .. } => {
+                        // Already in progress, reject duplicate
+                        false
+                    }
+                    ConnectionState::GatewayHandshake { .. } => {
+                        // Don't overwrite ongoing gateway handshake to avoid orphaning its task
+                        tracing::debug!(
+                            peer_addr = %addr,
+                            "Rejecting NAT traversal - gateway handshake already in progress"
+                        );
+                        false
+                    }
+                    ConnectionState::RecentlyClosed { closed_at_nanos } => {
+                        // Allow if grace period expired
+                        if now.saturating_sub(*closed_at_nanos)
+                            >= RECENTLY_CLOSED_DURATION.as_nanos() as u64
+                        {
+                            entry.insert(ConnectionState::NatTraversal {
+                                packet_sender,
+                                result_sender,
+                            });
+                            true
+                        } else {
+                            tracing::debug!(
+                                peer_addr = %addr,
+                                remaining_ms = (RECENTLY_CLOSED_DURATION.as_nanos() as u64 - now.saturating_sub(*closed_at_nanos)) / 1_000_000,
+                                "Rejecting NAT traversal - connection recently closed"
+                            );
+                            false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Complete NAT traversal atomically. Returns result_sender if state was NatTraversal.
+    fn complete_nat_traversal(
+        &mut self,
+        addr: SocketAddr,
+        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    ) -> Option<oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>> {
+        use std::collections::btree_map::Entry;
+
+        match self.states.entry(addr) {
+            Entry::Occupied(mut entry) => {
+                if matches!(entry.get(), ConnectionState::NatTraversal { .. }) {
+                    let old = entry.insert(ConnectionState::Established {
+                        inbound_packet_sender,
+                    });
+                    if let ConnectionState::NatTraversal { result_sender, .. } = old {
+                        return Some(result_sender);
+                    }
+                }
+                None
+            }
+            Entry::Vacant(_) => None,
+        }
+    }
+
+    /// Fail NAT traversal - remove state and return result_sender for error reporting.
+    fn fail_nat_traversal(
+        &mut self,
+        addr: &SocketAddr,
+    ) -> Option<oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>> {
+        if matches!(
+            self.states.get(addr),
+            Some(ConnectionState::NatTraversal { .. })
+        ) {
+            if let Some(ConnectionState::NatTraversal { result_sender, .. }) =
+                self.states.remove(addr)
+            {
+                return Some(result_sender);
+            }
+        }
+        None
+    }
+
+    /// Mark connection as closed. Only established connections enter the grace period.
+    fn mark_closed(&mut self, addr: &SocketAddr) {
+        match self.states.remove(addr) {
+            Some(ConnectionState::Established { .. }) => {
+                self.states.insert(
+                    *addr,
+                    ConnectionState::RecentlyClosed {
+                        closed_at_nanos: self.time_source.now_nanos(),
+                    },
+                );
+            }
+            Some(ConnectionState::NatTraversal { result_sender, .. }) => {
+                let _ = result_sender.send(Err(TransportError::ConnectionClosed(*addr)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove established connection and return the packet sender (for detection purposes).
+    fn remove_established(
+        &mut self,
+        addr: &SocketAddr,
+    ) -> Option<FastSender<PacketData<UnknownEncryption>>> {
+        if matches!(
+            self.states.get(addr),
+            Some(ConnectionState::Established { .. })
+        ) {
+            if let Some(ConnectionState::Established {
+                inbound_packet_sender,
+            }) = self.states.remove(addr)
+            {
+                return Some(inbound_packet_sender);
+            }
+        }
+        None
+    }
+
+    /// Check if address is rate limited for asymmetric decryption.
+    fn is_rate_limited(&self, addr: &SocketAddr) -> bool {
+        let now = self.time_source.now_nanos();
+        self.last_asym_attempt.get(addr).is_some_and(|last_nanos| {
+            now.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
+        })
+    }
+
+    /// Record an asymmetric decryption attempt for rate limiting.
+    fn record_asym_attempt(&mut self, addr: SocketAddr) {
+        let now = self.time_source.now_nanos();
+        self.last_asym_attempt.insert(addr, now);
+    }
+
+    /// Clear rate limit tracking for an address.
+    fn clear_rate_limit(&mut self, addr: &SocketAddr) {
+        self.last_asym_attempt.remove(addr);
+    }
+
+    /// Remove stale closed connections from the same IP.
+    fn remove_stale_from_ip(&mut self, new_addr: SocketAddr) {
+        let remote_ip = new_addr.ip();
+        let stale_addrs: Vec<_> = self
+            .states
+            .iter()
+            .filter_map(|(addr, state)| {
+                if addr.ip() == remote_ip && *addr != new_addr {
+                    if let ConnectionState::Established {
+                        inbound_packet_sender,
+                    } = state
+                    {
+                        if inbound_packet_sender.is_closed() {
+                            return Some(*addr);
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for stale_addr in stale_addrs {
+            self.states.remove(&stale_addr);
+            self.last_asym_attempt.remove(&stale_addr);
+            tracing::debug!(
+                stale_peer_addr = %stale_addr,
+                new_peer_addr = %new_addr,
+                "Removed stale closed connection from same IP"
+            );
+        }
+    }
+
+    /// Clean up expired RecentlyClosed states and rate limit entries.
+    fn cleanup_expired(&mut self) {
+        let now = self.time_source.now_nanos();
+
+        self.states.retain(|_, state| {
+            if let ConnectionState::RecentlyClosed { closed_at_nanos } = state {
+                now.saturating_sub(*closed_at_nanos) < RECENTLY_CLOSED_DURATION.as_nanos() as u64
+            } else {
+                true
+            }
+        });
+
+        self.last_asym_attempt.retain(|_, last_attempt_nanos| {
+            now.saturating_sub(*last_attempt_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
+        });
+    }
+}
 
 #[cfg(any(test, feature = "bench"))]
 impl<S, T: TimeSource> Drop for UdpPacketsListener<S, T> {
@@ -626,16 +1042,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             "Listening for packets"
         );
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S, T>> =
-            BTreeMap::new();
-        let mut ongoing_gw_connections: BTreeMap<
-            SocketAddr,
-            FastSender<PacketData<UnknownEncryption>>,
-        > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
-        let mut last_rate_limit_cleanup_nanos = self.time_source.now_nanos();
+        let mut last_cleanup_nanos = self.time_source.now_nanos();
 
         'outer: loop {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
@@ -645,47 +1055,33 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         Ok((size, remote_addr)) => {
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
-                                if now_nanos.saturating_sub(*time_nanos) < Duration::from_secs(60 * 10).as_nanos() as u64 {
+                                if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
                                     let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
-                                    // Peer was marked outdated due to version mismatch.
-                                    // Check if this is a valid intro packet with current version
-                                    // (peer may have upgraded). If so, allow reconnection.
                                     if packet_data.is_intro_packet() {
-                                        // Rate limit asymmetric decryption to prevent DoS
-                                        let rate_limited = self
-                                            .last_asym_attempt
-                                            .get(&remote_addr)
-                                            .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
-
-                                        if !rate_limited {
-                                            self.last_asym_attempt.insert(remote_addr, now_nanos);
-                                            if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
-                                                let decrypted_data = decrypted.data();
-                                                let proto_len = PROTOC_VERSION.len();
-                                                if decrypted_data.len() >= proto_len + 16
-                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
-                                                {
-                                                    // Peer upgraded! Clear outdated status and process packet
-                                                    tracing::info!(
-                                                        peer_addr = %remote_addr,
-                                                        "Outdated peer sent valid intro with current protocol version. \
-                                                         Peer likely upgraded. Allowing reconnection."
-                                                    );
-                                                    outdated_peer.remove(&remote_addr);
-                                                    // Clean up rate-limit tracking now that peer is reconnecting
-                                                    self.last_asym_attempt.remove(&remote_addr);
-                                                    // Don't continue - fall through to process the packet
-                                                } else {
-                                                    continue; // Still incompatible version
-                                                }
+                                        if self.connections.is_rate_limited(&remote_addr) {
+                                            continue;
+                                        }
+                                        self.connections.record_asym_attempt(remote_addr);
+                                        if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
+                                            let decrypted_data = decrypted.data();
+                                            let proto_len = PROTOC_VERSION.len();
+                                            if decrypted_data.len() >= proto_len + 16
+                                                && decrypted_data[..proto_len] == PROTOC_VERSION
+                                            {
+                                                tracing::info!(
+                                                    peer_addr = %remote_addr,
+                                                    "Outdated peer upgraded. Allowing reconnection."
+                                                );
+                                                outdated_peer.remove(&remote_addr);
+                                                self.connections.clear_rate_limit(&remote_addr);
                                             } else {
-                                                continue; // Not a valid intro packet
+                                                continue;
                                             }
                                         } else {
-                                            continue; // Rate limited
+                                            continue;
                                         }
                                     } else {
-                                        continue; // Not an intro packet
+                                        continue;
                                     }
                                 } else {
                                     outdated_peer.remove(&remote_addr);
@@ -696,285 +1092,153 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             tracing::trace!(
                                 peer_addr = %remote_addr,
                                 packet_size = size,
-                                has_remote_conn = self.remote_connections.contains_key(&remote_addr),
-                                has_ongoing_gw = ongoing_gw_connections.contains_key(&remote_addr),
-                                has_ongoing_conn = ongoing_connections.contains_key(&remote_addr),
+                                is_established = self.connections.is_established(&remote_addr),
+                                has_gw_handshake = self.connections.has_gateway_handshake(&remote_addr),
+                                has_nat_traversal = self.connections.has_nat_traversal(&remote_addr),
                                 "Received packet from remote"
                             );
 
-                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
-                                // Issue #2277: Check if this is a new intro packet from a peer that
-                                // restarted with a new identity. Use packet type discriminator to identify intro packets.
-                                // If we can decrypt it as an intro, a new peer is connecting from the
-                                // same IP:port (e.g., NAT assigned the same mapping after restart).
-                                let is_new_identity = if self.is_gateway
-                                    && packet_data.is_intro_packet()
-                                {
-                                    // Rate limit asymmetric decryption attempts to prevent DoS
-                                    let now_nanos = self.time_source.now_nanos();
-                                    let rate_limited = self
-                                        .last_asym_attempt
-                                        .get(&remote_addr)
-                                        .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
-
-                                    if rate_limited {
-                                        false
-                                    } else {
-                                        self.last_asym_attempt.insert(remote_addr, now_nanos);
-                                        // Try asymmetric decryption and validate intro packet structure
-                                        match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
-                                            Ok(decrypted) => {
-                                                // Validate intro packet structure:
-                                                // 1. Protocol version (PROTOC_VERSION.len() bytes)
-                                                // 2. Outbound symmetric key (16 bytes)
-                                                let decrypted_data = decrypted.data();
-                                                let proto_len = PROTOC_VERSION.len();
-                                                if decrypted_data.len() >= proto_len + 16
-                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
-                                                {
-                                                    true
-                                                } else {
-                                                    tracing::debug!(
-                                                        peer_addr = %remote_addr,
-                                                        "intro packet decrypted but not valid intro structure"
-                                                    );
-                                                    false
-                                                }
-                                            }
-                                            Err(_) => false, // Not a valid intro packet for us
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if is_new_identity {
-                                    tracing::info!(
-                                        peer_addr = %remote_addr,
-                                        "Detected new peer identity from existing address (issue #2277). \
-                                         Peer likely restarted with new identity. Resetting session."
-                                    );
-                                    // Clean up rate-limit tracking for the old peer
-                                    self.last_asym_attempt.remove(&remote_addr);
-                                    // Don't reinsert - let the packet fall through to gateway_connection
-                                    // which will establish a fresh session with the new peer
-                                } else {
-                                    // Forward packet to existing connection
-                                    match remote_conn.inbound_packet_sender.try_send(packet_data) {
-                                        Ok(_) => {
-                                            self.remote_connections.insert(remote_addr, remote_conn);
-                                            continue;
-                                        }
-                                        Err(fast_channel::TrySendError::Full(_)) => {
-                                            // Channel full, reinsert connection
-                                            self.remote_connections.insert(remote_addr, remote_conn);
-
-                                            // Track dropped packets and log warnings periodically
-                                            let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
-                                            *dropped_count += 1;
-
-                                            // Log warning every 10 seconds if packets are being dropped
-                                            let now_nanos = self.time_source.now_nanos();
-                                            if now_nanos.saturating_sub(self.last_drop_warning_nanos) > Duration::from_secs(10).as_nanos() as u64 {
-                                                let total_dropped: u64 = self.dropped_packets.values().sum();
-                                                tracing::warn!(
-                                                    total_dropped,
-                                                    elapsed_secs = 10,
-                                                    "Channel overflow: dropped packets (bandwidth limit may be too high or receiver too slow)"
-                                                );
-                                                for (addr, count) in &self.dropped_packets {
-                                                    if *count > 100 {
-                                                        tracing::warn!(
-                                                            peer_addr = %addr,
-                                                            dropped_count = count,
-                                                            "High packet drop rate for peer"
-                                                        );
+                            // Route packet based on connection state
+                            if let Some(state) = self.connections.get_state(&remote_addr) {
+                                match state {
+                                    ConnectionState::Established { .. } => {
+                                        // Check for new identity (peer restart)
+                                        let is_new_identity = if self.is_gateway && packet_data.is_intro_packet() {
+                                            if self.connections.is_rate_limited(&remote_addr) {
+                                                false
+                                            } else {
+                                                self.connections.record_asym_attempt(remote_addr);
+                                                match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
+                                                    Ok(decrypted) => {
+                                                        let decrypted_data = decrypted.data();
+                                                        let proto_len = PROTOC_VERSION.len();
+                                                        decrypted_data.len() >= proto_len + 16
+                                                            && decrypted_data[..proto_len] == PROTOC_VERSION
                                                     }
+                                                    Err(_) => false,
                                                 }
-                                                self.dropped_packets.clear();
-                                                self.last_drop_warning_nanos = now_nanos;
                                             }
+                                        } else {
+                                            false
+                                        };
 
-                                            // Drop the packet instead of falling through - prevents symmetric packets
-                                            // from being sent to asymmetric decryption handlers
-                                            continue;
-                                        }
-                                        Err(fast_channel::TrySendError::Disconnected(_)) => {
-                                            // Channel closed, connection is dead
-                                            tracing::warn!(
+                                        if is_new_identity {
+                                            tracing::info!(
                                                 peer_addr = %remote_addr,
-                                                "Connection closed, removing from active connections"
+                                                "Detected new peer identity. Resetting session."
                                             );
-                                            // Issue #2554: Don't clear rate-limit tracking here.
-                                            // Let the rate limit expire naturally (1 second) to prevent
-                                            // packets still in flight from being routed to asymmetric
-                                            // decryption. Symmetric packets arriving during the transition
-                                            // window would otherwise trigger decryption errors if they're
-                                            // mistakenly processed as intro packets.
-                                            // Don't reinsert - connection is truly dead
-                                            continue;
+                                            self.connections.clear_rate_limit(&remote_addr);
+                                            self.connections.remove_established(&remote_addr);
+                                            // Fall through to gateway handler for fresh session
+                                        } else {
+                                            match self.connections.try_send_established(&remote_addr, packet_data) {
+                                                Ok(true) => continue,
+                                                Ok(false) => {
+                                                    // Channel full - track dropped packets
+                                                    let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
+                                                    *dropped_count += 1;
+                                                    let now_nanos = self.time_source.now_nanos();
+                                                    if now_nanos.saturating_sub(self.last_drop_warning_nanos) > Duration::from_secs(10).as_nanos() as u64 {
+                                                        let total_dropped: u64 = self.dropped_packets.values().sum();
+                                                        tracing::warn!(
+                                                            total_dropped,
+                                                            elapsed_secs = 10,
+                                                            "Channel overflow: dropped packets (bandwidth limit may be too high or receiver too slow)"
+                                                        );
+                                                        for (addr, count) in &self.dropped_packets {
+                                                            if *count > 100 {
+                                                                tracing::warn!(
+                                                                    peer_addr = %addr,
+                                                                    dropped_count = count,
+                                                                    "High packet drop rate for peer"
+                                                                );
+                                                            }
+                                                        }
+                                                        self.dropped_packets.clear();
+                                                        self.last_drop_warning_nanos = now_nanos;
+                                                    }
+                                                    continue;
+                                                }
+                                                Err(()) => {
+                                                    tracing::warn!(peer_addr = %remote_addr, "Connection closed");
+                                                    continue;
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
 
-                            if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
-                                // Issue #2292: Filter out duplicate intro packets during gateway handshake.
-                                // The peer sends multiple intro packets for NAT traversal reliability.
-                                // After we detect a new identity and create a gateway_connection, subsequent
-                                // intro packets should be ignored - we're waiting for a symmetric ACK response.
-                                if packet_data.is_intro_packet() {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "inbound",
-                                        packet_len = size,
-                                        "Ignoring duplicate intro packet during gateway handshake"
-                                    );
-                                    continue;
-                                }
+                                    ConnectionState::GatewayHandshake { .. } => {
+                                        if packet_data.is_intro_packet() {
+                                            tracing::debug!(peer_addr = %remote_addr, "Ignoring duplicate intro during gateway handshake");
+                                            continue;
+                                        }
+                                        match self.connections.try_send_gateway_handshake(&remote_addr, packet_data) {
+                                            Ok(true) => continue,
+                                            Ok(false) | Err(()) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "Gateway handshake channel busy/closed, dropping packet");
+                                                continue;
+                                            }
+                                        }
+                                    }
 
-                                match inbound_packet_sender.try_send(packet_data) {
-                                    Ok(_) => continue,
-                                    Err(fast_channel::TrySendError::Full(_)) => {
-                                        // Channel full, drop packet to prevent misrouting
-                                        tracing::debug!(
-                                            peer_addr = %remote_addr,
-                                            direction = "inbound",
-                                            "Ongoing gateway connection channel full, dropping packet"
-                                        );
+                                    ConnectionState::NatTraversal { .. } => {
+                                        // Rate limit intro packets to prevent decryption storms
+                                        // during NAT traversal handshake
+                                        if packet_data.is_intro_packet() {
+                                            if self.connections.is_rate_limited(&remote_addr) {
+                                                tracing::trace!(peer_addr = %remote_addr, "Rate limiting NAT traversal intro packet");
+                                                continue;
+                                            }
+                                            self.connections.record_asym_attempt(remote_addr);
+                                        }
+                                        let _ = self.connections.send_nat_traversal(&remote_addr, packet_data).await;
                                         continue;
                                     }
-                                    Err(fast_channel::TrySendError::Disconnected(_)) => {
-                                        // Issue #2528: Do NOT remove from ongoing_gw_connections here.
-                                        // The channel is closed because the handshake task finished,
-                                        // but the handshake completion branch hasn't run yet to insert
-                                        // into remote_connections. If we remove here, subsequent packets
-                                        // won't be found in either map and will fall through to asymmetric
-                                        // decryption, causing spurious "decryption error" failures.
-                                        // Just drop the packet - the handshake completion branch will
-                                        // properly clean up by inserting to remote_connections first,
-                                        // then removing from ongoing_gw_connections (per issue #2517).
-                                        tracing::debug!(
-                                            peer_addr = %remote_addr,
-                                            direction = "inbound",
-                                            "Ongoing gateway connection channel closed, dropping packet (handshake completing)"
-                                        );
-                                        continue;
+
+                                    ConnectionState::RecentlyClosed { .. } => {
+                                        if !packet_data.is_intro_packet() || !self.is_gateway {
+                                            tracing::trace!(peer_addr = %remote_addr, "Dropping packet for recently closed connection");
+                                            continue;
+                                        }
+                                        // Intro packet - fall through to gateway handler for reconnection
                                     }
                                 }
                             }
 
-                            if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send_async(packet_data).await.inspect_err(|err| {
-                                    tracing::warn!(
-                                        peer_addr = %remote_addr,
-                                        error = %err,
-                                        "Failed to send packet to remote"
-                                    );
-                                }).is_ok() {
-                                    ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
-                                }
-                                continue;
-                            }
-
+                            // Gateway intro packet handling
                             if self.is_gateway {
-                                // Handle gateway-intro packets (peer -> gateway)
-                                // Note: We only enter this path when this node IS a gateway.
-                                // Previously, `is_known_gateway` was also checked here, but that
-                                // caused NAT peers to misroute gateway ACKs to this handler instead
-                                // of the traverse_nat handler, breaking peer->gateway connections.
-
-                                // Check if we already have a gateway connection in progress.
-                                // Note: This guard prevents CREATING duplicate connections. Packets for
-                                // EXISTING ongoing connections are routed above at line 504, where we
-                                // filter duplicate intro packets (issue #2292).
-                                if ongoing_gw_connections.contains_key(&remote_addr) {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "inbound",
-                                        "Gateway connection already in progress, ignoring duplicate packet"
-                                    );
+                                if self.connections.has_gateway_handshake(&remote_addr) {
+                                    tracing::debug!(peer_addr = %remote_addr, "Gateway connection already in progress");
                                     continue;
                                 }
 
-                                // Issue #2235: Clean up stale CLOSED connections from the same IP but different port.
-                                // When a peer reconnects (e.g., after restart), it may get a new ephemeral port.
-                                // The old connection's crypto state is stale and will cause AEAD decryption
-                                // failures if we try to reuse it.
-                                //
-                                // IMPORTANT: We only remove connections where the channel is closed, to avoid
-                                // breaking scenarios where multiple legitimate peers are behind the same NAT
-                                // (sharing the same public IP but using different source ports).
-                                let remote_ip = remote_addr.ip();
-                                let stale_addrs: Vec<_> = self.remote_connections
-                                    .iter()
-                                    .filter(|(addr, conn)| {
-                                        addr.ip() == remote_ip
-                                            && **addr != remote_addr
-                                            && conn.inbound_packet_sender.is_closed()
-                                    })
-                                    .map(|(addr, _)| *addr)
-                                    .collect();
-                                for stale_addr in stale_addrs {
-                                    self.remote_connections.remove(&stale_addr);
-                                    // Clean up rate-limit tracking for the stale connection
-                                    self.last_asym_attempt.remove(&stale_addr);
-                                    tracing::debug!(
-                                        stale_peer_addr = %stale_addr,
-                                        new_peer_addr = %remote_addr,
-                                        "Removed stale closed connection from same IP"
-                                    );
-                                }
+                                // Clean up stale closed connections from same IP
+                                self.connections.remove_stale_from_ip(remote_addr);
 
-                                // Issue #2528: Rate limit gateway intro handler to prevent decryption storms.
-                                // When a connection closes, subsequent symmetric packets fall through here.
-                                // Without rate limiting, each packet triggers asymmetric decryption which
-                                // fails (causing "decryption failed" errors) and blocks legitimate reconnects.
-                                let now_nanos = self.time_source.now_nanos();
-                                let rate_limited = self
-                                    .last_asym_attempt
-                                    .get(&remote_addr)
-                                    .is_some_and(|last_nanos| now_nanos.saturating_sub(*last_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64);
-                                if rate_limited {
-                                    tracing::trace!(
-                                        peer_addr = %remote_addr,
-                                        direction = "inbound",
-                                        "Rate limiting gateway intro attempt"
-                                    );
+                                // Rate limit intro attempts
+                                if self.connections.is_rate_limited(&remote_addr) {
+                                    tracing::trace!(peer_addr = %remote_addr, "Rate limiting gateway intro attempt");
                                     continue;
                                 }
-                                self.last_asym_attempt.insert(remote_addr, now_nanos);
+                                self.connections.record_asym_attempt(remote_addr);
 
-                                // Issue #2684: Verify packet is actually an intro packet before attempting
-                                // asymmetric decryption. When a connection closes, subsequent symmetric
-                                // packets may arrive before the rate limit expires. Without this check,
-                                // these packets would be passed to gateway_connection() which expects
-                                // PACKET_TYPE_INTRO (0x01) but receives PACKET_TYPE_SYMMETRIC (0x02),
-                                // causing "invalid packet type" errors in the decrypt function.
+                                // Only process intro packets
                                 if !packet_data.is_intro_packet() {
-                                    tracing::trace!(
-                                        peer_addr = %remote_addr,
-                                        direction = "inbound",
-                                        packet_type = ?packet_data.packet_type(),
-                                        "Dropping non-intro packet from unknown address (likely from closed connection)"
-                                    );
+                                    tracing::trace!(peer_addr = %remote_addr, "Dropping non-intro packet from unknown address");
                                     continue;
                                 }
 
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                                if !self.connections.start_gateway_handshake(remote_addr, packets_sender) {
+                                    continue; // State transition failed (e.g., RecentlyClosed still draining)
+                                }
                                 let task = GlobalExecutor::spawn(gw_ongoing_connection
                                     .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                     .map_err(move |error| {
-                                        tracing::warn!(
-                                            peer_addr = %remote_addr,
-                                            error = %error,
-                                            direction = "inbound",
-                                            "Gateway connection error"
-                                        );
+                                        tracing::warn!(peer_addr = %remote_addr, error = %error, "Gateway connection error");
                                         (error, remote_addr)
                                     }));
-                                ongoing_gw_connections.insert(remote_addr, packets_sender);
                                 gw_connection_tasks.push(task);
                                 continue;
                             } else {
@@ -996,244 +1260,168 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     }
                 },
+                // Handle completed gateway connection handshakes
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
                     let Some(res): GwOngoingConnectionResult<S, T> = gw_connection_handshake else {
                         unreachable!("gw_connection_tasks.next() should only return None if empty, which is guarded");
                     };
-                    match res.expect("task shouldn't panic") {
+                    // Issue #2725: Handle JoinError properly - tasks can be cancelled during
+                    // shutdown or cleanup, not just panic. Cancellation is expected behavior
+                    // and should not crash the handler.
+                    let task_result = match res {
+                        Ok(inner) => inner,
+                        Err(join_error) => {
+                            if join_error.is_cancelled() {
+                                tracing::debug!(
+                                    direction = "inbound",
+                                    "Gateway connection task was cancelled"
+                                );
+                            } else {
+                                // Task panicked - log but don't propagate to avoid crashing handler
+                                tracing::error!(
+                                    direction = "inbound",
+                                    "Gateway connection task panicked: {join_error}"
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    match task_result {
+                        // Successful gateway connection
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
                             let sent_tracker = outbound_remote_conn.sent_tracker.clone();
 
-                            // Issue #2517: Insert into remote_connections BEFORE removing from
-                            // ongoing_gw_connections to prevent race condition. Without this order,
-                            // there's a gap where incoming packets aren't found in either map and
-                            // fall through to asymmetric decryption, causing spurious "decryption error"
-                            // failures when symmetric packets are misrouted.
-                            //
-                            // PR #2575: Check if a connection already exists for this address.
-                            // A race can occur where both inbound (gateway) and outbound (NAT traversal)
-                            // connections complete for the same address. If we blindly insert, we replace
-                            // the existing connection, orphaning its PeerConnection which eventually times
-                            // out and causes "decryption failed" errors when its channel closes.
-                            ongoing_gw_connections.remove(&remote_addr);
-
-                            use std::collections::btree_map::Entry;
-                            if let Entry::Vacant(entry) = self.remote_connections.entry(remote_addr) {
-                                entry.insert(inbound_remote_connection);
-
+                            if self.connections.complete_gateway_handshake(remote_addr, inbound_remote_connection.inbound_packet_sender) {
                                 if self.new_connection_notifier
                                     .send(PeerConnection::new(outbound_remote_conn))
                                     .await
                                     .is_err() {
-                                    tracing::error!(
-                                        peer_addr = %remote_addr,
-                                        direction = "inbound",
-                                        "Gateway connection established but failed to notify new connection"
-                                    );
+                                    tracing::error!(peer_addr = %remote_addr, "Failed to notify new gateway connection");
                                     break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
                                 }
-
                                 sent_tracker.lock().report_sent_packet(
                                     SymmetricMessage::FIRST_PACKET_ID,
                                     outbound_ack_packet.prepared_send(),
                                 );
                             } else {
-                                tracing::debug!(
-                                    peer_addr = %remote_addr,
-                                    direction = "inbound",
-                                    "Connection already exists, discarding duplicate gateway connection"
-                                );
-                                // Don't insert or notify - keep the existing connection.
-                                // The new connection's resources (outbound_remote_conn, inbound_remote_connection)
-                                // will be dropped here, which is fine since we're keeping the existing one.
+                                tracing::debug!(peer_addr = %remote_addr, "Connection state changed during handshake");
                             }
                         }
+                        // Failed gateway connection
                         Err((error, remote_addr)) => {
-                            tracing::error!(
-                                error = %error,
-                                peer_addr = %remote_addr,
-                                direction = "inbound",
-                                "Failed to establish gateway connection"
-                            );
-                            // Only block peers with incompatible protocol versions, not other errors.
-                            // Issue #2292: Previously used fragile string matching on error messages.
-                            // Now we use proper typed error matching.
+                            tracing::error!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
-                                // Signal version mismatch for auto-update detection
                                 crate::transport::signal_version_mismatch();
                             }
-                            ongoing_gw_connections.remove(&remote_addr);
-                            ongoing_connections.remove(&remote_addr);
+                            self.connections.fail_gateway_handshake(&remote_addr);
                         }
                     }
                 },
+                // Handle completed NAT traversal handshakes
                 connection_handshake = connection_tasks.next(), if !connection_tasks.is_empty() => {
                     let Some(res): OngoingConnectionResult<S, T> = connection_handshake else {
                         unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
                     };
-                    match res.expect("task shouldn't panic") {
-                        Ok((outbound_remote_conn, inbound_remote_connection)) => {
-                            if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
-                                if self
-                                    .expected_non_gateway
-                                    .remove(&outbound_remote_conn.remote_addr.ip())
-                                    .is_some()
-                                {
-                                    tracing::debug!(
-                                        peer_addr = %outbound_remote_conn.remote_addr,
-                                        direction = "outbound",
-                                        "Cleared expected handshake flag after successful connection"
-                                    );
-                                }
-                                tracing::info!(
-                                    peer_addr = %outbound_remote_conn.remote_addr,
+                    // Issue #2725: Handle JoinError properly - tasks can be cancelled during
+                    // shutdown or cleanup, not just panic. Cancellation is expected behavior
+                    // and should not crash the handler.
+                    let task_result = match res {
+                        Ok(inner) => inner,
+                        Err(join_error) => {
+                            if join_error.is_cancelled() {
+                                tracing::debug!(
                                     direction = "outbound",
-                                    "Connection established"
+                                    "Connection task was cancelled"
                                 );
-                                // PR #2575: Check if a connection already exists for this address.
-                                // A race can occur where both inbound (gateway) and outbound (NAT traversal)
-                                // connections complete for the same address. Keep the existing one.
-                                let remote_addr = outbound_remote_conn.remote_addr;
-                                use std::collections::btree_map::Entry;
-                                if let Entry::Vacant(entry) = self.remote_connections.entry(remote_addr) {
-                                    entry.insert(inbound_remote_connection);
-                                    let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
-                                        tracing::error!(
-                                            "Failed sending back peer connection"
-                                        );
-                                    });
-                                } else {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "outbound",
-                                        "Connection already exists, discarding duplicate outbound connection"
-                                    );
-                                    // Send error back since we're not using this connection
-                                    let _ = result_sender.send(Err(TransportError::ConnectionEstablishmentFailure {
-                                        cause: "duplicate connection - keeping existing".into(),
-                                    }));
-                                }
                             } else {
+                                // Task panicked - log but don't propagate to avoid crashing handler
                                 tracing::error!(
-                                    peer_addr = %outbound_remote_conn.remote_addr,
                                     direction = "outbound",
-                                    "Connection established but no ongoing connection found"
+                                    "Connection task panicked: {join_error}"
                                 );
                             }
+                            continue;
                         }
+                    };
+                    match task_result {
+                        // Successful NAT traversal
+                        Ok((outbound_remote_conn, inbound_remote_connection)) => {
+                            let remote_addr = outbound_remote_conn.remote_addr;
+                            self.expected_non_gateway.remove(&remote_addr.ip());
+
+                            // Atomic transition: NatTraversal -> Established
+                            if let Some(result_sender) = self.connections.complete_nat_traversal(
+                                remote_addr,
+                                inbound_remote_connection.inbound_packet_sender,
+                            ) {
+                                tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
+                                let _ = result_sender.send(Ok(outbound_remote_conn));
+                            } else {
+                                tracing::debug!(peer_addr = %remote_addr, "Connection state changed during NAT traversal");
+                            }
+                        }
+                        // Failed NAT traversal
                         Err((error, remote_addr)) => {
-                            // Only log non-version-mismatch errors at error level
-                            // Version mismatches have their own user-friendly error message
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
-                                    // Log without extra fields - the error message itself contains
-                                    // user-friendly instructions that shouldn't be cluttered
                                     tracing::warn!(%error);
-                                    // Signal version mismatch for auto-update detection
                                     crate::transport::signal_version_mismatch();
                                 }
                                 _ => {
-                                    tracing::error!(
-                                        error = %error,
-                                        peer_addr = %remote_addr,
-                                        direction = "outbound",
-                                        "Failed to establish connection"
-                                    );
+                                    tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                 }
                             }
-                            if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
-                                if self
-                                    .expected_non_gateway
-                                    .remove(&remote_addr.ip())
-                                    .is_some()
-                                {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "outbound",
-                                        "Cleared expected handshake flag after failed connection"
-                                    );
-                                }
+                            self.expected_non_gateway.remove(&remote_addr.ip());
+                            if let Some(result_sender) = self.connections.fail_nat_traversal(&remote_addr) {
                                 let _ = result_sender.send(Err(error));
                             }
                         }
                     }
                 },
-                // Handling of connection events
+                // Handle new connection requests
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else {
-                        tracing::debug!(
-                            bind_addr = %self.this_addr,
-                            "Connection handler closed"
-                        );
+                        tracing::debug!(bind_addr = %self.this_addr, "Connection handler closed");
                         return Ok(());
                     };
-                    tracing::debug!(
-                        peer_addr = %remote_addr,
-                        "Received connection event"
-                    );
+                    tracing::debug!(peer_addr = %remote_addr, "Received connection event");
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
 
-                    // Check if we already have an active connection.
-                    // Issue #2470: When a gateway restarts, the peer's existing connection has
-                    // stale symmetric keys that can't communicate with the new gateway session.
-                    // The channel appears "open" (is_closed() returns false) but the connection
-                    // is non-functional. If the higher layer is requesting a new connection,
-                    // it's because the existing one isn't working - trust the caller and replace it.
-                    if let Some(_existing_conn) = self.remote_connections.remove(&remote_addr) {
-                        // Clean up rate-limit tracking
-                        self.last_asym_attempt.remove(&remote_addr);
-                        tracing::info!(
-                            peer_addr = %remote_addr,
-                            direction = "outbound",
-                            "Clearing existing connection to allow fresh handshake \
-                             (remote may have restarted with new session)"
-                        );
-                    }
-
-                    // Also check if a connection attempt is already in progress
-                    if ongoing_connections.contains_key(&remote_addr) {
-                        // Duplicate connection attempt - just reject this one
-                        // The first attempt is still in progress and will complete
-                        tracing::debug!(
-                            peer_addr = %remote_addr,
-                            direction = "outbound",
-                            "Connection attempt already in progress, rejecting duplicate"
-                        );
+                    // Check for existing NAT traversal in progress
+                    if self.connections.has_nat_traversal(&remote_addr) {
+                        tracing::debug!(peer_addr = %remote_addr, "NAT traversal already in progress");
                         let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
                         }));
                         continue;
                     }
-                    tracing::info!(
-                        peer_addr = %remote_addr,
-                        direction = "outbound",
-                        "Attempting to establish connection"
-                    );
-                    let (ongoing_connection, packets_sender) = self.traverse_nat(
-                        remote_addr,
-                        remote_public_key.clone(),
-                    );
+
+                    tracing::info!(peer_addr = %remote_addr, "Starting NAT traversal");
+                    let (ongoing_connection, packets_sender) = self.traverse_nat(remote_addr, remote_public_key.clone());
+
+                    if !self.connections.start_nat_traversal(remote_addr, packets_sender, open_connection) {
+                        continue;
+                    }
+
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
                         .map_err(move |err| (err, remote_addr))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
                     );
                     connection_tasks.push(task);
-                    ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
-                // Periodic cleanup of expired rate limit entries (issue #2554)
-                // Check if cleanup interval has passed and perform cleanup
                 _ = async {}, if {
                     let now_nanos = self.time_source.now_nanos();
-                    now_nanos.saturating_sub(last_rate_limit_cleanup_nanos) >= RATE_LIMIT_CLEANUP_INTERVAL.as_nanos() as u64
+                    now_nanos.saturating_sub(last_cleanup_nanos) >= RATE_LIMIT_CLEANUP_INTERVAL.as_nanos() as u64
                 } => {
+                    self.connections.cleanup_expired();
                     let now_nanos = self.time_source.now_nanos();
-                    self.last_asym_attempt.retain(|_, last_attempt_nanos| {
-                        now_nanos.saturating_sub(*last_attempt_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
-                    });
-                    last_rate_limit_cleanup_nanos = now_nanos;
+                    last_cleanup_nanos = now_nanos;
+
+                    let outdated_cutoff = now_nanos.saturating_sub(OUTDATED_PEER_EXPIRY.as_nanos() as u64);
+                    outdated_peer.retain(|_, timestamp| *timestamp > outdated_cutoff);
                 }
             }
         }
@@ -1442,11 +1630,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             direction = "outbound",
             "Starting NAT traversal"
         );
+
         #[allow(clippy::large_enum_variant)]
-        enum ConnectionState {
-            /// Initial state of the joiner
+        enum HandshakePhase {
+            /// Initiated the outbound handshake by sending our intro packet
+            /// Waiting for remote's intro packet
             StartOutbound,
-            /// Initial state of the joinee, at this point NAT has been already traversed
+            /// Received remote's intro, now sending symmetric ACK with our key
             RemoteInbound,
         }
 
@@ -1455,9 +1645,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             packet: &PacketData<UnknownEncryption>,
             transport_secret_key: &TransportSecretKey,
             outbound_sym_key: &mut Option<Aes128Gcm>,
-            state: &mut ConnectionState,
+            state: &mut HandshakePhase,
         ) -> Result<(), ()> {
-            // probably the first packet to punch through the NAT
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
                 tracing::debug!(
                     peer_addr = %remote_addr,
@@ -1480,7 +1669,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 let outbound_key =
                     Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
                 *outbound_sym_key = Some(outbound_key.clone());
-                *state = ConnectionState::RemoteInbound;
+                // Got remote's key, now we can send ACK with our key
+                *state = HandshakePhase::RemoteInbound;
                 return Ok(());
             }
             tracing::trace!(
@@ -1507,7 +1697,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 direction = "outbound",
                 "Starting outbound handshake (NAT traversal)"
             );
-            let mut state = ConnectionState::StartOutbound {};
+            let mut state = HandshakePhase::StartOutbound;
             let mut attempts = 0usize;
             let start_time_nanos = time_source.now_nanos();
             let overall_deadline = Duration::from_secs(3);
@@ -1536,7 +1726,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 // Send a packet if we haven't exceeded the max attempts
                 if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
                     match state {
-                        ConnectionState::StartOutbound => {
+                        HandshakePhase::StartOutbound => {
                             tracing::trace!(
                                 peer_addr = %remote_addr,
                                 direction = "outbound",
@@ -1548,7 +1738,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             attempts += 1;
                         }
-                        ConnectionState::RemoteInbound => {
+                        HandshakePhase::RemoteInbound => {
                             tracing::trace!(
                                 peer_addr = %remote_addr,
                                 direction = "outbound",
@@ -1583,9 +1773,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             "Received packet after sending it"
                         );
                         match state {
-                            ConnectionState::StartOutbound => {
-                                // at this point it's either the remote sending us an intro packet or a symmetric packet
-                                // cause is the first packet that passes through the NAT
+                            HandshakePhase::StartOutbound => {
                                 tracing::trace!(
                                     peer_addr = %remote_addr,
                                     direction = "outbound",
@@ -1595,7 +1783,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
-                                    // the remote got our inbound key, so we know that they are at least at the RemoteInbound state
+                                    // Remote decrypted our intro and is sending ACK with their key
                                     let symmetric_message =
                                         SymmetricMessage::deser(decrypted_packet.data())?;
 
@@ -1737,9 +1925,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 );
                                 continue;
                             }
-                            ConnectionState::RemoteInbound => {
-                                // next packet should be an acknowledgement packet, but might also be a repeated
-                                // intro packet so we need to handle that
+                            HandshakePhase::RemoteInbound => {
+                                // Handle repeated intro packet during NAT traversal
+                                // or proceed if symmetric ack received
                                 if packet.is_intro_packet() {
                                     tracing::trace!(
                                         peer_addr = %remote_addr,
@@ -2012,6 +2200,111 @@ mod version_cmp {
         let rc1 = parse_version_with_flags("0.1.0-rc1");
         let rc2 = parse_version_with_flags("0.1.0-rc2");
         assert_ne!(rc1, rc2, "rc1 and rc2 should have different flags");
+    }
+
+    /// Verifies that handshake completion is atomic - state transitions directly
+    /// from GatewayHandshake to Established with no intermediate None state.
+    #[test]
+    fn test_atomic_handshake_completion_no_packet_loss() {
+        use super::{fast_channel, ConnectionStateManager};
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use tokio::net::UdpSocket;
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+        // Create a channel for the handshake
+        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+
+        // Start gateway handshake
+        let started = manager.start_gateway_handshake(addr, tx);
+        assert!(started, "Should start gateway handshake");
+        assert!(
+            manager.has_gateway_handshake(&addr),
+            "Should be in GatewayHandshake state"
+        );
+
+        // Create channel for established connection
+        let (established_tx, _established_rx) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+
+        // Complete the handshake atomically
+        let completed = manager.complete_gateway_handshake(addr, established_tx);
+        assert!(completed, "Should complete gateway handshake");
+
+        // Verify state is Established (not None) - proves no gap
+        assert!(
+            manager.is_established(&addr),
+            "State must be Established immediately after completion - proves no race gap"
+        );
+        assert!(
+            manager.get_state(&addr).is_some(),
+            "get_state() must return Some immediately after transition"
+        );
+    }
+
+    /// Proves RecentlyClosed state prevents misrouting packets to asymmetric decryption.
+    ///
+    /// Without RecentlyClosed, packets arriving after connection close would fall through
+    /// to the asymmetric decryption handler (expensive and wrong).
+    #[test]
+    fn test_recently_closed_prevents_asymmetric_decryption() {
+        use super::{
+            fast_channel, ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION,
+        };
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::net::UdpSocket;
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+            ConnectionStateManager::new(time.clone());
+        let addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+
+        // Create an established connection
+        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        manager.start_gateway_handshake(addr, tx);
+        let (established_tx, _established_rx) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        manager.complete_gateway_handshake(addr, established_tx);
+        assert!(manager.is_established(&addr));
+
+        // Close the connection
+        manager.mark_closed(&addr);
+
+        // Verify state is RecentlyClosed (not removed)
+        let state = manager.get_state(&addr);
+        assert!(
+            state.is_some(),
+            "State should exist as RecentlyClosed, not be removed"
+        );
+        assert!(
+            matches!(state, Some(ConnectionState::RecentlyClosed { .. })),
+            "State must be RecentlyClosed - prevents packets from falling through"
+        );
+
+        // Verify it's not treated as unknown (which would trigger asymmetric decryption)
+        assert!(!manager.is_established(&addr), "Should not be Established");
+        assert!(
+            manager.get_state(&addr).is_some(),
+            "Should NOT return None - that would trigger asymmetric handler"
+        );
+
+        // Advance time past expiration and cleanup
+        time.advance(RECENTLY_CLOSED_DURATION + Duration::from_millis(1));
+        manager.cleanup_expired();
+
+        // Now the state should be gone
+        assert!(
+            manager.get_state(&addr).is_none(),
+            "State should be cleaned up after expiration"
+        );
     }
 }
 

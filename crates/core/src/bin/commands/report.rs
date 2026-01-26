@@ -22,6 +22,10 @@ use tokio_tungstenite::connect_async;
 const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
 /// Only include log entries from the last 30 minutes
 const LOG_RETENTION_MINUTES: i64 = 30;
+/// Maximum size for all logs combined in the report (2 MB)
+const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum length for a single log line (10 KB) - longer lines are truncated
+const MAX_LINE_LENGTH: usize = 10 * 1024;
 /// Default WebSocket API port
 const DEFAULT_WS_API_PORT: u16 = 7509;
 /// Timeout for WebSocket connection and queries
@@ -429,27 +433,56 @@ fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
 
 /// Read and merge multiple log files, filtering to the last 30 minutes.
 /// Returns (merged_content, total_original_size).
+/// Applies MAX_TOTAL_LOG_SIZE limit, keeping most recent entries if exceeded.
 fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
     if files.is_empty() {
         return (None, 0);
     }
 
     let mut total_original_size = 0u64;
-    let mut all_lines = Vec::new();
+    let mut all_content = Vec::new();
 
-    for file in files {
+    // Process files in reverse order (oldest first) so merged string is chronological.
+    // This way, most recent entries are at the end, and truncating from the beginning
+    // preserves the most recent (most relevant) logs.
+    for file in files.iter().rev() {
         let (content, size) = read_log_file(file);
         total_original_size += size;
         if let Some(content) = content {
-            all_lines.push(content);
+            all_content.push(content);
         }
     }
 
-    if all_lines.is_empty() {
-        (None, total_original_size)
-    } else {
-        (Some(all_lines.join("\n")), total_original_size)
+    if all_content.is_empty() {
+        return (None, total_original_size);
     }
+
+    let merged = all_content.join("\n");
+
+    // If total size exceeds limit, truncate from beginning to keep most recent logs
+    let result = if merged.len() > MAX_TOTAL_LOG_SIZE {
+        let skip_bytes = merged.len() - MAX_TOTAL_LOG_SIZE;
+        // Find a safe UTF-8 boundary, then find the next newline to avoid cutting mid-line
+        let safe_skip = merged
+            .char_indices()
+            .take_while(|(i, _)| *i <= skip_bytes)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let truncate_at = merged[safe_skip..]
+            .find('\n')
+            .map(|pos| safe_skip + pos + 1)
+            .unwrap_or(safe_skip);
+        format!(
+            "[... {} bytes truncated to fit size limit ...]\n{}",
+            truncate_at,
+            &merged[truncate_at..]
+        )
+    } else {
+        merged
+    };
+
+    (Some(result), total_original_size)
 }
 
 /// Read log file, filtering to entries from the last 30 minutes.
@@ -492,6 +525,23 @@ fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
         // Include this line if we're within the time window
         // (lines without timestamps inherit the state from the previous timestamped line)
         if include_line {
+            // Truncate very long lines (e.g., delegates logging full state as byte arrays)
+            let line = if line.len() > MAX_LINE_LENGTH {
+                // Find a safe UTF-8 character boundary for truncation
+                let truncate_at = line
+                    .char_indices()
+                    .take_while(|(i, _)| *i < MAX_LINE_LENGTH)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!(
+                    "{}... [truncated, {} total bytes]",
+                    &line[..truncate_at],
+                    line.len()
+                )
+            } else {
+                line
+            };
             filtered_lines.push(line);
         }
     }

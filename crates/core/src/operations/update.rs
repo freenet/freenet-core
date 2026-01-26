@@ -2,7 +2,7 @@ use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
-pub(crate) use self::messages::UpdateMsg;
+pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
@@ -103,21 +103,6 @@ impl UpdateOp {
         // Mark the operation as completed so it's removed from tracking
         op_manager.completed(self.id);
         Ok(())
-    }
-
-    /// Create a new outbound UpdateOp targeting a specific peer.
-    ///
-    /// Used when sending state to a specific subscriber (e.g., after they join
-    /// and need to receive the current state they may have missed).
-    pub(crate) fn new_outbound(id: Transaction, target: PeerKeyLocation) -> Self {
-        Self {
-            id,
-            state: Some(UpdateState::ReceivedRequest),
-            stats: Some(UpdateStats {
-                target: Some(target),
-            }),
-            upstream_addr: None, // We're the originator
-        }
     }
 }
 
@@ -261,6 +246,10 @@ impl Operation for UpdateOp {
                             let hash_before = state_before.as_ref().map(state_hash_full);
 
                             // Update contract locally
+                            // Note: RequestUpdate sender should NOT be excluded from broadcast.
+                            // Unlike BroadcastTo (where sender has the state), RequestUpdate sender
+                            // is REQUESTING we apply an update and needs to receive the result
+                            // via subscription to notify their client.
                             let UpdateExecution {
                                 value: updated_value,
                                 summary,
@@ -359,17 +348,7 @@ impl Operation for UpdateOp {
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
                             } else {
-                                // No peers available and we don't have the contract - capture context
-                                let subscribers = op_manager
-                                    .ring
-                                    .subscribers_of(key)
-                                    .map(|subs| {
-                                        subs.iter()
-                                            .filter_map(|loc| loc.socket_addr())
-                                            .map(|addr| format!("{:.8}", addr))
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
+                                // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
                                     .ring
                                     .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
@@ -382,7 +361,6 @@ impl Operation for UpdateOp {
                                 tracing::error!(
                                     tx = %id,
                                     contract = %key,
-                                    subscribers = ?subscribers,
                                     candidates = ?candidates,
                                     connection_count,
                                     peer_addr = ?sender_addr,
@@ -484,10 +462,14 @@ impl Operation for UpdateOp {
                         Err(err) => {
                             if is_delta {
                                 // Delta application failed - send ResyncRequest to get full state
+                                // This is a critical debugging event for state divergence issues
                                 tracing::warn!(
+                                    tx = %id,
                                     contract = %key,
+                                    sender = %sender_addr,
                                     error = %err,
-                                    "Delta application failed, sending ResyncRequest"
+                                    event = "delta_apply_failed",
+                                    "Delta application failed, sending ResyncRequest to get full state"
                                 );
 
                                 // Clear cached summary for sender since it's out of sync
@@ -506,6 +488,13 @@ impl Operation for UpdateOp {
                                 }
 
                                 // Send ResyncRequest to sender
+                                tracing::info!(
+                                    tx = %id,
+                                    contract = %key,
+                                    target = %sender_addr,
+                                    event = "resync_request_sent",
+                                    "Sending ResyncRequest to peer after delta failure"
+                                );
                                 let _ = op_manager
                                     .notify_node_event(
                                         crate::message::NodeEvent::SendInterestMessage {
@@ -523,9 +512,10 @@ impl Operation for UpdateOp {
                     };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    // Refresh GET subscription cache TTL when receiving updates
-                    // This keeps actively-updated contracts from being evicted
-                    op_manager.ring.touch_get_subscription(key);
+                    // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
+                    // Only GET and SUBSCRIBE should extend hosting lifetime.
+                    // If UPDATE refreshed TTL, a malicious contract author could spam
+                    // updates to keep their contract hosted everywhere, draining resources.
 
                     // Emit telemetry: broadcast applied with resulting state
                     if let Some(event) = NetEventLog::update_broadcast_applied(
@@ -576,6 +566,351 @@ impl Operation for UpdateOp {
                     new_state = None;
                     return_msg = None;
                 }
+
+                // ---- Streaming handlers ----
+                UpdateMsg::RequestUpdateStreaming {
+                    id,
+                    stream_id,
+                    key,
+                    total_size,
+                } => {
+                    use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
+
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %key,
+                            stream_id = %stream_id,
+                            "UPDATE RequestUpdateStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
+                    tracing::info!(
+                        tx = %id,
+                        contract = %key,
+                        stream_id = %stream_id,
+                        total_size,
+                        "Processing UPDATE RequestUpdateStreaming"
+                    );
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry for UPDATE"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                assembled_size = data.len(),
+                                expected_size = total_size,
+                                "Stream assembled for UPDATE"
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream for UPDATE"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    // Step 3: Deserialize the streaming payload
+                    let payload: UpdateStreamingPayload = match bincode::deserialize(&stream_data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                error = %e,
+                                "Failed to deserialize UpdateStreamingPayload"
+                            );
+                            return Err(OpError::invalid_transition(self.id));
+                        }
+                    };
+
+                    let UpdateStreamingPayload {
+                        related_contracts,
+                        value,
+                    } = payload;
+
+                    // Step 4: Apply the update (same logic as RequestUpdate)
+                    let self_location = op_manager.ring.connection_manager.own_location();
+                    let executing_addr = self_location.socket_addr();
+
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        executing_peer = ?executing_addr,
+                        request_sender = ?source_addr,
+                        "UPDATE RequestUpdateStreaming: applying update"
+                    );
+
+                    // Update contract locally
+                    let UpdateExecution {
+                        value: updated_value,
+                        summary,
+                        changed,
+                        ..
+                    } = update_contract(
+                        op_manager,
+                        *key,
+                        UpdateData::State(State::from(value.clone())),
+                        related_contracts.clone(),
+                    )
+                    .await?;
+
+                    // Emit telemetry
+                    let hash_after = Some(state_hash_full(&updated_value));
+                    if let Some(sender_addr) = source_addr {
+                        if let Some(requester_pkl) = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_by_addr(sender_addr)
+                        {
+                            if let Some(event) = NetEventLog::update_success(
+                                id,
+                                &op_manager.ring,
+                                *key,
+                                requester_pkl,
+                                None, // No before hash for streaming
+                                hash_after.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                        }
+                    }
+
+                    if !changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "UPDATE streaming yielded no state change"
+                        );
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "UPDATE streaming succeeded, state changed"
+                        );
+                    }
+
+                    // Network propagation is automatic via BroadcastStateChange
+                    if self.upstream_addr.is_none() {
+                        new_state = Some(UpdateState::Finished {
+                            key: *key,
+                            summary: summary.clone(),
+                        });
+                    } else {
+                        new_state = None;
+                    }
+                    return_msg = None;
+                }
+
+                UpdateMsg::BroadcastToStreaming {
+                    id,
+                    stream_id,
+                    key,
+                    total_size,
+                } => {
+                    use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
+
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            contract = %key,
+                            stream_id = %stream_id,
+                            "UPDATE BroadcastToStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
+                    let sender_addr = match source_addr {
+                        Some(addr) => addr,
+                        None => {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %key,
+                                stream_id = %stream_id,
+                                "BroadcastToStreaming received without source_addr"
+                            );
+                            return Err(OpError::UnexpectedOpState);
+                        }
+                    };
+
+                    tracing::info!(
+                        tx = %id,
+                        contract = %key,
+                        stream_id = %stream_id,
+                        total_size,
+                        sender = %sender_addr,
+                        "Processing UPDATE BroadcastToStreaming"
+                    );
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry for broadcast"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                assembled_size = data.len(),
+                                expected_size = total_size,
+                                "Stream assembled for broadcast"
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream for broadcast"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    // Step 3: Deserialize the broadcast streaming payload
+                    let payload: BroadcastStreamingPayload =
+                        match bincode::deserialize(&stream_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(
+                                    tx = %id,
+                                    error = %e,
+                                    "Failed to deserialize BroadcastStreamingPayload"
+                                );
+                                return Err(OpError::invalid_transition(self.id));
+                            }
+                        };
+
+                    let BroadcastStreamingPayload {
+                        state_bytes,
+                        sender_summary_bytes,
+                    } = payload;
+
+                    // Step 4: Apply the update (same logic as BroadcastTo with FullState)
+                    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
+
+                    // Update sender's cached summary in our interest manager
+                    if let Some(sender_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                        op_manager.interest_manager.update_peer_summary(
+                            key,
+                            &sender_key,
+                            Some(sender_summary.clone()),
+                        );
+                    }
+
+                    let update_data = UpdateData::State(State::from(state_bytes.clone()));
+
+                    // For telemetry
+                    let state_for_telemetry = WrappedState::from(state_bytes.clone());
+
+                    // Emit telemetry: broadcast received from upstream peer
+                    if let Some(requester_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        if let Some(event) = NetEventLog::update_broadcast_received(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            requester_pkl,
+                            state_for_telemetry.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+                    }
+
+                    tracing::debug!("Attempting contract value update - BroadcastToStreaming");
+                    let UpdateExecution {
+                        value: updated_value,
+                        summary: _summary,
+                        changed,
+                        ..
+                    } = update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                        .await?;
+
+                    tracing::debug!("Contract successfully updated - BroadcastToStreaming");
+
+                    // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
+                    // Only GET and SUBSCRIBE should extend hosting lifetime.
+
+                    // Emit telemetry: broadcast applied
+                    if let Some(event) = NetEventLog::update_broadcast_applied(
+                        id,
+                        &op_manager.ring,
+                        *key,
+                        &state_for_telemetry,
+                        &updated_value,
+                        changed,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
+                    if !changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "BroadcastToStreaming update produced no change"
+                        );
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "Successfully updated contract via BroadcastToStreaming"
+                        );
+                    }
+
+                    // Network peer propagation is automatic via BroadcastStateChange
+                    new_state = None;
+                    return_msg = None;
+                }
             }
 
             build_op_result(
@@ -603,6 +938,15 @@ impl OpManager {
     /// - Used to filter out the sender from broadcast targets (avoid echo)
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
     ///   in proximity cache targets if we're seeding the contract
+    ///
+    /// # Hybrid Architecture (2026-01 Refactor)
+    ///
+    /// Updates are propagated via TWO sources:
+    /// 1. Proximity cache: peers who have announced they seed this contract (fast, local knowledge)
+    /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
+    ///
+    /// This hybrid approach ensures updates reach all interested peers even if CacheAnnounce
+    /// messages haven't fully propagated yet.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -613,160 +957,86 @@ impl OpManager {
         let self_addr = self.ring.connection_manager.get_own_addr();
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
-        // Collect explicit subscribers (downstream interest)
-        // Only include subscribers we're currently connected to
-        let subscribers: HashSet<PeerKeyLocation> = self
-            .ring
-            .subscribers_of(key)
-            .map(|subs| {
-                subs.iter()
-                    // Filter out the sender to avoid sending the update back to where it came from
-                    .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
-                    // Only include peers we're actually connected to
-                    .filter(|pk| {
-                        pk.socket_addr()
-                            .map(|addr| {
-                                self.ring
-                                    .connection_manager
-                                    .get_peer_by_addr(addr)
-                                    .is_some()
-                            })
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
 
-        // Collect upstream peer (for bidirectional propagation through subscription tree)
-        // Updates should flow both toward the root AND toward the leaves
-        let raw_upstream = self.ring.get_upstream(key);
-        let upstream_target: Option<PeerKeyLocation> = raw_upstream
-            .clone()
-            .filter(|pk| {
-                let dominated_out = pk.socket_addr().as_ref() == Some(sender);
-                if dominated_out {
-                    tracing::warn!(
-                        contract = %format!("{:.8}", key),
-                        upstream = ?pk.socket_addr(),
-                        sender = %sender,
-                        "UPSTREAM_FILTERED: upstream matches sender (would echo back)"
-                    );
-                }
-                !dominated_out
-            })
-            .filter(|pk| {
-                let is_connected = pk
-                    .socket_addr()
-                    .map(|addr| {
-                        self.ring
-                            .connection_manager
-                            .get_peer_by_addr(addr)
-                            .is_some()
-                    })
-                    .unwrap_or(false);
-                if !is_connected {
-                    tracing::warn!(
-                        contract = %format!("{:.8}", key),
-                        upstream = ?pk.socket_addr(),
-                        "UPSTREAM_FILTERED: upstream peer not connected"
-                    );
-                }
-                is_connected
-            });
-
-        // Log upstream status for debugging subscription tree issues
-        if raw_upstream.is_none() {
-            tracing::info!(
-                contract = %format!("{:.8}", key),
-                sender = %sender,
-                is_local = is_local_update_initiator,
-                "UPSTREAM_STATUS: no upstream registered for this contract"
-            );
-        } else if upstream_target.is_some() {
-            tracing::info!(
-                contract = %format!("{:.8}", key),
-                upstream = ?upstream_target.as_ref().and_then(|p| p.socket_addr()),
-                "UPSTREAM_STATUS: upstream available and connected"
-            );
-        }
-
-        // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
+        // Source 1: Proximity cache (peers who announced they seed this contract)
         let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
-        let mut proximity_targets: HashSet<PeerKeyLocation> = HashSet::new();
+        let proximity_count = proximity_addrs.len();
 
         for addr in proximity_addrs {
+            // Skip sender to avoid echo (unless we're the originator)
             if &addr == sender && !is_local_update_initiator {
                 continue;
             }
+            // Skip ourselves if not local originator
             if !is_local_update_initiator && self_addr.as_ref() == Some(&addr) {
                 continue;
             }
+            // Only include connected peers
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
-                proximity_targets.insert(pkl);
-            } else {
-                tracing::debug!(
-                    peer = %addr,
-                    contract = %key,
-                    "PROXIMITY_CACHE: Skipping disconnected neighbor in UPDATE targets"
-                );
+                targets.insert(pkl);
             }
         }
 
-        // Combine all target sets (HashSet handles deduplication)
-        let subscriber_count = subscribers.len();
-        let proximity_count = proximity_targets.len();
-        let has_upstream = upstream_target.is_some();
-        let mut all_targets: HashSet<PeerKeyLocation> = subscribers;
-        all_targets.extend(proximity_targets);
-        if let Some(upstream) = upstream_target {
-            all_targets.insert(upstream);
+        // Source 2: Interest manager (peers who expressed interest via protocol)
+        let interested_peers = self.interest_manager.get_interested_peers(key);
+        let interest_count = interested_peers.len();
+
+        for (peer_key, _interest) in interested_peers {
+            // Look up peer by public key
+            if let Some(pkl) = self
+                .ring
+                .connection_manager
+                .get_peer_by_pub_key(&peer_key.0)
+            {
+                // Skip sender to avoid echo
+                if let Some(pkl_addr) = pkl.socket_addr() {
+                    if &pkl_addr == sender && !is_local_update_initiator {
+                        continue;
+                    }
+                    // Skip ourselves
+                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        continue;
+                    }
+                }
+                targets.insert(pkl);
+            }
         }
 
-        // Sort targets for deterministic iteration order (HashSet iteration is non-deterministic)
-        let mut targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
-        targets.sort();
+        // Sort targets for deterministic iteration order
+        let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
+        result.sort();
 
         // Trace update propagation for debugging
-        if !targets.is_empty() {
+        if !result.is_empty() {
             tracing::info!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
-                targets = %targets
+                targets = %result
                     .iter()
                     .filter_map(|s| s.socket_addr())
                     .map(|addr| format!("{:.8}", addr))
                     .collect::<Vec<_>>()
                     .join(","),
-                count = targets.len(),
-                subscribers = subscriber_count,
-                proximity = proximity_count,
-                upstream = has_upstream,
+                count = result.len(),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
         } else {
-            let own_addr = self.ring.connection_manager.get_own_addr();
-            let skip_slice = std::slice::from_ref(sender);
-            let fallback_candidates = self
-                .ring
-                .k_closest_potentially_caching(key, skip_slice, 5)
-                .into_iter()
-                .filter_map(|candidate| candidate.socket_addr())
-                .map(|addr| format!("{:.8}", addr))
-                .collect::<Vec<_>>();
-
             tracing::warn!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
-                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
-                fallback_candidates = ?fallback_candidates,
-                phase = "error",
-                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate"
+                self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
+                proximity_sources = proximity_count,
+                interest_sources = interest_count,
+                phase = "warning",
+                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );
         }
 
-        targets
+        result
     }
 }
 
@@ -1002,46 +1272,11 @@ pub(crate) async fn request_update(
         return Err(OpError::UnexpectedOpState);
     };
 
-    // the initial request must provide:
-    // - a peer as close as possible to the contract location
-    // - and the value to update
+    // Find the best peer to send this update to.
+    // In the simplified architecture (2026-01 refactor), we use:
+    // 1. Proximity cache - peers who have announced they seed this contract
+    // 2. Ring-based routing - find closest potentially-caching peer
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
-
-    let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
-        // Clone and filter out self from subscribers to prevent self-targeting
-        let mut filtered_subscribers: Vec<_> = subscribers
-            .iter()
-            .filter(|sub| sub.socket_addr() != Some(sender_addr))
-            .cloned()
-            .collect();
-        filtered_subscribers.pop()
-    } else {
-        None
-    };
-
-    // Check upstream peer in the subscription tree.
-    // This is critical for leaf nodes (subscribers) that want to send updates -
-    // they have no downstream subscribers, but they DO have an upstream peer
-    // through which updates should propagate toward the contract location.
-    let target_from_upstream = op_manager
-        .ring
-        .get_upstream(&key)
-        .filter(|upstream| upstream.socket_addr() != Some(sender_addr))
-        .filter(|upstream| {
-            // Verify the upstream peer is still connected before using it as a target.
-            // Without this check, we might try to send to a disconnected peer instead
-            // of falling through to the proximity cache or ring-based fallback.
-            upstream
-                .socket_addr()
-                .map(|addr| {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_by_addr(addr)
-                        .is_some()
-                })
-                .unwrap_or(false)
-        });
 
     // Check proximity cache for neighbors that have announced caching this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
@@ -1080,20 +1315,8 @@ pub(crate) async fn request_update(
         }
     }
 
-    let target = if let Some(remote_subscriber) = target_from_subscribers {
-        remote_subscriber
-    } else if let Some(upstream_peer) = target_from_upstream {
-        // Use upstream peer from subscription tree - this is how leaf nodes send updates
-        // toward the contract location for propagation through the tree.
-        tracing::debug!(
-            %key,
-            target = ?upstream_peer.socket_addr(),
-            "UPDATE: Using upstream peer from subscription tree as target"
-        );
-        upstream_peer
-    } else if let Some(proximity_neighbor) = target_from_proximity {
+    let target = if let Some(proximity_neighbor) = target_from_proximity {
         // Use peer from proximity cache that announced having this contract.
-        // This aligns with get_broadcast_targets_update() which also uses proximity cache.
         tracing::debug!(
             %key,
             target = ?proximity_neighbor.socket_addr(),
@@ -1119,25 +1342,22 @@ pub(crate) async fn request_update(
 
             let id = update_op.id;
 
-            // Check if we're seeding or subscribed to this contract
+            // Check if we're seeding this contract
             let is_seeding = op_manager.ring.is_seeding_contract(&key);
-            let has_subscribers = op_manager.ring.subscribers_of(&key).is_some();
-            let should_handle_update = is_seeding || has_subscribers;
+            let should_handle_update = is_seeding;
 
             if !should_handle_update {
                 tracing::error!(
                     contract = %key,
                     phase = "error",
-                    "UPDATE: Cannot update contract on isolated node - contract not seeded and no subscribers"
+                    "UPDATE: Cannot update contract on isolated node - contract not seeded"
                 );
                 return Err(OpError::RingError(RingError::NoCachingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:
             // 1. No remote peers are available (isolated node OR no suitable caching peers)
-            // 2. Either seeding the contract OR has subscribers (verified above)
-            // Note: This handles both truly isolated nodes and nodes where subscribers exist
-            // but no suitable remote caching peer was found.
+            // 2. We are seeding the contract (verified above)
             let UpdateExecution {
                 value: _updated_value,
                 summary,
@@ -1350,7 +1570,31 @@ mod messages {
     use crate::{
         message::{InnerMessage, Transaction},
         ring::{Location, PeerKeyLocation},
+        transport::peer_connection::StreamId,
     };
+
+    /// Payload for streaming UPDATE requests.
+    ///
+    /// Contains the same data as RequestUpdate but serialized for streaming.
+    /// The metadata (key, stream_id, total_size) is sent via RequestUpdateStreaming message.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct UpdateStreamingPayload {
+        #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+        pub related_contracts: RelatedContracts<'static>,
+        pub value: WrappedState,
+    }
+
+    /// Payload for streaming broadcast updates.
+    ///
+    /// Contains full state for broadcasting to subscribers via streaming.
+    /// Used when the full state is large (>streaming_threshold).
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct BroadcastStreamingPayload {
+        /// Full contract state bytes
+        pub state_bytes: Vec<u8>,
+        /// Sender's current state summary bytes
+        pub sender_summary_bytes: Vec<u8>,
+    }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     /// Update operation messages.
@@ -1387,6 +1631,35 @@ mod messages {
             /// Use `StateSummary::from(sender_summary_bytes.clone())` to convert.
             sender_summary_bytes: Vec<u8>,
         },
+
+        // ---- Streaming variants ----
+        /// Streaming variant of RequestUpdate for large state updates.
+        ///
+        /// Used when the state size exceeds the streaming threshold (default 64KB).
+        /// The actual state data is sent via a separate stream identified by stream_id.
+        RequestUpdateStreaming {
+            id: Transaction,
+            /// Identifies the stream carrying the update payload
+            stream_id: StreamId,
+            /// Contract key being updated
+            key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+        },
+
+        /// Streaming variant of BroadcastTo for large full state broadcasts.
+        ///
+        /// Used when broadcasting full state (not delta) and the state size exceeds
+        /// the streaming threshold. Deltas are typically small and use regular BroadcastTo.
+        BroadcastToStreaming {
+            id: Transaction,
+            /// Identifies the stream carrying the broadcast payload
+            stream_id: StreamId,
+            /// Contract key being broadcast
+            key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+        },
     }
 
     impl InnerMessage for UpdateMsg {
@@ -1394,7 +1667,9 @@ mod messages {
             match self {
                 UpdateMsg::RequestUpdate { id, .. }
                 | UpdateMsg::Broadcasting { id, .. }
-                | UpdateMsg::BroadcastTo { id, .. } => id,
+                | UpdateMsg::BroadcastTo { id, .. }
+                | UpdateMsg::RequestUpdateStreaming { id, .. }
+                | UpdateMsg::BroadcastToStreaming { id, .. } => id,
             }
         }
 
@@ -1402,7 +1677,9 @@ mod messages {
             match self {
                 UpdateMsg::RequestUpdate { key, .. }
                 | UpdateMsg::Broadcasting { key, .. }
-                | UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
+                | UpdateMsg::BroadcastTo { key, .. }
+                | UpdateMsg::RequestUpdateStreaming { key, .. }
+                | UpdateMsg::BroadcastToStreaming { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -1413,6 +1690,12 @@ mod messages {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
                 UpdateMsg::Broadcasting { id, .. } => write!(f, "Broadcasting(id: {id})"),
                 UpdateMsg::BroadcastTo { id, .. } => write!(f, "BroadcastTo(id: {id})"),
+                UpdateMsg::RequestUpdateStreaming { id, stream_id, .. } => {
+                    write!(f, "RequestUpdateStreaming(id: {id}, stream: {stream_id})")
+                }
+                UpdateMsg::BroadcastToStreaming { id, stream_id, .. } => {
+                    write!(f, "BroadcastToStreaming(id: {id}, stream: {stream_id})")
+                }
             }
         }
     }

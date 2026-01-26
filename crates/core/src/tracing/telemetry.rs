@@ -496,11 +496,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::ResponseSent { .. } => "subscribe_response_sent".to_string(),
                 SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
                 SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
-                SubscribeEvent::DownstreamAdded { .. } => "downstream_added".to_string(),
-                SubscribeEvent::DownstreamRemoved { .. } => "downstream_removed".to_string(),
-                SubscribeEvent::UpstreamSet { .. } => "upstream_set".to_string(),
-                SubscribeEvent::Unsubscribed { .. } => "unsubscribed".to_string(),
-                SubscribeEvent::SubscriptionState { .. } => "subscription_state".to_string(),
+                // Reserved discriminants for removed variants
+                _ => "subscribe_reserved".to_string(),
             }
         }
         EventKind::Update(update_event) => {
@@ -533,6 +530,17 @@ fn event_kind_to_string(kind: &EventKind) -> String {
             }
         }
         EventKind::TransportSnapshot(_) => "transport_snapshot".to_string(),
+        EventKind::InterestSync(interest_sync_event) => {
+            use crate::tracing::InterestSyncEvent;
+            match interest_sync_event {
+                InterestSyncEvent::ResyncRequestReceived { .. } => {
+                    "interest_resync_request_received".to_string()
+                }
+                InterestSyncEvent::ResyncResponseSent { .. } => {
+                    "interest_resync_response_sent".to_string()
+                }
+            }
+        }
     }
 }
 
@@ -992,80 +1000,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "timestamp": timestamp,
                     })
                 }
-                SubscribeEvent::DownstreamAdded {
-                    key,
-                    subscriber,
-                    downstream_count,
-                    timestamp,
-                } => {
-                    serde_json::json!({
-                        "type": "downstream_added",
-                        "key": key.to_string(),
-                        "subscriber": subscriber.to_string(),
-                        "downstream_count": downstream_count,
-                        "timestamp": timestamp,
-                    })
-                }
-                SubscribeEvent::DownstreamRemoved {
-                    key,
-                    subscriber,
-                    reason,
-                    downstream_count,
-                    timestamp,
-                } => {
-                    serde_json::json!({
-                        "type": "downstream_removed",
-                        "key": key.to_string(),
-                        "subscriber": subscriber.as_ref().map(|s| s.to_string()),
-                        "reason": format!("{:?}", reason),
-                        "downstream_count": downstream_count,
-                        "timestamp": timestamp,
-                    })
-                }
-                SubscribeEvent::UpstreamSet {
-                    key,
-                    upstream,
-                    timestamp,
-                } => {
-                    serde_json::json!({
-                        "type": "upstream_set",
-                        "key": key.to_string(),
-                        "upstream": upstream.to_string(),
-                        "timestamp": timestamp,
-                    })
-                }
-                SubscribeEvent::Unsubscribed {
-                    key,
-                    reason,
-                    upstream,
-                    timestamp,
-                } => {
-                    serde_json::json!({
-                        "type": "unsubscribed",
-                        "key": key.to_string(),
-                        "reason": format!("{:?}", reason),
-                        "upstream": upstream.as_ref().map(|u| u.to_string()),
-                        "timestamp": timestamp,
-                    })
-                }
-                SubscribeEvent::SubscriptionState {
-                    key,
-                    is_seeding,
-                    upstream,
-                    downstream_count,
-                    downstream,
-                    timestamp,
-                } => {
-                    serde_json::json!({
-                        "type": "subscription_state",
-                        "key": key.to_string(),
-                        "is_seeding": is_seeding,
-                        "upstream": upstream.as_ref().map(|u| u.to_string()),
-                        "downstream_count": downstream_count,
-                        "downstream": downstream.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                        "timestamp": timestamp,
-                    })
-                }
+                // Reserved discriminants for removed variants
+                _ => serde_json::json!({"type": "reserved"}),
             }
         }
         EventKind::Update(update_event) => {
@@ -1356,6 +1292,41 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "max_rtt_us": snapshot.max_rtt_us,
             })
         }
+        EventKind::InterestSync(interest_sync_event) => {
+            use crate::tracing::InterestSyncEvent;
+            match interest_sync_event {
+                InterestSyncEvent::ResyncRequestReceived {
+                    key,
+                    from_peer,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "resync_request_received",
+                        "contract_key": key.to_string(),
+                        "contract_id": key.id().to_string(),
+                        "from_peer": from_peer.to_string(),
+                        "from_peer_addr": from_peer.peer_addr.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                InterestSyncEvent::ResyncResponseSent {
+                    key,
+                    to_peer,
+                    state_size,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "resync_response_sent",
+                        "contract_key": key.to_string(),
+                        "contract_id": key.id().to_string(),
+                        "to_peer": to_peer.to_string(),
+                        "to_peer_addr": to_peer.peer_addr.to_string(),
+                        "state_size": state_size,
+                        "timestamp": timestamp,
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -1393,5 +1364,82 @@ mod tests {
         // Test ignored event (simplest case that doesn't require PeerId construction)
         let ignored = EventKind::Ignored;
         assert_eq!(event_kind_to_string(&ignored), "ignored");
+    }
+
+    #[test]
+    fn test_event_kind_to_string_interest_sync() {
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::InterestSyncEvent;
+        use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+
+        // Create test fixtures
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let peer = PeerKeyLocation::random();
+
+        // Test ResyncRequestReceived
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+            key,
+            from_peer: peer.clone(),
+            timestamp: 12345,
+        });
+        assert_eq!(
+            event_kind_to_string(&event),
+            "interest_resync_request_received"
+        );
+
+        // Test ResyncResponseSent
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+            key,
+            to_peer: peer,
+            state_size: 1024,
+            timestamp: 12345,
+        });
+        assert_eq!(
+            event_kind_to_string(&event),
+            "interest_resync_response_sent"
+        );
+    }
+
+    #[test]
+    fn test_event_kind_to_json_interest_sync() {
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::InterestSyncEvent;
+        use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+
+        // Create test fixtures
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let peer = PeerKeyLocation::random();
+
+        // Test ResyncRequestReceived JSON structure
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+            key,
+            from_peer: peer.clone(),
+            timestamp: 12345,
+        });
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "resync_request_received");
+        assert!(json["contract_key"].is_string());
+        assert!(json["contract_id"].is_string());
+        assert!(json["from_peer"].is_string());
+        assert_eq!(json["timestamp"], 12345);
+
+        // Test ResyncResponseSent JSON structure
+        let event = EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+            key,
+            to_peer: peer,
+            state_size: 1024,
+            timestamp: 67890,
+        });
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "resync_response_sent");
+        assert!(json["contract_key"].is_string());
+        assert!(json["contract_id"].is_string());
+        assert!(json["to_peer"].is_string());
+        assert_eq!(json["state_size"], 1024);
+        assert_eq!(json["timestamp"], 67890);
     }
 }

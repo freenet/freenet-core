@@ -327,7 +327,7 @@ impl<ER> Builder<ER> {
 async fn append_contracts(
     op_manager: &Arc<OpManager>,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
-    contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    _contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 ) -> anyhow::Result<()> {
     use crate::contract::ContractHandlerEvent;
     for (contract, state, subscription) in contracts {
@@ -348,20 +348,11 @@ async fn append_contracts(
         );
         if subscription {
             op_manager.ring.seed_contract(key, state_size);
+            // In the new lease-based model, register an active subscription
+            op_manager.ring.subscribe(key);
         }
-        if let Some(subscribers) = contract_subscribers.get(&key) {
-            // add contract subscribers as downstream (test setup - no upstream_addr)
-            for subscriber in subscribers {
-                if op_manager
-                    .ring
-                    .add_downstream(&key, subscriber.clone(), None)
-                    .is_err()
-                {
-                    tracing::warn!("Max subscribers for contract {} reached", key);
-                    break;
-                }
-            }
-        }
+        // Note: contract_subscribers is ignored in the new model.
+        // Proximity cache handles peer-to-peer awareness for update propagation.
     }
     Ok(())
 }

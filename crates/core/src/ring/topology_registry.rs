@@ -139,10 +139,20 @@ pub fn get_topology_snapshot(
 
 /// Get all topology snapshots for a network.
 pub fn get_all_topology_snapshots(network_name: &str) -> Vec<TopologySnapshot> {
-    TOPOLOGY_REGISTRY
+    let mut snapshots: Vec<_> = TOPOLOGY_REGISTRY
         .iter()
         .filter(|entry| entry.key().0 == network_name)
-        .map(|entry| entry.value().clone())
+        .map(|entry| (entry.key().1, entry.value().clone()))
+        .collect();
+    // Sort by socket address for deterministic ordering (critical for simulation tests)
+    snapshots.sort_by(|a, b| {
+        let addr_a = format!("{}", a.0);
+        let addr_b = format!("{}", b.0);
+        addr_a.cmp(&addr_b)
+    });
+    snapshots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
         .collect()
 }
 
@@ -205,6 +215,21 @@ pub fn validate_topology(
     contract_location: f64,
 ) -> TopologyValidationResult {
     let snapshots = get_all_topology_snapshots(network_name);
+    validate_topology_from_snapshots(&snapshots, contract_id, contract_location)
+}
+
+/// Validates the subscription topology for a contract from provided snapshots.
+///
+/// Use this variant when you have captured snapshots and the global registry
+/// may have been cleared (e.g., after SimNetwork::Drop).
+///
+/// Same validation as `validate_topology` but operates on the provided snapshots
+/// instead of fetching from the global registry.
+pub fn validate_topology_from_snapshots(
+    snapshots: &[TopologySnapshot],
+    contract_id: &ContractInstanceId,
+    contract_location: f64,
+) -> TopologyValidationResult {
     let mut result = TopologyValidationResult::default();
 
     // Build a map of peer -> (upstream, downstream) for this contract
@@ -213,7 +238,7 @@ pub fn validate_topology(
     let mut peer_locations: HashMap<SocketAddr, f64> = HashMap::new();
     let mut seeders: HashSet<SocketAddr> = HashSet::new();
 
-    for snapshot in &snapshots {
+    for snapshot in snapshots {
         peer_locations.insert(snapshot.peer_addr, snapshot.location);
 
         if let Some(sub) = snapshot.contracts.get(contract_id) {
@@ -249,15 +274,47 @@ pub fn validate_topology(
     // Source detection threshold: peers within 5% of ring distance to contract are considered sources
     const SOURCE_THRESHOLD: f64 = 0.05;
 
+    // Check if any seeder is within SOURCE_THRESHOLD (a "proper" source)
+    let has_proper_source = seeders.iter().any(|seeder| {
+        peer_locations
+            .get(seeder)
+            .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
+            .unwrap_or(false)
+    });
+
+    // Find de-facto sources: when no peer is within SOURCE_THRESHOLD,
+    // any seeder that is acting as a tree root (no upstream, has downstream) is a valid source.
+    // This is important for Issue #2755 - topology should still be valid even without a "proper" source.
+    let de_facto_sources: HashSet<SocketAddr> = if has_proper_source {
+        HashSet::new()
+    } else {
+        // Find all seeders that are acting as tree roots (no upstream but has downstream)
+        seeders
+            .iter()
+            .filter(|seeder| {
+                subscription_graph
+                    .get(*seeder)
+                    .map(|(upstream, downstream)| upstream.is_none() && !downstream.is_empty())
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect()
+    };
+
     // Check for orphan seeders and disconnected upstream
     for &seeder in &seeders {
         if let Some((upstream, downstream)) = subscription_graph.get(&seeder) {
             // Check if seeder is close to contract location (is source)
             // Use ring_distance for consistent wrap-around handling
-            let is_source = peer_locations
+            let is_proper_source = peer_locations
                 .get(&seeder)
                 .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
                 .unwrap_or(false);
+
+            // Also check if this is a de-facto source (acting as tree root when no proper source exists)
+            let is_de_facto_source = de_facto_sources.contains(&seeder);
+
+            let is_source = is_proper_source || is_de_facto_source;
 
             // Orphan if: not source, no upstream, no downstream
             if !is_source && upstream.is_none() && downstream.is_empty() {
@@ -432,8 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn test_disconnected_upstream_detection() {
-        let network = "test-disconnected-upstream";
+    fn test_de_facto_source_single_seeder() {
+        // Issue #2755: When no peer is within SOURCE_THRESHOLD, a single seeder
+        // acting as tree root (has downstream, no upstream) should be recognized
+        // as a valid de-facto source, NOT flagged as disconnected upstream.
+        let network = "test-de-facto-source";
         clear_topology_snapshots(network);
 
         let peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
@@ -441,9 +501,62 @@ mod tests {
         let contract_id = make_contract_id(1);
         let contract_key = make_contract_key(1);
 
-        // Create disconnected upstream: has downstream but no upstream (not source)
-        let mut snap = TopologySnapshot::new(peer, 0.3); // Location 0.3, contract at 0.5
+        // Single seeder acting as tree root: no upstream, has downstream
+        // Location 0.3, contract at 0.5, distance = 0.2 (> 0.05 threshold, not a proper source)
+        // But it's the only seeder and acting as root, so it's a valid de-facto source
+        let mut snap = TopologySnapshot::new(peer, 0.3);
         snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![downstream_peer],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+        assert!(
+            result.disconnected_upstream.is_empty(),
+            "Single seeder acting as tree root should be valid de-facto source, not disconnected"
+        );
+        assert!(result.is_healthy(), "Topology should be healthy");
+
+        clear_topology_snapshots(network);
+    }
+
+    #[test]
+    fn test_disconnected_upstream_with_proper_source() {
+        // When a proper source EXISTS (within threshold), other seeders acting
+        // as root (no upstream, has downstream) ARE disconnected upstreams.
+        let network = "test-disconnected-with-source";
+        clear_topology_snapshots(network);
+
+        let source_peer: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let disconnected_peer: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let downstream_peer: SocketAddr = "10.0.3.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Proper source: within threshold (location 0.52, contract at 0.5, distance = 0.02)
+        let mut source_snap = TopologySnapshot::new(source_peer, 0.52);
+        source_snap.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        // Disconnected peer: not a source (location 0.3, distance = 0.2), but acting as root
+        let mut disconnected_snap = TopologySnapshot::new(disconnected_peer, 0.3);
+        disconnected_snap.set_contract(
             contract_id,
             ContractSubscription {
                 contract_key,
@@ -454,12 +567,13 @@ mod tests {
             },
         );
 
-        register_topology_snapshot(network, snap);
+        register_topology_snapshot(network, source_snap);
+        register_topology_snapshot(network, disconnected_snap);
 
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
             !result.disconnected_upstream.is_empty(),
-            "Should detect disconnected upstream seeder"
+            "Should detect disconnected upstream when proper source exists"
         );
 
         clear_topology_snapshots(network);
@@ -714,6 +828,202 @@ mod tests {
             result.disconnected_upstream.len(),
             result.unreachable_seeders.len(),
             result.proximity_violations.len()
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    /// Tests detection of mutual downstream relationships (Issue #2773).
+    ///
+    /// This scenario occurs when two peers race to subscribe and both add
+    /// each other as downstream before either can establish an upstream.
+    ///
+    /// ## Scenario
+    ///
+    /// - Peer A: downstream=[B], upstream=None
+    /// - Peer B: downstream=[A], upstream=None
+    ///
+    /// Both have each other as downstream, but neither has an upstream.
+    /// This blocks both from receiving updates from the contract source.
+    ///
+    /// ## Current Behavior (Limitation)
+    ///
+    /// When no proper source exists (both peers are far from contract location),
+    /// the validation logic treats ANY peer with (no upstream, has downstream)
+    /// as a valid "de-facto source". This means mutual downstream relationships
+    /// are NOT detected when no proper source exists nearby.
+    ///
+    /// ## When It IS Detected
+    ///
+    /// When a proper source EXISTS (peer within SOURCE_THRESHOLD), mutual
+    /// downstream peers are correctly flagged as `disconnected_upstream`.
+    /// This test uses a proper source to demonstrate detection.
+    #[test]
+    fn test_mutual_downstream_detection_with_proper_source_issue_2773() {
+        let network = "test-mutual-downstream-with-source";
+        clear_topology_snapshots(network);
+
+        let source_peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let peer_a: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let peer_b: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Proper source: within threshold (location 0.51, contract at 0.5, distance = 0.01)
+        let mut snap_source = TopologySnapshot::new(source_peer, 0.51);
+        snap_source.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![], // Source with no subscribers yet
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        // Create mutual downstream: A has B as downstream, B has A as downstream
+        // Neither has upstream. Both are far from contract (not sources).
+        // Location 0.2 and 0.3, contract at 0.5:
+        // - A distance: 0.3 > SOURCE_THRESHOLD (0.05)
+        // - B distance: 0.2 > SOURCE_THRESHOLD (0.05)
+
+        let mut snap_a = TopologySnapshot::new(peer_a, 0.2);
+        snap_a.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,           // No upstream!
+                downstream: vec![peer_b], // B is downstream
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        let mut snap_b = TopologySnapshot::new(peer_b, 0.3);
+        snap_b.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,           // No upstream!
+                downstream: vec![peer_a], // A is downstream
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap_source);
+        register_topology_snapshot(network, snap_a);
+        register_topology_snapshot(network, snap_b);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+
+        // With a proper source, both A and B should be flagged as disconnected_upstream
+        // (has downstream but no upstream, and not a source since proper source exists)
+        assert_eq!(
+            result.disconnected_upstream.len(),
+            2,
+            "Both peers should be flagged as disconnected upstream when proper source exists, found: {:?}",
+            result.disconnected_upstream
+        );
+
+        // Verify both peers are in the disconnected list
+        let disconnected_addrs: Vec<_> = result
+            .disconnected_upstream
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        assert!(
+            disconnected_addrs.contains(&peer_a),
+            "Peer A should be in disconnected_upstream"
+        );
+        assert!(
+            disconnected_addrs.contains(&peer_b),
+            "Peer B should be in disconnected_upstream"
+        );
+
+        // This is NOT a bidirectional cycle (which requires mutual UPSTREAM)
+        assert!(
+            result.bidirectional_cycles.is_empty(),
+            "Mutual downstream is not a bidirectional cycle (no upstream established)"
+        );
+
+        // The topology is NOT healthy
+        assert!(
+            !result.is_healthy(),
+            "Mutual downstream should be flagged as unhealthy"
+        );
+
+        clear_topology_snapshots(network);
+    }
+
+    /// Tests that mutual downstream WITHOUT a proper source is NOT currently detected.
+    ///
+    /// This is a KNOWN LIMITATION. When no peer is within SOURCE_THRESHOLD, the
+    /// validation treats any peer with (no upstream, has downstream) as a valid
+    /// "de-facto source" for Issue #2755. But with mutual downstream, BOTH peers
+    /// qualify as de-facto sources, so neither is flagged.
+    ///
+    /// ## Future Work
+    ///
+    /// The validation should detect when multiple "de-facto sources" reference
+    /// each other's downstream, as this creates an isolated loop rather than
+    /// a valid tree rooted at a source. This would require checking if de-facto
+    /// sources form a connected component with no external upstream.
+    #[test]
+    fn test_mutual_downstream_without_source_not_detected_limitation() {
+        let network = "test-mutual-downstream-no-source";
+        clear_topology_snapshots(network);
+
+        let peer_a: SocketAddr = "10.0.1.1:5000".parse().unwrap();
+        let peer_b: SocketAddr = "10.0.2.1:5000".parse().unwrap();
+        let contract_id = make_contract_id(1);
+        let contract_key = make_contract_key(1);
+
+        // Create mutual downstream: A has B as downstream, B has A as downstream
+        // Neither has upstream. NO proper source exists.
+        let mut snap_a = TopologySnapshot::new(peer_a, 0.2);
+        snap_a.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![peer_b],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        let mut snap_b = TopologySnapshot::new(peer_b, 0.3);
+        snap_b.set_contract(
+            contract_id,
+            ContractSubscription {
+                contract_key,
+                upstream: None,
+                downstream: vec![peer_a],
+                is_seeding: true,
+                has_client_subscriptions: false,
+            },
+        );
+
+        register_topology_snapshot(network, snap_a);
+        register_topology_snapshot(network, snap_b);
+
+        let result = validate_topology(network, &contract_id, 0.5);
+
+        // KNOWN LIMITATION: Both peers are treated as valid de-facto sources
+        // because no proper source exists and both have (no upstream, has downstream).
+        // This means mutual downstream is NOT detected in this scenario.
+        assert!(
+            result.disconnected_upstream.is_empty(),
+            "KNOWN LIMITATION: Mutual downstream without proper source is not detected"
+        );
+
+        // The topology appears healthy but is actually broken
+        // (updates from neither peer can reach an actual source)
+        assert!(
+            result.is_healthy(),
+            "KNOWN LIMITATION: Mutual downstream appears healthy when no source exists"
         );
 
         clear_topology_snapshots(network);

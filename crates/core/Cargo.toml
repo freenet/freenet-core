@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.99"
+version = "0.1.106"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -95,7 +95,7 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { version = "0.5.0", optional = true }
 tokio-stream = "0.1.18"
-freenet-test-network = { version = "0.1.20", optional = true }
+freenet-test-network = { version = "0.1.21", optional = true }
 turmoil = "0.7"  # Deterministic simulation scheduling (always enabled for SimNetwork)
 lru = "0.16.3"
 
@@ -175,6 +175,8 @@ bench = []  # Exposes internal test infrastructure for benchmarking
 bench_full = []  # Enables full benchmark suite (slow, ~78 min)
 # Feature to enable simulation integration tests (run separately with --test-threads=1)
 simulation_tests = []
+# Feature to enable nightly-only tests (long-running, resource-intensive)
+nightly_tests = []
 
 # ==============================================================================
 # Lint Configuration

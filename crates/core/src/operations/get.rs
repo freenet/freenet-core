@@ -7,7 +7,6 @@ use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
 use crate::node::IsOperationCompleted;
-use crate::transport::peer_connection::StreamId;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -18,9 +17,11 @@ use crate::{
 };
 use either::Either;
 
+use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::{GetMsg, GetMsgResult};
+// GetStreamingPayload is used for serialization by senders, not receivers
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
@@ -321,36 +322,6 @@ enum GetState {
         /// Bloom filter tracking visited peers across all hops
         visited: super::VisitedPeers,
     },
-    /// Waiting for streaming response data to arrive.
-    /// Used when we're the requester and received ResponseStreaming.
-    #[allow(dead_code)]
-    AwaitingStreamData {
-        /// StreamId we're waiting for
-        stream_id: StreamId,
-        /// Contract key being fetched
-        key: ContractKey,
-        /// Instance ID for routing
-        instance_id: ContractInstanceId,
-        /// Expected total size of the stream
-        total_size: u64,
-        /// Whether the response includes contract code
-        includes_contract: bool,
-        /// Whether to subscribe after receiving
-        subscribe: bool,
-    },
-    /// Sending a streaming response back to the requester.
-    /// Used when we have the contract and it exceeds the streaming threshold.
-    #[allow(dead_code)]
-    SendingStreamResponse {
-        /// StreamId for the outbound stream
-        stream_id: StreamId,
-        /// Contract key being sent
-        key: ContractKey,
-        /// Instance ID for the contract
-        instance_id: ContractInstanceId,
-        /// Address to send the response to
-        target_addr: std::net::SocketAddr,
-    },
     /// Operation completed successfully
     Finished { key: ContractKey },
 }
@@ -379,28 +350,6 @@ impl Display for GetState {
                 ..
             } => {
                 write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
-            }
-            GetState::AwaitingStreamData {
-                stream_id,
-                key,
-                total_size,
-                ..
-            } => {
-                write!(
-                    f,
-                    "AwaitingStreamData(stream: {stream_id}, key: {key}, size: {total_size})"
-                )
-            }
-            GetState::SendingStreamResponse {
-                stream_id,
-                key,
-                target_addr,
-                ..
-            } => {
-                write!(
-                    f,
-                    "SendingStreamResponse(stream: {stream_id}, key: {key}, target: {target_addr})"
-                )
             }
             GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
         }
@@ -1605,23 +1554,32 @@ impl Operation for GetOp {
                                 %key,
                                 "Local state matches network state, skipping redundant cache"
                             );
-                            // State already cached and identical, mark as seeded if needed
-                            if !op_manager.ring.is_seeding_contract(&key) {
-                                tracing::debug!(tx = %id, %key, "Marking contract as seeded");
-                                let evicted =
-                                    op_manager.ring.record_get_access(key, value.size() as u64);
-                                super::announce_contract_cached(op_manager, &key).await;
 
-                                // Clean up interest tracking for evicted contracts
-                                let mut removed_contracts = Vec::new();
-                                for evicted_key in evicted {
-                                    if op_manager
-                                        .interest_manager
-                                        .unregister_local_seeding(&evicted_key)
-                                    {
-                                        removed_contracts.push(evicted_key);
-                                    }
+                            // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                            // Previously, we only recorded access if !is_seeding_contract(),
+                            // which meant re-GETs on cached contracts wouldn't refresh the
+                            // hosting cache's TTL/LRU position, causing subscriptions to expire.
+                            //
+                            // record_get_access now returns is_new atomically, eliminating the
+                            // TOCTOU race that existed when checking is_hosting_contract() first.
+                            let access_result =
+                                op_manager.ring.record_get_access(key, value.size() as u64);
+
+                            // Clean up interest tracking for evicted contracts (always, even if already hosting)
+                            let mut removed_contracts = Vec::new();
+                            for evicted_key in &access_result.evicted {
+                                if op_manager
+                                    .interest_manager
+                                    .unregister_local_seeding(evicted_key)
+                                {
+                                    removed_contracts.push(*evicted_key);
                                 }
+                            }
+
+                            // Only do first-time hosting setup if newly hosting
+                            if access_result.is_new {
+                                tracing::debug!(tx = %id, %key, "Contract newly hosted");
+                                super::announce_contract_cached(op_manager, &key).await;
 
                                 // Register local interest for delta-based sync
                                 let became_interested =
@@ -1637,22 +1595,24 @@ impl Operation for GetOp {
                                     )
                                     .await;
                                 }
+                            } else {
+                                tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                                // Still broadcast eviction changes if any contracts were evicted
+                                if !removed_contracts.is_empty() {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        vec![],
+                                        removed_contracts,
+                                    )
+                                    .await;
+                                }
+                            }
 
-                                // Auto-subscribe to receive updates for this contract
-                                if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                    // Track in GET subscription cache for auto-subscription lifecycle.
-                                    // Note: We do NOT remove subscription state for evicted contracts here,
-                                    // as they may still have active client subscriptions. The background
-                                    // sweep task handles proper cleanup with client subscription checks.
-                                    let evicted = op_manager.ring.record_get_subscription(key);
-                                    if !evicted.is_empty() {
-                                        tracing::debug!(
-                                            evicted_count = evicted.len(),
-                                            "GET subscription cache evicted contracts (cleanup handled by background task)"
-                                        );
-                                    }
-
-                                    // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
+                            // Auto-subscribe to receive updates for this contract
+                            // record_get_access already refreshed the hosting cache above
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                // Only start new subscription if not already subscribed
+                                if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                     let child_tx = super::start_subscription_request(
                                         op_manager, id, key, false,
                                     );
@@ -1676,27 +1636,31 @@ impl Operation for GetOp {
                                 match res {
                                     ContractHandlerEvent::PutResponse { new_value: Ok(_), .. } => {
                                         tracing::debug!(tx = %id, %key, "Contract put at executor");
-                                        let is_subscribed_contract =
-                                            op_manager.ring.is_seeding_contract(&key);
 
-                                        // Start subscription if not already seeding
-                                        if !is_subscribed_contract {
-                                            tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
-                                            let evicted = op_manager
-                                                .ring
-                                                .record_get_access(key, value.size() as u64);
-                                            super::announce_contract_cached(op_manager, &key).await;
+                                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                                        // This ensures re-GETs keep the hosting cache's TTL/LRU fresh.
+                                        //
+                                        // record_get_access now returns is_new atomically, eliminating the
+                                        // TOCTOU race that existed when checking is_hosting_contract() first.
+                                        tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Recording contract access in hosting cache");
+                                        let access_result = op_manager
+                                            .ring
+                                            .record_get_access(key, value.size() as u64);
 
-                                            // Clean up interest tracking for evicted contracts
-                                            let mut removed_contracts = Vec::new();
-                                            for evicted_key in evicted {
-                                                if op_manager
-                                                    .interest_manager
-                                                    .unregister_local_seeding(&evicted_key)
-                                                {
-                                                    removed_contracts.push(evicted_key);
-                                                }
+                                        // Clean up interest tracking for evicted contracts (always, even if already hosting)
+                                        let mut removed_contracts = Vec::new();
+                                        for evicted_key in &access_result.evicted {
+                                            if op_manager
+                                                .interest_manager
+                                                .unregister_local_seeding(evicted_key)
+                                            {
+                                                removed_contracts.push(*evicted_key);
                                             }
+                                        }
+
+                                        // Only do first-time hosting setup if newly hosting
+                                        if access_result.is_new {
+                                            super::announce_contract_cached(op_manager, &key).await;
 
                                             // Register local interest for delta-based sync
                                             let became_interested = op_manager
@@ -1714,22 +1678,24 @@ impl Operation for GetOp {
                                                 )
                                                 .await;
                                             }
+                                        } else {
+                                            tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract");
+                                            // Still broadcast eviction changes if any contracts were evicted
+                                            if !removed_contracts.is_empty() {
+                                                super::broadcast_change_interests(
+                                                    op_manager,
+                                                    vec![],
+                                                    removed_contracts,
+                                                )
+                                                .await;
+                                            }
+                                        }
 
-                                            // Auto-subscribe to receive updates for this contract
-                                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
-                                                // Track in GET subscription cache for auto-subscription lifecycle.
-                                                // Note: We do NOT remove subscription state for evicted contracts here,
-                                                // as they may still have active client subscriptions. The background
-                                                // sweep task handles proper cleanup with client subscription checks.
-                                                let evicted = op_manager.ring.record_get_subscription(key);
-                                                if !evicted.is_empty() {
-                                                    tracing::debug!(
-                                                        evicted_count = evicted.len(),
-                                                        "GET subscription cache evicted contracts (cleanup handled by background task)"
-                                                    );
-                                                }
-
-                                                // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
+                                        // Auto-subscribe to receive updates for this contract
+                                        // record_get_access already refreshed the hosting cache above
+                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                            // Only start new subscription if not already subscribed
+                                            if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                                 let child_tx =
                                                     super::start_subscription_request(op_manager, id, key, false);
                                                 tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
@@ -1893,30 +1859,242 @@ impl Operation for GetOp {
                     }
                 }
 
-                // Streaming variants - placeholder handlers until full implementation
-                // These will be implemented in Step 4 of Phase 3
+                // Streaming GET response handler
                 GetMsg::ResponseStreaming {
-                    id,
+                    id: msg_id,
                     instance_id,
+                    stream_id,
                     key,
-                    ..
+                    total_size,
+                    includes_contract,
                 } => {
-                    tracing::warn!(
+                    let id = *msg_id;
+                    let key = *key;
+                    let stream_id = *stream_id;
+                    let includes_contract = *includes_contract;
+
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            %instance_id,
+                            contract = %key,
+                            stream_id = %stream_id,
+                            "GET ResponseStreaming received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
+                    tracing::info!(
                         tx = %id,
                         %instance_id,
                         contract = %key,
-                        "GET ResponseStreaming received but streaming not yet implemented"
+                        stream_id = %stream_id,
+                        total_size,
+                        includes_contract,
+                        phase = "streaming_response",
+                        "Processing GET ResponseStreaming"
                     );
-                    return Err(OpError::UnexpectedOpState);
+
+                    // Step 1: Claim the stream from orphan registry
+                    let stream_handle = match op_manager
+                        .orphan_stream_registry()
+                        .claim_or_wait(stream_id, STREAM_CLAIM_TIMEOUT)
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to claim stream from orphan registry"
+                            );
+                            return Err(OpError::OrphanStreamClaimFailed);
+                        }
+                    };
+
+                    // Step 2: Wait for stream to complete and assemble data
+                    let stream_data = match stream_handle.assemble().await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to assemble stream data"
+                            );
+                            return Err(OpError::StreamCancelled);
+                        }
+                    };
+
+                    tracing::debug!(
+                        tx = %id,
+                        stream_id = %stream_id,
+                        received_size = stream_data.len(),
+                        expected_size = total_size,
+                        "Stream data assembled"
+                    );
+
+                    // Step 3: Deserialize the streaming payload
+                    let payload: messages::GetStreamingPayload =
+                        match bincode::deserialize(&stream_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(
+                                    tx = %id,
+                                    stream_id = %stream_id,
+                                    error = %e,
+                                    "Failed to deserialize streaming payload"
+                                );
+                                return Err(OpError::invalid_transition(self.id));
+                            }
+                        };
+
+                    // Verify key matches
+                    if payload.key != key {
+                        tracing::error!(
+                            tx = %id,
+                            expected = %key,
+                            actual = %payload.key,
+                            "Contract key mismatch in streaming payload"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    }
+
+                    let value = payload.value;
+
+                    // Step 4: Check if this is the original requester
+                    let is_original_requester = self.upstream_addr.is_none();
+
+                    // Get current hop for telemetry
+                    let current_hop =
+                        if let Some(GetState::AwaitingResponse { current_hop, .. }) = &self.state {
+                            Some(*current_hop)
+                        } else {
+                            None
+                        };
+
+                    // Step 5: Cache the contract locally (same as regular Response)
+                    if let Some(state) = &value.state {
+                        let contract_to_cache = if includes_contract {
+                            value.contract.clone()
+                        } else {
+                            None
+                        };
+
+                        // Check if we already have this contract
+                        let already_hosting = op_manager.ring.is_hosting_contract(&key);
+
+                        if !already_hosting {
+                            // Use put_query to cache the contract
+                            let _ = op_manager
+                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                    key,
+                                    state: state.clone(),
+                                    related_contracts: RelatedContracts::default(),
+                                    contract: contract_to_cache,
+                                })
+                                .await;
+                        }
+
+                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
+                        // This keeps the TTL/LRU position fresh for already-hosted contracts.
+                        op_manager.ring.record_get_access(key, state.size() as u64);
+                    }
+
+                    // Step 6: Emit telemetry
+                    let hop_count =
+                        current_hop.map(|h| op_manager.ring.max_hops_to_live.saturating_sub(h));
+                    let hash = value.state.as_ref().map(state_hash_full);
+                    if let Some(event) = NetEventLog::get_success(
+                        &id,
+                        &op_manager.ring,
+                        key,
+                        op_manager.ring.connection_manager.own_location(),
+                        hop_count,
+                        hash,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
+                    // Step 7: Build result and determine response
+                    if is_original_requester {
+                        // This is the original requester - operation complete
+                        tracing::info!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "complete",
+                            "Streaming GET complete (originator)"
+                        );
+
+                        // State must be present for a successful GET
+                        let state = match value.state {
+                            Some(s) => s,
+                            None => {
+                                tracing::error!(
+                                    tx = %id,
+                                    contract = %key,
+                                    "Streaming GET response has no state"
+                                );
+                                return Err(OpError::invalid_transition(self.id));
+                            }
+                        };
+
+                        result = Some(GetResult {
+                            key,
+                            state,
+                            contract: value.contract,
+                        });
+                        new_state = Some(GetState::Finished { key });
+                        return_msg = None;
+                    } else {
+                        // Forward the response to upstream as a regular Response
+                        // (streaming is only for large payloads, we've now received it)
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "forward",
+                            "Forwarding GET response to upstream"
+                        );
+
+                        return_msg = Some(GetMsg::Response {
+                            id,
+                            instance_id: *instance_id,
+                            result: GetMsgResult::Found { key, value },
+                        });
+                        new_state = None;
+                    }
                 }
 
-                GetMsg::ResponseStreamingAck { id, stream_id } => {
-                    tracing::warn!(
+                // Streaming GET response acknowledgment handler
+                GetMsg::ResponseStreamingAck {
+                    id: msg_id,
+                    stream_id,
+                } => {
+                    let id = *msg_id;
+                    let stream_id = *stream_id;
+
+                    // Check if streaming is enabled at runtime
+                    if !op_manager.streaming_enabled {
+                        tracing::warn!(
+                            tx = %id,
+                            stream_id = %stream_id,
+                            "GET ResponseStreamingAck received but streaming is disabled"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
+
+                    // The acknowledgment confirms the stream was received.
+                    // For now, we just log it and clean up.
+                    tracing::info!(
                         tx = %id,
-                        %stream_id,
-                        "GET ResponseStreamingAck received but streaming not yet implemented"
+                        stream_id = %stream_id,
+                        phase = "streaming_ack",
+                        "Streaming GET response acknowledged"
                     );
-                    return Err(OpError::UnexpectedOpState);
+                    new_state = None;
+                    return_msg = None;
                 }
             }
 
@@ -2108,6 +2286,14 @@ mod messages {
 
     use super::*;
     use crate::transport::peer_connection::StreamId;
+
+    /// Payload for streaming GET responses.
+    /// Contains the result of a GET operation, serialized for streaming transfer.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) struct GetStreamingPayload {
+        pub key: ContractKey,
+        pub value: StoreResponse,
+    }
 
     /// Result of a GET operation - either the contract was found or it wasn't.
     ///

@@ -69,7 +69,6 @@ pub(crate) struct OperationResult {
 pub(crate) struct OpInitialization<Op> {
     /// The source address of the peer that sent this message.
     /// Used for sending error responses (Aborted) and as upstream_addr.
-    /// Note: Currently unused but prepared for Phase 4 of #2164.
     #[allow(dead_code)]
     pub source_addr: Option<SocketAddr>,
     pub op: Op,
@@ -337,14 +336,9 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // Streaming-related errors (Phase 3 infrastructure - will be used by streaming handlers)
-    #[allow(dead_code)]
-    #[error("stream timed out waiting for data")]
-    StreamTimeout,
-    #[allow(dead_code)]
+    // Streaming-related errors
     #[error("stream was cancelled")]
     StreamCancelled,
-    #[allow(dead_code)]
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
 
@@ -530,7 +524,8 @@ fn start_subscription_request_internal(
     GlobalExecutor::spawn(async move {
         tokio::task::yield_now().await;
 
-        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx);
+        // is_renewal: false - GET-triggered subscription is a new subscription
+        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx, false);
 
         match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
             Ok(_) => {
@@ -590,8 +585,8 @@ async fn has_contract(
 /// The threshold comparison is exclusive (`>`), meaning payloads exactly at the
 /// threshold will NOT use streaming. This is intentional: the threshold represents
 /// "the maximum size for non-streaming transfers", so payloads must exceed it.
-#[allow(dead_code)]
-pub(crate) fn should_use_streaming(
+#[cfg(test)]
+fn should_use_streaming(
     streaming_enabled: bool,
     streaming_threshold: usize,
     payload_size: usize,

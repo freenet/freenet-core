@@ -1,6 +1,11 @@
 use super::{
-    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
-    native_api, secrets_store::SecretsStore, RuntimeResult,
+    contract_store::ContractStore,
+    delegate_store::DelegateStore,
+    error::RuntimeInnerError,
+    native_api,
+    secrets_store::SecretsStore,
+    tunables::{BaseTunables, LimitingTunables, DEFAULT_MAX_MEMORY_PAGES},
+    RuntimeResult,
 };
 use freenet_stdlib::{
     memory::{
@@ -9,12 +14,41 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use std::{collections::HashMap, sync::atomic::AtomicI64};
+use lru::LruCache;
+use std::{num::NonZeroUsize, sync::atomic::AtomicI64};
 use wasmer::sys::{CompilerConfig, EngineBuilder};
-use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
+use wasmer::{
+    imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Pages, Store, TypedFunction,
+};
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+
+/// Default capacity for each compiled WASM module cache.
+///
+/// This limits how many compiled contract/delegate modules are kept in memory.
+/// When a cache is full, the least recently used module is evicted.
+///
+/// **Current value: 128 modules per cache**
+///
+/// # Trade-offs
+///
+/// - Higher capacity = more memory usage, but fewer recompilations
+/// - Lower capacity = less memory usage, but more recompilation overhead
+///
+/// Recompilation is relatively expensive (~10-100ms per module), so the cache
+/// should be large enough to hold the "working set" of frequently-used contracts.
+///
+/// # Memory Impact
+///
+/// Each compiled `Module` consumes memory proportional to the contract's complexity.
+/// A typical compiled module is 100KB-1MB.
+///
+/// **Note:** The runtime maintains TWO separate caches (contracts and delegates),
+/// so total memory usage is approximately:
+/// - With 128 capacity: 2 × (12-128 MB) = **24-256 MB** total
+/// - With 256 capacity: 2 × (25-256 MB) = **50-512 MB** total
+pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 128;
 
 /// Execute a closure while suppressing stderr output.
 ///
@@ -31,11 +65,10 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 #[cfg(unix)]
 fn with_suppressed_stderr<T, F: FnOnce() -> T>(f: F) -> T {
     // Attempt to suppress stderr; if it fails (e.g., stderr already redirected),
-    // just run without suppression
-    match gag::Gag::stderr() {
-        Ok(_gag) => f(),
-        Err(_) => f(),
-    }
+    // just run without suppression. The _gag binding keeps suppression active
+    // for the duration of f().
+    let _gag = gag::Gag::stderr();
+    f()
 }
 
 #[cfg(not(unix))]
@@ -131,6 +164,17 @@ pub struct RuntimeConfig {
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
     pub enable_metering: bool,
+    /// Maximum number of compiled modules to keep in each cache.
+    ///
+    /// The runtime maintains two separate LRU caches: one for contracts
+    /// and one for delegates. Each cache has this capacity.
+    ///
+    /// When a cache is full, the least recently used module is evicted.
+    ///
+    /// **Note:** If set to 0, falls back to 1 (minimum valid capacity).
+    /// This ensures the runtime always functions, though with reduced
+    /// caching efficiency.
+    pub module_cache_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -140,6 +184,7 @@ impl Default for RuntimeConfig {
             cpu_cycles_per_second: None,
             safety_margin: 0.2,
             enable_metering: false,
+            module_cache_capacity: DEFAULT_MODULE_CACHE_CAPACITY,
         }
     }
 }
@@ -154,13 +199,15 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// loaded delegate modules
-    pub(super) delegate_modules: HashMap<DelegateKey, Module>,
+    /// LRU cache of compiled delegate modules.
+    /// Evicts least recently used modules when capacity is reached.
+    pub(super) delegate_modules: LruCache<DelegateKey, Module>,
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// loaded contract modules
-    pub(super) contract_modules: HashMap<ContractKey, Module>,
+    /// LRU cache of compiled contract modules.
+    /// Evicts least recently used modules when capacity is reached.
+    pub(super) contract_modules: LruCache<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
     pub(super) max_execution_seconds: f64,
 }
@@ -195,6 +242,10 @@ impl Runtime {
         native_api::rand::prepare_export(&mut store, &mut top_level_imports);
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
+        // SAFETY: DEFAULT_MODULE_CACHE_CAPACITY is non-zero
+        let cache_capacity =
+            NonZeroUsize::new(config.module_cache_capacity).unwrap_or(NonZeroUsize::MIN);
+
         Ok(Self {
             wasm_store: Some(store),
             top_level_imports,
@@ -202,10 +253,10 @@ impl Runtime {
 
             secret_store,
             delegate_store,
-            contract_modules: HashMap::new(),
+            contract_modules: LruCache::new(cache_capacity),
 
             contract_store,
-            delegate_modules: HashMap::new(),
+            delegate_modules: LruCache::new(cache_capacity),
             enabled_metering: config.enable_metering,
             max_execution_seconds: config.max_execution_seconds,
         })
@@ -265,9 +316,11 @@ impl Runtime {
         parameters: &Parameters,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
+        // Check cache first (updates LRU order if found)
         let module = if let Some(module) = self.contract_modules.get(key) {
-            module
+            module.clone()
         } else {
+            // Cache miss - compile the module
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
@@ -290,10 +343,10 @@ impl Runtime {
                 }
                 _ => unimplemented!(),
             };
-            self.contract_modules.insert(*key, module);
-            self.contract_modules.get(key).unwrap()
-        }
-        .clone();
+            // Insert into LRU cache (may evict least recently used entry)
+            self.contract_modules.put(*key, module.clone());
+            module
+        };
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
         RunningInstance::new(self, instance, Key::Contract(*key.id()))
@@ -305,9 +358,11 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
+        // Check cache first (updates LRU order if found)
         let module = if let Some(module) = self.delegate_modules.get(key) {
-            module
+            module.clone()
         } else {
+            // Cache miss - compile the module
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
@@ -315,10 +370,10 @@ impl Runtime {
             let store = self.wasm_store.as_ref().unwrap();
             let code = delegate.code().as_ref();
             let module = with_suppressed_stderr(|| Module::new(store, code))?;
-            self.delegate_modules.insert(key.clone(), module);
-            self.delegate_modules.get(key).unwrap()
-        }
-        .clone();
+            // Insert into LRU cache (may evict least recently used entry)
+            self.delegate_modules.put(key.clone(), module.clone());
+            module
+        };
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
         RunningInstance::new(self, instance, Key::Delegate(key.clone()))
@@ -346,8 +401,13 @@ impl Runtime {
     }
 
     fn instance_host_mem(store: &mut Store) -> RuntimeResult<Memory> {
-        // todo: max memory assigned for this runtime
-        Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
+        // Set maximum memory to prevent unbounded growth.
+        // 20 pages initial (1.28 MiB), max DEFAULT_MAX_MEMORY_PAGES (256 MiB).
+        // See: https://github.com/freenet/freenet-core/issues/2774
+        Ok(Memory::new(
+            store,
+            MemoryType::new(20u32, Some(DEFAULT_MAX_MEMORY_PAGES), false),
+        )?)
     }
 
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
@@ -398,9 +458,18 @@ impl Runtime {
             compiler_config.push_middleware(metering.clone());
         }
 
-        let engine = EngineBuilder::new(compiler_config).engine();
+        let mut engine = EngineBuilder::new(compiler_config).engine();
 
-        Store::new(&engine)
+        // Apply memory limits to prevent unbounded virtual address space growth.
+        // Without limits, each WASM instance reserves ~5GB of guard pages, which
+        // accumulates over time and can lead to OOM errors.
+        // See: https://github.com/freenet/freenet-core/issues/2774
+        let base_tunables = BaseTunables::for_target(engine.target());
+        let limiting_tunables =
+            LimitingTunables::new(base_tunables, Pages(DEFAULT_MAX_MEMORY_PAGES));
+        engine.set_tunables(limiting_tunables);
+
+        Store::new(engine)
     }
 
     pub(crate) fn handle_contract_error(

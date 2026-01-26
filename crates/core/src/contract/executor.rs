@@ -608,7 +608,8 @@ struct SubscribeContract {
 
 impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::subscribe::SubscribeOp {
-        operations::subscribe::start_op(self.instance_id)
+        // is_renewal: false - client-initiated subscriptions are always new
+        operations::subscribe::start_op(self.instance_id, false)
     }
 
     async fn resume_op(
@@ -668,6 +669,13 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
            + Send;
 
+    /// Upsert contract state.
+    ///
+    /// # Arguments
+    /// * `key` - The contract key
+    /// * `update` - Either a full state or a delta to apply
+    /// * `related_contracts` - Related contracts needed for validation
+    /// * `code` - Optional contract code (for PUT operations)
     fn upsert_contract_state(
         &mut self,
         key: ContractKey,

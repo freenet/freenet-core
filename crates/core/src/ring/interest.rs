@@ -266,6 +266,10 @@ pub struct InterestManager<T: TimeSource> {
     /// Total bytes saved by sending deltas instead of full state.
     /// Calculated as: sum of (state_size - delta_size) for each delta send.
     delta_bytes_saved: AtomicU64,
+
+    /// Number of ResyncRequests received (indicates delta application failures at remote peer).
+    /// This counter helps detect incorrect summary caching issues (see PR #2763).
+    resync_requests_received: AtomicU64,
 }
 
 impl<T: TimeSource> InterestManager<T> {
@@ -283,6 +287,7 @@ impl<T: TimeSource> InterestManager<T> {
             delta_sends: AtomicU64::new(0),
             full_state_sends: AtomicU64::new(0),
             delta_bytes_saved: AtomicU64::new(0),
+            resync_requests_received: AtomicU64::new(0),
         }
     }
 
@@ -303,6 +308,15 @@ impl<T: TimeSource> InterestManager<T> {
     /// or delta computation failed.
     pub fn record_full_state_send(&self) {
         self.full_state_sends.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a ResyncRequest was received from a peer.
+    ///
+    /// This indicates the peer couldn't apply a delta we sent, likely because
+    /// we had incorrect cached summary for them (the bug PR #2763 fixed).
+    pub fn record_resync_request_received(&self) {
+        self.resync_requests_received
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Register a peer's interest in a contract.
@@ -394,10 +408,14 @@ impl<T: TimeSource> InterestManager<T> {
 
     /// Get all peers interested in a contract.
     pub fn get_interested_peers(&self, contract: &ContractKey) -> Vec<(PeerKey, PeerInterest)> {
-        self.interested_peers
+        let mut peers: Vec<(PeerKey, PeerInterest)> = self
+            .interested_peers
             .get(contract)
             .map(|entry| entry.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Sort by PeerKey bytes for deterministic ordering (critical for simulation tests)
+        peers.sort_by(|(a, _), (b, _)| a.0.as_bytes().cmp(b.0.as_bytes()));
+        peers
     }
 
     /// Get a specific peer's interest info for a contract.
@@ -579,13 +597,22 @@ impl<T: TimeSource> InterestManager<T> {
         let now = self.time_source.now();
         let mut expired = Vec::new();
 
-        for entry in self.interested_peers.iter() {
-            let contract = *entry.key();
-            let peers_to_remove: Vec<PeerKey> = entry
+        // Collect and sort contracts for deterministic iteration order
+        let mut contracts: Vec<_> = self
+            .interested_peers
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        contracts.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        for (contract, peers_map) in contracts {
+            // Collect and sort peers for deterministic iteration order
+            let mut peers_to_remove: Vec<PeerKey> = peers_map
                 .iter()
                 .filter(|(_, interest)| interest.is_expired_at(now))
                 .map(|(peer, _)| peer.clone())
                 .collect();
+            peers_to_remove.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
             for peer in peers_to_remove {
                 expired.push((contract, peer));
@@ -695,18 +722,25 @@ impl<T: TimeSource> InterestManager<T> {
     ///
     /// Uses the existing hash index for O(1) access - no rehashing needed.
     pub fn get_all_interest_hashes(&self) -> Vec<u32> {
-        self.contract_hash_index.iter().map(|e| *e.key()).collect()
+        let mut hashes: Vec<u32> = self.contract_hash_index.iter().map(|e| *e.key()).collect();
+        // Sort for deterministic ordering (critical for simulation tests)
+        hashes.sort_unstable();
+        hashes
     }
 
     /// Get contracts we're interested in that match the given hashes.
     pub fn get_matching_contracts(&self, hashes: &[u32]) -> Vec<ContractKey> {
         let hash_set: std::collections::HashSet<u32> = hashes.iter().copied().collect();
 
-        self.contract_hash_index
+        let mut contracts: Vec<ContractKey> = self
+            .contract_hash_index
             .iter()
             .filter(|entry| hash_set.contains(entry.key()))
             .flat_map(|entry| entry.value().clone())
-            .collect()
+            .collect();
+        // Sort by contract ID bytes for deterministic ordering (critical for simulation tests)
+        contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        contracts
     }
 
     /// Cache a computed delta for reuse.
@@ -863,6 +897,7 @@ impl<T: TimeSource> InterestManager<T> {
             delta_sends: self.delta_sends.load(Ordering::Relaxed),
             full_state_sends: self.full_state_sends.load(Ordering::Relaxed),
             delta_bytes_saved: self.delta_bytes_saved.load(Ordering::Relaxed),
+            resync_requests_received: self.resync_requests_received.load(Ordering::Relaxed),
         }
     }
 }
@@ -884,6 +919,9 @@ pub struct InterestManagerStats {
     pub full_state_sends: u64,
     /// Total bytes saved by sending deltas.
     pub delta_bytes_saved: u64,
+    /// Number of ResyncRequests received (indicates delta failures at remote peers).
+    /// With correct summary caching (PR #2763), this should be zero in normal operation.
+    pub resync_requests_received: u64,
 }
 
 #[cfg(test)]

@@ -28,6 +28,11 @@ use std::{
     time::Duration,
 };
 
+// Re-export test utilities for use in tests
+pub use freenet::test_utils::{
+    allocate_test_node_block, reserve_local_port_on_ip, test_ip_for_node,
+};
+
 /// Global lock to prevent concurrent contract compilation which causes race conditions
 static COMPILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use tokio::{select, time::sleep};
@@ -143,8 +148,8 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
 
     let config = ConfigArgs {
         ws_api: WebsocketApiArgs {
-            // WebSocket always binds to localhost
-            address: Some(Ipv4Addr::LOCALHOST.into()),
+            // WebSocket binds to same IP as network for test isolation (prevents port conflicts)
+            address: Some(network_bind_ip.into()),
             ws_api_port: Some(ws_api_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
@@ -159,8 +164,8 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             location: Some(rng.random()),
             ignore_protocol_checking: true,
             address: Some(network_bind_ip.into()),
-            network_port: public_port, // if None, node will pick a free one or use default
-            min_connections: None,
+            network_port: public_port,
+            min_connections: Some(1),
             max_connections: None,
             bandwidth_limit: None,
             blocked_addresses,
@@ -220,6 +225,75 @@ pub fn gw_config_from_path_with_rng<R: Rng>(
     })
 }
 
+/// Wait for a node to be connected to the network with at least min_peers connections.
+/// Returns the number of connected peers on success.
+pub async fn wait_for_node_connected(
+    client: &mut WebApi,
+    node_name: &str,
+    min_peers: usize,
+    timeout_secs: u64,
+) -> Result<usize> {
+    let start = std::time::Instant::now();
+    let timeout_duration = Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout_duration {
+            return Err(anyhow!(
+                "{} failed to connect to network within {}s",
+                node_name,
+                timeout_secs
+            ));
+        }
+
+        // Query connected peers
+        if let Err(e) = client
+            .send(ClientRequest::NodeQueries(
+                freenet_stdlib::client_api::NodeQuery::ConnectedPeers,
+            ))
+            .await
+        {
+            tracing::warn!("{}: Failed to send query: {}", node_name, e);
+            sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+
+        // Wait for response with short timeout
+        match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(
+                freenet_stdlib::client_api::QueryResponse::ConnectedPeers { peers },
+            ))) => {
+                let peer_count = peers.len();
+                if peer_count >= min_peers {
+                    tracing::info!(
+                        "{}: Connected with {} peer(s) after {:?}",
+                        node_name,
+                        peer_count,
+                        start.elapsed()
+                    );
+                    return Ok(peer_count);
+                }
+                tracing::debug!(
+                    "{}: Only {} peers connected, waiting for {}...",
+                    node_name,
+                    peer_count,
+                    min_peers
+                );
+            }
+            Ok(Ok(_other)) => {
+                // Ignore other messages
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("{}: Error receiving response: {}", node_name, e);
+            }
+            Err(_) => {
+                // Timeout on recv - retry
+            }
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub fn ping_states_equal(a: &Ping, b: &Ping) -> bool {
     if a.len() != b.len() {
         return false;
@@ -248,6 +322,50 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
     Ok(WebApi::start(stream))
+}
+
+/// Connect to a WebSocket endpoint with retry logic.
+/// Retries connection attempts until successful or timeout is reached.
+pub async fn connect_ws_with_retry(
+    uri: &str,
+    node_name: &str,
+    timeout_secs: u64,
+) -> Result<WebApi> {
+    let start = std::time::Instant::now();
+    let timeout_duration = Duration::from_secs(timeout_secs);
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        match connect_async_with_config(uri, Some(ws_config()), false).await {
+            Ok((stream, _)) => {
+                tracing::info!(
+                    "{}: WebSocket connected after {} attempts ({:?})",
+                    node_name,
+                    attempt,
+                    start.elapsed()
+                );
+                return Ok(WebApi::start(stream));
+            }
+            Err(e) => {
+                if start.elapsed() > timeout_duration {
+                    return Err(anyhow!(
+                        "{}: Failed to connect to WebSocket after {}s: {}",
+                        node_name,
+                        timeout_secs,
+                        e
+                    ));
+                }
+                tracing::debug!(
+                    "{}: Connection attempt {} failed: {}, retrying...",
+                    node_name,
+                    attempt,
+                    e
+                );
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 /// Builds and packages a contract or delegate.

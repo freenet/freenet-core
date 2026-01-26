@@ -208,7 +208,7 @@ pub async fn start_server(supervisor: Arc<Supervisor>) -> Result<(), NetworkSimu
 pub async fn run_network(
     supervisor: Arc<Supervisor>,
     test_config: &TestConfig,
-    network: SimNetwork,
+    mut network: SimNetwork,
 ) -> Result<(), Error> {
     tracing::info!("Starting network");
 
@@ -238,7 +238,9 @@ pub async fn run_network(
             connectivity_timeout.as_millis(),
             network_connection_percent * 100.0
         );
-        network.check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
+        network
+            .check_partial_connectivity(connectivity_timeout, network_connection_percent)
+            .await?;
         // FIXME: we are getting connectivity check that is not real since peers are not reporting if they
         // are connected or not to other peers
         tracing::info!("Network is sufficiently connected, start sending events");

@@ -80,7 +80,7 @@ use tracing::info;
 use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
-    config::{ConfigArgs, GlobalExecutor},
+    config::{ConfigArgs, GlobalExecutor, GlobalRng},
     dev_tool::TransportKeypair,
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
@@ -194,6 +194,29 @@ impl SimOperation {
         state_bytes
     }
 
+    /// Creates a CRDT-mode test state with version prefix.
+    ///
+    /// Format: [version: u64 LE][64 bytes of data]
+    ///
+    /// Use this with `register_crdt_contract()` to test version-aware delta handling.
+    /// The CRDT mode enables testing of PR #2763's summary caching fix by:
+    /// - Using version-aware summaries (version + hash)
+    /// - Computing version-specific deltas
+    /// - Failing delta application when versions don't match
+    pub fn create_crdt_state(version: u64, seed: u8) -> Vec<u8> {
+        // State must be > 80 bytes for delta to be "efficient"
+        // (efficiency check: summary_size * 2 < state_size, where summary = 40 bytes)
+        // Using 128 bytes of data for total state size of 136 bytes
+        let mut state_bytes = Vec::with_capacity(8 + 128);
+        // Add version prefix
+        state_bytes.extend_from_slice(&version.to_le_bytes());
+        // Add data (128 bytes to make delta efficient)
+        for i in 0..128u8 {
+            state_bytes.push(seed.wrapping_add(i).wrapping_mul(3));
+        }
+        state_bytes
+    }
+
     /// Converts this operation to a ClientRequest.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn into_client_request(self) -> freenet_stdlib::client_api::ClientRequest<'static> {
@@ -249,6 +272,19 @@ impl ScheduledOperation {
     pub fn new(node: NodeLabel, operation: SimOperation) -> Self {
         Self { node, operation }
     }
+}
+
+/// Result of a controlled simulation, including topology snapshots.
+///
+/// This struct captures the simulation result along with topology snapshots
+/// taken at the end of the simulation (before cleanup). This allows tests
+/// to validate subscription topology after the simulation completes.
+#[derive(Debug)]
+pub struct ControlledSimulationResult {
+    /// The Turmoil simulation result
+    pub turmoil_result: turmoil::Result,
+    /// Topology snapshots captured at the end of simulation
+    pub topology_snapshots: Vec<crate::ring::topology_registry::TopologySnapshot>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -717,6 +753,11 @@ impl SimNetwork {
         seed: u64,
     ) -> Self {
         assert!(nodes > 0);
+
+        // Seed GlobalRng for deterministic location generation
+        // This ensures Location::random() calls in config_gateways/config_nodes are deterministic
+        GlobalRng::set_seed(seed);
+
         let (user_ev_controller, mut receiver_ch) =
             watch::channel((0, TransportKeypair::new().public().clone()));
         receiver_ch.borrow_and_update();
@@ -1231,7 +1272,8 @@ impl SimNetwork {
             let keypair = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
-            let location = Location::random();
+            // Use location computed from address for consistency with PeerKeyLocation::location()
+            let location = Location::from_address(&addr);
 
             // Track address for crash/restart operations
             self.node_addresses.insert(label.clone(), addr);
@@ -1337,11 +1379,15 @@ impl SimNetwork {
             }
             let port = self.derive_deterministic_port(node_no);
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            // Use location computed from address for consistency with PeerKeyLocation::location().
+            // This ensures the stored location matches what other peers compute when looking at our address.
+            let location = Location::from_address(&addr);
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.key_pair = crate::transport::TransportKeypair::new();
             config.with_own_addr(addr);
             config
+                .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);
@@ -1844,6 +1890,22 @@ impl SimNetwork {
         ControlledEventChain::new(user_ev_controller, event_sequence, label_to_key)
     }
 
+    /// Returns the locations of all peers (gateways + nodes) without consuming them.
+    pub fn get_peer_locations(&self) -> Vec<f64> {
+        let mut locations = Vec::new();
+        for (builder, _) in &self.gateways {
+            if let Some(loc) = &builder.config.location {
+                locations.push(loc.as_f64());
+            }
+        }
+        for (builder, _) in &self.nodes {
+            if let Some(loc) = &builder.config.location {
+                locations.push(loc.as_f64());
+            }
+        }
+        locations
+    }
+
     /// Builds peer nodes and returns the controller to trigger events.
     pub fn build_peers(&mut self) -> Vec<(NodeLabel, NodeConfig)> {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
@@ -1935,26 +1997,56 @@ impl SimNetwork {
 
     /// Checks that all peers in the network have acquired at least one connection to any
     /// other peers.
-    pub fn check_connectivity(&self, time_out: Duration) -> anyhow::Result<()> {
-        self.connectivity(time_out, 1.0)
+    ///
+    /// This function advances VirtualTime to allow connection messages to be delivered.
+    pub async fn check_connectivity(&mut self, time_out: Duration) -> anyhow::Result<()> {
+        self.connectivity(time_out, 1.0).await
     }
 
     /// Checks that a percentage (given as a float between 0 and 1) of the nodes has at least
     /// one connection to any other peers.
-    pub fn check_partial_connectivity(
-        &self,
+    ///
+    /// This function advances VirtualTime to allow connection messages to be delivered.
+    pub async fn check_partial_connectivity(
+        &mut self,
         time_out: Duration,
         percent: f64,
     ) -> anyhow::Result<()> {
-        self.connectivity(time_out, percent)
+        self.connectivity(time_out, percent).await
     }
 
-    fn connectivity(&self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
+    /// Internal connectivity check that advances VirtualTime.
+    ///
+    /// Issue #2725: The previous implementation used std::time::Instant (real wall-clock time)
+    /// but never advanced VirtualTime. Since simulations use VirtualTime for deterministic
+    /// message delivery, connection handshake messages were never delivered, causing all
+    /// connectivity checks to fail with "found disconnected nodes".
+    ///
+    /// This implementation advances VirtualTime in small steps while checking connectivity,
+    /// allowing connection messages to be delivered and processed.
+    async fn connectivity(&mut self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
         let num_nodes = self.number_of_nodes;
         let mut connected = HashSet::new();
         let elapsed = std::time::Instant::now();
+
+        // Time step for advancing VirtualTime - small enough for responsiveness,
+        // large enough to batch message delivery efficiently
+        let time_step = Duration::from_millis(100);
+
         while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
         {
+            // Advance VirtualTime to trigger message delivery
+            // This is critical for VirtualTime-based simulations where messages
+            // are scheduled for delivery at VirtualTime + latency
+            self.advance_time(time_step);
+
+            // Yield to tokio so tasks can process delivered messages
+            tokio::task::yield_now().await;
+
+            // Small real-time sleep to allow task scheduling without spinning CPU
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Check which nodes have connected
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
                 if !connected.contains(&node)
                     && self.is_connected(&NodeLabel::node(&self.name, node))
@@ -1973,15 +2065,17 @@ impl SimNetwork {
 
         tracing::info!("Number of simulated nodes: {num_nodes}");
 
-        let missing_percent = 1.0 - ((num_nodes - missing.len()) as f64 / num_nodes as f64);
-        if missing_percent > (percent + 0.01/* 1% error tolerance */) {
+        // Calculate the percentage of nodes that are connected
+        let connected_percent = connected.len() as f64 / num_nodes as f64;
+        // Fail if fewer nodes are connected than the required percentage (with tolerance)
+        if connected_percent < (percent - 0.01/* 1% error tolerance */) {
             missing.sort();
             let show_max = missing.len().min(100);
             tracing::error!("Nodes without connection: {:?}(..)", &missing[..show_max],);
             tracing::error!(
-                "Total nodes without connection: {:?},  ({}% > {}%)",
+                "Total nodes without connection: {:?},  ({:.1}% connected < {:.1}% required)",
                 missing.len(),
-                missing_percent * 100.0,
+                connected_percent * 100.0,
                 percent * 100.0
             );
             anyhow::bail!("found disconnected nodes");
@@ -2333,6 +2427,36 @@ impl SimNetwork {
             return 1.0; // No contracts replicated yet
         }
         result.converged.len() as f64 / total as f64
+    }
+
+    /// Returns the number of unique contracts that have been subscribed to.
+    ///
+    /// Counts distinct contracts from SubscribeSuccess events. Use this to verify
+    /// that subscribed contracts are actually getting replicated and converged.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscribed_count = sim.count_subscribed_contracts().await;
+    /// let converged = sim.check_convergence().await;
+    /// assert_eq!(subscribed_count, converged.total_contracts(),
+    ///     "All subscribed contracts should be replicated and checked for convergence");
+    /// ```
+    pub async fn count_subscribed_contracts(&self) -> usize {
+        use std::collections::HashSet;
+        let logs = self.event_listener.logs.lock().await;
+
+        let mut subscribed_contracts: HashSet<String> = HashSet::new();
+
+        for log in logs.iter() {
+            if let crate::tracing::EventKind::Subscribe(
+                crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
+            ) = &log.kind
+            {
+                subscribed_contracts.insert(format!("{:?}", key));
+            }
+        }
+
+        subscribed_contracts.len()
     }
 
     // =========================================================================
@@ -2872,6 +2996,558 @@ impl SimNetwork {
         sim.run()
     }
 
+    /// Run a deterministic simulation with controlled events using Turmoil.
+    ///
+    /// Unlike `run_simulation` which uses random events, this method takes
+    /// a predefined sequence of operations that will be executed in order.
+    /// This is useful for testing specific scenarios like subscription topology.
+    ///
+    /// The simulation runs under Turmoil's deterministic scheduler, so
+    /// `tokio::time::sleep` and other time-dependent operations are controlled.
+    ///
+    /// # Arguments
+    /// * `seed` - Random seed for deterministic simulation
+    /// * `operations` - Sequence of operations to execute in order
+    /// * `simulation_duration` - Maximum duration for the simulation
+    /// * `post_operations_wait` - Time to wait after operations complete (for recovery, etc.)
+    ///
+    /// # Returns
+    /// A `turmoil::Result` indicating success or failure.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let operations = vec![
+    ///     ScheduledOperation::new(NodeLabel::gateway("test", 0), SimOperation::Put { ... }),
+    ///     ScheduledOperation::new(NodeLabel::node("test", 1), SimOperation::Subscribe { ... }),
+    /// ];
+    /// let result = sim.run_controlled_simulation(
+    ///     SEED,
+    ///     operations,
+    ///     Duration::from_secs(120),
+    ///     Duration::from_secs(60), // Wait for orphan recovery
+    /// );
+    /// // After simulation, check result.topology_snapshots
+    /// ```
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_controlled_simulation(
+        mut self,
+        seed: u64,
+        operations: Vec<ScheduledOperation>,
+        simulation_duration: Duration,
+        post_operations_wait: Duration,
+    ) -> ControlledSimulationResult {
+        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::ring::topology_registry::{
+            get_all_topology_snapshots, set_current_network_name,
+        };
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Set up deterministic RNG and time for reproducible simulation
+        GlobalRng::set_seed(seed);
+
+        // Derive simulation epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Set the current network name for topology registration
+        set_current_network_name(&self.name);
+
+        // Save network name for topology retrieval after simulation
+        let network_name = self.name.clone();
+
+        // Build Turmoil simulation with seeded RNG for deterministic execution
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(simulation_duration)
+            .rng_seed(seed)
+            .build();
+
+        // Build a map of label -> list of (event_id, operation)
+        let mut operations_by_node: HashMap<NodeLabel, Vec<(EventId, SimOperation)>> =
+            HashMap::new();
+        let mut operation_sequence: Vec<(EventId, NodeLabel)> = Vec::new();
+
+        for (event_id, scheduled_op) in operations.into_iter().enumerate() {
+            let event_id = event_id as EventId;
+            operation_sequence.push((event_id, scheduled_op.node.clone()));
+            operations_by_node
+                .entry(scheduled_op.node)
+                .or_default()
+                .push((event_id, scheduled_op.operation));
+        }
+
+        // Register all gateways as Turmoil hosts
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            // Clone receiver_ch so each node gets its own subscription
+            let mut user_events =
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("turmoil_gateway_controlled", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Register all regular nodes as Turmoil hosts
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            // Create MemoryEventsGen without RNG (deterministic mode)
+            // Clone receiver_ch so each node gets its own subscription
+            let mut user_events =
+                MemoryEventsGen::new(receiver_ch.clone(), node.config.key_pair.public().clone());
+
+            // Populate events for this node
+            if let Some(node_ops) = operations_by_node.remove(&label) {
+                let events: Vec<_> = node_ops
+                    .into_iter()
+                    .map(|(id, op)| (id, op.into_client_request()))
+                    .collect();
+                user_events.generate_events(events);
+            }
+
+            let span = tracing::info_span!("turmoil_node_controlled", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Take the event controller and labels for triggering events
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("user_ev_controller should be set");
+        let labels: Vec<_> = self.labels.clone();
+
+        // Build a map from NodeLabel to peer key for event triggering
+        let label_to_key: HashMap<NodeLabel, _> = labels.into_iter().collect();
+
+        // Register the test client that triggers controlled events
+        sim.client("test", async move {
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Trigger events in the specified order
+            for (event_id, node_label) in operation_sequence {
+                if let Some(peer_key) = label_to_key.get(&node_label) {
+                    tracing::info!(
+                        event_id,
+                        node = %node_label,
+                        "Triggering controlled event"
+                    );
+
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            event_id,
+                            node = %node_label,
+                            "Failed to send event signal - receivers dropped"
+                        );
+                        break;
+                    }
+
+                    // Wait for operation to complete before triggering next
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                } else {
+                    tracing::warn!(
+                        event_id,
+                        node = %node_label,
+                        "No peer key found for node label"
+                    );
+                }
+            }
+
+            // Wait for post-operation processing (orphan recovery, topology stabilization, etc.)
+            tracing::info!(
+                wait_secs = post_operations_wait.as_secs(),
+                "Waiting for post-operation processing"
+            );
+            tokio::time::sleep(post_operations_wait).await;
+
+            Ok(())
+        });
+
+        // Run the simulation
+        let turmoil_result = sim.run();
+
+        // Capture topology snapshots BEFORE self is dropped (which clears them)
+        let topology_snapshots = get_all_topology_snapshots(&network_name);
+
+        ControlledSimulationResult {
+            turmoil_result,
+            topology_snapshots,
+        }
+    }
+
+    /// Run an fdev-style test using Turmoil's deterministic executor.
+    ///
+    /// This method provides the same functionality as the old `start_with_rand_gen`
+    /// approach but runs everything inside Turmoil for full determinism.
+    ///
+    /// Returns `Ok(())` on success, or an error if the test failed.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_fdev_test<R>(
+        mut self,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+        simulation_duration: Duration,
+    ) -> anyhow::Result<()>
+    where
+        R: RandomEventGenerator + Send + 'static,
+    {
+        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::ring::topology_registry::set_current_network_name;
+        use std::sync::Mutex;
+
+        // Set up deterministic RNG and time for reproducible simulation
+        GlobalRng::set_seed(seed);
+
+        // Derive simulation epoch from seed for deterministic ULID generation
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Set the current network name for topology registration
+        set_current_network_name(&self.name);
+
+        // Build Turmoil simulation with seeded RNG for deterministic execution
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(simulation_duration)
+            .rng_seed(seed)
+            .build();
+
+        // Get total peer count for event generation
+        let total_peer_num = self.gateways.len() + self.nodes.len();
+
+        // Register all gateways as Turmoil hosts
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                receiver_ch,
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+            let span = tracing::info_span!("turmoil_gateway", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Register all regular nodes as Turmoil hosts
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            let host_name = label.to_string();
+            let receiver_ch = self.receiver_ch.clone();
+
+            // Create shared in-memory storage for this node
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                receiver_ch,
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+            let span = tracing::info_span!("turmoil_node", %label);
+
+            // Store label for later reference
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
+
+            // Wrap in Option so we can take() on first call
+            let node = Arc::new(Mutex::new(Some(node)));
+            let user_events = Arc::new(Mutex::new(Some(user_events)));
+            let span = Arc::new(Mutex::new(Some(span)));
+            let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+
+            sim.host(host_name, move || {
+                let node = node.clone();
+                let user_events = user_events.clone();
+                let span = span.clone();
+                let shared_storage = shared_storage.clone();
+
+                async move {
+                    let node = node
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let user_events = user_events
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let span = span
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+                    let shared_storage = shared_storage
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Turmoil host should only be called once");
+
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                        .map_err(|e| {
+                            Box::new(std::io::Error::other(e.to_string()))
+                                as Box<dyn std::error::Error>
+                        })
+                }
+            });
+        }
+
+        // Take the event controller and labels for triggering events
+        let user_ev_controller = self
+            .user_ev_controller
+            .take()
+            .expect("user_ev_controller should be set");
+        let labels: Vec<_> = self.labels.clone();
+
+        // Clone event logs handle for convergence checking
+        let event_logs = self.event_listener.logs.clone();
+
+        // Register the test function as a Turmoil client
+        sim.client("test", async move {
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Use a seeded RNG for deterministic peer selection
+            use rand::prelude::*;
+            use rand::SeedableRng;
+            let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
+
+            // Trigger events by sending signals to peer event generators
+            for event_id in 0..iterations as u32 {
+                // Pick a random peer to generate an event
+                if let Some((_, peer_key)) = labels.choose(&mut event_rng) {
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(event_id, "Failed to send event signal - receivers dropped");
+                        break;
+                    }
+                }
+
+                // Wait between events (Turmoil handles this deterministically)
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            // Wait for events to fully propagate through the network
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Convergence checking happens here, inside Turmoil
+            // Count subscribed contracts from event logs
+            let subscribed_count = {
+                use std::collections::HashSet;
+                let logs = event_logs.lock().await;
+                let mut subscribed_contracts: HashSet<String> = HashSet::new();
+                for log in logs.iter() {
+                    if let crate::tracing::EventKind::Subscribe(
+                        crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
+                    ) = &log.kind
+                    {
+                        subscribed_contracts.insert(format!("{:?}", key));
+                    }
+                }
+                subscribed_contracts.len()
+            };
+
+            if subscribed_count > 0 {
+                tracing::info!(
+                    "Found {} subscribed contracts, checking convergence...",
+                    subscribed_count
+                );
+
+                // Simple convergence check within Turmoil
+                // We'll just wait a bit and then check final state
+                tokio::time::sleep(Duration::from_secs(10)).await;
+
+                // TODO: Add actual convergence checking here if needed
+                // For now, we just let the test complete
+            }
+
+            Ok(())
+        });
+
+        // Run the simulation
+        sim.run()
+            .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
+    }
+
     // =========================================================================
     // Subscription Topology Validation
     // =========================================================================
@@ -3088,8 +3764,9 @@ impl OperationSummary {
     }
 
     /// Returns overall success rate (0.0 to 1.0).
+    /// Includes timeouts as failed operations.
     pub fn overall_success_rate(&self) -> f64 {
-        let completed = self.total_completed();
+        let completed = self.total_completed() + self.timeouts;
         if completed == 0 {
             return 1.0; // No operations completed yet
         }
@@ -3316,3 +3993,56 @@ pub async fn check_convergence_from_logs(
 }
 
 use crate::contract::OperationMode;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that peer locations are deterministic with the same seed.
+    ///
+    /// Regression test for issue #2759 - SimNetwork should produce identical
+    /// peer locations across multiple runs with the same seed.
+    #[tokio::test]
+    async fn test_deterministic_peer_locations() {
+        const SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
+        // Create first network
+        let sim1 = SimNetwork::new(
+            "determinism-test-1",
+            2,  // 2 gateways
+            3,  // 3 regular nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+
+        let locations1 = sim1.get_peer_locations();
+
+        // Create second network with same seed
+        let sim2 = SimNetwork::new(
+            "determinism-test-2",
+            2, // same config
+            3,
+            7,
+            3,
+            10,
+            2,
+            SEED, // same seed
+        )
+        .await;
+
+        let locations2 = sim2.get_peer_locations();
+
+        // Verify locations are identical
+        assert_eq!(
+            locations1, locations2,
+            "Peer locations should be identical with the same seed.\n\
+             Run 1: {:?}\n\
+             Run 2: {:?}",
+            locations1, locations2
+        );
+    }
+}

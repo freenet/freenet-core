@@ -625,14 +625,34 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
         }
     });
 
+    let startup_code = if args.health_check_readiness {
+        quote! {
+            // Health-check based readiness (wait until nodes actually respond)
+            tracing::info!("Waiting for nodes to become ready (health-check mode, timeout: {}s)", #startup_wait_secs);
+            match ctx.wait_for_all_nodes_ready(Duration::from_secs(#startup_wait_secs)).await {
+                Ok(ready_time) => {
+                    tracing::info!("All nodes ready in {:?}, starting test", ready_time);
+                }
+                Err(e) => {
+                    return Err(anyhow!("Nodes failed to become ready: {}", e));
+                }
+            }
+        }
+    } else {
+        quote! {
+            // Fixed startup wait (backward compatibility)
+            tracing::info!("Waiting {} seconds for nodes to start up (fixed wait)", #startup_wait_secs);
+            tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
+            tracing::info!("Startup wait complete, running test");
+        }
+    };
+
     quote! {
         let test_future = tokio::time::timeout(
             Duration::from_secs(#timeout_secs),
             async {
-                // Wait for nodes to start
-                tracing::info!("Waiting {} seconds for nodes to start up", #startup_wait_secs);
-                tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
-                tracing::info!("Nodes should be ready, running test");
+                // Wait for nodes to start (either health-check or fixed wait)
+                #startup_code
 
                 // Run user's test
                 #inner_fn_name(&mut ctx).await

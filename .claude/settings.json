@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(freenet-core-dev:pr-creation)",
+      "Skill(freenet-core-dev:pr-creation:*)"
+    ]
+  },
+  "enabledPlugins": {
+    "freenet-dapp-builder@freenet-agent-skills": false,
+    "freenet-core-dev@freenet-agent-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "freenet-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "freenet/freenet-agent-skills"
+      }
+    }
+  }
+}

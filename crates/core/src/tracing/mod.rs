@@ -972,112 +972,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    /// Create a downstream_added event when a peer subscribes through us.
-    pub fn downstream_added(
-        ring: &'a Ring,
-        key: ContractKey,
-        subscriber: PeerKeyLocation,
-        downstream_count: usize,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::DownstreamAdded {
-                key,
-                subscriber,
-                downstream_count,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create a downstream_removed event when a downstream subscriber is removed.
-    #[allow(dead_code)] // Helper available for future use
-    pub fn downstream_removed(
-        ring: &'a Ring,
-        key: ContractKey,
-        subscriber: Option<PeerKeyLocation>,
-        reason: DownstreamRemovedReason,
-        downstream_count: usize,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::DownstreamRemoved {
-                key,
-                subscriber,
-                reason,
-                downstream_count,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create an upstream_set event when we subscribe through another peer.
-    pub fn upstream_set(
-        ring: &'a Ring,
-        key: ContractKey,
-        upstream: PeerKeyLocation,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::UpstreamSet {
-                key,
-                upstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create an unsubscribed event when we unsubscribe from a contract's upstream.
-    #[allow(dead_code)] // Helper available for future use
-    pub fn unsubscribed(
-        ring: &'a Ring,
-        key: ContractKey,
-        reason: UnsubscribedReason,
-        upstream: Option<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::Unsubscribed {
-                key,
-                reason,
-                upstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
-    /// Create a subscription_state snapshot event.
-    pub fn subscription_state(
-        ring: &'a Ring,
-        key: ContractKey,
-        is_seeding: bool,
-        upstream: Option<PeerKeyLocation>,
-        downstream: Vec<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let downstream_count = downstream.len();
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::SubscriptionState {
-                key,
-                is_seeding,
-                upstream,
-                downstream_count,
-                downstream,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            }),
-        })
-    }
-
     pub fn from_outbound_msg(
         msg: &'a NetMessage,
         ring: &'a Ring,
@@ -1432,6 +1326,51 @@ impl<'a> NetEventLog<'a> {
             tx: msg.id(),
             peer_id,
             kind,
+        })
+    }
+
+    /// Create a ResyncRequestReceived event.
+    ///
+    /// This is emitted when we receive a ResyncRequest from a peer, indicating
+    /// they failed to apply a delta we sent them. High counts may indicate
+    /// incorrect summary caching (see PR #2763).
+    pub fn resync_request_received(
+        ring: &'a Ring,
+        key: ContractKey,
+        from_peer: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::InterestSync(InterestSyncEvent::ResyncRequestReceived {
+                key,
+                from_peer,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a ResyncResponseSent event.
+    ///
+    /// This is emitted when we send a ResyncResponse (full state) to a peer
+    /// after they requested a resync due to delta application failure.
+    pub fn resync_response_sent(
+        ring: &'a Ring,
+        key: ContractKey,
+        to_peer: PeerKeyLocation,
+        state_size: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::InterestSync(InterestSyncEvent::ResyncResponseSent {
+                key,
+                to_peer,
+                state_size,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
         })
     }
 }
@@ -2379,6 +2318,11 @@ pub enum EventKind {
     /// Emitted every N seconds (default 30s) with aggregate transport statistics.
     /// This is more efficient than per-transfer events and provides trend data.
     TransportSnapshot(crate::transport::TransportSnapshot),
+    /// Interest sync events for delta-based state synchronization.
+    ///
+    /// Tracks ResyncRequests and ResyncResponses which indicate delta application
+    /// failures. Useful for monitoring the health of the delta sync protocol.
+    InterestSync(InterestSyncEvent),
 }
 
 impl EventKind {
@@ -2394,6 +2338,7 @@ impl EventKind {
     const TRANSFER: u8 = 9;
     const LIFECYCLE: u8 = 10;
     const TRANSPORT_SNAPSHOT: u8 = 11;
+    const INTEREST_SYNC: u8 = 12;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -2409,6 +2354,7 @@ impl EventKind {
             EventKind::Transfer(_) => Self::TRANSFER,
             EventKind::Lifecycle(_) => Self::LIFECYCLE,
             EventKind::TransportSnapshot(_) => Self::TRANSPORT_SNAPSHOT,
+            EventKind::InterestSync(_) => Self::INTEREST_SYNC,
         }
     }
 
@@ -2474,6 +2420,7 @@ impl EventKind {
             EventKind::Disconnected { .. } => "Disconnected",
             EventKind::Timeout { .. } => "Timeout",
             EventKind::TransportSnapshot(_) => "TransportSnapshot",
+            EventKind::InterestSync(_) => "InterestSync",
         }
     }
 }
@@ -3049,7 +2996,11 @@ impl GetEvent {
 /// - Success when subscription is established
 /// - NotFound when contract doesn't exist after search
 /// - Seeding state changes (local client subscriptions)
-/// - Subscription tree structure changes (upstream/downstream relationships)
+///
+/// # Serialization Compatibility
+///
+/// Discriminants 6-10 are reserved for removed variants (2026-01 lease-based refactor).
+/// New variants should be added after `_Reserved10` (discriminant 11+).
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) enum SubscribeEvent {
@@ -3126,74 +3077,20 @@ pub(crate) enum SubscribeEvent {
         reason: SeedingStoppedReason,
         timestamp: u64,
     },
-    /// A downstream subscriber was added for a contract.
-    ///
-    /// This event fires when another peer subscribes through us,
-    /// meaning we need to forward updates to them.
-    DownstreamAdded {
-        /// Contract for which subscriber was added.
-        key: ContractKey,
-        /// The new downstream subscriber.
-        subscriber: PeerKeyLocation,
-        /// Current count of downstream subscribers after this addition.
-        downstream_count: usize,
-        timestamp: u64,
-    },
-    /// A downstream subscriber was removed for a contract.
-    ///
-    /// This event fires when a peer that subscribed through us disconnects or unsubscribes.
-    DownstreamRemoved {
-        /// Contract from which subscriber was removed.
-        key: ContractKey,
-        /// The removed downstream subscriber (if known).
-        subscriber: Option<PeerKeyLocation>,
-        /// Reason for removal.
-        reason: DownstreamRemovedReason,
-        /// Remaining downstream subscribers after removal.
-        downstream_count: usize,
-        timestamp: u64,
-    },
-    /// An upstream source was set for a contract.
-    ///
-    /// This event fires when we subscribe to a contract through another peer,
-    /// meaning we will receive updates from them.
-    UpstreamSet {
-        /// Contract for which upstream was set.
-        key: ContractKey,
-        /// The upstream peer we subscribed through.
-        upstream: PeerKeyLocation,
-        timestamp: u64,
-    },
-    /// We unsubscribed from a contract's upstream.
-    ///
-    /// This event fires when we no longer need to receive updates for a contract,
-    /// typically because all local clients and downstream subscribers have gone.
-    Unsubscribed {
-        /// Contract we unsubscribed from.
-        key: ContractKey,
-        /// Reason for unsubscribing.
-        reason: UnsubscribedReason,
-        /// The upstream peer we unsubscribed from (if any).
-        upstream: Option<PeerKeyLocation>,
-        timestamp: u64,
-    },
-    /// Snapshot of subscription state for a contract.
-    ///
-    /// This periodic or on-change event provides visibility into the full
-    /// subscription tree structure for debugging update propagation.
-    SubscriptionState {
-        /// Contract this state is for.
-        key: ContractKey,
-        /// Whether we are locally seeding this contract (local client subscribed).
-        is_seeding: bool,
-        /// Our upstream source for updates (if any).
-        upstream: Option<PeerKeyLocation>,
-        /// Number of downstream subscribers.
-        downstream_count: usize,
-        /// List of downstream subscribers.
-        downstream: Vec<PeerKeyLocation>,
-        timestamp: u64,
-    },
+    // Reserved discriminants 6-10 for removed variants (2026-01 lease-based refactor).
+    // These placeholders ensure old stored events with these discriminants fail
+    // deserialization cleanly rather than being misinterpreted as new variants.
+    // New variants should be added after _Reserved10.
+    #[doc(hidden)]
+    _Reserved6,
+    #[doc(hidden)]
+    _Reserved7,
+    #[doc(hidden)]
+    _Reserved8,
+    #[doc(hidden)]
+    _Reserved9,
+    #[doc(hidden)]
+    _Reserved10,
 }
 
 impl SubscribeEvent {
@@ -3201,12 +3098,7 @@ impl SubscribeEvent {
     /// Only some variants have the full key; Request and some others have instance_id.
     fn contract_key(&self) -> Option<ContractKey> {
         match self {
-            SubscribeEvent::SubscribeSuccess { key, .. }
-            | SubscribeEvent::DownstreamAdded { key, .. }
-            | SubscribeEvent::DownstreamRemoved { key, .. }
-            | SubscribeEvent::UpstreamSet { key, .. }
-            | SubscribeEvent::Unsubscribed { key, .. }
-            | SubscribeEvent::SubscriptionState { key, .. } => Some(*key),
+            SubscribeEvent::SubscribeSuccess { key, .. } => Some(*key),
             SubscribeEvent::ResponseSent { key, .. } => *key,
             _ => None,
         }
@@ -3221,28 +3113,6 @@ pub enum SeedingStoppedReason {
     LastClientUnsubscribed,
     /// Client disconnected.
     ClientDisconnected,
-}
-
-/// Reason why a downstream subscriber was removed.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum DownstreamRemovedReason {
-    /// Peer explicitly unsubscribed.
-    PeerUnsubscribed,
-    /// Peer disconnected from the network.
-    PeerDisconnected,
-}
-
-/// Reason why we unsubscribed from upstream.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum UnsubscribedReason {
-    /// Last local client unsubscribed.
-    LastClientUnsubscribed,
-    /// Last downstream subscriber disconnected and no local clients.
-    NoRemainingInterest,
-    /// Upstream peer disconnected.
-    UpstreamDisconnected,
 }
 
 /// Direction of data transfer.
@@ -3383,8 +3253,45 @@ pub enum PeerLifecycleEvent {
     },
 }
 
+/// Interest sync events for delta-based state synchronization.
+///
+/// These events track the interest sync protocol operations, particularly
+/// ResyncRequests which indicate delta application failures. High ResyncRequest
+/// counts may indicate incorrect summary caching (see PR #2763).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum InterestSyncEvent {
+    /// A ResyncRequest was received from a peer.
+    ///
+    /// This indicates the peer failed to apply a delta we sent them,
+    /// likely due to version mismatch. We respond with full state.
+    ResyncRequestReceived {
+        /// Contract for which resync was requested.
+        key: ContractKey,
+        /// The peer that sent the ResyncRequest.
+        from_peer: PeerKeyLocation,
+        /// Timestamp of the event.
+        timestamp: u64,
+    },
+    /// A ResyncResponse (full state) was sent to a peer.
+    ///
+    /// This is the response to a ResyncRequest, providing the peer
+    /// with our full state so they can recover from the delta failure.
+    ResyncResponseSent {
+        /// Contract for which resync response was sent.
+        key: ContractKey,
+        /// The peer we sent the response to.
+        to_peer: PeerKeyLocation,
+        /// Size of the state sent (bytes).
+        state_size: usize,
+        /// Timestamp of the event.
+        timestamp: u64,
+    },
+}
+
 #[cfg(feature = "trace")]
 pub mod tracer {
+    use std::io::IsTerminal;
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use tracing::level_filters::LevelFilter;
@@ -3503,12 +3410,20 @@ pub mod tracer {
         // doesn't capture stdout, making `freenet service report` unable to collect logs.
         let use_file_logging = !to_stderr && get_log_dir().is_some();
 
-        // Build filter
-        let filter_layer = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_filter.into())
-            .from_env_lossy()
-            .add_directive("stretto=off".parse().expect("infallible"))
-            .add_directive("sqlx=error".parse().expect("infallible"));
+        // Build filter (we'll create separate instances for each layer since filters are consumed)
+        fn build_filter(default_filter: LevelFilter) -> tracing_subscriber::EnvFilter {
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(default_filter.into())
+                .from_env_lossy()
+                .add_directive("stretto=off".parse().expect("infallible"))
+                .add_directive("sqlx=error".parse().expect("infallible"))
+        }
+
+        let filter_layer = build_filter(default_filter);
+
+        // Also output to console when running interactively (stdout is a terminal)
+        // This restores the expected console output while keeping file logging for diagnostic reports
+        let also_log_to_console = std::io::stdout().is_terminal();
 
         // Get rate limit from environment or use default (1000 events/sec)
         let rate_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT")
@@ -3597,9 +3512,23 @@ pub mod tracer {
                         .with_writer(error_writer.clone())
                         .with_filter(error_filter);
 
-                    let subscriber = base.with(main_layer).with(error_layer);
-                    tracing::subscriber::set_global_default(subscriber)
-                        .expect("Error setting subscriber");
+                    // Add console layer if running interactively
+                    if also_log_to_console {
+                        let console_filter = build_filter(default_filter);
+                        let console_layer = tracing_subscriber::fmt::layer()
+                            .with_level(true)
+                            .pretty()
+                            .with_filter(console_filter);
+
+                        let subscriber =
+                            base.with(main_layer).with(error_layer).with(console_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    } else {
+                        let subscriber = base.with(main_layer).with(error_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    }
                 } else {
                     // Create layers for main and error logs (typed against plain registry)
                     let main_layer = tracing_subscriber::fmt::layer()
@@ -3618,9 +3547,25 @@ pub mod tracer {
                         .with_writer(error_writer)
                         .with_filter(error_filter);
 
-                    let subscriber = Registry::default().with(main_layer).with(error_layer);
-                    tracing::subscriber::set_global_default(subscriber)
-                        .expect("Error setting subscriber");
+                    // Add console layer if running interactively
+                    if also_log_to_console {
+                        let console_filter = build_filter(default_filter);
+                        let console_layer = tracing_subscriber::fmt::layer()
+                            .with_level(true)
+                            .pretty()
+                            .with_filter(console_filter);
+
+                        let subscriber = Registry::default()
+                            .with(main_layer)
+                            .with(error_layer)
+                            .with(console_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    } else {
+                        let subscriber = Registry::default().with(main_layer).with(error_layer);
+                        tracing::subscriber::set_global_default(subscriber)
+                            .expect("Error setting subscriber");
+                    }
                 }
 
                 return Ok(());

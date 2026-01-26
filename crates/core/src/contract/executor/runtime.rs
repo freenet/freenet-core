@@ -286,6 +286,24 @@ impl RuntimePool {
 
         Ok(executor)
     }
+
+    /// Get a reference to the shared state store.
+    /// Used for hosting metadata persistence operations during startup.
+    pub fn state_store(&self) -> &StateStore<Storage> {
+        &self.shared_state_store
+    }
+
+    /// Look up a code hash from an instance ID.
+    /// Used for legacy contract migration during startup.
+    pub fn code_hash_from_id(&self, instance_id: &ContractInstanceId) -> Option<CodeHash> {
+        // Try to find the code hash in any available executor
+        self.runtimes.iter().flatten().find_map(|executor| {
+            executor
+                .runtime
+                .contract_store
+                .code_hash_from_id(instance_id)
+        })
+    }
 }
 
 impl ContractExecutor for RuntimePool {
@@ -790,6 +808,7 @@ impl ContractExecutor for Executor<Runtime> {
                             }
 
                             // Notify network peers of new contract state (automatic propagation)
+                            // For new contracts (PUT), we don't exclude any sender since this is locally initiated
                             if let Some(op_manager) = &self.op_manager {
                                 tracing::info!(
                                     contract = %key,
@@ -1876,6 +1895,7 @@ impl Executor<Runtime> {
         }
 
         // Notify network peers of state change (automatic propagation)
+        // Echo-back prevention is handled by summary comparison in p2p_protoc
         if let Some(op_manager) = &self.op_manager {
             if let Err(err) = op_manager
                 .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {

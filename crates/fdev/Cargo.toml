@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.73"
+version = "0.3.80"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -44,9 +44,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 http = "1.4"
 
 # internal
-freenet = { path = "../core", version = "0.1.99" }
+freenet = { path = "../core", version = "0.1.106", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [features]
 trace-ot = ["freenet/trace-ot"]
-# Note: Turmoil-based deterministic simulation is now always enabled in freenet core
+# testing feature is always enabled for fdev (it's a development tool)

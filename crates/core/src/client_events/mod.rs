@@ -1154,12 +1154,12 @@ async fn process_open_request(
                         let local_satisfies_request =
                             has_local_state && (!return_contract_code || contract.is_some());
 
-                        // Check if we're part of the subscription tree for this contract.
-                        // This includes upstream/downstream network subscriptions AND local clients.
-                        // If we're in the tree, our cache is kept fresh via subscription updates.
+                        // Check if we should seed this contract (have an active subscription,
+                        // client subscriptions, or it's in our seeding cache).
+                        // If so, our cache is kept fresh via proximity cache updates.
                         let is_subscribed = full_key
                             .as_ref()
-                            .map(|k| op_manager.ring.is_in_subscription_tree(k))
+                            .map(|k| op_manager.ring.should_seed(k))
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND EITHER:
@@ -1531,11 +1531,13 @@ async fn process_open_request(
                                 })?;
 
                             // Start dedicated operation for this client AFTER registration
+                            // is_renewal: false - client-initiated subscriptions are new
                             let _result_tx = crate::node::subscribe_with_id(
                                 op_manager.clone(),
                                 key,
                                 None, // No legacy registration
                                 Some(tx),
+                                false,
                             )
                             .await
                             .inspect_err(|err| {
@@ -1579,19 +1581,26 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %tx,
-                                        contract = %key,
-                                        error = %err,
-                                        phase = "error",
-                                        "SUBSCRIBE operation failed"
-                                    );
-                                })?;
+                            // is_renewal: false - client-initiated subscriptions are new
+                            crate::node::subscribe_with_id(
+                                op_manager.clone(),
+                                key,
+                                None,
+                                Some(tx),
+                                false,
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %tx,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "SUBSCRIBE operation failed"
+                                );
+                            })?;
 
                             tracing::debug!(
                                 request_id = %request_id,

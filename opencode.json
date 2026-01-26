@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-agent-skills"],
+  "permission": {
+    "skill": {
+      "dapp-builder": "allow",
+      "pr-creation": "allow",
+      "systematic-debugging": "allow",
+      "*": "ask"
+    }
+  }
+}

@@ -36,7 +36,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, GlobalExecutor, GlobalRng, WebsocketApiConfig},
+    config::{Address, GatewayConfig, GlobalRng, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -44,9 +44,9 @@ use crate::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
-    ring::{Location, PeerKeyLocation, SubscriberType},
+    ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
-    tracing::{DownstreamRemovedReason, EventRegister, NetEventLog, NetEventRegister},
+    tracing::{EventRegister, NetEventLog, NetEventRegister},
 };
 use crate::{
     config::Config,
@@ -956,53 +956,6 @@ where
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed {
-                ref key,
-                ref from,
-                ref transaction,
-            } => {
-                tracing::debug!(%key, %from, "Received Unsubscribed");
-                let peer_id = PeerId {
-                    addr: from
-                        .socket_addr()
-                        .expect("from peer should have socket address"),
-                    pub_key: from.pub_key().clone(),
-                };
-
-                let result = op_manager.ring.remove_subscriber(key, &peer_id);
-
-                // Emit telemetry for downstream removal
-                if result.removed && result.removed_role == Some(SubscriberType::Downstream) {
-                    if let Some(event) = NetEventLog::downstream_removed(
-                        &op_manager.ring,
-                        *key,
-                        Some(from.clone()),
-                        DownstreamRemovedReason::PeerUnsubscribed,
-                        result.downstream_count,
-                    ) {
-                        op_manager.ring.register_events(Either::Left(event)).await;
-                    }
-                }
-
-                if let Some(upstream) = result.notify_upstream {
-                    let upstream_addr = upstream
-                        .socket_addr()
-                        .expect("upstream must have socket address");
-                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
-
-                    let own_location = op_manager.ring.connection_manager.own_location();
-                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
-                        transaction: *transaction,
-                        key: *key,
-                        from: own_location,
-                    });
-
-                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
-                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
-                    }
-                }
-                break;
-            }
             NetMessageV1::ProximityCache { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!(
@@ -1015,87 +968,10 @@ where
                     "Processing ProximityCache message (pure network)"
                 );
 
-                // Check if announced contracts could establish upstream subscriptions.
-                // This runs before handle_message to capture the added contracts.
-                if let crate::message::ProximityCacheMessage::CacheAnnounce { ref added, .. } =
-                    message
-                {
-                    // Check if sender is closer to any contracts we're seeding without upstream
-                    let our_loc = op_manager.ring.connection_manager.own_location();
-                    if let Some(our_location) = our_loc.location() {
-                        // Get sender's location from ring
-                        if let Some(sender_loc) = op_manager
-                            .ring
-                            .connection_manager
-                            .get_peer_location_by_addr(source)
-                            .and_then(|p| p.location())
-                        {
-                            // Build a HashMap for O(1) lookups instead of O(n*m) nested loops
-                            let contracts_without_upstream: std::collections::HashMap<_, _> =
-                                op_manager
-                                    .ring
-                                    .contracts_without_upstream()
-                                    .into_iter()
-                                    .map(|c| (*c.id(), c))
-                                    .collect();
-
-                            for announced_id in added {
-                                // O(1) lookup instead of iterating all contracts
-                                if let Some(contract) = contracts_without_upstream.get(announced_id)
-                                {
-                                    let contract_location = crate::ring::Location::from(contract);
-                                    let our_distance = our_location.distance(contract_location);
-                                    let sender_distance = sender_loc.distance(contract_location);
-
-                                    // Sender is closer - they might be upstream
-                                    if sender_distance < our_distance
-                                        && op_manager.ring.can_request_subscription(contract)
-                                    {
-                                        tracing::info!(
-                                            %contract,
-                                            %source,
-                                            sender_distance = %sender_distance,
-                                            our_distance = %our_distance,
-                                            "Neighbor with cached contract is closer, attempting subscription"
-                                        );
-
-                                        let contract_key = *contract;
-                                        if op_manager.ring.mark_subscription_pending(contract_key) {
-                                            let op_manager_clone = op_manager.clone();
-                                            GlobalExecutor::spawn(async move {
-                                                let instance_id = *contract_key.id();
-                                                let sub_op = crate::operations::subscribe::start_op(
-                                                    instance_id,
-                                                );
-                                                let result =
-                                                    crate::operations::subscribe::request_subscribe(
-                                                        &op_manager_clone,
-                                                        sub_op,
-                                                    )
-                                                    .await;
-
-                                                let success = result.is_ok();
-                                                if let Err(ref e) = result {
-                                                    tracing::warn!(
-                                                        %contract_key,
-                                                        error = %e,
-                                                        "Failed to re-establish subscription on cache announce"
-                                                    );
-                                                }
-                                                op_manager_clone
-                                                    .ring
-                                                    .complete_subscription_request(
-                                                        &contract_key,
-                                                        success,
-                                                    );
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // Note: In the simplified architecture (2026-01 refactor), we no longer
+                // attempt to establish subscriptions based on CacheAnnounce messages.
+                // Update propagation uses the proximity cache directly, and subscriptions
+                // are lease-based with automatic expiry.
 
                 if let Some(response) = op_manager
                     .proximity_cache
@@ -1169,6 +1045,21 @@ async fn handle_pure_network_result(
             tracing::debug!("Network operation returned no result");
         }
         Err(OpError::StatePushed) => {
+            return Ok(None);
+        }
+        Err(OpError::OpNotPresent(tx_id)) => {
+            // OpNotPresent means a response arrived for an operation that no longer exists.
+            // This is benign - it happens when:
+            // 1. An operation timed out before the response arrived
+            // 2. A late response arrives after a peer restart
+            // 3. The operation was already completed via another path
+            //
+            // We log at debug level and return Ok(None) to avoid propagating
+            // confusing "op not present" errors to clients.
+            tracing::debug!(
+                tx = %tx_id,
+                "Network response arrived for non-existent operation (likely timed out or already completed)"
+            );
             return Ok(None);
         }
         Err(e) => {
@@ -1326,8 +1217,13 @@ async fn handle_interest_sync_message(
             tracing::info!(
                 from = %source,
                 contract = %key,
+                event = "resync_request_received",
                 "Received ResyncRequest - peer needs full state"
             );
+
+            // Track this for testing - high counts indicate incorrect summary caching (PR #2763)
+            op_manager.interest_manager.record_resync_request_received();
+            crate::config::GlobalTestMetrics::record_resync_request();
 
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
@@ -1335,6 +1231,29 @@ async fn handle_interest_sync_message(
                 op_manager
                     .interest_manager
                     .update_peer_summary(&key, pk, None);
+            }
+
+            // Get PeerKeyLocation for telemetry
+            let from_peer = op_manager.ring.connection_manager.get_peer_by_addr(source);
+
+            // Emit telemetry for ResyncRequest received
+            if let Some(ref from_pkl) = from_peer {
+                if let Some(event) = crate::tracing::NetEventLog::resync_request_received(
+                    &op_manager.ring,
+                    key,
+                    from_pkl.clone(),
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            } else {
+                tracing::debug!(
+                    contract = %key,
+                    source = %source,
+                    "ResyncRequest telemetry skipped: peer lookup failed"
+                );
             }
 
             // Fetch current state from store
@@ -1357,12 +1276,29 @@ async fn handle_interest_sync_message(
                 return None;
             };
 
-            tracing::debug!(
+            tracing::info!(
+                to = %source,
                 contract = %key,
                 state_size = state.as_ref().len(),
                 summary_size = summary.as_ref().len(),
+                event = "resync_response_sent",
                 "Sending ResyncResponse with full state"
             );
+
+            // Emit telemetry for ResyncResponse sent
+            if let Some(ref to_pkl) = from_peer {
+                if let Some(event) = crate::tracing::NetEventLog::resync_response_sent(
+                    &op_manager.ring,
+                    key,
+                    to_pkl.clone(),
+                    state.as_ref().len(),
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            }
 
             Some(InterestMessage::ResyncResponse {
                 key,
@@ -1380,6 +1316,7 @@ async fn handle_interest_sync_message(
                 from = %source,
                 contract = %key,
                 state_size = state_bytes.len(),
+                event = "resync_response_received",
                 "Received ResyncResponse with full state"
             );
 
@@ -1400,21 +1337,37 @@ async fn handle_interest_sync_message(
                 Ok(ContractHandlerEvent::UpdateResponse {
                     new_value: Ok(_), ..
                 }) => {
-                    tracing::debug!(contract = %key, "ResyncResponse state applied successfully");
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = true,
+                        "ResyncResponse state applied successfully"
+                    );
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                    tracing::debug!(contract = %key, "ResyncResponse state unchanged");
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = false,
+                        "ResyncResponse state unchanged (already had this state)"
+                    );
                 }
                 Ok(other) => {
                     tracing::warn!(
+                        from = %source,
                         contract = %key,
+                        event = "resync_failed",
                         response = ?other,
                         "Unexpected response to resync update"
                     );
                 }
                 Err(e) => {
                     tracing::error!(
+                        from = %source,
                         contract = %key,
+                        event = "resync_failed",
                         error = %e,
                         "Failed to apply resync state"
                     );
@@ -1516,19 +1469,24 @@ pub async fn subscribe(
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    subscribe_with_id(op_manager, instance_id, client_id, None).await
+    // Client-initiated subscriptions are never renewals
+    subscribe_with_id(op_manager, instance_id, client_id, None, false).await
 }
 
 /// Attempts to subscribe to a contract with a specific transaction ID (for deduplication)
+///
+/// `is_renewal` indicates whether this is a renewal (requester already has the contract).
+/// If true, the responder will skip sending state to save bandwidth.
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
     transaction_id: Option<Transaction>,
+    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
     let op = match transaction_id {
-        Some(id) => subscribe::start_op_with_id(instance_id, id),
-        None => subscribe::start_op(instance_id),
+        Some(id) => subscribe::start_op_with_id(instance_id, id, is_renewal),
+        None => subscribe::start_op(instance_id, is_renewal),
     };
     let id = op.id;
     if let Some(client_id) = client_id {
