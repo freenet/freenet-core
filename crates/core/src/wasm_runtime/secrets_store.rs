@@ -73,12 +73,11 @@ impl SecretsStore {
             }
         }
 
-        // Migrate from legacy KEY_DATA file if it exists
+        // Migrate from legacy KEY_DATA file if it exists and hasn't been migrated
         let key_file = secrets_dir.join("KEY_DATA");
-        if key_file.exists() {
-            if let Err(e) = Self::migrate_from_legacy(&key_file, &db, &key_to_secret_part) {
-                tracing::warn!("Failed to migrate legacy KEY_DATA: {e}");
-            }
+        let migration_marker = secrets_dir.join(".migration_complete");
+        if key_file.exists() && !migration_marker.exists() {
+            Self::migrate_from_legacy(&key_file, &db, &key_to_secret_part)?;
         }
 
         Ok(Self {
@@ -190,7 +189,29 @@ impl SecretsStore {
             key_to_secret_part.insert(entry.key().clone(), entry.value().1.clone());
         }
 
-        tracing::info!("Migrated {count} secrets index entries to ReDb");
+        // Verify migration succeeded by reading back from ReDb
+        let verified = db.load_all_secrets_index().map_err(|e| {
+            tracing::error!("Failed to verify migration: {e}");
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+
+        if verified.len() != count {
+            let msg = format!(
+                "Migration verification failed: wrote {} entries, read back {}",
+                count,
+                verified.len()
+            );
+            tracing::error!("{msg}");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
+        }
+
+        tracing::info!("Migrated and verified {count} secrets index entries to ReDb");
+
+        // Create marker file to prevent re-migration even if rename fails
+        let marker_path = key_file.parent().unwrap().join(".migration_complete");
+        if let Err(e) = std::fs::write(&marker_path, b"secrets_store") {
+            tracing::warn!("Failed to create migration marker: {e}");
+        }
 
         // Rename the legacy file to mark it as migrated
         let migrated_path = key_file.with_extension("migrated");

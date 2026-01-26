@@ -51,12 +51,11 @@ impl ContractStore {
             }
         }
 
-        // Migrate from legacy KEY_DATA file if it exists
+        // Migrate from legacy KEY_DATA file if it exists and hasn't been migrated
         let key_file = contracts_dir.join("KEY_DATA");
-        if key_file.exists() {
-            if let Err(e) = Self::migrate_from_legacy(&key_file, &db, &key_to_code_part) {
-                tracing::warn!("Failed to migrate legacy KEY_DATA: {e}");
-            }
+        let migration_marker = contracts_dir.join(".migration_complete");
+        if key_file.exists() && !migration_marker.exists() {
+            Self::migrate_from_legacy(&key_file, &db, &key_to_code_part)?;
         }
 
         Ok(Self {
@@ -125,7 +124,29 @@ impl ContractStore {
             key_to_code_part.insert(*instance_id, *code_hash);
         }
 
-        tracing::info!("Migrated {count} contract index entries to ReDb");
+        // Verify migration succeeded by reading back from ReDb
+        let verified = db.load_all_contract_index().map_err(|e| {
+            tracing::error!("Failed to verify migration: {e}");
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+
+        if verified.len() != count {
+            let msg = format!(
+                "Migration verification failed: wrote {} entries, read back {}",
+                count,
+                verified.len()
+            );
+            tracing::error!("{msg}");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
+        }
+
+        tracing::info!("Migrated and verified {count} contract index entries to ReDb");
+
+        // Create marker file to prevent re-migration even if rename fails
+        let marker_path = key_file.parent().unwrap().join(".migration_complete");
+        if let Err(e) = std::fs::write(&marker_path, b"contract_store") {
+            tracing::warn!("Failed to create migration marker: {e}");
+        }
 
         // Rename the legacy file to mark it as migrated
         let migrated_path = key_file.with_extension("migrated");
@@ -485,6 +506,158 @@ mod test {
             fetched.is_some(),
             "Contract should be fetchable after store_contract adds missing index entry"
         );
+
+        Ok(())
+    }
+
+    /// Migration test: Verify legacy KEY_DATA files are correctly migrated to ReDb.
+    ///
+    /// This test:
+    /// 1. Creates a legacy KEY_DATA file using the old file format
+    /// 2. Creates a ContractStore (which should trigger migration)
+    /// 3. Verifies all entries are in ReDb
+    /// 4. Verifies KEY_DATA was renamed to .migrated
+    /// 5. Verifies contracts can be fetched after migration
+    #[tokio::test]
+    async fn test_migration_from_legacy_key_data() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::wasm_runtime::store::{SafeWriter, StoreFsManagement};
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        std::fs::create_dir_all(&contracts_dir)?;
+
+        // Helper to create a contract with specific index
+        fn make_contract(i: u8) -> (ContractInstanceId, CodeHash) {
+            let code = vec![i, i + 1, i + 2];
+            let params: Parameters = vec![i * 10, i * 10 + 1].into();
+            let contract =
+                WrappedContract::new(Arc::new(ContractCode::from(code)), params.into_owned());
+            (*contract.key().id(), *contract.key().code_hash())
+        }
+
+        // Create test contracts and write WASM files
+        let mut test_contracts: Vec<(ContractInstanceId, CodeHash)> = Vec::new();
+        for i in 0..5u8 {
+            let (instance_id, code_hash) = make_contract(i);
+
+            // Write the WASM file to disk
+            let code = vec![i, i + 1, i + 2];
+            let params: Parameters = vec![i * 10, i * 10 + 1].into();
+            let contract =
+                WrappedContract::new(Arc::new(ContractCode::from(code)), params.into_owned());
+            let wasm_path = contracts_dir
+                .join(code_hash.encode())
+                .with_extension("wasm");
+            let code_bytes = contract
+                .code()
+                .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+                .unwrap();
+            let mut file = std::fs::File::create(&wasm_path)?;
+            std::io::Write::write_all(&mut file, &code_bytes)?;
+
+            test_contracts.push((instance_id, code_hash));
+        }
+
+        // Step 1: Create a legacy KEY_DATA file using the old format
+        let key_file = contracts_dir.join("KEY_DATA");
+        {
+            // Define a helper to write to legacy format
+            struct LegacyWriter;
+            impl StoreFsManagement for LegacyWriter {
+                type MemContainer = Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>;
+                type Key = ContractInstanceId;
+                type Value = CodeHash;
+
+                fn insert_in_container(
+                    container: &mut Self::MemContainer,
+                    (key, offset): (Self::Key, u64),
+                    value: Self::Value,
+                ) {
+                    container.insert(key, (offset, value));
+                }
+
+                fn clear_container(container: &mut Self::MemContainer) {
+                    container.clear();
+                }
+            }
+
+            let mut file = SafeWriter::<LegacyWriter>::new(&key_file, false)?;
+            for (instance_id, code_hash) in &test_contracts {
+                LegacyWriter::insert(&mut file, *instance_id, code_hash)?;
+            }
+        }
+
+        // Verify KEY_DATA file exists
+        assert!(
+            key_file.exists(),
+            "KEY_DATA file should exist before migration"
+        );
+
+        // Step 2: Create ContractStore - this should trigger migration
+        let db = create_test_db(temp_dir.path()).await;
+        let store = ContractStore::new(contracts_dir.clone(), 100_000, db)?;
+
+        // Step 3: Verify KEY_DATA was renamed to .migrated
+        assert!(
+            !key_file.exists(),
+            "KEY_DATA should be renamed after migration"
+        );
+        assert!(
+            key_file.with_extension("migrated").exists(),
+            "KEY_DATA.migrated should exist after migration"
+        );
+
+        // Step 4: Verify .migration_complete marker exists
+        assert!(
+            contracts_dir.join(".migration_complete").exists(),
+            ".migration_complete marker should exist"
+        );
+
+        // Step 5: Verify all entries can be looked up via code_hash_from_id
+        for (instance_id, expected_code_hash) in &test_contracts {
+            let code_hash = store.code_hash_from_id(instance_id);
+            assert!(
+                code_hash.is_some(),
+                "code_hash_from_id should find migrated entry for {instance_id}"
+            );
+            assert_eq!(
+                code_hash.unwrap(),
+                *expected_code_hash,
+                "code_hash should match for {instance_id}"
+            );
+        }
+
+        // Step 6: Verify contracts can be fetched
+        for i in 0..5u8 {
+            let code = vec![i, i + 1, i + 2];
+            let params: Parameters = vec![i * 10, i * 10 + 1].into();
+            let contract = WrappedContract::new(
+                Arc::new(ContractCode::from(code)),
+                params.clone().into_owned(),
+            );
+            let fetched = store.fetch_contract(contract.key(), &params);
+            assert!(
+                fetched.is_some(),
+                "fetch_contract should work for migrated contract {i}"
+            );
+        }
+
+        // Step 7: Verify migration is idempotent - create new store, should not re-migrate
+        drop(store);
+        let db2 = create_test_db(temp_dir.path()).await;
+        let store2 = ContractStore::new(contracts_dir.clone(), 100_000, db2)?;
+
+        // Should still have all entries
+        for (instance_id, expected_code_hash) in &test_contracts {
+            let code_hash = store2.code_hash_from_id(instance_id);
+            assert!(
+                code_hash.is_some(),
+                "entries should persist after re-opening store"
+            );
+            assert_eq!(code_hash.unwrap(), *expected_code_hash);
+        }
 
         Ok(())
     }
