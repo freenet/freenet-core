@@ -108,24 +108,24 @@ impl ContractStore {
         let count = legacy_container.len();
         tracing::info!("Found {count} entries in legacy KEY_DATA file");
 
-        // Migrate each entry to ReDb
-        let mut migrated = 0;
-        for entry in legacy_container.iter() {
-            let instance_id = entry.key();
-            let code_hash = &entry.value().1;
+        // Collect entries for batch insert
+        let entries: Vec<(ContractInstanceId, CodeHash)> = legacy_container
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().1))
+            .collect();
 
-            // Store in ReDb
-            if let Err(e) = db.store_contract_index(instance_id, code_hash) {
-                tracing::warn!("Failed to migrate contract index entry: {e}");
-                continue;
-            }
+        // Batch insert into ReDb (single transaction)
+        db.store_contract_index_batch(&entries).map_err(|e| {
+            tracing::error!("Failed to migrate contract index entries: {e}");
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
 
-            // Update in-memory map
+        // Update in-memory map
+        for (instance_id, code_hash) in &entries {
             key_to_code_part.insert(*instance_id, *code_hash);
-            migrated += 1;
         }
 
-        tracing::info!("Migrated {migrated}/{count} contract index entries to ReDb");
+        tracing::info!("Migrated {count} contract index entries to ReDb");
 
         // Rename the legacy file to mark it as migrated
         let migrated_path = key_file.with_extension("migrated");

@@ -169,24 +169,28 @@ impl SecretsStore {
         let count = legacy_container.len();
         tracing::info!("Found {count} entries in legacy KEY_DATA file");
 
-        // Migrate each entry to ReDb
-        let mut migrated = 0;
+        // Collect entries for batch insert
+        let entries: Vec<(DelegateKey, Vec<[u8; 32]>)> = legacy_container
+            .iter()
+            .map(|entry| {
+                let delegate_key = entry.key().clone();
+                let secret_keys: Vec<[u8; 32]> = entry.value().1.iter().copied().collect();
+                (delegate_key, secret_keys)
+            })
+            .collect();
+
+        // Batch insert into ReDb (single transaction)
+        db.store_secrets_index_batch(&entries).map_err(|e| {
+            tracing::error!("Failed to migrate secrets index entries: {e}");
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+
+        // Update in-memory map
         for entry in legacy_container.iter() {
-            let delegate_key = entry.key();
-            let secret_keys: Vec<[u8; 32]> = entry.value().1.iter().copied().collect();
-
-            // Store in ReDb
-            if let Err(e) = db.store_secrets_index(delegate_key, &secret_keys) {
-                tracing::warn!("Failed to migrate secrets index entry: {e}");
-                continue;
-            }
-
-            // Update in-memory map
-            key_to_secret_part.insert(delegate_key.clone(), entry.value().1.clone());
-            migrated += 1;
+            key_to_secret_part.insert(entry.key().clone(), entry.value().1.clone());
         }
 
-        tracing::info!("Migrated {migrated}/{count} secrets index entries to ReDb");
+        tracing::info!("Migrated {count} secrets index entries to ReDb");
 
         // Rename the legacy file to mark it as migrated
         let migrated_path = key_file.with_extension("migrated");
