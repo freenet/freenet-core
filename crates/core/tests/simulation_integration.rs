@@ -126,6 +126,7 @@ impl TestConfig {
     /// - Events phase: 200 iterations × 200ms = 40 seconds
     /// - Idle phase: 3556 seconds (tests timeout handling, keep-alive)
     /// - Total: ~3600 seconds (1 hour)
+    #[allow(dead_code)]
     fn long_running_1h(name: &'static str, seed: u64) -> Self {
         Self {
             name,
