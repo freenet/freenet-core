@@ -1840,6 +1840,10 @@ impl P2pConnManager {
                                             payload_size,
                                         );
 
+                                    if use_streaming {
+                                        crate::config::GlobalTestMetrics::record_streaming_send();
+                                    }
+
                                     let send_result = if use_streaming {
                                         let sender_summary_bytes = our_summary
                                             .as_ref()

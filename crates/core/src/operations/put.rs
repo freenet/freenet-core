@@ -419,6 +419,7 @@ impl Operation for PutOp {
                             op_manager.streaming_threshold,
                             payload_size,
                         ) {
+                            crate::config::GlobalTestMetrics::record_streaming_send();
                             let sid = StreamId::next_operations();
                             tracing::info!(
                                 tx = %id,
@@ -439,6 +440,7 @@ impl Operation for PutOp {
                                 Some((sid, bytes::Bytes::from(payload_bytes))),
                             )
                         } else {
+                            crate::config::GlobalTestMetrics::record_inline_send();
                             (
                                 PutMsg::Request {
                                     id,
@@ -829,6 +831,7 @@ impl Operation for PutOp {
                             op_manager.streaming_threshold,
                             payload_size,
                         ) {
+                            crate::config::GlobalTestMetrics::record_streaming_send();
                             let sid = StreamId::next_operations();
                             tracing::info!(
                                 tx = %id,
@@ -849,6 +852,7 @@ impl Operation for PutOp {
                                 Some((sid, bytes::Bytes::from(payload_bytes))),
                             )
                         } else {
+                            crate::config::GlobalTestMetrics::record_inline_send();
                             (
                                 PutMsg::Request {
                                     id,

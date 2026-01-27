@@ -2084,6 +2084,14 @@ static GLOBAL_DELTA_SENDS: AtomicU64 = AtomicU64::new(0);
 /// Incremented when a state change broadcast sends full state (not delta).
 static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
 
+/// Global counter for streaming sends across all nodes.
+/// Incremented when an operation uses streaming transport (payload > threshold).
+static GLOBAL_STREAMING_SENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Global counter for inline sends across all nodes.
+/// Incremented when an operation uses inline transport (payload <= threshold).
+static GLOBAL_INLINE_SENDS: AtomicU64 = AtomicU64::new(0);
+
 /// Global test metrics for tracking events across the simulation network.
 ///
 /// These counters are incremented by production code and read by tests to verify
@@ -2111,6 +2119,8 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS.store(0, std::sync::atomic::Ordering::SeqCst);
         GLOBAL_DELTA_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
         GLOBAL_FULL_STATE_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_STREAMING_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_INLINE_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Records that a ResyncRequest was received.
@@ -2144,6 +2154,28 @@ impl GlobalTestMetrics {
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records that a streaming send was used for an operation.
+    /// Called from operations code when payload exceeds streaming threshold.
+    pub fn record_streaming_send() {
+        GLOBAL_STREAMING_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the total number of streaming sends since last reset.
+    pub fn streaming_sends() -> u64 {
+        GLOBAL_STREAMING_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records that an inline (non-streaming) send was used for an operation.
+    /// Called from operations code when payload is within inline threshold.
+    pub fn record_inline_send() {
+        GLOBAL_INLINE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the total number of inline sends since last reset.
+    pub fn inline_sends() -> u64 {
+        GLOBAL_INLINE_SENDS.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
