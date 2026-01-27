@@ -2182,16 +2182,106 @@ pub(crate) mod test {
                         }
                     }
                     val if (35..80).contains(&val) => {
-                        let new_state = UpdateData::State(State::from(self.random_byte_vec()));
                         if let Some(contract) = self.choose(&state.existing_contracts) {
-                            // TODO: It will be used when the delta updates are available
-                            // let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
                             if !for_this_peer {
                                 continue;
                             }
+
+                            // Generate different UpdateData variants to test all code paths
+                            // Distribute evenly across the different variants
+                            let update_data = match self.gen_range(0..100) {
+                                // 30% - State only (backwards compatible, most common)
+                                v if (0..30).contains(&v) => {
+                                    UpdateData::State(State::from(self.random_byte_vec()))
+                                }
+                                // 25% - Delta only (test delta-only updates)
+                                v if (30..55).contains(&v) => {
+                                    UpdateData::Delta(StateDelta::from(self.random_byte_vec()))
+                                }
+                                // 15% - StateAndDelta (test combined updates)
+                                v if (55..70).contains(&v) => {
+                                    UpdateData::StateAndDelta {
+                                        state: State::from(self.random_byte_vec()),
+                                        delta: StateDelta::from(self.random_byte_vec()),
+                                    }
+                                }
+                                // 10% - RelatedState (if we have multiple contracts)
+                                v if (70..80).contains(&v) && state.existing_contracts.len() > 1 => {
+                                    if let Some(related_contract) = self.choose(&state.existing_contracts) {
+                                        if related_contract.key() != contract.key() {
+                                            UpdateData::RelatedState {
+                                                related_to: *related_contract.key().id(),
+                                                state: State::from(self.random_byte_vec()),
+                                            }
+                                        } else {
+                                            // Fallback to State if we picked the same contract
+                                            UpdateData::State(State::from(self.random_byte_vec()))
+                                        }
+                                    } else {
+                                        UpdateData::State(State::from(self.random_byte_vec()))
+                                    }
+                                }
+                                // 10% - RelatedDelta (if we have multiple contracts)
+                                v if (80..90).contains(&v) && state.existing_contracts.len() > 1 => {
+                                    if let Some(related_contract) = self.choose(&state.existing_contracts) {
+                                        if related_contract.key() != contract.key() {
+                                            UpdateData::RelatedDelta {
+                                                related_to: *related_contract.key().id(),
+                                                delta: StateDelta::from(self.random_byte_vec()),
+                                            }
+                                        } else {
+                                            // Fallback to Delta
+                                            UpdateData::Delta(StateDelta::from(self.random_byte_vec()))
+                                        }
+                                    } else {
+                                        UpdateData::Delta(StateDelta::from(self.random_byte_vec()))
+                                    }
+                                }
+                                // 10% - RelatedStateAndDelta (if we have multiple contracts)
+                                _ if state.existing_contracts.len() > 1 => {
+                                    if let Some(related_contract) = self.choose(&state.existing_contracts) {
+                                        if related_contract.key() != contract.key() {
+                                            UpdateData::RelatedStateAndDelta {
+                                                related_to: *related_contract.key().id(),
+                                                state: State::from(self.random_byte_vec()),
+                                                delta: StateDelta::from(self.random_byte_vec()),
+                                            }
+                                        } else {
+                                            // Fallback to StateAndDelta
+                                            UpdateData::StateAndDelta {
+                                                state: State::from(self.random_byte_vec()),
+                                                delta: StateDelta::from(self.random_byte_vec()),
+                                            }
+                                        }
+                                    } else {
+                                        UpdateData::StateAndDelta {
+                                            state: State::from(self.random_byte_vec()),
+                                            delta: StateDelta::from(self.random_byte_vec()),
+                                        }
+                                    }
+                                }
+                                // Fallback to State for any edge cases
+                                _ => UpdateData::State(State::from(self.random_byte_vec())),
+                            };
+
+                            // Log the variant being generated for verification
+                            let variant_name = match &update_data {
+                                UpdateData::State(_) => "State",
+                                UpdateData::Delta(_) => "Delta",
+                                UpdateData::StateAndDelta { .. } => "StateAndDelta",
+                                UpdateData::RelatedState { .. } => "RelatedState",
+                                UpdateData::RelatedDelta { .. } => "RelatedDelta",
+                                UpdateData::RelatedStateAndDelta { .. } => "RelatedStateAndDelta",
+                            };
+                            tracing::trace!(
+                                contract_key = %contract.key().id(),
+                                variant = variant_name,
+                                "Generated UpdateData variant"
+                            );
+
                             let request = ContractRequest::Update {
                                 key: contract.key(),
-                                data: new_state,
+                                data: update_data,
                             };
                             if state.owns_contracts.contains(&contract.key()) {
                                 return Some(request.into());
@@ -2287,5 +2377,75 @@ pub(crate) mod test {
         for state in &states[1..] {
             assert_eq!(first_state.existing_contracts, state.existing_contracts);
         }
+    }
+
+    #[test]
+    fn test_delta_update_variants_generated() {
+        use std::collections::HashSet;
+
+        const ITERATIONS: usize = 1_000;
+        let mut rng = <rand::rngs::SmallRng as RandomEventGenerator>::seed_from_u64(42);
+
+        // Pre-populate with multiple contracts to enable RelatedState/Delta variants
+        let mut state = InternalGeneratorState {
+            this_peer: 0,
+            num_peers: 1,
+            max_contract_num: 10,
+            current_iteration: 0,
+            max_iterations: ITERATIONS,
+            owns_contracts: Default::default(),
+            existing_contracts: vec![],
+        };
+
+        // Add some contracts first
+        for _ in 0..5 {
+            let contract = rng.gen_contract_container();
+            state.existing_contracts.push(contract.clone());
+            state.owns_contracts.insert(contract.key());
+        }
+
+        let mut update_variants = HashSet::new();
+
+        // Generate many events and track which UpdateData variants are created
+        for _ in 0..ITERATIONS {
+            if let Some(ClientRequest::ContractOp(ContractRequest::Update { data, .. })) =
+                rng.gen_event(&mut state)
+            {
+                let variant_name = match data {
+                    UpdateData::State(_) => "State",
+                    UpdateData::Delta(_) => "Delta",
+                    UpdateData::StateAndDelta { .. } => "StateAndDelta",
+                    UpdateData::RelatedState { .. } => "RelatedState",
+                    UpdateData::RelatedDelta { .. } => "RelatedDelta",
+                    UpdateData::RelatedStateAndDelta { .. } => "RelatedStateAndDelta",
+                };
+                update_variants.insert(variant_name);
+            }
+        }
+
+        // Verify that we generated multiple different variants
+        // With enough iterations, we should see State, Delta, and StateAndDelta at minimum
+        assert!(
+            update_variants.contains("State"),
+            "Should generate State variants"
+        );
+        assert!(
+            update_variants.contains("Delta"),
+            "Should generate Delta variants - this verifies delta updates are enabled!"
+        );
+        assert!(
+            update_variants.contains("StateAndDelta"),
+            "Should generate StateAndDelta variants"
+        );
+
+        // With multiple contracts, we should also see Related* variants
+        // (though these are less frequent, so we just check if we got at least 3 variants)
+        assert!(
+            update_variants.len() >= 3,
+            "Should generate at least 3 different UpdateData variants, got: {:?}",
+            update_variants
+        );
+
+        println!("Generated UpdateData variants: {:?}", update_variants);
     }
 }
