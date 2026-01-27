@@ -433,25 +433,6 @@ impl ReDb {
         Ok(result)
     }
 
-    /// Store multiple contract index entries in a single transaction.
-    /// More efficient than calling store_contract_index repeatedly.
-    pub fn store_contract_index_batch(
-        &self,
-        entries: &[(ContractInstanceId, CodeHash)],
-    ) -> Result<(), redb::Error> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let txn = self.0.begin_write()?;
-        {
-            let mut tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
-            for (instance_id, code_hash) in entries {
-                tbl.insert(instance_id.as_ref(), code_hash.as_ref())?;
-            }
-        }
-        txn.commit().map_err(Into::into)
-    }
-
     // ==================== Delegate Index Methods ====================
     // These replace the legacy KEY_DATA file in delegates directory
 
@@ -539,28 +520,6 @@ impl ReDb {
             result.push((delegate_key, CodeHash::from(&value_bytes)));
         }
         Ok(result)
-    }
-
-    /// Store multiple delegate index entries in a single transaction.
-    /// More efficient than calling store_delegate_index repeatedly.
-    pub fn store_delegate_index_batch(
-        &self,
-        entries: &[(DelegateKey, CodeHash)],
-    ) -> Result<(), redb::Error> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let txn = self.0.begin_write()?;
-        {
-            let mut tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
-            for (delegate_key, code_hash) in entries {
-                let mut key_bytes = [0u8; 64];
-                key_bytes[..32].copy_from_slice(delegate_key.as_ref());
-                key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
-                tbl.insert(key_bytes.as_slice(), code_hash.as_ref())?;
-            }
-        }
-        txn.commit().map_err(Into::into)
     }
 
     // ==================== Secrets Index Methods ====================
@@ -666,33 +625,6 @@ impl ReDb {
             result.push((delegate_key, secret_keys));
         }
         Ok(result)
-    }
-
-    /// Store multiple secrets index entries in a single transaction.
-    /// More efficient than calling store_secrets_index repeatedly.
-    pub fn store_secrets_index_batch(
-        &self,
-        entries: &[(DelegateKey, Vec<[u8; 32]>)],
-    ) -> Result<(), redb::Error> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let txn = self.0.begin_write()?;
-        {
-            let mut tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
-            for (delegate_key, secret_keys) in entries {
-                let mut key_bytes = [0u8; 64];
-                key_bytes[..32].copy_from_slice(delegate_key.as_ref());
-                key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
-
-                let mut value_bytes = Vec::with_capacity(secret_keys.len() * 32);
-                for sk in secret_keys {
-                    value_bytes.extend_from_slice(sk);
-                }
-                tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
-            }
-        }
-        txn.commit().map_err(Into::into)
     }
 }
 
