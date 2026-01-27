@@ -1561,6 +1561,10 @@ impl Gateways {
     }
 
     pub fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
+        // Ensure parent directory exists (fixes Windows first-run where config dir may not exist)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let content = toml::to_string(self)?;
         fs::write(path, content)?;
         Ok(())
