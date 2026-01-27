@@ -50,111 +50,12 @@ impl DelegateStore {
             }
         }
 
-        // Migrate from legacy KEY_DATA file if it exists and hasn't been migrated
-        let key_file = delegates_dir.join("KEY_DATA");
-        let migration_marker = delegates_dir.join(".migration_complete");
-        if key_file.exists() && !migration_marker.exists() {
-            Self::migrate_from_legacy(&key_file, &db, &key_to_code_part)?;
-        }
-
         Ok(Self {
             delegate_cache: Cache::new(100, max_size).expect(ERR),
             delegates_dir,
             key_to_code_part,
             db,
         })
-    }
-
-    /// Migrate data from the legacy KEY_DATA file to ReDb.
-    /// After successful migration, renames the file to KEY_DATA.migrated.
-    fn migrate_from_legacy(
-        key_file: &PathBuf,
-        db: &Storage,
-        key_to_code_part: &DashMap<DelegateKey, CodeHash>,
-    ) -> RuntimeResult<()> {
-        use super::store::StoreFsManagement;
-
-        tracing::info!("Migrating delegate index from legacy KEY_DATA to ReDb");
-
-        // Use a temporary DashMap for the legacy loader
-        let mut legacy_container: Arc<DashMap<DelegateKey, (u64, CodeHash)>> =
-            Arc::new(DashMap::new());
-
-        // Load from legacy file format
-        struct LegacyLoader;
-        impl super::store::StoreFsManagement for LegacyLoader {
-            type MemContainer = Arc<DashMap<DelegateKey, (u64, CodeHash)>>;
-            type Key = DelegateKey;
-            type Value = CodeHash;
-
-            fn insert_in_container(
-                container: &mut Self::MemContainer,
-                (key, offset): (Self::Key, u64),
-                value: Self::Value,
-            ) {
-                container.insert(key, (offset, value));
-            }
-
-            fn clear_container(container: &mut Self::MemContainer) {
-                container.clear();
-            }
-        }
-
-        LegacyLoader::load_from_file(key_file, &mut legacy_container)?;
-
-        let count = legacy_container.len();
-        tracing::info!("Found {count} entries in legacy KEY_DATA file");
-
-        // Collect entries for batch insert
-        let entries: Vec<(DelegateKey, CodeHash)> = legacy_container
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().1))
-            .collect();
-
-        // Batch insert into ReDb (single transaction)
-        db.store_delegate_index_batch(&entries).map_err(|e| {
-            tracing::error!("Failed to migrate delegate index entries: {e}");
-            std::io::Error::other(e.to_string())
-        })?;
-
-        // Update in-memory map
-        for (delegate_key, code_hash) in &entries {
-            key_to_code_part.insert(delegate_key.clone(), *code_hash);
-        }
-
-        // Verify migration succeeded by reading back from ReDb
-        let verified = db.load_all_delegate_index().map_err(|e| {
-            tracing::error!("Failed to verify migration: {e}");
-            std::io::Error::other(e.to_string())
-        })?;
-
-        if verified.len() != count {
-            let msg = format!(
-                "Migration verification failed: wrote {} entries, read back {}",
-                count,
-                verified.len()
-            );
-            tracing::error!("{msg}");
-            return Err(std::io::Error::other(msg).into());
-        }
-
-        tracing::info!("Migrated and verified {count} delegate index entries to ReDb");
-
-        // Create marker file to prevent re-migration even if rename fails
-        let marker_path = key_file.parent().unwrap().join(".migration_complete");
-        if let Err(e) = std::fs::write(&marker_path, b"delegate_store") {
-            tracing::warn!("Failed to create migration marker: {e}");
-        }
-
-        // Rename the legacy file to mark it as migrated
-        let migrated_path = key_file.with_extension("migrated");
-        if let Err(e) = std::fs::rename(key_file, &migrated_path) {
-            tracing::warn!("Failed to rename KEY_DATA to .migrated: {e}");
-        } else {
-            tracing::info!("Renamed legacy KEY_DATA to {migrated_path:?}");
-        }
-
-        Ok(())
     }
 
     // Returns a copy of the delegate bytes if available, none otherwise.
