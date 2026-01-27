@@ -142,7 +142,9 @@ async fn test_priority_select_future_priority_ordering() {
     ));
     op_tx.send((callback_tx, dummy_msg.clone())).await.unwrap();
     bridge_tx
-        .send(Either::Right(NodeEvent::Disconnect { cause: None }))
+        .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
+            cause: None,
+        }))
         .await
         .unwrap();
 
@@ -357,7 +359,9 @@ async fn test_priority_select_event_loop_simulation() {
         for i in 0..2 {
             tracing::info!("Sending bridge event {}", i);
             bridge_tx_clone
-                .send(Either::Right(NodeEvent::Disconnect { cause: None }))
+                .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
+                    cause: None,
+                }))
                 .await
                 .unwrap();
         }
@@ -627,7 +631,9 @@ async fn test_with_seed(seed: u64) {
                 delay_us
             );
             bridge_tx
-                .send(Either::Right(NodeEvent::Disconnect { cause: None }))
+                .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
+                    cause: None,
+                }))
                 .await
                 .unwrap();
         }
@@ -982,7 +988,9 @@ async fn test_priority_select_all_pending_waker_registration() {
 
         tracing::info!("Sending to bridge channel");
         bridge_tx
-            .send(Either::Right(NodeEvent::Disconnect { cause: None }))
+            .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
+                cause: None,
+            }))
             .await
             .unwrap();
 

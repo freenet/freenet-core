@@ -64,6 +64,9 @@ pub(crate) struct OperationResult {
     pub next_hop: Option<SocketAddr>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
+    /// If set, stream data to send alongside the return_msg via operations-level streaming.
+    /// The StreamId in the metadata message (return_msg) must match this StreamId.
+    pub stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
 }
 
 pub(crate) struct OpInitialization<Op> {
@@ -124,6 +127,7 @@ where
             return_msg: None,
             next_hop: _,
             state: Some(final_state),
+            stream_data: _,
         }) if final_state.finalized() => {
             if op_manager.failed_parents().remove(&tx_id).is_some() {
                 tracing::warn!(
@@ -159,6 +163,7 @@ where
             return_msg: Some(msg),
             next_hop,
             state: Some(updated_state),
+            stream_data,
         }) => {
             if updated_state.finalized() {
                 let id = *msg.id();
@@ -167,6 +172,10 @@ where
                 if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending final message to target");
                     network_bridge.send(target, msg).await?;
+                    if let Some((stream_id, data)) = stream_data {
+                        tracing::debug!(%id, %stream_id, ?target, "sending stream data");
+                        network_bridge.send_stream(target, stream_id, data).await?;
+                    }
                 }
                 return Ok(Some(updated_state));
             } else {
@@ -179,6 +188,10 @@ where
                     // causing load_or_init to fail to find the operation.
                     op_manager.push(id, updated_state).await?;
                     network_bridge.send(target, msg).await?;
+                    if let Some((stream_id, data)) = stream_data {
+                        tracing::debug!(%id, %stream_id, ?target, "sending stream data");
+                        network_bridge.send_stream(target, stream_id, data).await?;
+                    }
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
                     debug_assert!(
@@ -200,6 +213,7 @@ where
             return_msg: None,
             next_hop: _,
             state: Some(updated_state),
+            stream_data: _,
         }) => {
             let id = *updated_state.id();
             op_manager.push(id, updated_state).await?;
@@ -208,18 +222,24 @@ where
             return_msg: Some(msg),
             next_hop,
             state: None,
+            stream_data,
         }) => {
             op_manager.completed(tx_id);
 
             if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
                 network_bridge.send(target, msg).await?;
+                if let Some((stream_id, data)) = stream_data {
+                    tracing::debug!(%tx_id, %stream_id, ?target, "sending stream data");
+                    network_bridge.send_stream(target, stream_id, data).await?;
+                }
             }
         }
         Ok(OperationResult {
             return_msg: None,
             next_hop: _,
             state: None,
+            stream_data: _,
         }) => {
             op_manager.completed(tx_id);
         }
@@ -585,8 +605,7 @@ async fn has_contract(
 /// The threshold comparison is exclusive (`>`), meaning payloads exactly at the
 /// threshold will NOT use streaming. This is intentional: the threshold represents
 /// "the maximum size for non-streaming transfers", so payloads must exceed it.
-#[cfg(test)]
-fn should_use_streaming(
+pub(crate) fn should_use_streaming(
     streaming_enabled: bool,
     streaming_threshold: usize,
     payload_size: usize,

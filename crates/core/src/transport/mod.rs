@@ -309,6 +309,18 @@ pub(crate) trait PeerConnectionApi: Send {
         &mut self,
         registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
     );
+
+    /// Sends raw stream data to the remote peer using the given operations-level StreamId.
+    ///
+    /// The data is fragmented and sent via the transport's outbound stream mechanism,
+    /// using the provided `stream_id` (which should have the operations marker bit set)
+    /// so that the receiver routes fragments through the orphan registry instead of
+    /// the legacy InboundStream decode path.
+    fn send_stream_data(
+        &mut self,
+        stream_id: crate::transport::peer_connection::StreamId,
+        data: bytes::Bytes,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 }
 
 #[cfg(test)]

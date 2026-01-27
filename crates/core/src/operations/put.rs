@@ -13,8 +13,12 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{
+    put, should_use_streaming, OpEnum, OpError, OpInitialization, OpOutcome, Operation,
+    OperationResult,
+};
 use crate::node::IsOperationCompleted;
+use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
@@ -395,13 +399,57 @@ impl Operation for PutOp {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
 
-                        let forward_msg = PutMsg::Request {
-                            id,
+                        let new_htl = htl.saturating_sub(1);
+
+                        // Check if we should use streaming for the forward
+                        let payload = PutStreamingPayload {
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
                             value: merged_value,
-                            htl: htl.saturating_sub(1),
-                            skip_list: new_skip_list,
+                        };
+                        let payload_bytes = bincode::serialize(&payload).map_err(|e| {
+                            OpError::NotificationChannelError(format!(
+                                "Failed to serialize streaming payload: {e}"
+                            ))
+                        })?;
+                        let payload_size = payload_bytes.len();
+
+                        let (forward_msg, stream_data) = if should_use_streaming(
+                            op_manager.streaming_enabled,
+                            op_manager.streaming_threshold,
+                            payload_size,
+                        ) {
+                            let sid = StreamId::next_operations();
+                            tracing::info!(
+                                tx = %id,
+                                stream_id = %sid,
+                                payload_size,
+                                "PUT request using operations-level streaming"
+                            );
+                            (
+                                PutMsg::RequestStreaming {
+                                    id,
+                                    stream_id: sid,
+                                    contract_key: key,
+                                    total_size: payload_size as u64,
+                                    htl: new_htl,
+                                    skip_list: new_skip_list,
+                                    subscribe,
+                                },
+                                Some((sid, bytes::Bytes::from(payload_bytes))),
+                            )
+                        } else {
+                            (
+                                PutMsg::Request {
+                                    id,
+                                    contract: payload.contract,
+                                    related_contracts: payload.related_contracts,
+                                    value: payload.value,
+                                    htl: new_htl,
+                                    skip_list: new_skip_list,
+                                },
+                                None,
+                            )
                         };
 
                         // Transition to AwaitingResponse, preserving subscribe flag for originator
@@ -420,6 +468,7 @@ impl Operation for PutOp {
                                 state: new_state,
                                 upstream_addr,
                             })),
+                            stream_data,
                         })
                     } else {
                         // No next hop - we're the final destination (or htl exhausted)
@@ -461,6 +510,7 @@ impl Operation for PutOp {
                                     state: Some(PutState::Finished { key }),
                                     upstream_addr: None,
                                 })),
+                                stream_data: None,
                             })
                         } else {
                             // Non-originator target peer - emit put_success for convergence checking
@@ -489,6 +539,7 @@ impl Operation for PutOp {
                                 return_msg: Some(NetMessage::from(response)),
                                 next_hop: Some(upstream),
                                 state: None, // Operation complete for this node
+                                stream_data: None,
                             })
                         }
                     }
@@ -552,6 +603,7 @@ impl Operation for PutOp {
                                 state: Some(PutState::Finished { key: *key }),
                                 upstream_addr: None,
                             })),
+                            stream_data: None,
                         })
                     } else {
                         // Forward response to our upstream
@@ -571,6 +623,7 @@ impl Operation for PutOp {
                             return_msg: Some(NetMessage::from(response)),
                             next_hop: Some(upstream),
                             state: None, // Operation complete for this node
+                            stream_data: None,
                         })
                     }
                 }
@@ -757,14 +810,56 @@ impl Operation for PutOp {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
 
-                        // Forward as regular PUT (simplifies implementation)
-                        let forward_msg = PutMsg::Request {
-                            id,
+                        // Forward PUT - check if streaming should be used
+                        let new_htl = htl.saturating_sub(1);
+                        let payload = PutStreamingPayload {
                             contract: contract.clone(),
                             related_contracts,
                             value: merged_value,
-                            htl: htl.saturating_sub(1),
-                            skip_list: new_skip_list,
+                        };
+                        let payload_bytes = bincode::serialize(&payload).map_err(|e| {
+                            OpError::NotificationChannelError(format!(
+                                "Failed to serialize streaming payload: {e}"
+                            ))
+                        })?;
+                        let payload_size = payload_bytes.len();
+
+                        let (forward_msg, stream_data) = if should_use_streaming(
+                            op_manager.streaming_enabled,
+                            op_manager.streaming_threshold,
+                            payload_size,
+                        ) {
+                            let sid = StreamId::next_operations();
+                            tracing::info!(
+                                tx = %id,
+                                stream_id = %sid,
+                                payload_size,
+                                "PUT request (from streaming) using operations-level streaming"
+                            );
+                            (
+                                PutMsg::RequestStreaming {
+                                    id,
+                                    stream_id: sid,
+                                    contract_key: key,
+                                    total_size: payload_size as u64,
+                                    htl: new_htl,
+                                    skip_list: new_skip_list,
+                                    subscribe: *msg_subscribe,
+                                },
+                                Some((sid, bytes::Bytes::from(payload_bytes))),
+                            )
+                        } else {
+                            (
+                                PutMsg::Request {
+                                    id,
+                                    contract: payload.contract,
+                                    related_contracts: payload.related_contracts,
+                                    value: payload.value,
+                                    htl: new_htl,
+                                    skip_list: new_skip_list,
+                                },
+                                None,
+                            )
                         };
 
                         let new_state = Some(PutState::AwaitingResponse {
@@ -781,6 +876,7 @@ impl Operation for PutOp {
                                 state: new_state,
                                 upstream_addr,
                             })),
+                            stream_data,
                         })
                     } else {
                         // No next hop - we're the final destination
@@ -817,6 +913,7 @@ impl Operation for PutOp {
                                     state: Some(PutState::Finished { key }),
                                     upstream_addr: None,
                                 })),
+                                stream_data: None,
                             })
                         } else {
                             // Send ResponseStreaming back to upstream
@@ -845,6 +942,7 @@ impl Operation for PutOp {
                                 return_msg: Some(NetMessage::from(response)),
                                 next_hop: Some(upstream),
                                 state: None,
+                                stream_data: None,
                             })
                         }
                     }
@@ -917,6 +1015,7 @@ impl Operation for PutOp {
                                 state: Some(PutState::Finished { key: *key }),
                                 upstream_addr: None,
                             })),
+                            stream_data: None,
                         })
                     } else {
                         // Forward response to upstream
@@ -938,6 +1037,7 @@ impl Operation for PutOp {
                             return_msg: Some(NetMessage::from(response)),
                             next_hop: Some(upstream),
                             state: None, // Operation complete for this node
+                            stream_data: None,
                         })
                     }
                 }

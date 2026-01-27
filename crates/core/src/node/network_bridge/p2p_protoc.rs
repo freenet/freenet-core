@@ -30,9 +30,9 @@ use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
 use crate::ring::{Location, PeerKey};
 use crate::transport::{
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, CongestionControlConfig,
-    ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError, TransportKeypair,
-    TransportPublicKey,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError,
+    TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -76,7 +76,16 @@ impl std::fmt::Display for EventLoopExitReason {
 
 impl std::error::Error for EventLoopExitReason {}
 
-type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
+#[derive(Debug)]
+pub(crate) enum P2pBridgeEvent {
+    Message(PeerKeyLocation, Box<NetMessage>),
+    NodeAction(NodeEvent),
+    StreamSend {
+        target_addr: SocketAddr,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+    },
+}
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
@@ -157,7 +166,9 @@ impl NetworkBridge for P2pBridge {
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
         if self.accepted_peers.remove(&peer_addr).is_some() {
             self.ev_listener_tx
-                .send(Right(NodeEvent::DropConnection(peer_addr)))
+                .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
+                    peer_addr,
+                )))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(peer_addr))?;
             // Log disconnect with PeerKeyLocation if we can construct one
@@ -209,7 +220,7 @@ impl NetworkBridge for P2pBridge {
         if let Some(ref target) = target_loc {
             self.op_manager.sending_transaction(target, &msg);
             self.ev_listener_tx
-                .send(Left((target.clone(), Box::new(msg))))
+                .send(P2pBridgeEvent::Message(target.clone(), Box::new(msg)))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         } else {
@@ -228,7 +239,7 @@ impl NetworkBridge for P2pBridge {
                 );
                 self.op_manager.sending_transaction(&gw_peer, &msg);
                 self.ev_listener_tx
-                    .send(Left((gw_peer, Box::new(msg))))
+                    .send(P2pBridgeEvent::Message(gw_peer, Box::new(msg)))
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
             } else {
@@ -245,11 +256,28 @@ impl NetworkBridge for P2pBridge {
                 );
                 self.op_manager.sending_transaction(&temp_peer, &msg);
                 self.ev_listener_tx
-                    .send(Left((temp_peer, Box::new(msg))))
+                    .send(P2pBridgeEvent::Message(temp_peer, Box::new(msg)))
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
             }
         }
+        Ok(())
+    }
+
+    async fn send_stream(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+    ) -> super::ConnResult<()> {
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::StreamSend {
+                target_addr,
+                stream_id,
+                data,
+            })
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         Ok(())
     }
 }
@@ -698,7 +726,7 @@ impl P2pConnManager {
                                     // Initiate connection to the peer
                                     ctx.bridge
                                         .ev_listener_tx
-                                        .send(Right(NodeEvent::ConnectPeer {
+                                        .send(P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
                                             peer: target_peer.clone(),
                                             tx,
                                             callback,
@@ -733,10 +761,10 @@ impl P2pConnManager {
                                                 );
                                                 // Re-send via P2pBridge which will route correctly
                                                 if let Err(e) = bridge_sender
-                                                    .send(Left((
+                                                    .send(P2pBridgeEvent::Message(
                                                         connected_peer,
                                                         Box::new(msg_clone),
-                                                    )))
+                                                    ))
                                                     .await
                                                 {
                                                     tracing::error!(
@@ -818,6 +846,39 @@ impl P2pConnManager {
                                 phase = "disconnect",
                                 "Transport connection closed"
                             );
+                        }
+                        ConnEvent::StreamSend {
+                            target_addr,
+                            stream_id,
+                            data,
+                        } => {
+                            // Route stream data to the per-connection channel
+                            if let Some(peer_connection) = ctx.connections.get(&target_addr) {
+                                if let Err(e) = peer_connection
+                                    .sender
+                                    .send(Right(ConnEvent::StreamSend {
+                                        target_addr,
+                                        stream_id,
+                                        data,
+                                    }))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        stream_id = %stream_id,
+                                        peer_addr = %target_addr,
+                                        error = %e,
+                                        phase = "error",
+                                        "Failed to send stream data to peer connection"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    stream_id = %stream_id,
+                                    peer_addr = %target_addr,
+                                    phase = "error",
+                                    "No connection found for stream send target"
+                                );
+                            }
                         }
                         ConnEvent::ClosedChannel(reason) => {
                             match reason {
@@ -1768,18 +1829,98 @@ impl P2pConnManager {
                                     // Save payload size before moving it into the message
                                     let payload_size = payload.size();
 
-                                    let msg = crate::operations::update::UpdateMsg::BroadcastTo {
-                                        id: update_tx,
-                                        key,
-                                        payload,
-                                        // Include our summary so peer doesn't echo back
-                                        sender_summary_bytes: our_summary
+                                    // Check if we should use streaming for full state broadcasts
+                                    let use_streaming = matches!(
+                                        &payload,
+                                        crate::message::DeltaOrFullState::FullState(_)
+                                    )
+                                        && crate::operations::should_use_streaming(
+                                            op_manager.streaming_enabled,
+                                            op_manager.streaming_threshold,
+                                            payload_size,
+                                        );
+
+                                    let send_result = if use_streaming {
+                                        let sender_summary_bytes = our_summary
                                             .as_ref()
                                             .map(|s| s.as_ref().to_vec())
-                                            .unwrap_or_default(),
+                                            .unwrap_or_default();
+                                        let state_bytes = match payload {
+                                            crate::message::DeltaOrFullState::FullState(data) => {
+                                                data
+                                            }
+                                            _ => unreachable!("checked above"),
+                                        };
+                                        let streaming_payload =
+                                            crate::operations::update::BroadcastStreamingPayload {
+                                                state_bytes,
+                                                sender_summary_bytes,
+                                            };
+                                        let payload_bytes = match bincode::serialize(
+                                            &streaming_payload,
+                                        ) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    tx = %update_tx,
+                                                    error = %e,
+                                                    "Failed to serialize BroadcastStreamingPayload, skipping"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        let sid = StreamId::next_operations();
+                                        tracing::debug!(
+                                            tx = %update_tx,
+                                            contract = %key,
+                                            peer = %peer_addr,
+                                            stream_id = %sid,
+                                            payload_size,
+                                            "Using streaming for BroadcastTo"
+                                        );
+                                        let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
+                                            id: update_tx,
+                                            stream_id: sid,
+                                            key,
+                                            total_size: payload_bytes.len() as u64,
+                                        };
+                                        let send_res = ctx.bridge.send(peer_addr, msg.into()).await;
+                                        if send_res.is_ok() {
+                                            // Send the stream data after the metadata message
+                                            if let Err(err) = ctx
+                                                .bridge
+                                                .send_stream(
+                                                    peer_addr,
+                                                    sid,
+                                                    bytes::Bytes::from(payload_bytes),
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    tx = %update_tx,
+                                                    peer = %peer_addr,
+                                                    error = %err,
+                                                    "Failed to send broadcast stream data"
+                                                );
+                                            }
+                                        }
+                                        send_res
+                                    } else {
+                                        let msg =
+                                            crate::operations::update::UpdateMsg::BroadcastTo {
+                                                id: update_tx,
+                                                key,
+                                                payload,
+                                                // Include our summary so peer doesn't echo back
+                                                sender_summary_bytes: our_summary
+                                                    .as_ref()
+                                                    .map(|s| s.as_ref().to_vec())
+                                                    .unwrap_or_default(),
+                                            };
+                                        ctx.bridge.send(peer_addr, msg.into()).await
                                     };
 
-                                    if let Err(err) = ctx.bridge.send(peer_addr, msg.into()).await {
+                                    if let Err(err) = send_result {
                                         tracing::warn!(
                                             tx = %update_tx,
                                             peer = %peer_addr,
@@ -2878,7 +3019,9 @@ impl P2pConnManager {
                         if cm.drop_transient(peer_addr).is_some() {
                             tracing::info!(%peer_addr, "Transient connection expired; dropping");
                             if let Err(err) = drop_tx
-                                .send(Right(NodeEvent::DropConnection(peer_addr)))
+                                .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
+                                    peer_addr,
+                                )))
                                 .await
                             {
                                 tracing::warn!(
@@ -3123,7 +3266,7 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((target, msg))) => {
+            Some(P2pBridgeEvent::Message(target, msg)) => {
                 // Use OutboundMessageWithTarget to preserve the target address from
                 // P2pBridge::send(). This is critical for NAT scenarios where
                 // the address in the message differs from the actual transport address.
@@ -3148,7 +3291,21 @@ impl P2pConnManager {
                     EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
                 }
             }
-            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
+            Some(P2pBridgeEvent::NodeAction(action)) => {
+                EventResult::Event(ConnEvent::NodeAction(action).into())
+            }
+            Some(P2pBridgeEvent::StreamSend {
+                target_addr,
+                stream_id,
+                data,
+            }) => EventResult::Event(
+                ConnEvent::StreamSend {
+                    target_addr,
+                    stream_id,
+                    data,
+                }
+                .into(),
+            ),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
     }
@@ -3297,6 +3454,13 @@ pub(super) enum ConnEvent {
         remote_addr: SocketAddr,
         error: TransportError,
     },
+    /// Send raw stream data to a peer via the transport's stream mechanism.
+    /// Used by operations-level streaming to send large payloads as stream fragments.
+    StreamSend {
+        target_addr: SocketAddr,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+    },
 }
 
 #[derive(Debug)]
@@ -3381,6 +3545,25 @@ async fn handle_peer_channel_message(
                         "[CONN_LIFECYCLE] Closing connection due to ClosedChannel action"
                     );
                     return Err(TransportError::ConnectionClosed(conn.remote_addr()));
+                }
+                ConnEvent::StreamSend {
+                    stream_id, data, ..
+                } => {
+                    tracing::debug!(
+                        to = %conn.remote_addr(),
+                        stream_id = %stream_id,
+                        data_len = data.len(),
+                        "[CONN_LIFECYCLE] Sending operations stream data to peer"
+                    );
+                    if let Err(error) = conn.send_stream_data(stream_id, data).await {
+                        tracing::error!(
+                            to = %conn.remote_addr(),
+                            stream_id = %stream_id,
+                            ?error,
+                            "[CONN_LIFECYCLE] Failed to send stream data to peer"
+                        );
+                        return Err(error);
+                    }
                 }
                 other => {
                     unreachable!(

@@ -3,11 +3,14 @@ use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{
+    should_use_streaming, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
+};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
+use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
@@ -188,6 +191,7 @@ impl Operation for UpdateOp {
             let stats = self.stats;
             // Track the next hop when forwarding RequestUpdate to another peer
             let mut forward_hop: Option<SocketAddr> = None;
+            let mut stream_data: Option<(StreamId, bytes::Bytes)> = None;
 
             match input {
                 UpdateMsg::RequestUpdate {
@@ -338,12 +342,46 @@ impl Operation for UpdateOp {
                                 );
 
                                 // Forward RequestUpdate to the next hop
-                                return_msg = Some(UpdateMsg::RequestUpdate {
-                                    id: *id,
-                                    key: *key,
+                                // Check if we should use streaming for this payload
+                                let payload = UpdateStreamingPayload {
                                     related_contracts: related_contracts.clone(),
                                     value: value.clone(),
-                                });
+                                };
+                                let payload_bytes = bincode::serialize(&payload).map_err(|e| {
+                                    OpError::NotificationChannelError(format!(
+                                        "Failed to serialize UpdateStreamingPayload: {e}"
+                                    ))
+                                })?;
+                                let payload_size = payload_bytes.len();
+
+                                if should_use_streaming(
+                                    op_manager.streaming_enabled,
+                                    op_manager.streaming_threshold,
+                                    payload_size,
+                                ) {
+                                    let sid = StreamId::next_operations();
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        stream_id = %sid,
+                                        payload_size,
+                                        "Using streaming for UPDATE RequestUpdate forward"
+                                    );
+                                    return_msg = Some(UpdateMsg::RequestUpdateStreaming {
+                                        id: *id,
+                                        stream_id: sid,
+                                        key: *key,
+                                        total_size: payload_size as u64,
+                                    });
+                                    stream_data = Some((sid, bytes::Bytes::from(payload_bytes)));
+                                } else {
+                                    return_msg = Some(UpdateMsg::RequestUpdate {
+                                        id: *id,
+                                        key: *key,
+                                        related_contracts: related_contracts.clone(),
+                                        value: value.clone(),
+                                    });
+                                }
                                 new_state = None;
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
@@ -920,6 +958,7 @@ impl Operation for UpdateOp {
                 stats,
                 self.upstream_addr,
                 forward_hop,
+                stream_data,
             )
         })
     }
@@ -1047,6 +1086,7 @@ fn build_op_result(
     stats: Option<UpdateStats>,
     upstream_addr: Option<std::net::SocketAddr>,
     forward_hop: Option<std::net::SocketAddr>,
+    stream_data: Option<(StreamId, bytes::Bytes)>,
 ) -> Result<super::OperationResult, OpError> {
     // With hop-by-hop routing:
     // - forward_hop is set when forwarding RequestUpdate to the next peer
@@ -1065,6 +1105,7 @@ fn build_op_result(
         return_msg: return_msg.map(NetMessage::from),
         next_hop,
         state,
+        stream_data,
     })
 }
 

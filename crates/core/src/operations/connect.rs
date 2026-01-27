@@ -1534,6 +1534,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
                 connect_forward_estimator: op.connect_forward_estimator.clone(),
             }))
         }),
+        stream_data: None,
     }
 }
 

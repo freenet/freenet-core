@@ -86,6 +86,16 @@ impl NetworkBridge for MockNetworkBridge {
         self.dropped_connections.lock().unwrap().push(peer_addr);
         Ok(())
     }
+
+    async fn send_stream(
+        &self,
+        _target_addr: SocketAddr,
+        _stream_id: crate::transport::peer_connection::StreamId,
+        _data: bytes::Bytes,
+    ) -> ConnResult<()> {
+        // Mock: no-op for tests (stream data is not tracked in mock bridge)
+        Ok(())
+    }
 }
 
 /// Helper to create a test PeerKeyLocation with a specific port
