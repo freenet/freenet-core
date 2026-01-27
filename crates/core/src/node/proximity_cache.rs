@@ -212,16 +212,46 @@ impl ProximityCacheManager {
 
             ProximityCacheMessage::CacheStateResponse { contracts } => {
                 let count = contracts.len();
+
+                // Find contracts that overlap with our local cache BEFORE storing.
+                // We need to announce these back so the peer knows we also have them.
+                let overlapping: Vec<ContractInstanceId> = contracts
+                    .iter()
+                    .filter(|id| self.my_cache.contains(*id))
+                    .copied()
+                    .collect();
+
                 self.neighbor_caches
                     .insert(from, contracts.into_iter().collect());
 
                 info!(
                     peer = %from,
                     contracts = count,
+                    overlapping = overlapping.len(),
                     "PROXIMITY_CACHE: Received full cache state from neighbor"
                 );
 
-                None
+                // CRITICAL: Send back our overlapping contracts so the peer can include us
+                // in UPDATE broadcasts. Without this, peers that reconnect after missing an
+                // update broadcast won't receive future updates because neighbors don't know
+                // they're still caching the contract.
+                //
+                // This uses is_response=true to prevent ping-pong loops - the peer receiving
+                // this announcement won't respond since they already know we requested their state.
+                if !overlapping.is_empty() {
+                    debug!(
+                        peer = %from,
+                        overlapping_count = overlapping.len(),
+                        "PROXIMITY_CACHE: Announcing our overlapping contracts to peer"
+                    );
+                    Some(ProximityCacheMessage::CacheAnnounce {
+                        added: overlapping,
+                        removed: vec![],
+                        is_response: true, // Prevent ping-pong
+                    })
+                } else {
+                    None
+                }
             }
         }
     }
@@ -806,5 +836,161 @@ mod tests {
         assert_eq!(a_neighbors[0], addr_b);
 
         // Both can now forward updates to each other
+    }
+
+    // === Reconnection Tests ===
+    // These tests cover the scenario where a peer disconnects/reconnects and needs
+    // to re-establish bidirectional awareness via CacheStateRequest/Response.
+
+    #[test]
+    fn test_cache_state_response_triggers_announcement_for_overlapping_contracts() {
+        // CRITICAL: This test catches the bug where peers that reconnect after missing
+        // an update broadcast don't receive future updates.
+        //
+        // Scenario:
+        // 1. Node A has contract X cached
+        // 2. Node B reconnects and has contract X cached
+        // 3. A sends CacheStateRequest to B (via on_ring_connection_established)
+        // 4. B responds with CacheStateResponse containing X
+        // 5. A receives CacheStateResponse - should announce X back to B
+        // 6. Now B knows A also has X and can include A in UPDATE broadcasts
+        //
+        // Without this fix, step 5 returned None and B never learned A has X.
+
+        let manager_a = ProximityCacheManager::new();
+        let key = test_contract_key();
+        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+
+        // A has contract X cached locally
+        manager_a.on_contract_cached(&key);
+
+        // B reconnects and sends CacheStateResponse (as if responding to A's request)
+        let b_state_response = ProximityCacheMessage::CacheStateResponse {
+            contracts: vec![*key.id()],
+        };
+
+        // A handles the response - should return announcement for overlapping contract X
+        let a_announcement = manager_a.handle_message(addr_b, b_state_response);
+
+        assert!(
+            a_announcement.is_some(),
+            "CRITICAL: A must announce overlapping contracts when receiving CacheStateResponse"
+        );
+
+        if let Some(ProximityCacheMessage::CacheAnnounce {
+            added,
+            removed,
+            is_response,
+        }) = a_announcement
+        {
+            assert_eq!(
+                added.len(),
+                1,
+                "Should announce the one overlapping contract"
+            );
+            assert_eq!(added[0], *key.id());
+            assert!(removed.is_empty());
+            assert!(
+                is_response,
+                "Should be marked as response to prevent ping-pong"
+            );
+        } else {
+            panic!("Expected CacheAnnounce, got something else");
+        }
+    }
+
+    #[test]
+    fn test_cache_state_response_no_announcement_when_no_overlap() {
+        // When receiving CacheStateResponse with no overlapping contracts,
+        // no announcement should be sent.
+
+        let manager_a = ProximityCacheManager::new();
+        let key_x = test_contract_key();
+        let key_y = test_contract_key_2();
+        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+
+        // A only has contract X
+        manager_a.on_contract_cached(&key_x);
+
+        // B has contract Y (no overlap with A)
+        let b_state_response = ProximityCacheMessage::CacheStateResponse {
+            contracts: vec![*key_y.id()],
+        };
+
+        let response = manager_a.handle_message(addr_b, b_state_response);
+        assert!(
+            response.is_none(),
+            "No announcement needed when no contracts overlap"
+        );
+
+        // But B's contracts should still be tracked
+        let b_neighbors = manager_a.neighbors_with_contract(&key_y);
+        assert_eq!(b_neighbors.len(), 1);
+        assert_eq!(b_neighbors[0], addr_b);
+    }
+
+    #[test]
+    fn test_reconnection_bidirectional_awareness_via_state_request_response() {
+        // Full reconnection flow test:
+        // 1. Both A and B have contract X
+        // 2. B disconnects and reconnects
+        // 3. A initiates cache state exchange with B
+        // 4. After exchange, both should know about each other for UPDATE forwarding
+
+        let manager_a = ProximityCacheManager::new();
+        let manager_b = ProximityCacheManager::new();
+        let key = test_contract_key();
+        let addr_a: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+
+        // Both have contract X cached
+        manager_a.on_contract_cached(&key);
+        manager_b.on_contract_cached(&key);
+
+        // Initially neither knows about the other
+        assert!(manager_a.neighbors_with_contract(&key).is_empty());
+        assert!(manager_b.neighbors_with_contract(&key).is_empty());
+
+        // Step 1: A establishes ring connection with B, generates CacheStateRequest
+        let a_request = manager_a.on_ring_connection_established(addr_b);
+        assert!(matches!(
+            a_request,
+            Some(ProximityCacheMessage::CacheStateRequest)
+        ));
+
+        // Step 2: B receives request, responds with its cache state
+        let b_response = manager_b.handle_message(addr_a, a_request.unwrap());
+        assert!(matches!(
+            b_response,
+            Some(ProximityCacheMessage::CacheStateResponse { .. })
+        ));
+
+        // Step 3: A receives B's state response
+        // CRITICAL: A should now announce its overlapping contracts back to B
+        let a_announcement = manager_a.handle_message(addr_b, b_response.unwrap());
+        assert!(
+            a_announcement.is_some(),
+            "A must announce overlapping contracts after receiving B's state"
+        );
+
+        // A now knows B has contract X
+        let a_neighbors = manager_a.neighbors_with_contract(&key);
+        assert_eq!(a_neighbors.len(), 1, "A should know B has contract X");
+        assert_eq!(a_neighbors[0], addr_b);
+
+        // Step 4: B receives A's announcement
+        let b_final = manager_b.handle_message(addr_a, a_announcement.unwrap());
+        // B should not respond (is_response=true prevents ping-pong)
+        assert!(
+            b_final.is_none(),
+            "B should not respond to A's announcement (is_response=true)"
+        );
+
+        // B now knows A has contract X
+        let b_neighbors = manager_b.neighbors_with_contract(&key);
+        assert_eq!(b_neighbors.len(), 1, "B should know A has contract X");
+        assert_eq!(b_neighbors[0], addr_a);
+
+        // SUCCESS: Both peers now have bidirectional awareness and can forward updates
     }
 }
