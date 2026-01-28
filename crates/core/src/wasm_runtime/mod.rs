@@ -19,7 +19,7 @@ pub use contract_store::ContractStore;
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
-pub(crate) use mock_state_storage::MockStateStorage;
+pub use mock_state_storage::MockStateStorage;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use secrets_store::SecretStoreError;
 pub use secrets_store::SecretsStore;

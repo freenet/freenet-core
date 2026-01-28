@@ -291,12 +291,15 @@ impl ScheduledOperation {
 /// This struct captures the simulation result along with topology snapshots
 /// taken at the end of the simulation (before cleanup). This allows tests
 /// to validate subscription topology after the simulation completes.
-#[derive(Debug)]
 pub struct ControlledSimulationResult {
     /// The Turmoil simulation result
     pub turmoil_result: turmoil::Result,
     /// Topology snapshots captured at the end of simulation
     pub topology_snapshots: Vec<crate::ring::topology_registry::TopologySnapshot>,
+    /// Shared storage handles for each node, keyed by NodeLabel.
+    /// These are clones of the Arc-backed storages passed into Turmoil,
+    /// so they reflect all state stored during the simulation.
+    pub node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -3145,6 +3148,11 @@ impl SimNetwork {
                 .push((event_id, scheduled_op.operation));
         }
 
+        // Collect storage handles for the result — cloning Arc-backed storage
+        // gives tests access to the same data written during the simulation.
+        let mut node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage> =
+            HashMap::new();
+
         // Register all gateways as Turmoil hosts
         let gateways: Vec<_> = self.gateways.drain(..).collect();
         for (node, config) in gateways {
@@ -3154,6 +3162,7 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            node_storages.insert(label.clone(), shared_storage.clone());
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
@@ -3227,6 +3236,7 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            node_storages.insert(label.clone(), shared_storage.clone());
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
@@ -3358,6 +3368,7 @@ impl SimNetwork {
         ControlledSimulationResult {
             turmoil_result,
             topology_snapshots,
+            node_storages,
         }
     }
 

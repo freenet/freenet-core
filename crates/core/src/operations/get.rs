@@ -980,7 +980,6 @@ impl Operation for GetOp {
                                         op_manager.streaming_threshold,
                                         payload_size,
                                     ) {
-                                        crate::config::GlobalTestMetrics::record_streaming_send();
                                         let sid = StreamId::next_operations();
                                         tracing::info!(
                                             tx = %id,
@@ -999,7 +998,6 @@ impl Operation for GetOp {
                                         stream_data =
                                             Some((sid, bytes::Bytes::from(payload_bytes)));
                                     } else {
-                                        crate::config::GlobalTestMetrics::record_inline_send();
                                         return_msg = Some(GetMsg::Response {
                                             id,
                                             instance_id: *payload.key.id(),
@@ -1037,7 +1035,6 @@ impl Operation for GetOp {
                                         op_manager.streaming_threshold,
                                         payload_size,
                                     ) {
-                                        crate::config::GlobalTestMetrics::record_streaming_send();
                                         let sid = StreamId::next_operations();
                                         tracing::info!(
                                             tx = %id,
@@ -1056,7 +1053,6 @@ impl Operation for GetOp {
                                         stream_data =
                                             Some((sid, bytes::Bytes::from(payload_bytes)));
                                     } else {
-                                        crate::config::GlobalTestMetrics::record_inline_send();
                                         return_msg = Some(GetMsg::Response {
                                             id,
                                             instance_id: *payload.key.id(),

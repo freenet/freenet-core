@@ -359,7 +359,6 @@ impl Operation for UpdateOp {
                                     op_manager.streaming_threshold,
                                     payload_size,
                                 ) {
-                                    crate::config::GlobalTestMetrics::record_streaming_send();
                                     let sid = StreamId::next_operations();
                                     tracing::debug!(
                                         tx = %id,
@@ -376,7 +375,6 @@ impl Operation for UpdateOp {
                                     });
                                     stream_data = Some((sid, bytes::Bytes::from(payload_bytes)));
                                 } else {
-                                    crate::config::GlobalTestMetrics::record_inline_send();
                                     return_msg = Some(UpdateMsg::RequestUpdate {
                                         id: *id,
                                         key: *key,
