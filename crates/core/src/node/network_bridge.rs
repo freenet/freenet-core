@@ -49,6 +49,18 @@ pub(crate) trait NetworkBridge: Send + Sync {
         target_addr: SocketAddr,
         msg: NetMessage,
     ) -> impl Future<Output = ConnResult<()>> + Send;
+
+    /// Send raw stream data to a peer using operations-level streaming.
+    ///
+    /// The `stream_id` should be created via `StreamId::next_operations()` so the
+    /// receiver skips legacy InboundStream decoding. The data is fragmented and
+    /// sent via the transport's streaming mechanism.
+    fn send_stream(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: crate::transport::peer_connection::StreamId,
+        data: bytes::Bytes,
+    ) -> impl Future<Output = ConnResult<()>> + Send;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]

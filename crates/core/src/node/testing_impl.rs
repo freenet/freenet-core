@@ -185,6 +185,18 @@ impl SimOperation {
         ContractWasmAPIVersion::V1(WrappedContract::new(code.into(), params)).into()
     }
 
+    /// Creates a large deterministic state for streaming tests.
+    ///
+    /// `size_bytes` controls total state size (use > streaming_threshold to trigger streaming).
+    /// The content is deterministic based on `seed` for reproducibility.
+    pub fn create_large_state(size_bytes: usize, seed: u8) -> Vec<u8> {
+        let mut state = Vec::with_capacity(size_bytes);
+        for i in 0..size_bytes {
+            state.push(seed.wrapping_add((i % 256) as u8).wrapping_mul(3));
+        }
+        state
+    }
+
     /// Creates a deterministic test state from a seed.
     pub fn create_test_state(seed: u8) -> Vec<u8> {
         let mut state_bytes = vec![0u8; 64];
@@ -279,12 +291,15 @@ impl ScheduledOperation {
 /// This struct captures the simulation result along with topology snapshots
 /// taken at the end of the simulation (before cleanup). This allows tests
 /// to validate subscription topology after the simulation completes.
-#[derive(Debug)]
 pub struct ControlledSimulationResult {
     /// The Turmoil simulation result
     pub turmoil_result: turmoil::Result,
     /// Topology snapshots captured at the end of simulation
     pub topology_snapshots: Vec<crate::ring::topology_registry::TopologySnapshot>,
+    /// Shared storage handles for each node, keyed by NodeLabel.
+    /// These are clones of the Arc-backed storages passed into Turmoil,
+    /// so they reflect all state stored during the simulation.
+    pub node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -735,6 +750,10 @@ pub struct SimNetwork {
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
     all_gateway_configs: Vec<GatewayConfig>,
+    /// Whether streaming transport is enabled for operations
+    pub streaming_enabled: bool,
+    /// Size threshold (bytes) above which streaming is used (default: system default 64KB)
+    pub streaming_threshold: Option<usize>,
 }
 
 impl SimNetwork {
@@ -790,6 +809,8 @@ impl SimNetwork {
             node_addresses: HashMap::new(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
+            streaming_enabled: false,
+            streaming_threshold: None,
         };
         net.config_gateways(
             gateways
@@ -817,6 +838,37 @@ impl SimNetwork {
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
         );
+    }
+
+    /// Enables streaming transport for operations with the given threshold.
+    ///
+    /// When enabled, payloads larger than `threshold` bytes will use streaming
+    /// instead of inline messages. This retroactively updates all already-built
+    /// gateway and node configs.
+    pub fn with_streaming(&mut self, threshold: usize) {
+        self.streaming_enabled = true;
+        self.streaming_threshold = Some(threshold);
+
+        // Retroactively update already-built node configs (since config_gateways/config_nodes
+        // ran inside new() before this method could be called).
+        for (builder, _) in &mut self.gateways {
+            let old_config = &*builder.config.config;
+            let mut new_network_api = old_config.network_api.clone();
+            new_network_api.streaming_enabled = true;
+            new_network_api.streaming_threshold = threshold;
+            let mut new_config = old_config.clone();
+            new_config.network_api = new_network_api;
+            builder.config.config = Arc::new(new_config);
+        }
+        for (builder, _) in &mut self.nodes {
+            let old_config = &*builder.config.config;
+            let mut new_network_api = old_config.network_api.clone();
+            new_network_api.streaming_enabled = true;
+            new_network_api.streaming_threshold = threshold;
+            let mut new_config = old_config.clone();
+            new_config.network_api = new_network_api;
+            builder.config.config = Arc::new(new_config);
+        }
     }
 
     /// Derives a deterministic per-peer seed from the master seed and peer index.
@@ -1281,6 +1333,15 @@ impl SimNetwork {
             let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
+                network_api: crate::config::NetworkArgs {
+                    streaming_enabled: if self.streaming_enabled {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    streaming_threshold: self.streaming_threshold,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             // TODO: it may be unnecessary use config_args.build() for the simulation. Related with the TODO in Config line 238
@@ -1364,6 +1425,15 @@ impl SimNetwork {
             let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
+                network_api: crate::config::NetworkArgs {
+                    streaming_enabled: if self.streaming_enabled {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    streaming_threshold: self.streaming_threshold,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
@@ -3078,6 +3148,11 @@ impl SimNetwork {
                 .push((event_id, scheduled_op.operation));
         }
 
+        // Collect storage handles for the result — cloning Arc-backed storage
+        // gives tests access to the same data written during the simulation.
+        let mut node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage> =
+            HashMap::new();
+
         // Register all gateways as Turmoil hosts
         let gateways: Vec<_> = self.gateways.drain(..).collect();
         for (node, config) in gateways {
@@ -3087,6 +3162,7 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            node_storages.insert(label.clone(), shared_storage.clone());
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
@@ -3160,6 +3236,7 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            node_storages.insert(label.clone(), shared_storage.clone());
 
             // Create MemoryEventsGen without RNG (deterministic mode)
             // Clone receiver_ch so each node gets its own subscription
@@ -3291,6 +3368,7 @@ impl SimNetwork {
         ControlledSimulationResult {
             turmoil_result,
             topology_snapshots,
+            node_storages,
         }
     }
 

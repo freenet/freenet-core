@@ -129,8 +129,27 @@ pub struct StreamId(u32);
 static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl StreamId {
+    /// Marker bit that distinguishes operations-level streams from transport-level streams.
+    /// When set, the receiver skips the legacy `InboundStream` reassembly path and only
+    /// routes fragments through the orphan registry / streaming handles.
+    const OPS_STREAM_BIT: u32 = 0x8000_0000;
+
     pub fn next() -> Self {
         Self(STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release))
+    }
+
+    /// Generate a new StreamId for operations-level streaming.
+    /// The high bit is set so the receiver can distinguish these from transport-level streams
+    /// and skip the legacy `InboundStream` decode path (which would fail because the bytes
+    /// are a streaming payload, not a `NetMessage`).
+    pub fn next_operations() -> Self {
+        let id = STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self(id | Self::OPS_STREAM_BIT)
+    }
+
+    /// Returns true if this stream was created for operations-level streaming.
+    pub fn is_operations_stream(&self) -> bool {
+        self.0 & Self::OPS_STREAM_BIT != 0
     }
 
     /// Reset the stream ID counter to initial state.
@@ -1161,6 +1180,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.streaming_handles.insert(stream_id, streaming_handle);
                 }
 
+                // Operations-level streams skip the legacy InboundStream path.
+                // Their bytes are a streaming payload (e.g. GetStreamingPayload), not a
+                // NetMessage, so decode_msg() would fail and close the connection.
+                if stream_id.is_operations_stream() {
+                    tracing::trace!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        stream_id = %stream_id,
+                        fragment_number,
+                        "Operations stream fragment - skipping legacy InboundStream path"
+                    );
+                    return Ok(None);
+                }
+
                 // Legacy path: push to fast_channel for existing recv() behavior
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
                     sender
@@ -1293,13 +1325,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
+        self.outbound_stream_with_id(stream_id, data.into()).await;
+    }
+
+    /// Send stream data with a caller-provided StreamId.
+    /// Used by operations-level streaming where the StreamId is communicated
+    /// in the metadata message and must match the data stream.
+    async fn outbound_stream_with_id(&mut self, stream_id: StreamId, data: bytes::Bytes) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
                 stream_id,
                 self.remote_conn.last_packet_id.clone(),
                 self.remote_conn.socket.clone(),
                 self.remote_conn.remote_addr,
-                data.into(),
+                data,
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
                 self.remote_conn.token_bucket.clone(),
@@ -1592,6 +1631,19 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
 
     fn set_orphan_stream_registry(&mut self, registry: std::sync::Arc<OrphanStreamRegistry>) {
         PeerConnection::set_orphan_stream_registry(self, registry);
+    }
+
+    fn send_stream_data(
+        &mut self,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.outbound_stream_with_id(stream_id, data).await;
+            Ok(())
+        })
     }
 }
 

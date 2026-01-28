@@ -18,10 +18,11 @@ use crate::{
 use either::Either;
 
 use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
-use super::{OpEnum, OpError, OpOutcome, OperationResult};
+use super::{should_use_streaming, OpEnum, OpError, OpOutcome, OperationResult};
+use crate::transport::peer_connection::StreamId;
 
+use self::messages::GetStreamingPayload;
 pub(crate) use self::messages::{GetMsg, GetMsgResult};
-// GetStreamingPayload is used for serialization by senders, not receivers
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
@@ -781,6 +782,7 @@ impl Operation for GetOp {
             let mut new_state = None;
             let mut result = None;
             let mut stats = self.stats;
+            let mut stream_data: Option<(StreamId, bytes::Bytes)> = None;
 
             // Look up sender's PeerKeyLocation from source address for logging/routing
             // This replaces the sender field that was previously embedded in messages
@@ -863,6 +865,7 @@ impl Operation for GetOp {
                             None,
                             stats,
                             self.upstream_addr,
+                            None,
                         );
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -956,17 +959,54 @@ impl Operation for GetOp {
                                     // This is a forwarded request - send result back to upstream
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
                                     new_state = None;
-                                    return_msg = Some(GetMsg::Response {
-                                        id,
-                                        instance_id: *key.id(),
-                                        result: GetMsgResult::Found {
-                                            key,
-                                            value: StoreResponse {
-                                                state: Some(state),
-                                                contract,
+                                    let store_response = StoreResponse {
+                                        state: Some(state),
+                                        contract,
+                                    };
+                                    let includes_contract = store_response.contract.is_some();
+                                    let payload = GetStreamingPayload {
+                                        key,
+                                        value: store_response,
+                                    };
+                                    let payload_bytes =
+                                        bincode::serialize(&payload).map_err(|e| {
+                                            OpError::NotificationChannelError(format!(
+                                                "Failed to serialize streaming payload: {e}"
+                                            ))
+                                        })?;
+                                    let payload_size = payload_bytes.len();
+                                    if should_use_streaming(
+                                        op_manager.streaming_enabled,
+                                        op_manager.streaming_threshold,
+                                        payload_size,
+                                    ) {
+                                        let sid = StreamId::next_operations();
+                                        tracing::info!(
+                                            tx = %id,
+                                            stream_id = %sid,
+                                            payload_size,
+                                            "GET response using operations-level streaming"
+                                        );
+                                        return_msg = Some(GetMsg::ResponseStreaming {
+                                            id,
+                                            instance_id: *payload.key.id(),
+                                            stream_id: sid,
+                                            key: payload.key,
+                                            total_size: payload_size as u64,
+                                            includes_contract,
+                                        });
+                                        stream_data =
+                                            Some((sid, bytes::Bytes::from(payload_bytes)));
+                                    } else {
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id: *payload.key.id(),
+                                            result: GetMsgResult::Found {
+                                                key: payload.key,
+                                                value: payload.value,
                                             },
-                                        },
-                                    });
+                                        });
+                                    }
                                 }
                                 Some(GetState::AwaitingResponse { .. })
                                     if self.upstream_addr.is_some() =>
@@ -974,17 +1014,54 @@ impl Operation for GetOp {
                                     // Forward contract to upstream
                                     new_state = None;
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
-                                    return_msg = Some(GetMsg::Response {
-                                        id,
-                                        instance_id: *key.id(),
-                                        result: GetMsgResult::Found {
-                                            key,
-                                            value: StoreResponse {
-                                                state: Some(state),
-                                                contract,
+                                    let store_response = StoreResponse {
+                                        state: Some(state),
+                                        contract,
+                                    };
+                                    let includes_contract = store_response.contract.is_some();
+                                    let payload = GetStreamingPayload {
+                                        key,
+                                        value: store_response,
+                                    };
+                                    let payload_bytes =
+                                        bincode::serialize(&payload).map_err(|e| {
+                                            OpError::NotificationChannelError(format!(
+                                                "Failed to serialize streaming payload: {e}"
+                                            ))
+                                        })?;
+                                    let payload_size = payload_bytes.len();
+                                    if should_use_streaming(
+                                        op_manager.streaming_enabled,
+                                        op_manager.streaming_threshold,
+                                        payload_size,
+                                    ) {
+                                        let sid = StreamId::next_operations();
+                                        tracing::info!(
+                                            tx = %id,
+                                            stream_id = %sid,
+                                            payload_size,
+                                            "GET response using operations-level streaming"
+                                        );
+                                        return_msg = Some(GetMsg::ResponseStreaming {
+                                            id,
+                                            instance_id: *payload.key.id(),
+                                            stream_id: sid,
+                                            key: payload.key,
+                                            total_size: payload_size as u64,
+                                            includes_contract,
+                                        });
+                                        stream_data =
+                                            Some((sid, bytes::Bytes::from(payload_bytes)));
+                                    } else {
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id: *payload.key.id(),
+                                            result: GetMsgResult::Found {
+                                                key: payload.key,
+                                                value: payload.value,
                                             },
-                                        },
-                                    });
+                                        });
+                                    }
                                 }
                                 Some(GetState::AwaitingResponse {
                                     requester: None, ..
@@ -2105,6 +2182,7 @@ impl Operation for GetOp {
                 result,
                 stats,
                 self.upstream_addr,
+                stream_data,
             )
         })
     }
@@ -2117,12 +2195,15 @@ fn build_op_result(
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
+    stream_data: Option<(StreamId, bytes::Bytes)>,
 ) -> Result<OperationResult, OpError> {
     // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
     // - For Request messages being forwarded: use next_hop from state
     let next_hop = match (&msg, &state) {
-        (Some(GetMsg::Response { .. }), _) => upstream_addr,
+        (Some(GetMsg::Response { .. }) | Some(GetMsg::ResponseStreaming { .. }), _) => {
+            upstream_addr
+        }
         (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse { next_hop, .. })) => {
             next_hop.socket_addr()
         }
@@ -2141,6 +2222,7 @@ fn build_op_result(
         return_msg: msg.map(NetMessage::from),
         next_hop,
         state: output_op.map(OpEnum::Get),
+        stream_data,
     })
 }
 
@@ -2238,6 +2320,7 @@ async fn try_forward_or_return(
             None,
             stats,
             upstream_addr,
+            None,
         )
     } else if upstream_addr.is_some() {
         // No targets found and we don't have the contract - send NotFound back to requester
@@ -2259,6 +2342,7 @@ async fn try_forward_or_return(
             None,
             stats,
             upstream_addr,
+            None,
         )
     } else {
         // Original requester with no forwarding targets - operation fails locally
@@ -2269,7 +2353,7 @@ async fn try_forward_or_return(
             "No peers to forward get request to and no upstream - local operation fails"
         );
 
-        build_op_result(id, None, None, None, stats, upstream_addr)
+        build_op_result(id, None, None, None, stats, upstream_addr, None)
     }
 }
 

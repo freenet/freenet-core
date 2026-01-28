@@ -96,7 +96,9 @@ pub mod dev_tool {
         validate_topology_from_snapshots, ContractSubscription, ProximityViolation,
         TopologySnapshot, TopologyValidationResult,
     };
-    pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
+    pub use wasm_runtime::{
+        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretsStore, StateStore,
+    };
 
     // Re-export simulation types for test infrastructure
     pub use crate::simulation::{

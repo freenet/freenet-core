@@ -559,6 +559,7 @@ impl Operation for SubscribeOp {
                                 })),
                                 next_hop: Some(requester_addr),
                                 state: None,
+                                stream_data: None,
                             });
                         } else {
                             // We're the originator and have the contract locally
@@ -572,6 +573,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     is_renewal: self.is_renewal,
                                 })),
+                                stream_data: None,
                             });
                         }
                     }
@@ -595,6 +597,7 @@ impl Operation for SubscribeOp {
                                 })),
                                 next_hop: Some(requester_addr),
                                 state: None,
+                                stream_data: None,
                             });
                         } else {
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator, contract arrived after wait)");
@@ -607,6 +610,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     is_renewal: self.is_renewal,
                                 })),
+                                stream_data: None,
                             });
                         }
                     }
@@ -669,6 +673,7 @@ impl Operation for SubscribeOp {
                             requester_addr: self.requester_addr,
                             is_renewal: self.is_renewal,
                         })),
+                        stream_data: None,
                     })
                 }
 
@@ -742,6 +747,7 @@ impl Operation for SubscribeOp {
                                     })),
                                     next_hop: Some(requester_addr),
                                     state: None,
+                                    stream_data: None,
                                 })
                             } else {
                                 // We're the originator - return completed state for handle_op_result
@@ -768,6 +774,7 @@ impl Operation for SubscribeOp {
                                         requester_addr: None,
                                         is_renewal: self.is_renewal,
                                     })),
+                                    stream_data: None,
                                 })
                             }
                         }
@@ -792,6 +799,7 @@ impl Operation for SubscribeOp {
                                     })),
                                     next_hop: Some(requester_addr),
                                     state: None,
+                                    stream_data: None,
                                 })
                             } else {
                                 // We're the originator - check if we have the contract locally
@@ -871,6 +879,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             is_renewal: self.is_renewal,
                                         })),
+                                        stream_data: None,
                                     })
                                 } else {
                                     // No local cache - subscription failed
@@ -896,6 +905,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             is_renewal: self.is_renewal,
                                         })),
+                                        stream_data: None,
                                     })
                                 }
                             }

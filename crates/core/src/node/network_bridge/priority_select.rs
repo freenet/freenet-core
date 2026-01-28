@@ -17,10 +17,8 @@ use crate::contract::{
 };
 use crate::dev_tool::Transaction;
 use crate::message::{NetMessage, NodeEvent};
-use crate::ring::PeerKeyLocation;
-
-// P2pBridgeEvent type alias for the event bridge channel
-pub type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
+// Re-export P2pBridgeEvent from p2p_protoc
+pub(crate) use super::p2p_protoc::P2pBridgeEvent;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]

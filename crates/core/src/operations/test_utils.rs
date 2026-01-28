@@ -31,6 +31,16 @@ pub struct MockNetworkBridge {
     fail_addresses: Arc<Mutex<Vec<SocketAddr>>>,
     /// Addresses that have been "dropped"
     dropped_connections: Arc<Mutex<Vec<SocketAddr>>>,
+    /// Records of (target_addr, stream_id, data) for all stream sends
+    sent_streams: Arc<
+        Mutex<
+            Vec<(
+                SocketAddr,
+                crate::transport::peer_connection::StreamId,
+                bytes::Bytes,
+            )>,
+        >,
+    >,
 }
 
 impl MockNetworkBridge {
@@ -64,10 +74,22 @@ impl MockNetworkBridge {
         self.dropped_connections.lock().unwrap().clone()
     }
 
+    /// Get all sent stream data
+    pub fn sent_streams(
+        &self,
+    ) -> Vec<(
+        SocketAddr,
+        crate::transport::peer_connection::StreamId,
+        bytes::Bytes,
+    )> {
+        self.sent_streams.lock().unwrap().clone()
+    }
+
     /// Clear all recorded data
     pub fn clear(&self) {
         self.sent_messages.lock().unwrap().clear();
         self.dropped_connections.lock().unwrap().clear();
+        self.sent_streams.lock().unwrap().clear();
     }
 }
 
@@ -84,6 +106,19 @@ impl NetworkBridge for MockNetworkBridge {
 
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> ConnResult<()> {
         self.dropped_connections.lock().unwrap().push(peer_addr);
+        Ok(())
+    }
+
+    async fn send_stream(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: crate::transport::peer_connection::StreamId,
+        data: bytes::Bytes,
+    ) -> ConnResult<()> {
+        self.sent_streams
+            .lock()
+            .unwrap()
+            .push((target_addr, stream_id, data));
         Ok(())
     }
 }
