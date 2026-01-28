@@ -85,6 +85,12 @@ pub(crate) enum P2pBridgeEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
     },
+    /// Pipe an inbound stream to a target, forwarding fragments incrementally.
+    PipeStream {
+        target_addr: SocketAddr,
+        outbound_stream_id: StreamId,
+        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+    },
 }
 
 #[derive(Clone)]
@@ -275,6 +281,23 @@ impl NetworkBridge for P2pBridge {
                 target_addr,
                 stream_id,
                 data,
+            })
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+        Ok(())
+    }
+
+    async fn pipe_stream(
+        &self,
+        target_addr: SocketAddr,
+        outbound_stream_id: StreamId,
+        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+    ) -> super::ConnResult<()> {
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::PipeStream {
+                target_addr,
+                outbound_stream_id,
+                inbound_handle,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -877,6 +900,39 @@ impl P2pConnManager {
                                     peer_addr = %target_addr,
                                     phase = "error",
                                     "No connection found for stream send target"
+                                );
+                            }
+                        }
+                        ConnEvent::PipeStream {
+                            target_addr,
+                            outbound_stream_id,
+                            inbound_handle,
+                        } => {
+                            // Route piped stream to the per-connection channel
+                            if let Some(peer_connection) = ctx.connections.get(&target_addr) {
+                                if let Err(e) = peer_connection
+                                    .sender
+                                    .send(Right(ConnEvent::PipeStream {
+                                        target_addr,
+                                        outbound_stream_id,
+                                        inbound_handle,
+                                    }))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        stream_id = %outbound_stream_id,
+                                        peer_addr = %target_addr,
+                                        error = %e,
+                                        phase = "error",
+                                        "Failed to pipe stream to peer connection"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    stream_id = %outbound_stream_id,
+                                    peer_addr = %target_addr,
+                                    phase = "error",
+                                    "No connection found for pipe stream target"
                                 );
                             }
                         }
@@ -3306,6 +3362,18 @@ impl P2pConnManager {
                 }
                 .into(),
             ),
+            Some(P2pBridgeEvent::PipeStream {
+                target_addr,
+                outbound_stream_id,
+                inbound_handle,
+            }) => EventResult::Event(
+                ConnEvent::PipeStream {
+                    target_addr,
+                    outbound_stream_id,
+                    inbound_handle,
+                }
+                .into(),
+            ),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
     }
@@ -3461,6 +3529,13 @@ pub(super) enum ConnEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
     },
+    /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
+    /// Used for low-latency forwarding at intermediate nodes.
+    PipeStream {
+        target_addr: SocketAddr,
+        outbound_stream_id: StreamId,
+        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+    },
 }
 
 #[derive(Debug)]
@@ -3561,6 +3636,30 @@ async fn handle_peer_channel_message(
                             stream_id = %stream_id,
                             ?error,
                             "[CONN_LIFECYCLE] Failed to send stream data to peer"
+                        );
+                        return Err(error);
+                    }
+                }
+                ConnEvent::PipeStream {
+                    outbound_stream_id,
+                    inbound_handle,
+                    ..
+                } => {
+                    tracing::debug!(
+                        to = %conn.remote_addr(),
+                        stream_id = %outbound_stream_id,
+                        total_bytes = inbound_handle.total_bytes(),
+                        "[CONN_LIFECYCLE] Piping stream to peer"
+                    );
+                    if let Err(error) = conn
+                        .pipe_stream_data(outbound_stream_id, inbound_handle)
+                        .await
+                    {
+                        tracing::error!(
+                            to = %conn.remote_addr(),
+                            stream_id = %outbound_stream_id,
+                            ?error,
+                            "[CONN_LIFECYCLE] Failed to pipe stream to peer"
                         );
                         return Err(error);
                     }

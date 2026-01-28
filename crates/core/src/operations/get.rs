@@ -768,7 +768,7 @@ impl Operation for GetOp {
 
     fn process_message<'a, NB: NetworkBridge>(
         self,
-        _conn_manager: &'a mut NB,
+        conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
         source_addr: Option<std::net::SocketAddr>,
@@ -1991,7 +1991,58 @@ impl Operation for GetOp {
                         }
                     };
 
-                    // Step 2: Wait for stream to complete and assemble data
+                    // Step 2: Check if we should pipe upstream BEFORE assembly
+                    // This enables low-latency forwarding of responses
+                    let is_original_requester = self.upstream_addr.is_none();
+                    let piping_started = if !is_original_requester {
+                        let upstream_addr = self
+                            .upstream_addr
+                            .expect("non-originator must have upstream");
+                        // Check if streaming should be used based on the original stream size
+                        if should_use_streaming(
+                            op_manager.streaming_enabled,
+                            op_manager.streaming_threshold,
+                            *total_size as usize,
+                        ) {
+                            let outbound_sid = StreamId::next_operations();
+                            let forked_handle = stream_handle.fork();
+
+                            tracing::info!(
+                                tx = %id,
+                                inbound_stream_id = %stream_id,
+                                outbound_stream_id = %outbound_sid,
+                                total_size,
+                                peer_addr = %upstream_addr,
+                                "Starting piped stream forwarding of GET response to upstream"
+                            );
+
+                            // Send metadata message first
+                            let pipe_metadata = GetMsg::ResponseStreaming {
+                                id,
+                                instance_id: *instance_id,
+                                stream_id: outbound_sid,
+                                key,
+                                total_size: *total_size,
+                                includes_contract,
+                            };
+                            conn_manager
+                                .send(upstream_addr, NetMessage::from(pipe_metadata))
+                                .await?;
+
+                            // Start piping (runs asynchronously in background)
+                            conn_manager
+                                .pipe_stream(upstream_addr, outbound_sid, forked_handle)
+                                .await?;
+
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Step 3: Wait for stream to complete and assemble data (for local caching)
                     let stream_data = match stream_handle.assemble().await {
                         Ok(data) => data,
                         Err(e) => {
@@ -2040,9 +2091,6 @@ impl Operation for GetOp {
                     }
 
                     let value = payload.value;
-
-                    // Step 4: Check if this is the original requester
-                    let is_original_requester = self.upstream_addr.is_none();
 
                     // Get current hop for telemetry
                     let current_hop =
@@ -2125,14 +2173,24 @@ impl Operation for GetOp {
                         });
                         new_state = Some(GetState::Finished { key });
                         return_msg = None;
-                    } else {
-                        // Forward the response to upstream as a regular Response
-                        // (streaming is only for large payloads, we've now received it)
+                    } else if piping_started {
+                        // Piping is already underway - no need to send return_msg
                         tracing::debug!(
                             tx = %id,
                             contract = %key,
                             phase = "forward",
-                            "Forwarding GET response to upstream"
+                            "GET response piping in progress to upstream"
+                        );
+                        return_msg = None;
+                        new_state = None;
+                    } else {
+                        // Forward the response to upstream as a regular Response
+                        // (streaming not used - payload below threshold)
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "forward",
+                            "Forwarding GET response as non-streaming to upstream"
                         );
 
                         return_msg = Some(GetMsg::Response {

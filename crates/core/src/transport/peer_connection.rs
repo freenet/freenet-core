@@ -1350,6 +1350,34 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.outbound_stream_futures.push(task);
     }
 
+    /// Pipe an inbound stream to an outbound connection.
+    ///
+    /// This forwards fragments from `inbound_handle` to the remote peer as they arrive,
+    /// without waiting for full reassembly. Used by intermediate nodes for low-latency
+    /// stream forwarding.
+    async fn pipe_stream_to_remote(
+        &mut self,
+        outbound_stream_id: StreamId,
+        inbound_handle: streaming::StreamHandle,
+    ) {
+        let task = GlobalExecutor::spawn(
+            outbound_stream::pipe_stream(
+                inbound_handle,
+                outbound_stream_id,
+                self.remote_conn.last_packet_id.clone(),
+                self.remote_conn.socket.clone(),
+                self.remote_conn.remote_addr,
+                self.remote_conn.outbound_symmetric_key.clone(),
+                self.remote_conn.sent_tracker.clone(),
+                self.remote_conn.token_bucket.clone(),
+                self.remote_conn.congestion_controller.clone(),
+                self.time_source.clone(),
+            )
+            .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
+        );
+        self.outbound_stream_futures.push(task);
+    }
+
     /// Sends a single stream fragment to the remote peer.
     ///
     /// This is the low-level API for piped forwarding. Unlike `send()` which
@@ -1642,6 +1670,20 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     > {
         Box::pin(async move {
             self.outbound_stream_with_id(stream_id, data).await;
+            Ok(())
+        })
+    }
+
+    fn pipe_stream_data(
+        &mut self,
+        outbound_stream_id: StreamId,
+        inbound_handle: streaming::StreamHandle,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle)
+                .await;
             Ok(())
         })
     }

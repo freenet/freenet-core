@@ -19,6 +19,9 @@ use crate::{
     },
 };
 
+use futures::StreamExt;
+
+use super::streaming::StreamHandle;
 use super::StreamId;
 
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
@@ -240,6 +243,194 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         stream_id: stream_id.0 as u64,
         remote_addr: destination_addr,
         bytes_transferred: bytes_to_send,
+        elapsed,
+        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
+        final_cwnd_bytes: generic_stats.cwnd as u32,
+        slowdowns_triggered: ledbat_stats
+            .as_ref()
+            .map(|s| s.periodic_slowdowns as u32)
+            .unwrap_or(0),
+        base_delay: generic_stats.base_delay,
+        final_ssthresh_bytes: generic_stats.ssthresh as u32,
+        min_ssthresh_floor_bytes: ledbat_stats
+            .as_ref()
+            .map(|s| s.min_ssthresh_floor as u32)
+            .unwrap_or(0),
+        total_timeouts: generic_stats.total_timeouts as u32,
+        final_flightsize: generic_stats.flightsize as u32,
+        configured_rate: congestion_controller.configured_rate() as u32,
+    })
+}
+
+/// Pipes an inbound stream to an outbound connection, forwarding fragments as they arrive.
+///
+/// Unlike `send_stream` which takes complete data and fragments it, this reads
+/// from a `StreamHandle` and forwards each fragment incrementally. This avoids
+/// full reassembly at intermediate nodes, reducing latency.
+///
+/// The outbound stream uses a new `outbound_stream_id` so the receiver sees
+/// a fresh stream. Fragments are sent with the same BBR congestion control
+/// and token bucket rate limiting as `send_stream`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
+    inbound_handle: StreamHandle,
+    outbound_stream_id: StreamId,
+    last_packet_id: Arc<AtomicU32>,
+    socket: Arc<S>,
+    destination_addr: SocketAddr,
+    outbound_symmetric_key: Aes128Gcm,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
+    token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
+    congestion_controller: Arc<CongestionController<T>>,
+    time_source: T,
+) -> Result<TransferStats, TransportError> {
+    let start_time = time_source.now();
+    let total_bytes = inbound_handle.total_bytes();
+
+    emit_transfer_started(
+        outbound_stream_id.0 as u64,
+        destination_addr,
+        total_bytes,
+        TransferDirection::Send,
+    );
+
+    tracing::debug!(
+        stream_id = %outbound_stream_id.0,
+        total_bytes,
+        "Piping stream to next hop"
+    );
+
+    let mut stream = inbound_handle.stream();
+    let mut sent_so_far = 0u64;
+    let mut fragment_number = 1u32;
+
+    while let Some(result) = stream.next().await {
+        let payload = match result {
+            Ok(data) => data,
+            Err(e) => {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!("inbound stream error: {e}"),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
+            }
+        };
+
+        let packet_size = payload.len();
+
+        // BBR congestion control - wait for cwnd space
+        let mut cwnd_wait_iterations = 0;
+        loop {
+            let flightsize = congestion_controller.flightsize();
+            let cwnd = congestion_controller.current_cwnd();
+
+            if flightsize + packet_size <= cwnd {
+                break;
+            }
+
+            cwnd_wait_iterations += 1;
+            if cwnd_wait_iterations == 1 {
+                tracing::trace!(
+                    stream_id = %outbound_stream_id.0,
+                    fragment_number,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    "Waiting for cwnd space in pipe_stream"
+                );
+            }
+
+            if cwnd_wait_iterations <= 10 {
+                tokio::task::yield_now().await;
+            } else if cwnd_wait_iterations <= 100 {
+                time_source.sleep(Duration::from_micros(100)).await;
+            } else {
+                time_source.sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        // Token bucket rate limiting
+        let wait_time = token_bucket.reserve(packet_size);
+        if !wait_time.is_zero() {
+            time_source.sleep(wait_time).await;
+        }
+
+        let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let token = congestion_controller.on_send_with_token(packet_size);
+
+        if let Err(e) = super::packet_sending(
+            destination_addr,
+            &socket,
+            packet_id,
+            &outbound_symmetric_key,
+            vec![],
+            symmetric_message::StreamFragment {
+                stream_id: outbound_stream_id,
+                total_length_bytes: total_bytes,
+                fragment_number,
+                payload,
+            },
+            sent_packet_tracker.as_ref(),
+            token,
+        )
+        .await
+        {
+            let elapsed = time_source.now().saturating_sub(start_time);
+            emit_transfer_failed(
+                outbound_stream_id.0 as u64,
+                destination_addr,
+                sent_so_far,
+                e.to_string(),
+                elapsed.as_millis() as u64,
+                TransferDirection::Send,
+            );
+            return Err(e);
+        }
+
+        sent_so_far += packet_size as u64;
+        fragment_number += 1;
+    }
+
+    let generic_stats = congestion_controller.stats();
+    let ledbat_stats = congestion_controller.ledbat_stats();
+    let elapsed = time_source.now().saturating_sub(start_time);
+
+    tracing::debug!(
+        stream_id = %outbound_stream_id.0,
+        fragments = fragment_number - 1,
+        bytes = sent_so_far,
+        elapsed_ms = elapsed.as_millis(),
+        "Pipe stream complete"
+    );
+
+    emit_transfer_completed(
+        outbound_stream_id.0 as u64,
+        destination_addr,
+        sent_so_far,
+        elapsed.as_millis() as u64,
+        if elapsed.as_secs() > 0 {
+            sent_so_far / elapsed.as_secs()
+        } else {
+            sent_so_far * 1000 / elapsed.as_millis().max(1) as u64
+        },
+        Some(generic_stats.peak_cwnd as u32),
+        Some(generic_stats.cwnd as u32),
+        ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
+        Some(generic_stats.base_delay.as_millis() as u32),
+        Some(generic_stats.ssthresh as u32),
+        ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
+        Some(generic_stats.total_timeouts as u32),
+        TransferDirection::Send,
+    );
+
+    Ok(TransferStats {
+        stream_id: outbound_stream_id.0 as u64,
+        remote_addr: destination_addr,
+        bytes_transferred: sent_so_far,
         elapsed,
         peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
         final_cwnd_bytes: generic_stats.cwnd as u32,

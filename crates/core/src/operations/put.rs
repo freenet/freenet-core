@@ -259,7 +259,7 @@ impl Operation for PutOp {
 
     fn process_message<'a, NB: NetworkBridge>(
         self,
-        _conn_manager: &'a mut NB,
+        conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
         source_addr: Option<std::net::SocketAddr>,
@@ -678,7 +678,88 @@ impl Operation for PutOp {
                         }
                     };
 
-                    // Step 2: Wait for stream to complete and assemble data
+                    // Step 2: Compute next hop BEFORE assembly (enables piped forwarding)
+                    // Build skip list for routing
+                    let htl = *htl;
+                    let mut routing_skip_list = skip_list.clone();
+                    if let Some(addr) = upstream_addr {
+                        routing_skip_list.insert(addr);
+                    }
+                    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+                        routing_skip_list.insert(own_addr);
+                    }
+
+                    let next_hop = if htl > 0 {
+                        op_manager
+                            .ring
+                            .closest_potentially_caching(contract_key, &routing_skip_list)
+                    } else {
+                        None
+                    };
+
+                    let next_peer_known =
+                        next_hop.and_then(|p| KnownPeerKeyLocation::try_from(p).ok());
+
+                    // Step 3: Start piping if we have a next hop and streaming is appropriate
+                    // Fork the handle and start forwarding BEFORE we assemble locally
+                    let piping_started = if let Some(ref next_peer) = next_peer_known {
+                        let next_addr = next_peer.socket_addr();
+                        // Check if streaming should be used based on the original stream size
+                        if should_use_streaming(
+                            op_manager.streaming_enabled,
+                            op_manager.streaming_threshold,
+                            *total_size as usize,
+                        ) {
+                            let outbound_sid = StreamId::next_operations();
+                            let forked_handle = stream_handle.fork();
+
+                            tracing::info!(
+                                tx = %id,
+                                inbound_stream_id = %stream_id,
+                                outbound_stream_id = %outbound_sid,
+                                total_size,
+                                peer_addr = %next_addr,
+                                "Starting piped stream forwarding to next hop"
+                            );
+
+                            // Send metadata message first
+                            let pipe_metadata = PutMsg::RequestStreaming {
+                                id,
+                                stream_id: outbound_sid,
+                                contract_key: *contract_key,
+                                total_size: *total_size,
+                                htl: htl.saturating_sub(1),
+                                skip_list: routing_skip_list.clone(),
+                                subscribe: *msg_subscribe,
+                            };
+                            conn_manager
+                                .send(next_addr, NetMessage::from(pipe_metadata))
+                                .await?;
+
+                            // Start piping (runs asynchronously in background)
+                            conn_manager
+                                .pipe_stream(next_addr, outbound_sid, forked_handle)
+                                .await?;
+
+                            if let Some(event) = NetEventLog::put_request(
+                                &id,
+                                &op_manager.ring,
+                                *contract_key,
+                                PeerKeyLocation::from(next_peer.clone()),
+                                htl.saturating_sub(1),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Step 4: Wait for stream to complete and assemble data (for local storage)
                     let stream_data = match stream_handle.assemble().await {
                         Ok(data) => data,
                         Err(e) => {
@@ -765,30 +846,43 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // Step 5: Determine forwarding
-                    let htl = *htl;
-                    let mut new_skip_list = skip_list.clone();
-                    if let Some(addr) = upstream_addr {
-                        new_skip_list.insert(addr);
-                    }
-                    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
-                        new_skip_list.insert(own_addr);
-                    }
+                    // Step 5: Handle forwarding or final destination
+                    if piping_started {
+                        // Piping is already underway - just track state, no need to forward via return
+                        let next_addr = next_peer_known
+                            .as_ref()
+                            .expect("piping_started implies next_peer_known")
+                            .socket_addr();
 
-                    let next_hop = if htl > 0 {
-                        op_manager
-                            .ring
-                            .closest_potentially_caching(&key, &new_skip_list)
-                    } else {
-                        None
-                    };
+                        tracing::debug!(
+                            tx = %id,
+                            contract = %key,
+                            peer_addr = %next_addr,
+                            htl = htl - 1,
+                            phase = "forward",
+                            "PUT piping in progress to next hop"
+                        );
 
-                    let next_peer_known =
-                        next_hop.and_then(|p| KnownPeerKeyLocation::try_from(p).ok());
+                        let new_state = Some(PutState::AwaitingResponse {
+                            subscribe: *msg_subscribe,
+                            next_hop: Some(next_addr),
+                            current_htl: htl,
+                        });
 
-                    if let Some(next_peer) = next_peer_known {
-                        // Forward to next hop - for now, forward as regular message
-                        // TODO: In future, could forward as streaming if payload is still large
+                        // No return_msg or stream_data needed - piping handles forwarding
+                        Ok(OperationResult {
+                            return_msg: None,
+                            next_hop: None, // Piping already sent to next_addr
+                            state: Some(OpEnum::Put(PutOp {
+                                id,
+                                state: new_state,
+                                upstream_addr,
+                            })),
+                            stream_data: None,
+                        })
+                    } else if let Some(next_peer) = next_peer_known {
+                        // Next hop exists but piping didn't start (streaming not appropriate for size)
+                        // Forward as non-streaming message
                         let next_addr = next_peer.socket_addr();
 
                         tracing::debug!(
@@ -797,7 +891,7 @@ impl Operation for PutOp {
                             peer_addr = %next_addr,
                             htl = htl - 1,
                             phase = "forward",
-                            "Forwarding PUT (from streaming) to next hop"
+                            "Forwarding PUT (from streaming) as non-streaming to next hop"
                         );
 
                         if let Some(event) = NetEventLog::put_request(
@@ -810,56 +904,14 @@ impl Operation for PutOp {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
 
-                        // Forward PUT - check if streaming should be used
                         let new_htl = htl.saturating_sub(1);
-                        let payload = PutStreamingPayload {
+                        let forward_msg = PutMsg::Request {
+                            id,
                             contract: contract.clone(),
                             related_contracts,
                             value: merged_value,
-                        };
-                        let payload_bytes = bincode::serialize(&payload).map_err(|e| {
-                            OpError::NotificationChannelError(format!(
-                                "Failed to serialize streaming payload: {e}"
-                            ))
-                        })?;
-                        let payload_size = payload_bytes.len();
-
-                        let (forward_msg, stream_data) = if should_use_streaming(
-                            op_manager.streaming_enabled,
-                            op_manager.streaming_threshold,
-                            payload_size,
-                        ) {
-                            let sid = StreamId::next_operations();
-                            tracing::info!(
-                                tx = %id,
-                                stream_id = %sid,
-                                payload_size,
-                                "PUT request (from streaming) using operations-level streaming"
-                            );
-                            (
-                                PutMsg::RequestStreaming {
-                                    id,
-                                    stream_id: sid,
-                                    contract_key: key,
-                                    total_size: payload_size as u64,
-                                    htl: new_htl,
-                                    skip_list: new_skip_list,
-                                    subscribe: *msg_subscribe,
-                                },
-                                Some((sid, bytes::Bytes::from(payload_bytes))),
-                            )
-                        } else {
-                            (
-                                PutMsg::Request {
-                                    id,
-                                    contract: payload.contract,
-                                    related_contracts: payload.related_contracts,
-                                    value: payload.value,
-                                    htl: new_htl,
-                                    skip_list: new_skip_list,
-                                },
-                                None,
-                            )
+                            htl: new_htl,
+                            skip_list: routing_skip_list,
                         };
 
                         let new_state = Some(PutState::AwaitingResponse {
@@ -876,7 +928,7 @@ impl Operation for PutOp {
                                 state: new_state,
                                 upstream_addr,
                             })),
-                            stream_data,
+                            stream_data: None,
                         })
                     } else {
                         // No next hop - we're the final destination

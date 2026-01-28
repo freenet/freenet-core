@@ -321,6 +321,20 @@ pub(crate) trait PeerConnectionApi: Send {
         stream_id: crate::transport::peer_connection::StreamId,
         data: bytes::Bytes,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.
+    ///
+    /// Unlike `send_stream_data` which takes complete data and fragments it, this reads
+    /// from an existing `StreamHandle` and forwards each fragment incrementally without
+    /// waiting for full reassembly. This enables low-latency forwarding at intermediate nodes.
+    ///
+    /// The `outbound_stream_id` should be created via `StreamId::next_operations()` for
+    /// operations-level routing at the receiver.
+    fn pipe_stream_data(
+        &mut self,
+        outbound_stream_id: crate::transport::peer_connection::StreamId,
+        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 }
 
 #[cfg(test)]
