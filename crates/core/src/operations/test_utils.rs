@@ -121,6 +121,16 @@ impl NetworkBridge for MockNetworkBridge {
             .push((target_addr, stream_id, data));
         Ok(())
     }
+
+    async fn pipe_stream(
+        &self,
+        _target_addr: SocketAddr,
+        _outbound_stream_id: crate::transport::peer_connection::StreamId,
+        _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+    ) -> ConnResult<()> {
+        // Mock implementation - just succeed without doing anything
+        Ok(())
+    }
 }
 
 /// Helper to create a test PeerKeyLocation with a specific port
