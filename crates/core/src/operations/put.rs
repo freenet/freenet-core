@@ -858,7 +858,7 @@ impl Operation for PutOp {
                             tx = %id,
                             contract = %key,
                             peer_addr = %next_addr,
-                            htl = htl - 1,
+                            htl = htl.saturating_sub(1),
                             phase = "forward",
                             "PUT piping in progress to next hop"
                         );
