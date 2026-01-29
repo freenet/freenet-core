@@ -323,7 +323,16 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
 
         let packet_size = payload.len();
 
-        // BBR congestion control - wait for cwnd space
+        // BBR congestion control - wait until cwnd has space for this packet.
+        //
+        // IMPORTANT: This loop requires that recv() is being called on this connection
+        // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
+        // cwnd space. If recv() is never called, flightsize never decreases and this
+        // loop will block forever.
+        //
+        // In production, PeerConnection is always used in a bidirectional select! loop
+        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
+        // always being polled. Tests must follow the same pattern.
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
