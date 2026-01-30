@@ -1952,9 +1952,17 @@ impl P2pConnManager {
                                         };
                                         let net_msg: NetMessage = msg.into();
                                         // Serialize metadata for embedding in fragment #1 (fix #2757)
-                                        let metadata = bincode::serialize(&net_msg)
-                                            .ok()
-                                            .map(bytes::Bytes::from);
+                                        let metadata = match bincode::serialize(&net_msg) {
+                                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    ?peer_addr,
+                                                    error = %e,
+                                                    "Failed to serialize BroadcastTo metadata for embedding"
+                                                );
+                                                None
+                                            }
+                                        };
                                         let send_res = ctx.bridge.send(peer_addr, net_msg).await;
                                         if send_res.is_ok() {
                                             // Send the stream data after the metadata message

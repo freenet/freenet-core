@@ -173,7 +173,13 @@ where
                     tracing::debug!(%id, ?target, "sending final message to target");
                     // Serialize metadata for embedding in fragment #1 (fix #2757)
                     let metadata = if stream_data.is_some() {
-                        bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                        match bincode::serialize(&msg) {
+                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                            Err(e) => {
+                                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -197,7 +203,13 @@ where
                     op_manager.push(id, updated_state).await?;
                     // Serialize metadata for embedding in fragment #1 (fix #2757)
                     let metadata = if stream_data.is_some() {
-                        bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                        match bincode::serialize(&msg) {
+                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                            Err(e) => {
+                                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -246,7 +258,13 @@ where
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
                 // Serialize metadata for embedding in fragment #1 (fix #2757)
                 let metadata = if stream_data.is_some() {
-                    bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                    match bincode::serialize(&msg) {
+                        Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                        Err(e) => {
+                            tracing::warn!(%tx_id, error = %e, "Failed to serialize metadata for embedding");
+                            None
+                        }
+                    }
                 } else {
                     None
                 };

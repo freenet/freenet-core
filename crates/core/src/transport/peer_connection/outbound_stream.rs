@@ -403,8 +403,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // embedding and rely on the separate metadata message instead.
         let metadata_bytes = if fragment_number == 1 {
             if let Some(meta) = pending_metadata.take() {
-                let meta_overhead = 1 + 8 + meta.len();
-                let required_size = payload.len() + 41 + meta_overhead;
+                // Note: The 41-byte overhead already includes Option discriminant (1 byte)
+                // and length prefix (8 bytes). Only add the metadata data length.
+                let required_size = payload.len() + 41 + meta.len();
                 if required_size <= packet_data::MAX_DATA_SIZE {
                     Some(meta)
                 } else {
@@ -838,5 +839,94 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Test that fragment #1 with embedded metadata never exceeds MAX_DATA_SIZE.
+    /// This is a regression test for the critical bug where adding metadata to
+    /// fragment #1 caused size overflow, breaking all streaming operations >1422 bytes.
+    #[test]
+    fn test_fragment_1_with_metadata_respects_max_size() {
+        use crate::transport::symmetric_message::{StreamFragment, SymmetricMessage};
+
+        // Test Case 1: Typical metadata size (~200 bytes)
+        let typical_metadata = bytes::Bytes::from(vec![0u8; 200]);
+        let meta_overhead = 1 + 8 + typical_metadata.len(); // Option discriminant + length + data
+        let available_payload = MAX_DATA_SIZE.saturating_sub(meta_overhead);
+
+        let fragment_with_typical_meta = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 1,
+            payload: bytes::Bytes::from(vec![0u8; available_payload]),
+            metadata_bytes: Some(typical_metadata),
+        };
+
+        let msg = SymmetricMessage {
+            packet_id: 1,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_with_typical_meta),
+        };
+
+        let serialized = bincode::serialize(&msg).expect("serialization should succeed");
+        assert!(
+            serialized.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #1 with typical metadata ({} bytes) exceeds MAX_DATA_SIZE: {} > {}",
+            200,
+            serialized.len(),
+            packet_data::MAX_DATA_SIZE
+        );
+
+        // Test Case 2: Large metadata (500 bytes) - stress test
+        let large_metadata = bytes::Bytes::from(vec![0u8; 500]);
+        let large_meta_overhead = 1 + 8 + large_metadata.len();
+        let available_payload_large = MAX_DATA_SIZE.saturating_sub(large_meta_overhead);
+
+        let fragment_with_large_meta = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 1,
+            payload: bytes::Bytes::from(vec![0u8; available_payload_large]),
+            metadata_bytes: Some(large_metadata),
+        };
+
+        let msg_large = SymmetricMessage {
+            packet_id: 2,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_with_large_meta),
+        };
+
+        let serialized_large =
+            bincode::serialize(&msg_large).expect("serialization should succeed");
+        assert!(
+            serialized_large.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #1 with large metadata ({} bytes) exceeds MAX_DATA_SIZE: {} > {}",
+            500,
+            serialized_large.len(),
+            packet_data::MAX_DATA_SIZE
+        );
+
+        // Test Case 3: Fragment #2 (no metadata) should use full MAX_DATA_SIZE
+        let fragment_2 = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 2,
+            payload: bytes::Bytes::from(vec![0u8; MAX_DATA_SIZE]),
+            metadata_bytes: None,
+        };
+
+        let msg_frag2 = SymmetricMessage {
+            packet_id: 3,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_2),
+        };
+
+        let serialized_frag2 =
+            bincode::serialize(&msg_frag2).expect("serialization should succeed");
+        assert!(
+            serialized_frag2.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #2 (no metadata, full payload) exceeds MAX_DATA_SIZE: {} > {}",
+            serialized_frag2.len(),
+            packet_data::MAX_DATA_SIZE
+        );
     }
 }

@@ -30,11 +30,12 @@ use crate::transport::packet_data;
 
 /// Maximum payload size per fragment (excluding metadata overhead).
 /// This matches the constant from peer_connection.rs.
+/// Measured overhead: 41 bytes (StreamFragment fields + Option discriminant for metadata_bytes)
 /// Public when bench feature is enabled for benchmarking.
 #[cfg(feature = "bench")]
-pub const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+pub const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 #[cfg(not(feature = "bench"))]
-pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// A lock-free buffer for reassembling stream fragments.
 ///

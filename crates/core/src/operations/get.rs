@@ -2041,9 +2041,17 @@ impl Operation for GetOp {
                             };
                             let pipe_metadata_net: NetMessage = pipe_metadata.into();
                             // Serialize metadata for embedding in fragment #1 (fix #2757)
-                            let embedded_metadata = bincode::serialize(&pipe_metadata_net)
-                                .ok()
-                                .map(bytes::Bytes::from);
+                            let embedded_metadata = match bincode::serialize(&pipe_metadata_net) {
+                                Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        error = %e,
+                                        "Failed to serialize piped stream metadata for embedding"
+                                    );
+                                    None
+                                }
+                            };
                             conn_manager.send(upstream_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)

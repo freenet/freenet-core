@@ -56,8 +56,9 @@ type OutboundStreamResult = std::result::Result<super::TransferStats, TransportE
 
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
-/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+/// Measured overhead: 41 bytes (see symmetric_message::stream_fragment_overhead())
+/// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// How often to check for pending ACKs and send them proactively.
 /// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
