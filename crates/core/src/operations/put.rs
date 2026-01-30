@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub(crate) use self::messages::{PutMsg, PutStreamingPayload};
-use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
+use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
@@ -638,20 +638,6 @@ impl Operation for PutOp {
                     skip_list,
                     subscribe: msg_subscribe,
                 } => {
-                    // Dedup check: if this stream was already claimed (e.g., via embedded
-                    // metadata in fragment #1), skip duplicate processing (fix #2757).
-                    if op_manager
-                        .orphan_stream_registry()
-                        .is_already_claimed(stream_id)
-                    {
-                        tracing::debug!(
-                            tx = %id,
-                            stream_id = %stream_id,
-                            "PUT RequestStreaming skipped — stream already claimed (dedup)"
-                        );
-                        return Err(OpError::OpNotPresent(id));
-                    }
-
                     // Check if streaming is enabled at runtime
                     if !op_manager.streaming_enabled {
                         tracing::warn!(
@@ -674,13 +660,21 @@ impl Operation for PutOp {
                         "Processing PUT RequestStreaming"
                     );
 
-                    // Step 1: Claim the stream from orphan registry
+                    // Step 1: Claim the stream from orphan registry (atomic dedup)
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
                         .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
                         .await
                     {
                         Ok(handle) => handle,
+                        Err(OrphanStreamError::AlreadyClaimed) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                "PUT RequestStreaming skipped — stream already claimed (dedup)"
+                            );
+                            return Err(OpError::OpNotPresent(id));
+                        }
                         Err(e) => {
                             tracing::error!(
                                 tx = %id,
