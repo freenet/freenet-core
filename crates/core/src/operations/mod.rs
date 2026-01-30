@@ -115,6 +115,17 @@ where
             tracing::debug!("entered in state pushed to continue with op");
             return Ok(None);
         }
+        Err(OpError::OpNotPresent(tx)) => {
+            // OpNotPresent is benign — it means a duplicate message arrived for an
+            // operation that was already completed or claimed (e.g., duplicate metadata
+            // from embedded fragment #1 + separate message). Do NOT send Aborted, as
+            // the primary processing path is still active and will complete normally.
+            tracing::debug!(
+                tx = %tx,
+                "Ignoring duplicate message for already-handled operation"
+            );
+            return Ok(None);
+        }
         Err(err) => {
             if let Some(addr) = source_addr {
                 network_bridge
