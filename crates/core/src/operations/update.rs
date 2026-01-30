@@ -773,6 +773,20 @@ impl Operation for UpdateOp {
                 } => {
                     use crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT;
 
+                    // Dedup check: if this stream was already claimed (e.g., via embedded
+                    // metadata in fragment #1), skip duplicate processing (fix #2757).
+                    if op_manager
+                        .orphan_stream_registry()
+                        .is_already_claimed(stream_id)
+                    {
+                        tracing::debug!(
+                            tx = %id,
+                            stream_id = %stream_id,
+                            "UPDATE BroadcastToStreaming skipped — stream already claimed (dedup)"
+                        );
+                        return Err(OpError::OpNotPresent(*id));
+                    }
+
                     // Check if streaming is enabled at runtime
                     if !op_manager.streaming_enabled {
                         tracing::warn!(

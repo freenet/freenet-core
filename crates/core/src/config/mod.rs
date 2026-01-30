@@ -120,7 +120,7 @@ impl Default for ConfigArgs {
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
                 min_connections: None,
                 max_connections: None,
-                streaming_enabled: None,   // Default: disabled
+                streaming_enabled: None,   // Default: enabled
                 streaming_threshold: None, // Default: 64KB (set in NetworkApiConfig)
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
@@ -307,9 +307,11 @@ impl ConfigArgs {
             self.network_api
                 .max_connections
                 .get_or_insert(cfg.network_api.max_connections);
-            if cfg.network_api.streaming_enabled {
-                self.network_api.streaming_enabled.get_or_insert(true);
-            }
+            // Config file can explicitly set streaming_enabled.
+            // CLI args (Option<bool>) override config file values when present.
+            self.network_api
+                .streaming_enabled
+                .get_or_insert(cfg.network_api.streaming_enabled);
             if cfg.network_api.streaming_threshold != default_streaming_threshold() {
                 self.network_api
                     .streaming_threshold
@@ -511,7 +513,7 @@ impl ConfigArgs {
                     .network_api
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
-                streaming_enabled: self.network_api.streaming_enabled.unwrap_or(false),
+                streaming_enabled: self.network_api.streaming_enabled.unwrap_or(true),
                 streaming_threshold: self
                     .network_api
                     .streaming_threshold
@@ -787,9 +789,9 @@ pub struct NetworkArgs {
     )]
     pub max_connections: Option<usize>,
 
-    /// Enable streaming transport for large transfers (experimental).
+    /// Enable streaming transport for large transfers.
     /// When enabled, transfers larger than streaming_threshold use streaming
-    /// instead of atomic messages. Default: false
+    /// instead of atomic messages. Default: true
     #[arg(long, env = "STREAMING_ENABLED")]
     #[serde(rename = "streaming-enabled", skip_serializing_if = "Option::is_none")]
     pub streaming_enabled: Option<bool>,
@@ -956,10 +958,10 @@ pub struct NetworkApiConfig {
     )]
     pub max_connections: usize,
 
-    /// Enable streaming transport for large transfers (experimental).
+    /// Enable streaming transport for large transfers.
     /// When enabled, transfers larger than `streaming_threshold` use streaming
-    /// instead of atomic messages. Default: false
-    #[serde(default, rename = "streaming-enabled")]
+    /// instead of atomic messages. Default: true
+    #[serde(default = "default_streaming_enabled", rename = "streaming-enabled")]
     pub streaming_enabled: bool,
 
     /// Threshold in bytes above which streaming transport is used.
@@ -1053,6 +1055,10 @@ fn default_min_connections() -> usize {
 
 fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_streaming_enabled() -> bool {
+    true
 }
 
 /// Default streaming threshold: 64KB
@@ -2350,7 +2356,7 @@ mod tests {
 
     #[test]
     fn test_streaming_config_defaults_via_serde() {
-        // Verify streaming is disabled by default when deserializing empty config
+        // Verify streaming is enabled by default when deserializing empty config
         // This tests the serde defaults which mirror the runtime defaults
         let minimal_config = r#"
             network-address = "127.0.0.1"
@@ -2358,8 +2364,8 @@ mod tests {
         "#;
         let network_api: NetworkApiConfig = toml::from_str(minimal_config).unwrap();
         assert!(
-            !network_api.streaming_enabled,
-            "Streaming should be disabled by default"
+            network_api.streaming_enabled,
+            "Streaming should be enabled by default"
         );
         assert_eq!(
             network_api.streaming_threshold,

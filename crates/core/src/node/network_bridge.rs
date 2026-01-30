@@ -60,6 +60,7 @@ pub(crate) trait NetworkBridge: Send + Sync {
         target_addr: SocketAddr,
         stream_id: crate::transport::peer_connection::StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
@@ -74,6 +75,7 @@ pub(crate) trait NetworkBridge: Send + Sync {
         target_addr: SocketAddr,
         outbound_stream_id: crate::transport::peer_connection::StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 }
 

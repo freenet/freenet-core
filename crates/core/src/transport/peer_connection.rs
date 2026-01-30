@@ -1134,6 +1134,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 total_length_bytes,
                 fragment_number,
                 payload,
+                metadata_bytes,
             } => {
                 // Push to streaming handle for incremental access (Phase 1 streaming)
                 if let Some(streaming_handle) = self.streaming_handles.get(&stream_id) {
@@ -1184,6 +1185,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // Their bytes are a streaming payload (e.g. GetStreamingPayload), not a
                 // NetMessage, so decode_msg() would fail and close the connection.
                 if stream_id.is_operations_stream() {
+                    // If fragment #1 carries embedded metadata bytes (fix #2757),
+                    // dispatch them as if they were a ShortMessage so the operations
+                    // layer processes the metadata even if the separate metadata
+                    // message was lost over UDP.
+                    if let Some(meta) = metadata_bytes {
+                        tracing::debug!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            stream_id = %stream_id,
+                            meta_len = meta.len(),
+                            "Dispatching embedded metadata from fragment #1"
+                        );
+                        return Ok(Some(meta.to_vec()));
+                    }
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -1325,13 +1339,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        self.outbound_stream_with_id(stream_id, data.into()).await;
+        self.outbound_stream_with_id(stream_id, data.into(), None)
+            .await;
     }
 
     /// Send stream data with a caller-provided StreamId.
     /// Used by operations-level streaming where the StreamId is communicated
     /// in the metadata message and must match the data stream.
-    async fn outbound_stream_with_id(&mut self, stream_id: StreamId, data: bytes::Bytes) {
+    async fn outbound_stream_with_id(
+        &mut self,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+    ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
                 stream_id,
@@ -1344,6 +1364,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
+                metadata,
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -1359,6 +1380,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         &mut self,
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::pipe_stream(
@@ -1372,6 +1394,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
+                metadata,
             )
             .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
         );
@@ -1477,6 +1500,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 total_length_bytes: fragment.total_bytes,
                 fragment_number: fragment.fragment_number,
                 payload: fragment.payload,
+                metadata_bytes: None,
             },
             &self.remote_conn.sent_tracker,
             token,
@@ -1665,11 +1689,13 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         &mut self,
         stream_id: StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.outbound_stream_with_id(stream_id, data).await;
+            self.outbound_stream_with_id(stream_id, data, metadata)
+                .await;
             Ok(())
         })
     }
@@ -1678,11 +1704,12 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         &mut self,
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle)
+            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata)
                 .await;
             Ok(())
         })
@@ -1830,6 +1857,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ))
         .map_err(|e| e.into());
 

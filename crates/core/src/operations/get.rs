@@ -1950,6 +1950,20 @@ impl Operation for GetOp {
                     let stream_id = *stream_id;
                     let includes_contract = *includes_contract;
 
+                    // Dedup check: if this stream was already claimed (e.g., via embedded
+                    // metadata in fragment #1), skip duplicate processing (fix #2757).
+                    if op_manager
+                        .orphan_stream_registry()
+                        .is_already_claimed(&stream_id)
+                    {
+                        tracing::debug!(
+                            tx = %id,
+                            stream_id = %stream_id,
+                            "GET ResponseStreaming skipped — stream already claimed (dedup)"
+                        );
+                        return Err(OpError::OpNotPresent(id));
+                    }
+
                     // Check if streaming is enabled at runtime
                     if !op_manager.streaming_enabled {
                         tracing::warn!(
@@ -2025,13 +2039,21 @@ impl Operation for GetOp {
                                 total_size: *total_size,
                                 includes_contract,
                             };
-                            conn_manager
-                                .send(upstream_addr, NetMessage::from(pipe_metadata))
-                                .await?;
+                            let pipe_metadata_net: NetMessage = pipe_metadata.into();
+                            // Serialize metadata for embedding in fragment #1 (fix #2757)
+                            let embedded_metadata = bincode::serialize(&pipe_metadata_net)
+                                .ok()
+                                .map(bytes::Bytes::from);
+                            conn_manager.send(upstream_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
                             conn_manager
-                                .pipe_stream(upstream_addr, outbound_sid, forked_handle)
+                                .pipe_stream(
+                                    upstream_addr,
+                                    outbound_sid,
+                                    forked_handle,
+                                    embedded_metadata,
+                                )
                                 .await?;
 
                             true

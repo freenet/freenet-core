@@ -171,10 +171,18 @@ where
                 op_manager.completed(id);
                 if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending final message to target");
+                    // Serialize metadata for embedding in fragment #1 (fix #2757)
+                    let metadata = if stream_data.is_some() {
+                        bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                    } else {
+                        None
+                    };
                     network_bridge.send(target, msg).await?;
                     if let Some((stream_id, data)) = stream_data {
                         tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-                        network_bridge.send_stream(target, stream_id, data).await?;
+                        network_bridge
+                            .send_stream(target, stream_id, data, metadata)
+                            .await?;
                     }
                 }
                 return Ok(Some(updated_state));
@@ -187,10 +195,18 @@ where
                     // If we send first, a fast response might arrive before the state is saved,
                     // causing load_or_init to fail to find the operation.
                     op_manager.push(id, updated_state).await?;
+                    // Serialize metadata for embedding in fragment #1 (fix #2757)
+                    let metadata = if stream_data.is_some() {
+                        bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                    } else {
+                        None
+                    };
                     network_bridge.send(target, msg).await?;
                     if let Some((stream_id, data)) = stream_data {
                         tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-                        network_bridge.send_stream(target, stream_id, data).await?;
+                        network_bridge
+                            .send_stream(target, stream_id, data, metadata)
+                            .await?;
                     }
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
@@ -228,10 +244,18 @@ where
 
             if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
+                // Serialize metadata for embedding in fragment #1 (fix #2757)
+                let metadata = if stream_data.is_some() {
+                    bincode::serialize(&msg).ok().map(bytes::Bytes::from)
+                } else {
+                    None
+                };
                 network_bridge.send(target, msg).await?;
                 if let Some((stream_id, data)) = stream_data {
                     tracing::debug!(%tx_id, %stream_id, ?target, "sending stream data");
-                    network_bridge.send_stream(target, stream_id, data).await?;
+                    network_bridge
+                        .send_stream(target, stream_id, data, metadata)
+                        .await?;
                 }
             }
         }

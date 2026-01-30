@@ -84,12 +84,14 @@ pub(crate) enum P2pBridgeEvent {
         target_addr: SocketAddr,
         stream_id: StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     },
     /// Pipe an inbound stream to a target, forwarding fragments incrementally.
     PipeStream {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     },
 }
 
@@ -275,12 +277,14 @@ impl NetworkBridge for P2pBridge {
         target_addr: SocketAddr,
         stream_id: StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
             .send(P2pBridgeEvent::StreamSend {
                 target_addr,
                 stream_id,
                 data,
+                metadata,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -292,12 +296,14 @@ impl NetworkBridge for P2pBridge {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
             .send(P2pBridgeEvent::PipeStream {
                 target_addr,
                 outbound_stream_id,
                 inbound_handle,
+                metadata,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -874,6 +880,7 @@ impl P2pConnManager {
                             target_addr,
                             stream_id,
                             data,
+                            metadata,
                         } => {
                             // Route stream data to the per-connection channel
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
@@ -883,6 +890,7 @@ impl P2pConnManager {
                                         target_addr,
                                         stream_id,
                                         data,
+                                        metadata,
                                     }))
                                     .await
                                 {
@@ -907,6 +915,7 @@ impl P2pConnManager {
                             target_addr,
                             outbound_stream_id,
                             inbound_handle,
+                            metadata,
                         } => {
                             // Route piped stream to the per-connection channel
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
@@ -916,6 +925,7 @@ impl P2pConnManager {
                                         target_addr,
                                         outbound_stream_id,
                                         inbound_handle,
+                                        metadata,
                                     }))
                                     .await
                                 {
@@ -1940,7 +1950,12 @@ impl P2pConnManager {
                                             key,
                                             total_size: payload_bytes.len() as u64,
                                         };
-                                        let send_res = ctx.bridge.send(peer_addr, msg.into()).await;
+                                        let net_msg: NetMessage = msg.into();
+                                        // Serialize metadata for embedding in fragment #1 (fix #2757)
+                                        let metadata = bincode::serialize(&net_msg)
+                                            .ok()
+                                            .map(bytes::Bytes::from);
+                                        let send_res = ctx.bridge.send(peer_addr, net_msg).await;
                                         if send_res.is_ok() {
                                             // Send the stream data after the metadata message
                                             if let Err(err) = ctx
@@ -1949,6 +1964,7 @@ impl P2pConnManager {
                                                     peer_addr,
                                                     sid,
                                                     bytes::Bytes::from(payload_bytes),
+                                                    metadata,
                                                 )
                                                 .await
                                             {
@@ -3354,11 +3370,13 @@ impl P2pConnManager {
                 target_addr,
                 stream_id,
                 data,
+                metadata,
             }) => EventResult::Event(
                 ConnEvent::StreamSend {
                     target_addr,
                     stream_id,
                     data,
+                    metadata,
                 }
                 .into(),
             ),
@@ -3366,11 +3384,13 @@ impl P2pConnManager {
                 target_addr,
                 outbound_stream_id,
                 inbound_handle,
+                metadata,
             }) => EventResult::Event(
                 ConnEvent::PipeStream {
                     target_addr,
                     outbound_stream_id,
                     inbound_handle,
+                    metadata,
                 }
                 .into(),
             ),
@@ -3528,6 +3548,7 @@ pub(super) enum ConnEvent {
         target_addr: SocketAddr,
         stream_id: StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     },
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     /// Used for low-latency forwarding at intermediate nodes.
@@ -3535,6 +3556,7 @@ pub(super) enum ConnEvent {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     },
 }
 
@@ -3622,15 +3644,19 @@ async fn handle_peer_channel_message(
                     return Err(TransportError::ConnectionClosed(conn.remote_addr()));
                 }
                 ConnEvent::StreamSend {
-                    stream_id, data, ..
+                    stream_id,
+                    data,
+                    metadata,
+                    ..
                 } => {
                     tracing::debug!(
                         to = %conn.remote_addr(),
                         stream_id = %stream_id,
                         data_len = data.len(),
+                        has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
-                    if let Err(error) = conn.send_stream_data(stream_id, data).await {
+                    if let Err(error) = conn.send_stream_data(stream_id, data, metadata).await {
                         tracing::error!(
                             to = %conn.remote_addr(),
                             stream_id = %stream_id,
@@ -3643,16 +3669,18 @@ async fn handle_peer_channel_message(
                 ConnEvent::PipeStream {
                     outbound_stream_id,
                     inbound_handle,
+                    metadata,
                     ..
                 } => {
                     tracing::debug!(
                         to = %conn.remote_addr(),
                         stream_id = %outbound_stream_id,
                         total_bytes = inbound_handle.total_bytes(),
+                        has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Piping stream to peer"
                     );
                     if let Err(error) = conn
-                        .pipe_stream_data(outbound_stream_id, inbound_handle)
+                        .pipe_stream_data(outbound_stream_id, inbound_handle, metadata)
                         .await
                     {
                         tracing::error!(

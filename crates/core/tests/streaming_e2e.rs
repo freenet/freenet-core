@@ -431,3 +431,138 @@ fn test_streaming_with_packet_loss() {
         "Stored state bytes should match the original 100KB state despite packet loss"
     );
 }
+
+// =============================================================================
+// Test 6: Streaming with packet reordering
+// =============================================================================
+
+/// Tests that streaming handles packet reordering via variable latency.
+///
+/// - SimNetwork: 1 gateway + 2 nodes, streaming threshold = 1024
+/// - Fault injection: variable latency 10ms..100ms (causes reordering)
+/// - Gateway PUTs a 100KB contract
+/// - Asserts: correct state arrives despite fragment reordering
+///
+/// LockFreeStreamBuffer indexes by fragment number, so reordering should be
+/// handled transparently.
+#[test]
+fn test_streaming_with_packet_reordering() {
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0xBE0F_0006_DEAD_1234;
+    const NETWORK_NAME: &str = "streaming-reorder";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 2, SEED, THRESHOLD));
+
+    // Inject variable latency to cause packet reordering
+    let fault_config = FaultConfig::builder()
+        .latency_range(Duration::from_millis(10)..Duration::from_millis(100))
+        .build();
+    sim.with_fault_injection(fault_config);
+
+    let contract = SimOperation::create_test_contract(66);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 66);
+    let contract_key = contract.key();
+
+    let operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: large_state.clone(),
+            subscribe: false,
+        },
+    )];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Streaming with packet reordering should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let stored = find_contract_in_non_gateway_storages(&result.node_storages, &contract_key);
+    assert!(
+        stored.is_some(),
+        "Expected 100KB contract to be stored despite packet reordering"
+    );
+    let stored_bytes: Vec<u8> = stored.unwrap().as_ref().to_vec();
+    assert_eq!(
+        stored_bytes, large_state,
+        "Stored state bytes should match the original 100KB state despite reordering"
+    );
+}
+
+// =============================================================================
+// Test 7: Multi-hop forwarding
+// =============================================================================
+
+/// Tests streaming through multi-hop forwarding with a larger network.
+///
+/// - SimNetwork: 1 gateway + 4 nodes, streaming threshold = 1024
+/// - Gateway PUTs a 200KB contract
+/// - With 4 nodes, the probability of multi-hop routing is higher
+/// - Asserts: at least one non-gateway node received the contract
+#[test]
+fn test_streaming_multi_hop_forwarding() {
+    const SEED: u64 = 0xF1A7_0007_CAFE_9876;
+    const NETWORK_NAME: &str = "streaming-multihop";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 200 * 1024; // 200KB
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+
+    let contract = SimOperation::create_test_contract(88);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 88);
+    let contract_key = contract.key();
+
+    let operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: large_state.clone(),
+            subscribe: false,
+        },
+    )];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Multi-hop streaming PUT should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let stored = find_contract_in_non_gateway_storages(&result.node_storages, &contract_key);
+    assert!(
+        stored.is_some(),
+        "Expected 200KB contract to be stored in at least one non-gateway node via multi-hop"
+    );
+    let stored_bytes: Vec<u8> = stored.unwrap().as_ref().to_vec();
+    assert_eq!(
+        stored_bytes, large_state,
+        "Stored state bytes should match the original 200KB state"
+    );
+}

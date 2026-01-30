@@ -114,6 +114,7 @@ impl NetworkBridge for MockNetworkBridge {
         target_addr: SocketAddr,
         stream_id: crate::transport::peer_connection::StreamId,
         data: bytes::Bytes,
+        _metadata: Option<bytes::Bytes>,
     ) -> ConnResult<()> {
         self.sent_streams
             .lock()
@@ -127,6 +128,7 @@ impl NetworkBridge for MockNetworkBridge {
         _target_addr: SocketAddr,
         _outbound_stream_id: crate::transport::peer_connection::StreamId,
         _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        _metadata: Option<bytes::Bytes>,
     ) -> ConnResult<()> {
         // Mock implementation - just succeed without doing anything
         Ok(())

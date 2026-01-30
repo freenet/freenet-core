@@ -57,6 +57,11 @@ pub struct OrphanStreamRegistry {
     /// Waiters for streams that haven't arrived yet (metadata arrived first).
     /// Maps StreamId -> oneshot sender to deliver the StreamHandle.
     stream_waiters: DashMap<StreamId, oneshot::Sender<StreamHandle>>,
+
+    /// Streams that have already been claimed. Used for deduplication when
+    /// both the embedded metadata (in fragment #1) and the separate metadata
+    /// message arrive — only the first one should be processed.
+    claimed_streams: DashMap<StreamId, ()>,
 }
 
 impl OrphanStreamRegistry {
@@ -65,6 +70,7 @@ impl OrphanStreamRegistry {
         Self {
             orphan_streams: DashMap::new(),
             stream_waiters: DashMap::new(),
+            claimed_streams: DashMap::new(),
         }
     }
 
@@ -98,6 +104,13 @@ impl OrphanStreamRegistry {
         }
     }
 
+    /// Returns true if the given stream has already been claimed.
+    /// Used for deduplication when embedded metadata and separate metadata
+    /// message both arrive.
+    pub fn is_already_claimed(&self, stream_id: &StreamId) -> bool {
+        self.claimed_streams.contains_key(stream_id)
+    }
+
     /// Try to claim an orphan stream, or register to wait for it.
     ///
     /// If the stream is already registered as an orphan, returns it immediately.
@@ -118,6 +131,7 @@ impl OrphanStreamRegistry {
                 stream_id = %stream_id,
                 "Claimed orphan stream immediately"
             );
+            self.claimed_streams.insert(stream_id, ());
             return Ok(handle);
         }
 
@@ -138,6 +152,7 @@ impl OrphanStreamRegistry {
                     stream_id = %stream_id,
                     "Stream arrived while waiting"
                 );
+                self.claimed_streams.insert(stream_id, ());
                 Ok(handle)
             }
             Ok(Err(_)) => {
@@ -184,6 +199,15 @@ impl OrphanStreamRegistry {
                 true
             }
         });
+
+        // Also prune claimed_streams to prevent unbounded growth.
+        // Entries older than the orphan timeout can be safely removed since
+        // no duplicate metadata message would arrive that late.
+        // We don't track insertion time for claimed_streams, so we cap at a
+        // reasonable size instead.
+        if self.claimed_streams.len() > 1000 {
+            self.claimed_streams.clear();
+        }
 
         if expired_count > 0 {
             tracing::info!(

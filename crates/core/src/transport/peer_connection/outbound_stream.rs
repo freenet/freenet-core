@@ -30,8 +30,9 @@ pub(crate) type SerializedStream = Bytes;
 
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
-/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+/// Measured overhead: 41 bytes (see symmetric_message::stream_fragment_overhead())
+/// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
@@ -51,6 +52,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
+    metadata: Option<Bytes>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -74,6 +76,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let total_packets = stream_to_send.len().div_ceil(MAX_DATA_SIZE);
     let mut sent_so_far = 0;
     let mut next_fragment_number = 1; // Fragment numbers are 1-indexed
+    let mut pending_metadata = metadata;
 
     loop {
         if sent_so_far == total_packets {
@@ -147,12 +150,35 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
+        // Embed metadata in fragment #1 for reliability (fix #2757).
+        // If the separate metadata message is lost over UDP, the receiver
+        // can reconstruct it from the embedded bytes.
+        let metadata_bytes = if next_fragment_number == 1 {
+            pending_metadata.take()
+        } else {
+            None
+        };
+
+        // Calculate available payload size for this fragment.
+        // For fragment #1 with embedded metadata, reduce payload to make room
+        // for the metadata bytes within the MAX_DATA_SIZE constraint.
+        let available_payload = if let Some(ref meta) = metadata_bytes {
+            // Reserve space for metadata: bincode serializes Option<Bytes> as:
+            // - 1 byte for Some discriminant
+            // - 8 bytes for length prefix
+            // - N bytes for the actual data
+            let meta_overhead = 1 + 8 + meta.len();
+            MAX_DATA_SIZE.saturating_sub(meta_overhead)
+        } else {
+            MAX_DATA_SIZE
+        };
+
         // Zero-copy fragmentation using Bytes::slice()
         // This avoids allocating a new Vec for each fragment
         let fragment = {
-            if stream_to_send.len() > MAX_DATA_SIZE {
-                let fragment = stream_to_send.slice(..MAX_DATA_SIZE);
-                stream_to_send = stream_to_send.slice(MAX_DATA_SIZE..);
+            if stream_to_send.len() > available_payload {
+                let fragment = stream_to_send.slice(..available_payload);
+                stream_to_send = stream_to_send.slice(available_payload..);
                 fragment
             } else {
                 std::mem::take(&mut stream_to_send)
@@ -175,6 +201,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 total_length_bytes: total_length_bytes as u64,
                 fragment_number: next_fragment_number,
                 payload: fragment,
+                metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
             token,
@@ -283,6 +310,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
+    metadata: Option<Bytes>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let total_bytes = inbound_handle.total_bytes();
@@ -303,6 +331,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let mut stream = inbound_handle.stream();
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
+    let mut pending_metadata = metadata;
 
     while let Some(result) = stream.next().await {
         let payload = match result {
@@ -368,6 +397,34 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
+        // Embed metadata in fragment #1 for reliability (fix #2757).
+        // For piped streams, only embed if it fits within MAX_DATA_SIZE without
+        // exceeding the limit. If the fragment #1 payload is too large, skip
+        // embedding and rely on the separate metadata message instead.
+        let metadata_bytes = if fragment_number == 1 {
+            if let Some(meta) = pending_metadata.take() {
+                let meta_overhead = 1 + 8 + meta.len();
+                let required_size = payload.len() + 41 + meta_overhead;
+                if required_size <= packet_data::MAX_DATA_SIZE {
+                    Some(meta)
+                } else {
+                    tracing::debug!(
+                        stream_id = %outbound_stream_id.0,
+                        payload_len = payload.len(),
+                        meta_len = meta.len(),
+                        required_size,
+                        max_size = packet_data::MAX_DATA_SIZE,
+                        "Skipping metadata embedding in piped fragment #1 - would exceed MAX_DATA_SIZE"
+                    );
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         let token = congestion_controller.on_send_with_token(packet_size);
 
@@ -382,6 +439,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 total_length_bytes: total_bytes,
                 fragment_number,
                 payload,
+                metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
             token,
@@ -559,6 +617,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
@@ -662,6 +721,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         // Wait for send task to complete
@@ -754,6 +814,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         // Wait for send task to complete

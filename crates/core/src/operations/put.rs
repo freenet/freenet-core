@@ -638,6 +638,20 @@ impl Operation for PutOp {
                     skip_list,
                     subscribe: msg_subscribe,
                 } => {
+                    // Dedup check: if this stream was already claimed (e.g., via embedded
+                    // metadata in fragment #1), skip duplicate processing (fix #2757).
+                    if op_manager
+                        .orphan_stream_registry()
+                        .is_already_claimed(stream_id)
+                    {
+                        tracing::debug!(
+                            tx = %id,
+                            stream_id = %stream_id,
+                            "PUT RequestStreaming skipped — stream already claimed (dedup)"
+                        );
+                        return Err(OpError::OpNotPresent(id));
+                    }
+
                     // Check if streaming is enabled at runtime
                     if !op_manager.streaming_enabled {
                         tracing::warn!(
@@ -732,13 +746,21 @@ impl Operation for PutOp {
                                 skip_list: routing_skip_list.clone(),
                                 subscribe: *msg_subscribe,
                             };
-                            conn_manager
-                                .send(next_addr, NetMessage::from(pipe_metadata))
-                                .await?;
+                            let pipe_metadata_net: NetMessage = pipe_metadata.into();
+                            // Serialize metadata for embedding in fragment #1 (fix #2757)
+                            let embedded_metadata = bincode::serialize(&pipe_metadata_net)
+                                .ok()
+                                .map(bytes::Bytes::from);
+                            conn_manager.send(next_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
                             conn_manager
-                                .pipe_stream(next_addr, outbound_sid, forked_handle)
+                                .pipe_stream(
+                                    next_addr,
+                                    outbound_sid,
+                                    forked_handle,
+                                    embedded_metadata,
+                                )
                                 .await?;
 
                             if let Some(event) = NetEventLog::put_request(
