@@ -666,20 +666,8 @@ impl Operation for PutOp {
                         .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
                         .await
                     {
-                        Ok(handle) => {
-                            eprintln!(
-                                "[DIAGNOSTIC] PUT claim_or_wait OK: tx={}, stream_id={}, \
-                                handle={:?}",
-                                id, stream_id, handle,
-                            );
-                            handle
-                        }
+                        Ok(handle) => handle,
                         Err(OrphanStreamError::AlreadyClaimed) => {
-                            eprintln!(
-                                "[DIAGNOSTIC] PUT claim_or_wait AlreadyClaimed (dedup): \
-                                tx={}, stream_id={}",
-                                id, stream_id,
-                            );
                             tracing::debug!(
                                 tx = %id,
                                 stream_id = %stream_id,
@@ -809,14 +797,6 @@ impl Operation for PutOp {
                         }
                     };
 
-                    eprintln!(
-                        "[DIAGNOSTIC] PUT stream assembled: tx={}, stream_id={}, \
-                        received_size={}, expected_total_size={}",
-                        id,
-                        stream_id,
-                        stream_data.len(),
-                        total_size,
-                    );
                     tracing::debug!(
                         tx = %id,
                         stream_id = %stream_id,
@@ -829,18 +809,6 @@ impl Operation for PutOp {
                     let payload: PutStreamingPayload = match bincode::deserialize(&stream_data) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!(
-                                "[DIAGNOSTIC] bincode deserialize FAILED for PUT stream: \
-                                tx={}, stream_id={}, bincode_error={}, \
-                                stream_data_len={}, expected_total_size={}, \
-                                first_64_bytes={:?}",
-                                id,
-                                stream_id,
-                                e,
-                                stream_data.len(),
-                                total_size,
-                                &stream_data[..stream_data.len().min(64)],
-                            );
                             tracing::error!(
                                 tx = %id,
                                 stream_id = %stream_id,
