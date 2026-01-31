@@ -425,17 +425,21 @@ impl Operation for UpdateOp {
                     // Convert sender's summary bytes to StateSummary
                     let sender_summary = StateSummary::from(sender_summary_bytes.clone());
 
-                    // Update sender's cached summary in our interest manager
+                    // Register the sender as interested and update their cached summary.
+                    // Using register_peer_interest instead of update_peer_summary ensures
+                    // the sender is tracked even if not previously known, so future
+                    // broadcasts include them as a target (bidirectional propagation).
                     if let Some(sender_pkl) = op_manager
                         .ring
                         .connection_manager
                         .get_peer_by_addr(sender_addr)
                     {
                         let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-                        op_manager.interest_manager.update_peer_summary(
+                        op_manager.interest_manager.register_peer_interest(
                             key,
-                            &sender_key,
+                            sender_key,
                             Some(sender_summary.clone()),
+                            false,
                         );
                     }
 
@@ -889,17 +893,21 @@ impl Operation for UpdateOp {
                     // Step 4: Apply the update (same logic as BroadcastTo with FullState)
                     let sender_summary = StateSummary::from(sender_summary_bytes.clone());
 
-                    // Update sender's cached summary in our interest manager
+                    // Register the sender as interested and update their cached summary.
+                    // Using register_peer_interest instead of update_peer_summary ensures
+                    // the sender is tracked even if not previously known, so future
+                    // broadcasts include them as a target (bidirectional propagation).
                     if let Some(sender_pkl) = op_manager
                         .ring
                         .connection_manager
                         .get_peer_by_addr(sender_addr)
                     {
                         let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-                        op_manager.interest_manager.update_peer_summary(
+                        op_manager.interest_manager.register_peer_interest(
                             key,
-                            &sender_key,
+                            sender_key,
                             Some(sender_summary.clone()),
+                            false,
                         );
                     }
 

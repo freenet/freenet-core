@@ -760,6 +760,23 @@ impl Operation for SubscribeOp {
                             // See: https://github.com/freenet/freenet-core/issues/XXX
                             super::announce_contract_cached(op_manager, key).await;
 
+                            // Register the responding peer in our interest manager.
+                            // The peer that fulfilled our subscription has the contract,
+                            // so we should include them in update broadcasts.
+                            if let Some(resp_addr) = source_addr {
+                                if let Some(pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(resp_addr)
+                                {
+                                    let peer_key =
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                    op_manager
+                                        .interest_manager
+                                        .register_peer_interest(key, peer_key, None, false);
+                                }
+                            }
+
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
