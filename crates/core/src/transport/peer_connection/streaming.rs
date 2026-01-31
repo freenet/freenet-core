@@ -423,6 +423,13 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(None); // Stream complete
         }
 
+        // If the stream has enough data but this fragment slot is empty, we're done.
+        // The overflow slot (allocated for potential metadata overhead in fragment #1)
+        // may not be used when fragment #1 has full payload capacity.
+        if self.handle.buffer.is_complete() && self.handle.buffer.get(next_idx).is_none() {
+            return Poll::Ready(None);
+        }
+
         // Try to get the next fragment (lock-free)
         if let Some(data) = self.try_get_fragment(next_idx) {
             self.next_fragment = next_idx + 1;
@@ -591,8 +598,8 @@ mod tests {
         let result = handle.push_fragment(0, Bytes::from_static(b"hello"));
         assert!(matches!(result, Err(StreamError::InvalidFragment { .. })));
 
-        // Index 2 is out of bounds (only 1 fragment expected)
-        let result = handle.push_fragment(2, Bytes::from_static(b"hello"));
+        // Index 3 is out of bounds (total_fragments=2: 1 base + 1 overflow)
+        let result = handle.push_fragment(3, Bytes::from_static(b"hello"));
         assert!(matches!(result, Err(StreamError::InvalidFragment { .. })));
     }
 
