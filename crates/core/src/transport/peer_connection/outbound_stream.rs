@@ -73,7 +73,21 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         "Sending stream"
     );
     let total_length_bytes = stream_to_send.len() as u32;
-    let total_packets = stream_to_send.len().div_ceil(MAX_DATA_SIZE);
+    // Calculate total_packets accounting for fragment #1's reduced payload when
+    // metadata is embedded. Without this adjustment, the loop terminates too early
+    // and the final bytes of the stream are never sent.
+    let total_packets = if let Some(ref meta) = metadata {
+        let meta_overhead = 1 + 8 + meta.len();
+        let first_frag_capacity = MAX_DATA_SIZE.saturating_sub(meta_overhead);
+        if stream_to_send.len() <= first_frag_capacity {
+            1
+        } else {
+            let remaining = stream_to_send.len() - first_frag_capacity;
+            1 + remaining.div_ceil(MAX_DATA_SIZE)
+        }
+    } else {
+        stream_to_send.len().div_ceil(MAX_DATA_SIZE)
+    };
     let mut sent_so_far = 0;
     let mut next_fragment_number = 1; // Fragment numbers are 1-indexed
     let mut pending_metadata = metadata;
