@@ -127,6 +127,13 @@ where
             return Ok(None);
         }
         Err(err) => {
+            tracing::error!(
+                tx = %tx_id,
+                error = %err,
+                error_debug = ?err,
+                source = ?source_addr,
+                "handle_op_result: sending Aborted due to operation error"
+            );
             if let Some(addr) = source_addr {
                 network_bridge
                     .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
