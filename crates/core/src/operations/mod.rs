@@ -127,6 +127,12 @@ where
             return Ok(None);
         }
         Err(err) => {
+            // Use eprintln! because spawned tasks don't inherit the test's
+            // tracing subscriber (RUST_LOG=error global default is a no-op).
+            eprintln!(
+                "[DIAGNOSTIC] handle_op_result: sending Aborted for tx={} error={} error_debug={:?} source={:?}",
+                tx_id, err, err, source_addr
+            );
             tracing::error!(
                 tx = %tx_id,
                 error = %err,
