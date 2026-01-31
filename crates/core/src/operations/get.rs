@@ -951,6 +951,31 @@ impl Operation for GetOp {
                                 "GET: contract found locally"
                             );
 
+                            // Register the GET requester's interest in this contract so that
+                            // update broadcasts include them as a target. This is critical for
+                            // partitioned topologies: the requester's auto-subscribe may route
+                            // to a blocked peer instead of back to us, so we register interest
+                            // proactively when serving the GET response.
+                            if let Some(upstream_addr) = self.upstream_addr {
+                                if let Some(pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(upstream_addr)
+                                {
+                                    let peer_key =
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                    op_manager
+                                        .interest_manager
+                                        .register_peer_interest(&key, peer_key, None, false);
+                                    tracing::debug!(
+                                        tx = %id,
+                                        contract = %key,
+                                        requester = %upstream_addr,
+                                        "Registered GET requester interest for update broadcasts"
+                                    );
+                                }
+                            }
+
                             // Check if this is a forwarded request or a local request
                             // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
                             // because get_peer_location_by_addr() can fail for transient connections
