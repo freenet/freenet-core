@@ -317,6 +317,10 @@ impl Runtime {
                     tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
+                    // Drain remaining messages to results before breaking to avoid message loss
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
                     break;
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
@@ -342,6 +346,10 @@ impl Runtime {
                         "Passing GetContractRequest to executor for async handling"
                     );
                     results.push(OutboundDelegateMsg::GetContractRequest(req));
+                    // Drain remaining messages to results before breaking to avoid message loss
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
                     // Break to let the executor handle this before continuing
                     break;
                 }
