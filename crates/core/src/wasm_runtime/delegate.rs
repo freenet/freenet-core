@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
+    DelegateInterfaceResult, DelegateKey, GetContractRequest, GetSecretRequest, GetSecretResponse,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
+    SetSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
@@ -90,6 +91,8 @@ impl Runtime {
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
             InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+            InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
+            InboundDelegateMsg::PutContractResponse(_) => "PutContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
@@ -125,6 +128,8 @@ impl Runtime {
                     OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
                     OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
                     OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+                    OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest".to_string(),
+                    OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest".to_string(),
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -162,6 +167,8 @@ impl Runtime {
                         OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretReq".to_string(),
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
+                        OutboundDelegateMsg::GetContractRequest(_) => "GetContractReq".to_string(),
+                        OutboundDelegateMsg::PutContractRequest(_) => "PutContractReq".to_string(),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -220,6 +227,8 @@ impl Runtime {
                                 OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
                                 OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
                                 OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+                                OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
+                                OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest",
                             })
                             .collect::<Vec<_>>();
                         tracing::debug!(
@@ -280,6 +289,45 @@ impl Runtime {
                     } else {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
+                }
+                // Contract requests require async handling, so return them to the caller.
+                // The contract handler will perform the operation and send back a response.
+                OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
+                    tracing::debug!(
+                        contract_id = %req.contract_id,
+                        "Returning GetContractRequest for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::GetContractRequest(req));
+                    // Drain remaining messages before breaking
+                    while let Some(remaining) = outbound_msgs.pop_front() {
+                        if remaining.processed() {
+                            results.push(remaining);
+                        }
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context, .. }) => {
+                    // Processed GetContractRequest - just update context
+                    last_context = context;
+                }
+                OutboundDelegateMsg::PutContractRequest(req) if !req.processed => {
+                    tracing::debug!(
+                        contract_key = %req.contract.key(),
+                        state_len = req.state.as_ref().len(),
+                        "Returning PutContractRequest for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::PutContractRequest(req));
+                    // Drain remaining messages before breaking
+                    while let Some(remaining) = outbound_msgs.pop_front() {
+                        if remaining.processed() {
+                            results.push(remaining);
+                        }
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::PutContractRequest(PutContractRequest { context, .. }) => {
+                    // Processed PutContractRequest - just update context
+                    last_context = context;
                 }
                 /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
                     send it back to the delegate?
