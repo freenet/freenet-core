@@ -1,0 +1,21 @@
+[package]
+name = "test-delegate-capabilities"
+version = "0.1.0"
+edition = "2021"
+description = "Test delegate for exercising all delegate capabilities in issue #2827"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use the git branch with GetContractRequest/GetContractResponse types
+freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "feat-delegate-contract-get", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]
