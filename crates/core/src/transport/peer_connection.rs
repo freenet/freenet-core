@@ -1142,13 +1142,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // Existing streaming handle - push fragment
                     if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
                     {
-                        tracing::warn!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            error = %e,
-                            "Failed to push fragment to streaming handle"
-                        );
+                        if matches!(e, streaming::StreamError::Cancelled) {
+                            // Stream was cancelled (e.g., transaction timeout). Remove handle
+                            // to stop processing further fragments for this stream.
+                            self.streaming_handles.remove(&stream_id);
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                "Stream cancelled, removed from handles"
+                            );
+                        } else {
+                            tracing::warn!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                error = %e,
+                                "Failed to push fragment to streaming handle"
+                            );
+                        }
                     }
                 } else {
                     // New stream - register with streaming registry
@@ -1158,28 +1170,50 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         .await;
                     if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
                     {
-                        tracing::warn!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            error = %e,
-                            "Failed to push first fragment to streaming handle"
-                        );
-                    }
+                        if matches!(e, streaming::StreamError::Cancelled) {
+                            // Stream was already cancelled, don't register it
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                "New stream already cancelled, not registering"
+                            );
+                            // Skip orphan registration and handle insertion
+                        } else {
+                            tracing::warn!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                error = %e,
+                                "Failed to push first fragment to streaming handle"
+                            );
+                            // Still register the handle for non-cancellation errors
+                            if let Some(orphan_registry) = &self.orphan_stream_registry {
+                                orphan_registry
+                                    .register_orphan(stream_id, streaming_handle.clone());
+                                tracing::trace!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    stream_id = %stream_id,
+                                    "Registered stream as orphan for operations layer"
+                                );
+                            }
+                            self.streaming_handles.insert(stream_id, streaming_handle);
+                        }
+                    } else {
+                        // Phase 4: Register with orphan stream registry for race condition handling.
+                        // This allows operations layer to claim the stream when metadata arrives,
+                        // even if the stream fragments arrived first.
+                        if let Some(orphan_registry) = &self.orphan_stream_registry {
+                            orphan_registry.register_orphan(stream_id, streaming_handle.clone());
+                            tracing::trace!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Registered stream as orphan for operations layer"
+                            );
+                        }
 
-                    // Phase 4: Register with orphan stream registry for race condition handling.
-                    // This allows operations layer to claim the stream when metadata arrives,
-                    // even if the stream fragments arrived first.
-                    if let Some(orphan_registry) = &self.orphan_stream_registry {
-                        orphan_registry.register_orphan(stream_id, streaming_handle.clone());
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            "Registered stream as orphan for operations layer"
-                        );
+                        self.streaming_handles.insert(stream_id, streaming_handle);
                     }
-
-                    self.streaming_handles.insert(stream_id, streaming_handle);
                 }
 
                 // Operations-level streams skip the legacy InboundStream path.
