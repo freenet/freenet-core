@@ -477,7 +477,68 @@ impl DelegateRuntimeInterface for Runtime {
                         .into());
                     }
                 }
-                _ => {}
+                InboundDelegateMsg::GetContractResponse(response) => {
+                    // Handle GetContractResponse by sending it to the delegate via exec_inbound
+                    let outbound = VecDeque::from(self.exec_inbound(
+                        params,
+                        attested,
+                        &InboundDelegateMsg::GetContractResponse(response),
+                        &process_func,
+                        &running.instance,
+                    )?);
+
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            OutboundDelegateMsg::SetSecretRequest(set) => {
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
+                            }
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
+                    // Update the shared context for next messages
+                    last_context = self.get_outbound(
+                        delegate_key,
+                        &running.instance,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut real_outbound,
+                        &mut results,
+                    )?;
+                }
+                InboundDelegateMsg::GetSecretResponse(response) => {
+                    // Handle GetSecretResponse by sending it to the delegate via exec_inbound
+                    let outbound = VecDeque::from(self.exec_inbound(
+                        params,
+                        attested,
+                        &InboundDelegateMsg::GetSecretResponse(response),
+                        &process_func,
+                        &running.instance,
+                    )?);
+
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            OutboundDelegateMsg::SetSecretRequest(set) => {
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
+                            }
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
+                    // Update the shared context for next messages
+                    last_context = self.get_outbound(
+                        delegate_key,
+                        &running.instance,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut real_outbound,
+                        &mut results,
+                    )?;
+                }
             }
         }
         for outbound in non_processed {

@@ -61,6 +61,8 @@ where
     let mut current_req = initial_req;
     let current_params = initial_params;
     let mut iterations = 0;
+    // Accumulate non-contract-request messages across iterations
+    let mut accumulated_messages: Vec<OutboundDelegateMsg> = Vec::new();
 
     loop {
         iterations += 1;
@@ -70,7 +72,8 @@ where
                 iterations = iterations,
                 "Exceeded maximum GetContractRequest iterations, possible infinite loop"
             );
-            return Vec::new();
+            // Return whatever we accumulated so far
+            return accumulated_messages;
         }
 
         // Execute the delegate request
@@ -88,7 +91,8 @@ where
                     phase = "unexpected_response",
                     "Unexpected response type from delegate request"
                 );
-                return Vec::new();
+                // Return whatever we accumulated so far
+                return accumulated_messages;
             }
             Err(err) => {
                 tracing::error!(
@@ -97,13 +101,13 @@ where
                     phase = "execution_failed",
                     "Failed executing delegate request"
                 );
-                return Vec::new();
+                // Return whatever we accumulated so far
+                return accumulated_messages;
             }
         };
 
         // Check for GetContractRequest messages
         let mut contract_requests: Vec<GetContractRequest> = Vec::new();
-        let mut other_messages: Vec<OutboundDelegateMsg> = Vec::new();
 
         for msg in values {
             match msg {
@@ -111,14 +115,15 @@ where
                     contract_requests.push(req);
                 }
                 other => {
-                    other_messages.push(other);
+                    // Accumulate non-contract-request messages
+                    accumulated_messages.push(other);
                 }
             }
         }
 
-        // If no contract requests, we're done
+        // If no contract requests, we're done - return all accumulated messages
         if contract_requests.is_empty() {
-            return other_messages;
+            return accumulated_messages;
         }
 
         tracing::debug!(
