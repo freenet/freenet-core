@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
+    DelegateInterfaceResult, DelegateKey, GetContractRequest, GetSecretRequest, GetSecretResponse,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
@@ -90,6 +90,7 @@ impl Runtime {
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
             InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+            InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
@@ -125,6 +126,9 @@ impl Runtime {
                     OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
                     OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
                     OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+                    OutboundDelegateMsg::GetContractRequest(req) => {
+                        format!("GetContractRequest(contract={})", req.contract_id)
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -162,6 +166,7 @@ impl Runtime {
                         OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretReq".to_string(),
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
+                        OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -220,6 +225,7 @@ impl Runtime {
                                 OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
                                 OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
                                 OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+                                OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
                             })
                             .collect::<Vec<_>>();
                         tracing::debug!(
@@ -327,6 +333,21 @@ impl Runtime {
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
                 }
                 OutboundDelegateMsg::ContextUpdated(context) => {
+                    last_context = context;
+                }
+                OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
+                    // Pass unprocessed contract requests to results for the executor to handle
+                    tracing::debug!(
+                        contract_id = %req.contract_id,
+                        "Passing GetContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::GetContractRequest(req));
+                    // Break to let the executor handle this before continuing
+                    break;
+                }
+                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context, .. }) => {
+                    // Processed contract request - just update context
+                    tracing::debug!("GetContractRequest processed");
                     last_context = context;
                 }
             }
