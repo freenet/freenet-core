@@ -1334,11 +1334,7 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: if self.streaming_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
+                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },
@@ -1426,11 +1422,7 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: if self.streaming_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
+                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },
