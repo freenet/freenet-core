@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
 
 use super::error::RuntimeInnerError;
+use super::native_api::{DelegateCallEnv, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
 use super::{ContractError, Runtime, RuntimeResult};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +61,43 @@ pub(crate) trait DelegateRuntimeInterface {
 }
 
 impl Runtime {
+    /// Execute the delegate's `process` function with the DelegateCallEnv set up
+    /// so that host functions for context and secret access are available.
+    fn exec_inbound_with_env(
+        &mut self,
+        delegate_key: &DelegateKey,
+        params: &Parameters<'_>,
+        attested: Option<&[u8]>,
+        msg: &InboundDelegateMsg,
+        context: Vec<u8>,
+        process_func: &TypedFunction<(i64, i64, i64), i64>,
+        instance: &Instance,
+        instance_id: i64,
+    ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
+        // Set up the delegate call environment with context and secret store access.
+        // SAFETY: self.secret_store is valid for the duration of the synchronous
+        // process_func.call() below. The environment is removed in the cleanup
+        // section before this function returns.
+        let env = unsafe {
+            DelegateCallEnv::new(context, &self.secret_store, delegate_key.clone())
+        };
+        DELEGATE_ENV.insert(instance_id, env);
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
+
+        // Execute the WASM process function
+        let result = self.exec_inbound(params, attested, msg, process_func, instance);
+
+        // Read back the (possibly mutated) context and clean up
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        let updated_context = DELEGATE_ENV
+            .remove(&instance_id)
+            .map(|(_, env)| env.context)
+            .unwrap_or_default();
+
+        let outbound = result?;
+        Ok((outbound, updated_context))
+    }
+
     fn exec_inbound(
         &mut self,
         params: &Parameters<'_>,
@@ -146,7 +184,7 @@ impl Runtime {
         }
     }
 
-    fn log_get_outbound_entry(
+    fn log_process_outbound_entry(
         &self,
         delegate_key: &DelegateKey,
         attested: Option<&[u8]>,
@@ -173,48 +211,78 @@ impl Runtime {
                 // Avoid computation if tracing level is disabled
                 Vec::new()
             }),
-            "get_outbound called"
+            "process_outbound called"
         );
     }
 
-    // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
+    /// Process outbound messages from a delegate, handling secret requests via
+    /// the old message-based round-trip pattern (backward compatibility with V1 delegates).
+    ///
+    /// New-style delegates that use host functions for secret access will not produce
+    /// GetSecretRequest messages, so this function becomes a simple pass-through.
     #[allow(clippy::too_many_arguments)]
-    fn get_outbound(
+    fn process_outbound(
         &mut self,
         delegate_key: &DelegateKey,
         instance: &Instance,
+        instance_id: i64,
         process_func: &TypedFunction<(i64, i64, i64), i64>,
         params: &Parameters<'_>,
         attested: Option<&[u8]>,
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
+        context: &mut Vec<u8>,
         results: &mut Vec<OutboundDelegateMsg>,
-    ) -> RuntimeResult<DelegateContext> {
-        self.log_get_outbound_entry(delegate_key, attested, outbound_msgs);
+    ) -> RuntimeResult<()> {
+        self.log_process_outbound_entry(delegate_key, attested, outbound_msgs);
 
         const MAX_ITERATIONS: usize = 100;
         let mut recursion = 0;
-        let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned())
-        else {
-            return Ok(DelegateContext::default());
-        };
+
         while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
+                // Unprocessed GetSecretRequest: fetch secret and re-invoke delegate
+                // (backward compat for V1 delegates that don't use host secret functions)
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key, processed, ..
-                }) if !processed => {
-                    tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
+                    key,
+                    context: req_context,
+                    processed: false,
+                }) => {
+                    tracing::debug!(%key, "Handling GetSecretRequest from delegate (legacy path)");
+                    // Use the context from the request (old delegates embed their state there)
+                    if !req_context.as_ref().is_empty() {
+                        *context = req_context.as_ref().to_vec();
+                    }
                     let secret_result = self.secret_store.get_secret(delegate_key, &key).ok();
-                    tracing::debug!(%key, secret_is_some = secret_result.is_some(), "Secret store responded");
+
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: secret_result,
-                        context: last_context.clone(),
+                        context: DelegateContext::new(context.clone()),
                     });
+
                     if recursion >= MAX_ITERATIONS {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
+                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
+                            DelegateError::Other(
+                                "The maximum number of attempts to get the secret has been exceeded"
+                                    .to_string(),
+                            )
+                            .into(),
+                        )));
                     }
-                    let new_msgs =
-                        self.exec_inbound(params, attested, &inbound, process_func, instance)?;
+
+                    let (new_msgs, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
+                        params,
+                        attested,
+                        &inbound,
+                        context.clone(),
+                        process_func,
+                        instance,
+                        instance_id,
+                    )?;
+                    *context = updated_context;
+                    recursion += 1;
+
                     if tracing::enabled!(tracing::Level::DEBUG) {
                         let summary = new_msgs
                             .iter()
@@ -234,51 +302,29 @@ impl Runtime {
                             "Messages returned from exec_inbound after GetSecretResponse"
                         );
                     }
-                    recursion += 1;
-                    let Some(last_msg) = new_msgs.last() else {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
-                            DelegateError::Other(
-                                "Delegate did not return any messages after GetSecretResponse"
-                                    .to_string(),
-                            )
-                            .into(),
-                        )));
-                    };
-                    let mut updated = false;
-                    if let Some(new_last_context) = last_msg.get_context() {
-                        last_context = new_last_context.clone();
-                        updated = true;
-                    };
-                    for mut pending in new_msgs {
-                        if updated {
-                            if let Some(ctx) = pending.get_mut_context() {
-                                *ctx = last_context.clone();
-                            };
-                        }
-                        // Check if the message is processed AND an ApplicationMessage
-                        if pending.processed() {
-                            if let OutboundDelegateMsg::ApplicationMessage(mut app_msg) = pending {
-                                // Add processed ApplicationMessages directly to results
-                                tracing::debug!(app = %app_msg.app, payload_len = app_msg.payload.len(), "Adding processed ApplicationMessage from GetSecretResponse handling to results");
-                                app_msg.context = DelegateContext::default(); // Ensure context is cleared
+
+                    for msg in new_msgs {
+                        if msg.processed() {
+                            if let OutboundDelegateMsg::ApplicationMessage(mut app_msg) = msg {
+                                app_msg.context = DelegateContext::default();
                                 results.push(OutboundDelegateMsg::ApplicationMessage(app_msg));
-                            } else {
-                                // Handle other processed messages if necessary (currently none expected here)
-                                tracing::warn!(?pending, "Ignoring unexpected processed message during GetSecretRequest handling");
                             }
                         } else {
-                            // Push non-processed messages back for further handling
-                            outbound_msgs.push_back(pending);
+                            outbound_msgs.push_back(msg);
                         }
                     }
                 }
-                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
-                    tracing::debug!("get secret, processed");
-                    last_context = context;
+
+                // Already-processed secret requests just update context
+                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context: ctx, .. }) => {
+                    tracing::debug!("GetSecretRequest already processed");
+                    *context = ctx.as_ref().to_vec();
                 }
-                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
-                    last_context = context;
+                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context: ctx, .. }) => {
+                    *context = ctx.as_ref().to_vec();
                 }
+
+                // SetSecretRequest: store or remove the secret directly
                 OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
                     if let Some(plaintext) = value {
                         self.secret_store
@@ -287,34 +333,15 @@ impl Runtime {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
-                /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
-                    send it back to the delegate?
 
-                OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                         if recursion >= MAX_ITERATIONS {
-                             return Err(DelegateExecError::DelegateError(DelegateError::Other(
-                                 "max recurssion (100) limit hit".into(),
-                             ))
-                             .into());
-                         }
-                         let outbound = self.exec_inbound(
-                             params,
-                             attested,
-                             &InboundDelegateMsg::ApplicationMessage(
-                                 ApplicationMessage::new(msg.app, msg.payload)
-                                     .processed(msg.processed)
-                                     .with_context(last_context.clone()),
-                             ),
-                             process_func,
-                             instance,
-                         )?;
-                         recursion += 1;
-                         for msg in outbound {
-                             outbound_msgs.push_back(msg);
-                         }
-                     } */
+                // Final application message — add to results
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
-                    tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
+                    tracing::debug!(
+                        app = %msg.app,
+                        payload_len = msg.payload.len(),
+                        processed = msg.processed,
+                        "Adding ApplicationMessage to results"
+                    );
                     msg.context = DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
                     // Drain remaining messages to results before breaking to avoid message loss
@@ -323,21 +350,23 @@ impl Runtime {
                     }
                     break;
                 }
+
                 OutboundDelegateMsg::RequestUserInput(req) => {
-                    // Simulate user response changes after receiving the RequestUserInput
                     let user_response =
                         ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
                     let response: Response = serde_json::from_slice(&user_response)
                         .map_err(|err| DelegateError::Deser(format!("{err}")))
                         .unwrap();
                     let req_id = req.request_id;
-                    let mut context: Context = bincode::deserialize(last_context.as_ref()).unwrap();
-                    context.waiting_for_user_input.remove(&req_id);
-                    context.user_response.insert(req_id, response);
-                    last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
+                    let mut ctx: Context =
+                        bincode::deserialize(context.as_slice()).unwrap_or_default();
+                    ctx.waiting_for_user_input.remove(&req_id);
+                    ctx.user_response.insert(req_id, response);
+                    *context = bincode::serialize(&ctx).unwrap();
                 }
-                OutboundDelegateMsg::ContextUpdated(context) => {
-                    last_context = context;
+
+                OutboundDelegateMsg::ContextUpdated(new_context) => {
+                    *context = new_context.as_ref().to_vec();
                 }
                 OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
                     // Pass unprocessed contract requests to results for the executor to handle
@@ -353,14 +382,14 @@ impl Runtime {
                     // Break to let the executor handle this before continuing
                     break;
                 }
-                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context, .. }) => {
+                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context: ctx, .. }) => {
                     // Processed contract request - just update context
                     tracing::debug!("GetContractRequest processed");
-                    last_context = context;
+                    *context = ctx.as_ref().to_vec();
                 }
             }
         }
-        Ok(last_context)
+        Ok(())
     }
 }
 
@@ -381,18 +410,10 @@ impl DelegateRuntimeInterface for Runtime {
             .instance
             .exports
             .get_typed_function(self.wasm_store.as_ref().unwrap(), "process")?;
+        let instance_id = running.id;
 
-        // Initialize the shared context with the first message context
-        let mut last_context = match inbound.first() {
-            Some(msg) => {
-                if let Some(context) = msg.get_context() {
-                    context.clone()
-                } else {
-                    DelegateContext::default()
-                }
-            }
-            _ => DelegateContext::default(),
-        };
+        // State maintained across process() calls within this conversation
+        let mut context: Vec<u8> = Vec::new();
 
         let mut non_processed = vec![];
         for msg in inbound {
@@ -403,66 +424,76 @@ impl DelegateRuntimeInterface for Runtime {
                     processed,
                     ..
                 }) => {
-                    let outbound = VecDeque::from(
-                        self.exec_inbound(
-                            params,
-                            attested,
-                            &InboundDelegateMsg::ApplicationMessage(
-                                ApplicationMessage::new(app, payload)
-                                    .processed(processed)
-                                    .with_context(last_context.clone()),
-                            ),
-                            &process_func,
-                            &running.instance,
-                        )?,
+                    let app_msg = InboundDelegateMsg::ApplicationMessage(
+                        ApplicationMessage::new(app, payload)
+                            .processed(processed)
+                            .with_context(DelegateContext::new(context.clone())),
                     );
 
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
+                        params,
+                        attested,
+                        &app_msg,
+                        context.clone(),
+                        &process_func,
+                        &running.instance,
+                        instance_id,
+                    )?;
+                    context = updated_context;
+
                     let mut real_outbound = VecDeque::new();
-                    for outbound in outbound {
-                        match outbound {
+                    for msg in outbound {
+                        match msg {
                             OutboundDelegateMsg::SetSecretRequest(set) => {
                                 non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
                             }
-                            // msg if !msg.processed() {}
                             msg => real_outbound.push_back(msg),
                         }
                     }
 
-                    // Update the shared context for next messages
-                    last_context = self.get_outbound(
+                    self.process_outbound(
                         delegate_key,
                         &running.instance,
+                        instance_id,
                         &process_func,
                         params,
                         attested,
                         &mut real_outbound,
+                        &mut context,
                         &mut results,
                     )?;
                 }
                 InboundDelegateMsg::UserResponse(response) => {
-                    let outbound = self.exec_inbound(
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
                         params,
                         attested,
                         &InboundDelegateMsg::UserResponse(response),
+                        context.clone(),
                         &process_func,
                         &running.instance,
+                        instance_id,
                     )?;
+                    context = updated_context;
 
                     let mut real_outbound = VecDeque::new();
-                    for outbound in outbound {
-                        match outbound {
+                    for msg in outbound {
+                        match msg {
                             msg if !msg.processed() => non_processed.push(msg),
                             msg => real_outbound.push_back(msg),
                         }
                     }
 
-                    self.get_outbound(
+                    self.process_outbound(
                         delegate_key,
                         &running.instance,
+                        instance_id,
                         &process_func,
                         params,
                         attested,
                         &mut real_outbound,
+                        &mut context,
                         &mut results,
                     )?;
                 }
@@ -486,14 +517,18 @@ impl DelegateRuntimeInterface for Runtime {
                     }
                 }
                 InboundDelegateMsg::GetContractResponse(response) => {
-                    // Handle GetContractResponse by sending it to the delegate via exec_inbound
-                    let outbound = VecDeque::from(self.exec_inbound(
+                    // Handle GetContractResponse by sending it to the delegate via exec_inbound_with_env
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
                         params,
                         attested,
                         &InboundDelegateMsg::GetContractResponse(response),
+                        context.clone(),
                         &process_func,
                         &running.instance,
-                    )?);
+                        instance_id,
+                    )?;
+                    context = updated_context;
 
                     let mut real_outbound = VecDeque::new();
                     for outbound in outbound {
@@ -505,26 +540,31 @@ impl DelegateRuntimeInterface for Runtime {
                         }
                     }
 
-                    // Update the shared context for next messages
-                    last_context = self.get_outbound(
+                    self.process_outbound(
                         delegate_key,
                         &running.instance,
+                        instance_id,
                         &process_func,
                         params,
                         attested,
                         &mut real_outbound,
+                        &mut context,
                         &mut results,
                     )?;
                 }
                 InboundDelegateMsg::GetSecretResponse(response) => {
-                    // Handle GetSecretResponse by sending it to the delegate via exec_inbound
-                    let outbound = VecDeque::from(self.exec_inbound(
+                    // Handle GetSecretResponse by sending it to the delegate via exec_inbound_with_env
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
                         params,
                         attested,
                         &InboundDelegateMsg::GetSecretResponse(response),
+                        context.clone(),
                         &process_func,
                         &running.instance,
-                    )?);
+                        instance_id,
+                    )?;
+                    context = updated_context;
 
                     let mut real_outbound = VecDeque::new();
                     for outbound in outbound {
@@ -536,19 +576,22 @@ impl DelegateRuntimeInterface for Runtime {
                         }
                     }
 
-                    // Update the shared context for next messages
-                    last_context = self.get_outbound(
+                    self.process_outbound(
                         delegate_key,
                         &running.instance,
+                        instance_id,
                         &process_func,
                         params,
                         attested,
                         &mut real_outbound,
+                        &mut context,
                         &mut results,
                     )?;
                 }
             }
         }
+
+        // Process any SetSecretRequests that were deferred
         for outbound in non_processed {
             match outbound {
                 OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
@@ -562,6 +605,7 @@ impl DelegateRuntimeInterface for Runtime {
                 _ => unreachable!("All OutboundDelegateMsg variants should be handled"),
             }
         }
+
         tracing::debug!(
             count = results.len(),
             "Final results returned by inbound_app_message"
@@ -602,6 +646,7 @@ mod test {
     use super::*;
 
     const TEST_DELEGATE_1: &str = "test_delegate_1";
+    const TEST_DELEGATE_2: &str = "test_delegate_2";
 
     #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
@@ -1076,6 +1121,53 @@ mod test {
             }
             other => panic!("Expected ContractState response, got {:?}", other),
         }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test the new-style delegate (test-delegate-2) that uses host functions
+    /// for context and secret access instead of the GetSecretRequest/Response round-trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_host_function_delegate() -> Result<(), Box<dyn std::error::Error>> {
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Step 1: CreateInboxRequest — stores secret via host function, returns pub key
+        let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
+        let create_msg = ApplicationMessage::new(app, payload);
+        let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+
+        let expected_payload =
+            bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
+        assert_eq!(outbound.len(), 1, "Expected exactly 1 outbound message");
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
+        ));
+
+        // Step 2: PleaseSignMessage — fetches secret via host function (no round-trip!)
+        // and returns the signed message in a single process() call.
+        let payload: Vec<u8> =
+            bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
+        let sign_msg = ApplicationMessage::new(app, payload);
+        let inbound = InboundDelegateMsg::ApplicationMessage(sign_msg);
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+
+        let expected_payload =
+            bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
+        assert_eq!(outbound.len(), 1, "Expected exactly 1 outbound message");
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
+        ));
 
         std::mem::drop(temp_dir);
         Ok(())
