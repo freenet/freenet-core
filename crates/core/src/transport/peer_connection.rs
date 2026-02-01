@@ -1146,11 +1146,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // Stream was cancelled (e.g., transaction timeout). Remove handle
                             // to stop processing further fragments for this stream.
                             self.streaming_handles.remove(&stream_id);
+                            self.streaming_registry.remove(stream_id);
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
                                 fragment_number,
-                                "Stream cancelled, removed from handles"
+                                "Stream cancelled, removed from handles and registry"
                             );
                         } else {
                             tracing::warn!(
