@@ -944,12 +944,19 @@ fn notify_subscription_timeout(
 ) {
     let ch = Arc::clone(ch_outbound);
     crate::config::GlobalExecutor::spawn(async move {
-        let _ = ch
+        if let Err(e) = ch
             .send_to_handler(ContractHandlerEvent::NotifySubscriptionError {
                 key: instance_id,
                 reason: format!("Subscription timed out for contract {}", instance_id),
             })
-            .await;
+            .await
+        {
+            tracing::debug!(
+                contract = %instance_id,
+                error = %e,
+                "Failed to notify subscription timeout"
+            );
+        }
     });
 }
 
