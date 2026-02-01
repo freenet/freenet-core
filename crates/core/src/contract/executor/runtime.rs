@@ -28,6 +28,30 @@ type SharedNotifications = Arc<
 type SharedSummaries =
     Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
 
+/// Send a subscription error to all clients registered for a contract.
+/// Takes a snapshot of the channels to avoid holding any lock during sends.
+fn send_subscription_error_to_clients(
+    channels: &[(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)],
+    key: ContractInstanceId,
+    reason: String,
+) {
+    let error: freenet_stdlib::client_api::ClientError =
+        freenet_stdlib::client_api::ErrorKind::OperationError {
+            cause: reason.into(),
+        }
+        .into();
+    for (client_id, sender) in channels {
+        if let Err(e) = sender.send(Err(error.clone())) {
+            tracing::debug!(
+                client = %client_id,
+                contract = %key,
+                error = %e,
+                "Failed to send subscription error notification (channel closed)"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
 // ============================================================================
@@ -479,6 +503,16 @@ impl ContractExecutor for RuntimePool {
                     })
             })
             .collect()
+    }
+
+    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
+        let channels = {
+            let notifications = self.shared_notifications.read().unwrap();
+            notifications.get(&key).cloned()
+        };
+        if let Some(channels) = channels {
+            send_subscription_error_to_clients(&channels, key, reason);
+        }
     }
 
     async fn summarize_contract_state(
@@ -1110,6 +1144,12 @@ impl ContractExecutor for Executor<Runtime> {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         self.get_subscription_info()
+    }
+
+    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
+        if let Some(channels) = self.update_notifications.get(&key) {
+            send_subscription_error_to_clients(channels, key, reason);
+        }
     }
 
     async fn summarize_contract_state(

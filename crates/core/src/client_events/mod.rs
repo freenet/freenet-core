@@ -281,6 +281,40 @@ async fn register_subscription_listener(
     }
 }
 
+/// Report an operation init failure to the client via the result router.
+async fn report_op_init_error(
+    op_manager: &OpManager,
+    tx: crate::message::Transaction,
+    contract: &impl std::fmt::Display,
+    op_name: &str,
+    err: &OpError,
+    client_id: ClientId,
+    request_id: RequestId,
+) {
+    tracing::error!(
+        client_id = %client_id,
+        request_id = %request_id,
+        tx = %tx,
+        contract = %contract,
+        error = %err,
+        phase = "error",
+        "{op_name} request failed"
+    );
+
+    let error_response = Err(ErrorKind::OperationError {
+        cause: format!("{op_name} operation failed: {err}").into(),
+    }
+    .into());
+
+    if let Err(e) = op_manager.result_router_tx.send((tx, error_response)).await {
+        tracing::error!(
+            tx = %tx,
+            error = %e,
+            "Failed to send {op_name} error to result router"
+        );
+    }
+}
+
 /// Process client events.
 ///
 /// # Architecture: Dual-Mode Client Handling
@@ -593,7 +627,6 @@ async fn process_open_request(
                             );
                             let op_id = op.id;
 
-                            // Register client for transaction result
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(op_id, client_id, request_id)
@@ -608,42 +641,35 @@ async fn process_open_request(
                                     )
                                 })?;
 
-                            // Execute the PUT operation
-                            // Since there are no remote peers, this will complete locally
                             if let Err(err) = put::request_put(&op_manager, op).await {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %op_id,
-                                    contract = %contract_key,
-                                    error = %err,
-                                    phase = "error",
-                                    "Local PUT request failed"
-                                );
-
-                                // Notify client of error via result router
-                                let error_response = Err(ErrorKind::OperationError {
-                                    cause: format!("PUT operation failed: {}", err).into(),
-                                }
-                                .into());
-
-                                if let Err(e) = op_manager
-                                    .result_router_tx
-                                    .send((op_id, error_response))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        tx = %op_id,
-                                        error = %e,
-                                        "Failed to send PUT error to result router"
+                                report_op_init_error(
+                                    &op_manager,
+                                    op_id,
+                                    &contract_key,
+                                    "PUT",
+                                    &err,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await;
+                            } else if subscribe {
+                                if let Some(sl) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        *contract_key.id(),
+                                        client_id,
+                                        sl,
+                                        "PUT",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %contract_key,
+                                        "PUT with subscribe=true but no subscription_listener"
                                     );
                                 }
                             }
-
-                            // Note: We bypass the router for local-only PUTs to avoid the race
-                            // condition where the transaction completes instantly and is removed
-                            // before other clients can join. The operation will complete locally
-                            // and deliver results through the normal transaction mechanism.
                         } else if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
@@ -669,7 +695,6 @@ async fn process_open_request(
                                     Error::Node(format!("Request routing failed: {}", e))
                                 })?;
 
-                            // Always register this client for the result
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(
@@ -685,7 +710,6 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // Only start new network operation if this is a new operation
                             if should_start_operation {
                                 tracing::debug!(
                                     client_id = %client_id,
@@ -707,31 +731,31 @@ async fn process_open_request(
                                 );
 
                                 if let Err(err) = put::request_put(&op_manager, op).await {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %transaction_id,
-                                        contract = %contract_key,
-                                        error = %err,
-                                        phase = "error",
-                                        "PUT request failed"
-                                    );
-
-                                    // Notify client of error via result router
-                                    let error_response = Err(ErrorKind::OperationError {
-                                        cause: format!("PUT operation failed: {}", err).into(),
-                                    }
-                                    .into());
-
-                                    if let Err(e) = op_manager
-                                        .result_router_tx
-                                        .send((transaction_id, error_response))
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            tx = %transaction_id,
-                                            error = %e,
-                                            "Failed to send PUT error to result router"
+                                    report_op_init_error(
+                                        &op_manager,
+                                        transaction_id,
+                                        &contract_key,
+                                        "PUT",
+                                        &err,
+                                        client_id,
+                                        request_id,
+                                    )
+                                    .await;
+                                } else if subscribe {
+                                    if let Some(sl) = subscription_listener {
+                                        register_subscription_listener(
+                                            &op_manager,
+                                            *contract_key.id(),
+                                            client_id,
+                                            sl,
+                                            "PUT",
+                                        )
+                                        .await?;
+                                    } else {
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %contract_key,
+                                            "PUT with subscribe=true but no subscription_listener"
                                         );
                                     }
                                 }
@@ -745,6 +769,24 @@ async fn process_open_request(
                                     phase = "reuse",
                                     "Reusing existing PUT operation - client registered for result"
                                 );
+                                if subscribe {
+                                    if let Some(sl) = subscription_listener {
+                                        register_subscription_listener(
+                                            &op_manager,
+                                            *contract_key.id(),
+                                            client_id,
+                                            sl,
+                                            "PUT",
+                                        )
+                                        .await?;
+                                    } else {
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %contract_key,
+                                            "PUT with subscribe=true but no subscription_listener"
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             tracing::debug!(
@@ -756,7 +798,6 @@ async fn process_open_request(
                                 "Starting direct PUT operation (legacy mode)"
                             );
 
-                            // Legacy mode: direct operation without deduplication
                             let op = put::start_op(
                                 contract.clone(),
                                 related_contracts.clone(),
@@ -781,53 +822,33 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) = put::request_put(&op_manager, op).await {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %op_id,
-                                    contract = %contract_key,
-                                    error = %err,
-                                    phase = "error",
-                                    "PUT request failed"
-                                );
-
-                                // Notify client of error via result router
-                                let error_response = Err(ErrorKind::OperationError {
-                                    cause: format!("PUT operation failed: {}", err).into(),
-                                }
-                                .into());
-
-                                if let Err(e) = op_manager
-                                    .result_router_tx
-                                    .send((op_id, error_response))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        tx = %op_id,
-                                        error = %e,
-                                        "Failed to send PUT error to result router"
+                                report_op_init_error(
+                                    &op_manager,
+                                    op_id,
+                                    &contract_key,
+                                    "PUT",
+                                    &err,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await;
+                            } else if subscribe {
+                                if let Some(sl) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        *contract_key.id(),
+                                        client_id,
+                                        sl,
+                                        "PUT",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %contract_key,
+                                        "PUT with subscribe=true but no subscription_listener"
                                     );
                                 }
-                            }
-                        }
-
-                        // Register subscription listener if subscribe=true
-                        if subscribe {
-                            if let Some(subscription_listener) = subscription_listener {
-                                register_subscription_listener(
-                                    &op_manager,
-                                    *contract_key.id(),
-                                    client_id,
-                                    subscription_listener,
-                                    "PUT",
-                                )
-                                .await?;
-                            } else {
-                                tracing::warn!(
-                                    client_id = %client_id,
-                                    contract = %contract_key,
-                                    "PUT with subscribe=true but no subscription_listener"
-                                );
                             }
                         }
                     }
@@ -968,34 +989,16 @@ async fn process_open_request(
                                 match update::request_update(&op_manager, op).await {
                                     Ok(()) | Err(OpError::StatePushed) => {}
                                     Err(err) => {
-                                        tracing::error!(
-                                            client_id = %client_id,
-                                            request_id = %request_id,
-                                            tx = %transaction_id,
-                                            contract = %key,
-                                            error = %err,
-                                            phase = "error",
-                                            "UPDATE request failed"
-                                        );
-
-                                        // Notify client of error via result router
-                                        let error_response = Err(ErrorKind::OperationError {
-                                            cause: format!("UPDATE operation failed: {}", err)
-                                                .into(),
-                                        }
-                                        .into());
-
-                                        if let Err(e) = op_manager
-                                            .result_router_tx
-                                            .send((transaction_id, error_response))
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                tx = %transaction_id,
-                                                error = %e,
-                                                "Failed to send UPDATE error to result router"
-                                            );
-                                        }
+                                        report_op_init_error(
+                                            &op_manager,
+                                            transaction_id,
+                                            &key,
+                                            "UPDATE",
+                                            &err,
+                                            client_id,
+                                            request_id,
+                                        )
+                                        .await;
                                     }
                                 }
                             } else {
@@ -1042,33 +1045,16 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) = update::request_update(&op_manager, op).await {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %op_id,
-                                    contract = %key,
-                                    error = %err,
-                                    phase = "error",
-                                    "UPDATE request failed"
-                                );
-
-                                // Notify client of error via result router
-                                let error_response = Err(ErrorKind::OperationError {
-                                    cause: format!("UPDATE operation failed: {}", err).into(),
-                                }
-                                .into());
-
-                                if let Err(e) = op_manager
-                                    .result_router_tx
-                                    .send((op_id, error_response))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        tx = %op_id,
-                                        error = %e,
-                                        "Failed to send UPDATE error to result router"
-                                    );
-                                }
+                                report_op_init_error(
+                                    &op_manager,
+                                    op_id,
+                                    &key,
+                                    "UPDATE",
+                                    &err,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1278,31 +1264,31 @@ async fn process_open_request(
                                 )
                                 .await
                                 {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %transaction_id,
-                                        contract = %key,
-                                        error = %err,
-                                        phase = "error",
-                                        "GET request failed"
-                                    );
-
-                                    // Notify client of error via result router
-                                    let error_response = Err(ErrorKind::OperationError {
-                                        cause: format!("GET operation failed: {}", err).into(),
-                                    }
-                                    .into());
-
-                                    if let Err(e) = op_manager
-                                        .result_router_tx
-                                        .send((transaction_id, error_response))
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            tx = %transaction_id,
-                                            error = %e,
-                                            "Failed to send GET error to result router"
+                                    report_op_init_error(
+                                        &op_manager,
+                                        transaction_id,
+                                        &key,
+                                        "GET",
+                                        &err,
+                                        client_id,
+                                        request_id,
+                                    )
+                                    .await;
+                                } else if subscribe {
+                                    if let Some(sl) = subscription_listener {
+                                        register_subscription_listener(
+                                            &op_manager,
+                                            key,
+                                            client_id,
+                                            sl,
+                                            "GET",
+                                        )
+                                        .await?;
+                                    } else {
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %key,
+                                            "GET with subscribe=true but no subscription_listener"
                                         );
                                     }
                                 }
@@ -1316,25 +1302,25 @@ async fn process_open_request(
                                     phase = "reuse",
                                     "Reusing existing GET operation - client registered for result"
                                 );
-                            }
 
-                            // Register subscription listener if subscribe=true
-                            if subscribe {
-                                if let Some(subscription_listener) = subscription_listener {
-                                    register_subscription_listener(
-                                        &op_manager,
-                                        key,
-                                        client_id,
-                                        subscription_listener,
-                                        "network GET",
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!(
-                                        client_id = %client_id,
-                                        contract = %key,
-                                        "GET with subscribe=true but no subscription_listener"
-                                    );
+                                // Register subscription listener for reused operations too
+                                if subscribe {
+                                    if let Some(subscription_listener) = subscription_listener {
+                                        register_subscription_listener(
+                                            &op_manager,
+                                            key,
+                                            client_id,
+                                            subscription_listener,
+                                            "network GET",
+                                        )
+                                        .await?;
+                                    } else {
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %key,
+                                            "GET with subscribe=true but no subscription_listener"
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -1368,36 +1354,18 @@ async fn process_open_request(
                             if let Err(err) =
                                 get::request_get(&op_manager, op, VisitedPeers::new(&op_id)).await
                             {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %op_id,
-                                    contract = %key,
-                                    error = %err,
-                                    phase = "error",
-                                    "GET request failed"
-                                );
-
-                                // Notify client of error via result router
-                                let error_response = Err(ErrorKind::OperationError {
-                                    cause: format!("GET operation failed: {}", err).into(),
-                                }
-                                .into());
-
-                                if let Err(e) = op_manager
-                                    .result_router_tx
-                                    .send((op_id, error_response))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        tx = %op_id,
-                                        error = %e,
-                                        "Failed to send GET error to result router"
-                                    );
-                                }
+                                report_op_init_error(
+                                    &op_manager,
+                                    op_id,
+                                    &key,
+                                    "GET",
+                                    &err,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await;
                             }
 
-                            // Register subscription listener if subscribe=true
                             if subscribe {
                                 if let Some(subscription_listener) = subscription_listener {
                                     register_subscription_listener(
@@ -1405,7 +1373,7 @@ async fn process_open_request(
                                         key,
                                         client_id,
                                         subscription_listener,
-                                        "legacy GET",
+                                        "GET",
                                     )
                                     .await?;
                                 } else {
