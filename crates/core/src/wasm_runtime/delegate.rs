@@ -705,7 +705,16 @@ mod test {
 
         #[derive(Debug, Serialize, Deserialize)]
         pub enum DelegateCommand {
-            GetContractState { contract_id: ContractInstanceId },
+            GetContractState {
+                contract_id: ContractInstanceId,
+            },
+            GetMultipleContractStates {
+                contract_ids: Vec<ContractInstanceId>,
+            },
+            GetContractWithEcho {
+                contract_id: ContractInstanceId,
+                echo_message: String,
+            },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -713,6 +722,12 @@ mod test {
             ContractState {
                 contract_id: ContractInstanceId,
                 state: Option<Vec<u8>>,
+            },
+            MultipleContractStates {
+                results: Vec<(ContractInstanceId, Option<Vec<u8>>)>,
+            },
+            Echo {
+                message: String,
             },
             Error {
                 message: String,
@@ -853,6 +868,210 @@ mod test {
                     state.is_none(),
                     "State should be None for not-found contract"
                 );
+            }
+            other => panic!("Expected ContractState response, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that multiple contract requests work in sequence.
+    /// The delegate requests contract1, then contract2, then contract3, and returns
+    /// the accumulated results at the end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract1 = ContractInstanceId::new([1u8; 32]);
+        let contract2 = ContractInstanceId::new([2u8; 32]);
+        let contract3 = ContractInstanceId::new([3u8; 32]);
+        let app_id = ContractInstanceId::new([10u8; 32]);
+
+        // Step 1: Send GetMultipleContractStates command
+        let command = DelegateCommand::GetMultipleContractStates {
+            contract_ids: vec![contract1.clone(), contract2.clone(), contract3.clone()],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: Verify we get first GetContractRequest
+        assert_eq!(outbound.len(), 1, "Expected one outbound message");
+        let req1 = match &outbound[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest, got {:?}", other),
+        };
+        assert_eq!(req1.contract_id, contract1);
+
+        // Step 3: Send response for first contract
+        let response1 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract1.clone(),
+            state: Some(WrappedState::new(vec![1, 1, 1])),
+            context: req1.context,
+        });
+
+        let outbound2 =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response1])?;
+
+        // Step 4: Verify we get second GetContractRequest
+        assert_eq!(outbound2.len(), 1, "Expected one outbound message");
+        let req2 = match &outbound2[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest for contract2, got {:?}", other),
+        };
+        assert_eq!(req2.contract_id, contract2);
+
+        // Step 5: Send response for second contract
+        let response2 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract2.clone(),
+            state: Some(WrappedState::new(vec![2, 2, 2])),
+            context: req2.context,
+        });
+
+        let outbound3 =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response2])?;
+
+        // Step 6: Verify we get third GetContractRequest
+        assert_eq!(outbound3.len(), 1, "Expected one outbound message");
+        let req3 = match &outbound3[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest for contract3, got {:?}", other),
+        };
+        assert_eq!(req3.contract_id, contract3);
+
+        // Step 7: Send response for third contract
+        let response3 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract3.clone(),
+            state: Some(WrappedState::new(vec![3, 3, 3])),
+            context: req3.context,
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response3])?;
+
+        // Step 8: Verify we get the final MultipleContractStates response
+        assert_eq!(final_outbound.len(), 1, "Expected one final message");
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::MultipleContractStates { results } => {
+                assert_eq!(results.len(), 3, "Should have 3 results");
+                assert_eq!(results[0].0, contract1);
+                assert_eq!(results[0].1, Some(vec![1, 1, 1]));
+                assert_eq!(results[1].0, contract2);
+                assert_eq!(results[1].1, Some(vec![2, 2, 2]));
+                assert_eq!(results[2].0, contract3);
+                assert_eq!(results[2].1, Some(vec![3, 3, 3]));
+            }
+            other => panic!("Expected MultipleContractStates, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that message accumulation works correctly.
+    /// The delegate emits both a GetContractRequest AND an ApplicationMessage (Echo).
+    /// The runtime should return both after processing the contract request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let echo_message = "Hello from test!".to_string();
+
+        // Step 1: Send GetContractWithEcho command
+        let command = DelegateCommand::GetContractWithEcho {
+            contract_id: contract_id.clone(),
+            echo_message: echo_message.clone(),
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: The delegate returns BOTH GetContractRequest AND Echo message
+        assert_eq!(outbound.len(), 2, "Expected two outbound messages");
+
+        // Find the GetContractRequest (order may vary)
+        let contract_request = outbound
+            .iter()
+            .find_map(|msg| match msg {
+                OutboundDelegateMsg::GetContractRequest(req) => Some(req.clone()),
+                _ => None,
+            })
+            .expect("Expected a GetContractRequest");
+        assert_eq!(contract_request.contract_id, contract_id);
+
+        // Find the Echo ApplicationMessage
+        let echo_msg = outbound
+            .iter()
+            .find_map(|msg| match msg {
+                OutboundDelegateMsg::ApplicationMessage(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("Expected an ApplicationMessage (Echo)");
+        assert!(echo_msg.processed);
+
+        let echo_response: DelegateResponse = bincode::deserialize(&echo_msg.payload)?;
+        match echo_response {
+            DelegateResponse::Echo { message } => {
+                assert_eq!(message, echo_message);
+            }
+            other => panic!("Expected Echo response, got {:?}", other),
+        }
+
+        // Step 3: Send the contract response
+        let contract_response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract_id.clone(),
+            state: Some(WrappedState::new(vec![1, 2, 3, 4])),
+            context: contract_request.context,
+        });
+
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![contract_response],
+        )?;
+
+        // Step 4: Verify we get the final ContractState response
+        assert_eq!(final_outbound.len(), 1, "Expected one final message");
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractState {
+                contract_id: id,
+                state,
+            } => {
+                assert_eq!(id, contract_id);
+                assert_eq!(state, Some(vec![1, 2, 3, 4]));
             }
             other => panic!("Expected ContractState response, got {:?}", other),
         }
