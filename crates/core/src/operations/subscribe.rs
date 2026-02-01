@@ -425,46 +425,47 @@ impl SubscribeOp {
             "Subscribe operation aborted due to connection failure"
         );
 
-        // Create an error result to notify the client
-        let error_result: crate::client_events::HostResult =
-            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "Subscribe operation failed: peer connection dropped".into(),
+        if op_manager.is_sub_operation(self.id) {
+            // Async sub-operation: no client is waiting on this transaction.
+            // Notify via the subscription notification channel instead.
+            if let Some(SubscribeState::AwaitingResponse { instance_id, .. }) = &self.state {
+                let reason = format!(
+                    "Subscription failed for contract {}: peer connection dropped",
+                    instance_id
+                );
+                if let Err(e) = op_manager
+                    .notify_contract_handler(
+                        crate::contract::ContractHandlerEvent::NotifySubscriptionError {
+                            key: *instance_id,
+                            reason,
+                        },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        tx = %self.id,
+                        contract = %instance_id,
+                        error = %e,
+                        "Failed to send subscription abort error to notification channels"
+                    );
+                }
             }
-            .into());
-
-        // Send the error to the client via the result router
-        if let Err(err) = op_manager
-            .result_router_tx
-            .send((self.id, error_result))
-            .await
-        {
-            tracing::error!(
-                tx = %self.id,
-                error = %err,
-                "Failed to send abort notification to client"
-            );
-        }
-
-        // Notify subscribed clients via the notification channel.
-        if let Some(SubscribeState::AwaitingResponse { instance_id, .. }) = &self.state {
-            let reason = format!(
-                "Subscription failed for contract {}: peer connection dropped",
-                instance_id
-            );
-            if let Err(e) = op_manager
-                .notify_contract_handler(
-                    crate::contract::ContractHandlerEvent::NotifySubscriptionError {
-                        key: *instance_id,
-                        reason,
-                    },
-                )
+        } else {
+            // Standalone subscribe: client is waiting on this transaction directly.
+            let error_result: crate::client_events::HostResult =
+                Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                    cause: "Subscribe operation failed: peer connection dropped".into(),
+                }
+                .into());
+            if let Err(err) = op_manager
+                .result_router_tx
+                .send((self.id, error_result))
                 .await
             {
-                tracing::debug!(
+                tracing::error!(
                     tx = %self.id,
-                    contract = %instance_id,
-                    error = %e,
-                    "Failed to send subscription abort error to notification channels"
+                    error = %err,
+                    "Failed to send abort notification to client"
                 );
             }
         }
