@@ -1,0 +1,20 @@
+[package]
+name = "test-delegate-capabilities"
+version = "0.1.0"
+edition = "2021"
+description = "Test delegate for exercising all delegate capabilities in issue #2827"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.1.31", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]

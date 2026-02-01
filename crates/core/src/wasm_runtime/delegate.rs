@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
+    DelegateInterfaceResult, DelegateKey, GetContractRequest, GetSecretRequest, GetSecretResponse,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
@@ -90,6 +90,7 @@ impl Runtime {
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
             InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+            InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
@@ -125,6 +126,9 @@ impl Runtime {
                     OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
                     OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
                     OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+                    OutboundDelegateMsg::GetContractRequest(req) => {
+                        format!("GetContractRequest(contract={})", req.contract_id)
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -162,6 +166,7 @@ impl Runtime {
                         OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretReq".to_string(),
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
+                        OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -220,6 +225,7 @@ impl Runtime {
                                 OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
                                 OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
                                 OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+                                OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
                             })
                             .collect::<Vec<_>>();
                         tracing::debug!(
@@ -311,6 +317,10 @@ impl Runtime {
                     tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
+                    // Drain remaining messages to results before breaking to avoid message loss
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
                     break;
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
@@ -327,6 +337,25 @@ impl Runtime {
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
                 }
                 OutboundDelegateMsg::ContextUpdated(context) => {
+                    last_context = context;
+                }
+                OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
+                    // Pass unprocessed contract requests to results for the executor to handle
+                    tracing::debug!(
+                        contract_id = %req.contract_id,
+                        "Passing GetContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::GetContractRequest(req));
+                    // Drain remaining messages to results before breaking to avoid message loss
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    // Break to let the executor handle this before continuing
+                    break;
+                }
+                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context, .. }) => {
+                    // Processed contract request - just update context
+                    tracing::debug!("GetContractRequest processed");
                     last_context = context;
                 }
             }
@@ -456,7 +485,68 @@ impl DelegateRuntimeInterface for Runtime {
                         .into());
                     }
                 }
-                _ => {}
+                InboundDelegateMsg::GetContractResponse(response) => {
+                    // Handle GetContractResponse by sending it to the delegate via exec_inbound
+                    let outbound = VecDeque::from(self.exec_inbound(
+                        params,
+                        attested,
+                        &InboundDelegateMsg::GetContractResponse(response),
+                        &process_func,
+                        &running.instance,
+                    )?);
+
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            OutboundDelegateMsg::SetSecretRequest(set) => {
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
+                            }
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
+                    // Update the shared context for next messages
+                    last_context = self.get_outbound(
+                        delegate_key,
+                        &running.instance,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut real_outbound,
+                        &mut results,
+                    )?;
+                }
+                InboundDelegateMsg::GetSecretResponse(response) => {
+                    // Handle GetSecretResponse by sending it to the delegate via exec_inbound
+                    let outbound = VecDeque::from(self.exec_inbound(
+                        params,
+                        attested,
+                        &InboundDelegateMsg::GetSecretResponse(response),
+                        &process_func,
+                        &running.instance,
+                    )?);
+
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            OutboundDelegateMsg::SetSecretRequest(set) => {
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
+                            }
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
+                    // Update the shared context for next messages
+                    last_context = self.get_outbound(
+                        delegate_key,
+                        &running.instance,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut real_outbound,
+                        &mut results,
+                    )?;
+                }
             }
         }
         for outbound in non_processed {
@@ -602,6 +692,390 @@ mod test {
             outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    // Test delegate module name for capabilities test
+    const TEST_DELEGATE_CAPABILITIES: &str = "test_delegate_capabilities";
+
+    /// Message types for test-delegate-capabilities (must match the delegate's types)
+    mod capabilities_messages {
+        use super::*;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum DelegateCommand {
+            GetContractState {
+                contract_id: ContractInstanceId,
+            },
+            GetMultipleContractStates {
+                contract_ids: Vec<ContractInstanceId>,
+            },
+            GetContractWithEcho {
+                contract_id: ContractInstanceId,
+                echo_message: String,
+            },
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum DelegateResponse {
+            ContractState {
+                contract_id: ContractInstanceId,
+                state: Option<Vec<u8>>,
+            },
+            MultipleContractStates {
+                results: Vec<(ContractInstanceId, Option<Vec<u8>>)>,
+            },
+            Echo {
+                message: String,
+            },
+            Error {
+                message: String,
+            },
+        }
+    }
+
+    /// Test that GetContractRequest is properly returned from WASM runtime
+    /// and GetContractResponse is properly delivered back to the delegate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        // Create a contract ID that the delegate will request
+        let target_contract_id = ContractInstanceId::new([42u8; 32]);
+
+        // Create an app ID for the response
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        // Step 1: Send GetContractState command to delegate
+        let command = DelegateCommand::GetContractState {
+            contract_id: target_contract_id.clone(),
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: Verify we get a GetContractRequest back
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let contract_request = match &outbound[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest, got {:?}", other),
+        };
+        assert_eq!(
+            contract_request.contract_id, target_contract_id,
+            "Contract ID should match"
+        );
+        assert!(
+            !contract_request.processed,
+            "Request should not be processed yet"
+        );
+
+        // Step 3: Simulate the executor sending GetContractResponse back
+        let contract_state = vec![1, 2, 3, 4, 5]; // Some test state
+        let response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: target_contract_id.clone(),
+            state: Some(WrappedState::new(contract_state.clone())),
+            context: contract_request.context.clone(),
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+
+        // Step 4: Verify we get the final ApplicationMessage with the contract state
+        assert_eq!(
+            final_outbound.len(),
+            1,
+            "Expected exactly one final message"
+        );
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed, "Final message should be processed");
+
+        // Verify the response content
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractState { contract_id, state } => {
+                assert_eq!(contract_id, target_contract_id);
+                assert_eq!(state, Some(contract_state));
+            }
+            other => panic!("Expected ContractState response, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that GetContractResponse with None state (contract not found) is handled correctly
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_contract_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let target_contract_id = ContractInstanceId::new([99u8; 32]);
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        // Send GetContractState command
+        let command = DelegateCommand::GetContractState {
+            contract_id: target_contract_id.clone(),
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Get the request
+        let contract_request = match &outbound[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest, got {:?}", other),
+        };
+
+        // Send response with None state (contract not found)
+        let response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: target_contract_id.clone(),
+            state: None, // Not found
+            context: contract_request.context.clone(),
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+
+        // Verify the response indicates no state
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractState { state, .. } => {
+                assert!(
+                    state.is_none(),
+                    "State should be None for not-found contract"
+                );
+            }
+            other => panic!("Expected ContractState response, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that multiple contract requests work in sequence.
+    /// The delegate requests contract1, then contract2, then contract3, and returns
+    /// the accumulated results at the end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract1 = ContractInstanceId::new([1u8; 32]);
+        let contract2 = ContractInstanceId::new([2u8; 32]);
+        let contract3 = ContractInstanceId::new([3u8; 32]);
+        let app_id = ContractInstanceId::new([10u8; 32]);
+
+        // Step 1: Send GetMultipleContractStates command
+        let command = DelegateCommand::GetMultipleContractStates {
+            contract_ids: vec![contract1.clone(), contract2.clone(), contract3.clone()],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: Verify we get first GetContractRequest
+        assert_eq!(outbound.len(), 1, "Expected one outbound message");
+        let req1 = match &outbound[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest, got {:?}", other),
+        };
+        assert_eq!(req1.contract_id, contract1);
+
+        // Step 3: Send response for first contract
+        let response1 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract1.clone(),
+            state: Some(WrappedState::new(vec![1, 1, 1])),
+            context: req1.context,
+        });
+
+        let outbound2 =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response1])?;
+
+        // Step 4: Verify we get second GetContractRequest
+        assert_eq!(outbound2.len(), 1, "Expected one outbound message");
+        let req2 = match &outbound2[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest for contract2, got {:?}", other),
+        };
+        assert_eq!(req2.contract_id, contract2);
+
+        // Step 5: Send response for second contract
+        let response2 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract2.clone(),
+            state: Some(WrappedState::new(vec![2, 2, 2])),
+            context: req2.context,
+        });
+
+        let outbound3 =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response2])?;
+
+        // Step 6: Verify we get third GetContractRequest
+        assert_eq!(outbound3.len(), 1, "Expected one outbound message");
+        let req3 = match &outbound3[0] {
+            OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
+            other => panic!("Expected GetContractRequest for contract3, got {:?}", other),
+        };
+        assert_eq!(req3.contract_id, contract3);
+
+        // Step 7: Send response for third contract
+        let response3 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract3.clone(),
+            state: Some(WrappedState::new(vec![3, 3, 3])),
+            context: req3.context,
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response3])?;
+
+        // Step 8: Verify we get the final MultipleContractStates response
+        assert_eq!(final_outbound.len(), 1, "Expected one final message");
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::MultipleContractStates { results } => {
+                assert_eq!(results.len(), 3, "Should have 3 results");
+                assert_eq!(results[0].0, contract1);
+                assert_eq!(results[0].1, Some(vec![1, 1, 1]));
+                assert_eq!(results[1].0, contract2);
+                assert_eq!(results[1].1, Some(vec![2, 2, 2]));
+                assert_eq!(results[2].0, contract3);
+                assert_eq!(results[2].1, Some(vec![3, 3, 3]));
+            }
+            other => panic!("Expected MultipleContractStates, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that message accumulation works correctly.
+    /// The delegate emits both a GetContractRequest AND an ApplicationMessage (Echo).
+    /// The runtime should return both after processing the contract request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let echo_message = "Hello from test!".to_string();
+
+        // Step 1: Send GetContractWithEcho command
+        let command = DelegateCommand::GetContractWithEcho {
+            contract_id: contract_id.clone(),
+            echo_message: echo_message.clone(),
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: The delegate returns BOTH GetContractRequest AND Echo message
+        assert_eq!(outbound.len(), 2, "Expected two outbound messages");
+
+        // Find the GetContractRequest (order may vary)
+        let contract_request = outbound
+            .iter()
+            .find_map(|msg| match msg {
+                OutboundDelegateMsg::GetContractRequest(req) => Some(req.clone()),
+                _ => None,
+            })
+            .expect("Expected a GetContractRequest");
+        assert_eq!(contract_request.contract_id, contract_id);
+
+        // Find the Echo ApplicationMessage
+        let echo_msg = outbound
+            .iter()
+            .find_map(|msg| match msg {
+                OutboundDelegateMsg::ApplicationMessage(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("Expected an ApplicationMessage (Echo)");
+        assert!(echo_msg.processed);
+
+        let echo_response: DelegateResponse = bincode::deserialize(&echo_msg.payload)?;
+        match echo_response {
+            DelegateResponse::Echo { message } => {
+                assert_eq!(message, echo_message);
+            }
+            other => panic!("Expected Echo response, got {:?}", other),
+        }
+
+        // Step 3: Send the contract response
+        let contract_response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: contract_id.clone(),
+            state: Some(WrappedState::new(vec![1, 2, 3, 4])),
+            context: contract_request.context,
+        });
+
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![contract_response],
+        )?;
+
+        // Step 4: Verify we get the final ContractState response
+        assert_eq!(final_outbound.len(), 1, "Expected one final message");
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractState {
+                contract_id: id,
+                state,
+            } => {
+                assert_eq!(id, contract_id);
+                assert_eq!(state, Some(vec![1, 2, 3, 4]));
+            }
+            other => panic!("Expected ContractState response, got {:?}", other),
+        }
+
         std::mem::drop(temp_dir);
         Ok(())
     }
