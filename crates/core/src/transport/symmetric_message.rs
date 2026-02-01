@@ -88,6 +88,7 @@ impl SymmetricMessage {
                     total_length_bytes: u64::MAX,
                     fragment_number: u32::MAX,
                     payload: Bytes::new(),
+                    metadata_bytes: None,
                 },
             };
             bincode::serialized_size(&blank).unwrap() as usize
@@ -237,6 +238,10 @@ pub(super) struct StreamFragment {
     pub total_length_bytes: u64,
     pub fragment_number: u32,
     pub payload: MessagePayload,
+    /// Serialized metadata NetMessage embedded in fragment #1 for reliability.
+    /// If the separate metadata message (ResponseStreaming, RequestStreaming, etc.)
+    /// is lost over UDP, the receiver can reconstruct it from this field.
+    pub metadata_bytes: Option<MessagePayload>,
 }
 
 impl From<StreamFragment> for SymmetricMessagePayload {
@@ -246,6 +251,7 @@ impl From<StreamFragment> for SymmetricMessagePayload {
             total_length_bytes: stream_fragment.total_length_bytes,
             fragment_number: stream_fragment.fragment_number,
             payload: stream_fragment.payload,
+            metadata_bytes: stream_fragment.metadata_bytes,
         }
     }
 }
@@ -273,6 +279,11 @@ pub(crate) enum SymmetricMessagePayload {
         total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,
+        /// Serialized metadata NetMessage embedded in fragment #1 for reliability.
+        /// None for fragments other than #1. When present, the transport layer
+        /// dispatches this as if a ShortMessage were received, so the operations
+        /// layer processes it through the normal path.
+        metadata_bytes: Option<MessagePayload>,
     },
     NoOp,
     /// Bidirectional liveness probe - sender expects a Pong response.
@@ -372,6 +383,22 @@ mod test {
                     crate::config::GlobalRng::fill_bytes(&mut buf);
                     buf
                 }),
+                metadata_bytes: None,
+            },
+            SymmetricMessagePayload::StreamFragment {
+                stream_id: StreamId::next(),
+                total_length_bytes: 200,
+                fragment_number: 1,
+                payload: Bytes::from({
+                    let mut buf = vec![0u8; 50];
+                    crate::config::GlobalRng::fill_bytes(&mut buf);
+                    buf
+                }),
+                metadata_bytes: Some(Bytes::from({
+                    let mut buf = vec![0u8; 80];
+                    crate::config::GlobalRng::fill_bytes(&mut buf);
+                    buf
+                })),
             },
             SymmetricMessagePayload::NoOp,
             SymmetricMessagePayload::Ping { sequence: 12345 },
@@ -481,6 +508,7 @@ mod test {
                 total_length_bytes: u64::MAX,
                 fragment_number: u32::MAX,
                 payload: Bytes::from(vec![0u8; MAX_DATA_SIZE - overhead]),
+                metadata_bytes: None,
             },
         };
         let size = bincode::serialized_size(&msg).unwrap();

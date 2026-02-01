@@ -115,7 +115,25 @@ where
             tracing::debug!("entered in state pushed to continue with op");
             return Ok(None);
         }
+        Err(OpError::OpNotPresent(tx)) => {
+            // OpNotPresent is benign — it means a duplicate message arrived for an
+            // operation that was already completed or claimed (e.g., duplicate metadata
+            // from embedded fragment #1 + separate message). Do NOT send Aborted, as
+            // the primary processing path is still active and will complete normally.
+            tracing::debug!(
+                tx = %tx,
+                "Ignoring duplicate message for already-handled operation"
+            );
+            return Ok(None);
+        }
         Err(err) => {
+            tracing::error!(
+                tx = %tx_id,
+                error = %err,
+                error_debug = ?err,
+                source = ?source_addr,
+                "handle_op_result: sending Aborted due to operation error"
+            );
             if let Some(addr) = source_addr {
                 network_bridge
                     .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
@@ -171,10 +189,24 @@ where
                 op_manager.completed(id);
                 if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending final message to target");
+                    // Serialize metadata for embedding in fragment #1 (fix #2757)
+                    let metadata = if stream_data.is_some() {
+                        match bincode::serialize(&msg) {
+                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                            Err(e) => {
+                                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     network_bridge.send(target, msg).await?;
                     if let Some((stream_id, data)) = stream_data {
                         tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-                        network_bridge.send_stream(target, stream_id, data).await?;
+                        network_bridge
+                            .send_stream(target, stream_id, data, metadata)
+                            .await?;
                     }
                 }
                 return Ok(Some(updated_state));
@@ -187,10 +219,24 @@ where
                     // If we send first, a fast response might arrive before the state is saved,
                     // causing load_or_init to fail to find the operation.
                     op_manager.push(id, updated_state).await?;
+                    // Serialize metadata for embedding in fragment #1 (fix #2757)
+                    let metadata = if stream_data.is_some() {
+                        match bincode::serialize(&msg) {
+                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                            Err(e) => {
+                                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     network_bridge.send(target, msg).await?;
                     if let Some((stream_id, data)) = stream_data {
                         tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-                        network_bridge.send_stream(target, stream_id, data).await?;
+                        network_bridge
+                            .send_stream(target, stream_id, data, metadata)
+                            .await?;
                     }
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
@@ -228,10 +274,24 @@ where
 
             if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
+                // Serialize metadata for embedding in fragment #1 (fix #2757)
+                let metadata = if stream_data.is_some() {
+                    match bincode::serialize(&msg) {
+                        Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                        Err(e) => {
+                            tracing::warn!(%tx_id, error = %e, "Failed to serialize metadata for embedding");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 network_bridge.send(target, msg).await?;
                 if let Some((stream_id, data)) = stream_data {
                     tracing::debug!(%tx_id, %stream_id, ?target, "sending stream data");
-                    network_bridge.send_stream(target, stream_id, data).await?;
+                    network_bridge
+                        .send_stream(target, stream_id, data, metadata)
+                        .await?;
                 }
             }
         }

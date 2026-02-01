@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub(crate) use self::messages::{PutMsg, PutStreamingPayload};
-use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
+use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
@@ -660,13 +660,21 @@ impl Operation for PutOp {
                         "Processing PUT RequestStreaming"
                     );
 
-                    // Step 1: Claim the stream from orphan registry
+                    // Step 1: Claim the stream from orphan registry (atomic dedup)
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
                         .claim_or_wait(*stream_id, STREAM_CLAIM_TIMEOUT)
                         .await
                     {
                         Ok(handle) => handle,
+                        Err(OrphanStreamError::AlreadyClaimed) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                "PUT RequestStreaming skipped — stream already claimed (dedup)"
+                            );
+                            return Err(OpError::OpNotPresent(id));
+                        }
                         Err(e) => {
                             tracing::error!(
                                 tx = %id,
@@ -732,13 +740,29 @@ impl Operation for PutOp {
                                 skip_list: routing_skip_list.clone(),
                                 subscribe: *msg_subscribe,
                             };
-                            conn_manager
-                                .send(next_addr, NetMessage::from(pipe_metadata))
-                                .await?;
+                            let pipe_metadata_net: NetMessage = pipe_metadata.into();
+                            // Serialize metadata for embedding in fragment #1 (fix #2757)
+                            let embedded_metadata = match bincode::serialize(&pipe_metadata_net) {
+                                Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        error = %e,
+                                        "Failed to serialize piped stream metadata for embedding"
+                                    );
+                                    None
+                                }
+                            };
+                            conn_manager.send(next_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
                             conn_manager
-                                .pipe_stream(next_addr, outbound_sid, forked_handle)
+                                .pipe_stream(
+                                    next_addr,
+                                    outbound_sid,
+                                    forked_handle,
+                                    embedded_metadata,
+                                )
                                 .await?;
 
                             if let Some(event) = NetEventLog::put_request(

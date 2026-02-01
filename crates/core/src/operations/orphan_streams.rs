@@ -57,6 +57,11 @@ pub struct OrphanStreamRegistry {
     /// Waiters for streams that haven't arrived yet (metadata arrived first).
     /// Maps StreamId -> oneshot sender to deliver the StreamHandle.
     stream_waiters: DashMap<StreamId, oneshot::Sender<StreamHandle>>,
+
+    /// Streams that have already been claimed. Used for deduplication when
+    /// both the embedded metadata (in fragment #1) and the separate metadata
+    /// message arrive — only the first one should be processed.
+    claimed_streams: DashMap<StreamId, ()>,
 }
 
 impl OrphanStreamRegistry {
@@ -65,6 +70,7 @@ impl OrphanStreamRegistry {
         Self {
             orphan_streams: DashMap::new(),
             stream_waiters: DashMap::new(),
+            claimed_streams: DashMap::new(),
         }
     }
 
@@ -100,11 +106,17 @@ impl OrphanStreamRegistry {
 
     /// Try to claim an orphan stream, or register to wait for it.
     ///
+    /// This method is atomic with respect to deduplication: if the stream has
+    /// already been claimed (e.g., via embedded metadata in fragment #1),
+    /// returns `AlreadyClaimed` immediately without waiting.
+    ///
     /// If the stream is already registered as an orphan, returns it immediately.
     /// Otherwise, waits up to `timeout` for the stream to arrive.
     ///
     /// # Errors
     ///
+    /// Returns `OrphanStreamError::AlreadyClaimed` if another caller already
+    /// claimed this stream (deduplication).
     /// Returns `OrphanStreamError::Timeout` if the stream doesn't arrive within
     /// the timeout period.
     pub async fn claim_or_wait(
@@ -112,6 +124,22 @@ impl OrphanStreamRegistry {
         stream_id: StreamId,
         timeout: Duration,
     ) -> Result<StreamHandle, OrphanStreamError> {
+        // Atomic dedup: try to insert into claimed_streams. If already present,
+        // another caller already claimed this stream.
+        use dashmap::mapref::entry::Entry;
+        match self.claimed_streams.entry(stream_id) {
+            Entry::Occupied(_) => {
+                tracing::debug!(
+                    stream_id = %stream_id,
+                    "Stream already claimed (dedup)"
+                );
+                return Err(OrphanStreamError::AlreadyClaimed);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
+
         // Check if orphan exists
         if let Some((_, (handle, _))) = self.orphan_streams.remove(&stream_id) {
             tracing::debug!(
@@ -143,6 +171,8 @@ impl OrphanStreamRegistry {
             Ok(Err(_)) => {
                 // Sender was dropped (shouldn't happen in normal operation)
                 self.stream_waiters.remove(&stream_id);
+                // Remove our claim so a retry is possible
+                self.claimed_streams.remove(&stream_id);
                 tracing::warn!(
                     stream_id = %stream_id,
                     "Stream waiter cancelled unexpectedly"
@@ -152,6 +182,8 @@ impl OrphanStreamRegistry {
             Err(_) => {
                 // Timeout expired
                 self.stream_waiters.remove(&stream_id);
+                // Remove our claim so a retry is possible
+                self.claimed_streams.remove(&stream_id);
                 tracing::warn!(
                     stream_id = %stream_id,
                     timeout_ms = timeout.as_millis(),
@@ -184,6 +216,15 @@ impl OrphanStreamRegistry {
                 true
             }
         });
+
+        // Also prune claimed_streams to prevent unbounded growth.
+        // Entries older than the orphan timeout can be safely removed since
+        // no duplicate metadata message would arrive that late.
+        // We don't track insertion time for claimed_streams, so we cap at a
+        // reasonable size instead.
+        if self.claimed_streams.len() > 1000 {
+            self.claimed_streams.clear();
+        }
 
         if expired_count > 0 {
             tracing::info!(
@@ -251,6 +292,8 @@ pub enum OrphanStreamError {
     Timeout,
     /// Waiter was cancelled (sender dropped unexpectedly).
     WaiterCancelled,
+    /// Stream was already claimed by another caller (deduplication).
+    AlreadyClaimed,
 }
 
 impl std::fmt::Display for OrphanStreamError {
@@ -258,6 +301,7 @@ impl std::fmt::Display for OrphanStreamError {
         match self {
             OrphanStreamError::Timeout => write!(f, "timeout waiting for stream"),
             OrphanStreamError::WaiterCancelled => write!(f, "stream waiter was cancelled"),
+            OrphanStreamError::AlreadyClaimed => write!(f, "stream already claimed (duplicate)"),
         }
     }
 }
@@ -330,6 +374,26 @@ mod tests {
         let result = waiter.await.unwrap();
         assert!(result.is_ok());
         assert_eq!(registry.waiter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_claim_returns_already_claimed() {
+        let registry = OrphanStreamRegistry::new();
+        let stream_id = StreamId::next();
+        let handle = make_test_handle(stream_id);
+
+        // Register and claim once
+        registry.register_orphan(stream_id, handle);
+        let result = registry
+            .claim_or_wait(stream_id, Duration::from_secs(1))
+            .await;
+        assert!(result.is_ok());
+
+        // Second claim should return AlreadyClaimed immediately (no timeout wait)
+        let result = registry
+            .claim_or_wait(stream_id, Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Err(OrphanStreamError::AlreadyClaimed)));
     }
 
     #[tokio::test]

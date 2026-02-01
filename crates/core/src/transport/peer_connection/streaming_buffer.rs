@@ -30,11 +30,12 @@ use crate::transport::packet_data;
 
 /// Maximum payload size per fragment (excluding metadata overhead).
 /// This matches the constant from peer_connection.rs.
+/// Measured overhead: 41 bytes (StreamFragment fields + Option discriminant for metadata_bytes)
 /// Public when bench feature is enabled for benchmarking.
 #[cfg(feature = "bench")]
-pub const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+pub const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 #[cfg(not(feature = "bench"))]
-pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// A lock-free buffer for reassembling stream fragments.
 ///
@@ -71,11 +72,21 @@ pub struct LockFreeStreamBuffer<T: TimeSource = RealTime> {
     /// Pre-allocated slots for each fragment. Each slot is a pointer to heap-allocated Bytes.
     /// Fragment numbers are 1-indexed, so fragment N is stored at slots[N-1].
     /// NULL means empty/cleared, non-NULL means fragment is present.
+    ///
+    /// Note: One extra slot is allocated beyond the base fragment count to handle
+    /// the case where fragment #1 has reduced payload due to embedded metadata
+    /// (fix #2757). This ensures the overflow fragment can be stored.
     fragments: Box<[AtomicPtr<Bytes>]>,
     /// Total expected bytes for the complete stream.
     total_size: u64,
-    /// Total number of fragments expected.
+    /// Total number of fragment slots allocated (includes one extra for metadata overflow).
     total_fragments: u32,
+    /// Minimum number of contiguous fragments needed for the stream to be complete.
+    /// This is the base fragment count (without the +1 overflow slot).
+    /// When fragment #1 has full payload (no metadata), this many fragments suffice.
+    /// When fragment #1 has reduced payload, the sender sends one extra fragment
+    /// that fits in the overflow slot.
+    min_complete_fragments: u32,
     /// Highest contiguous fragment number from the start (0 = none received).
     /// Uses atomic CAS for lock-free frontier advancement.
     contiguous_fragments: AtomicU32,
@@ -132,6 +143,7 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
     ///
     /// A new `LockFreeStreamBuffer` with enough slots to hold all fragments.
     pub fn new_with_time_source(total_size: u64, time_source: T) -> Self {
+        let base_fragments = Self::base_fragment_count(total_size);
         let num_fragments = Self::calculate_fragment_count(total_size);
         let fragments: Vec<AtomicPtr<Bytes>> = (0..num_fragments)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
@@ -141,6 +153,7 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
             fragments: fragments.into_boxed_slice(),
             total_size,
             total_fragments: num_fragments as u32,
+            min_complete_fragments: base_fragments as u32,
             contiguous_fragments: AtomicU32::new(0),
             consumed_frontier: AtomicU32::new(0),
             data_available: Event::new(),
@@ -148,13 +161,28 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
         }
     }
 
-    /// Calculates the number of fragments needed for a given byte count.
-    fn calculate_fragment_count(total_size: u64) -> usize {
+    /// Base fragment count: the minimum number of fragments needed assuming
+    /// all fragments carry full FRAGMENT_PAYLOAD_SIZE payloads.
+    fn base_fragment_count(total_size: u64) -> usize {
         if total_size == 0 {
             return 0;
         }
-        // Round up division
         (total_size as usize).div_ceil(FRAGMENT_PAYLOAD_SIZE)
+    }
+
+    /// Calculates the number of fragment slots to allocate for a given byte count.
+    ///
+    /// Allocates one extra slot beyond the base calculation to handle the case
+    /// where fragment #1 has reduced payload due to embedded metadata (fix #2757).
+    /// When metadata is embedded in fragment #1, its payload is smaller, which
+    /// may require one additional fragment to carry the overflow data.
+    fn calculate_fragment_count(total_size: u64) -> usize {
+        let base = Self::base_fragment_count(total_size);
+        if base == 0 {
+            return 0;
+        }
+        // +1 for potential metadata overflow in fragment #1
+        base + 1
     }
 
     /// Inserts a fragment into the buffer.
@@ -270,9 +298,15 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
         }
     }
 
-    /// Returns true if all fragments have been received.
+    /// Returns true if enough contiguous fragments have been received.
+    ///
+    /// Uses `min_complete_fragments` (the base count) rather than `total_fragments`
+    /// (which includes the overflow slot). This way the stream is considered
+    /// complete when at least the base number of fragments are present.
+    /// If the sender needed the overflow slot, the extra fragment will also
+    /// be contiguous and the frontier will be >= min_complete_fragments.
     pub fn is_complete(&self) -> bool {
-        self.contiguous_fragments.load(Ordering::Acquire) == self.total_fragments
+        self.contiguous_fragments.load(Ordering::Acquire) >= self.min_complete_fragments
     }
 
     /// Returns the number of fragments that are currently present (not consumed).
@@ -438,20 +472,31 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
             return None; // Can't assemble if fragments were consumed
         }
 
-        let mut result = Vec::with_capacity(self.total_size as usize);
+        let target_size = self.total_size as usize;
+        let mut result = Vec::with_capacity(target_size);
         for slot in self.fragments.iter() {
             let ptr = slot.load(Ordering::Acquire);
             if ptr.is_null() {
-                return None;
+                // The extra overflow slot may be empty when no metadata was
+                // embedded. Stop iterating once we've collected enough data.
+                break;
             }
             // SAFETY: ptr is non-null and was set by insert()
             let data = unsafe { &*ptr };
             result.extend_from_slice(data);
+            if result.len() >= target_size {
+                break;
+            }
         }
 
-        // Truncate to exact size (last fragment may be smaller)
-        result.truncate(self.total_size as usize);
-        Some(result)
+        // Truncate to exact size (last fragment may be smaller, or overflow
+        // fragment may push us slightly past total_size)
+        result.truncate(target_size);
+        if result.len() == target_size {
+            Some(result)
+        } else {
+            None // Not enough contiguous data despite is_complete() being true
+        }
     }
 
     /// Returns an iterator over the fragments in order.
@@ -569,7 +614,8 @@ mod tests {
     #[test]
     fn test_new_buffer_single_fragment() {
         let buffer = LockFreeStreamBuffer::new(100);
-        assert_eq!(buffer.total_fragments(), 1);
+        // +1 overflow slot for potential metadata overhead in fragment #1
+        assert_eq!(buffer.total_fragments(), 2);
         assert!(!buffer.is_complete());
     }
 
@@ -578,7 +624,7 @@ mod tests {
         // FRAGMENT_PAYLOAD_SIZE bytes per fragment
         let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
         let buffer = LockFreeStreamBuffer::new(total);
-        assert_eq!(buffer.total_fragments(), 3);
+        assert_eq!(buffer.total_fragments(), 4); // 3 base + 1 overflow
     }
 
     #[test]
@@ -586,7 +632,7 @@ mod tests {
         // 2.5 fragments worth of data
         let total = (FRAGMENT_PAYLOAD_SIZE * 2 + FRAGMENT_PAYLOAD_SIZE / 2) as u64;
         let buffer = LockFreeStreamBuffer::new(total);
-        assert_eq!(buffer.total_fragments(), 3);
+        assert_eq!(buffer.total_fragments(), 4); // 3 base + 1 overflow
     }
 
     #[test]
@@ -630,7 +676,8 @@ mod tests {
         let buffer = LockFreeStreamBuffer::new(100);
         let data = Bytes::from_static(b"hello");
 
-        let result = buffer.insert(2, data); // Only 1 fragment expected
+        // Buffer has 2 slots (1 base + 1 overflow), so fragment 3 is out of bounds
+        let result = buffer.insert(3, data);
         assert!(matches!(result, Err(InsertError::InvalidNumber { .. })));
     }
 
@@ -769,7 +816,7 @@ mod tests {
     #[test]
     fn test_single_byte_stream() {
         let buffer = LockFreeStreamBuffer::new(1);
-        assert_eq!(buffer.total_fragments(), 1);
+        assert_eq!(buffer.total_fragments(), 2); // 1 base + 1 overflow
         assert_eq!(buffer.total_bytes(), 1);
 
         buffer.insert(1, Bytes::from_static(b"X")).unwrap();
@@ -784,7 +831,7 @@ mod tests {
         // Total size is exactly 2 fragments
         let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
         let buffer = LockFreeStreamBuffer::new(total);
-        assert_eq!(buffer.total_fragments(), 2);
+        assert_eq!(buffer.total_fragments(), 3); // 2 base + 1 overflow
 
         buffer
             .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
@@ -802,7 +849,7 @@ mod tests {
         let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
         let buffer = LockFreeStreamBuffer::new(total);
 
-        // Insert all fragments
+        // Insert all base fragments
         for i in 1..=3 {
             buffer
                 .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
@@ -810,8 +857,11 @@ mod tests {
         }
 
         let fragments: Vec<_> = buffer.iter().collect();
-        assert_eq!(fragments.len(), 3);
-        assert!(fragments.iter().all(|f| f.is_some()));
+        assert_eq!(fragments.len(), 4); // 3 base + 1 overflow slot
+        assert!(fragments[0].is_some());
+        assert!(fragments[1].is_some());
+        assert!(fragments[2].is_some());
+        assert!(fragments[3].is_none()); // Overflow slot unused
     }
 
     #[test]
@@ -828,10 +878,11 @@ mod tests {
             .unwrap();
 
         let fragments: Vec<_> = buffer.iter().collect();
-        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments.len(), 4); // 3 base + 1 overflow slot
         assert!(fragments[0].is_some());
         assert!(fragments[1].is_none()); // Gap
         assert!(fragments[2].is_some());
+        assert!(fragments[3].is_none()); // Overflow slot unused
     }
 
     #[test]
@@ -1123,11 +1174,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "mark_consumed index 5 exceeds total_fragments 3")]
+    #[should_panic(expected = "mark_consumed index 5 exceeds total_fragments 4")]
     fn test_mark_consumed_panics_on_invalid_index() {
         let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
         let buffer = LockFreeStreamBuffer::new(total);
-        buffer.mark_consumed(5); // Should panic
+        buffer.mark_consumed(5); // Should panic (total_fragments = 3 base + 1 overflow = 4)
     }
 
     #[test]

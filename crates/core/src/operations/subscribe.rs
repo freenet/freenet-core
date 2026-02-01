@@ -550,6 +550,19 @@ impl Operation for SubscribeOp {
                         // In the lease-based model (2026-01), we just confirm we have the contract.
                         // Updates propagate via proximity cache, not explicit tree.
                         if let Some(requester_addr) = self.requester_addr {
+                            // Register the subscribing peer in the interest manager so that
+                            // update broadcasts include them as a target immediately.
+                            if let Some(pkl) = op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_by_addr(requester_addr)
+                            {
+                                let peer_key =
+                                    crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                op_manager
+                                    .interest_manager
+                                    .register_peer_interest(&key, peer_key, None, false);
+                            }
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
@@ -589,6 +602,19 @@ impl Operation for SubscribeOp {
                         // Contract arrived - respond to confirm subscription
                         // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
+                            // Register the subscribing peer in the interest manager so that
+                            // update broadcasts include them as a target immediately.
+                            if let Some(pkl) = op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_by_addr(requester_addr)
+                            {
+                                let peer_key =
+                                    crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                op_manager
+                                    .interest_manager
+                                    .register_peer_interest(&key, peer_key, None, false);
+                            }
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -733,6 +759,23 @@ impl Operation for SubscribeOp {
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
                             // See: https://github.com/freenet/freenet-core/issues/XXX
                             super::announce_contract_cached(op_manager, key).await;
+
+                            // Register the responding peer in our interest manager.
+                            // The peer that fulfilled our subscription has the contract,
+                            // so we should include them in update broadcasts.
+                            if let Some(resp_addr) = source_addr {
+                                if let Some(pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(resp_addr)
+                                {
+                                    let peer_key =
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                    op_manager
+                                        .interest_manager
+                                        .register_peer_interest(key, peer_key, None, false);
+                                }
+                            }
 
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
