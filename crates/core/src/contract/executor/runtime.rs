@@ -527,9 +527,7 @@ impl ContractExecutor for RuntimePool {
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
         let mut executor = self.pop_executor().await;
-        let result = executor
-            .get_contract_state_delta(key, their_summary)
-            .await;
+        let result = executor.get_contract_state_delta(key, their_summary).await;
 
         if !Self::is_executor_healthy(&executor) {
             let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
