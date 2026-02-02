@@ -287,6 +287,38 @@ impl RuntimePool {
         Ok(executor)
     }
 
+    /// Return an executor to the pool, replacing it if unhealthy.
+    ///
+    /// This is the single point for post-operation health checking. After any
+    /// pool operation (contract or delegate), the executor's WASM store is
+    /// checked. If the store was lost (e.g., due to a panic during WASM
+    /// execution), a fresh executor is created and returned to the pool instead.
+    async fn return_checked(&mut self, executor: Executor<Runtime>, operation: &str) {
+        if Self::is_executor_healthy(&executor) {
+            self.return_executor(executor);
+            return;
+        }
+
+        let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            operation,
+            replacement_number = replacement_num,
+            "Executor became unhealthy, creating replacement"
+        );
+        match self.create_replacement_executor().await {
+            Ok(new_executor) => {
+                self.return_executor(new_executor);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create replacement executor");
+                // Return the broken executor anyway — next operation will fail
+                // but at least the pool isn't depleted
+                self.return_executor(executor);
+            }
+        }
+        self.log_health_if_degraded();
+    }
+
     /// Get a reference to the shared state store.
     /// Used for hosting metadata persistence operations during startup.
     pub fn state_store(&self) -> &StateStore<Storage> {
@@ -325,32 +357,7 @@ impl ContractExecutor for RuntimePool {
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
         let mut executor = self.pop_executor().await;
         let result = executor.fetch_contract(key, return_contract_code).await;
-
-        // Check if executor is still healthy after the operation
-        // If the WASM execution panicked, the store is lost and we need a new executor
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after fetch_contract, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    // Return the broken executor anyway - next operation will fail
-                    // but at least the pool isn't depleted
-                    self.return_executor(executor);
-                }
-            }
-            // Log health status after replacement
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "fetch_contract").await;
         result
     }
 
@@ -365,29 +372,7 @@ impl ContractExecutor for RuntimePool {
         let result = executor
             .upsert_contract_state(key, update, related_contracts, code)
             .await;
-
-        // Check if executor is still healthy after the operation
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after upsert_contract_state, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    self.return_executor(executor);
-                }
-            }
-            // Log health status after replacement
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "upsert_contract_state").await;
         result
     }
 
@@ -449,27 +434,8 @@ impl ContractExecutor for RuntimePool {
     ) -> Response {
         let mut executor = self.pop_executor().await;
         let result = executor.delegate_request(req, attested_contract);
-
-        // Check if executor is still healthy after the operation
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                replacement_number = replacement_num,
-                "Executor became unhealthy after execute_delegate_request, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    self.return_executor(executor);
-                }
-            }
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "execute_delegate_request")
+            .await;
         result
     }
 
@@ -497,27 +463,8 @@ impl ContractExecutor for RuntimePool {
     ) -> Result<StateSummary<'static>, ExecutorError> {
         let mut executor = self.pop_executor().await;
         let result = executor.summarize_contract_state(key).await;
-
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after summarize_contract_state, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    self.return_executor(executor);
-                }
-            }
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "summarize_contract_state")
+            .await;
         result
     }
 
@@ -528,27 +475,8 @@ impl ContractExecutor for RuntimePool {
     ) -> Result<StateDelta<'static>, ExecutorError> {
         let mut executor = self.pop_executor().await;
         let result = executor.get_contract_state_delta(key, their_summary).await;
-
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after get_contract_state_delta, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    self.return_executor(executor);
-                }
-            }
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "get_contract_state_delta")
+            .await;
         result
     }
 }
