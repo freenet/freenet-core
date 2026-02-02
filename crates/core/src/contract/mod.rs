@@ -80,6 +80,7 @@ where
         let values = match contract_handler
             .executor()
             .execute_delegate_request(current_req, attested_contract)
+            .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
                 values
