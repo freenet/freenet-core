@@ -704,6 +704,7 @@ mod test {
         use super::*;
 
         #[derive(Debug, Serialize, Deserialize)]
+        #[allow(clippy::enum_variant_names)]
         pub enum DelegateCommand {
             GetContractState {
                 contract_id: ContractInstanceId,
@@ -751,10 +752,10 @@ mod test {
 
         // Step 1: Send GetContractState command to delegate
         let command = DelegateCommand::GetContractState {
-            contract_id: target_contract_id.clone(),
+            contract_id: target_contract_id,
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+        let app_msg = ApplicationMessage::new(app_id, payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -781,7 +782,7 @@ mod test {
         // Step 3: Simulate the executor sending GetContractResponse back
         let contract_state = vec![1, 2, 3, 4, 5]; // Some test state
         let response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: target_contract_id.clone(),
+            contract_id: target_contract_id,
             state: Some(WrappedState::new(contract_state.clone())),
             context: contract_request.context.clone(),
         });
@@ -827,10 +828,10 @@ mod test {
 
         // Send GetContractState command
         let command = DelegateCommand::GetContractState {
-            contract_id: target_contract_id.clone(),
+            contract_id: target_contract_id,
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+        let app_msg = ApplicationMessage::new(app_id, payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -847,7 +848,7 @@ mod test {
 
         // Send response with None state (contract not found)
         let response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: target_contract_id.clone(),
+            contract_id: target_contract_id,
             state: None, // Not found
             context: contract_request.context.clone(),
         });
@@ -892,10 +893,10 @@ mod test {
 
         // Step 1: Send GetMultipleContractStates command
         let command = DelegateCommand::GetMultipleContractStates {
-            contract_ids: vec![contract1.clone(), contract2.clone(), contract3.clone()],
+            contract_ids: vec![contract1, contract2, contract3],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+        let app_msg = ApplicationMessage::new(app_id, payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -914,7 +915,7 @@ mod test {
 
         // Step 3: Send response for first contract
         let response1 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: contract1.clone(),
+            contract_id: contract1,
             state: Some(WrappedState::new(vec![1, 1, 1])),
             context: req1.context,
         });
@@ -932,7 +933,7 @@ mod test {
 
         // Step 5: Send response for second contract
         let response2 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: contract2.clone(),
+            contract_id: contract2,
             state: Some(WrappedState::new(vec![2, 2, 2])),
             context: req2.context,
         });
@@ -950,7 +951,7 @@ mod test {
 
         // Step 7: Send response for third contract
         let response3 = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: contract3.clone(),
+            contract_id: contract3,
             state: Some(WrappedState::new(vec![3, 3, 3])),
             context: req3.context,
         });
@@ -999,11 +1000,11 @@ mod test {
 
         // Step 1: Send GetContractWithEcho command
         let command = DelegateCommand::GetContractWithEcho {
-            contract_id: contract_id.clone(),
+            contract_id,
             echo_message: echo_message.clone(),
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id.clone(), payload);
+        let app_msg = ApplicationMessage::new(app_id, payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -1045,7 +1046,7 @@ mod test {
 
         // Step 3: Send the contract response
         let contract_response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
-            contract_id: contract_id.clone(),
+            contract_id,
             state: Some(WrappedState::new(vec![1, 2, 3, 4])),
             context: contract_request.context,
         });

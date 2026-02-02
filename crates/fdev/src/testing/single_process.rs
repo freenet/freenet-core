@@ -20,11 +20,16 @@ pub(super) fn run(config: &super::TestConfig) -> anyhow::Result<(), super::Error
     let seed = config.seed();
     let max_contract_num = config.max_contract_number.unwrap_or(config.nodes * 10);
     let iterations = config.events as usize;
-    let event_wait = Duration::from_millis(config.event_wait_ms.unwrap_or(200));
 
-    // Calculate simulation duration from event timing:
-    // total virtual time = startup(2s) + events * wait + propagation(2s) + convergence(10s) + 20% buffer
-    let event_time_secs = (iterations as u64 * event_wait.as_millis() as u64) / 1000;
+    // In turmoil (SingleProcess) mode, 200ms between events is sufficient for the
+    // deterministic network to process each event. The --event-wait-ms CLI parameter
+    // controls pacing in Network mode (real-time), but turmoil's virtual time doesn't
+    // need long waits — it just needs enough time for event propagation.
+    const TURMOIL_EVENT_WAIT: Duration = Duration::from_millis(200);
+
+    // Calculate simulation duration: startup(2s) + events*wait + propagation(2s) +
+    // convergence(10s) + 20% buffer
+    let event_time_secs = (iterations as u64 * TURMOIL_EVENT_WAIT.as_millis() as u64) / 1000;
     let base_duration_secs = 2 + event_time_secs + 2 + 10;
     let simulation_duration = Duration::from_secs(base_duration_secs + base_duration_secs / 5);
 
@@ -34,7 +39,6 @@ pub(super) fn run(config: &super::TestConfig) -> anyhow::Result<(), super::Error
             max_contract_num,
             iterations,
             simulation_duration,
-            event_wait,
         )
     })
     .join()
