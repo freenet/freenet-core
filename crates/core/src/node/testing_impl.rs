@@ -3377,6 +3377,7 @@ impl SimNetwork {
         max_contract_num: usize,
         iterations: usize,
         simulation_duration: Duration,
+        event_wait: Duration,
     ) -> anyhow::Result<()>
     where
         R: RandomEventGenerator + Send + 'static,
@@ -3573,7 +3574,7 @@ impl SimNetwork {
                 }
 
                 // Wait between events (Turmoil handles this deterministically)
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(event_wait).await;
             }
 
             // Wait for events to fully propagate through the network
