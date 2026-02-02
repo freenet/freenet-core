@@ -5,6 +5,11 @@
 //! exit code. This prevents malicious peers from triggering exits by claiming
 //! fake version numbers.
 //!
+//! Uses exponential backoff for GitHub API checks: starts at 1 minute after first
+//! mismatch detection, doubles after each check that finds no update, up to 1 hour max.
+//! This ensures peers update promptly when a release is published without spamming
+//! the GitHub API.
+//!
 //! This is temporary alpha-testing infrastructure to reduce the burden of
 //! frequent updates during rapid development.
 
@@ -21,8 +26,11 @@ pub use freenet::transport::{clear_version_mismatch, has_version_mismatch};
 /// The service wrapper catches this and runs `freenet update` before restarting.
 pub const EXIT_CODE_UPDATE_NEEDED: i32 = 42;
 
-/// Minimum interval between update checks (1 hour).
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+/// Initial backoff interval for update checks (1 minute).
+const INITIAL_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Maximum backoff interval for update checks (1 hour).
+const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Maximum consecutive update failures before disabling auto-update.
 const MAX_UPDATE_FAILURES: u32 = 3;
@@ -52,12 +60,9 @@ impl std::error::Error for UpdateNeededError {}
 /// Result of an update check attempt.
 #[derive(Debug, PartialEq)]
 pub enum UpdateCheckResult {
-    /// Rate limited or too many failures - didn't actually check GitHub.
-    /// The caller should NOT clear the version mismatch flag (preserve it for later).
+    /// Rate limited, too many failures, or no update available yet - will retry later.
+    /// The caller should NOT clear the version mismatch flag (preserve it for retry).
     Skipped,
-    /// Checked GitHub, no newer version available.
-    /// The caller should clear the version mismatch flag.
-    NoUpdateAvailable,
     /// Checked GitHub, newer version confirmed.
     /// The caller should clear the version mismatch flag.
     UpdateAvailable(String),
@@ -66,12 +71,12 @@ pub enum UpdateCheckResult {
 /// Check if an update is available, respecting rate limits and failure counts.
 ///
 /// Returns an `UpdateCheckResult` indicating:
-/// - `Skipped` if rate limited or too many failures (didn't check GitHub)
-/// - `NoUpdateAvailable` if checked but no newer version exists
+/// - `Skipped` if rate limited, too many failures, or no update available yet (will retry)
 /// - `UpdateAvailable(version)` if a newer version is confirmed on GitHub
 ///
-/// IMPORTANT: The caller should only clear the version mismatch flag if the
-/// result is NOT `Skipped`. This prevents losing mismatches when rate-limited.
+/// Uses exponential backoff: after each check that finds no update, the backoff
+/// interval doubles (starting at 1 minute, max 1 hour). This handles the case where
+/// a gateway is running a pre-release version before the GitHub release is published.
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
@@ -86,9 +91,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
         return UpdateCheckResult::Skipped;
     }
 
-    // Rate limit checks
-    if !should_check_for_update() {
-        tracing::debug!("Skipping update check - checked recently");
+    // Check if enough time has passed according to current backoff
+    let current_backoff = get_current_backoff();
+    if !should_check_for_update(current_backoff) {
+        tracing::debug!(
+            backoff_secs = current_backoff.as_secs(),
+            "Skipping update check - backoff not elapsed"
+        );
         return UpdateCheckResult::Skipped;
     }
 
@@ -106,7 +115,9 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                         current_version,
                         e
                     );
-                    return UpdateCheckResult::NoUpdateAvailable;
+                    // Increase backoff and retry later
+                    increase_backoff();
+                    return UpdateCheckResult::Skipped;
                 }
             };
 
@@ -114,7 +125,9 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("Failed to parse latest version '{}': {}", latest, e);
-                    return UpdateCheckResult::NoUpdateAvailable;
+                    // Increase backoff and retry later
+                    increase_backoff();
+                    return UpdateCheckResult::Skipped;
                 }
             };
 
@@ -124,26 +137,30 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     latest = %latest,
                     "Newer version confirmed on GitHub"
                 );
-                // Clear failure count since we successfully checked
+                // Clear failure count and backoff since we found an update
                 clear_update_failures();
+                reset_backoff();
                 UpdateCheckResult::UpdateAvailable(latest)
             } else {
                 tracing::debug!(
                     current = %current_version,
                     latest = %latest,
-                    "No newer version available (peer may have claimed fake version)"
+                    backoff_secs = current_backoff.as_secs(),
+                    "No newer version on GitHub yet, will retry with increased backoff"
                 );
-                UpdateCheckResult::NoUpdateAvailable
+                // No update yet - increase backoff and keep the mismatch flag for retry
+                increase_backoff();
+                UpdateCheckResult::Skipped
             }
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to check GitHub for updates: {}. Continuing to run.",
+                "Failed to check GitHub for updates: {}. Will retry with increased backoff.",
                 e
             );
-            // Treat network errors as "checked but no update" - don't preserve the flag
-            // forever just because GitHub was temporarily unreachable
-            UpdateCheckResult::NoUpdateAvailable
+            // Network error - increase backoff and retry later
+            increase_backoff();
+            UpdateCheckResult::Skipped
         }
     }
 }
@@ -190,26 +207,46 @@ fn record_check_time() {
     }
 }
 
-/// Check if enough time has passed since the last update check.
-fn should_check_for_update() -> bool {
-    match get_last_check_time() {
-        Some(last) => last
-            .elapsed()
-            .map(|e| e > UPDATE_CHECK_INTERVAL)
-            .unwrap_or(true),
-        None => true,
+/// Get the current backoff interval from file, defaulting to INITIAL_BACKOFF.
+fn get_current_backoff() -> Duration {
+    let path = state_dir().map(|d| d.join("update_backoff_secs"));
+    path.and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(INITIAL_BACKOFF)
+}
+
+/// Increase the backoff interval (double it, up to MAX_BACKOFF).
+fn increase_backoff() {
+    if let Some(dir) = state_dir() {
+        let _ = fs::create_dir_all(&dir);
+        let current = get_current_backoff();
+        let new_backoff = std::cmp::min(current * 2, MAX_BACKOFF);
+        let _ = fs::write(
+            dir.join("update_backoff_secs"),
+            new_backoff.as_secs().to_string(),
+        );
     }
+}
+
+/// Reset backoff to initial value (called when update is found).
+pub fn reset_backoff() {
+    if let Some(dir) = state_dir() {
+        let _ = fs::remove_file(dir.join("update_backoff_secs"));
+    }
+}
+
+/// Check if enough time has passed since the last update check.
+fn should_check_for_update(backoff: Duration) -> bool {
+    get_last_check_time()
+        .and_then(|last| last.elapsed().ok())
+        .map_or(true, |elapsed| elapsed > backoff)
 }
 
 /// Get the number of consecutive update failures.
 fn get_update_failure_count() -> u32 {
-    let marker = match state_dir() {
-        Some(d) => d.join("update_failures"),
-        None => return 0,
-    };
-
-    fs::read_to_string(marker)
-        .ok()
+    let path = state_dir().map(|d| d.join("update_failures"));
+    path.and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
@@ -267,5 +304,19 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("0.1.74"));
         assert!(msg.contains("auto-update"));
+    }
+
+    #[test]
+    fn test_backoff_constants() {
+        // Verify backoff progression: 1m -> 2m -> 4m -> 8m -> 16m -> 32m -> 64m (capped to 60m)
+        assert_eq!(INITIAL_BACKOFF, Duration::from_secs(60));
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(3600));
+
+        // Doubling 60 six times: 60 -> 120 -> 240 -> 480 -> 960 -> 1920 -> 3840 (capped to 3600)
+        let mut backoff = INITIAL_BACKOFF;
+        for _ in 0..6 {
+            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+        }
+        assert_eq!(backoff, MAX_BACKOFF);
     }
 }
