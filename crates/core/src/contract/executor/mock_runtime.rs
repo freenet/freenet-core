@@ -588,7 +588,7 @@ where
         Ok(())
     }
 
-    fn execute_delegate_request(
+    async fn execute_delegate_request(
         &mut self,
         _req: DelegateRequest<'_>,
         _attested_contract: Option<&ContractInstanceId>,
