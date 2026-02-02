@@ -94,21 +94,25 @@ impl DelegateStore {
         })
     }
 
+    /// Ensures the index mapping exists for a key, repairing it if missing.
+    /// This handles crash recovery and same-code-different-params scenarios.
+    fn ensure_index_entry(&mut self, key: &DelegateKey, code_hash: &CodeHash) -> RuntimeResult<()> {
+        if !self.key_to_code_part.contains_key(key) {
+            self.db
+                .store_delegate_index(key, code_hash)
+                .map_err(|e| anyhow::anyhow!("Failed to store delegate index: {e}"))?;
+            self.key_to_code_part.insert(key.clone(), *code_hash);
+        }
+        Ok(())
+    }
+
     pub fn store_delegate(&mut self, delegate: DelegateContainer) -> RuntimeResult<()> {
         let code_hash = delegate.code_hash();
         let key = delegate.key();
 
         // Early return if already in cache - but ensure index is updated
-        // This handles the case where cache has the code but index entry is missing
-        // (e.g., after crash, corruption, or same code registered with different params)
         if self.delegate_cache.get(code_hash).is_some() {
-            // Ensure index mapping exists for this key
-            if !self.key_to_code_part.contains_key(key) {
-                self.db
-                    .store_delegate_index(key, code_hash)
-                    .map_err(|e| anyhow::anyhow!("Failed to store delegate index: {e}"))?;
-                self.key_to_code_part.insert(key.clone(), *code_hash);
-            }
+            self.ensure_index_entry(key, code_hash)?;
             return Ok(());
         }
 
@@ -116,15 +120,8 @@ impl DelegateStore {
         let delegate_path = self.delegates_dir.join(key_path).with_extension("wasm");
 
         // Early return if file exists on disk - but ensure index is updated
-        // This handles the case where WASM file exists but index entry is missing
         if let Ok((code, _ver)) = DelegateCode::load_versioned_from_path(delegate_path.as_path()) {
-            // Ensure index mapping exists for this key
-            if !self.key_to_code_part.contains_key(key) {
-                self.db
-                    .store_delegate_index(key, code_hash)
-                    .map_err(|e| anyhow::anyhow!("Failed to store delegate index: {e}"))?;
-                self.key_to_code_part.insert(key.clone(), *code_hash);
-            }
+            self.ensure_index_entry(key, code_hash)?;
             let size = delegate.code().size() as i64;
             self.delegate_cache.insert(*code_hash, code, size);
             return Ok(());
