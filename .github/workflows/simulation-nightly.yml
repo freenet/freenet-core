@@ -146,13 +146,13 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Long-duration simulation test (10 min virtual time)
+      # Long-duration simulation test (1 hour virtual time, ~2.5 min wall clock)
       # Uses Turmoil deterministic scheduler for reproducible results
       # Uncovers time-dependent bugs that only manifest after extended operation
       # NOTE: Gated by nightly_tests feature — does NOT run in regular CI
-      - name: Long-running simulation (10 min virtual time)
+      - name: Long-running simulation (1 hour virtual time)
         run: |
-          echo "Running long-running deterministic simulation test (600s virtual time)"
+          echo "Running long-running deterministic simulation test (3600s virtual time)"
           echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
           cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
             test_long_running_deterministic -- \

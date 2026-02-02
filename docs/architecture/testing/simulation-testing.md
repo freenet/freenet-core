@@ -235,12 +235,12 @@ TestConfig::long_running("my-long-test", SEED)
 
 This configuration:
 - 2 gateways, 6 nodes
-- 10 minutes (600 seconds) virtual time with events spaced 2s apart
-- 300 contract operations distributed across the duration
+- 1 hour (3600 seconds) virtual time with events spaced 10s apart
+- 360 contract operations distributed across the duration
 - Tests for: connection timeout handling, state drift, timer edge cases
 
 Note: Turmoil steps through every virtual millisecond polling all hosts, so virtual
-time has a real cost. 600s virtual ≈ 8-10 min wall clock with 8 hosts.
+time has a real cost. 3600s virtual ≈ 2.5 min wall clock with 8 hosts.
 
 ## Nightly Test Suite
 
@@ -252,7 +252,7 @@ All fdev tests include realistic network conditions and use 200ms default event 
 | Medium scale (×2 seeds) | 50 | 2000 | ~400s | 10-50ms jitter |
 | Fault tolerance | 30 | 1000 | ~200s | 15% loss + 10-50ms jitter |
 | High latency | 14 | 500 | ~100s | 50-200ms latency |
-| Long-running (Rust test) | 8 | 300 | ~600s | 10-50ms jitter |
+| Long-running (Rust test) | 8 | 360 | ~3600s | 10-50ms jitter |
 | Large scale | 500 | 10000 | ~2000s | 10-50ms jitter |
 
 All tests require convergence (eventual consistency).

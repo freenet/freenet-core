@@ -135,9 +135,9 @@ impl TestConfig {
     /// - Post-events buffer: 10 seconds for final propagation
     #[allow(dead_code)]
     fn long_running(name: &'static str, seed: u64) -> Self {
-        // 300 events × 2s apart = 600s (10 min) virtual time.
-        // Turmoil steps through every virtual ms, so 600s ≈ 600k steps × 8 hosts.
-        // Wall clock: roughly 8-10 min on CI (vs. ~45 min for 3600s).
+        // 360 events × 10s apart = 3600s (1 hour) virtual time.
+        // Turmoil steps every virtual ms: 3600s ≈ 3.6M steps × 8 hosts.
+        // Wall clock: ~2.5 min (25x acceleration with 8 hosts).
         Self {
             name,
             seed,
@@ -148,9 +148,9 @@ impl TestConfig {
             max_connections: 15,
             min_connections: 3,
             max_contracts: 8,
-            iterations: 300, // Events distributed across 10 min virtual
-            duration: Duration::from_secs(700), // Max simulation time (buffer)
-            event_wait: Duration::from_secs(2), // 2s between events = ~600s total
+            iterations: 360, // Events distributed across 1 hour virtual
+            duration: Duration::from_secs(3700), // Max simulation time (buffer)
+            event_wait: Duration::from_secs(10), // 10s between events = ~3600s total
             sleep_after_events: Duration::from_secs(10), // Brief propagation wait
             require_convergence: true,
             // Realistic latency jitter (10-50ms) to uncover timing issues
@@ -2952,16 +2952,17 @@ fn test_subscription_broadcast_propagation() {
 /// deterministic scheduler, ensuring reproducible results.
 ///
 /// # Runtime
-/// Long-running deterministic simulation (10 min virtual time).
+/// Long-running deterministic simulation (1 hour virtual time).
 ///
 /// Tests for time-dependent bugs (connection timeouts, state drift, etc.)
 /// that only manifest after extended operation. Uses wider event spacing
-/// (2s apart) compared to regular tests (200ms) to exercise idle-path code.
+/// (10s apart) compared to regular tests (200ms) to exercise idle-path code.
 ///
 /// # Virtual Time Breakdown
-/// - Events phase: 300 operations × 2s = 600 seconds (10 min)
+/// - Events phase: 360 operations × 10s = 3600 seconds (1 hour)
 /// - Propagation: 10 seconds
-/// - Total: ~610 seconds virtual time
+/// - Total: ~3610 seconds virtual time
+/// - Wall clock: ~2.5 min (25x acceleration with 8 turmoil hosts)
 ///
 /// NOTE: Gated by nightly_tests feature — does NOT run in regular CI.
 #[test_log::test]
@@ -2971,7 +2972,7 @@ fn test_long_running_deterministic() {
 
     tracing::info!("=== Starting Long-Running Deterministic Simulation ===");
     tracing::info!("Seed: 0x{:X}", SEED);
-    tracing::info!("Virtual time target: 600 seconds (10 min)");
+    tracing::info!("Virtual time target: 3600 seconds (1 hour)");
 
     let start_time = std::time::Instant::now();
 
@@ -2987,7 +2988,7 @@ fn test_long_running_deterministic() {
     tracing::info!("Wall clock time: {:.1} seconds", wall_clock.as_secs_f64());
     tracing::info!(
         "Time acceleration: {:.1}x",
-        600.0 / wall_clock.as_secs_f64()
+        3600.0 / wall_clock.as_secs_f64()
     );
 
     tracing::info!("test_long_running_deterministic PASSED");
