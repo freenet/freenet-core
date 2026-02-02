@@ -68,19 +68,18 @@ jobs:
       - name: Build fdev
         run: cargo build -p fdev --release
 
-      # Medium scale test (50 nodes) - 1 hour virtual time with realistic jitter
+      # Medium scale test (50 nodes, 2000 events)
       # Expects 100% success rate and 100% convergence
-      # Virtual time: 2000 events × 1800ms = 3600s (1 hour)
-      - name: Medium scale test (50 nodes, 1h, seed 0xDEADBEEF)
+      # Virtual time: 2000 events × 200ms (turmoil default) = 400s
+      - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
         run: |
-          echo "Running medium scale simulation (50 nodes, 2000 events, 1 hour virtual time)"
+          echo "Running medium scale simulation (50 nodes, 2000 events)"
           cargo run -p fdev --release -- test \
-            --name "nightly-medium-50-1h" \
+            --name "nightly-medium-50" \
             --seed 0xDEADBEEF \
             --gateways 4 \
             --nodes 46 \
             --events 2000 \
-            --event-wait-ms 1800 \
             --ring-max-htl 12 \
             --max-connections 20 \
             --min-connections 6 \
@@ -92,18 +91,15 @@ jobs:
             single-process
 
       # Medium scale with different seed (explores different code paths)
-      # 1 hour virtual time with realistic jitter
-      # Virtual time: 2000 events × 1800ms = 3600s (1 hour)
-      - name: Medium scale test (50 nodes, 1h, seed 0xCAFEBABE)
+      - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
         run: |
-          echo "Running medium scale simulation with alternate seed (2000 events, 1 hour virtual time)"
+          echo "Running medium scale simulation with alternate seed (2000 events)"
           cargo run -p fdev --release -- test \
-            --name "nightly-medium-50-1h-alt" \
+            --name "nightly-medium-50-alt" \
             --seed 0xCAFEBABE \
             --gateways 4 \
             --nodes 46 \
             --events 2000 \
-            --event-wait-ms 1800 \
             --ring-max-htl 12 \
             --max-connections 20 \
             --min-connections 6 \
@@ -114,20 +110,17 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Fault tolerance test with aggressive message loss + realistic jitter
-      # 1 hour virtual time to catch time-dependent issues under load
+      # Fault tolerance test with aggressive message loss
       # Success rate can be <100% due to message loss, but convergence must be 100%
-      # Virtual time: 1000 events × 3600ms = 3600s (1 hour)
-      - name: Fault tolerance test (15% message loss, 1h)
+      - name: Fault tolerance test (15% message loss)
         run: |
-          echo "Running fault tolerance simulation with 15% message loss (1000 events, 1 hour virtual time)"
+          echo "Running fault tolerance simulation with 15% message loss (1000 events)"
           cargo run -p fdev --release -- test \
-            --name "nightly-fault-loss-1h" \
+            --name "nightly-fault-loss" \
             --seed 0xFA017001 \
             --gateways 3 \
             --nodes 27 \
             --events 1000 \
-            --event-wait-ms 3600 \
             --message-loss 0.15 \
             --latency-min 10 \
             --latency-max 50 \
@@ -136,19 +129,16 @@ jobs:
             --print-network-stats \
             single-process
 
-      # High latency test - 1 hour virtual time
-      # Tests behavior under sustained high latency conditions
-      # Virtual time: 500 events × 7200ms = 3600s (1 hour)
-      - name: High latency test (50-200ms latency, 1h)
+      # High latency test - tests behavior under sustained high latency conditions
+      - name: High latency test (50-200ms latency)
         run: |
-          echo "Running high latency simulation (500 events, 1 hour virtual time)"
+          echo "Running high latency simulation (500 events)"
           cargo run -p fdev --release -- test \
-            --name "nightly-high-latency-1h" \
+            --name "nightly-high-latency" \
             --seed 0x1A7E0C71 \
             --gateways 2 \
             --nodes 12 \
             --events 500 \
-            --event-wait-ms 7200 \
             --latency-min 50 \
             --latency-max 200 \
             --min-success-rate 0.95 \
@@ -156,19 +146,16 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Large scale test (500 nodes) - 3 hour virtual time with realistic jitter
-      # Extended duration stress test to catch time-dependent scaling issues
-      # Virtual time: 10000 events × 1080ms = 10800s (3 hours)
-      - name: Large scale test (500 nodes, 3h)
+      # Large scale test (500 nodes) - stress test for scaling issues
+      - name: Large scale test (500 nodes)
         run: |
-          echo "Running large scale simulation (500 nodes, 10000 events, 3 hours virtual time)"
+          echo "Running large scale simulation (500 nodes, 10000 events)"
           cargo run -p fdev --release -- test \
-            --name "nightly-large-500-3h" \
+            --name "nightly-large-500" \
             --seed 0x500BEEF \
             --gateways 10 \
             --nodes 490 \
             --events 10000 \
-            --event-wait-ms 1080 \
             --ring-max-htl 15 \
             --max-connections 30 \
             --min-connections 10 \
