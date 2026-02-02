@@ -74,7 +74,7 @@ jobs:
       - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
         run: |
           echo "Running medium scale simulation (50 nodes, 2000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-medium-50" \
             --seed 0xDEADBEEF \
             --gateways 4 \
@@ -94,7 +94,7 @@ jobs:
       - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
         run: |
           echo "Running medium scale simulation with alternate seed (2000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-medium-50-alt" \
             --seed 0xCAFEBABE \
             --gateways 4 \
@@ -115,7 +115,7 @@ jobs:
       - name: Fault tolerance test (15% message loss)
         run: |
           echo "Running fault tolerance simulation with 15% message loss (1000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-fault-loss" \
             --seed 0xFA017001 \
             --gateways 3 \
@@ -133,7 +133,7 @@ jobs:
       - name: High latency test (50-200ms latency)
         run: |
           echo "Running high latency simulation (500 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-high-latency" \
             --seed 0x1A7E0C71 \
             --gateways 2 \
@@ -163,7 +163,7 @@ jobs:
       - name: Large scale test (500 nodes)
         run: |
           echo "Running large scale simulation (500 nodes, 10000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-large-500" \
             --seed 0x500BEEF \
             --gateways 10 \
