@@ -168,15 +168,9 @@ async fn run_network_node_with_signals(
                         let _ = update_tx.send(new_version);
                         return;
                     }
-                    UpdateCheckResult::NoUpdateAvailable => {
-                        // Clear the flag - peer claimed fake version or we're up to date
-                        clear_version_mismatch();
-                        tracing::debug!("No update available, continuing to run");
-                    }
                     UpdateCheckResult::Skipped => {
-                        // Don't clear the flag - we didn't actually check.
-                        // The mismatch will be rechecked when rate limit expires.
-                        tracing::debug!("Update check skipped (rate limited), will retry later");
+                        // Don't clear the flag - either rate limited, no update yet, or error.
+                        // Will retry with exponential backoff (1min -> 2min -> ... -> 1hr max).
                     }
                 }
             }
