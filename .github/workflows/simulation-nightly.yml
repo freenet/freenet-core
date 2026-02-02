@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 120
 
     env:
-      RUST_LOG: info
+      RUST_LOG: info,turmoil=warn
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       RUST_MIN_STACK: 16777216
       # Use mold linker to avoid rust-lld crashes
@@ -146,17 +146,16 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Long-duration simulation test (1 hour virtual time)
+      # Long-duration simulation test (10 min virtual time)
       # Uses Turmoil deterministic scheduler for reproducible results
       # Uncovers time-dependent bugs that only manifest after extended operation
-      # Wall clock time: ~3 minutes (with 19.6x time acceleration)
       # NOTE: Gated by nightly_tests feature — does NOT run in regular CI
-      - name: Long-running simulation (1 hour virtual time)
+      - name: Long-running simulation (10 min virtual time)
         run: |
-          echo "Running 1-hour long-running deterministic simulation test"
+          echo "Running long-running deterministic simulation test (600s virtual time)"
           echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
           cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
-            test_long_running_1h_deterministic -- \
+            test_long_running_deterministic -- \
             --test-threads=1 --nocapture
 
       # Large scale test (500 nodes) - stress test for scaling issues

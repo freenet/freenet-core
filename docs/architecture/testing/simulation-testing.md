@@ -223,10 +223,10 @@ Virtual time runs significantly faster than wall clock time due to Turmoil's sch
 
 ### Long-Duration Test Configuration
 
-For tests simulating extended periods (hours/days), use the `long_running_1h` configuration:
+For tests simulating extended periods, use the `long_running` configuration:
 
 ```rust
-TestConfig::long_running_1h("my-long-test", SEED)
+TestConfig::long_running("my-long-test", SEED)
     .run()
     .assert_ok()
     .verify_operation_coverage()
@@ -235,37 +235,40 @@ TestConfig::long_running_1h("my-long-test", SEED)
 
 This configuration:
 - 2 gateways, 6 nodes
-- 1 hour (3600 seconds) virtual time
-- 200 contract operations spread across the hour
+- 10 minutes (600 seconds) virtual time with events spaced 2s apart
+- 300 contract operations distributed across the duration
 - Tests for: connection timeout handling, state drift, timer edge cases
+
+Note: Turmoil steps through every virtual millisecond polling all hosts, so virtual
+time has a real cost. 600s virtual ≈ 8-10 min wall clock with 8 hosts.
 
 ## Nightly Test Suite
 
 The nightly workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios.
-All fdev tests include realistic network conditions (10-50ms jitter) and run for 1+ hours of virtual time.
+All fdev tests include realistic network conditions and use 200ms default event spacing.
 
-| Test | Nodes | Virtual Time | Fault Injection |
-|------|-------|--------------|-----------------|
-| Medium scale (×2 seeds) | 50 | 1 hour | 10-50ms jitter |
-| Large scale | 500 | **3 hours** | 10-50ms jitter |
-| Fault tolerance | 30 | 1 hour | 15% loss + 10-50ms jitter |
-| High latency | 14 | 1 hour | 50-200ms latency |
-| Long-running (Rust test) | 8 | 1 hour | 10-50ms jitter |
+| Test | Nodes | Events | Virtual Time | Fault Injection |
+|------|-------|--------|--------------|-----------------|
+| Medium scale (×2 seeds) | 50 | 2000 | ~400s | 10-50ms jitter |
+| Fault tolerance | 30 | 1000 | ~200s | 15% loss + 10-50ms jitter |
+| High latency | 14 | 500 | ~100s | 50-200ms latency |
+| Long-running (Rust test) | 8 | 300 | ~600s | 10-50ms jitter |
+| Large scale | 500 | 10000 | ~2000s | 10-50ms jitter |
 
 All tests require convergence (eventual consistency).
 
 ### Long-Running Test Details
 
-The `test_long_running_1h_deterministic` test specifically targets time-dependent bugs:
+The `test_long_running_deterministic` test specifically targets time-dependent bugs:
 
 ```bash
 # Run manually (requires nightly_tests feature)
 cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
-  test_long_running_1h_deterministic -- --nocapture --test-threads=1
+  test_long_running_deterministic -- --nocapture --test-threads=1
 ```
 
 **What it tests:**
-- Connection timeout handling over 1 hour of virtual time
+- Connection timeout handling over extended virtual time
 - Keep-alive and heartbeat mechanisms
 - Long-lived contract state consistency
 - Timer edge cases (wraparound, scheduling)
