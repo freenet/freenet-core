@@ -159,18 +159,7 @@ jobs:
             test_long_running_1h_deterministic -- \
             --test-threads=1 --nocapture
 
-      # Large network test - requires riverctl, skipped if not available
-      - name: Run large network test (50+ nodes)
-        run: |
-          echo "Running large network simulation with seed: $SIMULATION_SEED"
-          if command -v riverctl &> /dev/null; then
-            cargo test -p freenet --test large_network -- --ignored --nocapture --test-threads=1
-          else
-            echo "Skipping large_network test - riverctl not installed"
-          fi
-
-      # Large scale test (500 nodes) - slowest test, runs last
-      # Stress test for scaling issues with many nodes
+      # Large scale test (500 nodes) - stress test for scaling issues
       - name: Large scale test (500 nodes)
         run: |
           echo "Running large scale simulation (500 nodes, 10000 events)"
@@ -189,6 +178,16 @@ jobs:
             --print-summary \
             --print-network-stats \
             single-process
+
+      # Real-process soak test - runs last (requires riverctl, skipped if not available)
+      - name: Run large network soak test (50+ real nodes)
+        run: |
+          echo "Running large network soak test with seed: $SIMULATION_SEED"
+          if command -v riverctl &> /dev/null; then
+            cargo test -p freenet --test large_network -- --ignored --nocapture --test-threads=1
+          else
+            echo "Skipping large_network test - riverctl not installed"
+          fi
 
   # Notify Matrix channel on failure
   # Uses curl directly because the matrix-message action doesn't URL-encode room IDs
