@@ -209,13 +209,8 @@ fn record_check_time() {
 
 /// Get the current backoff interval from file, defaulting to INITIAL_BACKOFF.
 fn get_current_backoff() -> Duration {
-    let marker = match state_dir() {
-        Some(d) => d.join("update_backoff_secs"),
-        None => return INITIAL_BACKOFF,
-    };
-
-    fs::read_to_string(marker)
-        .ok()
+    let path = state_dir().map(|d| d.join("update_backoff_secs"));
+    path.and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(INITIAL_BACKOFF)
@@ -243,21 +238,15 @@ pub fn reset_backoff() {
 
 /// Check if enough time has passed since the last update check.
 fn should_check_for_update(backoff: Duration) -> bool {
-    match get_last_check_time() {
-        Some(last) => last.elapsed().map(|e| e > backoff).unwrap_or(true),
-        None => true,
-    }
+    get_last_check_time()
+        .and_then(|last| last.elapsed().ok())
+        .map_or(true, |elapsed| elapsed > backoff)
 }
 
 /// Get the number of consecutive update failures.
 fn get_update_failure_count() -> u32 {
-    let marker = match state_dir() {
-        Some(d) => d.join("update_failures"),
-        None => return 0,
-    };
-
-    fs::read_to_string(marker)
-        .ok()
+    let path = state_dir().map(|d| d.join("update_failures"));
+    path.and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
