@@ -43,7 +43,11 @@ struct TestConfig {
     max_contracts: usize,
     iterations: usize,
     duration: Duration,
-    sleep_between_ops: Duration,
+    /// Time to sleep between each event in turmoil virtual time.
+    /// Default: 200ms (sufficient for event propagation in deterministic sim).
+    event_wait: Duration,
+    /// Time to sleep after all events complete (post-events phase).
+    sleep_after_events: Duration,
     require_convergence: bool,
     /// Optional latency range for jitter simulation (min..max)
     latency_range: Option<std::ops::Range<Duration>>,
@@ -64,8 +68,9 @@ impl TestConfig {
             max_contracts: 3,
             iterations: 15,
             duration: Duration::from_secs(20),
-            sleep_between_ops: Duration::from_secs(1),
-            require_convergence: false,
+            event_wait: Duration::from_millis(200),
+            sleep_after_events: Duration::from_secs(1),
+            require_convergence: true,
             latency_range: None,
         }
     }
@@ -84,8 +89,9 @@ impl TestConfig {
             max_contracts: 8,
             iterations: 100,
             duration: Duration::from_secs(120),
-            sleep_between_ops: Duration::from_secs(3),
-            require_convergence: false,
+            event_wait: Duration::from_millis(200),
+            sleep_after_events: Duration::from_secs(3),
+            require_convergence: true,
             latency_range: None,
         }
     }
@@ -104,8 +110,9 @@ impl TestConfig {
             max_contracts: 15,
             iterations: 150,
             duration: Duration::from_secs(300),
-            sleep_between_ops: Duration::from_secs(10),
-            require_convergence: false,
+            event_wait: Duration::from_millis(200),
+            sleep_after_events: Duration::from_secs(10),
+            require_convergence: true,
             latency_range: None,
         }
     }
@@ -118,16 +125,19 @@ impl TestConfig {
     /// - Timer edge cases (keep-alive, connection idle timeout)
     /// - Resource exhaustion patterns
     ///
-    /// Wall clock time: ~30-60 seconds (with Turmoil's time acceleration)
+    /// Events are distributed across the full hour (1 event every ~10s) so
+    /// the network must remain functional throughout — not just survive idle.
     ///
     /// Includes 10-50ms latency jitter to simulate realistic network conditions.
     ///
     /// # Virtual Time Breakdown
-    /// - Events phase: 200 iterations × 200ms = 40 seconds
-    /// - Idle phase: 3556 seconds (tests timeout handling, keep-alive)
-    /// - Total: ~3600 seconds (1 hour)
+    /// - 360 events × 10s between events = 3600 seconds (1 hour)
+    /// - Post-events buffer: 10 seconds for final propagation
     #[allow(dead_code)]
-    fn long_running_1h(name: &'static str, seed: u64) -> Self {
+    fn long_running(name: &'static str, seed: u64) -> Self {
+        // 360 events × 10s apart = 3600s (1 hour) virtual time.
+        // Turmoil steps every virtual ms: 3600s ≈ 3.6M steps × 8 hosts.
+        // Wall clock: ~2.5 min (25x acceleration with 8 hosts).
         Self {
             name,
             seed,
@@ -138,12 +148,11 @@ impl TestConfig {
             max_connections: 15,
             min_connections: 3,
             max_contracts: 8,
-            iterations: 200,                     // Contract operations
+            iterations: 360, // Events distributed across 1 hour virtual
             duration: Duration::from_secs(3700), // Max simulation time (buffer)
-            // Sleep after events to reach ~1 hour total virtual time
-            // Events take ~44s (200×200ms + setup), so sleep for ~3556s
-            sleep_between_ops: Duration::from_secs(3556),
-            require_convergence: true, // Must converge after 1 hour
+            event_wait: Duration::from_secs(10), // 10s between events = ~3600s total
+            sleep_after_events: Duration::from_secs(10), // Brief propagation wait
+            require_convergence: true,
             // Realistic latency jitter (10-50ms) to uncover timing issues
             latency_range: Some(Duration::from_millis(10)..Duration::from_millis(50)),
         }
@@ -176,7 +185,7 @@ impl TestConfig {
     }
 
     fn with_sleep(mut self, sleep: Duration) -> Self {
-        self.sleep_between_ops = sleep;
+        self.sleep_after_events = sleep;
         self
     }
 
@@ -241,12 +250,14 @@ impl TestConfig {
             (sim, logs_handle)
         });
 
-        let sleep_duration = self.sleep_between_ops;
+        let sleep_duration = self.sleep_after_events;
+        let event_wait = self.event_wait;
         let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
             self.seed,
             self.max_contracts,
             self.iterations,
             self.duration,
+            event_wait,
             move || async move {
                 tokio::time::sleep(sleep_duration).await;
                 Ok(())
@@ -580,6 +591,7 @@ fn test_strict_determinism_exact_event_equality() {
             10, // max_contract_num - more contracts = more subscription operations
             40, // iterations - more iterations to trigger DashMap operations
             Duration::from_secs(30), // simulation_duration
+            Duration::from_millis(200),
             || async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(())
@@ -733,6 +745,7 @@ fn test_strict_determinism_multi_gateway() {
             5,
             20,
             Duration::from_secs(30),
+            Duration::from_millis(200),
             || async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(())
@@ -817,6 +830,7 @@ fn test_deterministic_replay_events() {
             3,
             10,
             Duration::from_secs(20),
+            Duration::from_millis(200),
             || async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(())
@@ -992,6 +1006,7 @@ fn test_turmoil_determinism_verification() {
             3,
             15,
             Duration::from_secs(20),
+            Duration::from_millis(200),
             || async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(())
@@ -1049,6 +1064,7 @@ fn test_graceful_shutdown_no_deadlock() {
         10,
         3,
         Duration::from_secs(30),
+        Duration::from_millis(200),
         || async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             tracing::info!("Test client: simulation will end gracefully");
@@ -2936,26 +2952,31 @@ fn test_subscription_broadcast_propagation() {
 /// deterministic scheduler, ensuring reproducible results.
 ///
 /// # Runtime
-/// Wall clock time: ~3 minutes (with Turmoil's 19.6x time acceleration).
-/// Too slow for regular CI, runs in nightly.
+/// Long-running deterministic simulation (1 hour virtual time).
+///
+/// Tests for time-dependent bugs (connection timeouts, state drift, etc.)
+/// that only manifest after extended operation. Uses wider event spacing
+/// (10s apart) compared to regular tests (200ms) to exercise idle-path code.
 ///
 /// # Virtual Time Breakdown
-/// - Events phase: 200 operations × 200ms = 40 seconds
-/// - Idle phase: ~3556 seconds (tests timeout handling, keep-alive)
-/// - Total: ~3600 seconds (1 hour)
+/// - Events phase: 360 operations × 10s = 3600 seconds (1 hour)
+/// - Propagation: 10 seconds
+/// - Total: ~3610 seconds virtual time
+/// - Wall clock: ~2.5 min (25x acceleration with 8 turmoil hosts)
+///
+/// NOTE: Gated by nightly_tests feature — does NOT run in regular CI.
 #[test_log::test]
 #[cfg(feature = "nightly_tests")]
-fn test_long_running_1h_deterministic() {
-    const SEED: u64 = 0x1A00_2C00_72AC; // "1h contract" seed
+fn test_long_running_deterministic() {
+    const SEED: u64 = 0x1A00_2C00_72AC;
 
-    tracing::info!("=== Starting 1-Hour Deterministic Simulation ===");
+    tracing::info!("=== Starting Long-Running Deterministic Simulation ===");
     tracing::info!("Seed: 0x{:X}", SEED);
     tracing::info!("Virtual time target: 3600 seconds (1 hour)");
 
     let start_time = std::time::Instant::now();
 
-    // Run the 1-hour simulation using the standard test pattern
-    TestConfig::long_running_1h("long-running-1h", SEED)
+    TestConfig::long_running("long-running", SEED)
         .run()
         .assert_ok()
         .verify_operation_coverage()
@@ -2963,13 +2984,12 @@ fn test_long_running_1h_deterministic() {
 
     let wall_clock = start_time.elapsed();
 
-    // Log performance metrics
-    tracing::info!("=== 1-Hour Simulation Complete ===");
+    tracing::info!("=== Long-Running Simulation Complete ===");
     tracing::info!("Wall clock time: {:.1} seconds", wall_clock.as_secs_f64());
     tracing::info!(
         "Time acceleration: {:.1}x",
         3600.0 / wall_clock.as_secs_f64()
     );
 
-    tracing::info!("test_long_running_1h_deterministic PASSED");
+    tracing::info!("test_long_running_deterministic PASSED");
 }

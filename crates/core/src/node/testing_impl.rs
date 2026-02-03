@@ -2845,6 +2845,7 @@ impl SimNetwork {
         max_contract_num: usize,
         iterations: usize,
         simulation_duration: Duration,
+        event_wait: Duration,
         test_fn: F,
     ) -> turmoil::Result
     where
@@ -3040,10 +3041,8 @@ impl SimNetwork {
                         break;
                     }
 
-                    // Longer delay between events to allow full processing
-                    // This is critical for determinism - each operation must complete
-                    // before the next one starts
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    // Delay between events to allow processing and control virtual time pacing
+                    tokio::time::sleep(event_wait).await;
                 }
             }
 
