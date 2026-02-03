@@ -255,18 +255,9 @@ pub(crate) mod delegate_secrets {
         imports.register_namespace(
             "freenet_delegate_secrets",
             [
-                (
-                    "__frnt__delegate__get_secret".to_owned(),
-                    get_secret.into(),
-                ),
-                (
-                    "__frnt__delegate__set_secret".to_owned(),
-                    set_secret.into(),
-                ),
-                (
-                    "__frnt__delegate__has_secret".to_owned(),
-                    has_secret.into(),
-                ),
+                ("__frnt__delegate__get_secret".to_owned(), get_secret.into()),
+                ("__frnt__delegate__set_secret".to_owned(), set_secret.into()),
+                ("__frnt__delegate__has_secret".to_owned(), has_secret.into()),
             ],
         );
     }
@@ -324,8 +315,7 @@ pub(crate) mod delegate_secrets {
         // SAFETY: Single-threaded access during synchronous WASM call.
         // The Runtime holds &mut self when calling process(), so no other
         // code can access the SecretsStore.
-        let store =
-            unsafe { &mut *(env.secret_store as *const SecretsStore as *mut SecretsStore) };
+        let store = unsafe { &mut *(env.secret_store as *mut SecretsStore) };
         match store.store_secret(&env.delegate_key, &secret_id, value) {
             Ok(()) => 0,
             Err(e) => {

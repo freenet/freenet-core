@@ -80,27 +80,51 @@ fn host_set_secret(key: &[u8], value: &[u8]) -> bool {
 }
 
 fn host_has_secret(key: &[u8]) -> bool {
-    let result = unsafe {
-        __frnt__delegate__has_secret(key.as_ptr() as i64, key.len() as i32)
-    };
+    let result = unsafe { __frnt__delegate__has_secret(key.as_ptr() as i64, key.len() as i32) };
     result == 1
 }
 
-// -- Application message types (same as test-delegate-1) --
+// -- Application message types --
 
 const PRIVATE_KEY: [u8; 3] = [1, 2, 3];
 const PUB_KEY: [u8; 1] = [1];
 
 #[derive(Debug, Serialize, Deserialize)]
-enum InboundAppMessage {
+pub enum InboundAppMessage {
+    /// Original test: create inbox and store secret
     CreateInboxRequest,
+    /// Original test: sign message using stored secret
     PleaseSignMessage(Vec<u8>),
+    /// New: Write data to context
+    WriteContext(Vec<u8>),
+    /// New: Read context and return it
+    ReadContext,
+    /// New: Increment a counter stored in context (tests read-modify-write)
+    IncrementCounter,
+    /// New: Check if a secret exists
+    HasSecret(Vec<u8>),
+    /// New: Try to get a non-existent secret (should return error info)
+    GetNonExistentSecret(Vec<u8>),
+    /// New: Store a secret with given key and value
+    StoreSecret { key: Vec<u8>, value: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum OutboundAppMessage {
+pub enum OutboundAppMessage {
     CreateInboxResponse(Vec<u8>),
     MessageSigned(Vec<u8>),
+    /// New: Context data read back
+    ContextData(Vec<u8>),
+    /// New: Counter value after increment
+    CounterValue(u32),
+    /// New: Whether secret exists
+    SecretExists(bool),
+    /// New: Result of getting a secret (None if not found)
+    SecretResult(Option<Vec<u8>>),
+    /// New: Acknowledgement of context write
+    ContextWritten,
+    /// New: Acknowledgement of secret store
+    SecretStored,
 }
 
 // -- Delegate implementation --
@@ -122,30 +146,107 @@ impl DelegateInterface for Delegate {
 
                 match message {
                     InboundAppMessage::CreateInboxRequest => {
-                        // Store the secret directly via host function — no SetSecretRequest needed
+                        // Store the secret directly via host function
                         host_set_secret(&PRIVATE_KEY, &PRIVATE_KEY);
 
-                        // Respond with public key
                         let response_msg_content =
                             OutboundAppMessage::CreateInboxResponse(PUB_KEY.to_vec());
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(incoming_app.app, payload)
-                            .processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
+
                     InboundAppMessage::PleaseSignMessage(inbox_priv_key) => {
                         // Fetch the secret directly — no round-trip needed!
                         let _secret = host_get_secret(&inbox_priv_key)
                             .ok_or_else(|| DelegateError::Other("Secret not found".into()))?;
 
-                        // Sign the message (test: just produce a fixed signature)
                         let signature = vec![4, 5, 2];
                         let response_msg_content = OutboundAppMessage::MessageSigned(signature);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(incoming_app.app, payload)
-                            .processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::WriteContext(data) => {
+                        // Write data to context via host function
+                        ctx_write_bytes(&data);
+
+                        let response_msg_content = OutboundAppMessage::ContextWritten;
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::ReadContext => {
+                        // Read context via host function
+                        let data = ctx_read_bytes();
+
+                        let response_msg_content = OutboundAppMessage::ContextData(data);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::IncrementCounter => {
+                        // Read current counter from context, increment, write back
+                        let ctx = ctx_read_bytes();
+                        let current: u32 = if ctx.is_empty() {
+                            0
+                        } else {
+                            bincode::deserialize(&ctx).unwrap_or(0)
+                        };
+                        let new_value = current + 1;
+                        let new_ctx = bincode::serialize(&new_value)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        ctx_write_bytes(&new_ctx);
+
+                        let response_msg_content = OutboundAppMessage::CounterValue(new_value);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::HasSecret(key) => {
+                        let exists = host_has_secret(&key);
+
+                        let response_msg_content = OutboundAppMessage::SecretExists(exists);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::GetNonExistentSecret(key) => {
+                        let result = host_get_secret(&key);
+
+                        let response_msg_content = OutboundAppMessage::SecretResult(result);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::StoreSecret { key, value } => {
+                        host_set_secret(&key, &value);
+
+                        let response_msg_content = OutboundAppMessage::SecretStored;
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                 }

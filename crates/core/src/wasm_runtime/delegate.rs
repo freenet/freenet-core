@@ -63,6 +63,7 @@ pub(crate) trait DelegateRuntimeInterface {
 impl Runtime {
     /// Execute the delegate's `process` function with the DelegateCallEnv set up
     /// so that host functions for context and secret access are available.
+    #[allow(clippy::too_many_arguments)]
     fn exec_inbound_with_env(
         &mut self,
         delegate_key: &DelegateKey,
@@ -78,9 +79,8 @@ impl Runtime {
         // SAFETY: self.secret_store is valid for the duration of the synchronous
         // process_func.call() below. The environment is removed in the cleanup
         // section before this function returns.
-        let env = unsafe {
-            DelegateCallEnv::new(context, &self.secret_store, delegate_key.clone())
-        };
+        let env =
+            unsafe { DelegateCallEnv::new(context, &self.secret_store, delegate_key.clone()) };
         DELEGATE_ENV.insert(instance_id, env);
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
 
@@ -316,11 +316,15 @@ impl Runtime {
                 }
 
                 // Already-processed secret requests just update context
-                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context: ctx, .. }) => {
+                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+                    context: ctx, ..
+                }) => {
                     tracing::debug!("GetSecretRequest already processed");
                     *context = ctx.as_ref().to_vec();
                 }
-                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context: ctx, .. }) => {
+                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                    context: ctx, ..
+                }) => {
                     *context = ctx.as_ref().to_vec();
                 }
 
@@ -382,7 +386,10 @@ impl Runtime {
                     // Break to let the executor handle this before continuing
                     break;
                 }
-                OutboundDelegateMsg::GetContractRequest(GetContractRequest { context: ctx, .. }) => {
+                OutboundDelegateMsg::GetContractRequest(GetContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
                     // Processed contract request - just update context
                     tracing::debug!("GetContractRequest processed");
                     *context = ctx.as_ref().to_vec();
@@ -648,6 +655,7 @@ mod test {
     const TEST_DELEGATE_1: &str = "test_delegate_1";
     const TEST_DELEGATE_2: &str = "test_delegate_2";
 
+    /// Message types for test-delegate-1 (legacy message-based secrets)
     #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
         CreateInboxRequest,
@@ -658,6 +666,35 @@ mod test {
     enum OutboundAppMessage {
         CreateInboxResponse(Vec<u8>),
         MessageSigned(Vec<u8>),
+    }
+
+    /// Message types for test-delegate-2 (host function API)
+    mod delegate2_messages {
+        use super::*;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum InboundAppMessage {
+            CreateInboxRequest,
+            PleaseSignMessage(Vec<u8>),
+            WriteContext(Vec<u8>),
+            ReadContext,
+            IncrementCounter,
+            HasSecret(Vec<u8>),
+            GetNonExistentSecret(Vec<u8>),
+            StoreSecret { key: Vec<u8>, value: Vec<u8> },
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum OutboundAppMessage {
+            CreateInboxResponse(Vec<u8>),
+            MessageSigned(Vec<u8>),
+            ContextData(Vec<u8>),
+            CounterValue(u32),
+            SecretExists(bool),
+            SecretResult(Option<Vec<u8>>),
+            ContextWritten,
+            SecretStored,
+        }
     }
 
     async fn setup_runtime(
@@ -1130,6 +1167,8 @@ mod test {
     /// for context and secret access instead of the GetSecretRequest/Response round-trip.
     #[tokio::test(flavor = "multi_thread")]
     async fn validate_host_function_delegate() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
@@ -1168,6 +1207,373 @@ mod test {
             outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that context written via host function persists within the same inbound_app_message call.
+    /// Note: Context is NOT preserved across separate inbound_app_message calls - each call
+    /// starts with a fresh context. This test validates context sharing within a single call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_persistence_within_call() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Send WriteContext and ReadContext in the same batch - they should share context
+        let test_data = vec![1, 2, 3, 4, 5];
+
+        let write_payload =
+            bincode::serialize(&InboundAppMessage::WriteContext(test_data.clone()))?;
+        let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+
+        let messages = vec![
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, write_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, read_payload)),
+        ];
+
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+
+        assert_eq!(outbound.len(), 2, "Should have 2 responses");
+
+        // First response: ContextWritten
+        let response1: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(matches!(response1, OutboundAppMessage::ContextWritten));
+
+        // Second response: Should contain the data we wrote
+        let response2: OutboundAppMessage = match &outbound[1] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response2 {
+            OutboundAppMessage::ContextData(data) => {
+                assert_eq!(
+                    data, test_data,
+                    "Context data should match what was written"
+                );
+            }
+            other => panic!("Expected ContextData, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that context is reset between separate inbound_app_message calls.
+    /// This validates that each call starts fresh - context is NOT preserved across calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_reset_between_calls() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // First call: increment counter (should become 1)
+        let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::CounterValue(1)),
+            "First increment should return 1"
+        );
+
+        // Second call (separate inbound_app_message): increment counter again
+        // Since context is reset, it should also return 1, not 2
+        let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::CounterValue(1)),
+            "Second call should also return 1 (context reset between calls)"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test has_secret host function.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_has_secret_host_function() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let secret_key = vec![10, 20, 30];
+        let secret_value = vec![100, 200];
+
+        // Step 1: Check that secret doesn't exist yet
+        let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretExists(false)),
+            "Secret should not exist yet"
+        );
+
+        // Step 2: Store the secret
+        let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+            key: secret_key.clone(),
+            value: secret_value.clone(),
+        })?;
+        let msg = ApplicationMessage::new(app, payload);
+        let _ = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        // Step 3: Check that secret now exists
+        let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretExists(true)),
+            "Secret should exist after storing"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test get_secret returns None for non-existent secrets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_nonexistent_secret() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Try to get a secret that doesn't exist
+        let nonexistent_key = vec![99, 98, 97];
+        let payload =
+            bincode::serialize(&InboundAppMessage::GetNonExistentSecret(nonexistent_key))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretResult(None)),
+            "Should return None for non-existent secret"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that secrets stored via host function can be retrieved via host function.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let secret_key = vec![42, 43, 44];
+        let secret_value = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Step 1: Store the secret
+        let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+            key: secret_key.clone(),
+            value: secret_value.clone(),
+        })?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(matches!(response, OutboundAppMessage::SecretStored));
+
+        // Step 2: Retrieve the secret using GetNonExistentSecret (which just calls get_secret)
+        let payload =
+            bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::SecretResult(Some(value)) => {
+                assert_eq!(
+                    value, secret_value,
+                    "Retrieved secret should match stored value"
+                );
+            }
+            other => panic!("Expected SecretResult(Some(...)), got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that empty context is handled correctly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_empty_context() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Read context without writing anything first — should return empty
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert!(data.is_empty(), "Context should be empty initially");
+            }
+            other => panic!("Expected ContextData, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test multiple messages in a single inbound_app_message call share context.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_shared_across_batch() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Send multiple IncrementCounter messages in one batch
+        let messages: Vec<InboundDelegateMsg> = (0..3)
+            .map(|_| {
+                let payload = bincode::serialize(&InboundAppMessage::IncrementCounter).unwrap();
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload))
+            })
+            .collect();
+
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+
+        // Should get 3 responses with counter values 1, 2, 3
+        assert_eq!(outbound.len(), 3, "Should have 3 responses");
+
+        for (i, msg) in outbound.iter().enumerate() {
+            let response: OutboundAppMessage = match msg {
+                OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+                _ => panic!("Expected ApplicationMessage"),
+            };
+            match response {
+                OutboundAppMessage::CounterValue(value) => {
+                    assert_eq!(
+                        value,
+                        (i + 1) as u32,
+                        "Counter should increment across batch"
+                    );
+                }
+                other => panic!("Expected CounterValue, got {:?}", other),
+            }
+        }
 
         std::mem::drop(temp_dir);
         Ok(())
