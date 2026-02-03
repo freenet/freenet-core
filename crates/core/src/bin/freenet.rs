@@ -218,7 +218,7 @@ async fn run_network_node_with_signals(
 }
 
 fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
-    freenet::config::set_logger(None, None);
+    freenet::config::set_logger(None, None, config_args.config_paths.log_dir.as_deref());
 
     if config_args.version {
         println!(

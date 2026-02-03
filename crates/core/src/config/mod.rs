@@ -22,6 +22,7 @@ use tokio::runtime::Runtime;
 use crate::{
     dev_tool::PeerId,
     local_node::OperationMode,
+    tracing::tracer::get_log_dir,
     transport::{CongestionControlAlgorithm, CongestionControlConfig, TransportKeypair},
 };
 
@@ -1291,12 +1292,16 @@ pub struct ConfigPathsArgs {
     /// The data directory.
     #[arg(long, default_value = None, env = "DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+    /// The log directory.
+    #[arg(long, default_value = None, env = "LOG_DIR")]
+    pub log_dir: Option<PathBuf>,
 }
 
 impl ConfigPathsArgs {
     fn merge(&mut self, other: ConfigPaths) {
         self.config_dir.get_or_insert(other.config_dir);
         self.data_dir.get_or_insert(other.data_dir);
+        self.log_dir = self.log_dir.take().or(other.log_dir);
     }
 
     fn default_dirs(id: Option<&str>) -> std::io::Result<Either<ProjectDirs, PathBuf>> {
@@ -1385,6 +1390,8 @@ impl ConfigPathsArgs {
                 Ok(defaults.config_dir().to_path_buf())
             })?;
 
+        let log_dir = self.log_dir.or_else(get_log_dir);
+
         Ok(ConfigPaths {
             config_dir,
             data_dir: app_data_dir,
@@ -1393,6 +1400,7 @@ impl ConfigPathsArgs {
             secrets_dir,
             db_dir,
             event_log,
+            log_dir,
         })
     }
 }
@@ -1406,6 +1414,7 @@ pub struct ConfigPaths {
     event_log: PathBuf,
     data_dir: PathBuf,
     config_dir: PathBuf,
+    log_dir: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -2153,7 +2162,11 @@ impl GlobalTestMetrics {
     }
 }
 
-pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: Option<String>) {
+pub fn set_logger(
+    level: Option<tracing::level_filters::LevelFilter>,
+    endpoint: Option<String>,
+    log_dir: Option<&Path>,
+) {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);
@@ -2169,7 +2182,8 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: 
             return;
         }
 
-        crate::tracing::tracer::init_tracer(level, endpoint).expect("failed tracing initialization")
+        crate::tracing::tracer::init_tracer(level, endpoint, log_dir)
+            .expect("failed tracing initialization")
     }
 }
 
