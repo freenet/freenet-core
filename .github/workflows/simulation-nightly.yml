@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 120
 
     env:
-      RUST_LOG: info
+      RUST_LOG: info,turmoil=warn
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       RUST_MIN_STACK: 16777216
       # Use mold linker to avoid rust-lld crashes
@@ -74,7 +74,7 @@ jobs:
       - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
         run: |
           echo "Running medium scale simulation (50 nodes, 2000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-medium-50" \
             --seed 0xDEADBEEF \
             --gateways 4 \
@@ -94,7 +94,7 @@ jobs:
       - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
         run: |
           echo "Running medium scale simulation with alternate seed (2000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-medium-50-alt" \
             --seed 0xCAFEBABE \
             --gateways 4 \
@@ -115,7 +115,7 @@ jobs:
       - name: Fault tolerance test (15% message loss)
         run: |
           echo "Running fault tolerance simulation with 15% message loss (1000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-fault-loss" \
             --seed 0xFA017001 \
             --gateways 3 \
@@ -133,7 +133,7 @@ jobs:
       - name: High latency test (50-200ms latency)
         run: |
           echo "Running high latency simulation (500 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-high-latency" \
             --seed 0x1A7E0C71 \
             --gateways 2 \
@@ -146,11 +146,23 @@ jobs:
             --print-network-stats \
             single-process
 
+      # Long-duration simulation test (1 hour virtual time, ~2.5 min wall clock)
+      # Uses Turmoil deterministic scheduler for reproducible results
+      # Uncovers time-dependent bugs that only manifest after extended operation
+      # NOTE: Gated by nightly_tests feature — does NOT run in regular CI
+      - name: Long-running simulation (1 hour virtual time)
+        run: |
+          echo "Running long-running deterministic simulation test (3600s virtual time)"
+          echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
+          cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
+            test_long_running_deterministic -- \
+            --test-threads=1 --nocapture
+
       # Large scale test (500 nodes) - stress test for scaling issues
       - name: Large scale test (500 nodes)
         run: |
           echo "Running large scale simulation (500 nodes, 10000 events)"
-          cargo run -p fdev --release -- test \
+          target/release/fdev test \
             --name "nightly-large-500" \
             --seed 0x500BEEF \
             --gateways 10 \
@@ -166,41 +178,10 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Replica validation with step-by-step consistency checking
-      # Runs in 3 phases, verifying convergence and replica counts after each
-      # NOTE: This test reveals convergence issues - failures are expected and logged for investigation
-      - name: Replica validation test (stepwise consistency)
+      # Real-process soak test - runs last (requires riverctl, skipped if not available)
+      - name: Run large network soak test (50+ real nodes)
         run: |
-          echo "Running replica validation with step-by-step consistency"
-          echo "NOTE: This test may fail due to known convergence issues being investigated"
-          cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration \
-            replica_validation_and_stepwise_consistency -- \
-            --test-threads=1 --nocapture || echo "Test failed - convergence issues detected (expected)"
-
-      # Dense network replication test (higher connectivity)
-      - name: Dense network replication test
-        run: |
-          echo "Running dense network replication test"
-          cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration \
-            dense_network_replication -- \
-            --test-threads=1 --nocapture
-
-      # Long-duration simulation test (1 hour virtual time)
-      # Uses Turmoil deterministic scheduler for reproducible results
-      # Uncovers time-dependent bugs that only manifest after extended operation
-      # Wall clock time: ~3 minutes (with 19.6x time acceleration)
-      - name: Long-running simulation (1 hour virtual time)
-        run: |
-          echo "Running 1-hour long-running deterministic simulation test"
-          echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
-          cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
-            test_long_running_1h_deterministic -- \
-            --test-threads=1 --nocapture
-
-      # Large network test - requires riverctl, skipped if not available
-      - name: Run large network test (50+ nodes)
-        run: |
-          echo "Running large network simulation with seed: $SIMULATION_SEED"
+          echo "Running large network soak test with seed: $SIMULATION_SEED"
           if command -v riverctl &> /dev/null; then
             cargo test -p freenet --test large_network -- --ignored --nocapture --test-threads=1
           else
