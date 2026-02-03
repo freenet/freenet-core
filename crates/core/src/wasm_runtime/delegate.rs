@@ -10,8 +10,29 @@ use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
 
 use super::error::RuntimeInnerError;
-use super::native_api::{DelegateCallEnv, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
+use super::native_api::{DelegateCallEnv, InstanceId, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
 use super::{ContractError, Runtime, RuntimeResult};
+
+/// RAII guard that ensures cleanup of delegate environment state.
+/// When dropped, it clears the thread-local instance ID and removes the
+/// entry from the global DELEGATE_ENV map.
+struct DelegateEnvGuard {
+    instance_id: InstanceId,
+}
+
+impl DelegateEnvGuard {
+    fn new(instance_id: InstanceId) -> Self {
+        Self { instance_id }
+    }
+}
+
+impl Drop for DelegateEnvGuard {
+    fn drop(&mut self) {
+        // Clear thread-local first, then remove from global map
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&self.instance_id);
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -63,6 +84,8 @@ pub(crate) trait DelegateRuntimeInterface {
 impl Runtime {
     /// Execute the delegate's `process` function with the DelegateCallEnv set up
     /// so that host functions for context and secret access are available.
+    ///
+    /// Uses RAII guard pattern to ensure cleanup happens even if WASM execution panics.
     #[allow(clippy::too_many_arguments)]
     fn exec_inbound_with_env(
         &mut self,
@@ -77,22 +100,27 @@ impl Runtime {
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
         // Set up the delegate call environment with context and secret store access.
         // SAFETY: self.secret_store is valid for the duration of the synchronous
-        // process_func.call() below. The environment is removed in the cleanup
-        // section before this function returns.
-        let env =
-            unsafe { DelegateCallEnv::new(context, &self.secret_store, delegate_key.clone()) };
+        // process_func.call() below. The guard ensures cleanup even on panic.
+        let env = unsafe {
+            DelegateCallEnv::new(context, &mut self.secret_store, delegate_key.clone())
+        };
         DELEGATE_ENV.insert(instance_id, env);
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
+
+        // Create RAII guard to ensure cleanup on all exit paths (including panic)
+        let _guard = DelegateEnvGuard::new(instance_id);
 
         // Execute the WASM process function
         let result = self.exec_inbound(params, attested, msg, process_func, instance);
 
-        // Read back the (possibly mutated) context and clean up
-        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        // Read back the (possibly mutated) context before guard drops
+        // Note: We need to get the context before the guard drops and removes it
         let updated_context = DELEGATE_ENV
-            .remove(&instance_id)
-            .map(|(_, env)| env.context)
+            .get(&instance_id)
+            .map(|env| env.context.clone())
             .unwrap_or_default();
+
+        // Guard will clean up CURRENT_DELEGATE_INSTANCE and DELEGATE_ENV on drop
 
         let outbound = result?;
         Ok((outbound, updated_context))
@@ -682,6 +710,9 @@ mod test {
             HasSecret(Vec<u8>),
             GetNonExistentSecret(Vec<u8>),
             StoreSecret { key: Vec<u8>, value: Vec<u8> },
+            RemoveSecret(Vec<u8>),
+            WriteLargeContext(usize),
+            StoreLargeSecret { key: Vec<u8>, size: usize },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -694,6 +725,9 @@ mod test {
             SecretResult(Option<Vec<u8>>),
             ContextWritten,
             SecretStored,
+            SecretRemoved,
+            LargeContextWritten(usize),
+            LargeSecretStored(usize),
         }
     }
 
@@ -1576,6 +1610,432 @@ mod test {
         }
 
         std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test remove_secret host function.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let secret_key = vec![50, 51, 52];
+        let secret_value = vec![200, 201, 202];
+
+        // Step 1: Store a secret
+        let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+            key: secret_key.clone(),
+            value: secret_value.clone(),
+        })?;
+        let msg = ApplicationMessage::new(app, payload);
+        let _ = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        // Step 2: Verify it exists
+        let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretExists(true)),
+            "Secret should exist before removal"
+        );
+
+        // Step 3: Remove the secret
+        let payload = bincode::serialize(&InboundAppMessage::RemoveSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretRemoved),
+            "Should acknowledge removal"
+        );
+
+        // Step 4: Verify it no longer exists
+        let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretExists(false)),
+            "Secret should not exist after removal"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test large context data (1MB).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_large_context_data() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let large_size = 1024 * 1024; // 1MB
+
+        // Write large context
+        let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::LargeContextWritten(size) => {
+                assert_eq!(size, large_size, "Should report correct size written");
+            }
+            other => panic!("Expected LargeContextWritten, got {:?}", other),
+        }
+
+        // Read it back and verify
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                // Note: context is reset between calls, so this should be empty
+                // But within the same call batch, it would persist
+                assert!(
+                    data.is_empty(),
+                    "Context should be empty (reset between calls)"
+                );
+            }
+            other => panic!("Expected ContextData, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test large context persistence within the same batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // MAX_SIZE in DelegateContext is ~400KB, so use less
+        let large_size = 256 * 1024; // 256KB
+
+        // Write large context and read it back in the same batch
+        let write_payload =
+            bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
+        let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+
+        let messages = vec![
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, write_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, read_payload)),
+        ];
+
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+
+        assert_eq!(outbound.len(), 2, "Should have 2 responses");
+
+        // Second response should have the large data
+        let response: OutboundAppMessage = match &outbound[1] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert_eq!(
+                    data.len(),
+                    large_size,
+                    "Context should contain the large data within batch"
+                );
+                // Verify data pattern
+                for (i, byte) in data.iter().enumerate() {
+                    assert_eq!(*byte, (i % 256) as u8, "Data pattern mismatch at index {i}");
+                }
+            }
+            other => panic!("Expected ContextData, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test large secret data (1MB).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let secret_key = vec![77, 88, 99];
+        let large_size = 1024 * 1024; // 1MB
+
+        // Store large secret
+        let payload = bincode::serialize(&InboundAppMessage::StoreLargeSecret {
+            key: secret_key.clone(),
+            size: large_size,
+        })?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::LargeSecretStored(size) => {
+                assert_eq!(size, large_size, "Should report correct size stored");
+            }
+            other => panic!("Expected LargeSecretStored, got {:?}", other),
+        }
+
+        // Retrieve it using GetNonExistentSecret (which just calls get_secret)
+        let payload =
+            bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::SecretResult(Some(data)) => {
+                assert_eq!(data.len(), large_size, "Secret should be correct size");
+                // Verify data pattern
+                for (i, byte) in data.iter().enumerate() {
+                    assert_eq!(*byte, (i % 256) as u8, "Data pattern mismatch at index {i}");
+                }
+            }
+            other => panic!("Expected SecretResult(Some(...)), got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test concurrent delegate execution on separate threads.
+    /// This verifies that two delegates running in parallel don't interfere with each other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        // Set up two independent runtimes with their own delegates
+        let (delegate1, runtime1, temp_dir1) = setup_runtime(TEST_DELEGATE_2).await?;
+        let (delegate2, runtime2, temp_dir2) = setup_runtime(TEST_DELEGATE_2).await?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Wrap in Arc<Mutex> for thread-safe access
+        let runtime1 = Arc::new(std::sync::Mutex::new(runtime1));
+        let runtime2 = Arc::new(std::sync::Mutex::new(runtime2));
+        let delegate1 = Arc::new(delegate1);
+        let delegate2 = Arc::new(delegate2);
+
+        // Use a barrier to synchronize the two threads
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Thread 1: Store and retrieve secret with key "thread1"
+        let barrier1 = barrier.clone();
+        let runtime1_clone = runtime1.clone();
+        let delegate1_clone = delegate1.clone();
+        let handle1 = tokio::spawn(async move {
+            barrier1.wait().await;
+
+            let secret_key = b"thread1_key".to_vec();
+            let secret_value = b"thread1_value".to_vec();
+
+            // Store secret
+            let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+                key: secret_key.clone(),
+                value: secret_value.clone(),
+            })
+            .unwrap();
+            let msg = ApplicationMessage::new(app, payload);
+            {
+                let mut runtime = runtime1_clone.lock().unwrap();
+                let _ = runtime
+                    .inbound_app_message(
+                        delegate1_clone.key(),
+                        &vec![].into(),
+                        None,
+                        vec![InboundDelegateMsg::ApplicationMessage(msg)],
+                    )
+                    .unwrap();
+            }
+
+            // Retrieve and verify
+            let payload =
+                bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))
+                    .unwrap();
+            let msg = ApplicationMessage::new(app, payload);
+            let outbound = {
+                let mut runtime = runtime1_clone.lock().unwrap();
+                runtime
+                    .inbound_app_message(
+                        delegate1_clone.key(),
+                        &vec![].into(),
+                        None,
+                        vec![InboundDelegateMsg::ApplicationMessage(msg)],
+                    )
+                    .unwrap()
+            };
+
+            let response: OutboundAppMessage = match &outbound[0] {
+                OutboundDelegateMsg::ApplicationMessage(m) => {
+                    bincode::deserialize(&m.payload).unwrap()
+                }
+                _ => panic!("Expected ApplicationMessage"),
+            };
+            match response {
+                OutboundAppMessage::SecretResult(Some(value)) => {
+                    assert_eq!(value, secret_value, "Thread 1 secret mismatch");
+                }
+                other => panic!("Thread 1: Expected SecretResult(Some(...)), got {:?}", other),
+            }
+        });
+
+        // Thread 2: Store and retrieve secret with key "thread2"
+        let barrier2 = barrier.clone();
+        let runtime2_clone = runtime2.clone();
+        let delegate2_clone = delegate2.clone();
+        let handle2 = tokio::spawn(async move {
+            barrier2.wait().await;
+
+            let secret_key = b"thread2_key".to_vec();
+            let secret_value = b"thread2_value".to_vec();
+
+            // Store secret
+            let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+                key: secret_key.clone(),
+                value: secret_value.clone(),
+            })
+            .unwrap();
+            let msg = ApplicationMessage::new(app, payload);
+            {
+                let mut runtime = runtime2_clone.lock().unwrap();
+                let _ = runtime
+                    .inbound_app_message(
+                        delegate2_clone.key(),
+                        &vec![].into(),
+                        None,
+                        vec![InboundDelegateMsg::ApplicationMessage(msg)],
+                    )
+                    .unwrap();
+            }
+
+            // Retrieve and verify
+            let payload =
+                bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))
+                    .unwrap();
+            let msg = ApplicationMessage::new(app, payload);
+            let outbound = {
+                let mut runtime = runtime2_clone.lock().unwrap();
+                runtime
+                    .inbound_app_message(
+                        delegate2_clone.key(),
+                        &vec![].into(),
+                        None,
+                        vec![InboundDelegateMsg::ApplicationMessage(msg)],
+                    )
+                    .unwrap()
+            };
+
+            let response: OutboundAppMessage = match &outbound[0] {
+                OutboundDelegateMsg::ApplicationMessage(m) => {
+                    bincode::deserialize(&m.payload).unwrap()
+                }
+                _ => panic!("Expected ApplicationMessage"),
+            };
+            match response {
+                OutboundAppMessage::SecretResult(Some(value)) => {
+                    assert_eq!(value, secret_value, "Thread 2 secret mismatch");
+                }
+                other => panic!("Thread 2: Expected SecretResult(Some(...)), got {:?}", other),
+            }
+        });
+
+        // Wait for both threads to complete
+        handle1.await?;
+        handle2.await?;
+
+        std::mem::drop(temp_dir1);
+        std::mem::drop(temp_dir2);
         Ok(())
     }
 }

@@ -31,6 +31,12 @@ pub enum InboundAppMessage {
     GetNonExistentSecret(Vec<u8>),
     /// New: Store a secret with given key and value
     StoreSecret { key: Vec<u8>, value: Vec<u8> },
+    /// New: Remove a secret by key
+    RemoveSecret(Vec<u8>),
+    /// New: Write large data to context (for stress testing)
+    WriteLargeContext(usize),
+    /// New: Store large secret (for stress testing)
+    StoreLargeSecret { key: Vec<u8>, size: usize },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +55,12 @@ pub enum OutboundAppMessage {
     ContextWritten,
     /// New: Acknowledgement of secret store
     SecretStored,
+    /// New: Acknowledgement of secret removal
+    SecretRemoved,
+    /// New: Result of large context write (returns size written)
+    LargeContextWritten(usize),
+    /// New: Result of large secret store (returns size stored)
+    LargeSecretStored(usize),
 }
 
 // -- Delegate implementation --
@@ -170,6 +182,43 @@ impl DelegateInterface for Delegate {
                         secrets.set(&key, &value);
 
                         let response_msg_content = OutboundAppMessage::SecretStored;
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::RemoveSecret(key) => {
+                        secrets.remove(&key);
+
+                        let response_msg_content = OutboundAppMessage::SecretRemoved;
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::WriteLargeContext(size) => {
+                        // Generate deterministic data pattern
+                        let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+                        ctx.write(&data);
+
+                        let response_msg_content = OutboundAppMessage::LargeContextWritten(size);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::StoreLargeSecret { key, size } => {
+                        // Generate deterministic data pattern
+                        let value: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+                        secrets.set(&key, &value);
+
+                        let response_msg_content = OutboundAppMessage::LargeSecretStored(size);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
                         let response =
