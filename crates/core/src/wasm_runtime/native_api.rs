@@ -252,12 +252,17 @@ pub(crate) mod delegate_secrets {
         let get_secret = Function::new_typed(store, get_secret);
         let set_secret = Function::new_typed(store, set_secret);
         let has_secret = Function::new_typed(store, has_secret);
+        let remove_secret = Function::new_typed(store, remove_secret);
         imports.register_namespace(
             "freenet_delegate_secrets",
             [
                 ("__frnt__delegate__get_secret".to_owned(), get_secret.into()),
                 ("__frnt__delegate__set_secret".to_owned(), set_secret.into()),
                 ("__frnt__delegate__has_secret".to_owned(), has_secret.into()),
+                (
+                    "__frnt__delegate__remove_secret".to_owned(),
+                    remove_secret.into(),
+                ),
             ],
         );
     }
@@ -342,6 +347,30 @@ pub(crate) mod delegate_secrets {
         match store.get_secret(&env.delegate_key, &secret_id) {
             Ok(_) => 1,
             Err(_) => 0,
+        }
+    }
+
+    /// Remove a secret by key. Returns 0 on success, -1 if not found or error.
+    fn remove_secret(key_ptr: i64, key_len: i32) -> i32 {
+        let id = current_instance_id();
+        assert!(id != -1, "delegate remove_secret called outside process()");
+        let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
+        let env = DELEGATE_ENV
+            .get(&id)
+            .expect("delegate call env not set for instance");
+
+        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
+        let secret_id = SecretsId::new(key_bytes.to_vec());
+
+        // SAFETY: Single-threaded access during synchronous WASM call.
+        let store = unsafe { &mut *(env.secret_store as *mut SecretsStore) };
+        match store.remove_secret(&env.delegate_key, &secret_id) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::debug!("delegate remove_secret failed: {e}");
+                -1
+            }
         }
     }
 }

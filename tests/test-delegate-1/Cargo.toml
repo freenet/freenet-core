@@ -11,7 +11,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { version = "0.1.24", features = ["contract"]}
+# Using local path during development of new host function API
+freenet-stdlib = { path = "/Volumes/PRO-G40/projects/freenet-stdlib/rust", features = ["contract"]}
 serde = "1"
 serde_json = "1"
 bincode = "1"

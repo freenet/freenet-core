@@ -1,3 +1,7 @@
+/// Test delegate that demonstrates the legacy message-based pattern for secrets.
+///
+/// This delegate uses GetSecretRequest/GetSecretResponse round-trips rather than
+/// the newer host function API. It's kept to ensure backward compatibility.
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +30,7 @@ impl From<SecretsContext> for DelegateContext {
 #[derive(Debug, Serialize, Deserialize)]
 enum InboundAppMessage {
     CreateInboxRequest,
-    PleaseSignMessage(Vec<u8>)
+    PleaseSignMessage(Vec<u8>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,10 +44,15 @@ struct Delegate;
 #[delegate]
 impl DelegateInterface for Delegate {
     fn process(
+        _ctx: &mut DelegateCtx,
+        _secrets: &mut SecretsStore,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        // Note: This delegate demonstrates the legacy message-based pattern.
+        // It doesn't use ctx or secrets handles - instead it uses
+        // GetSecretRequest/SetSecretRequest messages.
         let mut outbound = Vec::new();
         match messages {
             InboundDelegateMsg::ApplicationMessage(incoming_app) => {
@@ -53,7 +62,7 @@ impl DelegateInterface for Delegate {
 
                 match message {
                     InboundAppMessage::CreateInboxRequest => {
-                        // Set secret request
+                        // Set secret request (legacy message-based pattern)
                         let key = SecretsId::new(PRIVATE_KEY.to_vec());
                         let set_secret_request =
                             OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -84,7 +93,7 @@ impl DelegateInterface for Delegate {
                             let request_secret = GetSecretRequest {
                                 key,
                                 context: context.into(),
-                                processed: false, // This flag is internal to the runtime, doesn't matter here
+                                processed: false,
                             }
                             .into();
                             // Only return the GetSecretRequest
@@ -92,15 +101,11 @@ impl DelegateInterface for Delegate {
                         }
 
                         // If we received this message again but *with* context,
-                        // it implies something went wrong in the expected flow (e.g., runtime error).
-                        // For robustness, we could re-request the secret, preserving the context.
-                        // This branch should ideally not be hit if the flow is correct,
-                        // but if it is, we re-request the secret.
+                        // re-request the secret, preserving the message_to_sign_payload
                         let secrets_context: SecretsContext =
                             bincode::deserialize(incoming_app.context.as_ref())
                                 .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
-                        // Re-request the secret, preserving the message_to_sign_payload
                         let get_secret_request_msg =
                             OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                                 key,
@@ -119,36 +124,26 @@ impl DelegateInterface for Delegate {
 
                 // Deserialize the context that was sent with the GetSecretRequest
                 let secrets_context: SecretsContext =
-                    bincode::deserialize(secret_response.context.as_ref())
-                        .map_err(|err| {
-                            DelegateError::Other(format!(
-                                "Failed to deserialize context in GetSecretResponse: {err}"
-                            ))
-                        })?;
+                    bincode::deserialize(secret_response.context.as_ref()).map_err(|err| {
+                        DelegateError::Other(format!(
+                            "Failed to deserialize context in GetSecretResponse: {err}"
+                        ))
+                    })?;
 
                 if let Some(_payload_to_sign) = secrets_context.message_to_sign_payload {
-                    // Use pk_bytes and _payload_to_sign to generate a real signature here
-                    // For this test, we just use the hardcoded value and the existence of the key/payload
                     let signature = vec![4, 5, 2];
                     let response_msg_content: OutboundAppMessage =
                         OutboundAppMessage::MessageSigned(signature);
                     let response_payload: Vec<u8> = bincode::serialize(&response_msg_content)
                         .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
-                    // Find the original app ID from the context or handle appropriately
-                    // For now, assuming a default or placeholder app ID if needed,
-                    // but ideally, the app ID should be part of the context or derived.
-                    // Let's assume the context doesn't hold the app ID, and we might need it.
-                    // FIXME: How to get the original app ID here? For the test, it might not matter.
                     let app_id = ContractInstanceId::new([0u8; 32]); // Placeholder
 
                     let response_app_msg = ApplicationMessage::new(app_id, response_payload)
                         .processed(true)
-                        // Clear context for the final response
                         .with_context(DelegateContext::default());
                     outbound.push(OutboundDelegateMsg::ApplicationMessage(response_app_msg));
                 } else {
-                    // This case shouldn't happen if PleaseSignMessage correctly set the context
                     return Err(DelegateError::Other(
                         "Received secret response but no message payload was stored in context"
                             .to_string(),
@@ -167,6 +162,11 @@ impl DelegateInterface for Delegate {
 
 #[test]
 fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
+    // Create handles for the test (they won't actually work in native mode,
+    // but this delegate doesn't use them - it uses message-based patterns)
+    let mut ctx = unsafe { DelegateCtx::__new() };
+    let mut secrets = unsafe { SecretsStore::__new() };
+
     // 1. create inbox message parts
     let contract = WrappedContract::new(
         std::sync::Arc::new(ContractCode::from(vec![1])),
@@ -177,8 +177,13 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     let create_inbox_request_msg = ApplicationMessage::new(app, payload).processed(false);
 
     let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-    // Note: The test signature for DelegateInterface::process changed, adding Option<&[u8]>
-    let output1 = Delegate::process(Parameters::from(vec![]), None, inbound)?;
+    let output1 = Delegate::process(
+        &mut ctx,
+        &mut secrets,
+        Parameters::from(vec![]),
+        None,
+        inbound,
+    )?;
     assert_eq!(output1.len(), 2);
     assert!(matches!(
         output1.first().unwrap(),
@@ -188,9 +193,11 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
         OutboundDelegateMsg::ApplicationMessage(msg) => msg,
         _ => panic!("Expected ApplicationMessage"),
     };
-    let app_response_payload: OutboundAppMessage = bincode::deserialize(app_response.payload.as_ref())?;
-    assert!(matches!(app_response_payload, OutboundAppMessage::CreateInboxResponse(pk) if pk == PUB_KEY));
-
+    let app_response_payload: OutboundAppMessage =
+        bincode::deserialize(app_response.payload.as_ref())?;
+    assert!(
+        matches!(app_response_payload, OutboundAppMessage::CreateInboxResponse(pk) if pk == PUB_KEY)
+    );
 
     // 2. Request sign message - should return only GetSecretRequest
     let sign_payload_content = InboundAppMessage::PleaseSignMessage(PRIVATE_KEY.to_vec());
@@ -198,12 +205,18 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     let app_id = ContractInstanceId::try_from(['a'; 32].into_iter().collect::<String>()).unwrap();
     let sign_msg = ApplicationMessage::new(app_id.clone(), sign_payload.clone()).processed(false);
     let output2 = Delegate::process(
+        &mut ctx,
+        &mut secrets,
         Parameters::from(vec![]),
         None,
         InboundDelegateMsg::ApplicationMessage(sign_msg),
     )?;
 
-    assert_eq!(output2.len(), 1, "Expected only one message (GetSecretRequest)");
+    assert_eq!(
+        output2.len(),
+        1,
+        "Expected only one message (GetSecretRequest)"
+    );
     let get_secret_req = match output2.first().unwrap() {
         OutboundDelegateMsg::GetSecretRequest(req) => req,
         other => panic!("Expected GetSecretRequest, got {:?}", other),
@@ -213,28 +226,40 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     // Verify context contains the payload to sign
     let ctx_step2: SecretsContext = bincode::deserialize(get_secret_req.context.as_ref())?;
     assert!(ctx_step2.private_key.is_none());
-    assert_eq!(ctx_step2.message_to_sign_payload.as_ref().unwrap(), &sign_payload);
+    assert_eq!(
+        ctx_step2.message_to_sign_payload.as_ref().unwrap(),
+        &sign_payload
+    );
 
-
-    // 3. Simulate runtime returning the secret; delegate should now sign and return the final message
+    // 3. Simulate runtime returning the secret
     let secret_response_msg = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
         key: get_secret_req.key.clone(),
         value: Some(PRIVATE_KEY.to_vec()),
-        context: get_secret_req.context.clone(), // Use context from the request
+        context: get_secret_req.context.clone(),
     });
-    let output3 = Delegate::process(Parameters::from(vec![]), None, secret_response_msg)?;
+    let output3 = Delegate::process(
+        &mut ctx,
+        &mut secrets,
+        Parameters::from(vec![]),
+        None,
+        secret_response_msg,
+    )?;
 
-    assert_eq!(output3.len(), 1, "Expected only one message (ApplicationMessage with signature)");
+    assert_eq!(
+        output3.len(),
+        1,
+        "Expected only one message (ApplicationMessage with signature)"
+    );
     let final_app_msg = match output3.first().unwrap() {
         OutboundDelegateMsg::ApplicationMessage(msg) => msg,
         other => panic!("Expected ApplicationMessage, got {:?}", other),
     };
 
     assert!(final_app_msg.processed);
-    // assert_eq!(final_app_msg.app, app_id); // FIXME: App ID is currently lost/hardcoded in delegate response
     let final_payload: OutboundAppMessage = bincode::deserialize(final_app_msg.payload.as_ref())?;
-    assert!(matches!(final_payload, OutboundAppMessage::MessageSigned(sig) if sig == vec![4, 5, 2]));
-    // Ensure context is cleared in the final response
+    assert!(
+        matches!(final_payload, OutboundAppMessage::MessageSigned(sig) if sig == vec![4, 5, 2])
+    );
     assert!(final_app_msg.context.as_ref().is_empty());
 
     Ok(())
