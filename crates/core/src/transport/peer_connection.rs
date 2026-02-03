@@ -1197,6 +1197,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     stream_id = %stream_id,
                                     "Registered stream as orphan for operations layer"
                                 );
+                            } else if stream_id.is_operations_stream() {
+                                tracing::error!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    stream_id = %stream_id,
+                                    "Operations stream fragment arrived but orphan_stream_registry is None! \
+                                     This will cause claim_or_wait() to timeout. Check connection setup."
+                                );
                             }
                             self.streaming_handles.insert(stream_id, streaming_handle);
                         }
@@ -1210,6 +1217,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
                                 "Registered stream as orphan for operations layer"
+                            );
+                        } else if stream_id.is_operations_stream() {
+                            // CRITICAL: Operations-level streams require orphan registry for claim_or_wait().
+                            // If registry is None, the stream won't be registered and the operations
+                            // layer will timeout waiting for it. This indicates a bug in connection setup.
+                            tracing::error!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Operations stream fragment arrived but orphan_stream_registry is None! \
+                                 This will cause claim_or_wait() to timeout. Check connection setup."
                             );
                         }
 
