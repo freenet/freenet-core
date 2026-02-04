@@ -106,6 +106,7 @@ struct TestDelegate;
 #[delegate]
 impl DelegateInterface for TestDelegate {
     fn process(
+        _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
@@ -310,6 +311,12 @@ fn handle_contract_response(
 mod tests {
     use super::*;
 
+    // Helper to call process with dummy ctx
+    fn call_process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        let mut ctx = DelegateCtx::default();
+        TestDelegate::process(&mut ctx, Parameters::from(vec![]), None, message)
+    }
+
     #[test]
     fn test_get_contract_state_request() {
         let contract_id = ContractInstanceId::new([1u8; 32]);
@@ -321,12 +328,7 @@ mod tests {
         let payload = bincode::serialize(&command).unwrap();
         let app_msg = ApplicationMessage::new(app_id.clone(), payload);
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::ApplicationMessage(app_msg),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -356,12 +358,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::GetContractResponse(response),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::GetContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -397,12 +394,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::GetContractResponse(response),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::GetContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -429,12 +421,7 @@ mod tests {
         let payload = bincode::serialize(&command).unwrap();
         let app_msg = ApplicationMessage::new(app_id, payload);
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::ApplicationMessage(app_msg),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
         // Should return empty results immediately
         assert_eq!(result.len(), 1);
@@ -466,12 +453,7 @@ mod tests {
         let payload = bincode::serialize(&command).unwrap();
         let app_msg = ApplicationMessage::new(app_id, payload);
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::ApplicationMessage(app_msg),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
         // Should emit GetContractRequest for the first contract
         assert_eq!(result.len(), 1);
@@ -511,12 +493,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::GetContractResponse(response),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::GetContractResponse(response)).unwrap();
 
         // Should emit GetContractRequest for the second contract
         assert_eq!(result.len(), 1);
@@ -559,12 +536,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::GetContractResponse(response),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::GetContractResponse(response)).unwrap();
 
         // Should return accumulated results
         assert_eq!(result.len(), 1);
@@ -602,12 +574,7 @@ mod tests {
         let payload = bincode::serialize(&command).unwrap();
         let app_msg = ApplicationMessage::new(app_id, payload);
 
-        let result = TestDelegate::process(
-            Parameters::from(vec![]),
-            None,
-            InboundDelegateMsg::ApplicationMessage(app_msg),
-        )
-        .unwrap();
+        let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
         // Should emit BOTH GetContractRequest AND Echo message
         assert_eq!(result.len(), 2);

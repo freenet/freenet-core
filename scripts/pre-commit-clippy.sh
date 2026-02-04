@@ -47,7 +47,19 @@ for pkg in $packages; do
     if [ "$pkg" = "freenet" ]; then
         cargo clippy -p "$pkg" --all-targets --features bench -- -D warnings || exit 1
     else
-        cargo clippy -p "$pkg" --all-targets -- -D warnings || exit 1
+        # Check if this package is in the workspace or standalone
+        if cargo metadata --no-deps --format-version=1 2>/dev/null | grep -q "\"name\":\"$pkg\""; then
+            cargo clippy -p "$pkg" --all-targets -- -D warnings || exit 1
+        else
+            # Package is standalone - find and run clippy from its directory
+            pkg_dir=$(find tests apps crates -name Cargo.toml -exec grep -l "name = \"$pkg\"" {} \; 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+            if [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then
+                echo "    (standalone package at $pkg_dir)"
+                (cd "$pkg_dir" && cargo clippy --all-targets -- -D warnings) || exit 1
+            else
+                echo "    Warning: Could not find package '$pkg', skipping"
+            fi
+        fi
     fi
 done
 
