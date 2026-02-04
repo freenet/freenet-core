@@ -102,6 +102,13 @@ impl Runtime {
         // process_func.call() below. The guard ensures cleanup even on panic.
         let env =
             unsafe { DelegateCallEnv::new(context, &mut self.secret_store, delegate_key.clone()) };
+
+        // Debug assertion: instance IDs should never collide (they come from a monotonic counter)
+        debug_assert!(
+            !DELEGATE_ENV.contains_key(&instance_id),
+            "Instance ID {instance_id} already exists in DELEGATE_ENV - this indicates a bug"
+        );
+
         DELEGATE_ENV.insert(instance_id, env);
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
 
@@ -507,6 +514,7 @@ mod test {
             PleaseSignMessage(Vec<u8>),
             WriteContext(Vec<u8>),
             ReadContext,
+            ClearContext,
             IncrementCounter,
             HasSecret(Vec<u8>),
             GetNonExistentSecret(Vec<u8>),
@@ -525,6 +533,7 @@ mod test {
             SecretExists(bool),
             SecretResult(Option<Vec<u8>>),
             ContextWritten,
+            ContextCleared,
             SecretStored,
             SecretRemoved,
             LargeContextWritten(usize),
@@ -1315,6 +1324,73 @@ mod test {
         match response {
             OutboundAppMessage::ContextData(data) => {
                 assert!(data.is_empty(), "Context should be empty initially");
+            }
+            other => panic!("Expected ContextData, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test that context can be cleared using ctx.clear().
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_clear() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Step 1: Write some data to context
+        let test_data = vec![1, 2, 3, 4, 5];
+        let payload = bincode::serialize(&InboundAppMessage::WriteContext(test_data.clone()))?;
+        let msg = ApplicationMessage::new(app, payload);
+        let _ = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        // Step 2: Clear the context
+        let payload = bincode::serialize(&InboundAppMessage::ClearContext)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::ContextCleared),
+            "Expected ContextCleared response"
+        );
+
+        // Step 3: Read context and verify it's empty
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert!(data.is_empty(), "Context should be empty after clear");
             }
             other => panic!("Expected ContextData, got {:?}", other),
         }

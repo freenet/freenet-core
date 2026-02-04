@@ -23,6 +23,8 @@ pub enum InboundAppMessage {
     WriteContext(Vec<u8>),
     /// New: Read context and return it
     ReadContext,
+    /// New: Clear the context (write empty data)
+    ClearContext,
     /// New: Increment a counter stored in context (tests read-modify-write)
     IncrementCounter,
     /// New: Check if a secret exists
@@ -53,6 +55,8 @@ pub enum OutboundAppMessage {
     SecretResult(Option<Vec<u8>>),
     /// New: Acknowledgement of context write
     ContextWritten,
+    /// New: Acknowledgement of context clear
+    ContextCleared,
     /// New: Acknowledgement of secret store
     SecretStored,
     /// New: Acknowledgement of secret removal
@@ -127,6 +131,18 @@ impl DelegateInterface for Delegate {
                         let data = ctx.read();
 
                         let response_msg_content = OutboundAppMessage::ContextData(data);
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::ClearContext => {
+                        // Clear context by calling clear()
+                        ctx.clear();
+
+                        let response_msg_content = OutboundAppMessage::ContextCleared;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
                         let response =
