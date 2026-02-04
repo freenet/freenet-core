@@ -3,15 +3,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, GetContractRequest, GetSecretRequest, GetSecretResponse,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
+    DelegateInterfaceResult, DelegateKey, GetContractRequest, InboundDelegateMsg,
+    OutboundDelegateMsg, Parameters, SecretsId,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
 
-use super::error::RuntimeInnerError;
 use super::native_api::{DelegateCallEnv, InstanceId, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
-use super::{ContractError, Runtime, RuntimeResult};
+use super::{Runtime, RuntimeResult};
 
 /// RAII guard that ensures cleanup of delegate environment state.
 /// When dropped, it clears the thread-local instance ID and removes the
@@ -242,19 +241,18 @@ impl Runtime {
         );
     }
 
-    /// Process outbound messages from a delegate, handling secret requests via
-    /// the old message-based round-trip pattern (backward compatibility with V1 delegates).
+    /// Process outbound messages from a delegate.
     ///
-    /// New-style delegates that use host functions for secret access will not produce
-    /// GetSecretRequest messages, so this function becomes a simple pass-through.
+    /// Delegates use host functions for secret access, so this function primarily
+    /// handles contract requests and application messages.
     #[allow(clippy::too_many_arguments)]
     fn process_outbound(
         &mut self,
         delegate_key: &DelegateKey,
-        instance: &Instance,
-        instance_id: i64,
-        process_func: &TypedFunction<(i64, i64, i64), i64>,
-        params: &Parameters<'_>,
+        _instance: &Instance,
+        _instance_id: i64,
+        _process_func: &TypedFunction<(i64, i64, i64), i64>,
+        _params: &Parameters<'_>,
         attested: Option<&[u8]>,
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         context: &mut Vec<u8>,
@@ -262,110 +260,9 @@ impl Runtime {
     ) -> RuntimeResult<()> {
         self.log_process_outbound_entry(delegate_key, attested, outbound_msgs);
 
-        const MAX_ITERATIONS: usize = 100;
-        let mut recursion = 0;
-
         while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
-                // Unprocessed GetSecretRequest: fetch secret and re-invoke delegate
-                // (backward compat for V1 delegates that don't use host secret functions)
-                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key,
-                    context: req_context,
-                    processed: false,
-                }) => {
-                    tracing::debug!(%key, "Handling GetSecretRequest from delegate (legacy path)");
-                    // Use the context from the request (old delegates embed their state there)
-                    if !req_context.as_ref().is_empty() {
-                        *context = req_context.as_ref().to_vec();
-                    }
-                    let secret_result = self.secret_store.get_secret(delegate_key, &key).ok();
-
-                    let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                        key,
-                        value: secret_result,
-                        context: DelegateContext::new(context.clone()),
-                    });
-
-                    if recursion >= MAX_ITERATIONS {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
-                            DelegateError::Other(
-                                "The maximum number of attempts to get the secret has been exceeded"
-                                    .to_string(),
-                            )
-                            .into(),
-                        )));
-                    }
-
-                    let (new_msgs, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &inbound,
-                        context.clone(),
-                        process_func,
-                        instance,
-                        instance_id,
-                    )?;
-                    *context = updated_context;
-                    recursion += 1;
-
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        let summary = new_msgs
-                            .iter()
-                            .map(|m| match m {
-                                OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
-                                OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
-                                OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
-                                OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
-                                OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
-                                OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
-                                OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
-                            })
-                            .collect::<Vec<_>>();
-                        tracing::debug!(
-                            count = new_msgs.len(),
-                            ?summary,
-                            "Messages returned from exec_inbound after GetSecretResponse"
-                        );
-                    }
-
-                    for msg in new_msgs {
-                        if msg.processed() {
-                            if let OutboundDelegateMsg::ApplicationMessage(mut app_msg) = msg {
-                                app_msg.context = DelegateContext::default();
-                                results.push(OutboundDelegateMsg::ApplicationMessage(app_msg));
-                            }
-                        } else {
-                            outbound_msgs.push_back(msg);
-                        }
-                    }
-                }
-
-                // Already-processed secret requests just update context
-                OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    context: ctx, ..
-                }) => {
-                    tracing::debug!("GetSecretRequest already processed");
-                    *context = ctx.as_ref().to_vec();
-                }
-                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                    context: ctx, ..
-                }) => {
-                    *context = ctx.as_ref().to_vec();
-                }
-
-                // SetSecretRequest: store or remove the secret directly
-                OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
-                    if let Some(plaintext) = value {
-                        self.secret_store
-                            .store_secret(delegate_key, &key, plaintext)?;
-                    } else {
-                        self.secret_store.remove_secret(delegate_key, &key)?;
-                    }
-                }
-
-                // Final application message — add to results
+                // Application message — add to results
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
                     tracing::debug!(
                         app = %msg.app,
@@ -421,6 +318,15 @@ impl Runtime {
                     tracing::debug!("GetContractRequest processed");
                     *context = ctx.as_ref().to_vec();
                 }
+
+                // Deprecated message types - delegates should use host functions instead
+                OutboundDelegateMsg::GetSecretRequest(_)
+                | OutboundDelegateMsg::SetSecretRequest(_)
+                | OutboundDelegateMsg::GetSecretResponse(_) => {
+                    tracing::warn!(
+                        "Delegate emitted deprecated secret message type - use host functions instead"
+                    );
+                }
             }
         }
         Ok(())
@@ -449,7 +355,6 @@ impl DelegateRuntimeInterface for Runtime {
         // State maintained across process() calls within this conversation
         let mut context: Vec<u8> = Vec::new();
 
-        let mut non_processed = vec![];
         for msg in inbound {
             match msg {
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
@@ -476,16 +381,7 @@ impl DelegateRuntimeInterface for Runtime {
                     )?;
                     context = updated_context;
 
-                    let mut real_outbound = VecDeque::new();
-                    for msg in outbound {
-                        match msg {
-                            OutboundDelegateMsg::SetSecretRequest(set) => {
-                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
-                            }
-                            msg => real_outbound.push_back(msg),
-                        }
-                    }
-
+                    let mut outbound_queue = VecDeque::from(outbound);
                     self.process_outbound(
                         delegate_key,
                         &running.instance,
@@ -493,7 +389,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         params,
                         attested,
-                        &mut real_outbound,
+                        &mut outbound_queue,
                         &mut context,
                         &mut results,
                     )?;
@@ -511,14 +407,7 @@ impl DelegateRuntimeInterface for Runtime {
                     )?;
                     context = updated_context;
 
-                    let mut real_outbound = VecDeque::new();
-                    for msg in outbound {
-                        match msg {
-                            msg if !msg.processed() => non_processed.push(msg),
-                            msg => real_outbound.push_back(msg),
-                        }
-                    }
-
+                    let mut outbound_queue = VecDeque::from(outbound);
                     self.process_outbound(
                         delegate_key,
                         &running.instance,
@@ -526,32 +415,12 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         params,
                         attested,
-                        &mut real_outbound,
+                        &mut outbound_queue,
                         &mut context,
                         &mut results,
                     )?;
                 }
-                InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key: secret_key, ..
-                }) => {
-                    if attested.is_some() {
-                        let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
-                        let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                            key: secret_key,
-                            value: Some(secret),
-                            context: Default::default(),
-                        });
-                        results.push(msg);
-                    } else {
-                        return Err(DelegateExecError::UnauthorizedSecretAccess {
-                            secret: secret_key.clone(),
-                            delegate: delegate_key.clone(),
-                        }
-                        .into());
-                    }
-                }
                 InboundDelegateMsg::GetContractResponse(response) => {
-                    // Handle GetContractResponse by sending it to the delegate via exec_inbound_with_env
                     let (outbound, updated_context) = self.exec_inbound_with_env(
                         delegate_key,
                         params,
@@ -564,16 +433,7 @@ impl DelegateRuntimeInterface for Runtime {
                     )?;
                     context = updated_context;
 
-                    let mut real_outbound = VecDeque::new();
-                    for outbound in outbound {
-                        match outbound {
-                            OutboundDelegateMsg::SetSecretRequest(set) => {
-                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
-                            }
-                            msg => real_outbound.push_back(msg),
-                        }
-                    }
-
+                    let mut outbound_queue = VecDeque::from(outbound);
                     self.process_outbound(
                         delegate_key,
                         &running.instance,
@@ -581,62 +441,18 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         params,
                         attested,
-                        &mut real_outbound,
+                        &mut outbound_queue,
                         &mut context,
                         &mut results,
                     )?;
                 }
-                InboundDelegateMsg::GetSecretResponse(response) => {
-                    // Handle GetSecretResponse by sending it to the delegate via exec_inbound_with_env
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::GetSecretResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut real_outbound = VecDeque::new();
-                    for outbound in outbound {
-                        match outbound {
-                            OutboundDelegateMsg::SetSecretRequest(set) => {
-                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
-                            }
-                            msg => real_outbound.push_back(msg),
-                        }
-                    }
-
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut real_outbound,
-                        &mut context,
-                        &mut results,
-                    )?;
+                // Deprecated message types - delegates should use host functions for secrets
+                InboundDelegateMsg::GetSecretRequest(_)
+                | InboundDelegateMsg::GetSecretResponse(_) => {
+                    tracing::warn!(
+                        "Received deprecated secret message type - use host functions instead"
+                    );
                 }
-            }
-        }
-
-        // Process any SetSecretRequests that were deferred
-        for outbound in non_processed {
-            match outbound {
-                OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
-                    if let Some(plaintext) = value {
-                        self.secret_store
-                            .store_secret(delegate_key, &key, plaintext)?;
-                    } else {
-                        self.secret_store.remove_secret(delegate_key, &key)?;
-                    }
-                }
-                _ => unreachable!("All OutboundDelegateMsg variants should be handled"),
             }
         }
 
@@ -679,21 +495,7 @@ mod test {
     use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
     use super::*;
 
-    const TEST_DELEGATE_1: &str = "test_delegate_1";
     const TEST_DELEGATE_2: &str = "test_delegate_2";
-
-    /// Message types for test-delegate-1 (legacy message-based secrets)
-    #[derive(Debug, Serialize, Deserialize)]
-    enum InboundAppMessage {
-        CreateInboxRequest,
-        PleaseSignMessage(Vec<u8>),
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    enum OutboundAppMessage {
-        CreateInboxResponse(Vec<u8>),
-        MessageSigned(Vec<u8>),
-    }
 
     /// Message types for test-delegate-2 (host function API)
     mod delegate2_messages {
@@ -765,50 +567,6 @@ mod test {
             .register_delegate(delegate.key().clone(), cipher, nonce);
 
         Ok((delegate, runtime, temp_dir))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn validate_process() -> Result<(), Box<dyn std::error::Error>> {
-        let contract = WrappedContract::new(
-            Arc::new(ContractCode::from(vec![1])),
-            Parameters::from(vec![]),
-        );
-        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_1).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
-
-        // CreateInboxRequest message parts
-        let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
-        let create_inbox_request_msg = ApplicationMessage::new(app, payload);
-
-        let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
-        let expected_payload =
-            bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
-
-        assert_eq!(outbound.len(), 1);
-        assert!(matches!(
-            outbound.first(),
-            Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
-        ));
-
-        // CreateInboxRequest message parts
-        let payload: Vec<u8> =
-            bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
-        let please_sign_message_msg = ApplicationMessage::new(app, payload);
-
-        let inbound = InboundDelegateMsg::ApplicationMessage(please_sign_message_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
-        let expected_payload =
-            bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
-        assert_eq!(outbound.len(), 1);
-        assert!(matches!(
-            outbound.first(),
-            Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
-        ));
-        std::mem::drop(temp_dir);
-        Ok(())
     }
 
     // Test delegate module name for capabilities test
