@@ -106,6 +106,14 @@ impl DelegateCallEnv {
     }
 
     /// Access the secrets store mutably. Only safe during the synchronous process() call.
+    ///
+    /// # Safety invariants (why this lint is suppressed)
+    /// This uses interior mutability through a raw pointer, which is safe because:
+    /// 1. The Runtime holds `&mut self` when calling `process()`, ensuring exclusive access
+    /// 2. WASM execution is synchronous on the calling thread (Singlepass compiler)
+    /// 3. The `DelegateCallEnv` is created immediately before and destroyed immediately after
+    ///    the WASM call, so no concurrent access is possible
+    #[allow(clippy::mut_from_ref)]
     fn secret_store_mut(&self) -> &mut SecretsStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
