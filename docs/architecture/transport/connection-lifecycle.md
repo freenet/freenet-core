@@ -6,25 +6,18 @@ This document describes the high-level connection lifecycle in the Freenet trans
 
 ## Connection States
 
-```
-┌─────────────┐
-│   INITIAL   │  No connection exists
-└──────┬──────┘
-       │ connect()
-       ▼
-┌─────────────┐
-│ CONNECTING  │  Intro packets being sent, waiting for ACK
-└──────┬──────┘
-       │ ACK received + key exchange complete
-       ▼
-┌─────────────┐
-│   ACTIVE    │  Bidirectional encrypted communication
-└──────┬──────┘
-       │ timeout, error, or explicit close()
-       ▼
-┌─────────────┐
-│   CLOSED    │  Connection terminated, cleanup complete
-└─────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> INITIAL
+    INITIAL --> CONNECTING : connect()
+    CONNECTING --> ACTIVE : ACK received +<br/>key exchange complete
+    ACTIVE --> CLOSED : timeout, error,<br/>or explicit close()
+    CLOSED --> [*]
+
+    INITIAL : No connection exists
+    CONNECTING : Intro packets being sent,<br/>waiting for ACK
+    ACTIVE : Bidirectional encrypted<br/>communication
+    CLOSED : Connection terminated,<br/>cleanup complete
 ```
 
 ## Outbound Connection Flow
@@ -45,15 +38,19 @@ This document describes the high-level connection lifecycle in the Freenet trans
 
 **Strategy:** Aggressive packet sending to establish NAT hole-punch
 
-```
-Node A (behind NAT)                         Node B (gateway, expected inbound)
-      |                                              |
-      | ─────────── intro packet 1 ──────────────> | (May be dropped by NAT)
-      | ─────────── intro packet 2 ──────────────> | (May be dropped by NAT)
-      | ─────────── intro packet 3 ──────────────> | ✓ NAT hole established!
-      |                                              | (Decrypts, validates version)
-      | <──────────── ACK (encrypted) ───────────── | (Contains B's symmetric key)
-      | ✓ Connection established                    |
+```mermaid
+sequenceDiagram
+    participant A as Node A<br/>(behind NAT)
+    participant B as Node B<br/>(gateway)
+
+    A->>B: intro packet 1
+    Note right of B: May be dropped by NAT
+    A->>B: intro packet 2
+    Note right of B: May be dropped by NAT
+    A->>B: intro packet 3
+    Note right of B: NAT hole established!<br/>Decrypts, validates version
+    B-->>A: ACK (encrypted)<br/>Contains B's symmetric key
+    Note left of A: Connection established
 ```
 
 **Parameters:**
@@ -103,12 +100,15 @@ Node A (behind NAT)                         Node B (gateway, expected inbound)
 
 For NAT traversal to work, the gateway must send traffic back immediately:
 
-```
-Peer (behind NAT)                           Gateway (public)
-      |                                              |
-      | ──────────── intro packet ───────────────> | ✓ Arrives at gateway
-      |                                              | (Gateway's NAT table now has entry)
-      | <────────────── ACK ──────────────────────  | ✓ Can reply through NAT hole
+```mermaid
+sequenceDiagram
+    participant P as Peer<br/>(behind NAT)
+    participant G as Gateway<br/>(public)
+
+    P->>G: intro packet
+    Note right of G: Arrives at gateway<br/>NAT table now has entry
+    G-->>P: ACK
+    Note left of P: Can reply through NAT hole
 ```
 
 The gateway's response packet creates the "expected inbound" entry in the peer's NAT table, allowing bidirectional communication.

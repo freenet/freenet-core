@@ -207,33 +207,38 @@ Without fairness mechanisms, later connections would starve earlier ones.
 
 LEDBAT++ introduces periodic "probing" where flows briefly reduce their sending rate:
 
-```
-Normal Operation     Slowdown      Freeze       Ramp-up      Normal
-─────────────────────────────────────────────────────────────────────►
-     cwnd: 300KB   → cwnd: 75KB → hold 2 RTTs → exponential → 300KB
+```mermaid
+gantt
+    title Periodic Slowdown Cycle
+    dateFormat X
+    axisFormat %s
 
-     ↑ 9x interval │◄── ~1 second total ──►│
+    section cwnd
+    Normal (300KB)     :a1, 0, 9
+    Slowdown (75KB)    :crit, a2, 9, 1
+    Freeze (hold 2 RTTs) :crit, a3, 10, 2
+    Ramp-up (exponential) :a4, 12, 2
+    Normal (300KB)     :a5, 14, 9
 ```
+
+**Timeline:** Normal operation (9x interval) → Slowdown (cwnd: 300KB → 75KB) → Freeze (hold 2 RTTs) → Ramp-up (exponential) → Normal (300KB)
 
 ### 3.2 State Machine
 
-```
-┌─────────┐     slow start    ┌───────────────────┐
-│ Normal  │ ──── exit ──────► │ WaitingForSlowdown│
-└─────────┘                   │   (2 RTTs delay)  │
-     ▲                        └─────────┬─────────┘
-     │                                  │
-     │                                  ▼
-     │                        ┌─────────────────┐
-     │ ramp-up complete       │   InSlowdown    │
-     │                        │ (cwnd reduced)  │
-     │                        └─────────┬───────┘
-     │                                  │
-     │                                  ▼
-┌────┴────────┐               ┌─────────────────┐
-│  RampingUp  │ ◄──────────── │     Frozen      │
-│ (slow start)│   2 RTTs      │ (hold reduced)  │
-└─────────────┘               └─────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+    Normal --> WaitingForSlowdown : slow start exit
+    WaitingForSlowdown --> InSlowdown : 2 RTTs delay
+    InSlowdown --> Frozen : cwnd reduced
+    Frozen --> RampingUp : 2 RTTs
+    RampingUp --> Normal : ramp-up complete
+
+    Normal : Normal operation
+    WaitingForSlowdown : 2 RTTs delay<br/>before first slowdown
+    InSlowdown : cwnd reduced to 25%
+    Frozen : Hold at reduced cwnd
+    RampingUp : Slow start back<br/>to pre-slowdown level
 ```
 
 ### 3.3 Timing
@@ -415,26 +420,19 @@ When a path change is detected, the BDP proxy is considered stale and is not use
 
 The adaptive floor uses a priority system:
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Explicit min_ssthresh configured?                                │
-│    YES → Use max(min_ssthresh, spec_floor)                          │
-│          RTT-based scaling also applies within min_ssthresh bounds  │
-└─────────────────────────────────────────────────────────────────────┘
-                              │ NO
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 2. BDP proxy available AND path unchanged?                          │
-│    YES → Use max(slow_start_exit_cwnd, spec_floor)                  │
-│          Capped at initial_ssthresh for safety                      │
-└─────────────────────────────────────────────────────────────────────┘
-                              │ NO
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 3. Fallback to spec-compliant floor                                 │
-│    → Use spec_floor = 2 * min_cwnd ≈ 5.7KB                          │
-│    Standard LEDBAT++ behavior                                       │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Start([Calculate ssthresh floor]) --> Q1{Explicit min_ssthresh<br/>configured?}
+
+    Q1 -->|YES| A1["Use max(min_ssthresh, spec_floor)<br/>RTT-based scaling applies within bounds"]
+    Q1 -->|NO| Q2{BDP proxy available<br/>AND path unchanged?}
+
+    Q2 -->|YES| A2["Use max(slow_start_exit_cwnd, spec_floor)<br/>Capped at initial_ssthresh for safety"]
+    Q2 -->|NO| A3["Fallback to spec-compliant floor<br/>spec_floor = 2 × min_cwnd ≈ 5.7KB<br/>Standard LEDBAT++ behavior"]
+
+    style A1 fill:#d4edda,stroke:#28a745
+    style A2 fill:#d4edda,stroke:#28a745
+    style A3 fill:#fff3cd,stroke:#ffc107
 ```
 
 #### 4.6.4 Implementation Details

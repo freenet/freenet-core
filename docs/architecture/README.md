@@ -11,35 +11,47 @@ Freenet Core is a peer-to-peer runtime that enables decentralized applications. 
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Client Applications                         │
-│            (WebSocket API / HTTP Gateway)                        │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────────┐
-│                     Node Event Loop                              │
-│                   (Central Coordinator)                          │
-│  ┌──────────────┬──────────────┬──────────────┬───────────────┐ │
-│  │   Client     │  Operation   │   Contract   │   Network     │ │
-│  │   Events     │   Manager    │   Handler    │   Bridge      │ │
-│  └──────────────┴──────────────┴──────────────┴───────────────┘ │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────────┐
-│                      Ring Topology                               │
-│                   (DHT Peer Routing)                            │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────────┐
-│                    Transport Layer                               │
-│  ┌──────────────┬──────────────┬──────────────┬───────────────┐ │
-│  │  Encryption  │  Congestion  │    Rate      │     RTT       │ │
-│  │ (X25519+AES) │   Control    │  Limiting    │   Tracking    │ │
-│  └──────────────┴──────────────┴──────────────┴───────────────┘ │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                      UDP Socket Layer
+```mermaid
+flowchart TB
+    subgraph Client["Client Applications"]
+        ClientAPI["WebSocket API / HTTP Gateway"]
+    end
+
+    subgraph NodeLoop["Node Event Loop (Central Coordinator)"]
+        ClientEvents["Client Events"]
+        OpManager["Operation Manager"]
+        ContractHandler["Contract Handler"]
+        NetworkBridge["Network Bridge"]
+    end
+
+    subgraph Ring["Ring Topology"]
+        DHT["DHT Peer Routing"]
+    end
+
+    subgraph Transport["Transport Layer"]
+        Encryption["Encryption<br/>(X25519+AES)"]
+        Congestion["Congestion<br/>Control"]
+        RateLimit["Rate<br/>Limiting"]
+        RTT["RTT<br/>Tracking"]
+    end
+
+    UDP["UDP Socket Layer"]
+
+    Client --> NodeLoop
+    ClientEvents --- OpManager
+    OpManager --- ContractHandler
+    ContractHandler --- NetworkBridge
+    NodeLoop --> Ring
+    Ring --> Transport
+    Encryption --- Congestion
+    Congestion --- RateLimit
+    RateLimit --- RTT
+    Transport --> UDP
+
+    style Client fill:#e3f2fd,stroke:#1976d2
+    style NodeLoop fill:#e8f5e9,stroke:#388e3c
+    style Ring fill:#fff3e0,stroke:#f57c00
+    style Transport fill:#f3e5f5,stroke:#7b1fa2
 ```
 
 ## Core Components
