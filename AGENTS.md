@@ -31,6 +31,24 @@ DO NOT delete or comment out the test.
 → Create GitHub issue
 ```
 
+### WHEN you discover outdated or missing documentation
+
+```
+1. Is information in AGENTS.md, .claude/rules/, or CLAUDE.md incorrect?
+   → Fix it immediately in the same commit or PR
+
+2. Did you learn something important that would help future work?
+   → Add it to the appropriate file:
+     - Project-wide patterns → AGENTS.md
+     - Code conventions → .claude/rules/code-style.md
+     - Testing patterns → .claude/rules/testing.md
+     - Git/PR workflow → .claude/rules/git-workflow.md
+     - Crate-specific → crates/*/CLAUDE.md
+
+3. Is a file reference (line number, path) stale?
+   → Update or remove it
+```
+
 ## Quick Reference
 
 ### Commands
