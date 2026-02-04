@@ -1,54 +1,49 @@
 # Freenet Applications
 
-Example applications demonstrating Freenet development patterns.
+## Trigger-Action Rules
 
-## Applications
+### WHEN creating a new app
 
-| App | Purpose | Components |
-|-----|---------|------------|
-| `freenet-ping/` | Simple pub-sub demo | Contract + CLI app |
-| `freenet-email-app/` | Email system | Full WASM application |
-| `freenet-microblogging/` | Social network | Web app example |
+```
+1. Create directory structure:
+   app-name/
+   ├── app/          # Application binary
+   ├── contracts/    # WASM contracts
+   └── types/        # Shared type definitions
 
-## Building Apps
+2. Define interface first in types/
+3. Implement contract logic in contracts/
+4. Build with: cargo run -p fdev -- build
+```
 
-```bash
-# Build contracts with fdev
+### WHEN building contracts
+
+```
 cargo run -p fdev -- build
-
-# Install app binary
-cargo install --path apps/freenet-ping/app
 ```
 
-## Structure
+### WHEN testing an app
 
-Each app typically has:
 ```
-app-name/
-├── app/          # Application binary
-├── contracts/    # WASM contracts
-└── types/        # Shared type definitions
-```
+Need quick local test?
+  → cargo run -p fdev -- test --gateways 1 --nodes 3 single-process
 
-## Testing
-
-Apps can be tested using:
-
-```bash
-# Single-process simulation
-cargo run -p fdev -- test --gateways 1 --nodes 3 single-process
-
-# Multi-process network
-cargo run -p fdev -- test --gateways 1 --nodes 5 multi-process
+Need realistic network test?
+  → cargo run -p fdev -- test --gateways 1 --nodes 5 multi-process
 ```
 
-## Contract Development
+### WHEN deploying
 
-Contracts are compiled to WASM and deployed to the network:
+```
+1. Build: cargo run -p fdev -- build
+2. Test locally first
+3. See https://freenet.org/resources/manual/ for publishing
+```
 
-1. Define contract interface in `types/`
-2. Implement contract logic in `contracts/`
-3. Build with `fdev build`
-4. Test locally before publishing
+## Available Apps
 
-See https://freenet.org/resources/manual/ for contract development guide.
+| App | Purpose | Use as reference for |
+|-----|---------|---------------------|
+| `freenet-ping/` | Pub-sub demo | Simple contract + CLI |
+| `freenet-email-app/` | Email system | Full WASM app |
+| `freenet-microblogging/` | Social network | Web frontend |

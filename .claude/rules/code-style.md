@@ -1,63 +1,91 @@
-# Code Style Guidelines
+---
+applyTo: "**/*.rs"
+---
 
-## Rust Conventions
+# Code Style Rules
 
-- Use `rustfmt` defaults (run `cargo fmt`)
-- Follow `clippy` lints (`cargo clippy --all-targets --all-features`)
-- Prefer explicit error handling over `.unwrap()` in production code
-- Use `thiserror` for custom error types
+## Trigger-Action Rules
 
-## Module Organization
+### WHEN writing a new module
 
-```rust
-// Ordering within modules:
-// 1. Module declarations
-mod submodule;
+```
+1. Order contents as:
+   mod declarations → imports → types → trait impls → functions
 
-// 2. Imports (grouped: std, external, crate)
-use std::collections::HashMap;
-use tokio::sync::mpsc;
-use crate::config::Config;
+2. Group imports:
+   std:: → external crates → crate::
 
-// 3. Type definitions
-struct MyStruct { ... }
-
-// 4. Trait implementations
-impl MyTrait for MyStruct { ... }
-
-// 5. Functions
-fn helper() { ... }
+3. Check: Is this in crates/core/?
+   → YES: See .claude/rules/testing.md for DST requirements
 ```
 
-## Error Handling
+### WHEN handling errors
 
+```
+Is this production code?
+  → YES: Use explicit match/if-let, never .unwrap()
+  → Use thiserror for custom error types
+
+Is this test code?
+  → .unwrap() and .expect("reason") are acceptable
+```
+
+**Production pattern:**
 ```rust
-// Production code: explicit handling
 match operation() {
     Ok(result) => process(result),
-    Err(e) => handle_error(e),
+    Err(e) => return Err(e.into()),
 }
-
-// Test code: .unwrap() / .expect() acceptable
-let result = operation().expect("operation should succeed");
 ```
 
-## Async Patterns
+### WHEN writing async code
 
-- Use `tokio::select!` for multiplexing
-- Prefer channels over shared state
-- Document cancellation safety when relevant
+```
+Need to wait on multiple futures?
+  → Use tokio::select!, not sequential .await
 
-## Key Abstractions
+Need shared state across tasks?
+  → Prefer channels (mpsc, oneshot) over Arc<Mutex<>>
 
-| Concern | Use | Location |
-|---------|-----|----------|
-| Time | `TimeSource` trait | `crates/core/src/simulation/` |
-| RNG | `GlobalRng` | `crates/core/src/config/mod.rs` |
-| Sockets | `Socket` trait | `crates/core/src/transport/` |
+Is cancellation possible?
+  → Document cancellation safety in function docs
+```
 
-## Documentation
+### WHEN you need time/rng/sockets in `crates/core/`
 
-- Document public APIs with `///` comments
-- Include examples for complex functions
-- Explain "why" in implementation comments, not "what"
+```
+Need current time?
+  → DO NOT use: std::time::Instant::now(), tokio::time::sleep()
+  → USE: TimeSource trait (crates/core/src/simulation/)
+
+Need randomness?
+  → DO NOT use: rand::random(), rand::thread_rng()
+  → USE: GlobalRng (crates/core/src/config/mod.rs)
+
+Need network socket in tests?
+  → DO NOT use: tokio::net::UdpSocket
+  → USE: Socket trait (crates/core/src/transport/)
+```
+
+### WHEN writing documentation
+
+```
+Is this a public API?
+  → Add /// doc comment with:
+    - One-line summary
+    - # Example section for complex functions
+    - # Panics section if it can panic
+    - # Errors section if it returns Result
+
+Is this implementation logic?
+  → Comment explains WHY, not WHAT
+  → If code needs a WHAT comment, refactor for clarity instead
+```
+
+### BEFORE submitting code
+
+```
+1. Run: cargo fmt
+2. Run: cargo clippy --all-targets --all-features
+3. Fix all warnings (CI enforces this)
+```

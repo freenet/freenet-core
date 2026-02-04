@@ -1,77 +1,73 @@
 # Freenet Core Crate
 
-This is the main runtime crate containing the Freenet node implementation.
+## Trigger-Action Rules
 
-## Module Overview
+### BEFORE writing any new code in this crate
 
-| Module | Purpose | Key Files |
-|--------|---------|-----------|
-| `node/` | Event loop, coordination | `node.rs`, `network_bridge/` |
-| `operations/` | Transaction state machines | `get.rs`, `put.rs`, `update.rs`, `subscribe.rs`, `connect.rs` |
-| `contract/` | WASM contract execution | `executor.rs`, `handler.rs`, `storages/` |
-| `transport/` | UDP networking | `connection_handler.rs`, `peer_connection/` |
-| `ring/` | DHT topology | `mod.rs`, `seeding_cache.rs` |
-| `server/` | WebSocket/HTTP API | `mod.rs`, `http_gateway.rs` |
-| `simulation/` | DST framework | `time.rs`, `rng.rs` |
-| `wasm_runtime/` | WASM sandbox | Runtime interface |
-| `tracing/` | Observability | Event logging |
+```
+Does this code need current time?
+  → DO NOT use: std::time::Instant::now(), tokio::time::sleep()
+  → USE: TimeSource trait from src/simulation/
 
-## Deterministic Simulation Testing (DST)
+Does this code need randomness?
+  → DO NOT use: rand::random(), rand::thread_rng()
+  → USE: GlobalRng from src/config/mod.rs
 
-When writing code in this crate, follow DST rules to ensure reproducible tests.
-
-### Time Sources
-
-```rust
-// GOOD: Use TimeSource trait
-fn new(time_source: impl TimeSource) -> Self { ... }
-
-// BAD: Real wall-clock time
-std::time::Instant::now()
-tokio::time::sleep()
+Is this network code for tests?
+  → DO NOT use: tokio::net::UdpSocket
+  → USE: SimulationSocket from src/transport/in_memory_socket.rs
 ```
 
-### Random Sources
+### WHEN adding a test
 
-```rust
-// GOOD: Seeded RNG
-GlobalRng::random_u64()
-GlobalRng::fill_bytes(&mut buf)
-GlobalRng::with_rng(|rng| distribution.sample(rng))
+```
+Is it testing network behavior?
+  → Use #[freenet_test] macro for SimNetwork
 
-// BAD: System entropy
-rand::random()
-rand::thread_rng()
+Is it a unit test?
+  → Use mocks: MockNetworkBridge, MockRing
+
+Need deterministic results?
+  → Run with: cargo test -- --test-threads=1
 ```
 
-### Network I/O (in simulation tests)
+### WHEN modifying transport/
 
-```rust
-// GOOD: In-memory socket
-SimulationSocket::bind(addr).await
-
-// BAD: Real network
-tokio::net::UdpSocket::bind(addr).await
+```
+Read first: docs/architecture/transport/README.md
+Key decision points:
+  - Connection state: peer_connection.rs
+  - Rate limiting: rate_limiter.rs
+  - Congestion control: congestion/ (LEDBAT++, BBR, FixedRate)
 ```
 
-## Test Commands
+### WHEN modifying operations/
+
+```
+Each file is a state machine:
+  connect.rs → CONNECT operation
+  get.rs     → GET operation
+  put.rs     → PUT operation
+  update.rs  → UPDATE operation
+  subscribe.rs → SUBSCRIBE operation
+```
+
+## Module Map
+
+| Module | Entry Point | What It Does |
+|--------|-------------|--------------|
+| `node/` | `node.rs` | Event loop (start here for data flow) |
+| `operations/` | `mod.rs` | Transaction state machines |
+| `contract/` | `handler.rs` | WASM execution |
+| `transport/` | `connection_handler.rs` | Networking layer |
+| `ring/` | `mod.rs` | DHT routing |
+| `server/` | `mod.rs` | Client API |
+| `simulation/` | `time.rs`, `rng.rs` | DST abstractions |
+
+## Commands
 
 ```bash
 cargo test -p freenet                           # All tests
-cargo test -p freenet --lib                     # Unit tests
-cargo test -p freenet --test simulation_integration  # SimNetwork
 cargo test -p freenet -- --test-threads=1       # Deterministic
+cargo bench --bench transport_perf -- level0    # Quick benchmark
 ```
-
-## Benchmarks
-
-```bash
-cargo bench --bench transport_perf -- level0    # CI-friendly
-cargo bench --bench transport_perf -- transport # Transport suite
-```
-
-## Documentation
-
-- Transport layer: `docs/architecture/transport/README.md`
-- Testing guide: `docs/architecture/testing/README.md`
-- Simulation testing: `docs/architecture/testing/simulation-testing.md`

@@ -1,59 +1,70 @@
 # Git & PR Workflow
 
-## PR Title Format
+## Trigger-Action Rules
 
-All PR titles must follow Conventional Commits. CI fails non-conforming titles.
+### BEFORE every commit
 
 ```
-feat: add new feature
-fix: resolve bug in X
-docs: update architecture docs
-refactor: simplify Y module
-test: add integration tests for Z
-build: update dependencies
+1. Run: cargo fmt
+2. Run: cargo clippy --all-targets --all-features
+3. Run: cargo test
+4. Check: Any TODO-MUST-FIX markers in staged files?
+   → If YES: CI will block. Either fix or create tracking issue first.
 ```
 
-## PR Description Template
+### WHEN creating a commit message
 
-PR descriptions must explain **WHY**, not just **WHAT**.
+```
+Does the subject line follow conventional commits?
+  → NO: Rewrite as: feat|fix|docs|refactor|test|build: description
 
-```markdown
-## Problem
-[What's broken and user-visible impact]
-[Why existing tests didn't catch it]
+Is subject under 72 characters?
+  → NO: Shorten it
 
-## Solution
-[Key insight or design decision]
-[Why this approach over alternatives]
-
-## Testing
-[New tests and what they validate]
-[Local validation steps]
-
-## Fixes
-Closes #XXXX
+Does the body explain WHY, not WHAT?
+  → NO: Add reasoning. Code diff shows WHAT; message explains WHY.
 ```
 
-**Key principle:** Reviewer should understand your reasoning without reading the issue thread.
+**Valid prefixes:**
+- `feat:` – new feature
+- `fix:` – bug fix
+- `docs:` – documentation only
+- `refactor:` – code change that doesn't fix bug or add feature
+- `test:` – adding/updating tests
+- `build:` – build system or dependencies
 
-## Commit Messages
+### WHEN creating a PR
 
-- Focus on "why" rather than "what"
-- Reference issue numbers when applicable
-- Keep subject line under 72 characters
+```
+1. Check title: Does it follow conventional commits?
+   → NO: CI will fail. Fix title first.
 
-## Before Pushing
+2. Check description: Does it have these sections?
+   - ## Problem (what's broken, user impact)
+   - ## Solution (key insight, why this approach)
+   - ## Testing (what validates this)
+   - ## Fixes (closes #XXXX)
+   → Missing sections: Add them. Reviewer shouldn't need to read issue thread.
 
-```bash
-cargo fmt
-cargo clippy --all-targets --all-features
-cargo test
+3. Ask yourself: Can reviewer understand my reasoning from PR alone?
+   → NO: Add more context to description.
 ```
 
-## TODO-MUST-FIX Marker
+### WHEN a test starts failing
 
-The repository blocks commits with `// TODO-MUST-FIX:` comments. Use this marker when temporarily disabling tests, then create a follow-up issue.
+```
+DO NOT:
+  ✗ Delete the test
+  ✗ Comment it out
+  ✗ Skip without documentation
 
+DO:
+  ✓ Add #[ignore] attribute
+  ✓ Add marker: // TODO-MUST-FIX: [reason] #[issue]
+  ✓ Create GitHub issue immediately
+```
+
+Example:
 ```rust
 // TODO-MUST-FIX: Re-enable after fixing #1234
 #[ignore]
@@ -61,4 +72,15 @@ The repository blocks commits with `// TODO-MUST-FIX:` comments. Use this marker
 fn flaky_test() { ... }
 ```
 
-Never remove failing tests without understanding the root cause.
+### WHEN reviewing code
+
+```
+Does PR explain WHY changes were made?
+  → NO: Request explanation before approving
+
+Are there new TODO-MUST-FIX markers?
+  → YES: Verify tracking issue exists
+
+Does test coverage match changed code?
+  → NO: Request tests for uncovered paths
+```

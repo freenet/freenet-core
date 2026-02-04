@@ -1,87 +1,88 @@
+---
+applyTo: "crates/core/**"
+---
+
 # Testing Rules
 
-## Quick Reference: Which Approach to Use
+## Decision Tree: Choosing Test Approach
 
-| Scenario | Approach |
-|----------|----------|
-| Single function/algorithm | Unit tests with `#[test]` |
-| Transport/ring logic | Unit tests with mocks (`MockNetworkBridge`, `MockRing`) |
-| Contract operations | `#[freenet_test]` macro with single gateway |
-| Multi-node connectivity | `#[freenet_test]` macro with multiple nodes |
-| Fault tolerance | SimNetwork with FaultConfig |
-| Deterministic replay | SimNetwork with fixed seed |
-| Scale testing (20+ peers) | `freenet-test-network` |
+```
+Is it a single function/algorithm?
+  → YES: Unit test with #[test]
+  → NO: Continue...
 
-## Deterministic Simulation Testing (DST)
+Does it need network simulation?
+  → NO: Unit test with mocks (MockNetworkBridge, MockRing)
+  → YES: Continue...
 
-The codebase uses DST for reproducible tests. Follow these rules when working in `crates/core/`:
+How many nodes?
+  → 1 gateway: #[freenet_test] macro
+  → 2-10 nodes: #[freenet_test] with multiple nodes
+  → 20+ nodes: freenet-test-network
 
-### Time Sources
-
-**Use `TimeSource` trait, not real time:**
-```rust
-// Good: TimeSource injection
-fn new(time_source: impl TimeSource) -> Self { ... }
-
-// Bad: Real wall-clock time
-std::time::Instant::now()
-tokio::time::sleep()
+Need fault injection?
+  → YES: SimNetwork with FaultConfig
 ```
 
-**Examples:** `crates/core/src/ring/seeding_cache.rs:76`, `crates/core/src/transport/peer_connection.rs:1674`
+## Trigger-Action Rules
 
-### Random Sources
+### When writing new code in `crates/core/`
 
-**Use `GlobalRng`, not system entropy:**
+**BEFORE writing any function that needs current time:**
+→ Check: Am I using `TimeSource` trait?
+→ If using `std::time::Instant::now()` or `tokio::time::sleep()`: STOP. Refactor to accept `impl TimeSource`.
+
+**BEFORE writing any code that needs randomness:**
+→ Check: Am I using `GlobalRng`?
+→ If using `rand::random()` or `rand::thread_rng()`: STOP. Use `GlobalRng::random_u64()` or `GlobalRng::fill_bytes()`.
+
+**BEFORE writing any socket code in tests:**
+→ Check: Is this a simulation test?
+→ If YES and using `tokio::net::UdpSocket`: STOP. Use `SimulationSocket::bind()`.
+
+### When a test fails
+
+```
+Test failed?
+  → DO NOT delete the test
+  → DO NOT comment it out without marker
+  → Instead:
+    1. Add #[ignore] attribute
+    2. Add comment: // TODO-MUST-FIX: [reason] #[issue-number]
+    3. Create GitHub issue for follow-up
+```
+
+### When running tests
+
+```
+Running simulation tests?
+  → Use: cargo test -p freenet -- --test-threads=1
+  → Why: Ensures deterministic scheduling
+
+Running all tests?
+  → Use: cargo test -p freenet
+
+Running specific integration test?
+  → Use: cargo test -p freenet --test simulation_integration
+```
+
+## Reference Patterns
+
+**Time injection:**
 ```rust
-// Good: Seeded RNG
+fn new(time_source: impl TimeSource) -> Self { ... }
+```
+See: `crates/core/src/ring/seeding_cache.rs:76`
+
+**RNG usage:**
+```rust
 GlobalRng::random_u64()
 GlobalRng::fill_bytes(&mut buf)
-
-// Bad: Non-deterministic
-rand::random()
-rand::thread_rng()
 ```
+See: `crates/core/src/ring/location.rs:68`
 
-**Examples:** `crates/core/src/ring/location.rs:68`, `crates/core/src/transport/peer_connection.rs:1667`
-
-### Network I/O
-
-**Use `SimulationSocket` for simulation tests:**
+**Simulation socket:**
 ```rust
-// Good: In-memory socket
 SimulationSocket::bind(addr).await
-
-// Bad: Real network (for simulation tests)
-tokio::net::UdpSocket::bind(addr).await
 ```
-
-**Implementation:** `crates/core/src/transport/in_memory_socket.rs`
-
-### Time Advancement Pattern
-
-```rust
-// In simulation tests
-let mut sim = SimNetwork::new(...).await;
-for _ in 0..iterations {
-    sim.advance_time(step).await;
-    tokio::task::yield_now().await;
-}
-```
-
-**Examples:** `crates/core/tests/simulation_smoke.rs:29-42`
-
-## Test Commands
-
-```bash
-cargo test -p freenet                           # All tests
-cargo test -p freenet --lib                     # Unit tests only
-cargo test -p freenet --test simulation_integration  # SimNetwork tests
-cargo test -p freenet -- --test-threads=1       # Deterministic scheduling
-```
-
-## Documentation
-
-- Full testing guide: `docs/architecture/testing/README.md`
-- Simulation testing: `docs/architecture/testing/simulation-testing.md`
-- Testing matrix: `docs/architecture/testing/testing-matrix.md`
+See: `crates/core/src/transport/in_memory_socket.rs`
