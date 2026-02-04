@@ -107,7 +107,6 @@ struct TestDelegate;
 impl DelegateInterface for TestDelegate {
     fn process(
         _ctx: &mut DelegateCtx,
-        _secrets: &mut SecretsStore,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
@@ -312,17 +311,10 @@ fn handle_contract_response(
 mod tests {
     use super::*;
 
-    // Helper to call process with dummy ctx and secrets
+    // Helper to call process with dummy ctx
     fn call_process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let mut ctx = DelegateCtx::default();
-        let mut secrets = SecretsStore::default();
-        TestDelegate::process(
-            &mut ctx,
-            &mut secrets,
-            Parameters::from(vec![]),
-            None,
-            message,
-        )
+        TestDelegate::process(&mut ctx, Parameters::from(vec![]), None, message)
     }
 
     #[test]

@@ -101,9 +101,8 @@ impl Runtime {
         // Set up the delegate call environment with context and secret store access.
         // SAFETY: self.secret_store is valid for the duration of the synchronous
         // process_func.call() below. The guard ensures cleanup even on panic.
-        let env = unsafe {
-            DelegateCallEnv::new(context, &mut self.secret_store, delegate_key.clone())
-        };
+        let env =
+            unsafe { DelegateCallEnv::new(context, &mut self.secret_store, delegate_key.clone()) };
         DELEGATE_ENV.insert(instance_id, env);
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
 
@@ -1778,8 +1777,7 @@ mod test {
         let large_size = 256 * 1024; // 256KB
 
         // Write large context and read it back in the same batch
-        let write_payload =
-            bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
+        let write_payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
         let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
 
         let messages = vec![
@@ -1966,7 +1964,10 @@ mod test {
                 OutboundAppMessage::SecretResult(Some(value)) => {
                     assert_eq!(value, secret_value, "Thread 1 secret mismatch");
                 }
-                other => panic!("Thread 1: Expected SecretResult(Some(...)), got {:?}", other),
+                other => panic!(
+                    "Thread 1: Expected SecretResult(Some(...)), got {:?}",
+                    other
+                ),
             }
         });
 
@@ -2026,7 +2027,10 @@ mod test {
                 OutboundAppMessage::SecretResult(Some(value)) => {
                     assert_eq!(value, secret_value, "Thread 2 secret mismatch");
                 }
-                other => panic!("Thread 2: Expected SecretResult(Some(...)), got {:?}", other),
+                other => panic!(
+                    "Thread 2: Expected SecretResult(Some(...)), got {:?}",
+                    other
+                ),
             }
         });
 

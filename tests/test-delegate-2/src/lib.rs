@@ -2,7 +2,7 @@
 ///
 /// This delegate demonstrates the simplified pattern where:
 /// - Context is read/written via `ctx.read()` / `ctx.write()`
-/// - Secrets are accessed via `secrets.get()` / `secrets.set()` / `secrets.has()`
+/// - Secrets are accessed via `ctx.get_secret()` / `ctx.set_secret()` / `ctx.has_secret()`
 /// - No GetSecretRequest/GetSecretResponse round-trip is needed
 /// - The delegate handles everything in a single `process()` call
 use freenet_stdlib::prelude::*;
@@ -71,7 +71,6 @@ struct Delegate;
 impl DelegateInterface for Delegate {
     fn process(
         ctx: &mut DelegateCtx,
-        secrets: &mut SecretsStore,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
@@ -84,8 +83,8 @@ impl DelegateInterface for Delegate {
 
                 match message {
                     InboundAppMessage::CreateInboxRequest => {
-                        // Store the secret directly via secrets handle
-                        secrets.set(&PRIVATE_KEY, &PRIVATE_KEY);
+                        // Store the secret directly via ctx handle
+                        ctx.set_secret(&PRIVATE_KEY, &PRIVATE_KEY);
 
                         let response_msg_content =
                             OutboundAppMessage::CreateInboxResponse(PUB_KEY.to_vec());
@@ -97,9 +96,9 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::PleaseSignMessage(inbox_priv_key) => {
-                        // Fetch the secret directly via secrets handle — no round-trip needed!
-                        let _secret = secrets
-                            .get(&inbox_priv_key)
+                        // Fetch the secret directly via ctx handle — no round-trip needed!
+                        let _secret = ctx
+                            .get_secret(&inbox_priv_key)
                             .ok_or_else(|| DelegateError::Other("Secret not found".into()))?;
 
                         let signature = vec![4, 5, 2];
@@ -157,7 +156,7 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::HasSecret(key) => {
-                        let exists = secrets.has(&key);
+                        let exists = ctx.has_secret(&key);
 
                         let response_msg_content = OutboundAppMessage::SecretExists(exists);
                         let payload = bincode::serialize(&response_msg_content)
@@ -168,7 +167,7 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::GetNonExistentSecret(key) => {
-                        let result = secrets.get(&key);
+                        let result = ctx.get_secret(&key);
 
                         let response_msg_content = OutboundAppMessage::SecretResult(result);
                         let payload = bincode::serialize(&response_msg_content)
@@ -179,7 +178,7 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::StoreSecret { key, value } => {
-                        secrets.set(&key, &value);
+                        ctx.set_secret(&key, &value);
 
                         let response_msg_content = OutboundAppMessage::SecretStored;
                         let payload = bincode::serialize(&response_msg_content)
@@ -190,7 +189,7 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::RemoveSecret(key) => {
-                        secrets.remove(&key);
+                        ctx.remove_secret(&key);
 
                         let response_msg_content = OutboundAppMessage::SecretRemoved;
                         let payload = bincode::serialize(&response_msg_content)
@@ -216,7 +215,7 @@ impl DelegateInterface for Delegate {
                     InboundAppMessage::StoreLargeSecret { key, size } => {
                         // Generate deterministic data pattern
                         let value: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-                        secrets.set(&key, &value);
+                        ctx.set_secret(&key, &value);
 
                         let response_msg_content = OutboundAppMessage::LargeSecretStored(size);
                         let payload = bincode::serialize(&response_msg_content)

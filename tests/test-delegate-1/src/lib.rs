@@ -45,13 +45,12 @@ struct Delegate;
 impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
-        _secrets: &mut SecretsStore,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         // Note: This delegate demonstrates the legacy message-based pattern.
-        // It doesn't use ctx or secrets handles - instead it uses
+        // It doesn't use ctx handles - instead it uses
         // GetSecretRequest/SetSecretRequest messages.
         let mut outbound = Vec::new();
         match messages {
@@ -162,10 +161,9 @@ impl DelegateInterface for Delegate {
 
 #[test]
 fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
-    // Create handles for the test (they won't actually work in native mode,
-    // but this delegate doesn't use them - it uses message-based patterns)
+    // Create handle for the test (it won't actually work in native mode,
+    // but this delegate doesn't use it - it uses message-based patterns)
     let mut ctx = unsafe { DelegateCtx::__new() };
-    let mut secrets = unsafe { SecretsStore::__new() };
 
     // 1. create inbox message parts
     let contract = WrappedContract::new(
@@ -177,13 +175,7 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     let create_inbox_request_msg = ApplicationMessage::new(app, payload).processed(false);
 
     let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-    let output1 = Delegate::process(
-        &mut ctx,
-        &mut secrets,
-        Parameters::from(vec![]),
-        None,
-        inbound,
-    )?;
+    let output1 = Delegate::process(&mut ctx, Parameters::from(vec![]), None, inbound)?;
     assert_eq!(output1.len(), 2);
     assert!(matches!(
         output1.first().unwrap(),
@@ -206,7 +198,6 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     let sign_msg = ApplicationMessage::new(app_id.clone(), sign_payload.clone()).processed(false);
     let output2 = Delegate::process(
         &mut ctx,
-        &mut secrets,
         Parameters::from(vec![]),
         None,
         InboundDelegateMsg::ApplicationMessage(sign_msg),
@@ -221,7 +212,7 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
         OutboundDelegateMsg::GetSecretRequest(req) => req,
         other => panic!("Expected GetSecretRequest, got {:?}", other),
     };
-    assert_eq!(get_secret_req.key.as_ref(), PRIVATE_KEY);
+    assert_eq!(get_secret_req.key.key(), PRIVATE_KEY);
 
     // Verify context contains the payload to sign
     let ctx_step2: SecretsContext = bincode::deserialize(get_secret_req.context.as_ref())?;
@@ -237,13 +228,8 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
         value: Some(PRIVATE_KEY.to_vec()),
         context: get_secret_req.context.clone(),
     });
-    let output3 = Delegate::process(
-        &mut ctx,
-        &mut secrets,
-        Parameters::from(vec![]),
-        None,
-        secret_response_msg,
-    )?;
+    let output3 =
+        Delegate::process(&mut ctx, Parameters::from(vec![]), None, secret_response_msg)?;
 
     assert_eq!(
         output3.len(),

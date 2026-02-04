@@ -514,7 +514,10 @@ pub(crate) mod delegate_secrets {
         let val_src = compute_ptr::<u8>(val_ptr, info.start_ptr);
         let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
 
-        match env.secret_store_mut().store_secret(&env.delegate_key, &secret_id, value) {
+        match env
+            .secret_store_mut()
+            .store_secret(&env.delegate_key, &secret_id, value)
+        {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::error!("delegate set_secret failed: {e}");
@@ -590,7 +593,10 @@ pub(crate) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env.secret_store_mut().remove_secret(&env.delegate_key, &secret_id) {
+        match env
+            .secret_store_mut()
+            .remove_secret(&env.delegate_key, &secret_id)
+        {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::debug!("delegate remove_secret failed: {e}");
