@@ -1,8 +1,7 @@
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Constants to simplify the test
-const TEST_DATA: [u8; 3] = [1, 2, 3];
+// Constant for test response
 const TEST_RESPONSE: [u8; 3] = [4, 5, 6];
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,6 +19,7 @@ struct Delegate;
 #[delegate]
 impl DelegateInterface for Delegate {
     fn process(
+        _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
@@ -27,8 +27,10 @@ impl DelegateInterface for Delegate {
         match messages {
             InboundDelegateMsg::ApplicationMessage(incoming_app) => {
                 // Deserialize the incoming message
-                let message: InboundAppMessage = bincode::deserialize(incoming_app.payload.as_slice())
-                    .map_err(|err| DelegateError::Other(format!("Error deserializing message: {err}")))?;
+                let message: InboundAppMessage =
+                    bincode::deserialize(incoming_app.payload.as_slice()).map_err(|err| {
+                        DelegateError::Other(format!("Error deserializing message: {err}"))
+                    })?;
 
                 match message {
                     InboundAppMessage::TestRequest(request_data) => {
@@ -39,18 +41,22 @@ impl DelegateInterface for Delegate {
                         );
 
                         // Serialize the response
-                        let payload: Vec<u8> = bincode::serialize(&response_msg_content)
-                            .map_err(|err| DelegateError::Other(format!("Error serializing response: {err}")))?;
+                        let payload: Vec<u8> =
+                            bincode::serialize(&response_msg_content).map_err(|err| {
+                                DelegateError::Other(format!("Error serializing response: {err}"))
+                            })?;
 
                         // Create the response message for the application
                         let response_app_msg = ApplicationMessage::new(incoming_app.app, payload)
                             .processed(true)
                             .with_context(incoming_app.context);
 
-                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response_app_msg)])
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                            response_app_msg,
+                        )])
                     }
                 }
-            },
+            }
             _ => Err(DelegateError::Other("Unsupported message type".to_string())),
         }
     }
@@ -65,22 +71,32 @@ fn test_delegate() -> Result<(), Box<dyn std::error::Error>> {
     let app_id = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
     let request_data = "test-data".to_string();
-    let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone())).unwrap();
+    let payload: Vec<u8> =
+        bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone())).unwrap();
     let test_request_msg = ApplicationMessage::new(app_id, payload).processed(false);
 
     let inbound = InboundDelegateMsg::ApplicationMessage(test_request_msg);
-    let output = Delegate::process(Parameters::from(vec![]), None, inbound)?;
+    let mut ctx = DelegateCtx::default();
+    let output = Delegate::process(&mut ctx, Parameters::from(vec![]), None, inbound)?;
 
-    assert_eq!(output.len(), 1, "There should be exactly one output message");
+    assert_eq!(
+        output.len(),
+        1,
+        "There should be exactly one output message"
+    );
 
     let app_response = match output.first().unwrap() {
         OutboundDelegateMsg::ApplicationMessage(msg) => msg,
         _ => panic!("Expected an ApplicationMessage"),
     };
 
-    assert!(app_response.processed, "The message should be marked as processed");
+    assert!(
+        app_response.processed,
+        "The message should be marked as processed"
+    );
 
-    let app_response_payload: OutboundAppMessage = bincode::deserialize(app_response.payload.as_ref())?;
+    let app_response_payload: OutboundAppMessage =
+        bincode::deserialize(app_response.payload.as_ref())?;
 
     match app_response_payload {
         OutboundAppMessage::TestResponse(response_text, response_data) => {
