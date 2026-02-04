@@ -73,10 +73,14 @@ State machines for each transaction type:
 | **CONNECT** | Establish peer connections | `connect.rs` |
 | **GET** | Retrieve contract state | `get.rs` |
 | **PUT** | Store/publish contracts | `put.rs` |
-| **UPDATE** | Modify contract state | `update.rs` |
-| **SUBSCRIBE** | Subscribe to contract updates | `subscribe.rs` |
+| **UPDATE** | Propagate state changes | `update.rs` |
+| **SUBSCRIBE** | Receive update notifications | `subscribe.rs` |
 
 Each operation follows a request-response pattern with timeout and retry handling.
+The `OpManager` coordinates all operation state and tracks parent-child relationships
+for composite operations (e.g., PUT with SUBSCRIBE).
+
+See [operations/README.md](operations/README.md) for detailed documentation.
 
 ### Contracts (`crates/core/src/contract/`)
 
@@ -114,9 +118,17 @@ See [transport/README.md](transport/README.md) for detailed documentation.
 
 DHT implementation with small-world routing:
 
-- **Location-based routing** – Peers store contracts based on ring position
-- **Connection management** – Maintains peer connections
-- **Seeding cache** – Bootstrap node discovery
+- **Location-based routing** – Peers and contracts positioned on 1D ring [0, 1]
+- **Connection management** – Maintains 25-200 peer connections
+- **Performance-aware routing** – Learns from routing history to optimize peer selection
+- **Small-world topology** – Accept-only-at-terminus creates local connections naturally
+
+Key abstractions:
+- `Location` – Ring position calculated from IP hash (peers) or contract key hash
+- `ConnectionManager` – Peer organization by location
+- `Router` – Performance-based peer selection
+
+See [ring/README.md](ring/README.md) for detailed documentation.
 
 ### Server (`crates/core/src/server/`)
 
@@ -216,11 +228,24 @@ cargo bench --bench transport_perf -- level0
 
 ## Documentation Index
 
+### Core Architecture
 | Document | Description |
 |----------|-------------|
+| [ring/README.md](ring/README.md) | Ring/DHT topology and routing |
+| [operations/README.md](operations/README.md) | Operation state machines |
 | [transport/README.md](transport/README.md) | Transport layer architecture |
+
+### Transport Details
+| Document | Description |
+|----------|-------------|
 | [transport/security.md](transport/security.md) | Security and encryption |
 | [transport/connection-lifecycle.md](transport/connection-lifecycle.md) | Connection states |
+| [transport/design/ledbat-plus-plus.md](transport/design/ledbat-plus-plus.md) | LEDBAT++ congestion control |
+| [transport/configuration/bandwidth-configuration.md](transport/configuration/bandwidth-configuration.md) | Bandwidth settings |
+
+### Testing
+| Document | Description |
+|----------|-------------|
 | [testing/README.md](testing/README.md) | Testing infrastructure |
 | [testing/simulation-testing.md](testing/simulation-testing.md) | DST framework |
 

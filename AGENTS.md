@@ -95,6 +95,8 @@ docs/architecture/  # Design docs
 | Topic | Location |
 |-------|----------|
 | Architecture | `docs/architecture/README.md` |
+| Ring/DHT | `docs/architecture/ring/README.md` |
+| Operations | `docs/architecture/operations/README.md` |
 | Transport | `docs/architecture/transport/README.md` |
 | Testing | `docs/architecture/testing/README.md` |
 | Code style | `.claude/rules/code-style.md` |
