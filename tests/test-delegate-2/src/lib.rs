@@ -39,6 +39,8 @@ pub enum InboundAppMessage {
     WriteLargeContext(usize),
     /// New: Store large secret (for stress testing)
     StoreLargeSecret { key: Vec<u8>, size: usize },
+    /// Test deprecated message path - emit a GetSecretRequest (deprecated)
+    EmitDeprecatedSecretRequest { key: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +67,8 @@ pub enum OutboundAppMessage {
     LargeContextWritten(usize),
     /// New: Result of large secret store (returns size stored)
     LargeSecretStored(usize),
+    /// Acknowledgement that deprecated request was emitted
+    DeprecatedRequestEmitted,
 }
 
 // -- Delegate implementation --
@@ -239,6 +243,29 @@ impl DelegateInterface for Delegate {
                         let response =
                             ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::EmitDeprecatedSecretRequest { key } => {
+                        // Emit a deprecated GetSecretRequest message to test backward compatibility
+                        // The runtime should log a warning but still handle this gracefully
+                        let deprecated_request =
+                            OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+                                key: SecretsId::new(key),
+                                context: DelegateContext::default(),
+                                processed: false,
+                            });
+
+                        // Also send an app message so we know the delegate completed
+                        let response_msg_content = OutboundAppMessage::DeprecatedRequestEmitted;
+                        let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
+
+                        Ok(vec![
+                            deprecated_request,
+                            OutboundDelegateMsg::ApplicationMessage(response),
+                        ])
                     }
                 }
             }
