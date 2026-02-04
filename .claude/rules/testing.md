@@ -1,5 +1,6 @@
 ---
-applyTo: "crates/core/**"
+paths:
+  - "crates/core/**"
 ---
 
 # Testing Rules

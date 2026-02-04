@@ -1,5 +1,6 @@
 ---
-applyTo: "**/*.rs"
+paths:
+  - "**/*.rs"
 ---
 
 # Code Style Rules
