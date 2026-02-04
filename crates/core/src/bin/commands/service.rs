@@ -6,7 +6,8 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use std::path::Path;
+use freenet::config::ConfigPaths;
+use std::{path::Path, sync::Arc};
 
 use super::report::ReportCommand;
 
@@ -88,6 +89,7 @@ impl ServiceCommand {
         git_commit: &str,
         git_dirty: &str,
         build_timestamp: &str,
+        config_dirs: Arc<ConfigPaths>,
     ) -> Result<()> {
         match self {
             ServiceCommand::Install => install_service(),
@@ -97,7 +99,9 @@ impl ServiceCommand {
             ServiceCommand::Stop => stop_service(),
             ServiceCommand::Restart => restart_service(),
             ServiceCommand::Logs { err } => service_logs(*err),
-            ServiceCommand::Report(cmd) => cmd.run(version, git_commit, git_dirty, build_timestamp),
+            ServiceCommand::Report(cmd) => {
+                cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
+            }
         }
     }
 }

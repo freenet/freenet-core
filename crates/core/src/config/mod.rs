@@ -675,7 +675,7 @@ impl Config {
         self.secrets.transport_keypair()
     }
 
-    pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
+    pub fn paths(&self) -> Arc<ConfigPaths> {
         self.config_paths.clone()
     }
 }
@@ -1414,6 +1414,7 @@ pub struct ConfigPaths {
     event_log: PathBuf,
     data_dir: PathBuf,
     config_dir: PathBuf,
+    #[serde(default = "get_log_dir")]
     log_dir: Option<PathBuf>,
 }
 
@@ -1479,6 +1480,10 @@ impl ConfigPaths {
             }
             OperationMode::Network => self.event_log.to_owned(),
         }
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.log_dir.as_deref()
     }
 
     pub fn with_event_log(mut self, event_log: PathBuf) -> Self {
@@ -2270,6 +2275,7 @@ mod tests {
             config_paths: ConfigPathsArgs {
                 config_dir: Some(temp_dir.path().to_path_buf()),
                 data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
             },
             ..Default::default()
         };

@@ -218,8 +218,6 @@ async fn run_network_node_with_signals(
 }
 
 fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
-    freenet::config::set_logger(None, None, config_args.config_paths.log_dir.as_deref());
-
     if config_args.version {
         println!(
             "Freenet version: {} ({}{})",
@@ -252,30 +250,36 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
         .build()
         .unwrap();
 
-    tracing::info!(
-        max_blocking_threads,
-        "Tokio runtime configured with bounded blocking thread pool"
-    );
-
     rt.block_on(async move {
         let config = config_args.build().await?;
+        freenet::config::set_logger(None, None, config.paths().log_dir());
+        // The logger is needed before this info which is why it's here instead of above
+        tracing::info!(
+            max_blocking_threads,
+            "Tokio runtime configured with bounded blocking thread pool"
+        );
         run(config).await
     })?;
+
     Ok(())
 }
 
-fn main() {
-    use commands::auto_update::{UpdateNeededError, EXIT_CODE_UPDATE_NEEDED};
-
+fn freenet_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Some(Command::Service(cmd)) => cmd.run(
-            build_info::VERSION,
-            build_info::GIT_COMMIT,
-            build_info::GIT_DIRTY,
-            build_info::BUILD_TIMESTAMP,
-        ),
+    match cli.command {
+        Some(Command::Service(cmd)) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let config = rt.block_on(cli.config.build())?;
+
+            cmd.run(
+                build_info::VERSION,
+                build_info::GIT_COMMIT,
+                build_info::GIT_DIRTY,
+                build_info::BUILD_TIMESTAMP,
+                config.paths(),
+            )
+        }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);
@@ -289,9 +293,13 @@ fn main() {
             // Default behavior: run with the config from top-level args
             run_node(cli.config)
         }
-    };
+    }
+}
 
-    match result {
+fn main() {
+    use commands::auto_update::{UpdateNeededError, EXIT_CODE_UPDATE_NEEDED};
+
+    match freenet_main() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // Check if this is an "update needed" error from auto-update detection
