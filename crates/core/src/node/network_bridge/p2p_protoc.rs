@@ -752,14 +752,19 @@ impl P2pConnManager {
                                     let op_manager = ctx.bridge.op_manager.clone();
                                     let gateways = ctx.gateways.clone();
 
-                                    // Initiate connection to the peer
+                                    // Mark gateway connections as transient to prevent
+                                    // premature ring promotion (should only happen via
+                                    // ConnectResponse).
+                                    let is_gw = gateways
+                                        .iter()
+                                        .any(|gw| gw.socket_addr() == Some(target_addr));
                                     ctx.bridge
                                         .ev_listener_tx
                                         .send(P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
                                             peer: target_peer.clone(),
                                             tx,
                                             callback,
-                                            is_gw: false,
+                                            is_gw,
                                         }))
                                         .await?;
 
