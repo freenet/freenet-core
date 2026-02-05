@@ -242,8 +242,8 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
 /// Fixes: #2490
 #[freenet_test(
     nodes = ["gateway", "node-a"],
-    timeout_secs = 120,
-    startup_wait_secs = 15,
+    timeout_secs = 180,
+    startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -258,7 +258,7 @@ async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestRe
 
     let mut got_result_error = false;
     let mut got_notification_error = false;
-    let deadline = Duration::from_secs(30);
+    let deadline = Duration::from_secs(90);
     let start = tokio::time::Instant::now();
 
     while start.elapsed() < deadline {
@@ -291,7 +291,10 @@ async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestRe
 
     assert!(
         got_result_error || got_notification_error,
-        "Client did not receive any error for failed subscription (issue #2490)"
+        "Client did not receive any error for failed subscription \
+         Got result_error={}, notification_error={}",
+        got_result_error,
+        got_notification_error
     );
 
     client

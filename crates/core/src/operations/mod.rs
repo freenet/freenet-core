@@ -553,7 +553,7 @@ fn start_subscription_request_internal(
             }
             Err(error) => {
                 let error_msg = format!("{}", error);
-                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %error_msg, phase = "error", "child subscription failed");
+                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = error_msg, phase = "error", "child subscription failed");
 
                 if let Err(e) = op_manager_cloned
                     .sub_operation_failed(child_tx, &error_msg)

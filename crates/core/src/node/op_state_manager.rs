@@ -960,6 +960,20 @@ fn notify_subscription_timeout(
     });
 }
 
+/// Removes a subscribe operation from the ops map and notifies timeout if found.
+/// Returns `Some(())` if the operation was found and removed, `None` otherwise.
+fn remove_subscribe_and_notify_timeout(
+    ops: &Ops,
+    tx: &Transaction,
+    ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
+) -> Option<()> {
+    let (_, sub_op) = ops.subscribe.remove(tx)?;
+    if let Some(instance_id) = sub_op.instance_id() {
+        notify_subscription_timeout(ch_outbound, instance_id);
+    }
+    Some(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
@@ -1013,14 +1027,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
                         TransactionType::Get => ops.get.remove(&tx).is_none(),
                         TransactionType::Subscribe => {
-                            if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
-                                if let Some(instance_id) = sub_op.instance_id() {
-                                    notify_subscription_timeout(&ch_outbound, instance_id);
-                                }
-                                false
-                            } else {
-                                true
-                            }
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_none()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
@@ -1093,14 +1100,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
                         TransactionType::Get => ops.get.remove(&tx).is_some(),
                         TransactionType::Subscribe => {
-                            if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
-                                if let Some(instance_id) = sub_op.instance_id() {
-                                    notify_subscription_timeout(&ch_outbound, instance_id);
-                                }
-                                true
-                            } else {
-                                false
-                            }
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_some()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };
