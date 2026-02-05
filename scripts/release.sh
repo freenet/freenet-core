@@ -28,6 +28,7 @@ RELEASE_STEPS=(
     "RELEASE_CREATED"
     "LOCAL_DEPLOYED"
     "MATRIX_ANNOUNCED"
+    "RIVER_ANNOUNCED"
 )
 
 # Completed steps (populated by auto-detection)
@@ -1197,6 +1198,90 @@ Published to crates.io (freenet v$VERSION, fdev v$FDEV_VERSION)"
     fi
 }
 
+announce_to_river() {
+    echo "Announcing release to River (Freenet Official room):"
+
+    # Skip if already announced
+    if is_step_completed "RIVER_ANNOUNCED"; then
+        echo "  ✓ [RIVER_ANNOUNCED] River announcement already sent (skipping)"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  [DRY RUN] Would announce to Freenet Official River room"
+        return 0
+    fi
+
+    # Check if riverctl is available
+    if ! command -v riverctl &> /dev/null; then
+        echo "  ⚠️  riverctl not found, skipping River announcement"
+        return 0
+    fi
+
+    # Check if Freenet node is running (required for riverctl)
+    if ! curl -s --max-time 2 http://127.0.0.1:7509/ &>/dev/null; then
+        echo "  ⚠️  Freenet node not running on localhost:7509"
+        echo "     Skipping River announcement (riverctl requires local node)"
+        return 0
+    fi
+
+    # River Official room details
+    # Room Owner VK is also the room ID for riverctl
+    local ROOM_OWNER_VK="69Ht4YjZsT884MndR2uWhQYe1wb9b2x77HRq7Dgq7wYE"
+    local SIGNING_KEY_FILE="$HOME/.config/freenet-river-official/room_owner_signing_key.bin"
+    local ROOMS_JSON="$HOME/.local/share/river/rooms.json"
+
+    # Check if we have the room in local storage with signing key
+    if [[ ! -f "$ROOMS_JSON" ]]; then
+        echo "  ⚠️  River rooms.json not found at $ROOMS_JSON"
+        echo "     Setup required: run 'riverctl room create' first"
+        return 0
+    fi
+
+    # Ensure Room Owner signing key is in rooms.json
+    # (riverctl uses local storage, not --signing-key for room members)
+    if [[ -f "$SIGNING_KEY_FILE" ]]; then
+        python3 -c "
+import json
+import sys
+
+signing_key_file = '$SIGNING_KEY_FILE'
+rooms_file = '$ROOMS_JSON'
+room_vk = '$ROOM_OWNER_VK'
+
+with open(signing_key_file, 'rb') as f:
+    key_bytes = list(f.read())
+
+with open(rooms_file, 'r') as f:
+    data = json.load(f)
+
+if room_vk not in data.get('rooms', {}):
+    print('Room not in local storage', file=sys.stderr)
+    sys.exit(1)
+
+# Update signing key if different
+current_key = data['rooms'][room_vk].get('signing_key_bytes', [])
+if current_key != key_bytes:
+    data['rooms'][room_vk]['signing_key_bytes'] = key_bytes
+    with open(rooms_file, 'w') as f:
+        json.dump(data, f)
+" 2>/dev/null || true
+    fi
+
+    # Simple announcement
+    local announcement="Freenet v$VERSION released! https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
+
+    echo -n "  Sending announcement to River... "
+    if timeout 60 riverctl message send "$ROOM_OWNER_VK" "$announcement" 2>/dev/null; then
+        echo "✓"
+        mark_completed "RIVER_ANNOUNCED"
+    else
+        echo "✗"
+        echo "  ⚠️  Failed to send River announcement (non-critical)"
+        echo "     Manual: riverctl message send $ROOM_OWNER_VK \"$announcement\""
+    fi
+}
+
 # Main execution
 echo "Freenet Release Script"
 echo "======================"
@@ -1217,6 +1302,7 @@ create_github_release
 wait_for_binaries
 deploy_gateways
 announce_to_matrix
+announce_to_river
 
 echo
 echo "🎉 Release $VERSION completed successfully!"
@@ -1227,6 +1313,7 @@ echo "- fdev $FDEV_VERSION published to crates.io"
 echo "- GitHub release created: https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
 echo "- Cross-compiled binaries attached to release"
 echo "- Announcement sent to Matrix (#freenet-locutus)"
+echo "- Announcement sent to River (Freenet Official room)"
 
 # Show deployment status
 if [[ "$DEPLOY_LOCAL" == "true" ]]; then

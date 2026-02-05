@@ -28,7 +28,163 @@ pub(crate) use handler::{
 pub use executor::{Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
 
+use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;
+
+/// Maximum iterations when handling GetContractRequest to prevent infinite loops
+const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
+
+/// Handle a delegate request, including any GetContractRequest messages in the response.
+///
+/// When a delegate emits GetContractRequest, this function:
+/// 1. Fetches the contract state from the local state store
+/// 2. Creates a GetContractResponse and sends it back to the delegate
+/// 3. Repeats until no more GetContractRequest messages
+///
+/// Returns the final response with GetContractRequest messages filtered out.
+async fn handle_delegate_with_contract_requests<CH>(
+    contract_handler: &mut CH,
+    initial_req: DelegateRequest<'static>,
+    attested_contract: Option<&ContractInstanceId>,
+    delegate_key: &DelegateKey,
+) -> Vec<OutboundDelegateMsg>
+where
+    CH: ContractHandler + Send + 'static,
+{
+    // Extract initial params from the request (only ApplicationMessages has params we need)
+    let initial_params = match &initial_req {
+        DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
+        DelegateRequest::GetSecretRequest { params, .. } => params.clone(),
+        _ => Parameters::from(Vec::new()),
+    };
+
+    let mut current_req = initial_req;
+    let current_params = initial_params;
+    let mut iterations = 0;
+    // Accumulate non-contract-request messages across iterations
+    let mut accumulated_messages: Vec<OutboundDelegateMsg> = Vec::new();
+
+    loop {
+        iterations += 1;
+        if iterations > MAX_CONTRACT_REQUEST_ITERATIONS {
+            tracing::error!(
+                delegate_key = %delegate_key,
+                iterations = iterations,
+                "Exceeded maximum GetContractRequest iterations, possible infinite loop"
+            );
+            // Return whatever we accumulated so far
+            return accumulated_messages;
+        }
+
+        // Execute the delegate request
+        let values = match contract_handler
+            .executor()
+            .execute_delegate_request(current_req, attested_contract)
+            .await
+        {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
+                values
+            }
+            Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),
+            Ok(_other) => {
+                tracing::error!(
+                    delegate_key = %delegate_key,
+                    phase = "unexpected_response",
+                    "Unexpected response type from delegate request"
+                );
+                // Return whatever we accumulated so far
+                return accumulated_messages;
+            }
+            Err(err) => {
+                tracing::error!(
+                    delegate_key = %delegate_key,
+                    error = %err,
+                    phase = "execution_failed",
+                    "Failed executing delegate request"
+                );
+                // Return whatever we accumulated so far
+                return accumulated_messages;
+            }
+        };
+
+        // Check for GetContractRequest messages
+        let mut contract_requests: Vec<GetContractRequest> = Vec::new();
+
+        for msg in values {
+            match msg {
+                OutboundDelegateMsg::GetContractRequest(req) => {
+                    contract_requests.push(req);
+                }
+                other => {
+                    // Accumulate non-contract-request messages
+                    accumulated_messages.push(other);
+                }
+            }
+        }
+
+        // If no contract requests, we're done - return all accumulated messages
+        if contract_requests.is_empty() {
+            return accumulated_messages;
+        }
+
+        tracing::debug!(
+            delegate_key = %delegate_key,
+            count = contract_requests.len(),
+            "Processing GetContractRequest messages from delegate"
+        );
+
+        // Process each contract request and build responses
+        let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
+        for req in contract_requests {
+            let contract_id = req.contract_id;
+            let context = req.context;
+
+            // Look up the full key from the instance id
+            let state = match contract_handler.executor().lookup_key(&contract_id) {
+                Some(full_key) => {
+                    // Fetch the contract state
+                    match contract_handler
+                        .executor()
+                        .fetch_contract(full_key, false)
+                        .await
+                    {
+                        Ok((state, _)) => state,
+                        Err(err) => {
+                            tracing::warn!(
+                                contract = %contract_id,
+                                error = %err,
+                                "Failed to fetch contract for delegate GetContractRequest"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        contract = %contract_id,
+                        "Contract not found locally for delegate GetContractRequest"
+                    );
+                    None
+                }
+            };
+
+            inbound_responses.push(InboundDelegateMsg::GetContractResponse(
+                GetContractResponse {
+                    contract_id,
+                    state,
+                    context,
+                },
+            ));
+        }
+
+        // Create a new request to send the responses back to the delegate
+        current_req = DelegateRequest::ApplicationMessages {
+            key: delegate_key.clone(),
+            inbound: inbound_responses,
+            params: current_params.clone(),
+        };
+    }
+}
 
 pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
@@ -353,37 +509,14 @@ where
                     "Processing delegate request"
                 );
 
-                let response = match contract_handler
-                    .executor()
-                    .execute_delegate_request(req, attested_contract.as_ref())
-                {
-                    Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
-                        key: _,
-                        values,
-                    }) => values,
-                    Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),
-                    Ok(_other) => {
-                        tracing::error!(
-                            delegate_key = %delegate_key,
-                            phase = "unexpected_response",
-                            "Unexpected response type from delegate request"
-                        );
-                        // Don't crash the node - log and continue with empty response
-                        Vec::new()
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            delegate_key = %delegate_key,
-                            error = %err,
-                            phase = "execution_failed",
-                            "Failed executing delegate request"
-                        );
-                        // Don't crash the node - log and continue with empty response.
-                        // This can happen during startup if stale delegate state references
-                        // data that is no longer valid (e.g., missing attested contract).
-                        Vec::new()
-                    }
-                };
+                // Execute the delegate and handle any GetContractRequest messages
+                let response = handle_delegate_with_contract_requests(
+                    &mut contract_handler,
+                    req,
+                    attested_contract.as_ref(),
+                    &delegate_key,
+                )
+                .await;
 
                 // Send response back to caller. If the caller disconnected, the response channel
                 // may be dropped. This is not fatal - the delegate has already been processed.

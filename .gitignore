@@ -47,6 +47,8 @@ CI_STATUS.md
 claude_notes/
 .claude/**
 !.claude/settings.json
+!.claude/rules/
+!.claude/rules/**
 .claude-plugin/
 external_plugins/
 plugins/

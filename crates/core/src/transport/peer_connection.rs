@@ -56,8 +56,9 @@ type OutboundStreamResult = std::result::Result<super::TransferStats, TransportE
 
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
-/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+/// Measured overhead: 41 bytes (see symmetric_message::stream_fragment_overhead())
+/// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// How often to check for pending ACKs and send them proactively.
 /// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
@@ -1134,19 +1135,33 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 total_length_bytes,
                 fragment_number,
                 payload,
+                metadata_bytes,
             } => {
                 // Push to streaming handle for incremental access (Phase 1 streaming)
                 if let Some(streaming_handle) = self.streaming_handles.get(&stream_id) {
                     // Existing streaming handle - push fragment
                     if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
                     {
-                        tracing::warn!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            error = %e,
-                            "Failed to push fragment to streaming handle"
-                        );
+                        if matches!(e, streaming::StreamError::Cancelled) {
+                            // Stream was cancelled (e.g., transaction timeout). Remove handle
+                            // to stop processing further fragments for this stream.
+                            self.streaming_handles.remove(&stream_id);
+                            self.streaming_registry.remove(stream_id);
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                "Stream cancelled, removed from handles and registry"
+                            );
+                        } else {
+                            tracing::warn!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                error = %e,
+                                "Failed to push fragment to streaming handle"
+                            );
+                        }
                     }
                 } else {
                     // New stream - register with streaming registry
@@ -1156,34 +1171,86 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         .await;
                     if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
                     {
-                        tracing::warn!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            error = %e,
-                            "Failed to push first fragment to streaming handle"
-                        );
-                    }
+                        if matches!(e, streaming::StreamError::Cancelled) {
+                            // Stream was already cancelled, don't register it
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                "New stream already cancelled, not registering"
+                            );
+                            // Skip orphan registration and handle insertion
+                        } else {
+                            tracing::warn!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                fragment_number,
+                                error = %e,
+                                "Failed to push first fragment to streaming handle"
+                            );
+                            // Still register the handle for non-cancellation errors
+                            if let Some(orphan_registry) = &self.orphan_stream_registry {
+                                orphan_registry
+                                    .register_orphan(stream_id, streaming_handle.clone());
+                                tracing::trace!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    stream_id = %stream_id,
+                                    "Registered stream as orphan for operations layer"
+                                );
+                            } else if stream_id.is_operations_stream() {
+                                tracing::error!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    stream_id = %stream_id,
+                                    "Operations stream fragment arrived but orphan_stream_registry is None! \
+                                     This will cause claim_or_wait() to timeout. Check connection setup."
+                                );
+                            }
+                            self.streaming_handles.insert(stream_id, streaming_handle);
+                        }
+                    } else {
+                        // Phase 4: Register with orphan stream registry for race condition handling.
+                        // This allows operations layer to claim the stream when metadata arrives,
+                        // even if the stream fragments arrived first.
+                        if let Some(orphan_registry) = &self.orphan_stream_registry {
+                            orphan_registry.register_orphan(stream_id, streaming_handle.clone());
+                            tracing::trace!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Registered stream as orphan for operations layer"
+                            );
+                        } else if stream_id.is_operations_stream() {
+                            // CRITICAL: Operations-level streams require orphan registry for claim_or_wait().
+                            // If registry is None, the stream won't be registered and the operations
+                            // layer will timeout waiting for it. This indicates a bug in connection setup.
+                            tracing::error!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Operations stream fragment arrived but orphan_stream_registry is None! \
+                                 This will cause claim_or_wait() to timeout. Check connection setup."
+                            );
+                        }
 
-                    // Phase 4: Register with orphan stream registry for race condition handling.
-                    // This allows operations layer to claim the stream when metadata arrives,
-                    // even if the stream fragments arrived first.
-                    if let Some(orphan_registry) = &self.orphan_stream_registry {
-                        orphan_registry.register_orphan(stream_id, streaming_handle.clone());
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            "Registered stream as orphan for operations layer"
-                        );
+                        self.streaming_handles.insert(stream_id, streaming_handle);
                     }
-
-                    self.streaming_handles.insert(stream_id, streaming_handle);
                 }
 
                 // Operations-level streams skip the legacy InboundStream path.
                 // Their bytes are a streaming payload (e.g. GetStreamingPayload), not a
                 // NetMessage, so decode_msg() would fail and close the connection.
                 if stream_id.is_operations_stream() {
+                    // If fragment #1 carries embedded metadata bytes (fix #2757),
+                    // dispatch them as if they were a ShortMessage so the operations
+                    // layer processes the metadata even if the separate metadata
+                    // message was lost over UDP.
+                    if let Some(meta) = metadata_bytes {
+                        tracing::debug!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            stream_id = %stream_id,
+                            meta_len = meta.len(),
+                            "Dispatching embedded metadata from fragment #1"
+                        );
+                        return Ok(Some(meta.to_vec()));
+                    }
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -1325,13 +1392,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        self.outbound_stream_with_id(stream_id, data.into()).await;
+        self.outbound_stream_with_id(stream_id, data.into(), None)
+            .await;
     }
 
     /// Send stream data with a caller-provided StreamId.
     /// Used by operations-level streaming where the StreamId is communicated
     /// in the metadata message and must match the data stream.
-    async fn outbound_stream_with_id(&mut self, stream_id: StreamId, data: bytes::Bytes) {
+    async fn outbound_stream_with_id(
+        &mut self,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+    ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
                 stream_id,
@@ -1344,6 +1417,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
+                metadata,
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -1359,6 +1433,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         &mut self,
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::pipe_stream(
@@ -1372,6 +1447,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.token_bucket.clone(),
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
+                metadata,
             )
             .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
         );
@@ -1477,6 +1553,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 total_length_bytes: fragment.total_bytes,
                 fragment_number: fragment.fragment_number,
                 payload: fragment.payload,
+                metadata_bytes: None,
             },
             &self.remote_conn.sent_tracker,
             token,
@@ -1665,11 +1742,13 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         &mut self,
         stream_id: StreamId,
         data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.outbound_stream_with_id(stream_id, data).await;
+            self.outbound_stream_with_id(stream_id, data, metadata)
+                .await;
             Ok(())
         })
     }
@@ -1678,11 +1757,12 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         &mut self,
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
+        metadata: Option<bytes::Bytes>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle)
+            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata)
                 .await;
             Ok(())
         })
@@ -1830,6 +1910,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ))
         .map_err(|e| e.into());
 

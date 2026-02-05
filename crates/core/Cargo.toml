@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.108"
+version = "0.1.112"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -71,7 +71,7 @@ tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 zeroize = { version = "1.8", features = ["derive"] }
 wasmer = { features = ["sys"], workspace = true }
-wasmer-middlewares = "6.1.0"
+wasmer-middlewares = "7.0.1"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -105,7 +105,7 @@ gag = "1"  # For suppressing libunwind stderr warnings during WASM execution
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
-wmi = "0.18.0"
+wmi = "0.18.1"
 serde = { version = "1.0", features = ["derive"] }
 zip = "7"
 

@@ -1334,11 +1334,7 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: if self.streaming_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
+                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },
@@ -1426,11 +1422,7 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: if self.streaming_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
+                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },
@@ -2853,6 +2845,7 @@ impl SimNetwork {
         max_contract_num: usize,
         iterations: usize,
         simulation_duration: Duration,
+        event_wait: Duration,
         test_fn: F,
     ) -> turmoil::Result
     where
@@ -3048,10 +3041,8 @@ impl SimNetwork {
                         break;
                     }
 
-                    // Longer delay between events to allow full processing
-                    // This is critical for determinism - each operation must complete
-                    // before the next one starts
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    // Delay between events to allow processing and control virtual time pacing
+                    tokio::time::sleep(event_wait).await;
                 }
             }
 
@@ -3385,6 +3376,7 @@ impl SimNetwork {
         max_contract_num: usize,
         iterations: usize,
         simulation_duration: Duration,
+        event_wait: Duration,
     ) -> anyhow::Result<()>
     where
         R: RandomEventGenerator + Send + 'static,
@@ -3581,7 +3573,7 @@ impl SimNetwork {
                 }
 
                 // Wait between events (Turmoil handles this deterministically)
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(event_wait).await;
             }
 
             // Wait for events to fully propagate through the network

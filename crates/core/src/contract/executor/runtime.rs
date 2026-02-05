@@ -311,6 +311,38 @@ impl RuntimePool {
         Ok(executor)
     }
 
+    /// Return an executor to the pool, replacing it if unhealthy.
+    ///
+    /// This is the single point for post-operation health checking. After any
+    /// pool operation (contract or delegate), the executor's WASM store is
+    /// checked. If the store was lost (e.g., due to a panic during WASM
+    /// execution), a fresh executor is created and returned to the pool instead.
+    async fn return_checked(&mut self, executor: Executor<Runtime>, operation: &str) {
+        if Self::is_executor_healthy(&executor) {
+            self.return_executor(executor);
+            return;
+        }
+
+        let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            operation,
+            replacement_number = replacement_num,
+            "Executor became unhealthy, creating replacement"
+        );
+        match self.create_replacement_executor().await {
+            Ok(new_executor) => {
+                self.return_executor(new_executor);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create replacement executor");
+                // Return the broken executor anyway — next operation will fail
+                // but at least the pool isn't depleted
+                self.return_executor(executor);
+            }
+        }
+        self.log_health_if_degraded();
+    }
+
     /// Get a reference to the shared state store.
     /// Used for hosting metadata persistence operations during startup.
     pub fn state_store(&self) -> &StateStore<Storage> {
@@ -349,32 +381,7 @@ impl ContractExecutor for RuntimePool {
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
         let mut executor = self.pop_executor().await;
         let result = executor.fetch_contract(key, return_contract_code).await;
-
-        // Check if executor is still healthy after the operation
-        // If the WASM execution panicked, the store is lost and we need a new executor
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after fetch_contract, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    // Return the broken executor anyway - next operation will fail
-                    // but at least the pool isn't depleted
-                    self.return_executor(executor);
-                }
-            }
-            // Log health status after replacement
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "fetch_contract").await;
         result
     }
 
@@ -389,29 +396,7 @@ impl ContractExecutor for RuntimePool {
         let result = executor
             .upsert_contract_state(key, update, related_contracts, code)
             .await;
-
-        // Check if executor is still healthy after the operation
-        if !Self::is_executor_healthy(&executor) {
-            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                contract = %key,
-                replacement_number = replacement_num,
-                "Executor became unhealthy after upsert_contract_state, creating replacement"
-            );
-            match self.create_replacement_executor().await {
-                Ok(new_executor) => {
-                    self.return_executor(new_executor);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create replacement executor");
-                    self.return_executor(executor);
-                }
-            }
-            // Log health status after replacement
-            self.log_health_if_degraded();
-        } else {
-            self.return_executor(executor);
-        }
+        self.return_checked(executor, "upsert_contract_state").await;
         result
     }
 
@@ -466,25 +451,16 @@ impl ContractExecutor for RuntimePool {
         Ok(())
     }
 
-    fn execute_delegate_request(
+    async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        // For delegate requests, use the first available executor synchronously
-        // This is acceptable because delegate operations are typically quick
-        // Find the first available executor's index
-        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
-
-        match executor_idx {
-            Some(idx) => {
-                let executor = self.runtimes[idx].as_mut().unwrap();
-                executor.execute_delegate_request(req, attested_contract)
-            }
-            None => Err(ExecutorError::other(anyhow::anyhow!(
-                "No executors available for delegate request"
-            ))),
-        }
+        let mut executor = self.pop_executor().await;
+        let result = executor.delegate_request(req, attested_contract);
+        self.return_checked(executor, "execute_delegate_request")
+            .await;
+        result
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -519,17 +495,11 @@ impl ContractExecutor for RuntimePool {
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
-        // Acquire an executor from the pool to do the summarization
-        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
-        match executor_idx {
-            Some(idx) => {
-                let executor = self.runtimes[idx].as_mut().unwrap();
-                executor.summarize_contract_state(key).await
-            }
-            None => Err(ExecutorError::other(anyhow::anyhow!(
-                "No executors available for summarize_contract_state"
-            ))),
-        }
+        let mut executor = self.pop_executor().await;
+        let result = executor.summarize_contract_state(key).await;
+        self.return_checked(executor, "summarize_contract_state")
+            .await;
+        result
     }
 
     async fn get_contract_state_delta(
@@ -537,17 +507,11 @@ impl ContractExecutor for RuntimePool {
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
-        // Acquire an executor from the pool to compute the delta
-        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
-        match executor_idx {
-            Some(idx) => {
-                let executor = self.runtimes[idx].as_mut().unwrap();
-                executor.get_contract_state_delta(key, their_summary).await
-            }
-            None => Err(ExecutorError::other(anyhow::anyhow!(
-                "No executors available for get_contract_state_delta"
-            ))),
-        }
+        let mut executor = self.pop_executor().await;
+        let result = executor.get_contract_state_delta(key, their_summary).await;
+        self.return_checked(executor, "get_contract_state_delta")
+            .await;
+        result
     }
 }
 
@@ -1021,125 +985,12 @@ impl ContractExecutor for Executor<Runtime> {
         Ok(())
     }
 
-    fn execute_delegate_request(
+    async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        tracing::debug!(
-            attested_contract = ?attested_contract,
-            "received delegate request"
-        );
-        match req {
-            DelegateRequest::RegisterDelegate {
-                delegate,
-                cipher,
-                nonce,
-            } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = (&cipher).into();
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = nonce.into();
-                if let Some(contract) = attested_contract {
-                    self.delegate_attested_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::warn!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "register_failed",
-                            "Failed to register delegate"
-                        );
-                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
-                    }
-                }
-            }
-            DelegateRequest::UnregisterDelegate(key) => {
-                self.delegate_attested_ids.remove(&key);
-                match self.runtime.unregister_delegate(&key) {
-                    Ok(_) => Ok(HostResponse::Ok),
-                    Err(err) => {
-                        tracing::warn!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "unregister_failed",
-                            "Failed to unregister delegate"
-                        );
-                        Ok(HostResponse::Ok)
-                    }
-                }
-            }
-            DelegateRequest::GetSecretRequest {
-                key,
-                params,
-                get_request,
-            } => {
-                tracing::debug!(
-                    delegate_key = %key,
-                    params_size = params.as_ref().len(),
-                    attested_contract = ?attested_contract,
-                    "Handling GetSecretRequest for delegate"
-                );
-                let attested = attested_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested.map(|c| c.as_bytes()),
-                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
-                    Err(err) => Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Delegate(key.clone())),
-                    )),
-                }
-            }
-            DelegateRequest::ApplicationMessages {
-                key,
-                inbound,
-                params,
-            } => {
-                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
-                let attested_bytes = attested_contract.map(|c| c.as_bytes());
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested_bytes,
-                    inbound
-                        .into_iter()
-                        .map(InboundDelegateMsg::into_owned)
-                        .collect(),
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
-                    Err(err) => {
-                        tracing::error!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "execution_failed",
-                            "Failed executing delegate"
-                        );
-                        Err(ExecutorError::execution(
-                            err,
-                            Some(InnerOpError::Delegate(key)),
-                        ))
-                    }
-                }
-            }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
-        }
+        self.delegate_request(req, attested_contract)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {

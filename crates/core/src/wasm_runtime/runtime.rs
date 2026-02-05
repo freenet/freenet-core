@@ -241,6 +241,8 @@ impl Runtime {
         native_api::log::prepare_export(&mut store, &mut top_level_imports);
         native_api::rand::prepare_export(&mut store, &mut top_level_imports);
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
+        native_api::delegate_context::prepare_export(&mut store, &mut top_level_imports);
+        native_api::delegate_secrets::prepare_export(&mut store, &mut top_level_imports);
 
         // SAFETY: DEFAULT_MODULE_CACHE_CAPACITY is non-zero
         let cache_capacity =

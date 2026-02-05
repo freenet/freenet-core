@@ -30,8 +30,9 @@ pub(crate) type SerializedStream = Bytes;
 
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
-/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
+/// Measured overhead: 41 bytes (see symmetric_message::stream_fragment_overhead())
+/// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
@@ -51,6 +52,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
+    metadata: Option<Bytes>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -71,9 +73,24 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         "Sending stream"
     );
     let total_length_bytes = stream_to_send.len() as u32;
-    let total_packets = stream_to_send.len().div_ceil(MAX_DATA_SIZE);
+    // Calculate total_packets accounting for fragment #1's reduced payload when
+    // metadata is embedded. Without this adjustment, the loop terminates too early
+    // and the final bytes of the stream are never sent.
+    let total_packets = if let Some(ref meta) = metadata {
+        let meta_overhead = 1 + 8 + meta.len();
+        let first_frag_capacity = MAX_DATA_SIZE.saturating_sub(meta_overhead);
+        if stream_to_send.len() <= first_frag_capacity {
+            1
+        } else {
+            let remaining = stream_to_send.len() - first_frag_capacity;
+            1 + remaining.div_ceil(MAX_DATA_SIZE)
+        }
+    } else {
+        stream_to_send.len().div_ceil(MAX_DATA_SIZE)
+    };
     let mut sent_so_far = 0;
     let mut next_fragment_number = 1; // Fragment numbers are 1-indexed
+    let mut pending_metadata = metadata;
 
     loop {
         if sent_so_far == total_packets {
@@ -147,12 +164,35 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
+        // Embed metadata in fragment #1 for reliability (fix #2757).
+        // If the separate metadata message is lost over UDP, the receiver
+        // can reconstruct it from the embedded bytes.
+        let metadata_bytes = if next_fragment_number == 1 {
+            pending_metadata.take()
+        } else {
+            None
+        };
+
+        // Calculate available payload size for this fragment.
+        // For fragment #1 with embedded metadata, reduce payload to make room
+        // for the metadata bytes within the MAX_DATA_SIZE constraint.
+        let available_payload = if let Some(ref meta) = metadata_bytes {
+            // Reserve space for metadata: bincode serializes Option<Bytes> as:
+            // - 1 byte for Some discriminant
+            // - 8 bytes for length prefix
+            // - N bytes for the actual data
+            let meta_overhead = 1 + 8 + meta.len();
+            MAX_DATA_SIZE.saturating_sub(meta_overhead)
+        } else {
+            MAX_DATA_SIZE
+        };
+
         // Zero-copy fragmentation using Bytes::slice()
         // This avoids allocating a new Vec for each fragment
         let fragment = {
-            if stream_to_send.len() > MAX_DATA_SIZE {
-                let fragment = stream_to_send.slice(..MAX_DATA_SIZE);
-                stream_to_send = stream_to_send.slice(MAX_DATA_SIZE..);
+            if stream_to_send.len() > available_payload {
+                let fragment = stream_to_send.slice(..available_payload);
+                stream_to_send = stream_to_send.slice(available_payload..);
                 fragment
             } else {
                 std::mem::take(&mut stream_to_send)
@@ -175,6 +215,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 total_length_bytes: total_length_bytes as u64,
                 fragment_number: next_fragment_number,
                 payload: fragment,
+                metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
             token,
@@ -283,6 +324,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
+    metadata: Option<Bytes>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let total_bytes = inbound_handle.total_bytes();
@@ -303,6 +345,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let mut stream = inbound_handle.stream();
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
+    let mut pending_metadata = metadata;
 
     while let Some(result) = stream.next().await {
         let payload = match result {
@@ -368,6 +411,35 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
+        // Embed metadata in fragment #1 for reliability (fix #2757).
+        // For piped streams, only embed if it fits within MAX_DATA_SIZE without
+        // exceeding the limit. If the fragment #1 payload is too large, skip
+        // embedding and rely on the separate metadata message instead.
+        let metadata_bytes = if fragment_number == 1 {
+            if let Some(meta) = pending_metadata.take() {
+                // Note: The 41-byte overhead already includes Option discriminant (1 byte)
+                // and length prefix (8 bytes). Only add the metadata data length.
+                let required_size = payload.len() + 41 + meta.len();
+                if required_size <= packet_data::MAX_DATA_SIZE {
+                    Some(meta)
+                } else {
+                    tracing::debug!(
+                        stream_id = %outbound_stream_id.0,
+                        payload_len = payload.len(),
+                        meta_len = meta.len(),
+                        required_size,
+                        max_size = packet_data::MAX_DATA_SIZE,
+                        "Skipping metadata embedding in piped fragment #1 - would exceed MAX_DATA_SIZE"
+                    );
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         let token = congestion_controller.on_send_with_token(packet_size);
 
@@ -382,6 +454,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 total_length_bytes: total_bytes,
                 fragment_number,
                 payload,
+                metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
             token,
@@ -559,6 +632,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
@@ -662,6 +736,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         // Wait for send task to complete
@@ -754,6 +829,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
         ));
 
         // Wait for send task to complete
@@ -777,5 +853,94 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Test that fragment #1 with embedded metadata never exceeds MAX_DATA_SIZE.
+    /// This is a regression test for the critical bug where adding metadata to
+    /// fragment #1 caused size overflow, breaking all streaming operations >1422 bytes.
+    #[test]
+    fn test_fragment_1_with_metadata_respects_max_size() {
+        use crate::transport::symmetric_message::{StreamFragment, SymmetricMessage};
+
+        // Test Case 1: Typical metadata size (~200 bytes)
+        let typical_metadata = bytes::Bytes::from(vec![0u8; 200]);
+        let meta_overhead = 1 + 8 + typical_metadata.len(); // Option discriminant + length + data
+        let available_payload = MAX_DATA_SIZE.saturating_sub(meta_overhead);
+
+        let fragment_with_typical_meta = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 1,
+            payload: bytes::Bytes::from(vec![0u8; available_payload]),
+            metadata_bytes: Some(typical_metadata),
+        };
+
+        let msg = SymmetricMessage {
+            packet_id: 1,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_with_typical_meta),
+        };
+
+        let serialized = bincode::serialize(&msg).expect("serialization should succeed");
+        assert!(
+            serialized.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #1 with typical metadata ({} bytes) exceeds MAX_DATA_SIZE: {} > {}",
+            200,
+            serialized.len(),
+            packet_data::MAX_DATA_SIZE
+        );
+
+        // Test Case 2: Large metadata (500 bytes) - stress test
+        let large_metadata = bytes::Bytes::from(vec![0u8; 500]);
+        let large_meta_overhead = 1 + 8 + large_metadata.len();
+        let available_payload_large = MAX_DATA_SIZE.saturating_sub(large_meta_overhead);
+
+        let fragment_with_large_meta = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 1,
+            payload: bytes::Bytes::from(vec![0u8; available_payload_large]),
+            metadata_bytes: Some(large_metadata),
+        };
+
+        let msg_large = SymmetricMessage {
+            packet_id: 2,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_with_large_meta),
+        };
+
+        let serialized_large =
+            bincode::serialize(&msg_large).expect("serialization should succeed");
+        assert!(
+            serialized_large.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #1 with large metadata ({} bytes) exceeds MAX_DATA_SIZE: {} > {}",
+            500,
+            serialized_large.len(),
+            packet_data::MAX_DATA_SIZE
+        );
+
+        // Test Case 3: Fragment #2 (no metadata) should use full MAX_DATA_SIZE
+        let fragment_2 = StreamFragment {
+            stream_id: StreamId::next_operations(),
+            total_length_bytes: 10000,
+            fragment_number: 2,
+            payload: bytes::Bytes::from(vec![0u8; MAX_DATA_SIZE]),
+            metadata_bytes: None,
+        };
+
+        let msg_frag2 = SymmetricMessage {
+            packet_id: 3,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::from(fragment_2),
+        };
+
+        let serialized_frag2 =
+            bincode::serialize(&msg_frag2).expect("serialization should succeed");
+        assert!(
+            serialized_frag2.len() <= packet_data::MAX_DATA_SIZE,
+            "Fragment #2 (no metadata, full payload) exceeds MAX_DATA_SIZE: {} > {}",
+            serialized_frag2.len(),
+            packet_data::MAX_DATA_SIZE
+        );
     }
 }

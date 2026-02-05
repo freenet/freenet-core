@@ -696,7 +696,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
         &mut self,
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
-    ) -> Response;
+    ) -> impl Future<Output = Response> + Send;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 

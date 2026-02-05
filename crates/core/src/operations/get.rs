@@ -17,7 +17,7 @@ use crate::{
 };
 use either::Either;
 
-use super::orphan_streams::STREAM_CLAIM_TIMEOUT;
+use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use super::{should_use_streaming, OpEnum, OpError, OpOutcome, OperationResult};
 use crate::transport::peer_connection::StreamId;
 
@@ -950,6 +950,31 @@ impl Operation for GetOp {
                                 phase = "complete",
                                 "GET: contract found locally"
                             );
+
+                            // Register the GET requester's interest in this contract so that
+                            // update broadcasts include them as a target. This is critical for
+                            // partitioned topologies: the requester's auto-subscribe may route
+                            // to a blocked peer instead of back to us, so we register interest
+                            // proactively when serving the GET response.
+                            if let Some(upstream_addr) = self.upstream_addr {
+                                if let Some(pkl) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(upstream_addr)
+                                {
+                                    let peer_key =
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                                    op_manager
+                                        .interest_manager
+                                        .register_peer_interest(&key, peer_key, None, false);
+                                    tracing::debug!(
+                                        tx = %id,
+                                        contract = %key,
+                                        requester = %upstream_addr,
+                                        "Registered GET requester interest for update broadcasts"
+                                    );
+                                }
+                            }
 
                             // Check if this is a forwarded request or a local request
                             // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
@@ -1973,13 +1998,21 @@ impl Operation for GetOp {
                         "Processing GET ResponseStreaming"
                     );
 
-                    // Step 1: Claim the stream from orphan registry
+                    // Step 1: Claim the stream from orphan registry (atomic dedup)
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
                         .claim_or_wait(stream_id, STREAM_CLAIM_TIMEOUT)
                         .await
                     {
                         Ok(handle) => handle,
+                        Err(OrphanStreamError::AlreadyClaimed) => {
+                            tracing::debug!(
+                                tx = %id,
+                                stream_id = %stream_id,
+                                "GET ResponseStreaming skipped — stream already claimed (dedup)"
+                            );
+                            return Err(OpError::OpNotPresent(id));
+                        }
                         Err(e) => {
                             tracing::error!(
                                 tx = %id,
@@ -2025,13 +2058,29 @@ impl Operation for GetOp {
                                 total_size: *total_size,
                                 includes_contract,
                             };
-                            conn_manager
-                                .send(upstream_addr, NetMessage::from(pipe_metadata))
-                                .await?;
+                            let pipe_metadata_net: NetMessage = pipe_metadata.into();
+                            // Serialize metadata for embedding in fragment #1 (fix #2757)
+                            let embedded_metadata = match bincode::serialize(&pipe_metadata_net) {
+                                Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        error = %e,
+                                        "Failed to serialize piped stream metadata for embedding"
+                                    );
+                                    None
+                                }
+                            };
+                            conn_manager.send(upstream_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
                             conn_manager
-                                .pipe_stream(upstream_addr, outbound_sid, forked_handle)
+                                .pipe_stream(
+                                    upstream_addr,
+                                    outbound_sid,
+                                    forked_handle,
+                                    embedded_metadata,
+                                )
                                 .await?;
 
                             true
