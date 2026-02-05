@@ -182,57 +182,50 @@ cargo bench --bench transport_perf -- slow_start
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Application Layer                       │
-│              (PeerConnection::send/recv)                    │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-        ┌────────────▼────────────┐
-        │   Outbound Stream       │
-        │  (Fragment & Queue)     │
-        └────┬───────────┬────────┘
-             │           │
-    ┌────────▼───┐  ┌───▼──────────┐  ┌──────────────────┐
-    │   LEDBAT   │  │ Token Bucket │  │ Global Bandwidth │
-    │   (cwnd)   │  │ (rate limit) │◄─│ Pool (optional)  │
-    └────┬───────┘  └───┬──────────┘  │ total/N = rate   │
-         │              │             └──────────────────┘
-         │              │
-         │    rate = min(ledbat_rate, global_rate)
-         └──────┬───────┘
-                │
-      ┌─────────▼──────────┐
-      │  Packet Assembly   │
-      │  (Serialize +      │
-      │   Encrypt)         │
-      └─────────┬──────────┘
-                │
-      ┌─────────▼──────────┐
-      │    UDP Socket      │
-      │  (sendto/recvfrom) │
-      └─────────┬──────────┘
-                │
-                │ (incoming fragments)
-                ▼
-      ┌─────────────────────────────────────────────────────┐
-      │              StreamRegistry                          │
-      │         (stream_id → StreamHandle)                   │
-      └─────────────────────┬───────────────────────────────┘
-                            │
-      ┌─────────────────────▼───────────────────────────────┐
-      │              LockFreeStreamBuffer                    │
-      │  ┌─────┬─────┬─────┬─────┬─────┐                    │
-      │  │ [1] │ [2] │ [3] │ ... │ [n] │  OnceLock<Bytes>   │
-      │  └─────┴─────┴─────┴─────┴─────┘                    │
-      │  contiguous_fragments: AtomicU32 (frontier tracking)│
-      └─────────────────────┬───────────────────────────────┘
-                            │
-      ┌─────────────────────▼───────────────────────────────┐
-      │           StreamingInboundStream                     │
-      │              (futures::Stream)                       │
-      │         [independent read position]                  │
-      └─────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Application["Application Layer"]
+        PeerConn["PeerConnection::send/recv"]
+    end
+
+    subgraph Outbound["Outbound Processing"]
+        OutStream["Outbound Stream<br/>(Fragment & Queue)"]
+    end
+
+    subgraph RateControl["Rate Control"]
+        LEDBAT["LEDBAT<br/>(cwnd)"]
+        TokenBucket["Token Bucket<br/>(rate limit)"]
+        GlobalBW["Global Bandwidth Pool<br/>(optional)<br/>total/N = rate"]
+    end
+
+    subgraph PacketProc["Packet Processing"]
+        Assembly["Packet Assembly<br/>(Serialize + Encrypt)"]
+        UDP["UDP Socket<br/>(sendto/recvfrom)"]
+    end
+
+    subgraph Inbound["Inbound Processing"]
+        Registry["StreamRegistry<br/>(stream_id → StreamHandle)"]
+        Buffer["LockFreeStreamBuffer<br/>OnceLock&lt;Bytes&gt; array<br/>contiguous_fragments: AtomicU32"]
+        InStream["StreamingInboundStream<br/>(futures::Stream)<br/>independent read position"]
+    end
+
+    PeerConn --> OutStream
+    OutStream --> LEDBAT
+    OutStream --> TokenBucket
+    GlobalBW -.->|"provides rate"| TokenBucket
+    LEDBAT -->|"ledbat_rate"| RateCalc["rate = min(ledbat_rate, global_rate)"]
+    TokenBucket -->|"global_rate"| RateCalc
+    RateCalc --> Assembly
+    Assembly --> UDP
+    UDP -->|"incoming fragments"| Registry
+    Registry --> Buffer
+    Buffer --> InStream
+
+    style Application fill:#e3f2fd,stroke:#1976d2
+    style Outbound fill:#fff3e0,stroke:#f57c00
+    style RateControl fill:#f3e5f5,stroke:#7b1fa2
+    style PacketProc fill:#e8f5e9,stroke:#388e3c
+    style Inbound fill:#fce4ec,stroke:#c2185b
 ```
 
 ## Flow Control

@@ -218,28 +218,26 @@ This means:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    PeerConnection                           │
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │    LEDBAT    │    │   Global     │    │  TokenBucket │  │
-│  │  Controller  │    │  Bandwidth   │    │   (Pacer)    │  │
-│  │              │    │   Manager    │    │              │  │
-│  │ Measures RTT │    │ Counts conns │    │ Paces packets│  │
-│  │ & queuing    │    │ Divides fair │    │ at final     │  │
-│  │ delay        │    │ share        │    │ rate         │  │
-│  └──────┬───────┘    └──────┬───────┘    └──────▲───────┘  │
-│         │                   │                   │          │
-│         │   ledbat_rate     │   global_rate     │          │
-│         └─────────┬─────────┘                   │          │
-│                   │                             │          │
-│                   ▼                             │          │
-│            ┌──────────────┐                     │          │
-│            │  min(a, b)   │─────────────────────┘          │
-│            └──────────────┘     final_rate                 │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph PeerConnection["PeerConnection"]
+        subgraph Controllers["Rate Controllers"]
+            LEDBAT["LEDBAT Controller<br/>Measures RTT & queuing delay"]
+            GlobalBW["Global Bandwidth Manager<br/>Counts conns, divides fair share"]
+            TokenBucket["TokenBucket (Pacer)<br/>Paces packets at final rate"]
+        end
+
+        LEDBAT -->|"ledbat_rate"| MinCalc["min(a, b)"]
+        GlobalBW -->|"global_rate"| MinCalc
+        MinCalc -->|"final_rate"| TokenBucket
+    end
+
+    style PeerConnection fill:#f8f9fa,stroke:#6c757d
+    style Controllers fill:#e9ecef,stroke:#495057
+    style LEDBAT fill:#d4edda,stroke:#28a745
+    style GlobalBW fill:#cce5ff,stroke:#004085
+    style TokenBucket fill:#fff3cd,stroke:#856404
+    style MinCalc fill:#f8d7da,stroke:#721c24
 ```
 
 ## Implementation Details

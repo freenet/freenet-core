@@ -11,7 +11,13 @@
    → Check .claude/rules/testing.md for DST requirements
    → Verify: TimeSource for time, GlobalRng for randomness
 
-2. Is this Rust code?
+2. Which module are you modifying?
+   → ring/router/     → Check .claude/rules/ring.md
+   → operations/      → Check .claude/rules/operations.md
+   → transport/       → Check .claude/rules/transport.md
+   → contract/wasm_runtime/ → Check .claude/rules/contracts.md
+
+3. Is this Rust code?
    → Check .claude/rules/code-style.md
 ```
 
@@ -92,14 +98,32 @@ docs/architecture/  # Design docs
 
 ## Documentation
 
+### Architecture Docs
+
 | Topic | Location |
 |-------|----------|
 | Architecture | `docs/architecture/README.md` |
+| Ring/DHT | `docs/architecture/ring/README.md` |
+| Operations | `docs/architecture/operations/README.md` |
 | Transport | `docs/architecture/transport/README.md` |
 | Testing | `docs/architecture/testing/README.md` |
+
+### Module Rules (path-scoped)
+
+| Module | Rules |
+|--------|-------|
+| Ring/Router | `.claude/rules/ring.md` |
+| Operations | `.claude/rules/operations.md` |
+| Transport | `.claude/rules/transport.md` |
+| Contracts | `.claude/rules/contracts.md` |
+
+### General Rules
+
+| Topic | Location |
+|-------|----------|
 | Code style | `.claude/rules/code-style.md` |
 | Git workflow | `.claude/rules/git-workflow.md` |
-| DST rules | `.claude/rules/testing.md` |
+| DST testing | `.claude/rules/testing.md` |
 
 ## External Resources
 
