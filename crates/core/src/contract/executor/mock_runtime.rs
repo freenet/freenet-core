@@ -602,6 +602,10 @@ where
         vec![] // Mock implementation returns empty list
     }
 
+    fn notify_subscription_error(&self, _key: ContractInstanceId, _reason: String) {
+        // No-op in mock runtime
+    }
+
     async fn summarize_contract_state(
         &mut self,
         key: ContractKey,

@@ -309,6 +309,7 @@ impl OpManager {
         let sub_op_tracker = SubOperationTracker::new();
         let connect_forward_estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
         let request_router = Arc::new(OnceLock::new());
+        let ch_outbound = Arc::new(ch_outbound);
 
         GlobalExecutor::spawn(
             garbage_cleanup_task(
@@ -321,6 +322,7 @@ impl OpManager {
                 result_router_tx.clone(),
                 request_router.clone(),
                 ring.clone(),
+                ch_outbound.clone(),
             )
             .instrument(garbage_span),
         );
@@ -366,7 +368,7 @@ impl OpManager {
             ring,
             ops,
             to_event_listener: notification_channel,
-            ch_outbound: Arc::new(ch_outbound),
+            ch_outbound,
             new_transactions,
             result_router_tx,
             connect_forward_estimator,
@@ -934,6 +936,44 @@ async fn notify_transaction_timeout(
     }
 }
 
+/// Fire-and-forget notification that a subscription timed out.
+/// Spawns a task to avoid blocking the garbage cleanup loop on the contract handler response.
+fn notify_subscription_timeout(
+    ch_outbound: &Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
+    instance_id: ContractInstanceId,
+) {
+    let ch = Arc::clone(ch_outbound);
+    crate::config::GlobalExecutor::spawn(async move {
+        if let Err(e) = ch
+            .send_to_handler(ContractHandlerEvent::NotifySubscriptionError {
+                key: instance_id,
+                reason: format!("Subscription timed out for contract {}", instance_id),
+            })
+            .await
+        {
+            tracing::debug!(
+                contract = %instance_id,
+                error = %e,
+                "Failed to notify subscription timeout"
+            );
+        }
+    });
+}
+
+/// Removes a subscribe operation from the ops map and notifies timeout if found.
+/// Returns `Some(())` if the operation was found and removed, `None` otherwise.
+fn remove_subscribe_and_notify_timeout(
+    ops: &Ops,
+    tx: &Transaction,
+    ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
+) -> Option<()> {
+    let (_, sub_op) = ops.subscribe.remove(tx)?;
+    if let Some(instance_id) = sub_op.instance_id() {
+        notify_subscription_timeout(ch_outbound, instance_id);
+    }
+    Some(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
@@ -945,6 +985,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
+    ch_outbound: Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -985,7 +1026,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
                         TransactionType::Get => ops.get.remove(&tx).is_none(),
-                        TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
+                        TransactionType::Subscribe => {
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_none()
+                        }
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
                     if still_waiting {
@@ -1056,7 +1099,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
                         TransactionType::Get => ops.get.remove(&tx).is_some(),
-                        TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),
+                        TransactionType::Subscribe => {
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_some()
+                        }
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };
                     if removed {

@@ -565,6 +565,22 @@ where
                     );
                 }
             }
+            ContractHandlerEvent::NotifySubscriptionError { key, reason } => {
+                contract_handler
+                    .executor()
+                    .notify_subscription_error(key, reason);
+                if let Err(error) = contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::NotifySubscriptionErrorResponse)
+                    .await
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send NotifySubscriptionError response"
+                    );
+                }
+            }
             ContractHandlerEvent::QuerySubscriptions { callback } => {
                 // Get subscription information from the executor and send it through the callback
                 let subscriptions = contract_handler.executor().get_subscription_info();

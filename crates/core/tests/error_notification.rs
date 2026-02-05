@@ -5,15 +5,16 @@
 //!
 //! Related Issues:
 //! - #1858: Clients hang when operations fail (no error notification)
+//! - #2490: Notify clients when async subscription fails
 
 use freenet::{
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, TestContext},
+    test_utils::{load_contract, make_get, make_subscribe, TestContext},
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, WebApi},
+    client_api::{ClientRequest, ContractRequest, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -231,6 +232,74 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
         .send(ClientRequest::Disconnect { cause: None })
         .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    Ok(())
+}
+
+/// Subscribe to a non-existent contract on a 2-node network and verify the client
+/// receives an error instead of silently holding a dead notification channel.
+///
+/// Fixes: #2490
+#[freenet_test(
+    nodes = ["gateway", "node-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.gateway()?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
+    let mut client = WebApi::start(ws_stream);
+
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = load_contract(TEST_CONTRACT, vec![42u8; 32].into())?;
+    make_subscribe(&mut client, contract.key()).await?;
+
+    let mut got_result_error = false;
+    let mut got_notification_error = false;
+    let deadline = Duration::from_secs(90);
+    let start = tokio::time::Instant::now();
+
+    while start.elapsed() < deadline {
+        match timeout(Duration::from_secs(10), client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::SubscribeResponse {
+                    subscribed, ..
+                },
+            ))) => {
+                if !subscribed {
+                    got_result_error = true;
+                }
+            }
+            Ok(Err(e)) => {
+                let err_str = format!("{e}");
+                if err_str.contains("not found") || err_str.contains("Subscription failed") {
+                    got_notification_error = true;
+                } else {
+                    got_result_error = true;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Err(_) => break,
+        }
+
+        if got_result_error && got_notification_error {
+            break;
+        }
+    }
+
+    assert!(
+        got_result_error || got_notification_error,
+        "Client did not receive any error for failed subscription \
+         Got result_error={}, notification_error={}",
+        got_result_error,
+        got_notification_error
+    );
+
+    client
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
 
     Ok(())
 }

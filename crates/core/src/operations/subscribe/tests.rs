@@ -467,7 +467,10 @@ async fn test_subscription_validates_k_closest_usage() {
     {
         let op = SubscribeOp {
             id: transaction_id,
-            state: Some(SubscribeState::AwaitingResponse { next_hop: None }),
+            state: Some(SubscribeState::AwaitingResponse {
+                next_hop: None,
+                instance_id: *contract_key.id(),
+            }),
             requester_addr: None,
             is_renewal: false,
         };
@@ -584,6 +587,7 @@ fn test_subscribe_op_state_lifecycle() {
         id: tx_id,
         state: Some(SubscribeState::AwaitingResponse {
             next_hop: Some(peer_addr),
+            instance_id,
         }),
         requester_addr: None,
         is_renewal: false,

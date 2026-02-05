@@ -92,6 +92,8 @@ enum SubscribeState {
     AwaitingResponse {
         /// The target we're sending to (for hop-by-hop routing)
         next_hop: Option<std::net::SocketAddr>,
+        /// The contract being subscribed to (needed for error notification on abort)
+        instance_id: ContractInstanceId,
     },
     /// Subscription completed.
     Completed { key: ContractKey },
@@ -307,6 +309,7 @@ pub(crate) async fn request_subscribe(
         id: *id,
         state: Some(SubscribeState::AwaitingResponse {
             next_hop: Some(target_addr),
+            instance_id: *instance_id,
         }),
         requester_addr: None, // We're the originator
         is_renewal,
@@ -369,6 +372,15 @@ pub(crate) struct SubscribeOp {
 }
 
 impl SubscribeOp {
+    /// Extract the contract instance_id from the current state, if available.
+    pub(crate) fn instance_id(&self) -> Option<ContractInstanceId> {
+        match &self.state {
+            Some(SubscribeState::PrepareRequest { instance_id, .. }) => Some(*instance_id),
+            Some(SubscribeState::AwaitingResponse { instance_id, .. }) => Some(*instance_id),
+            _ => None,
+        }
+    }
+
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
         OpOutcome::Irrelevant
     }
@@ -397,7 +409,7 @@ impl SubscribeOp {
     /// an outbound message. Used for hop-by-hop routing.
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(SubscribeState::AwaitingResponse { next_hop }) => *next_hop,
+            Some(SubscribeState::AwaitingResponse { next_hop, .. }) => *next_hop,
             _ => None,
         }
     }
@@ -413,24 +425,49 @@ impl SubscribeOp {
             "Subscribe operation aborted due to connection failure"
         );
 
-        // Create an error result to notify the client
-        let error_result: crate::client_events::HostResult =
-            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "Subscribe operation failed: peer connection dropped".into(),
+        if op_manager.is_sub_operation(self.id) {
+            // Async sub-operation: no client is waiting on this transaction.
+            // Notify via the subscription notification channel instead.
+            if let Some(SubscribeState::AwaitingResponse { instance_id, .. }) = &self.state {
+                let reason = format!(
+                    "Subscription failed for contract {}: peer connection dropped",
+                    instance_id
+                );
+                if let Err(e) = op_manager
+                    .notify_contract_handler(
+                        crate::contract::ContractHandlerEvent::NotifySubscriptionError {
+                            key: *instance_id,
+                            reason,
+                        },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        tx = %self.id,
+                        contract = %instance_id,
+                        error = %e,
+                        "Failed to send subscription abort error to notification channels"
+                    );
+                }
             }
-            .into());
-
-        // Send the error to the client via the result router
-        if let Err(err) = op_manager
-            .result_router_tx
-            .send((self.id, error_result))
-            .await
-        {
-            tracing::error!(
-                tx = %self.id,
-                error = %err,
-                "Failed to send abort notification to client"
-            );
+        } else {
+            // Standalone subscribe: client is waiting on this transaction directly.
+            let error_result: crate::client_events::HostResult =
+                Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                    cause: "Subscribe operation failed: peer connection dropped".into(),
+                }
+                .into());
+            if let Err(err) = op_manager
+                .result_router_tx
+                .send((self.id, error_result))
+                .await
+            {
+                tracing::error!(
+                    tx = %self.id,
+                    error = %err,
+                    "Failed to send abort notification to client"
+                );
+            }
         }
 
         // Mark the operation as completed so it's removed from tracking
@@ -491,16 +528,21 @@ impl Operation for SubscribeOp {
                 }
 
                 // New request from another peer - we're an intermediate/terminal node
-                // Extract is_renewal from the Request message
-                let is_renewal = match msg {
-                    SubscribeMsg::Request { is_renewal, .. } => *is_renewal,
-                    _ => false, // Response case handled above
+                // Extract is_renewal and instance_id from the Request message
+                let (is_renewal, msg_instance_id) = match msg {
+                    SubscribeMsg::Request {
+                        is_renewal,
+                        instance_id,
+                        ..
+                    } => (*is_renewal, *instance_id),
+                    _ => unreachable!("Response case handled above"),
                 };
                 Ok(OpInitialization {
                     op: Self {
                         id,
                         state: Some(SubscribeState::AwaitingResponse {
                             next_hop: None, // Will be determined during processing
+                            instance_id: msg_instance_id,
                         }),
                         requester_addr: source_addr, // Store who sent us this request
                         is_renewal,
@@ -695,6 +737,7 @@ impl Operation for SubscribeOp {
                             id: *id,
                             state: Some(SubscribeState::AwaitingResponse {
                                 next_hop: None, // Already routing via next_hop in OperationResult
+                                instance_id: *instance_id,
                             }),
                             requester_addr: self.requester_addr,
                             is_renewal: self.is_renewal,
@@ -927,6 +970,27 @@ impl Operation for SubscribeOp {
                                 } else {
                                     // No local cache - subscription failed
                                     tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
+
+                                    // Notify subscribed clients that the subscription failed
+                                    let reason = format!(
+                                        "Subscription failed: contract {} not found in network",
+                                        instance_id
+                                    );
+                                    if let Err(e) = op_manager
+                                        .notify_contract_handler(
+                                            ContractHandlerEvent::NotifySubscriptionError {
+                                                key: *instance_id,
+                                                reason,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            contract = %instance_id,
+                                            error = %e,
+                                            "Failed to send subscription error to client notification channels"
+                                        );
+                                    }
 
                                     // Emit telemetry for subscription not found
                                     if let Some(event) = NetEventLog::subscribe_not_found(

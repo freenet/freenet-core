@@ -612,14 +612,35 @@ fn start_subscription_request_internal(
                 tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
             }
             Err(error) => {
-                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %error, phase = "error", "child subscription failed");
-
                 let error_msg = format!("{}", error);
+                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = error_msg, phase = "error", "child subscription failed");
+
                 if let Err(e) = op_manager_cloned
                     .sub_operation_failed(child_tx, &error_msg)
                     .await
                 {
                     tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %e, phase = "error", "failed to propagate failure");
+                }
+
+                // Without parent tracking, sub_operation_failed has no parent link
+                // to propagate through, so notify clients via the subscription channel.
+                if !track_parent {
+                    let instance_id = *key.id();
+                    if let Err(e) = op_manager_cloned
+                        .notify_contract_handler(
+                            crate::contract::ContractHandlerEvent::NotifySubscriptionError {
+                                key: instance_id,
+                                reason: format!("Subscription failed: {}", error_msg),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            contract = %instance_id,
+                            error = %e,
+                            "Failed to send subscription error to notification channels"
+                        );
+                    }
                 }
             }
         }
