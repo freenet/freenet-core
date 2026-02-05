@@ -225,62 +225,76 @@ pub fn gw_config_from_path_with_rng<R: Rng>(
     })
 }
 
-/// Wait for a node to be connected to the network with at least min_peers connections.
-/// Returns the number of connected peers on success.
+/// Wait for a node to have at least min_peers ring connections.
+/// Uses NodeDiagnostics to check ring connections (not transport-level connections),
+/// ensuring the CONNECT handshake has completed and peers are promoted to the ring.
+/// Returns the number of ring-connected peers on success.
 pub async fn wait_for_node_connected(
     client: &mut WebApi,
     node_name: &str,
     min_peers: usize,
     timeout_secs: u64,
 ) -> Result<usize> {
+    use freenet_stdlib::client_api::{NodeDiagnosticsConfig, NodeQuery, QueryResponse};
+
     let start = std::time::Instant::now();
     let timeout_duration = Duration::from_secs(timeout_secs);
+    let config = NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![],
+        include_system_metrics: true,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
 
     loop {
         if start.elapsed() > timeout_duration {
             return Err(anyhow!(
-                "{} failed to connect to network within {}s",
+                "{} failed to get {} ring connection(s) within {}s",
                 node_name,
+                min_peers,
                 timeout_secs
             ));
         }
 
-        // Query connected peers
+        // Query diagnostics for ring connection count
         if let Err(e) = client
-            .send(ClientRequest::NodeQueries(
-                freenet_stdlib::client_api::NodeQuery::ConnectedPeers,
-            ))
+            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                config: config.clone(),
+            }))
             .await
         {
-            tracing::warn!("{}: Failed to send query: {}", node_name, e);
+            tracing::warn!("{}: Failed to send diagnostics query: {}", node_name, e);
             sleep(Duration::from_millis(500)).await;
             continue;
         }
 
         // Wait for response with short timeout
         match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
-            Ok(Ok(HostResponse::QueryResponse(
-                freenet_stdlib::client_api::QueryResponse::ConnectedPeers { peers },
-            ))) => {
-                let peer_count = peers.len();
-                if peer_count >= min_peers {
-                    tracing::info!(
-                        "{}: Connected with {} peer(s) after {:?}",
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
+                if let Some(metrics) = &response.system_metrics {
+                    let ring_count = metrics.active_connections as usize;
+                    if ring_count >= min_peers {
+                        tracing::info!(
+                            "{}: {} ring connection(s) after {:?}",
+                            node_name,
+                            ring_count,
+                            start.elapsed()
+                        );
+                        return Ok(ring_count);
+                    }
+                    tracing::debug!(
+                        "{}: Only {} ring connection(s), waiting for {}...",
                         node_name,
-                        peer_count,
-                        start.elapsed()
+                        ring_count,
+                        min_peers
                     );
-                    return Ok(peer_count);
                 }
-                tracing::debug!(
-                    "{}: Only {} peers connected, waiting for {}...",
-                    node_name,
-                    peer_count,
-                    min_peers
-                );
             }
             Ok(Ok(_other)) => {
-                // Ignore other messages
+                // Ignore other messages (e.g. UpdateNotification)
             }
             Ok(Err(e)) => {
                 tracing::warn!("{}: Error receiving response: {}", node_name, e);
