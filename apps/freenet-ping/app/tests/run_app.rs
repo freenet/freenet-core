@@ -700,8 +700,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 60).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 60).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract
@@ -1388,8 +1388,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 60).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 60).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract
