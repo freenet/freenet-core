@@ -234,7 +234,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: freenet/river
-          ref: feat/blocking-subscribe
           path: river-src
 
       - uses: dtolnay/rust-toolchain@stable
