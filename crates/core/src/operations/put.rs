@@ -349,6 +349,12 @@ impl Operation for PutOp {
                         }
                     }
 
+                    // Invariant: after storing and seeding, the contract MUST be in the seed list.
+                    debug_assert!(
+                        op_manager.ring.is_seeding_contract(&key),
+                        "PUT Request: contract {key} must be in seed list after put_contract + seed_contract"
+                    );
+
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
@@ -870,6 +876,12 @@ impl Operation for PutOp {
                         }
                     }
 
+                    // Invariant: after storing and seeding, the contract MUST be in the seed list.
+                    debug_assert!(
+                        op_manager.ring.is_seeding_contract(&key),
+                        "PUT Streaming: contract {key} must be in seed list after put_contract + seed_contract"
+                    );
+
                     // Step 5: Handle forwarding or final destination
                     if piping_started {
                         // Piping is already underway - just track state, no need to forward via return
@@ -1347,6 +1359,12 @@ async fn put_contract(
         }) => {
             // Notify any waiters that this contract has been stored
             op_manager.notify_contract_stored(&key);
+            // Invariant: after a successful PUT, the stored state must be non-empty.
+            // A successful PutResponse with an empty value indicates a contract handler bug.
+            debug_assert!(
+                new_val.size() > 0,
+                "put_contract: stored state must be non-empty after successful PUT for contract {key}"
+            );
             Ok((new_val, state_changed))
         }
         Ok(ContractHandlerEvent::PutResponse {
