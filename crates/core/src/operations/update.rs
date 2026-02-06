@@ -1178,6 +1178,12 @@ async fn update_contract(
             new_value: Ok(new_val),
             state_changed,
         }) => {
+            // Invariant: after a successful UPDATE, the resulting state must be non-empty.
+            // A successful UpdateResponse with an empty value indicates a contract handler bug.
+            debug_assert!(
+                new_val.size() > 0,
+                "update_contract: state must be non-empty after successful UPDATE for contract {key}"
+            );
             let new_bytes = State::from(new_val.clone()).into_bytes();
             let summary = StateSummary::from(new_bytes);
 
