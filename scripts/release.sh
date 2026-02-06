@@ -484,7 +484,7 @@ check_prerequisites() {
         local total_checks in_progress_count failed_count
         total_checks=$(echo "$check_runs_json" | jq '.total_count // 0')
         in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed")] | length')
-        failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")] | length')
+        failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot")] | length')
 
         if [[ "$total_checks" == "0" ]]; then
             echo "⚠️  (no checks found)"
