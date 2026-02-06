@@ -1789,7 +1789,6 @@ pub async fn run_local_node(
                 let op_name = match op {
                     DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
                     DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
-                    DelegateRequest::GetSecretRequest { .. } => "GetSecretRequest",
                     DelegateRequest::UnregisterDelegate(_) => "UnregisterDelegate",
                     _ => "Unknown",
                 };

@@ -159,8 +159,6 @@ impl Runtime {
         let inbound_msg_name = match msg {
             InboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
-            InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
-            InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
             InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
@@ -194,9 +192,6 @@ impl Runtime {
                     ),
                     OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput".to_string(),
                     OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
-                    OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
-                    OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
-                    OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
                     OutboundDelegateMsg::GetContractRequest(req) => {
                         format!("GetContractRequest(contract={})", req.contract_id)
                     }
@@ -232,9 +227,6 @@ impl Runtime {
                 outbound_msgs.iter().map(|msg| {
                     match msg {
                         OutboundDelegateMsg::ApplicationMessage(m) => format!("AppMsg(payload_len={})", m.payload.len()),
-                        OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretReq".to_string(),
-                        OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResp".to_string(),
-                        OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretReq".to_string(),
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
                         OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
@@ -324,15 +316,6 @@ impl Runtime {
                     // Processed contract request - just update context
                     tracing::debug!("GetContractRequest processed");
                     *context = ctx.as_ref().to_vec();
-                }
-
-                // Deprecated message types - delegates should use host functions instead
-                OutboundDelegateMsg::GetSecretRequest(_)
-                | OutboundDelegateMsg::SetSecretRequest(_)
-                | OutboundDelegateMsg::GetSecretResponse(_) => {
-                    tracing::warn!(
-                        "Delegate emitted deprecated secret message type - use host functions instead"
-                    );
                 }
             }
         }
@@ -453,13 +436,6 @@ impl DelegateRuntimeInterface for Runtime {
                         &mut results,
                     )?;
                 }
-                // Deprecated message types - delegates should use host functions for secrets
-                InboundDelegateMsg::GetSecretRequest(_)
-                | InboundDelegateMsg::GetSecretResponse(_) => {
-                    tracing::warn!(
-                        "Received deprecated secret message type - use host functions instead"
-                    );
-                }
             }
         }
 
@@ -522,7 +498,6 @@ mod test {
             RemoveSecret(Vec<u8>),
             WriteLargeContext(usize),
             StoreLargeSecret { key: Vec<u8>, size: usize },
-            EmitDeprecatedSecretRequest { key: Vec<u8> },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -539,7 +514,6 @@ mod test {
             SecretRemoved,
             LargeContextWritten(usize),
             LargeSecretStored(usize),
-            DeprecatedRequestEmitted,
         }
     }
 
@@ -1396,61 +1370,6 @@ mod test {
             }
             other => panic!("Expected ContextData, got {:?}", other),
         }
-
-        std::mem::drop(temp_dir);
-        Ok(())
-    }
-
-    /// Test that deprecated secret messages (GetSecretRequest, etc.) are handled gracefully.
-    /// The runtime should log a warning but still complete successfully.
-    /// Deprecated messages are intentionally discarded (not forwarded) - the delegate should
-    /// use host functions instead.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_deprecated_secret_message_handling() -> Result<(), Box<dyn std::error::Error>> {
-        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
-
-        let contract = WrappedContract::new(
-            Arc::new(ContractCode::from(vec![1])),
-            Parameters::from(vec![]),
-        );
-        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
-
-        // Send message that causes delegate to emit a deprecated GetSecretRequest
-        // The delegate returns: [GetSecretRequest (deprecated), ApplicationMessage]
-        // The runtime should log a warning for the deprecated message and discard it,
-        // but still return the ApplicationMessage successfully.
-        let payload = bincode::serialize(&InboundAppMessage::EmitDeprecatedSecretRequest {
-            key: vec![1, 2],
-        })?;
-        let msg = ApplicationMessage::new(app, payload);
-        let outbound = runtime.inbound_app_message(
-            delegate.key(),
-            &vec![].into(),
-            None,
-            vec![InboundDelegateMsg::ApplicationMessage(msg)],
-        )?;
-
-        // Only the ApplicationMessage should be returned - deprecated messages are discarded
-        assert_eq!(
-            outbound.len(),
-            1,
-            "Only ApplicationMessage should be returned, deprecated messages are discarded"
-        );
-
-        // Verify the ApplicationMessage response
-        let response: OutboundAppMessage = match &outbound[0] {
-            OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                bincode::deserialize(&app_msg.payload)?
-            }
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
-        };
-
-        assert!(
-            matches!(response, OutboundAppMessage::DeprecatedRequestEmitted),
-            "Expected DeprecatedRequestEmitted response, got {:?}",
-            response
-        );
 
         std::mem::drop(temp_dir);
         Ok(())

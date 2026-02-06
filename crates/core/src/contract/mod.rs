@@ -54,7 +54,6 @@ where
     // Extract initial params from the request (only ApplicationMessages has params we need)
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        DelegateRequest::GetSecretRequest { params, .. } => params.clone(),
         _ => Parameters::from(Vec::new()),
     };
 
