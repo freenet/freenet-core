@@ -178,7 +178,7 @@ async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> 
         bail!("Peer id not set");
     };
     std::env::set_var("FREENET_PEER_ID", peer_id);
-    freenet::config::set_logger(None, None);
+    freenet::config::set_logger(None, None, None);
     let peer = NetworkPeer::new(peer_id.clone()).await?;
     peer.run(config, peer_id.clone()).await?;
     Ok(())

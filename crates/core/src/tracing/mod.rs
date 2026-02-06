@@ -3306,7 +3306,7 @@ pub mod tracer {
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 
-    /// Get the log directory for the current platform.
+    /// Get the default log directory for the current platform.
     /// Used by both the tracer (for writing logs) and report command (for reading logs).
     pub fn get_log_dir() -> Option<PathBuf> {
         #[cfg(target_os = "linux")]
@@ -3369,6 +3369,7 @@ pub mod tracer {
     pub fn init_tracer(
         level: Option<LevelFilter>,
         _endpoint: Option<String>,
+        log_dir: Option<&std::path::Path>,
     ) -> anyhow::Result<()> {
         // Initialize console subscriber if enabled
         #[cfg(feature = "console-subscriber")]
@@ -3398,7 +3399,7 @@ pub mod tracer {
 
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
         let use_json = std::env::var("FREENET_LOG_FORMAT")
-            .map(|v| v.to_lowercase() == "json")
+            .map(|v| v.eq_ignore_ascii_case("json"))
             .unwrap_or(false);
 
         // Determine if we should write to files:
@@ -3408,7 +3409,7 @@ pub mod tracer {
         //
         // Note: On Windows especially, logs must go to files because Task Scheduler
         // doesn't capture stdout, making `freenet service report` unable to collect logs.
-        let use_file_logging = !to_stderr && get_log_dir().is_some();
+        let use_file_logging = !to_stderr && log_dir.is_some();
 
         // Build filter (we'll create separate instances for each layer since filters are consumed)
         fn build_filter(default_filter: LevelFilter) -> tracing_subscriber::EnvFilter {
@@ -3443,9 +3444,9 @@ pub mod tracer {
         };
 
         if use_file_logging {
-            if let Some(log_dir) = get_log_dir() {
+            if let Some(log_dir) = log_dir {
                 // Create log directory if it doesn't exist
-                if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                if let Err(e) = std::fs::create_dir_all(log_dir) {
                     eprintln!("Warning: Failed to create log directory: {e}");
                     // Fall back to stdout logging
                     return init_stdout_tracer(
@@ -3458,7 +3459,7 @@ pub mod tracer {
                 }
 
                 // Clean up old log files (including legacy daily logs) on startup
-                cleanup_old_logs(&log_dir);
+                cleanup_old_logs(log_dir);
 
                 // Create rolling file appender for main log (hourly rotation, 3 hour retention)
                 let main_appender = RollingFileAppender::builder()
@@ -3466,7 +3467,7 @@ pub mod tracer {
                     .max_log_files(LOG_RETENTION_HOURS)
                     .filename_prefix("freenet")
                     .filename_suffix("log")
-                    .build(&log_dir)
+                    .build(log_dir)
                     .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
 
                 // Create rolling file appender for error log (hourly rotation, 3 hour retention)
@@ -3475,7 +3476,7 @@ pub mod tracer {
                     .max_log_files(LOG_RETENTION_HOURS)
                     .filename_prefix("freenet.error")
                     .filename_suffix("log")
-                    .build(&log_dir)
+                    .build(log_dir)
                     .map_err(|e| anyhow::anyhow!("Failed to create error log appender: {e}"))?;
 
                 let (main_writer, main_guard) = tracing_appender::non_blocking(main_appender);

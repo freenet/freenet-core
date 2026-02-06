@@ -38,7 +38,7 @@ enum Error {
 fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     if !config.sub_command.is_child() {
-        freenet::config::set_logger(None, None);
+        freenet::config::set_logger(None, None, config.additional.paths.log_dir.as_deref());
     }
 
     // Test subcommand uses Turmoil which requires running outside of any tokio runtime

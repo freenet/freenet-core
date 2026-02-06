@@ -294,6 +294,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                         config_paths: freenet::config::ConfigPathsArgs {
                             config_dir: Some(temp_dir.path().to_path_buf()),
                             data_dir: Some(temp_dir.path().to_path_buf()),
+                            log_dir: Some(temp_dir.path().to_path_buf()),
                         },
                         secrets: freenet::config::SecretArgs {
                             transport_keypair: Some(transport_keypair),
@@ -431,6 +432,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                         config_paths: freenet::config::ConfigPathsArgs {
                             config_dir: Some(temp_dir.path().to_path_buf()),
                             data_dir: Some(temp_dir.path().to_path_buf()),
+                            log_dir: Some(temp_dir.path().to_path_buf()),
                         },
                         secrets: freenet::config::SecretArgs {
                             transport_keypair: Some(transport_keypair),

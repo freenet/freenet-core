@@ -368,6 +368,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir_gw.path().to_path_buf()),
             data_dir: Some(temp_dir_gw.path().to_path_buf()),
+            log_dir: Some(temp_dir_gw.path().to_path_buf()),
         },
         secrets: freenet::config::SecretArgs {
             transport_keypair: Some(gateway_transport_keypair),
@@ -424,6 +425,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir_peer.path().to_path_buf()),
             data_dir: Some(temp_dir_peer.path().to_path_buf()),
+            log_dir: Some(temp_dir_peer.path().to_path_buf()),
         },
         secrets: freenet::config::SecretArgs {
             transport_keypair: Some(peer_transport_keypair),

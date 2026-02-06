@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
 use freenet_stdlib::client_api::{
     ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
@@ -15,7 +16,8 @@ use freenet_stdlib::client_api::{
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio_tungstenite::connect_async;
 
@@ -111,11 +113,18 @@ impl ReportCommand {
         git_commit: &str,
         git_dirty: &str,
         build_timestamp: &str,
+        config_dirs: Arc<ConfigPaths>,
     ) -> Result<()> {
         println!("Collecting diagnostic info...");
 
         // Collect all diagnostic data
-        let report = self.collect_report(version, git_commit, git_dirty, build_timestamp)?;
+        let report = self.collect_report(
+            version,
+            git_commit,
+            git_dirty,
+            build_timestamp,
+            &config_dirs,
+        )?;
 
         // Print summary
         self.print_summary(&report);
@@ -137,6 +146,7 @@ impl ReportCommand {
         git_commit: &str,
         git_dirty: &str,
         build_timestamp: &str,
+        config_dirs: &ConfigPaths,
     ) -> Result<DiagnosticReport> {
         let system_info = SystemInfo {
             os: std::env::consts::OS.to_string(),
@@ -153,8 +163,8 @@ impl ReportCommand {
             build_timestamp: build_timestamp.to_string(),
         };
 
-        let logs = self.collect_logs()?;
-        let config = self.collect_config();
+        let logs = self.collect_logs(config_dirs.log_dir().map(Path::to_path_buf))?;
+        let config = self.collect_config(&config_dirs.config_dir());
         let network_status = self.collect_network_status(&config);
         let user_message = self.get_user_message()?;
 
@@ -171,8 +181,10 @@ impl ReportCommand {
         })
     }
 
-    fn collect_logs(&self) -> Result<LogContents> {
-        let log_dir = get_log_dir().context("Unsupported platform for log collection")?;
+    fn collect_logs(&self, log_dir: Option<PathBuf>) -> Result<LogContents> {
+        let log_dir = log_dir
+            .or_else(get_log_dir)
+            .context("Unsupported platform for log collection")?;
 
         // Find log files - support both legacy names and rolling log patterns
         let main_log_files = find_log_files(&log_dir, "freenet");
@@ -195,9 +207,10 @@ impl ReportCommand {
         })
     }
 
-    fn collect_config(&self) -> Option<String> {
+    fn collect_config(&self, config_dir: &Path) -> Option<String> {
         // Try standard config locations
         let config_paths = [
+            Some(config_dir.join("config.toml")),
             dirs::config_dir().map(|p| p.join("freenet").join("config.toml")),
             dirs::home_dir().map(|p| p.join(".config").join("freenet").join("config.toml")),
         ];

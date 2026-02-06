@@ -45,6 +45,7 @@ async fn create_test_config(
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
             data_dir: Some(temp_dir.path().to_path_buf()),
+            log_dir: Some(temp_dir.path().to_path_buf()),
         },
         secrets: SecretArgs {
             transport_keypair: Some(transport_keypair),
@@ -139,6 +140,7 @@ async fn test_default_token_configuration() -> TestResult {
             config_paths: freenet::config::ConfigPathsArgs {
                 config_dir: Some(temp_dir.path().to_path_buf()),
                 data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
             },
             secrets: SecretArgs {
                 transport_keypair: Some(transport_keypair),

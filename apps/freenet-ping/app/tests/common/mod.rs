@@ -185,6 +185,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
             data_dir: Some(temp_dir.path().to_path_buf()),
+            log_dir: Some(temp_dir.path().to_path_buf()),
         },
         secrets: SecretArgs {
             transport_keypair: Some(transport_keypair),
