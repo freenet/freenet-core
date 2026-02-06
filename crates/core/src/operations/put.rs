@@ -902,6 +902,9 @@ impl Operation for PutOp {
                             "PUT piping in progress to next hop"
                         );
 
+                        // Forwarding nodes always use non-blocking subscriptions:
+                        // blocking_subscribe is a client-side preference that only
+                        // applies to the originator node.
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe: *msg_subscribe,
                             blocking_subscribe: false,
@@ -954,6 +957,9 @@ impl Operation for PutOp {
                             skip_list: routing_skip_list,
                         };
 
+                        // Forwarding nodes always use non-blocking subscriptions:
+                        // blocking_subscribe is a client-side preference that only
+                        // applies to the originator node.
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe: *msg_subscribe,
                             blocking_subscribe: false,
@@ -1555,7 +1561,7 @@ mod messages {
 mod tests {
     use super::*;
     use crate::message::Transaction;
-    use crate::operations::test_utils::make_contract_key;
+    use crate::operations::test_utils::{make_contract_key, make_test_contract};
 
     fn make_put_op(state: Option<PutState>) -> PutOp {
         PutOp {
@@ -1695,5 +1701,80 @@ mod tests {
             display.contains("PutResponse"),
             "Display should contain message type name"
         );
+    }
+
+    // Tests for blocking_subscribe propagation
+    #[test]
+    fn start_op_propagates_blocking_subscribe_true() {
+        let contract = make_test_contract(&[1u8]);
+        let op = start_op(
+            contract,
+            RelatedContracts::default(),
+            WrappedState::new(vec![]),
+            10,
+            true, // subscribe
+            true, // blocking_subscribe
+        );
+        match op.state {
+            Some(PutState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_with_id_propagates_blocking_subscribe_true() {
+        let contract = make_test_contract(&[1u8]);
+        let tx = Transaction::new::<PutMsg>();
+        let op = start_op_with_id(
+            contract,
+            RelatedContracts::default(),
+            WrappedState::new(vec![]),
+            10,
+            true, // subscribe
+            true, // blocking_subscribe
+            tx,
+        );
+        match op.state {
+            Some(PutState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest via start_op_with_id"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_defaults_blocking_subscribe_false() {
+        let contract = make_test_contract(&[1u8]);
+        let op = start_op(
+            contract,
+            RelatedContracts::default(),
+            WrappedState::new(vec![]),
+            10,
+            true,  // subscribe
+            false, // blocking_subscribe
+        );
+        match op.state {
+            Some(PutState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    !blocking_subscribe,
+                    "blocking_subscribe should be false by default"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
     }
 }

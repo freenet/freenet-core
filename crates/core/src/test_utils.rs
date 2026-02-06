@@ -315,13 +315,23 @@ pub async fn make_put(
     contract: ContractContainer,
     subscribe: bool,
 ) -> anyhow::Result<()> {
+    make_put_with_blocking(client, state, contract, subscribe, false).await
+}
+
+pub async fn make_put_with_blocking(
+    client: &mut WebApi,
+    state: WrappedState,
+    contract: ContractContainer,
+    subscribe: bool,
+    blocking_subscribe: bool,
+) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Put {
             contract: contract.clone(),
             state: state.clone(),
             related_contracts: RelatedContracts::default(),
             subscribe,
-            blocking_subscribe: false,
+            blocking_subscribe,
         }))
         .await?;
     Ok(())
@@ -357,12 +367,22 @@ pub async fn make_get(
     return_contract_code: bool,
     subscribe: bool,
 ) -> anyhow::Result<()> {
+    make_get_with_blocking(client, key, return_contract_code, subscribe, false).await
+}
+
+pub async fn make_get_with_blocking(
+    client: &mut WebApi,
+    key: ContractKey,
+    return_contract_code: bool,
+    subscribe: bool,
+    blocking_subscribe: bool,
+) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
             key: *key.id(),
             return_contract_code,
             subscribe,
-            blocking_subscribe: false,
+            blocking_subscribe,
         }))
         .await?;
     Ok(())

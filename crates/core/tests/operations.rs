@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure};
 use freenet::test_utils::{
-    self, load_delegate, make_get, make_put, make_subscribe, make_update, verify_contract_exists,
-    TestContext,
+    self, load_delegate, make_get, make_get_with_blocking, make_put, make_put_with_blocking,
+    make_subscribe, make_update, verify_contract_exists, TestContext,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
@@ -1900,6 +1900,225 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
         contract = %contract_key,
         phase = "test_complete",
         "test_put_with_subscribe_flag completed successfully"
+    );
+    Ok(())
+}
+
+/// Tests that PUT with blocking_subscribe=true completes successfully.
+/// The PUT response should arrive only after the subscription is established.
+/// No SubscribeResponse should leak to the client (subscription is a sub-operation).
+#[freenet_test(
+    nodes = ["gateway", "node-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_put_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let node_a = ctx.node("node-a")?;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let uri_a = node_a.ws_url();
+    let (stream1, _) = connect_async(&uri_a).await?;
+    let mut client_api1 = WebApi::start(stream1);
+
+    // PUT with subscribe=true AND blocking_subscribe=true
+    let put_start = std::time::Instant::now();
+    tracing::info!(
+        contract = %contract_key,
+        subscribe = true,
+        blocking_subscribe = true,
+        phase = "put_request",
+        "Sending blocking subscribe PUT request"
+    );
+    make_put_with_blocking(
+        &mut client_api1,
+        wrapped_state.clone(),
+        contract.clone(),
+        true, // subscribe
+        true, // blocking_subscribe
+    )
+    .await?;
+
+    // Wait for put response — with blocking_subscribe, the response should only
+    // arrive after the subscription is established (not before).
+    let mut put_response_received = false;
+    let start = std::time::Instant::now();
+    while !put_response_received && start.elapsed() < Duration::from_secs(45) {
+        let resp = tokio::time::timeout(Duration::from_secs(5), client_api1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                tracing::info!(
+                    contract = %contract_key,
+                    elapsed_ms = put_start.elapsed().as_millis(),
+                    phase = "put_response",
+                    "Blocking subscribe PUT response received"
+                );
+                put_response_received = true;
+            }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed: _,
+            }))) => {
+                bail!(
+                    "Received unexpected SubscribeResponse for contract {key} - \
+                         sub-operations should not send client notifications"
+                );
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    response = ?other,
+                    "Received unexpected response while waiting for blocking PUT"
+                );
+            }
+            Ok(Err(e)) => {
+                bail!("WebSocket error while waiting for PUT response: {}", e);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Waiting for blocking PUT response (no message in 5s)"
+                );
+            }
+        }
+    }
+
+    ensure!(
+        put_response_received,
+        "Did not receive PUT response within 45 seconds for blocking_subscribe=true"
+    );
+
+    tracing::info!(
+        contract = %contract_key,
+        elapsed_ms = put_start.elapsed().as_millis(),
+        phase = "test_complete",
+        "test_put_with_blocking_subscribe completed successfully"
+    );
+    Ok(())
+}
+
+/// Tests that GET with blocking_subscribe=true completes successfully.
+/// The GET response should arrive and no SubscribeResponse should leak.
+#[freenet_test(
+    nodes = ["gateway", "node-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_get_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let node_a = ctx.node("node-a")?;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let uri_a = node_a.ws_url();
+
+    // First put the contract (non-blocking, no subscribe)
+    let (stream1, _) = connect_async(&uri_a).await?;
+    let mut client_api1 = WebApi::start(stream1);
+
+    make_put(
+        &mut client_api1,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    let resp = tokio::time::timeout(Duration::from_secs(45), client_api1.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+        }
+        other => bail!("Unexpected response waiting for PUT: {:?}", other),
+    }
+
+    // Now GET with blocking_subscribe=true
+    let (stream2, _) = connect_async(&uri_a).await?;
+    let mut client_api2 = WebApi::start(stream2);
+
+    tracing::info!(
+        contract = %contract_key,
+        subscribe = true,
+        blocking_subscribe = true,
+        phase = "get_request",
+        "Sending blocking subscribe GET request"
+    );
+    make_get_with_blocking(&mut client_api2, contract_key, true, true, true).await?;
+
+    // Wait for GET response
+    let mut get_response_received = false;
+    let start = std::time::Instant::now();
+    while !get_response_received && start.elapsed() < Duration::from_secs(45) {
+        let resp = tokio::time::timeout(Duration::from_secs(5), client_api2.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                contract: _,
+                state: _,
+            }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+                tracing::info!(
+                    contract = %contract_key,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    phase = "get_response",
+                    "Blocking subscribe GET response received"
+                );
+                get_response_received = true;
+            }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed: _,
+            }))) => {
+                bail!(
+                    "Received unexpected SubscribeResponse for contract {key} - \
+                         sub-operations should not send client notifications"
+                );
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    response = ?other,
+                    "Received unexpected response while waiting for blocking GET"
+                );
+            }
+            Ok(Err(e)) => {
+                bail!("WebSocket error while waiting for GET response: {}", e);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Waiting for blocking GET response (no message in 5s)"
+                );
+            }
+        }
+    }
+
+    ensure!(
+        get_response_received,
+        "Did not receive GET response within 45 seconds for blocking_subscribe=true"
+    );
+
+    tracing::info!(
+        contract = %contract_key,
+        elapsed_ms = start.elapsed().as_millis(),
+        phase = "test_complete",
+        "test_get_with_blocking_subscribe completed successfully"
     );
     Ok(())
 }

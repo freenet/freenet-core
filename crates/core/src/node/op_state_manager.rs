@@ -1052,6 +1052,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 "Child operation timed out, propagating failure to parent"
                             );
 
+                            // Clean up parent-child tracking to prevent DashMap entry leaks
+                            // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
+                            sub_op_tracker.remove_child_link(parent_tx, tx);
+                            sub_op_tracker.mark_sub_op_completed(parent_tx);
+                            let _ = sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx);
+                            sub_op_tracker.cleanup_parent_tracking(parent_tx);
+
                             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                                 cause: format!("Sub-operation {} timed out", tx).into(),
                             }.into());
@@ -1120,6 +1127,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 parent_tx = %parent_tx,
                                 "Child operation timed out, propagating failure to parent"
                             );
+
+                            // Clean up parent-child tracking to prevent DashMap entry leaks
+                            // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
+                            sub_op_tracker.remove_child_link(parent_tx, tx);
+                            sub_op_tracker.mark_sub_op_completed(parent_tx);
+                            let _ = sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx);
+                            sub_op_tracker.cleanup_parent_tracking(parent_tx);
 
                             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                                 cause: format!("Sub-operation {} timed out", tx).into(),

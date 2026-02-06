@@ -2424,6 +2424,9 @@ async fn try_forward_or_return(
             tried_peers.insert(addr);
         }
 
+        // Forwarding nodes always use non-blocking subscriptions:
+        // blocking_subscribe is a client-side preference that only
+        // applies to the originator node.
         build_op_result(
             id,
             Some(GetState::AwaitingResponse {
@@ -2945,5 +2948,58 @@ mod tests {
             Location::from(&instance_id),
             "Location should be derived from instance_id for NotFound too"
         );
+    }
+
+    // Tests for blocking_subscribe propagation
+    #[test]
+    fn start_op_propagates_blocking_subscribe_true() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let op = start_op(instance_id, true, true, true);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_with_id_propagates_blocking_subscribe_true() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let tx = Transaction::new::<GetMsg>();
+        let op = start_op_with_id(instance_id, true, true, true, tx);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest via start_op_with_id"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_defaults_blocking_subscribe_false() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let op = start_op(instance_id, true, true, false);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    !blocking_subscribe,
+                    "blocking_subscribe should be false by default"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
     }
 }
