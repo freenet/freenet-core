@@ -744,6 +744,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 state: wrapped_state.clone(),
                 related_contracts: RelatedContracts::new(),
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -760,6 +761,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -776,6 +778,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -917,6 +920,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                     key: *contract_key.id(),
                     return_contract_code: false,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }))
                 .await?;
             let state_gw = wait_for_get_response(&mut client_gw, &contract_key)
@@ -928,6 +932,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                     key: *contract_key.id(),
                     return_contract_code: false,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }))
                 .await?;
             let state_node1 = wait_for_get_response(&mut client_node1, &contract_key)
@@ -939,6 +944,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                     key: *contract_key.id(),
                     return_contract_code: false,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }))
                 .await?;
             let state_node2 = wait_for_get_response(&mut client_node2, &contract_key)
@@ -989,6 +995,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -997,6 +1004,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -1005,6 +1013,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -1446,6 +1455,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
                 state: wrapped_state.clone(),
                 related_contracts: RelatedContracts::new(),
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -1462,6 +1472,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -1478,6 +1489,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 

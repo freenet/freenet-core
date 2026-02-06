@@ -327,6 +327,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                 state: wrapped_state.clone(),
                 related_contracts: RelatedContracts::new(),
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -355,6 +356,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                     key: *contract_key.id(),
                     return_contract_code: true,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }))
                 .await?;
             get_requests.push(i);
@@ -370,6 +372,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                     key: *contract_key.id(),
                     return_contract_code: true,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }))
                 .await?;
             gw_get_requests.push(i);
@@ -471,6 +474,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         key: *contract_key.id(),
                         return_contract_code: true,
                         subscribe: false,
+                        blocking_subscribe: false,
                     }))
                     .await?;
                 final_get_requests.push(i);
@@ -704,6 +708,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         key: *contract_key.id(),
                         return_contract_code: false,
                         subscribe: false,
+                        blocking_subscribe: false,
                     }))
                     .await?;
                 get_state_requests.push(i);
@@ -721,6 +726,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         key: *contract_key.id(),
                         return_contract_code: false,
                         subscribe: false,
+                        blocking_subscribe: false,
                     }))
                     .await?;
                 gw_get_state_requests.push(i);

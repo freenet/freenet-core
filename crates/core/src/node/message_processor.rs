@@ -99,7 +99,7 @@ mod tests {
     fn create_success_host_result() -> Option<HostResult> {
         use freenet_stdlib::prelude::ContractInstanceId;
         let instance_id = ContractInstanceId::new([1u8; 32]);
-        let get_op = get::start_op(instance_id, false, false);
+        let get_op = get::start_op(instance_id, false, false, false);
         Some(OpEnum::Get(get_op).to_host_result())
     }
 

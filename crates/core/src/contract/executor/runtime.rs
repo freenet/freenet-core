@@ -1147,6 +1147,7 @@ impl Executor<Runtime> {
                     state,
                     related_contracts,
                     subscribe: false,
+                    blocking_subscribe: false,
                 },
                 cli_id,
                 None,

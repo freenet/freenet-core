@@ -367,6 +367,7 @@ async fn run_blocked_peers_test_inner(
                 state: wrapped_state.clone(),
                 related_contracts: RelatedContracts::new(),
                 subscribe: config.subscribe_immediately,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -386,6 +387,7 @@ async fn run_blocked_peers_test_inner(
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: config.subscribe_immediately,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -405,6 +407,7 @@ async fn run_blocked_peers_test_inner(
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: config.subscribe_immediately,
+                blocking_subscribe: false,
             }))
             .await?;
 

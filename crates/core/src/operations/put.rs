@@ -277,10 +277,19 @@ impl Operation for PutOp {
                     .get_peer_location_by_addr(addr)
             });
 
-            // Extract subscribe flag from state (only relevant for originator)
+            // Extract subscribe flags from state (only relevant for originator)
             let subscribe = match &self.state {
                 Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
                 Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
+                _ => false,
+            };
+            let blocking_subscribe = match &self.state {
+                Some(PutState::PrepareRequest {
+                    blocking_subscribe, ..
+                }) => *blocking_subscribe,
+                Some(PutState::AwaitingResponse {
+                    blocking_subscribe, ..
+                }) => *blocking_subscribe,
                 _ => false,
             };
 
@@ -452,10 +461,11 @@ impl Operation for PutOp {
                             )
                         };
 
-                        // Transition to AwaitingResponse, preserving subscribe flag for originator
+                        // Transition to AwaitingResponse, preserving subscribe flags for originator
                         // Store next_hop so handle_notification_msg can route the message
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe,
+                            blocking_subscribe,
                             next_hop: Some(next_addr),
                             current_htl: htl,
                         });
@@ -497,9 +507,14 @@ impl Operation for PutOp {
                             }
 
                             // Start subscription if requested
-                            // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                             if subscribe {
-                                start_subscription_after_put(op_manager, id, key, false).await;
+                                start_subscription_after_put(
+                                    op_manager,
+                                    id,
+                                    key,
+                                    blocking_subscribe,
+                                )
+                                .await;
                             }
 
                             Ok(OperationResult {
@@ -590,9 +605,9 @@ impl Operation for PutOp {
                         }
 
                         // Start subscription if requested
-                        // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                         if subscribe {
-                            start_subscription_after_put(op_manager, id, *key, false).await;
+                            start_subscription_after_put(op_manager, id, *key, blocking_subscribe)
+                                .await;
                         }
 
                         Ok(OperationResult {
@@ -889,6 +904,7 @@ impl Operation for PutOp {
 
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe: *msg_subscribe,
+                            blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
                         });
@@ -940,6 +956,7 @@ impl Operation for PutOp {
 
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe: *msg_subscribe,
+                            blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
                         });
@@ -978,7 +995,13 @@ impl Operation for PutOp {
                             }
 
                             if *msg_subscribe {
-                                start_subscription_after_put(op_manager, id, key, false).await;
+                                start_subscription_after_put(
+                                    op_manager,
+                                    id,
+                                    key,
+                                    blocking_subscribe,
+                                )
+                                .await;
                             }
 
                             Ok(OperationResult {
@@ -1073,7 +1096,8 @@ impl Operation for PutOp {
 
                         // Start subscription if requested
                         if subscribe {
-                            start_subscription_after_put(op_manager, id, *key, false).await;
+                            start_subscription_after_put(op_manager, id, *key, blocking_subscribe)
+                                .await;
                         }
 
                         tracing::info!(
@@ -1129,8 +1153,8 @@ impl Operation for PutOp {
 ///   is sent immediately
 /// - When true: PUT response waits for subscription to complete
 ///
-/// This parameter is intended to come from the client request (ContractRequest::Put)
-/// once stdlib is updated. For now, callers should pass `false` for non-blocking behavior.
+/// This value comes from the client request's `blocking_subscribe` field
+/// (`ContractRequest::Put`).
 async fn start_subscription_after_put(
     op_manager: &OpManager,
     parent_tx: Transaction,
@@ -1167,6 +1191,7 @@ pub(crate) fn start_op(
     value: WrappedState,
     htl: usize,
     subscribe: bool,
+    blocking_subscribe: bool,
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
@@ -1179,6 +1204,7 @@ pub(crate) fn start_op(
         value,
         htl,
         subscribe,
+        blocking_subscribe,
     });
 
     PutOp {
@@ -1195,6 +1221,7 @@ pub(crate) fn start_op_with_id(
     value: WrappedState,
     htl: usize,
     subscribe: bool,
+    blocking_subscribe: bool,
     id: Transaction,
 ) -> PutOp {
     let key = contract.key();
@@ -1207,6 +1234,7 @@ pub(crate) fn start_op_with_id(
         value,
         htl,
         subscribe,
+        blocking_subscribe,
     });
 
     PutOp {
@@ -1237,11 +1265,15 @@ pub enum PutState {
         htl: usize,
         /// If true, start a subscription after PUT completes
         subscribe: bool,
+        /// If true, the PUT response waits for the subscription to complete
+        blocking_subscribe: bool,
     },
     /// Waiting for response from downstream node.
     AwaitingResponse {
         /// If true, start a subscription after PUT completes (originator only)
         subscribe: bool,
+        /// If true, the PUT response waits for the subscription to complete
+        blocking_subscribe: bool,
         /// Next hop address for routing the outbound message
         next_hop: Option<std::net::SocketAddr>,
         /// Current HTL (remaining hops) for hop_count calculation.
@@ -1254,31 +1286,34 @@ pub enum PutState {
 /// Request to insert/update a value into a contract.
 /// Called when a client initiates a PUT operation.
 pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result<(), OpError> {
-    let (id, contract, value, related_contracts, htl, subscribe) = match &put_op.state {
-        Some(PutState::PrepareRequest {
-            contract,
-            value,
-            related_contracts,
-            htl,
-            subscribe,
-        }) => (
-            put_op.id,
-            contract.clone(),
-            value.clone(),
-            related_contracts.clone(),
-            *htl,
-            *subscribe,
-        ),
-        _ => {
-            tracing::error!(
-                tx = %put_op.id,
-                state = ?put_op.state,
-                phase = "error",
-                "request_put called with unexpected state"
-            );
-            return Err(OpError::UnexpectedOpState);
-        }
-    };
+    let (id, contract, value, related_contracts, htl, subscribe, blocking_subscribe) =
+        match &put_op.state {
+            Some(PutState::PrepareRequest {
+                contract,
+                value,
+                related_contracts,
+                htl,
+                subscribe,
+                blocking_subscribe,
+            }) => (
+                put_op.id,
+                contract.clone(),
+                value.clone(),
+                related_contracts.clone(),
+                *htl,
+                *subscribe,
+                *blocking_subscribe,
+            ),
+            _ => {
+                tracing::error!(
+                    tx = %put_op.id,
+                    state = ?put_op.state,
+                    phase = "error",
+                    "request_put called with unexpected state"
+                );
+                return Err(OpError::UnexpectedOpState);
+            }
+        };
 
     let key = contract.key();
 
@@ -1307,6 +1342,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
         id,
         state: Some(PutState::AwaitingResponse {
             subscribe,
+            blocking_subscribe,
             next_hop: None,
             current_htl: htl,
         }),
@@ -1554,6 +1590,7 @@ mod tests {
     fn put_op_not_finalized_when_awaiting_response() {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
+            blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
         }));
@@ -1588,6 +1625,7 @@ mod tests {
     fn put_op_to_host_result_error_when_not_finished() {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
+            blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
         }));
@@ -1624,6 +1662,7 @@ mod tests {
     fn put_op_is_not_completed_when_in_progress() {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
+            blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
         }));

@@ -348,6 +348,7 @@ async fn test_put_propagation(
             state: wrapped_state.clone(),
             related_contracts: RelatedContracts::new(),
             subscribe: false,
+            blocking_subscribe: false,
         });
 
         match client.send(put_request.clone()).await {
@@ -409,6 +410,7 @@ async fn test_concurrent_gets(
             key: *contract_key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         });
 
         match timeout(Duration::from_secs(30), async {
@@ -614,6 +616,7 @@ async fn test_update_propagation(
             key: *contract_key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         });
 
         match timeout(Duration::from_secs(30), async {

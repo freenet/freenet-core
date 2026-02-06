@@ -244,6 +244,7 @@ impl SimOperation {
                 state: WrappedState::new(state),
                 related_contracts: RelatedContracts::new(),
                 subscribe,
+                blocking_subscribe: false,
             }),
             SimOperation::Get {
                 contract_id,
@@ -253,6 +254,7 @@ impl SimOperation {
                 key: contract_id,
                 return_contract_code,
                 subscribe,
+                blocking_subscribe: false,
             }),
             SimOperation::Subscribe { contract_id } => {
                 ClientRequest::ContractOp(ContractRequest::Subscribe {

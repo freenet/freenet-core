@@ -321,6 +321,7 @@ pub async fn make_put(
             state: state.clone(),
             related_contracts: RelatedContracts::default(),
             subscribe,
+            blocking_subscribe: false,
         }))
         .await?;
     Ok(())
@@ -361,6 +362,7 @@ pub async fn make_get(
             key: *key.id(),
             return_contract_code,
             subscribe,
+            blocking_subscribe: false,
         }))
         .await?;
     Ok(())

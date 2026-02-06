@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 state: WrappedState::new(serialized),
                 related_contracts: RelatedContracts::new(),
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -81,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 

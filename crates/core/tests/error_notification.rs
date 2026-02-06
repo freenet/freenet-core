@@ -132,6 +132,7 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
         state: invalid_state,
         related_contracts: Default::default(),
         subscribe: false,
+        blocking_subscribe: false,
     });
 
     client.send(put_request).await?;
@@ -497,6 +498,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             state: wrapped_state.clone(),
             related_contracts: Default::default(),
             subscribe: false,
+            blocking_subscribe: false,
         });
 
         client.send(put_request).await?;

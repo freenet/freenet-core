@@ -2871,6 +2871,7 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
         key: nonexistent_instance_id,
         return_contract_code: true,
         subscribe: false,
+        blocking_subscribe: false,
     });
     client_api.send(get_request).await?;
 

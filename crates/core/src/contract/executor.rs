@@ -592,7 +592,7 @@ struct GetContract {
 
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.instance_id, self.return_contract_code, false)
+        operations::get::start_op(self.instance_id, self.return_contract_code, false, false)
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
