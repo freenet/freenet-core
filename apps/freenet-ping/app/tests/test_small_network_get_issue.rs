@@ -192,6 +192,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 state: wrapped_state.clone(),
                 related_contracts: RelatedContracts::new(),
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -229,6 +230,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -248,6 +250,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 
@@ -272,6 +275,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
         println!(
@@ -324,6 +328,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 key: *contract_key.id(),
                 return_contract_code: true, // Same as first GET for consistency
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 

@@ -65,6 +65,7 @@ pub(super) async fn contract_home(
                     key: instance_id,
                     return_contract_code: true,
                     subscribe: false,
+                    blocking_subscribe: false,
                 }
                 .into(),
             ),

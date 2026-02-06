@@ -143,7 +143,13 @@ impl Hash for RequestResource {
     }
 }
 
-/// A client request that can be deduplicated
+/// A client request that can be deduplicated.
+///
+/// **Coalescing note:** `blocking_subscribe` is excluded from the dedup key
+/// ([`RequestResource`]). When multiple clients issue identical requests with
+/// different `blocking_subscribe` values, only the first client's value is used
+/// for the actual operation. Subsequent clients share the same transaction and
+/// receive the result when the first client's operation completes.
 #[derive(Debug, Clone)]
 pub enum DeduplicatedRequest {
     Get {
@@ -151,6 +157,12 @@ pub enum DeduplicatedRequest {
         key: ContractInstanceId,
         return_contract_code: bool,
         subscribe: bool,
+        /// Not used for deduplication or by the router; the caller reads
+        /// `blocking_subscribe` from the original `ContractRequest` scope.
+        /// Included here for structural completeness so the request carries
+        /// all client-specified fields.
+        #[allow(dead_code)]
+        blocking_subscribe: bool,
         client_id: ClientId,
         request_id: RequestId,
     },
@@ -160,6 +172,12 @@ pub enum DeduplicatedRequest {
         related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
         state: freenet_stdlib::prelude::WrappedState,
         subscribe: bool,
+        /// Not used for deduplication or by the router; the caller reads
+        /// `blocking_subscribe` from the original `ContractRequest` scope.
+        /// Included here for structural completeness so the request carries
+        /// all client-specified fields.
+        #[allow(dead_code)]
+        blocking_subscribe: bool,
         client_id: ClientId,
         request_id: RequestId,
     },
@@ -493,6 +511,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_1,
             request_id: request_id_1,
         };
@@ -502,6 +521,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_2,
             request_id: request_id_2,
         };
@@ -529,6 +549,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_1,
         };
@@ -538,6 +559,7 @@ mod tests {
             key: instance_id,
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_2,
         };
@@ -597,6 +619,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state.clone(),
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_1,
             request_id: request_id_1,
         };
@@ -608,6 +631,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state.clone(),
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_2,
             request_id: request_id_2,
         };
@@ -641,6 +665,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state1,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_1,
         };
@@ -652,6 +677,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state2,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_2,
         };
@@ -682,6 +708,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state.clone(),
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_1,
         };
@@ -693,6 +720,7 @@ mod tests {
             related_contracts: related_contracts.clone(),
             state: state.clone(),
             subscribe: true,
+            blocking_subscribe: false,
             client_id,
             request_id: request_id_2,
         };
@@ -981,6 +1009,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_1,
             request_id: request_id_1,
         };
@@ -997,6 +1026,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_2,
             request_id: request_id_2,
         };
@@ -1024,6 +1054,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id,
         };
@@ -1074,6 +1105,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id,
             request_id,
         };
@@ -1114,6 +1146,7 @@ mod tests {
                         key: instance_id,
                         return_contract_code: true,
                         subscribe: false,
+                        blocking_subscribe: false,
                         client_id,
                         request_id,
                     };
@@ -1184,6 +1217,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_1,
             request_id: request_id_1,
         };
@@ -1201,6 +1235,7 @@ mod tests {
             key: instance_id,
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
             client_id: client_id_2,
             request_id: request_id_2,
         };

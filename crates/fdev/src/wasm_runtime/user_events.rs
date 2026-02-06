@@ -219,6 +219,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
                 key: *key.id(),
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }
             .into(),
             Command::Put => {
@@ -228,6 +229,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
                     state: WrappedState::new(state.into_bytes()),
                     related_contracts: Default::default(),
                     subscribe: false,
+                    blocking_subscribe: false,
                 }
                 .into()
             }
@@ -309,6 +311,7 @@ impl ClientEventsProxy for StdInput {
                                 key: *key.id(),
                                 return_contract_code: true,
                                 subscribe: false,
+                                blocking_subscribe: false,
                             }))
                             .await
                             .map_err(|e| {

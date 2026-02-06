@@ -103,6 +103,7 @@ async fn test_websocket_client_waits_for_put_response() {
         state: WrappedState::new(vec![]),
         related_contracts: RelatedContracts::default(),
         subscribe: false,
+        blocking_subscribe: false,
     });
 
     client.send(request).await.expect("send request");

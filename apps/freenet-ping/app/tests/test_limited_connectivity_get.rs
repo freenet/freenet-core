@@ -173,6 +173,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
                 key: nonexistent_id,
                 return_contract_code: false,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 

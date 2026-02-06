@@ -34,6 +34,7 @@ pub(crate) fn start_op(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
     subscribe: bool,
+    blocking_subscribe: bool,
 ) -> GetOp {
     let contract_location = Location::from(&instance_id);
     let id = Transaction::new::<GetMsg>();
@@ -43,6 +44,7 @@ pub(crate) fn start_op(
         id,
         fetch_contract,
         subscribe,
+        blocking_subscribe,
     });
     GetOp {
         id,
@@ -64,6 +66,7 @@ pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
     subscribe: bool,
+    blocking_subscribe: bool,
     id: Transaction,
 ) -> GetOp {
     let contract_location = Location::from(&instance_id);
@@ -73,6 +76,7 @@ pub(crate) fn start_op_with_id(
         id,
         fetch_contract,
         subscribe,
+        blocking_subscribe,
     });
     GetOp {
         id,
@@ -226,6 +230,7 @@ pub(crate) async fn request_get(
             instance_id: _,
             id: _,
             subscribe,
+            blocking_subscribe,
         }) => {
             let mut tried_peers = HashSet::new();
             if let Some(addr) = target.socket_addr() {
@@ -239,6 +244,7 @@ pub(crate) async fn request_get(
                 requester: None,
                 current_hop: op_manager.ring.max_hops_to_live,
                 subscribe,
+                blocking_subscribe,
                 next_hop: target.clone(),
                 tried_peers,
                 alternatives: candidates,
@@ -298,6 +304,7 @@ enum GetState {
         id: Transaction,
         fetch_contract: bool,
         subscribe: bool,
+        blocking_subscribe: bool,
     },
     /// Awaiting response from petition.
     AwaitingResponse {
@@ -309,6 +316,7 @@ enum GetState {
         retries: usize,
         current_hop: usize,
         subscribe: bool,
+        blocking_subscribe: bool,
         /// Peer we are currently trying to reach.
         /// Note: With connection-based routing, this is only used for state tracking,
         /// not for response routing (which uses upstream_addr instead).
@@ -336,6 +344,7 @@ impl Display for GetState {
                 id,
                 fetch_contract,
                 subscribe,
+                ..
             } => {
                 write!(
                     f,
@@ -440,6 +449,7 @@ impl GetOp {
             retries,
             current_hop,
             subscribe,
+            blocking_subscribe,
             next_hop: failed_peer,
             mut tried_peers,
             mut alternatives,
@@ -474,6 +484,7 @@ impl GetOp {
                     retries,
                     current_hop,
                     subscribe,
+                    blocking_subscribe,
                     next_hop: next_target,
                     tried_peers,
                     alternatives,
@@ -539,6 +550,7 @@ impl GetOp {
                         retries: retries + 1,
                         current_hop,
                         subscribe,
+                        blocking_subscribe,
                         next_hop: next_target,
                         tried_peers: new_tried_peers,
                         alternatives: new_candidates,
@@ -1177,6 +1189,7 @@ impl Operation for GetOp {
                             requester,
                             current_hop,
                             subscribe,
+                            blocking_subscribe,
                             mut tried_peers,
                             mut alternatives,
                             attempts_at_hop,
@@ -1230,6 +1243,7 @@ impl Operation for GetOp {
                                     requester: requester.clone(),
                                     current_hop,
                                     subscribe,
+                                    blocking_subscribe,
                                     tried_peers: updated_tried_peers.clone(),
                                     alternatives,
                                     attempts_at_hop: attempts_at_hop + 1,
@@ -1289,6 +1303,7 @@ impl Operation for GetOp {
                                         requester: requester.clone(),
                                         current_hop,
                                         subscribe,
+                                        blocking_subscribe,
                                         tried_peers: new_tried_peers,
                                         alternatives: new_candidates,
                                         attempts_at_hop: 1,
@@ -1614,11 +1629,16 @@ impl Operation for GetOp {
                     let is_original_requester = self.upstream_addr.is_none();
 
                     // Check if subscription was requested
-                    let subscribe_requested =
-                        if let Some(GetState::AwaitingResponse { subscribe, .. }) = &self.state {
-                            *subscribe
+                    let (subscribe_requested, blocking_sub) =
+                        if let Some(GetState::AwaitingResponse {
+                            subscribe,
+                            blocking_subscribe,
+                            ..
+                        }) = &self.state
+                        {
+                            (*subscribe, *blocking_subscribe)
                         } else {
-                            false
+                            (false, false)
                         };
 
                     // Always cache contracts we encounter - LRU will handle eviction
@@ -1715,10 +1735,11 @@ impl Operation for GetOp {
                             if crate::ring::AUTO_SUBSCRIBE_ON_GET {
                                 // Only start new subscription if not already subscribed
                                 if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
+                                    let blocking = subscribe_requested && blocking_sub;
                                     let child_tx = super::start_subscription_request(
-                                        op_manager, id, key, false,
+                                        op_manager, id, key, blocking,
                                     );
-                                    tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
                                 }
                             }
                         } else {
@@ -1798,9 +1819,10 @@ impl Operation for GetOp {
                                         if crate::ring::AUTO_SUBSCRIBE_ON_GET {
                                             // Only start new subscription if not already subscribed
                                             if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
+                                                let blocking = subscribe_requested && blocking_sub;
                                                 let child_tx =
-                                                    super::start_subscription_request(op_manager, id, key, false);
-                                                tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
+                                                    super::start_subscription_request(op_manager, id, key, blocking);
+                                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
                                             }
                                         }
                                     }
@@ -2402,6 +2424,9 @@ async fn try_forward_or_return(
             tried_peers.insert(addr);
         }
 
+        // Forwarding nodes always use non-blocking subscriptions:
+        // blocking_subscribe is a client-side preference that only
+        // applies to the originator node.
         build_op_result(
             id,
             Some(GetState::AwaitingResponse {
@@ -2411,6 +2436,7 @@ async fn try_forward_or_return(
                 fetch_contract,
                 current_hop: new_htl,
                 subscribe: false,
+                blocking_subscribe: false,
                 next_hop: target.clone(),
                 tried_peers,
                 alternatives,
@@ -2922,5 +2948,58 @@ mod tests {
             Location::from(&instance_id),
             "Location should be derived from instance_id for NotFound too"
         );
+    }
+
+    // Tests for blocking_subscribe propagation
+    #[test]
+    fn start_op_propagates_blocking_subscribe_true() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let op = start_op(instance_id, true, true, true);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_with_id_propagates_blocking_subscribe_true() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let tx = Transaction::new::<GetMsg>();
+        let op = start_op_with_id(instance_id, true, true, true, tx);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    blocking_subscribe,
+                    "blocking_subscribe should be true in PrepareRequest via start_op_with_id"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_op_defaults_blocking_subscribe_false() {
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let op = start_op(instance_id, true, true, false);
+        match op.state {
+            Some(GetState::PrepareRequest {
+                blocking_subscribe, ..
+            }) => {
+                assert!(
+                    !blocking_subscribe,
+                    "blocking_subscribe should be false by default"
+                );
+            }
+            other => panic!("Expected PrepareRequest state, got {:?}", other),
+        }
     }
 }

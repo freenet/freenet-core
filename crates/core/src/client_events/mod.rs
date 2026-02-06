@@ -582,6 +582,7 @@ async fn process_open_request(
                         contract,
                         related_contracts,
                         subscribe,
+                        blocking_subscribe,
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
@@ -624,6 +625,7 @@ async fn process_open_request(
                                 state.clone(),
                                 op_manager.ring.max_hops_to_live,
                                 subscribe,
+                                blocking_subscribe,
                             );
                             let op_id = op.id;
 
@@ -686,6 +688,7 @@ async fn process_open_request(
                                 related_contracts: related_contracts.clone(),
                                 state: state.clone(),
                                 subscribe,
+                                blocking_subscribe,
                                 client_id,
                                 request_id,
                             };
@@ -727,6 +730,7 @@ async fn process_open_request(
                                     state.clone(),
                                     op_manager.ring.max_hops_to_live,
                                     subscribe,
+                                    blocking_subscribe,
                                     transaction_id,
                                 );
 
@@ -804,6 +808,7 @@ async fn process_open_request(
                                 state.clone(),
                                 op_manager.ring.max_hops_to_live,
                                 subscribe,
+                                blocking_subscribe,
                             );
                             let op_id = op.id;
 
@@ -1062,6 +1067,7 @@ async fn process_open_request(
                         key,
                         return_contract_code,
                         subscribe,
+                        blocking_subscribe,
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
@@ -1213,6 +1219,7 @@ async fn process_open_request(
                                 key,
                                 return_contract_code,
                                 subscribe,
+                                blocking_subscribe,
                                 client_id,
                                 request_id,
                             };
@@ -1254,6 +1261,7 @@ async fn process_open_request(
                                     key,
                                     return_contract_code,
                                     subscribe,
+                                    blocking_subscribe,
                                     transaction_id,
                                 );
 
@@ -1334,7 +1342,12 @@ async fn process_open_request(
                             );
 
                             // Legacy mode: direct operation without deduplication
-                            let op = get::start_op(key, return_contract_code, subscribe);
+                            let op = get::start_op(
+                                key,
+                                return_contract_code,
+                                subscribe,
+                                blocking_subscribe,
+                            );
                             let op_id = op.id;
 
                             op_manager
@@ -2106,6 +2119,7 @@ pub(crate) mod test {
                             state: WrappedState::new(self.random_byte_vec()),
                             related_contracts: RelatedContracts::new(),
                             subscribe: true,
+                            blocking_subscribe: false,
                         };
                         state.existing_contracts.push(contract);
                         if !for_this_peer {
@@ -2126,6 +2140,7 @@ pub(crate) mod test {
                                 // Subscribe to ensure this peer joins the subscription tree
                                 // and can receive/propagate updates
                                 subscribe: true,
+                                blocking_subscribe: false,
                             };
 
                             tracing::debug!(
@@ -2145,6 +2160,7 @@ pub(crate) mod test {
                                 key: *key.id(),
                                 return_contract_code: true,
                                 subscribe: false,
+                                blocking_subscribe: false,
                             };
                             return Some(request.into());
                         }

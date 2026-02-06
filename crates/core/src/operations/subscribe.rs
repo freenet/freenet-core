@@ -71,7 +71,7 @@ async fn fetch_contract_if_missing(
     }
 
     // Start a GET operation to fetch the contract
-    let get_op = get::start_op(instance_id, true, false);
+    let get_op = get::start_op(instance_id, true, false, false);
     let visited = super::VisitedPeers::new(&get_op.id);
     get::request_get(op_manager, get_op, visited).await?;
 

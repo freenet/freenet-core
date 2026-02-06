@@ -635,6 +635,7 @@ pub async fn deploy_contract(
             state: wrapped_state,
             related_contracts: RelatedContracts::new(),
             subscribe,
+            blocking_subscribe: false,
         }))
         .await?;
     wait_for_put_response(client, &contract_key)
@@ -664,6 +665,7 @@ pub async fn get_contract_state(
             key: *key.id(),
             return_contract_code: fetch_contract,
             subscribe: false,
+            blocking_subscribe: false,
         }))
         .await?;
     wait_for_get_response(client, &key)
@@ -701,6 +703,7 @@ pub async fn get_all_ping_states(
             key: *key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         }))
         .await?;
 
@@ -709,6 +712,7 @@ pub async fn get_all_ping_states(
             key: *key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         }))
         .await?;
 
@@ -717,6 +721,7 @@ pub async fn get_all_ping_states(
             key: *key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         }))
         .await?;
 
