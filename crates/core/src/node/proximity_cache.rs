@@ -23,13 +23,14 @@
 //! `OpManager::get_broadcast_targets_update()`, where HashSet naturally deduplicates
 //! any overlap.
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tracing::{debug, info, trace};
 
 use crate::message::ProximityCacheMessage;
+use crate::transport::TransportPublicKey;
 
 /// Manages proximity-based cache tracking for UPDATE forwarding.
 ///
@@ -44,8 +45,10 @@ pub struct ProximityCacheManager {
     my_cache: Arc<DashSet<ContractInstanceId>>,
 
     /// What we know about our neighbors' caches.
-    /// Maps neighbor address to the set of contracts they're caching.
-    neighbor_caches: DashMap<SocketAddr, HashSet<ContractInstanceId>>,
+    /// Maps neighbor public key to the set of contracts they're caching.
+    /// Keyed by TransportPublicKey (stable identity) rather than SocketAddr (mutable
+    /// due to NAT/reconnection), so entries survive address changes.
+    neighbor_caches: DashMap<TransportPublicKey, HashSet<ContractInstanceId>>,
 }
 
 impl Default for ProximityCacheManager {
@@ -119,7 +122,7 @@ impl ProximityCacheManager {
     /// Returns an optional response message to send back.
     pub fn handle_message(
         &self,
-        from: SocketAddr,
+        from: &TransportPublicKey,
         message: ProximityCacheMessage,
     ) -> Option<ProximityCacheMessage> {
         match message {
@@ -132,25 +135,37 @@ impl ProximityCacheManager {
                 // This is needed to detect genuinely NEW contracts vs duplicates.
                 let previously_known: HashSet<ContractInstanceId> = self
                     .neighbor_caches
-                    .get(&from)
-                    .map(|entry| entry.value().clone())
+                    .get(from)
+                    .map(
+                        |entry: dashmap::mapref::one::Ref<
+                            '_,
+                            TransportPublicKey,
+                            HashSet<ContractInstanceId>,
+                        >| entry.value().clone(),
+                    )
                     .unwrap_or_default();
 
                 // Update neighbor's cache state
-                if let Some(mut entry) = self.neighbor_caches.get_mut(&from) {
+                if let Some(mut entry) = self.neighbor_caches.get_mut(from) {
                     entry.extend(added.iter().copied());
                     for id in &removed {
                         entry.remove(id);
                     }
                 } else if !added.is_empty() {
                     self.neighbor_caches
-                        .insert(from, added.iter().copied().collect());
+                        .insert(from.clone(), added.iter().copied().collect());
                 }
 
-                let neighbor_contracts = self
+                let neighbor_contracts: usize = self
                     .neighbor_caches
-                    .get(&from)
-                    .map(|c| c.len())
+                    .get(from)
+                    .map(
+                        |entry: dashmap::mapref::one::Ref<
+                            '_,
+                            TransportPublicKey,
+                            HashSet<ContractInstanceId>,
+                        >| entry.value().len(),
+                    )
                     .unwrap_or(0);
 
                 info!(
@@ -222,7 +237,7 @@ impl ProximityCacheManager {
                     .collect();
 
                 self.neighbor_caches
-                    .insert(from, contracts.into_iter().collect());
+                    .insert(from.clone(), contracts.into_iter().collect());
 
                 info!(
                     peer = %from,
@@ -258,15 +273,29 @@ impl ProximityCacheManager {
 
     /// Get the list of neighbors who have a specific contract cached.
     ///
+    /// Returns TransportPublicKey (stable identity) rather than SocketAddr,
+    /// so callers can resolve to current addresses via ConnectionManager.
     /// Used by UPDATE operations to find additional targets beyond explicit subscribers.
-    pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<SocketAddr> {
+    pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<TransportPublicKey> {
         let contract_id = contract_key.id();
 
-        let mut neighbors: Vec<SocketAddr> = self
+        let mut neighbors: Vec<TransportPublicKey> = self
             .neighbor_caches
             .iter()
-            .filter(|entry| entry.value().contains(contract_id))
-            .map(|entry| *entry.key())
+            .filter(
+                |entry: &dashmap::mapref::multiple::RefMulti<
+                    '_,
+                    TransportPublicKey,
+                    HashSet<ContractInstanceId>,
+                >| entry.value().contains(contract_id),
+            )
+            .map(
+                |entry: dashmap::mapref::multiple::RefMulti<
+                    '_,
+                    TransportPublicKey,
+                    HashSet<ContractInstanceId>,
+                >| entry.key().clone(),
+            )
             .collect();
 
         // Sort for deterministic iteration order (DashMap iteration is non-deterministic)
@@ -284,11 +313,12 @@ impl ProximityCacheManager {
     }
 
     /// Handle peer disconnection by removing their cache state.
-    pub fn on_peer_disconnected(&self, addr: &SocketAddr) {
-        if let Some((_, removed_cache)) = self.neighbor_caches.remove(addr) {
+    pub fn on_peer_disconnected(&self, pub_key: &TransportPublicKey) {
+        if let Some((_, removed_cache)) = self.neighbor_caches.remove(pub_key) {
+            let count = removed_cache.len();
             debug!(
-                peer = %addr,
-                cached_contracts = removed_cache.len(),
+                peer = %pub_key,
+                cached_contracts = count,
                 "PROXIMITY_CACHE: Removed disconnected peer from neighbor cache"
             );
         }
@@ -300,10 +330,10 @@ impl ProximityCacheManager {
     /// enabling UPDATE forwarding to nearby seeders.
     pub fn on_ring_connection_established(
         &self,
-        peer_addr: SocketAddr,
+        pub_key: &TransportPublicKey,
     ) -> Option<ProximityCacheMessage> {
         debug!(
-            peer = %peer_addr,
+            peer = %pub_key,
             "PROXIMITY_CACHE: New ring connection, requesting cache state"
         );
         Some(ProximityCacheMessage::CacheStateRequest)
@@ -331,6 +361,7 @@ impl ProximityCacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TransportKeypair;
     use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
 
     fn test_contract_key() -> ContractKey {
@@ -339,6 +370,10 @@ mod tests {
 
     fn test_contract_key_2() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]))
+    }
+
+    fn make_pub_key(_seed: u8) -> TransportPublicKey {
+        TransportKeypair::new().public().clone()
     }
 
     #[test]
@@ -408,7 +443,7 @@ mod tests {
     fn test_neighbor_cache_tracking() {
         let manager = ProximityCacheManager::new();
         let key = test_contract_key();
-        let neighbor: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let neighbor = make_pub_key(1);
 
         // Initially no neighbors with contract
         assert!(manager.neighbors_with_contract(&key).is_empty());
@@ -419,7 +454,7 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        manager.handle_message(neighbor, msg);
+        manager.handle_message(&neighbor, msg);
 
         // Now neighbor should be found
         let neighbors = manager.neighbors_with_contract(&key);
@@ -432,14 +467,14 @@ mod tests {
         let manager = ProximityCacheManager::new();
         let key1 = test_contract_key();
         let key2 = test_contract_key_2();
-        let neighbor: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let neighbor = make_pub_key(1);
 
         // Cache some contracts locally
         manager.on_contract_cached(&key1);
         manager.on_contract_cached(&key2);
 
         // Handle cache state request
-        let response = manager.handle_message(neighbor, ProximityCacheMessage::CacheStateRequest);
+        let response = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
         assert!(response.is_some());
 
         if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = response {
@@ -455,7 +490,7 @@ mod tests {
     fn test_peer_disconnection() {
         let manager = ProximityCacheManager::new();
         let key = test_contract_key();
-        let neighbor: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let neighbor = make_pub_key(1);
 
         // Add neighbor's cache info
         let msg = ProximityCacheMessage::CacheAnnounce {
@@ -463,7 +498,7 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        manager.handle_message(neighbor, msg);
+        manager.handle_message(&neighbor, msg);
 
         assert_eq!(manager.neighbor_count(), 1);
 
@@ -486,7 +521,7 @@ mod tests {
         // Expected: Node A should respond with its own announcement so B knows A has X too.
         let manager_a = ProximityCacheManager::new();
         let key = test_contract_key();
-        let node_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let node_b = make_pub_key(2);
 
         // Node A caches contract X
         manager_a.on_contract_cached(&key);
@@ -499,7 +534,7 @@ mod tests {
         };
 
         // Node A should respond with a reciprocal announcement
-        let response = manager_a.handle_message(node_b, announcement_from_b);
+        let response = manager_a.handle_message(&node_b, announcement_from_b);
         assert!(
             response.is_some(),
             "Expected reciprocal announcement for overlapping contract"
@@ -534,7 +569,7 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let key_x = test_contract_key();
         let key_y = test_contract_key_2();
-        let node_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let node_b = make_pub_key(2);
 
         // Node A only has contract X
         manager_a.on_contract_cached(&key_x);
@@ -546,7 +581,7 @@ mod tests {
             is_response: false,
         };
 
-        let response = manager_a.handle_message(node_b, announcement);
+        let response = manager_a.handle_message(&node_b, announcement);
         assert!(
             response.is_none(),
             "No response expected when contracts don't overlap"
@@ -561,7 +596,7 @@ mod tests {
         let key_x = test_contract_key();
         let key_y = test_contract_key_2();
         let key_z = test_contract_key_3();
-        let node_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let node_b = make_pub_key(2);
 
         // Node A has X and Y
         manager_a.on_contract_cached(&key_x);
@@ -574,7 +609,7 @@ mod tests {
             is_response: false,
         };
 
-        let response = manager_a.handle_message(node_b, announcement);
+        let response = manager_a.handle_message(&node_b, announcement);
         assert!(response.is_some(), "Expected response for partial overlap");
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
@@ -613,8 +648,8 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let manager_b = ProximityCacheManager::new();
         let key = test_contract_key();
-        let addr_a: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_a = make_pub_key(1);
+        let key_b = make_pub_key(2);
 
         // Both nodes cache contract X
         manager_a.on_contract_cached(&key);
@@ -628,7 +663,7 @@ mod tests {
         };
 
         // Step 2: B receives A's announcement, generates reciprocal (with is_response=true)
-        let b_response = manager_b.handle_message(addr_a, a_announcement);
+        let b_response = manager_b.handle_message(&key_a, a_announcement);
         assert!(
             b_response.is_some(),
             "B should respond with reciprocal announcement"
@@ -640,7 +675,7 @@ mod tests {
         }
 
         // Step 3: A receives B's response
-        let a_second_response = manager_a.handle_message(addr_b, b_response.unwrap());
+        let a_second_response = manager_a.handle_message(&key_b, b_response.unwrap());
 
         // Step 4: A should NOT respond again - the loop terminates due to is_response=true
         assert!(
@@ -658,8 +693,8 @@ mod tests {
         let manager_b = ProximityCacheManager::new();
         let key_x = test_contract_key();
         let key_y = test_contract_key_2();
-        let addr_a: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_a = make_pub_key(1);
+        let key_b = make_pub_key(2);
 
         // Both have X and Y
         manager_a.on_contract_cached(&key_x);
@@ -675,7 +710,7 @@ mod tests {
         };
 
         // B responds with both (reciprocal, is_response=true set automatically)
-        let b_response = manager_b.handle_message(addr_a, a_announcement);
+        let b_response = manager_b.handle_message(&key_a, a_announcement);
         assert!(b_response.is_some());
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
@@ -693,7 +728,7 @@ mod tests {
         }
 
         // A receives B's response - should NOT respond because is_response=true
-        let a_second = manager_a.handle_message(addr_b, b_response.unwrap());
+        let a_second = manager_a.handle_message(&key_b, b_response.unwrap());
         assert!(
             a_second.is_none(),
             "Ping-pong must terminate with multiple contracts"
@@ -713,7 +748,7 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let key_x = test_contract_key();
         let key_y = test_contract_key_2();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_b = make_pub_key(2);
 
         // A has both X and Y
         manager_a.on_contract_cached(&key_x);
@@ -725,7 +760,7 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let response_to_x = manager_a.handle_message(addr_b, b_announces_x);
+        let response_to_x = manager_a.handle_message(&key_b, b_announces_x);
         assert!(
             response_to_x.is_some(),
             "A should respond to initial X announcement"
@@ -737,7 +772,7 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let response_to_y = manager_a.handle_message(addr_b, b_announces_y);
+        let response_to_y = manager_a.handle_message(&key_b, b_announces_y);
         assert!(
             response_to_y.is_some(),
             "A should respond to NEW contract Y even after X exchange completed"
@@ -757,7 +792,7 @@ mod tests {
 
         let manager_a = ProximityCacheManager::new();
         let key = test_contract_key();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_b = make_pub_key(2);
 
         // A has contract X
         manager_a.on_contract_cached(&key);
@@ -768,14 +803,14 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let first_response = manager_a.handle_message(addr_b, announcement.clone());
+        let first_response = manager_a.handle_message(&key_b, announcement.clone());
         assert!(
             first_response.is_some(),
             "First announcement should get response"
         );
 
         // Duplicate/retransmitted announcement from B (still not a response)
-        let second_response = manager_a.handle_message(addr_b, announcement);
+        let second_response = manager_a.handle_message(&key_b, announcement);
         assert!(
             second_response.is_none(),
             "Duplicate announcement should not trigger response (already known)"
@@ -790,8 +825,8 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let manager_b = ProximityCacheManager::new();
         let key = test_contract_key();
-        let addr_a: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_a = make_pub_key(1);
+        let key_b = make_pub_key(2);
 
         // Both cache the contract
         manager_a.on_contract_cached(&key);
@@ -813,12 +848,12 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let b_response = manager_b.handle_message(addr_a, a_announcement);
+        let b_response = manager_b.handle_message(&key_a, a_announcement);
 
         // Now B knows about A
         let b_neighbors = manager_b.neighbors_with_contract(&key);
         assert_eq!(b_neighbors.len(), 1);
-        assert_eq!(b_neighbors[0], addr_a);
+        assert_eq!(b_neighbors[0], key_a);
 
         // A still doesn't know about B
         assert!(
@@ -828,12 +863,12 @@ mod tests {
 
         // B's response goes to A
         assert!(b_response.is_some());
-        let _ = manager_a.handle_message(addr_b, b_response.unwrap());
+        let _ = manager_a.handle_message(&key_b, b_response.unwrap());
 
         // Now A also knows about B - bidirectional awareness achieved!
         let a_neighbors = manager_a.neighbors_with_contract(&key);
         assert_eq!(a_neighbors.len(), 1);
-        assert_eq!(a_neighbors[0], addr_b);
+        assert_eq!(a_neighbors[0], key_b);
 
         // Both can now forward updates to each other
     }
@@ -859,7 +894,7 @@ mod tests {
 
         let manager_a = ProximityCacheManager::new();
         let key = test_contract_key();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_b = make_pub_key(2);
 
         // A has contract X cached locally
         manager_a.on_contract_cached(&key);
@@ -870,7 +905,7 @@ mod tests {
         };
 
         // A handles the response - should return announcement for overlapping contract X
-        let a_announcement = manager_a.handle_message(addr_b, b_state_response);
+        let a_announcement = manager_a.handle_message(&key_b, b_state_response);
 
         assert!(
             a_announcement.is_some(),
@@ -907,7 +942,7 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let key_x = test_contract_key();
         let key_y = test_contract_key_2();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_b = make_pub_key(2);
 
         // A only has contract X
         manager_a.on_contract_cached(&key_x);
@@ -917,7 +952,7 @@ mod tests {
             contracts: vec![*key_y.id()],
         };
 
-        let response = manager_a.handle_message(addr_b, b_state_response);
+        let response = manager_a.handle_message(&key_b, b_state_response);
         assert!(
             response.is_none(),
             "No announcement needed when no contracts overlap"
@@ -926,7 +961,7 @@ mod tests {
         // But B's contracts should still be tracked
         let b_neighbors = manager_a.neighbors_with_contract(&key_y);
         assert_eq!(b_neighbors.len(), 1);
-        assert_eq!(b_neighbors[0], addr_b);
+        assert_eq!(b_neighbors[0], key_b);
     }
 
     #[test]
@@ -940,8 +975,8 @@ mod tests {
         let manager_a = ProximityCacheManager::new();
         let manager_b = ProximityCacheManager::new();
         let key = test_contract_key();
-        let addr_a: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let key_a = make_pub_key(1);
+        let key_b = make_pub_key(2);
 
         // Both have contract X cached
         manager_a.on_contract_cached(&key);
@@ -952,14 +987,14 @@ mod tests {
         assert!(manager_b.neighbors_with_contract(&key).is_empty());
 
         // Step 1: A establishes ring connection with B, generates CacheStateRequest
-        let a_request = manager_a.on_ring_connection_established(addr_b);
+        let a_request = manager_a.on_ring_connection_established(&key_b);
         assert!(matches!(
             a_request,
             Some(ProximityCacheMessage::CacheStateRequest)
         ));
 
         // Step 2: B receives request, responds with its cache state
-        let b_response = manager_b.handle_message(addr_a, a_request.unwrap());
+        let b_response = manager_b.handle_message(&key_a, a_request.unwrap());
         assert!(matches!(
             b_response,
             Some(ProximityCacheMessage::CacheStateResponse { .. })
@@ -967,7 +1002,7 @@ mod tests {
 
         // Step 3: A receives B's state response
         // CRITICAL: A should now announce its overlapping contracts back to B
-        let a_announcement = manager_a.handle_message(addr_b, b_response.unwrap());
+        let a_announcement = manager_a.handle_message(&key_b, b_response.unwrap());
         assert!(
             a_announcement.is_some(),
             "A must announce overlapping contracts after receiving B's state"
@@ -976,10 +1011,10 @@ mod tests {
         // A now knows B has contract X
         let a_neighbors = manager_a.neighbors_with_contract(&key);
         assert_eq!(a_neighbors.len(), 1, "A should know B has contract X");
-        assert_eq!(a_neighbors[0], addr_b);
+        assert_eq!(a_neighbors[0], key_b);
 
         // Step 4: B receives A's announcement
-        let b_final = manager_b.handle_message(addr_a, a_announcement.unwrap());
+        let b_final = manager_b.handle_message(&key_a, a_announcement.unwrap());
         // B should not respond (is_response=true prevents ping-pong)
         assert!(
             b_final.is_none(),
@@ -989,7 +1024,7 @@ mod tests {
         // B now knows A has contract X
         let b_neighbors = manager_b.neighbors_with_contract(&key);
         assert_eq!(b_neighbors.len(), 1, "B should know A has contract X");
-        assert_eq!(b_neighbors[0], addr_a);
+        assert_eq!(b_neighbors[0], key_a);
 
         // SUCCESS: Both peers now have bidirectional awareness and can forward updates
     }

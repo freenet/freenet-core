@@ -1019,25 +1019,28 @@ impl OpManager {
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
 
         // Source 1: Proximity cache (peers who announced they seed this contract)
-        let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
-        let proximity_count = proximity_addrs.len();
+        // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
+        let proximity_pub_keys = self.proximity_cache.neighbors_with_contract(key);
+        let proximity_count = proximity_pub_keys.len();
 
-        for addr in proximity_addrs {
-            // Skip sender to avoid echo (unless we're the originator)
-            if &addr == sender && !is_local_update_initiator {
-                continue;
-            }
-            // Skip ourselves if not local originator
-            if !is_local_update_initiator && self_addr.as_ref() == Some(&addr) {
-                continue;
-            }
-            // Only include connected peers
-            if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
+        for pub_key in proximity_pub_keys {
+            // Resolve pub_key to PeerKeyLocation (which includes current address)
+            if let Some(pkl) = self.ring.connection_manager.get_peer_by_pub_key(&pub_key) {
+                // Skip sender to avoid echo (unless we're the originator)
+                if let Some(pkl_addr) = pkl.socket_addr() {
+                    if &pkl_addr == sender && !is_local_update_initiator {
+                        continue;
+                    }
+                    // Skip ourselves if not local originator
+                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        continue;
+                    }
+                }
                 targets.insert(pkl);
             } else {
                 tracing::warn!(
                     contract = %format!("{:.8}", key),
-                    proximity_neighbor = %addr,
+                    proximity_neighbor = %pub_key,
                     is_local = is_local_update_initiator,
                     phase = "target_lookup_failed",
                     "Proximity cache neighbor not found in connection manager"
@@ -1363,17 +1366,24 @@ pub(crate) async fn request_update(
     // neighbors receive the announcement. This is acceptable - the ring-based fallback
     // handles this case, and the proximity cache improves the common case where
     // announcements have propagated.
-    let proximity_neighbors: Vec<_> = op_manager
-        .proximity_cache
-        .neighbors_with_contract(&key)
-        .into_iter()
-        .filter(|addr| addr != &sender_addr)
-        .collect();
+    let proximity_neighbors: Vec<_> = op_manager.proximity_cache.neighbors_with_contract(&key);
 
     let mut target_from_proximity = None;
-    for addr in &proximity_neighbors {
-        match op_manager.ring.connection_manager.get_peer_by_addr(*addr) {
+    for pub_key in &proximity_neighbors {
+        match op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(pub_key)
+        {
             Some(peer) => {
+                // Skip ourselves
+                if peer
+                    .socket_addr()
+                    .map(|a| a == sender_addr)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 target_from_proximity = Some(peer);
                 break;
             }
@@ -1383,7 +1393,7 @@ pub(crate) async fn request_update(
                 // will be cleaned up when the disconnect is processed.
                 tracing::debug!(
                     %key,
-                    peer = %addr,
+                    peer = %pub_key,
                     "UPDATE: Proximity cache neighbor not connected, trying next"
                 );
             }

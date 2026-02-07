@@ -982,9 +982,22 @@ where
                 // Update propagation uses the proximity cache directly, and subscriptions
                 // are lease-based with automatic expiry.
 
+                // Resolve source SocketAddr to TransportPublicKey for proximity cache
+                let source_pub_key = op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(source)
+                    .map(|pkl| pkl.pub_key().clone());
+                let Some(source_pub_key) = source_pub_key else {
+                    tracing::warn!(
+                        %source,
+                        "ProximityCache: could not resolve source addr to pub_key, skipping"
+                    );
+                    break;
+                };
                 if let Some(response) = op_manager
                     .proximity_cache
-                    .handle_message(source, message.clone())
+                    .handle_message(&source_pub_key, message.clone())
                 {
                     // Send response back to sender
                     let response_msg =
