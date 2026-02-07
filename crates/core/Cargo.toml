@@ -70,7 +70,7 @@ tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 zeroize = { version = "1.8", features = ["derive"] }
-wasmer = { features = ["sys"], workspace = true }
+wasmer = { features = ["sys", "experimental-async"], workspace = true }
 wasmer-middlewares = "7.0.1"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }

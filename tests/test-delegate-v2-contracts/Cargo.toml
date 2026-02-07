@@ -1,0 +1,19 @@
+[package]
+name = "test-delegate-v2-contracts"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.1.34", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]
