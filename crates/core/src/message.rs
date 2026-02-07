@@ -619,6 +619,8 @@ pub(crate) enum NodeEvent {
         tx: Transaction,
         key: ContractKey,
         subscribed: bool,
+        /// Whether this was a node-internal subscription renewal (no client waiting).
+        is_renewal: bool,
     },
     /// Register expectation for an inbound connection from the given peer.
     ExpectPeerConnection {
@@ -720,6 +722,7 @@ impl Display for NodeEvent {
                 tx,
                 key,
                 subscribed,
+                ..
             } => {
                 write!(
                     f,
