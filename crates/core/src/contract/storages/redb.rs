@@ -338,6 +338,23 @@ impl ReDb {
         }
     }
 
+    /// Read a contract's state synchronously.
+    ///
+    /// This is the same as `StateStorage::get` but without the async wrapper.
+    /// Used by V2 delegate host functions that need synchronous access during
+    /// WASM `process()` execution.
+    pub fn get_state_sync(&self, key: &ContractKey) -> Result<Option<WrappedState>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let val = {
+            let tbl = txn.open_table(STATE_TABLE)?;
+            tbl.get(key.as_bytes())?
+        };
+        match val {
+            Some(v) => Ok(Some(WrappedState::new(v.value().to_vec()))),
+            None => Ok(None),
+        }
+    }
+
     /// Iterate all contract keys that have stored state.
     /// Returns the raw key bytes - caller must reconstruct ContractKey.
     pub fn iter_all_state_keys(&self) -> Result<Vec<Vec<u8>>, redb::Error> {
