@@ -1653,8 +1653,16 @@ pub(crate) async fn initial_join_procedure(
 
         loop {
             let open_conns = op_manager.ring.open_connections();
-            let unconnected_gateways: Vec<_> =
-                op_manager.ring.is_not_connected(gateways.iter()).collect();
+
+            // When we have zero ring connections, try ALL gateways regardless of
+            // pending_reservations. This handles the case where a CONNECT operation
+            // reserved a gateway slot but the actual connection was routed to a
+            // blocked acceptor, leaving a stale reservation that prevents retries.
+            let unconnected_gateways: Vec<_> = if open_conns == 0 {
+                gateways.iter().collect()
+            } else {
+                op_manager.ring.is_not_connected(gateways.iter()).collect()
+            };
 
             tracing::debug!(
                 "Connection status: open_connections = {}, unconnected_gateways = {}",

@@ -121,7 +121,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
 
     for i in 0..NUM_GATEWAYS {
         let gw_ip = gateway_ips[i];
-        let (cfg, preset) = base_node_test_config_with_ip(
+        let (mut cfg, preset) = base_node_test_config_with_ip(
             true,
             vec![],
             Some(gateway_network_ports[i]),
@@ -132,6 +132,12 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             Some(gw_ip), // Use varied IP for unique ring location
         )
         .await?;
+
+        // Set min_connections high enough so the topology manager doesn't
+        // reject ring promotions for any of the regular nodes. Without this,
+        // the topology manager can reject connections based on location density
+        // with random locations, causing non-deterministic test failures.
+        cfg.network_api.min_connections = Some(NUM_REGULAR_NODES + NUM_GATEWAYS);
 
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
@@ -237,11 +243,14 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Start all regular nodes
+    // Start regular nodes with staggered startup to avoid overwhelming the
+    // gateway with simultaneous CONNECT handshakes (causes timeouts on CI).
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for _i in 0..NUM_REGULAR_NODES {
+    for i in 0..NUM_REGULAR_NODES {
         let config = node_configs.remove(0);
         let regular_node_future = async move {
+            // Stagger node startup by 500ms each to prevent thundering herd
+            tokio::time::sleep(Duration::from_millis(i as u64 * 500)).await;
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
             let gateway_service = serve_gateway(config.ws_api).await?;
