@@ -155,4 +155,268 @@ mod tests {
     fn test_v2_has_contract_host_functions() {
         assert!(DelegateApiVersion::V2.has_contract_host_functions());
     }
+
+    // ============ ReDb synchronous state access tests ============
+
+    use crate::contract::storages::Storage;
+    use crate::util::tests::get_temp_dir;
+    use crate::wasm_runtime::StateStorage;
+    use freenet_stdlib::prelude::*;
+
+    fn make_contract_key(seed: u8) -> (ContractKey, ContractInstanceId, CodeHash) {
+        let code = ContractCode::from(vec![seed, seed + 1, seed + 2]);
+        let params = Parameters::from(vec![seed + 10, seed + 11]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let id = *key.id();
+        let code_hash = *key.code_hash();
+        (key, id, code_hash)
+    }
+
+    /// Verify ReDb::get_state_sync returns the same data as the async get path.
+    #[tokio::test]
+    async fn test_redb_get_state_sync_matches_async() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(1);
+        let state_data = vec![10, 20, 30, 40, 50];
+        let state = WrappedState::new(state_data.clone());
+
+        // Store via async path
+        db.store(key, state).await.unwrap();
+
+        // Read via sync path
+        let sync_result = db.get_state_sync(&key).unwrap();
+        assert!(sync_result.is_some(), "sync get should find stored state");
+        assert_eq!(
+            sync_result.unwrap().as_ref(),
+            &state_data,
+            "sync result should match stored data"
+        );
+
+        // Read via async path for comparison
+        let async_result = db.get(&key).await.unwrap();
+        assert!(async_result.is_some());
+        assert_eq!(async_result.unwrap().as_ref(), &state_data);
+    }
+
+    /// Verify get_state_sync returns None for non-existent contracts.
+    #[tokio::test]
+    async fn test_redb_get_state_sync_missing() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(99);
+        let result = db.get_state_sync(&key).unwrap();
+        assert!(result.is_none(), "should return None for missing contract");
+    }
+
+    /// Verify get_state_sync handles empty state correctly.
+    #[tokio::test]
+    async fn test_redb_get_state_sync_empty_state() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(2);
+        let state = WrappedState::new(vec![]);
+
+        db.store(key, state).await.unwrap();
+
+        let result = db.get_state_sync(&key).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().size(), 0, "empty state should have size 0");
+    }
+
+    /// Verify get_state_sync reads the latest state after updates.
+    #[tokio::test]
+    async fn test_redb_get_state_sync_after_update() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(3);
+
+        // Store initial state
+        db.store(key, WrappedState::new(vec![1, 1, 1]))
+            .await
+            .unwrap();
+
+        // Overwrite with new state
+        db.store(key, WrappedState::new(vec![9, 9, 9]))
+            .await
+            .unwrap();
+
+        // Sync read should return the latest
+        let result = db.get_state_sync(&key).unwrap().unwrap();
+        assert_eq!(result.as_ref(), &[9, 9, 9]);
+    }
+
+    // ============ DelegateCallEnv contract state access tests ============
+
+    use super::super::contract_store::ContractStore;
+    use super::super::native_api::DelegateCallEnv;
+    use super::super::secrets_store::SecretsStore;
+
+    /// Helper to create a DelegateCallEnv wired to real stores.
+    struct TestEnv {
+        _temp_dir: tempfile::TempDir,
+        contract_store: ContractStore,
+        secret_store: SecretsStore,
+        db: Storage,
+    }
+
+    impl TestEnv {
+        async fn new() -> Self {
+            let temp_dir = get_temp_dir();
+            let db = Storage::new(temp_dir.path()).await.unwrap();
+
+            let contracts_dir = temp_dir.path().join("contracts");
+            let delegates_dir = temp_dir.path().join("delegates");
+            let secrets_dir = temp_dir.path().join("secrets");
+
+            let contract_store = ContractStore::new(contracts_dir, 10_000_000, db.clone()).unwrap();
+            let delegate_store =
+                super::super::delegate_store::DelegateStore::new(delegates_dir, 10_000, db.clone())
+                    .unwrap();
+            // DelegateStore not stored since we only need contract_store + secret_store
+            drop(delegate_store);
+            let secret_store =
+                SecretsStore::new(secrets_dir, Default::default(), db.clone()).unwrap();
+
+            Self {
+                _temp_dir: temp_dir,
+                contract_store,
+                secret_store,
+                db,
+            }
+        }
+
+        /// Store a contract (code + state) so the env can find it.
+        async fn store_contract(&mut self, seed: u8, state_data: &[u8]) -> ContractInstanceId {
+            let code = ContractCode::from(vec![seed, seed + 1, seed + 2]);
+            let params = Parameters::from(vec![seed + 10, seed + 11]);
+            let key = ContractKey::from_params_and_code(&params, &code);
+            let id = *key.id();
+
+            // Register in contract store's in-memory index so code_hash_from_id works
+            self.contract_store.ensure_key_indexed(&key).unwrap();
+
+            // Store state in ReDb
+            self.db
+                .store(key, WrappedState::new(state_data.to_vec()))
+                .await
+                .unwrap();
+
+            id
+        }
+
+        /// Create a DelegateCallEnv with access to contract stores.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env(&mut self) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+            DelegateCallEnv::new(
+                vec![],
+                &mut self.secret_store,
+                &self.contract_store,
+                Some(self.db.clone()),
+                delegate_key,
+            )
+        }
+    }
+
+    /// V2 delegate can read contract state synchronously.
+    #[tokio::test]
+    async fn test_env_get_contract_state_found() {
+        let mut env_holder = TestEnv::new().await;
+        let state_data = vec![100, 200, 255];
+        let contract_id = env_holder.store_contract(50, &state_data).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.get_contract_state_sync(&contract_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(state_data));
+    }
+
+    /// V2 delegate gets None for a contract that isn't stored locally.
+    #[tokio::test]
+    async fn test_env_get_contract_state_not_found() {
+        let mut env_holder = TestEnv::new().await;
+
+        let env = unsafe { env_holder.make_env() };
+        let missing_id = ContractInstanceId::new([77u8; 32]);
+        let result = env.get_contract_state_sync(&missing_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// V2 delegate can read empty state.
+    #[tokio::test]
+    async fn test_env_get_contract_state_empty() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(60, &[]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.get_contract_state_sync(&contract_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(vec![]));
+    }
+
+    /// V2 delegate can read multiple different contracts.
+    #[tokio::test]
+    async fn test_env_get_multiple_contracts() {
+        let mut env_holder = TestEnv::new().await;
+        let id1 = env_holder.store_contract(10, &[1, 1, 1]).await;
+        let id2 = env_holder.store_contract(20, &[2, 2, 2]).await;
+        let id3 = env_holder.store_contract(30, &[3, 3, 3]).await;
+
+        let env = unsafe { env_holder.make_env() };
+
+        assert_eq!(
+            env.get_contract_state_sync(&id1).unwrap(),
+            Some(vec![1, 1, 1])
+        );
+        assert_eq!(
+            env.get_contract_state_sync(&id2).unwrap(),
+            Some(vec![2, 2, 2])
+        );
+        assert_eq!(
+            env.get_contract_state_sync(&id3).unwrap(),
+            Some(vec![3, 3, 3])
+        );
+    }
+
+    /// V2 delegate gets an error if state store isn't configured.
+    #[tokio::test]
+    async fn test_env_get_contract_state_no_store() {
+        let mut env_holder = TestEnv::new().await;
+
+        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut env_holder.secret_store,
+                &env_holder.contract_store,
+                None, // No state store
+                delegate_key,
+            )
+        };
+
+        let result = env.get_contract_state_sync(&ContractInstanceId::new([1u8; 32]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not configured"));
+    }
+
+    /// V2 delegate can read large contract state (1 MB).
+    #[tokio::test]
+    async fn test_env_get_large_contract_state() {
+        let mut env_holder = TestEnv::new().await;
+        let large_state: Vec<u8> = (0..1_000_000u32).map(|i| (i % 256) as u8).collect();
+        let contract_id = env_holder.store_contract(70, &large_state).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
+        assert_eq!(result.len(), 1_000_000);
+        assert_eq!(result, large_state);
+    }
 }

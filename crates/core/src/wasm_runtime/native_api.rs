@@ -145,7 +145,10 @@ impl DelegateCallEnv {
     /// Returns `Some(state_bytes)` if found, `None` if the contract is not stored locally.
     /// This is the synchronous fast path used by V2 delegates instead of the
     /// GetContractRequest/Response round-trip.
-    fn get_contract_state_sync(
+    ///
+    /// Uses `ReDb::get_state_sync` — a purely synchronous ReDb read transaction
+    /// with no async overhead.
+    pub(super) fn get_contract_state_sync(
         &self,
         instance_id: &ContractInstanceId,
     ) -> Result<Option<Vec<u8>>, String> {
@@ -162,13 +165,9 @@ impl DelegateCallEnv {
         // Step 2: Construct the full ContractKey
         let contract_key = ContractKey::from_id_and_code(*instance_id, code_hash);
 
-        // Step 3: Read state directly from ReDb (synchronous)
-        // ReDb's StateStorage::get is async in signature but purely synchronous internally.
-        // We replicate the read logic here to avoid the async wrapper.
-        use crate::wasm_runtime::StateStorage;
-        let state = futures::executor::block_on(db.get(&contract_key));
-
-        match state {
+        // Step 3: Read state directly from ReDb via synchronous read transaction.
+        // No async wrapper, no futures::executor::block_on — just a plain read txn.
+        match db.get_state_sync(&contract_key) {
             Ok(Some(wrapped_state)) => Ok(Some(wrapped_state.as_ref().to_vec())),
             Ok(None) => Ok(None),
             Err(e) => Err(format!("state store read error: {e}")),
