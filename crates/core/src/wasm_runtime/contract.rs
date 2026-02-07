@@ -1,17 +1,12 @@
-use std::time::Duration;
-
+use super::engine::{WasmEngine, WasmError};
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use wasmer::{Instance, Store, TypedFunction};
-
-type FfiReturnTy = i64;
 
 pub(crate) trait ContractRuntimeInterface {
-    /// Verify that the state is valid, given the parameters. This will be used before a peer
-    /// caches a new state.
+    /// Verify that the state is valid, given the parameters.
     fn validate_state(
         &mut self,
         key: &ContractKey,
@@ -20,13 +15,7 @@ pub(crate) trait ContractRuntimeInterface {
         related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult>;
 
-    /// Determine whether this delta is a valid update for this contract. If it is, return the modified state,
-    /// else return error.
-    ///
-    /// The contract must be implemented in a way such that this function call is idempotent:
-    /// - If the same `update_state` is applied twice to a value, then the second will be ignored.
-    /// - Application of `update_state` is "order invariant", no matter what the order in which the values are
-    ///   applied, the resulting value must be exactly the same.
+    /// Determine whether this delta is a valid update for this contract.
     fn update_state(
         &mut self,
         key: &ContractKey,
@@ -35,9 +24,7 @@ pub(crate) trait ContractRuntimeInterface {
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>>;
 
-    /// Generate a concise summary of a state that can be used to create deltas relative to this state.
-    ///
-    /// This allows flexible and efficient state synchronization between peers.
+    /// Generate a concise summary of a state.
     fn summarize_state(
         &mut self,
         key: &ContractKey,
@@ -46,8 +33,6 @@ pub(crate) trait ContractRuntimeInterface {
     ) -> RuntimeResult<StateSummary<'static>>;
 
     /// Generate a state delta using a summary from the current state.
-    /// This along with [`Self::summarize_state`] allows flexible and efficient
-    /// state synchronization between peers.
     fn get_state_delta(
         &mut self,
         key: &ContractKey,
@@ -67,55 +52,34 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.instance)?;
+        let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.handle, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.instance, state)?;
+            let mut state_buf = self.init_buf(&running.handle, state)?;
             state_buf.write(state)?;
             state_buf.ptr()
         };
         let related_buf_ptr = {
             let serialized = bincode::serialize(related)?;
-            let mut related_buf = self.init_buf(&running.instance, &serialized)?;
+            let mut related_buf = self.init_buf(&running.handle, &serialized)?;
             related_buf.write(serialized)?;
             related_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
-            .instance
-            .exports
-            .get_typed_function(&wasm_store, "validate_state")
-        {
-            Ok(f) => f,
-            Err(e) => {
-                self.wasm_store = Some(wasm_store);
-                return Err(e.into());
-            }
-        };
-
-        let param_buf_ptr = param_buf_ptr as i64;
-        let state_buf_ptr = state_buf_ptr as i64;
-        let related_buf_ptr = related_buf_ptr as i64;
-        let r = execute_wasm_blocking(
-            move || {
-                let r = validate_func.call(
-                    &mut wasm_store,
-                    param_buf_ptr,
-                    state_buf_ptr,
-                    related_buf_ptr,
-                );
-                (r, wasm_store)
-            },
-            self,
+        let result = self.engine.call_3i64_blocking(
+            &running.handle,
+            "validate_state",
+            param_buf_ptr as i64,
+            state_buf_ptr as i64,
+            related_buf_ptr as i64,
         );
+        let result = classify_result(result)?;
 
-        let result = match_err(self, &running.instance, r)?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
                 .unwrap_validate_state_res(linear_mem)
@@ -131,61 +95,37 @@ impl ContractRuntimeInterface for super::Runtime {
         state: &WrappedState,
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>> {
-        // todo: if we keep this hot in memory some things to take into account:
-        //       - over subsequent requests state size may change
-        //       - the delta may not be necessarily the same size
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.instance)?;
+        let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.handle, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.instance, state)?;
+            let mut state_buf = self.init_buf(&running.handle, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let update_data_buf_ptr = {
             let serialized = bincode::serialize(update_data)?;
-            let mut update_data_buf = self.init_buf(&running.instance, &serialized)?;
+            let mut update_data_buf = self.init_buf(&running.handle, &serialized)?;
             update_data_buf.write(serialized)?;
             update_data_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
-        let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
-            .instance
-            .exports
-            .get_typed_function(&wasm_store, "update_state")
-        {
-            Ok(f) => f,
-            Err(e) => {
-                self.wasm_store = Some(wasm_store);
-                return Err(e.into());
-            }
-        };
-
-        let param_buf_ptr = param_buf_ptr as i64;
-        let state_buf_ptr = state_buf_ptr as i64;
-        let update_data_buf_ptr = update_data_buf_ptr as i64;
-        let r = execute_wasm_blocking(
-            move || {
-                let r = update_state_func.call(
-                    &mut wasm_store,
-                    param_buf_ptr,
-                    state_buf_ptr,
-                    update_data_buf_ptr,
-                );
-                (r, wasm_store)
-            },
-            self,
+        let result = self.engine.call_3i64_blocking(
+            &running.handle,
+            "update_state",
+            param_buf_ptr as i64,
+            state_buf_ptr as i64,
+            update_data_buf_ptr as i64,
         );
+        let result = classify_result(result)?;
 
-        let result = match_err(self, &running.instance, r)?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
                 .unwrap_update_state(linear_mem)
@@ -203,50 +143,34 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.instance)?;
+        let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.handle, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.instance, state)?;
+            let mut state_buf = self.init_buf(&running.handle, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
-        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = match running
-            .instance
-            .exports
-            .get_typed_function(&wasm_store, "summarize_state")
-        {
-            Ok(f) => f,
-            Err(e) => {
-                self.wasm_store = Some(wasm_store);
-                return Err(e.into());
-            }
-        };
-
-        let param_buf_ptr = param_buf_ptr as i64;
-        let state_buf_ptr = state_buf_ptr as i64;
-        let r = execute_wasm_blocking(
-            move || {
-                let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
-                (r, wasm_store)
-            },
-            self,
+        let result = self.engine.call_2i64_blocking(
+            &running.handle,
+            "summarize_state",
+            param_buf_ptr as i64,
+            state_buf_ptr as i64,
         );
+        let result = classify_result(result)?;
 
-        let result = match_err(self, &running.instance, r)?;
-        let result = unsafe {
+        let summary = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
                 .unwrap_summarize_state(linear_mem)
                 .map_err(Into::<ContractExecError>::into)?
         };
 
-        Ok(result)
+        Ok(summary)
     }
 
     fn get_state_delta<'a>(
@@ -258,190 +182,49 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.instance)?;
+        let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.handle, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.instance, state)?;
+            let mut state_buf = self.init_buf(&running.handle, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let summary_buf_ptr = {
-            let mut summary_buf = self.init_buf(&running.instance, summary)?;
+            let mut summary_buf = self.init_buf(&running.handle, summary)?;
             summary_buf.write(summary)?;
             summary_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
-        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
-            .instance
-            .exports
-            .get_typed_function(&wasm_store, "get_state_delta")?;
-
-        let param_buf_ptr = param_buf_ptr as i64;
-        let state_buf_ptr = state_buf_ptr as i64;
-        let summary_buf_ptr = summary_buf_ptr as i64;
-        let r = execute_wasm_blocking(
-            move || {
-                let r = get_state_delta_func.call(
-                    &mut wasm_store,
-                    param_buf_ptr,
-                    state_buf_ptr,
-                    summary_buf_ptr,
-                );
-                (r, wasm_store)
-            },
-            self,
+        let result = self.engine.call_3i64_blocking(
+            &running.handle,
+            "get_state_delta",
+            param_buf_ptr as i64,
+            state_buf_ptr as i64,
+            summary_buf_ptr as i64,
         );
+        let result = classify_result(result)?;
 
-        let result = match_err(self, &running.instance, r)?;
-        let result = unsafe {
+        let delta = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
                 .unwrap_get_state_delta(linear_mem)
                 .map_err(Into::<ContractExecError>::into)?
         };
 
-        Ok(result)
+        Ok(delta)
     }
 }
 
-/// Result type for WASM execution.
-type WasmResult = (Result<i64, wasmer::RuntimeError>, Store);
-
-/// Execute WASM code on a blocking thread with timeout handling.
-///
-/// This function handles WASM execution in two modes:
-/// 1. **With Tokio runtime**: Uses `spawn_blocking` for integration with tokio's
-///    bounded blocking thread pool (controlled by `max_blocking_threads` config)
-/// 2. **Without Tokio runtime**: Falls back to `std::thread::spawn` for sync tests
-///
-/// In both cases, it polls for completion while respecting the timeout.
-fn execute_wasm_blocking<F>(f: F, rt: &mut super::Runtime) -> Result<i64, Errors>
-where
-    F: FnOnce() -> WasmResult + Send + 'static,
-{
-    let timeout = Duration::from_secs_f64(rt.max_execution_seconds);
-    let start = std::time::Instant::now();
-
-    // Check if we're inside a Tokio runtime
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // We have a Tokio runtime - use spawn_blocking for bounded parallelism
-            let task_handle = tokio::task::spawn_blocking(f);
-
-            // Poll until completion or timeout
-            loop {
-                if task_handle.is_finished() {
-                    break;
-                }
-
-                if start.elapsed() >= timeout {
-                    task_handle.abort();
-                    tracing::warn!(
-                        timeout_secs = rt.max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out, aborting task"
-                    );
-                    return Err(Errors::MaxComputeTimeExceeded);
-                }
-
-                std::thread::sleep(Duration::from_millis(10));
-            }
-
-            // Get result using block_in_place to allow blocking within an async context.
-            // We use block_in_place + block_on because we're called from within a tokio task.
-            let join_result = tokio::task::block_in_place(|| handle.block_on(task_handle));
-            let (result, store) = join_result.map_err(|e| {
-                if e.is_panic() {
-                    tracing::error!("WASM blocking task panicked during execution");
-                    Errors::Other(anyhow::anyhow!("WASM execution panicked"))
-                } else if e.is_cancelled() {
-                    Errors::Other(anyhow::anyhow!("WASM execution was cancelled"))
-                } else {
-                    Errors::Other(anyhow::anyhow!("WASM execution failed: {}", e))
-                }
-            })?;
-
-            rt.wasm_store = Some(store);
-            result.map_err(Errors::Wasmer)
-        }
-        Err(_) => {
-            // No Tokio runtime - fall back to std::thread::spawn for sync tests
-            let (tx, rx) = std::sync::mpsc::channel();
-            let thread_handle = std::thread::spawn(move || {
-                let result = f();
-                // Send result through channel (ignore errors if receiver dropped)
-                let _ = tx.send(result);
-            });
-
-            // Poll until completion or timeout
-            loop {
-                // Check if result is available
-                match rx.try_recv() {
-                    Ok((result, store)) => {
-                        rt.wasm_store = Some(store);
-                        // Wait for thread to fully complete
-                        let _ = thread_handle.join();
-                        return result.map_err(Errors::Wasmer);
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // Not ready yet
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Thread panicked - join to get the panic info
-                        return match thread_handle.join() {
-                            Err(_) => {
-                                tracing::error!("WASM thread panicked during execution");
-                                Err(Errors::Other(anyhow::anyhow!("WASM execution panicked")))
-                            }
-                            Ok(()) => {
-                                // This shouldn't happen - channel disconnected but no panic
-                                Err(Errors::Other(anyhow::anyhow!(
-                                    "WASM thread exited without sending result"
-                                )))
-                            }
-                        };
-                    }
-                }
-
-                if start.elapsed() >= timeout {
-                    tracing::warn!(
-                        timeout_secs = rt.max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out (no tokio runtime)"
-                    );
-                    // Can't abort std::thread, but we return the error
-                    // The thread will continue but result is ignored
-                    return Err(Errors::MaxComputeTimeExceeded);
-                }
-
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+/// Convert a WasmError from the engine into the appropriate RuntimeResult error.
+fn classify_result(result: Result<i64, WasmError>) -> RuntimeResult<i64> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(WasmError::OutOfGas) => Err(ContractExecError::OutOfGas.into()),
+        Err(WasmError::Timeout) => Err(ContractExecError::MaxComputeTimeExceeded.into()),
+        Err(e) => Err(e.into()),
     }
-}
-
-fn match_err(
-    rt: &mut super::Runtime,
-    instance: &Instance,
-    r: Result<i64, Errors>,
-) -> RuntimeResult<i64> {
-    match r {
-        Ok(result) => Ok(result),
-        Err(Errors::Wasmer(e)) => Err(rt.handle_contract_error(e, instance, "get_state_delta")),
-        Err(Errors::MaxComputeTimeExceeded) => {
-            Err(ContractExecError::MaxComputeTimeExceeded.into())
-        }
-        Err(Errors::Other(e)) => Err(e.into()),
-    }
-}
-
-enum Errors {
-    Wasmer(wasmer::RuntimeError),
-    MaxComputeTimeExceeded,
-    Other(anyhow::Error),
 }
