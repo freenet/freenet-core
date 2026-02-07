@@ -381,7 +381,7 @@ impl ConnectionManager {
 
     /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
     pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerKeyLocation> {
-        // Check connections by location
+        // Check connections by location (direct address match)
         let connections = self.connections_by_location.read();
         for conns in connections.values() {
             for conn in conns {
@@ -391,22 +391,21 @@ impl ConnectionManager {
             }
         }
 
-        // Log diagnostic info when lookup fails but connections exist
-        let conn_count: usize = connections.values().map(|v| v.len()).sum();
-        if conn_count > 0 {
-            let known_addrs: Vec<_> = connections
-                .values()
-                .flat_map(|conns| conns.iter())
-                .filter_map(|conn| conn.location.socket_addr())
-                .collect();
-            tracing::debug!(
-                requested_addr = %addr,
-                connection_count = conn_count,
-                known_addrs = ?known_addrs,
-                in_location_for_peer = self.location_for_peer.read().contains_key(&addr),
-                transient_count = self.transient_connections.len(),
-                "get_peer_by_addr: no match found"
-            );
+        // Fallback: the transport address may differ from the advertised address
+        // stored in PeerKeyLocation. Use location_for_peer (which maps transport
+        // addresses to ring locations) to bridge the gap.
+        if let Some(&location) = self.location_for_peer.read().get(&addr) {
+            if let Some(conns) = connections.get(&location) {
+                if let Some(conn) = conns.first() {
+                    tracing::debug!(
+                        requested_addr = %addr,
+                        resolved_via = "location_for_peer",
+                        location = %location,
+                        "get_peer_by_addr: resolved via location_for_peer fallback"
+                    );
+                    return Some(conn.location.clone());
+                }
+            }
         }
 
         drop(connections);
