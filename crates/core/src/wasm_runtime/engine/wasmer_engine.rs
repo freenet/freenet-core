@@ -99,6 +99,12 @@ impl WasmEngine for WasmerEngine {
             .map_err(|e| WasmError::Compile(e.to_string()))
     }
 
+    fn module_has_async_imports(&self, module: &Module) -> bool {
+        module
+            .imports()
+            .any(|import| import.module() == "freenet_delegate_contracts")
+    }
+
     fn create_instance(
         &mut self,
         module: &Module,
@@ -190,30 +196,6 @@ impl WasmEngine for WasmerEngine {
             .map_err(|e| classify_runtime_error(enabled_metering, store, instance, e))
     }
 
-    fn call_2i64(
-        &mut self,
-        handle: &InstanceHandle,
-        name: &str,
-        a: i64,
-        b: i64,
-    ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-        let func: TypedFunction<(i64, i64), i64> = instance
-            .exports
-            .get_typed_function(&*store, name)
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-        func.call(store, a, b)
-            .map_err(|e| classify_runtime_error(enabled_metering, store, instance, e))
-    }
-
     fn call_3i64(
         &mut self,
         handle: &InstanceHandle,
@@ -274,21 +256,47 @@ impl WasmEngine for WasmerEngine {
             };
 
         // Convert Store to StoreAsync for async host function support.
-        // Use futures::executor::block_on as the bridge from sync to async.
-        // This works because the current async host functions complete
-        // synchronously (ReDb reads). When truly async operations are added
-        // (network fetches, subscriptions), the DelegateRuntimeInterface
-        // trait should be made async and the bridge removed.
+        //
+        // The async host functions currently complete synchronously (ReDb reads),
+        // but call_async still requires an async executor. We use:
+        // - Inside tokio: block_in_place + Handle::block_on (avoids deadlock)
+        // - Outside tokio: futures::executor::block_on (simpler fallback)
+        //
+        // Panic safety: AssertUnwindSafe + catch_unwind ensures the Store is
+        // restored even if block_on or call_async panics.
         let store_async = store.into_async();
-        let call_result = futures::executor::block_on(func.call_async(&store_async, a, b, c));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let call_result = block_on_async(func.call_async(&store_async, a, b, c));
+            (call_result, store_async)
+        }));
 
-        // Convert StoreAsync back to Store and restore it
-        let store = store_async
-            .into_store()
-            .expect("StoreAsync should convert back to Store after call_async completes");
-        self.store = Some(store);
+        match panic_result {
+            Ok((call_result, store_async)) => {
+                // Normal path: convert StoreAsync back to Store
+                let mut store = store_async
+                    .into_store()
+                    .expect("StoreAsync should convert back to Store after call_async completes");
 
-        call_result.map_err(|e| WasmError::Runtime(e.to_string()))
+                // Classify errors (metering/gas detection) with the restored Store
+                let result = call_result.map_err(|e| {
+                    classify_runtime_error(self.enabled_metering, &mut store, instance, e)
+                });
+                self.store = Some(store);
+                result
+            }
+            Err(panic_payload) => {
+                // WASM call panicked — Store is lost (moved into closure)
+                tracing::error!("WASM async call panicked — engine Store is permanently lost");
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    format!("WASM async call panicked: {s}")
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    format!("WASM async call panicked: {s}")
+                } else {
+                    "WASM async call panicked".to_string()
+                };
+                Err(WasmError::Other(anyhow::anyhow!(msg)))
+            }
+        }
     }
 
     fn call_2i64_blocking(
@@ -409,22 +417,6 @@ impl WasmEngine for WasmerEngine {
             BlockingResult::Panic(err) => Err(WasmError::Other(err)),
         }
     }
-
-    fn is_out_of_gas(&self, handle: &InstanceHandle) -> bool {
-        if !self.enabled_metering {
-            return false;
-        }
-        if self.store.is_none() {
-            return false;
-        }
-        if !self.instances.contains_key(&handle.id) {
-            return false;
-        }
-        // get_remaining_points needs &mut Store but we only have &Store.
-        // We can't check from an immutable reference. This is a limitation.
-        // The actual check happens in classify_runtime_error after a call fails.
-        false
-    }
 }
 
 // =============================================================================
@@ -517,6 +509,22 @@ impl WasmerEngine {
             }
         }
         Ok(())
+    }
+}
+
+/// Bridge from sync to async, using the right executor for the current context.
+///
+/// - Inside a tokio runtime: `block_in_place` + `Handle::block_on` so the tokio
+///   reactor can still make progress (avoids deadlocking if an async host function
+///   ever needs tokio I/O).
+/// - Outside tokio: `futures::executor::block_on` (lightweight, no runtime needed).
+///
+/// Note: wasmer's `call_async` returns a `!Send` future (corosensei coroutines),
+/// so we cannot `tokio::spawn` it. Both paths run on the current thread.
+fn block_on_async<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => futures::executor::block_on(future),
     }
 }
 
@@ -893,5 +901,103 @@ mod tests {
         // Within limit should pass
         let mem_type = MemoryType::new(10, Some(50), false);
         assert!(tunables.validate_memory(&mem_type).is_ok());
+    }
+
+    // ============ module_has_async_imports detection tests ============
+
+    #[test]
+    fn test_module_without_async_imports_detected_as_v1() {
+        let store = Store::default();
+        let wat = r#"
+        (module
+          (import "freenet_log" "info" (func $log (param i64 i32)))
+          (func (export "process") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = Module::new(&store, wat).unwrap();
+        assert!(
+            !module
+                .imports()
+                .any(|i| i.module() == "freenet_delegate_contracts"),
+            "V1 module should not have freenet_delegate_contracts imports"
+        );
+    }
+
+    #[test]
+    fn test_module_with_async_imports_detected_as_v2() {
+        let store = Store::default();
+        let wat = r#"
+        (module
+          (import "freenet_log" "info" (func $log (param i64 i32)))
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
+            (func $get_state (param i64 i32 i64 i64) (result i64)))
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (func (export "process") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = Module::new(&store, wat).unwrap();
+        assert!(
+            module
+                .imports()
+                .any(|i| i.module() == "freenet_delegate_contracts"),
+            "V2 module should have freenet_delegate_contracts imports"
+        );
+    }
+
+    /// End-to-end test: a V2 WASM module with async host functions for contract
+    /// access can be compiled, instantiated, and executed through the engine's
+    /// call_3i64_async_imports path.
+    #[test]
+    fn test_v2_async_call_path_end_to_end() {
+        use crate::wasm_runtime::runtime::RuntimeConfig;
+
+        // WAT module that imports async contract host functions and calls them.
+        // get_contract_state_len(id_ptr, id_len) returns a packed i64.
+        // We just call it and return the result + 1 to prove async path works.
+        let wat = r#"
+        (module
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (global $instance_id (mut i64) (i64.const 0))
+          (func (export "__frnt_set_id") (param i64)
+            local.get 0
+            global.set $instance_id)
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            i64.const 100)
+          (func (export "process") (param i64 i64 i64) (result i64)
+            ;; Call get_state_len with dummy args (will return an error code
+            ;; since we're not in a real delegate env, but that's fine —
+            ;; the point is that call_async works through the engine).
+            i64.const 0
+            i32.const 0
+            call $get_state_len))
+        "#;
+
+        let mut engine =
+            WasmerEngine::new(&RuntimeConfig::default(), false).expect("engine creation");
+
+        let module = engine.compile(wat.as_bytes()).expect("compile");
+        assert!(
+            engine.module_has_async_imports(&module),
+            "module should be detected as V2"
+        );
+
+        let handle = engine
+            .create_instance(&module, 999, 1024)
+            .expect("create instance");
+
+        // Call through the async imports path
+        let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
+        // The function should execute successfully (returning an error code from
+        // get_state_len since no delegate env is set up, but no WASM trap).
+        assert!(
+            result.is_ok(),
+            "V2 async call path should succeed, got: {:?}",
+            result
+        );
+
+        engine.drop_instance(&handle);
     }
 }

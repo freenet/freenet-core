@@ -1,5 +1,6 @@
 use super::{
     contract_store::ContractStore,
+    delegate_api::DelegateApiVersion,
     delegate_store::DelegateStore,
     engine::{Engine, InstanceHandle, WasmEngine},
     error::RuntimeInnerError,
@@ -47,10 +48,14 @@ pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 128;
 
 /// A live WASM instance with RAII cleanup.
 ///
-/// On drop, removes the MEM_ADDR entry and the engine instance.
+/// On drop, removes the MEM_ADDR entry. The wasmer `Instance` is cleaned
+/// up by calling [`Runtime::drop_running_instance`] after the instance is
+/// no longer needed.
 pub(super) struct RunningInstance {
     pub id: i64,
     pub handle: InstanceHandle,
+    /// Set to true when the engine instance has been explicitly cleaned up.
+    dropped_from_engine: bool,
 }
 
 impl RunningInstance {
@@ -73,18 +78,24 @@ impl RunningInstance {
             },
         );
 
-        Ok(Self { id, handle })
+        Ok(Self {
+            id,
+            handle,
+            dropped_from_engine: false,
+        })
     }
 }
 
 impl Drop for RunningInstance {
     fn drop(&mut self) {
-        // MEM_ADDR cleanup is handled by Engine::drop_instance
-        // (which is called... well, we need to handle this differently)
-        // Actually, we can't call engine.drop_instance here because we don't have &mut Engine.
-        // But MEM_ADDR is cleaned up by the engine's drop_instance.
-        // For now, just clean up MEM_ADDR here and let the engine instance leak.
-        // The engine will clean up when it's dropped or when a new instance is created.
+        if !self.dropped_from_engine {
+            tracing::debug!(
+                instance_id = self.id,
+                "RunningInstance dropped without engine cleanup — MEM_ADDR cleaned up, \
+                 but wasmer Instance will leak until engine is dropped"
+            );
+        }
+        // Always clean up MEM_ADDR as a safety net (idempotent — engine may have already removed it)
         let _ = native_api::MEM_ADDR.remove(&self.id);
     }
 }
@@ -115,9 +126,6 @@ pub enum ContractExecError {
 
     #[error("Attempted to perform a put for an already put contract ({0}), use update instead")]
     DoublePut(ContractKey),
-
-    #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
-    InsufficientMemory { req: usize, free: usize },
 
     #[error("could not cast array length of {0} to max size (i32::MAX)")]
     InvalidArrayLength(usize),
@@ -225,6 +233,16 @@ impl Runtime {
         )
     }
 
+    /// Explicitly clean up a running instance from the engine.
+    ///
+    /// This removes the wasmer `Instance` from the engine's HashMap and
+    /// the MEM_ADDR entry. Should be called after the instance is no longer
+    /// needed (after all WASM calls are complete).
+    pub(super) fn drop_running_instance(&mut self, running: &mut RunningInstance) {
+        self.engine.drop_instance(&running.handle);
+        running.dropped_from_engine = true;
+    }
+
     pub(super) fn init_buf<T>(
         &mut self,
         handle: &InstanceHandle,
@@ -288,12 +306,17 @@ impl Runtime {
         )
     }
 
+    /// Prepare a delegate for execution and detect its API version.
+    ///
+    /// Returns the running instance and the detected API version (V1 or V2).
+    /// V2 is detected by inspecting whether the WASM module imports the
+    /// `freenet_delegate_contracts` namespace (async host functions).
     pub(super) fn prepare_delegate_call(
         &mut self,
         params: &Parameters,
         key: &DelegateKey,
         req_bytes: usize,
-    ) -> RuntimeResult<RunningInstance> {
+    ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
         let module = if let Some(module) = self.delegate_modules.get(key) {
             module.clone()
         } else {
@@ -306,11 +329,19 @@ impl Runtime {
             self.delegate_modules.put(key.clone(), module.clone());
             module
         };
-        RunningInstance::new(
+
+        let api_version = if self.engine.module_has_async_imports(&module) {
+            DelegateApiVersion::V2
+        } else {
+            DelegateApiVersion::V1
+        };
+
+        let running = RunningInstance::new(
             &mut self.engine,
             &module,
             Key::Delegate(key.clone()),
             req_bytes,
-        )
+        )?;
+        Ok((running, api_version))
     }
 }

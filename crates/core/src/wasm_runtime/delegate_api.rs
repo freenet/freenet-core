@@ -76,9 +76,11 @@
 //!
 //! ### Detection
 //!
-//! The runtime detects V2 delegates by checking whether they import the
-//! `freenet_delegate_contracts` namespace. V1 delegates that don't use
-//! contract host functions continue to work unchanged.
+//! The runtime detects V2 delegates by inspecting the compiled WASM
+//! module's imports for the `freenet_delegate_contracts` namespace.
+//! Only delegates that actually import the contract access host functions
+//! use the async call path (`call_async` with `StoreAsync`).
+//! V1 delegates continue to use the synchronous call path unchanged.
 
 use std::fmt;
 
@@ -87,7 +89,6 @@ use std::fmt;
 /// Used by the runtime to select the correct execution path and
 /// determine which host functions are available to a delegate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Public API — used by consumers for version-based dispatch
 pub enum DelegateApiVersion {
     /// V1: Request/response pattern for contract access.
     ///

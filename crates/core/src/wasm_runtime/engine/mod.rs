@@ -79,7 +79,6 @@ pub(crate) enum WasmError {
 ///
 /// Implementors manage the full lifecycle of WASM modules and instances:
 /// compilation, instantiation, memory management, and function execution.
-#[allow(dead_code)]
 pub(crate) trait WasmEngine: Send {
     /// Compiled module type, cached in LRU caches by the runtime.
     type Module: Clone + Send;
@@ -101,6 +100,14 @@ pub(crate) trait WasmEngine: Send {
 
     /// Compile WASM bytecode into an executable module.
     fn compile(&mut self, code: &[u8]) -> Result<Self::Module, WasmError>;
+
+    // -- Module inspection --
+
+    /// Check if a compiled module imports async host functions.
+    ///
+    /// Returns `true` if the module imports the `freenet_delegate_contracts`
+    /// namespace, indicating it's a V2 delegate that needs `call_async`.
+    fn module_has_async_imports(&self, module: &Self::Module) -> bool;
 
     // -- Instance lifecycle --
 
@@ -130,16 +137,8 @@ pub(crate) trait WasmEngine: Send {
     // Used for delegate process() calls where thread-local state is needed.
 
     /// Call a WASM function `name() -> ()` synchronously (no args, no return).
+    #[allow(dead_code)] // Used in tests via concrete Engine type
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError>;
-
-    /// Call a WASM function `name(a, b) -> i64` synchronously.
-    fn call_2i64(
-        &mut self,
-        handle: &InstanceHandle,
-        name: &str,
-        a: i64,
-        b: i64,
-    ) -> Result<i64, WasmError>;
 
     /// Call a WASM function `name(a, b, c) -> i64` synchronously.
     fn call_3i64(
@@ -194,11 +193,6 @@ pub(crate) trait WasmEngine: Send {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError>;
-
-    // -- Metering --
-
-    /// Check if the given instance has exhausted its gas allocation.
-    fn is_out_of_gas(&self, handle: &InstanceHandle) -> bool;
 }
 
 // Backend selection via type alias — no generics leak outside wasm_runtime/
