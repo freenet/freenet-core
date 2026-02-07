@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
-use super::{delegate, runtime, secrets_store};
+use super::{delegate, engine, runtime, secrets_store};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -44,11 +44,7 @@ impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
 impl_err!(delegate::DelegateExecError);
 impl_err!(runtime::ContractExecError);
-impl_err!(wasmer::CompileError);
-impl_err!(wasmer::ExportError);
-impl_err!(wasmer::InstantiationError);
-impl_err!(wasmer::MemoryError);
-impl_err!(wasmer::RuntimeError);
+impl_err!(engine::WasmError);
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RuntimeInnerError {
@@ -74,26 +70,14 @@ pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
     DelegateExecError(#[from] delegate::DelegateExecError),
 
-    // contract runtime  errors
+    // contract runtime errors
     #[error("contract {0} not found in store")]
     ContractNotFound(ContractKey),
 
     #[error(transparent)]
     ContractExecError(#[from] runtime::ContractExecError),
 
-    // wasm runtime errors
+    // wasm engine errors (all backend-specific errors unified here)
     #[error(transparent)]
-    WasmCompileError(#[from] wasmer::CompileError),
-
-    #[error(transparent)]
-    WasmExportError(#[from] wasmer::ExportError),
-
-    #[error(transparent)]
-    WasmInstantiationError(#[from] wasmer::InstantiationError),
-
-    #[error(transparent)]
-    WasmMemError(#[from] wasmer::MemoryError),
-
-    #[error(transparent)]
-    WasmRtError(#[from] wasmer::RuntimeError),
+    WasmError(#[from] engine::WasmError),
 }

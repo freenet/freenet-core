@@ -285,7 +285,7 @@ impl RuntimePool {
     }
 
     /// Check if an executor is healthy and can be reused.
-    /// An executor is unhealthy if its wasm_store is None (lost due to panic).
+    /// An executor is unhealthy if the WASM engine is in a broken state (e.g., store lost due to panic).
     fn is_executor_healthy(executor: &Executor<Runtime>) -> bool {
         executor.runtime.is_healthy()
     }

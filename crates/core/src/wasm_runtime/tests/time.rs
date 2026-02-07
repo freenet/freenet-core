@@ -1,8 +1,7 @@
-//! A test WASM module that checkes that the `time` module in the std lib works correctly.
-
-use wasmer::TypedFunction;
+//! A test WASM module that checks that the `time` module in the std lib works correctly.
 
 use super::{super::Runtime, TestSetup};
+use crate::wasm_runtime::engine::WasmEngine;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn now() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,13 +15,7 @@ async fn now() -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let module = runtime.prepare_contract_call(&contract_key, &vec![].into(), 1_000)?;
-    let wasm_store = runtime.wasm_store.as_mut().unwrap();
-    let f: TypedFunction<(), ()> = module
-        .instance
-        .exports
-        .get_function("time_func")?
-        .typed(&*wasm_store)?;
-    f.call(wasm_store)?;
+    runtime.engine.call_void(&module.handle, "time_func")?;
     std::mem::drop(temp_dir);
     Ok(())
 }
