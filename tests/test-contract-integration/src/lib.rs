@@ -166,7 +166,7 @@ impl ContractInterface for Contract {
                     // Determine if this is a client update or a network broadcast:
                     // - If incoming version > current version: network broadcast, use as-is
                     // - If incoming version == current version: client update, may need version bump
-                    // - If incoming version < current version: reject or use current (shouldn't happen)
+                    // - If incoming version < current version: stale broadcast, keep current state
                     if incoming.version > todo_list.version {
                         // Network broadcast with newer version - use it directly
                         todo_list = incoming;
@@ -176,10 +176,9 @@ impl ContractInterface for Contract {
                         todo_list = incoming;
                         received_delta = true; // Treat as a delta for version increment logic
                     } else {
-                        // Incoming has older version - this is a conflict, but we'll accept
-                        // and treat as a modification for version increment
-                        todo_list = incoming;
-                        received_delta = true;
+                        // Incoming has older version (stale broadcast) - keep current state.
+                        // This happens when e.g. a gateway echoes back an earlier PUT state
+                        // after we've already applied a newer UPDATE locally.
                     }
                 }
                 _ => return Err(ContractError::InvalidUpdate),
