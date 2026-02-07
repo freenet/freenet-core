@@ -11,6 +11,7 @@ use wasmer::{Instance, TypedFunction};
 
 use super::native_api::{DelegateCallEnv, InstanceId, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
 use super::{Runtime, RuntimeResult};
+use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
 /// RAII guard that ensures cleanup of delegate environment state.
 /// When dropped, it clears the thread-local instance ID and removes the
@@ -96,10 +97,11 @@ impl Runtime {
         process_func: &TypedFunction<(i64, i64, i64), i64>,
         instance: &Instance,
         instance_id: i64,
+        api_version: DelegateApiVersion,
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
         // Set up the delegate call environment with context, secret store, and
         // contract store access. SAFETY: self.secret_store and self.contract_store
-        // are valid for the duration of the synchronous process_func.call() below.
+        // are valid for the duration of the process_func.call() / call_async() below.
         // The guard ensures cleanup even on panic.
         let env = unsafe {
             DelegateCallEnv::new(
@@ -123,8 +125,10 @@ impl Runtime {
         // Create RAII guard to ensure cleanup on all exit paths (including panic)
         let _guard = DelegateEnvGuard::new(instance_id);
 
-        // Execute the WASM process function
-        let result = self.exec_inbound(params, attested, msg, process_func, instance);
+        // Execute the WASM process function.
+        // V2 delegates use call_async (async host functions for contract access).
+        // V1 delegates use synchronous call.
+        let result = self.exec_inbound(params, attested, msg, process_func, instance, api_version);
 
         // Read back the (possibly mutated) context before guard drops
         // Note: We need to get the context before the guard drops and removes it
@@ -146,6 +150,7 @@ impl Runtime {
         msg: &InboundDelegateMsg,
         process_func: &TypedFunction<(i64, i64, i64), i64>,
         instance: &Instance,
+        api_version: DelegateApiVersion,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let param_buf_ptr = {
             let mut param_buf = self.init_buf(instance, params)?;
@@ -169,13 +174,54 @@ impl Runtime {
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
         };
-        tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
-        let res = process_func.call(
-            self.wasm_store.as_mut().unwrap(),
-            param_buf_ptr as i64,
-            attested_buf_ptr as i64,
-            msg_ptr as i64,
-        )?;
+        tracing::debug!(
+            inbound_msg_name,
+            api_version = %api_version,
+            "Calling delegate with inbound message"
+        );
+
+        let res = match api_version {
+            DelegateApiVersion::V1 => {
+                // V1: synchronous call — no async host functions involved
+                process_func.call(
+                    self.wasm_store.as_mut().unwrap(),
+                    param_buf_ptr as i64,
+                    attested_buf_ptr as i64,
+                    msg_ptr as i64,
+                )?
+            }
+            DelegateApiVersion::V2 => {
+                // V2: async call — contract host functions are async.
+                // Take the Store out, convert to StoreAsync, call_async, convert back.
+                //
+                // We use futures::executor::block_on as the bridge from sync to async.
+                // This works because the current async host functions complete
+                // synchronously (ReDb reads). When truly async operations are added
+                // (network fetches, subscriptions), the DelegateRuntimeInterface
+                // trait should be made async and the bridge removed.
+                let store = self
+                    .wasm_store
+                    .take()
+                    .expect("wasm_store should be present");
+                let store_async = store.into_async();
+
+                let call_result = futures::executor::block_on(process_func.call_async(
+                    &store_async,
+                    param_buf_ptr as i64,
+                    attested_buf_ptr as i64,
+                    msg_ptr as i64,
+                ));
+
+                // Convert StoreAsync back to Store and restore it
+                let store = store_async
+                    .into_store()
+                    .expect("StoreAsync should convert back to Store after call_async completes");
+                self.wasm_store = Some(store);
+
+                call_result?
+            }
+        };
+
         let linear_mem = self.linear_mem(instance)?;
         let outbound = unsafe {
             DelegateInterfaceResult::from_raw(res, &linear_mem)
@@ -350,6 +396,23 @@ impl DelegateRuntimeInterface for Runtime {
             .get_typed_function(self.wasm_store.as_ref().unwrap(), "process")?;
         let instance_id = running.id;
 
+        // Detect API version: V2 delegates import from the freenet_delegate_contracts
+        // namespace (async contract access host functions). For the prototype, we
+        // always use V2 (call_async) since it's backward-compatible with V1 delegates
+        // that don't call the contract functions — call_async just adds a thin
+        // coroutine wrapper that completes immediately for non-yielding functions.
+        let api_version = if self.state_store_db.is_some() {
+            DelegateApiVersion::V2
+        } else {
+            DelegateApiVersion::V1
+        };
+
+        tracing::debug!(
+            delegate_key = %delegate_key,
+            api_version = %api_version,
+            "Starting delegate execution"
+        );
+
         // State maintained across process() calls within this conversation
         let mut context: Vec<u8> = Vec::new();
 
@@ -376,6 +439,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         &running.instance,
                         instance_id,
+                        api_version,
                     )?;
                     context = updated_context;
 
@@ -402,6 +466,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         &running.instance,
                         instance_id,
+                        api_version,
                     )?;
                     context = updated_context;
 
@@ -428,6 +493,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &process_func,
                         &running.instance,
                         instance_id,
+                        api_version,
                     )?;
                     context = updated_context;
 

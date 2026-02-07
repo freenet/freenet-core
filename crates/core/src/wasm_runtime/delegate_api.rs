@@ -17,19 +17,25 @@
 //! managing serialization/deserialization of intermediate state and handling
 //! multiple message types.
 //!
-//! ## V2 (New — synchronous host functions for async operations)
+//! ## V2 (New — async host functions for contract access)
 //!
-//! Delegates still implement `process()`, but the `DelegateCtx` gains new host
-//! functions for contract access:
+//! Delegates still implement `process()`, but the `DelegateCtx` gains new
+//! **async host functions** for contract access, registered via wasmer's
+//! `Function::new_typed_async` (requires `experimental-async` feature):
 //!
 //! ```text
 //! ctx.get_contract_state(contract_id)  → Option<Vec<u8>>
 //! ```
 //!
-//! From the WASM delegate's perspective, these calls are synchronous — the
+//! From the WASM delegate's perspective, these calls appear synchronous — the
 //! delegate simply calls the function and gets the result back immediately.
-//! Behind the scenes, the host runtime reads from the local state store
-//! (ReDb) synchronously on the calling thread.
+//! Behind the scenes, the host functions are registered as async and the
+//! `process()` call uses `TypedFunction::call_async` with a `StoreAsync`.
+//!
+//! Currently the host function implementations are synchronous internally
+//! (direct ReDb reads), but because they're registered as async, the
+//! infrastructure is ready for truly async operations (network fetches,
+//! PUT operations, subscriptions) that will genuinely yield in the future.
 //!
 //! ### Example: V1 vs V2
 //!
@@ -91,10 +97,13 @@ pub enum DelegateApiVersion {
     /// encoded in `DelegateContext` across round-trips.
     V1,
 
-    /// V2: Host function-based contract access.
+    /// V2: Async host function-based contract access.
     ///
     /// Delegates call `ctx.get_contract_state()` directly during `process()`.
-    /// The runtime handles the state lookup synchronously via the local store.
+    /// The runtime uses `TypedFunction::call_async` with a `StoreAsync` so
+    /// async host functions can yield. Currently the contract access functions
+    /// resolve synchronously (ReDb reads), but the infrastructure supports
+    /// future async operations (network, subscriptions).
     /// No round-trip, no manual context encoding.
     V2,
 }
@@ -418,5 +427,159 @@ mod tests {
         let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
         assert_eq!(result.len(), 1_000_000);
         assert_eq!(result, large_state);
+    }
+
+    // ============ Wasmer async host function integration tests ============
+
+    /// Verify that a WASM module with async host functions can be called
+    /// via `call_async` with a `StoreAsync`.
+    ///
+    /// This tests the core mechanism: `Function::new_typed_async` +
+    /// `Store::into_async()` + `TypedFunction::call_async()`.
+    #[test]
+    fn test_wasmer_async_host_function_roundtrip() {
+        use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
+
+        // Simple WAT module: calls an async host function and returns the result + 1
+        let wat = r#"
+        (module
+          (import "host" "async_get_value" (func $get_value (result i32)))
+          (func (export "compute") (result i32)
+            call $get_value
+            i32.const 1
+            i32.add))
+        "#;
+
+        let mut store = Store::default();
+        let module = Module::new(&store, wat).unwrap();
+
+        // Register an async host function that returns 41
+        let async_get_value = Function::new_typed_async(&mut store, || async move { 41_i32 });
+
+        let import_object = imports! {
+            "host" => {
+                "async_get_value" => async_get_value,
+            }
+        };
+
+        let instance = Instance::new(&mut store, &module, &import_object).unwrap();
+        let compute: TypedFunction<(), i32> = instance
+            .exports
+            .get_typed_function(&store, "compute")
+            .unwrap();
+
+        // Convert Store to StoreAsync and call via call_async
+        let store_async = store.into_async();
+        let result = futures::executor::block_on(compute.call_async(&store_async));
+        assert_eq!(result.unwrap(), 42, "async_get_value(41) + 1 should be 42");
+    }
+
+    /// Verify that sync and async host functions can coexist in the same module.
+    #[test]
+    fn test_wasmer_mixed_sync_async_host_functions() {
+        use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
+
+        let wat = r#"
+        (module
+          (import "host" "sync_add" (func $sync_add (param i32 i32) (result i32)))
+          (import "host" "async_mul" (func $async_mul (param i32 i32) (result i32)))
+          (func (export "compute") (param i32 i32) (result i32)
+            ;; sync_add(a, b) + async_mul(a, b)
+            local.get 0
+            local.get 1
+            call $sync_add
+            local.get 0
+            local.get 1
+            call $async_mul
+            i32.add))
+        "#;
+
+        let mut store = Store::default();
+        let module = Module::new(&store, wat).unwrap();
+
+        // Sync host function
+        let sync_add = Function::new_typed(&mut store, |a: i32, b: i32| a + b);
+
+        // Async host function
+        let async_mul =
+            Function::new_typed_async(&mut store, |a: i32, b: i32| async move { a * b });
+
+        let import_object = imports! {
+            "host" => {
+                "sync_add" => sync_add,
+                "async_mul" => async_mul,
+            }
+        };
+
+        let instance = Instance::new(&mut store, &module, &import_object).unwrap();
+        let compute: TypedFunction<(i32, i32), i32> = instance
+            .exports
+            .get_typed_function(&store, "compute")
+            .unwrap();
+
+        // Must use call_async since we have async imports
+        let store_async = store.into_async();
+        let result = futures::executor::block_on(compute.call_async(&store_async, 3, 4));
+        // sync_add(3, 4) = 7, async_mul(3, 4) = 12, total = 19
+        assert_eq!(result.unwrap(), 19);
+    }
+
+    /// Verify that `StoreAsync::into_store()` round-trips correctly.
+    ///
+    /// Note: Once async host functions are registered, ALL calls must use
+    /// `call_async` — sync `call()` will trap with `YieldOutsideAsyncContext`.
+    /// The `into_store()` round-trip is useful for operations that need
+    /// `&mut Store` (e.g., creating new instances, growing memory).
+    #[test]
+    fn test_wasmer_store_async_roundtrip() {
+        use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
+
+        let wat = r#"
+        (module
+          (import "host" "async_inc" (func $inc (param i32) (result i32)))
+          (func (export "call_inc") (param i32) (result i32)
+            local.get 0
+            call $inc))
+        "#;
+
+        let mut store = Store::default();
+        let module = Module::new(&store, wat).unwrap();
+
+        let async_inc = Function::new_typed_async(&mut store, |x: i32| async move { x + 1 });
+
+        let import_object = imports! {
+            "host" => {
+                "async_inc" => async_inc,
+            }
+        };
+
+        let instance = Instance::new(&mut store, &module, &import_object).unwrap();
+        let call_inc: TypedFunction<i32, i32> = instance
+            .exports
+            .get_typed_function(&store, "call_inc")
+            .unwrap();
+
+        // First async call
+        let store_async = store.into_async();
+        let result1 = futures::executor::block_on(call_inc.call_async(&store_async, 10));
+        assert_eq!(result1.unwrap(), 11);
+
+        // Convert back to Store (needed for operations requiring &mut Store)
+        let store = store_async
+            .into_store()
+            .expect("should convert back to Store");
+
+        // Convert to async again and make another call
+        let store_async = store.into_async();
+        let result2 = futures::executor::block_on(call_inc.call_async(&store_async, 20));
+        assert_eq!(result2.unwrap(), 21);
+
+        // One more round-trip to verify stability
+        let store = store_async
+            .into_store()
+            .expect("second round-trip should work");
+        let store_async = store.into_async();
+        let result3 = futures::executor::block_on(call_inc.call_async(&store_async, 30));
+        assert_eq!(result3.unwrap(), 31);
     }
 }

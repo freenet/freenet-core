@@ -668,13 +668,19 @@ pub(crate) mod delegate_secrets {
     }
 }
 
-/// Host functions for synchronous contract state access (V2 delegate API).
+/// Host functions for async contract state access (V2 delegate API).
 ///
 /// These allow a V2 delegate to read contract state directly during `process()`,
 /// eliminating the GetContractRequest/GetContractResponse round-trip.
 ///
-/// The delegate passes a `ContractInstanceId` (32 bytes) and receives the
-/// contract state bytes back in a pre-allocated output buffer.
+/// **Async host functions**: These are registered via `Function::new_typed_async`
+/// so they can be called with `call_async` on a `StoreAsync`. This establishes
+/// the async execution pattern needed for future operations (network fetches,
+/// PUT operations, subscriptions) that will genuinely yield.
+///
+/// Currently the implementations are synchronous internally (ReDb reads), but
+/// because they're registered as async, the delegate execution path must use
+/// `call_async` via a `StoreAsync`.
 ///
 /// ## Usage Pattern (from WASM)
 ///
@@ -694,8 +700,20 @@ pub(crate) mod delegate_contracts {
     use crate::wasm_runtime::delegate_api::contract_error_codes;
 
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let get_state = Function::new_typed(store, get_contract_state);
-        let get_state_len = Function::new_typed(store, get_contract_state_len);
+        // Register as async host functions using Function::new_typed_async.
+        // This means the WASM execution must use call_async() via a StoreAsync.
+        // The closures |args| async move { ... } satisfy the HostFunction trait:
+        //   Fn(Args) -> impl Future<Output = Rets> + Send + 'static
+        let get_state = Function::new_typed_async(
+            store,
+            |id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64| async move {
+                get_contract_state_impl(id_ptr, id_len, out_ptr, out_len)
+            },
+        );
+        let get_state_len =
+            Function::new_typed_async(store, |id_ptr: i64, id_len: i32| async move {
+                get_contract_state_len_impl(id_ptr, id_len)
+            });
         imports.register_namespace(
             "freenet_delegate_contracts",
             [
@@ -711,17 +729,11 @@ pub(crate) mod delegate_contracts {
         );
     }
 
-    /// Get the size of a contract's state without retrieving it.
+    /// Implementation of get_contract_state_len.
     ///
-    /// The contract instance ID is read from WASM memory at `id_ptr` (must be 32 bytes).
-    ///
-    /// ## Returns
-    /// - Non-negative: state size in bytes
-    /// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
-    /// - `ERR_INVALID_PARAM` (-4): instance ID is not 32 bytes
-    /// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
-    /// - `ERR_STORE_ERROR` (-8): internal storage error
-    fn get_contract_state_len(id_ptr: i64, id_len: i32) -> i64 {
+    /// Extracted as a free function so it can be called from the async wrapper.
+    /// Accesses only global statics (MEM_ADDR, DELEGATE_ENV) which are Send + 'static.
+    fn get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_contract_state_len called outside process()");
@@ -776,19 +788,10 @@ pub(crate) mod delegate_contracts {
         }
     }
 
-    /// Read a contract's state into the WASM linear memory.
+    /// Implementation of get_contract_state.
     ///
-    /// The contract instance ID is read from `id_ptr` (32 bytes).
-    /// State bytes are written to `out_ptr` (max `out_len` bytes).
-    ///
-    /// ## Returns
-    /// - Non-negative: number of bytes written
-    /// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
-    /// - `ERR_INVALID_PARAM` (-4): bad parameters
-    /// - `ERR_BUFFER_TOO_SMALL` (-6): output buffer too small
-    /// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
-    /// - `ERR_STORE_ERROR` (-8): internal storage error
-    fn get_contract_state(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64 {
+    /// Extracted as a free function so it can be called from the async wrapper.
+    fn get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_contract_state called outside process()");
