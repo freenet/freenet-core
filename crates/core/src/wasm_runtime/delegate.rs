@@ -4,7 +4,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetContractRequest, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
+    OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId, SubscribeContractRequest,
+    UpdateContractRequest,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
@@ -161,6 +162,8 @@ impl Runtime {
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
             InboundDelegateMsg::PutContractResponse(_) => "PutContractResponse",
+            InboundDelegateMsg::UpdateContractResponse(_) => "UpdateContractResponse",
+            InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
@@ -199,6 +202,12 @@ impl Runtime {
                     OutboundDelegateMsg::PutContractRequest(req) => {
                         format!("PutContractRequest(contract={})", req.contract.key())
                     }
+                    OutboundDelegateMsg::UpdateContractRequest(req) => {
+                        format!("UpdateContractRequest(contract={})", req.contract_id)
+                    }
+                    OutboundDelegateMsg::SubscribeContractRequest(req) => {
+                        format!("SubscribeContractRequest(contract={})", req.contract_id)
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -235,6 +244,8 @@ impl Runtime {
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
                         OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
                         OutboundDelegateMsg::PutContractRequest(r) => format!("PutContractReq({})", r.contract.key()),
+                        OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -339,6 +350,44 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("PutContractRequest processed");
+                    *context = ctx.as_ref().to_vec();
+                }
+                OutboundDelegateMsg::UpdateContractRequest(req) if !req.processed => {
+                    // Fire-and-forget: pass to executor for async handling
+                    tracing::debug!(
+                        contract = %req.contract_id,
+                        "Passing UpdateContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::UpdateContractRequest(req));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
+                    tracing::debug!("UpdateContractRequest processed");
+                    *context = ctx.as_ref().to_vec();
+                }
+                OutboundDelegateMsg::SubscribeContractRequest(req) if !req.processed => {
+                    // Fire-and-forget: pass to executor for async handling
+                    tracing::debug!(
+                        contract = %req.contract_id,
+                        "Passing SubscribeContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::SubscribeContractRequest(req));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
+                    tracing::debug!("SubscribeContractRequest processed");
                     *context = ctx.as_ref().to_vec();
                 }
             }
@@ -466,6 +515,58 @@ impl DelegateRuntimeInterface for Runtime {
                         params,
                         attested,
                         &InboundDelegateMsg::PutContractResponse(response),
+                        context.clone(),
+                        &process_func,
+                        &running.instance,
+                        instance_id,
+                    )?;
+                    context = updated_context;
+
+                    let mut outbound_queue = VecDeque::from(outbound);
+                    self.process_outbound(
+                        delegate_key,
+                        &running.instance,
+                        instance_id,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut outbound_queue,
+                        &mut context,
+                        &mut results,
+                    )?;
+                }
+                InboundDelegateMsg::UpdateContractResponse(response) => {
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
+                        params,
+                        attested,
+                        &InboundDelegateMsg::UpdateContractResponse(response),
+                        context.clone(),
+                        &process_func,
+                        &running.instance,
+                        instance_id,
+                    )?;
+                    context = updated_context;
+
+                    let mut outbound_queue = VecDeque::from(outbound);
+                    self.process_outbound(
+                        delegate_key,
+                        &running.instance,
+                        instance_id,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut outbound_queue,
+                        &mut context,
+                        &mut results,
+                    )?;
+                }
+                InboundDelegateMsg::SubscribeContractResponse(response) => {
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
+                        params,
+                        attested,
+                        &InboundDelegateMsg::SubscribeContractResponse(response),
                         context.clone(),
                         &process_func,
                         &running.instance,
@@ -624,6 +725,17 @@ mod test {
                 contract_id: ContractInstanceId,
                 echo_message: String,
             },
+            PutContractState {
+                contract: ContractContainer,
+                state: Vec<u8>,
+            },
+            UpdateContractState {
+                contract_id: ContractInstanceId,
+                state: Vec<u8>,
+            },
+            SubscribeContract {
+                contract_id: ContractInstanceId,
+            },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -637,6 +749,21 @@ mod test {
             },
             Echo {
                 message: String,
+            },
+            ContractPutResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
+            },
+            ContractUpdateResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
+            },
+            ContractSubscribeResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
             },
             Error {
                 message: String,

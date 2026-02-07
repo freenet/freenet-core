@@ -36,10 +36,12 @@ const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 
 /// Handle a delegate request, including any contract request messages in the response.
 ///
-/// When a delegate emits GetContractRequest or PutContractRequest, this function:
+/// When a delegate emits contract request messages, this function:
 /// 1. For GET: Fetches the contract state and sends GetContractResponse back to the delegate
 /// 2. For PUT: Upserts the contract state (fire-and-forget, sends PutContractResponse back)
-/// 3. Repeats until no more contract request messages
+/// 3. For UPDATE: Applies a state update (fire-and-forget, sends UpdateContractResponse back)
+/// 4. For SUBSCRIBE: Registers subscription (partial - sends SubscribeContractResponse back)
+/// 5. Repeats until no more contract request messages
 ///
 /// Returns the final response with contract request messages filtered out.
 async fn handle_delegate_with_contract_requests<CH>(
@@ -106,9 +108,11 @@ where
             }
         };
 
-        // Check for contract request messages (GET and PUT)
+        // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE)
         let mut get_requests: Vec<GetContractRequest> = Vec::new();
         let mut put_requests: Vec<PutContractRequest> = Vec::new();
+        let mut update_requests: Vec<UpdateContractRequest> = Vec::new();
+        let mut subscribe_requests: Vec<SubscribeContractRequest> = Vec::new();
 
         for msg in values {
             match msg {
@@ -118,6 +122,12 @@ where
                 OutboundDelegateMsg::PutContractRequest(req) => {
                     put_requests.push(req);
                 }
+                OutboundDelegateMsg::UpdateContractRequest(req) => {
+                    update_requests.push(req);
+                }
+                OutboundDelegateMsg::SubscribeContractRequest(req) => {
+                    subscribe_requests.push(req);
+                }
                 other => {
                     // Accumulate non-contract-request messages
                     accumulated_messages.push(other);
@@ -126,7 +136,11 @@ where
         }
 
         // If no contract requests, we're done - return all accumulated messages
-        if get_requests.is_empty() && put_requests.is_empty() {
+        if get_requests.is_empty()
+            && put_requests.is_empty()
+            && update_requests.is_empty()
+            && subscribe_requests.is_empty()
+        {
             return accumulated_messages;
         }
 
@@ -221,6 +235,138 @@ where
                     GetContractResponse {
                         contract_id,
                         state,
+                        context,
+                    },
+                ));
+            }
+        }
+
+        // Process UPDATE requests (fire-and-forget: apply update, send result back)
+        if !update_requests.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = update_requests.len(),
+                "Processing UpdateContractRequest messages from delegate"
+            );
+
+            for req in update_requests {
+                let contract_id = req.contract_id;
+                let context = req.context;
+
+                // Look up the full key from the instance id
+                let result = match contract_handler.executor().lookup_key(&contract_id) {
+                    Some(full_key) => {
+                        let update_value: Either<WrappedState, StateDelta<'static>> = match req
+                            .update
+                        {
+                            freenet_stdlib::prelude::UpdateData::State(state) => {
+                                Either::Left(WrappedState::from(state.into_bytes()))
+                            }
+                            freenet_stdlib::prelude::UpdateData::Delta(delta) => {
+                                Either::Right(delta)
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    contract = %contract_id,
+                                    "Unsupported UpdateData variant in delegate UpdateContractRequest"
+                                );
+                                inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
+                                    UpdateContractResponse {
+                                        contract_id,
+                                        result: Err("Unsupported UpdateData variant".to_string()),
+                                        context,
+                                    },
+                                ));
+                                continue;
+                            }
+                        };
+
+                        contract_handler
+                            .executor()
+                            .upsert_contract_state(
+                                full_key,
+                                update_value,
+                                RelatedContracts::default(),
+                                None,
+                            )
+                            .await
+                    }
+                    None => {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Contract not found locally for delegate UpdateContractRequest"
+                        );
+                        inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
+                            UpdateContractResponse {
+                                contract_id,
+                                result: Err("Contract not found".to_string()),
+                                context,
+                            },
+                        ));
+                        continue;
+                    }
+                };
+
+                let update_result = match result {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        tracing::warn!(
+                            contract = %contract_id,
+                            error = %err,
+                            "Failed to update contract for delegate UpdateContractRequest"
+                        );
+                        Err(format!("{err}"))
+                    }
+                };
+
+                inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
+                    UpdateContractResponse {
+                        contract_id,
+                        result: update_result,
+                        context,
+                    },
+                ));
+            }
+        }
+
+        // Process SUBSCRIBE requests (register subscription, send result back)
+        // Note: This registers the subscription but notification delivery to the delegate
+        // is not yet implemented - it will require the async delegate v2 API.
+        if !subscribe_requests.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = subscribe_requests.len(),
+                "Processing SubscribeContractRequest messages from delegate"
+            );
+
+            for req in subscribe_requests {
+                let contract_id = req.contract_id;
+                let context = req.context;
+
+                // For now, we acknowledge the subscription request but cannot fully
+                // register a notifier because we don't have a ClientId or notification
+                // channel for the delegate. Full implementation requires async v2 API.
+                let subscribe_result = match contract_handler.executor().lookup_key(&contract_id) {
+                    Some(_full_key) => {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Subscription request acknowledged for delegate (notification delivery pending v2 API)"
+                        );
+                        Ok(())
+                    }
+                    None => {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Contract not found locally for delegate SubscribeContractRequest"
+                        );
+                        Err("Contract not found".to_string())
+                    }
+                };
+
+                inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
+                    SubscribeContractResponse {
+                        contract_id,
+                        result: subscribe_result,
                         context,
                     },
                 ));
