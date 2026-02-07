@@ -1795,15 +1795,11 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no targets exist (no proximity neighbors), skip broadcast.
-                                // This can happen when:
-                                // 1. Gateway just PUT a new contract (no subscribers yet)
-                                // 2. Isolated node with no connected peers seeding this contract
                                 if targets.is_empty() {
                                     tracing::warn!(
                                         contract = %key,
                                         self_addr = %self_addr,
-                                        "BROADCAST_NO_TARGETS: skipping broadcast - no proximity targets"
+                                        "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
                                     );
                                     continue;
                                 }
