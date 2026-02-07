@@ -6,6 +6,36 @@ paths:
 
 # Contracts Module Rules
 
+## WASM Engine Architecture
+
+### Engine Abstraction (`wasm_runtime/engine/`)
+
+```
+WasmEngine trait    → mod.rs      (backend-agnostic interface)
+WasmerEngine impl   → wasmer_engine.rs (ONLY file that imports wasmer::)
+Engine type alias   → mod.rs      (Engine = WasmerEngine)
+```
+
+**All `wasmer::` imports MUST stay in `engine/wasmer_engine.rs`.**
+Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
+
+### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)
+
+```
+V1: Synchronous process() — delegates use request/response for contract access
+V2: Async host functions — delegates call ctx.get_contract_state() directly
+    Uses wasmer experimental-async (Function::new_typed_async + call_async)
+    Selected when state_store_db is configured on Runtime
+```
+
+### WASM Call Modes
+
+```
+call_3i64()              — Sync, same thread (delegates V1)
+call_3i64_async_imports() — Async host fns via Store::into_async() (delegates V2)
+call_*_blocking()        — spawn_blocking + timeout (contracts)
+```
+
 ## WASM Execution Rules
 
 ### WHEN executing contract code
@@ -16,11 +46,13 @@ ALWAYS:
   - Set memory limits (prevent DoS)
   - Set execution time limits
   - Validate WASM module before execution
+  - Clean up RunningInstance via drop_running_instance() after use
 
 NEVER:
   - Execute untrusted code outside sandbox
   - Allow contracts to access filesystem directly
   - Allow contracts to make network calls directly
+  - Import wasmer:: outside of engine/wasmer_engine.rs
 ```
 
 ### WHEN exposing host functions
@@ -31,6 +63,8 @@ Host functions (callable from WASM):
   - MUST handle panics gracefully
   - MUST NOT leak host memory to guest
   - SHOULD be idempotent where possible
+  - V2 async host functions: use Function::new_typed_async in wasmer_engine.rs
+  - Logic implementations: keep in native_api.rs as pub(super) helpers
 
 Pattern:
   fn host_function(ctx: &mut Ctx, args: ...) -> Result<...> {

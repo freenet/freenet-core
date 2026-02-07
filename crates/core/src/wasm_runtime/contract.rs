@@ -51,7 +51,7 @@ impl ContractRuntimeInterface for super::Runtime {
         related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
-        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
@@ -78,7 +78,10 @@ impl ContractRuntimeInterface for super::Runtime {
             state_buf_ptr as i64,
             related_buf_ptr as i64,
         );
-        let result = classify_result(result)?;
+        let result = classify_result(result);
+
+        self.drop_running_instance(&mut running);
+        let result = result?;
 
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
@@ -97,7 +100,7 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<UpdateModification<'static>> {
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
-        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
@@ -124,7 +127,10 @@ impl ContractRuntimeInterface for super::Runtime {
             state_buf_ptr as i64,
             update_data_buf_ptr as i64,
         );
-        let result = classify_result(result)?;
+        let result = classify_result(result);
+
+        self.drop_running_instance(&mut running);
+        let result = result?;
 
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
@@ -142,7 +148,7 @@ impl ContractRuntimeInterface for super::Runtime {
         state: &WrappedState,
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
-        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
@@ -162,7 +168,10 @@ impl ContractRuntimeInterface for super::Runtime {
             param_buf_ptr as i64,
             state_buf_ptr as i64,
         );
-        let result = classify_result(result)?;
+        let result = classify_result(result);
+
+        self.drop_running_instance(&mut running);
+        let result = result?;
 
         let summary = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)
@@ -181,7 +190,7 @@ impl ContractRuntimeInterface for super::Runtime {
         summary: &StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&running.handle)?;
 
         let param_buf_ptr = {
@@ -207,7 +216,10 @@ impl ContractRuntimeInterface for super::Runtime {
             state_buf_ptr as i64,
             summary_buf_ptr as i64,
         );
-        let result = classify_result(result)?;
+        let result = classify_result(result);
+
+        self.drop_running_instance(&mut running);
+        let result = result?;
 
         let delta = unsafe {
             ContractInterfaceResult::from_raw(result, &linear_mem)

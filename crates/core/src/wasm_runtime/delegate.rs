@@ -353,19 +353,8 @@ impl DelegateRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let running = self.prepare_delegate_call(params, delegate_key, 4096)?;
+        let (mut running, api_version) = self.prepare_delegate_call(params, delegate_key, 4096)?;
         let instance_id = running.id;
-
-        // Detect API version: V2 delegates use async host functions for contract
-        // access. For the prototype, we select V2 when a state store is configured,
-        // since V2 is backward-compatible with V1 delegates that don't call the
-        // contract functions — call_async just adds a thin coroutine wrapper that
-        // completes immediately for non-yielding functions.
-        let api_version = if self.state_store_db.is_some() {
-            DelegateApiVersion::V2
-        } else {
-            DelegateApiVersion::V1
-        };
 
         tracing::debug!(
             delegate_key = %delegate_key,
@@ -376,96 +365,106 @@ impl DelegateRuntimeInterface for Runtime {
         // State maintained across process() calls within this conversation
         let mut context: Vec<u8> = Vec::new();
 
-        for msg in inbound {
-            match msg {
-                InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
-                    app,
-                    payload,
-                    processed,
-                    ..
-                }) => {
-                    let app_msg = InboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, payload)
-                            .processed(processed)
-                            .with_context(DelegateContext::new(context.clone())),
-                    );
+        // Process all messages, collecting the result.
+        // Cleanup happens after the loop regardless of success/failure.
+        let process_result: RuntimeResult<()> = (|| {
+            for msg in inbound {
+                match msg {
+                    InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
+                        app,
+                        payload,
+                        processed,
+                        ..
+                    }) => {
+                        let app_msg = InboundDelegateMsg::ApplicationMessage(
+                            ApplicationMessage::new(app, payload)
+                                .processed(processed)
+                                .with_context(DelegateContext::new(context.clone())),
+                        );
 
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &app_msg,
-                        context.clone(),
-                        &running.handle,
-                        instance_id,
-                        api_version,
-                    )?;
-                    context = updated_context;
+                        let (outbound, updated_context) = self.exec_inbound_with_env(
+                            delegate_key,
+                            params,
+                            attested,
+                            &app_msg,
+                            context.clone(),
+                            &running.handle,
+                            instance_id,
+                            api_version,
+                        )?;
+                        context = updated_context;
 
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.handle,
-                        instance_id,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::UserResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::UserResponse(response),
-                        context.clone(),
-                        &running.handle,
-                        instance_id,
-                        api_version,
-                    )?;
-                    context = updated_context;
+                        let mut outbound_queue = VecDeque::from(outbound);
+                        self.process_outbound(
+                            delegate_key,
+                            &running.handle,
+                            instance_id,
+                            params,
+                            attested,
+                            &mut outbound_queue,
+                            &mut context,
+                            &mut results,
+                        )?;
+                    }
+                    InboundDelegateMsg::UserResponse(response) => {
+                        let (outbound, updated_context) = self.exec_inbound_with_env(
+                            delegate_key,
+                            params,
+                            attested,
+                            &InboundDelegateMsg::UserResponse(response),
+                            context.clone(),
+                            &running.handle,
+                            instance_id,
+                            api_version,
+                        )?;
+                        context = updated_context;
 
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.handle,
-                        instance_id,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::GetContractResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::GetContractResponse(response),
-                        context.clone(),
-                        &running.handle,
-                        instance_id,
-                        api_version,
-                    )?;
-                    context = updated_context;
+                        let mut outbound_queue = VecDeque::from(outbound);
+                        self.process_outbound(
+                            delegate_key,
+                            &running.handle,
+                            instance_id,
+                            params,
+                            attested,
+                            &mut outbound_queue,
+                            &mut context,
+                            &mut results,
+                        )?;
+                    }
+                    InboundDelegateMsg::GetContractResponse(response) => {
+                        let (outbound, updated_context) = self.exec_inbound_with_env(
+                            delegate_key,
+                            params,
+                            attested,
+                            &InboundDelegateMsg::GetContractResponse(response),
+                            context.clone(),
+                            &running.handle,
+                            instance_id,
+                            api_version,
+                        )?;
+                        context = updated_context;
 
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.handle,
-                        instance_id,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
+                        let mut outbound_queue = VecDeque::from(outbound);
+                        self.process_outbound(
+                            delegate_key,
+                            &running.handle,
+                            instance_id,
+                            params,
+                            attested,
+                            &mut outbound_queue,
+                            &mut context,
+                            &mut results,
+                        )?;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
+
+        // Always clean up the wasmer Instance, even on error.
+        self.drop_running_instance(&mut running);
+
+        process_result?;
 
         tracing::debug!(
             count = results.len(),
@@ -1716,6 +1715,290 @@ mod test {
 
         std::mem::drop(temp_dir1);
         std::mem::drop(temp_dir2);
+        Ok(())
+    }
+
+    /// Verify that V1 delegates are correctly detected as V1 even when
+    /// state_store_db is configured. This ensures backward compatibility —
+    /// V2 detection is based on module imports, not runtime configuration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v1_delegate_detected_as_v1_with_state_store(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+
+        // Configure state_store_db — V1 delegates should STILL be detected as V1
+        runtime.set_state_store_db(db);
+
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
+        };
+        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _ = runtime
+            .secret_store
+            .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        // Verify API version detection: V1 delegate should be V1
+        let (mut running, api_version) =
+            runtime.prepare_delegate_call(&vec![].into(), delegate.key(), 4096)?;
+        assert_eq!(
+            api_version,
+            DelegateApiVersion::V1,
+            "V1 delegate should be detected as V1 even with state_store_db configured"
+        );
+        runtime.drop_running_instance(&mut running);
+
+        // Verify the delegate still works normally via the V1 path
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
+        let create_msg = ApplicationMessage::new(app, payload);
+        let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+
+        let expected_payload =
+            bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
+        assert_eq!(outbound.len(), 1);
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
+        ));
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    const TEST_DELEGATE_V2_CONTRACTS: &str = "test_delegate_v2_contracts";
+
+    /// Message types for test-delegate-v2-contracts (must match the delegate's types)
+    mod v2_contracts_messages {
+        use super::*;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum InboundAppMessage {
+            GetContractState { contract_id: [u8; 32] },
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum OutboundAppMessage {
+            ContractState {
+                contract_id: [u8; 32],
+                state: Vec<u8>,
+            },
+            ContractNotFound {
+                contract_id: [u8; 32],
+                error_code: i64,
+            },
+        }
+    }
+
+    /// V2 delegate end-to-end test: a real compiled WASM delegate that reads
+    /// contract state via host functions from the `freenet_delegate_contracts`
+    /// namespace. This exercises the full V2 async call path:
+    ///
+    /// 1. Module is detected as V2 (imports `freenet_delegate_contracts`)
+    /// 2. `call_3i64_async_imports` is used instead of `call_3i64`
+    /// 3. Host functions `get_contract_state_len` and `get_contract_state`
+    ///    read from the ReDb state store
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
+        use crate::wasm_runtime::StateStorage;
+        use v2_contracts_messages::*;
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        runtime.set_state_store_db(db.clone());
+
+        // Store contract state in the DB so the V2 delegate can read it
+        let contract_instance_id = ContractInstanceId::new([42u8; 32]);
+        let contract_code = ContractCode::from(vec![1, 2, 3]);
+        let contract_key =
+            ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
+        let expected_state = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        db.store(contract_key, WrappedState::new(expected_state.clone()))
+            .await?;
+        // Index the contract so code_hash_from_id() works
+        runtime.contract_store.ensure_key_indexed(&contract_key)?;
+
+        // Load the V2 delegate
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
+        };
+        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _ = runtime
+            .secret_store
+            .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        // Verify the module is detected as V2
+        let (mut running, api_version) =
+            runtime.prepare_delegate_call(&vec![].into(), delegate.key(), 4096)?;
+        assert_eq!(
+            api_version,
+            DelegateApiVersion::V2,
+            "V2 delegate should be detected as V2 (imports freenet_delegate_contracts)"
+        );
+        runtime.drop_running_instance(&mut running);
+
+        // Send a message asking the delegate to read the contract state
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let command = InboundAppMessage::GetContractState {
+            contract_id: [42u8; 32],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let response_msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(response_msg.processed);
+
+        let response: OutboundAppMessage = bincode::deserialize(&response_msg.payload)?;
+        match response {
+            OutboundAppMessage::ContractState { contract_id, state } => {
+                assert_eq!(contract_id, [42u8; 32]);
+                assert_eq!(
+                    state, expected_state,
+                    "V2 delegate should read contract state via host functions"
+                );
+            }
+            OutboundAppMessage::ContractNotFound { error_code, .. } => {
+                panic!(
+                    "V2 delegate returned ContractNotFound with error code {error_code} — \
+                     expected ContractState"
+                );
+            }
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// V2 delegate: contract not found returns error code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
+        use v2_contracts_messages::*;
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        runtime.set_state_store_db(db);
+
+        // Load the V2 delegate (no contract state stored — should get not-found)
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
+        };
+        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _ = runtime
+            .secret_store
+            .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        // Ask for a contract that doesn't exist
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let command = InboundAppMessage::GetContractState {
+            contract_id: [99u8; 32],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1);
+        let response_msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+
+        let response: OutboundAppMessage = bincode::deserialize(&response_msg.payload)?;
+        match response {
+            OutboundAppMessage::ContractNotFound { error_code, .. } => {
+                assert!(
+                    error_code < 0,
+                    "Expected negative error code for not-found, got {error_code}"
+                );
+            }
+            OutboundAppMessage::ContractState { .. } => {
+                panic!("Expected ContractNotFound for non-existent contract");
+            }
+        }
+
+        std::mem::drop(temp_dir);
         Ok(())
     }
 }
