@@ -188,7 +188,7 @@ pub(crate) async fn request_subscribe(
                     phase = "local_complete",
                     "Peer not joined, but contract available locally - completing subscription locally"
                 );
-                return complete_local_subscription(op_manager, *id, key).await;
+                return complete_local_subscription(op_manager, *id, key, is_renewal).await;
             }
             tracing::warn!(
                 tx = %id,
@@ -266,7 +266,7 @@ pub(crate) async fn request_subscribe(
                         phase = "local_complete",
                         "Contract available locally and no network connections, completing subscription locally"
                     );
-                    return complete_local_subscription(op_manager, *id, key).await;
+                    return complete_local_subscription(op_manager, *id, key, is_renewal).await;
                 }
                 tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
                 return Err(RingError::NoCachingPeers(*instance_id).into());
@@ -338,10 +338,12 @@ async fn complete_local_subscription(
     op_manager: &OpManager,
     id: Transaction,
     key: ContractKey,
+    is_renewal: bool,
 ) -> Result<(), OpError> {
     tracing::debug!(
         %key,
         tx = %id,
+        is_renewal,
         "Local subscription completed - client will receive updates via executor notification channel"
     );
 
@@ -353,6 +355,7 @@ async fn complete_local_subscription(
             tx: id,
             key,
             subscribed: true,
+            is_renewal,
         })
         .await?;
 
@@ -379,6 +382,11 @@ impl SubscribeOp {
             Some(SubscribeState::AwaitingResponse { instance_id, .. }) => Some(*instance_id),
             _ => None,
         }
+    }
+
+    /// Whether this is a subscription renewal (node-internal, no client waiting).
+    pub(crate) fn is_renewal(&self) -> bool {
+        self.is_renewal
     }
 
     pub(super) fn outcome(&self) -> OpOutcome<'_> {

@@ -331,6 +331,12 @@ impl OpEnum {
             pub fn to_host_result(&self) -> HostResult;
         }
     }
+
+    /// Returns true if this is a subscription renewal (node-internal operation
+    /// with no client waiting for the result).
+    pub fn is_subscription_renewal(&self) -> bool {
+        matches!(self, OpEnum::Subscribe(op) if op.is_renewal())
+    }
 }
 
 macro_rules! try_from_op_enum {

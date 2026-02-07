@@ -1588,6 +1588,7 @@ impl P2pConnManager {
                                 tx,
                                 key,
                                 subscribed,
+                                is_renewal,
                             } => {
                                 // This event is only fired for STANDALONE subscriptions (no remote peers).
                                 // Normal subscribe flow now goes through handle_op_result which sends
@@ -1595,6 +1596,7 @@ impl P2pConnManager {
                                 tracing::debug!(
                                     tx = %tx,
                                     contract = %key,
+                                    is_renewal,
                                     phase = "complete",
                                     "Standalone subscribe operation completed"
                                 );
@@ -1607,6 +1609,19 @@ impl P2pConnManager {
                                         contract = %key,
                                         phase = "complete",
                                         "Completing standalone child subscribe operation"
+                                    );
+                                    op_manager.completed(tx);
+                                    continue;
+                                }
+
+                                // Subscription renewals are node-internal operations with no
+                                // client waiting for results. Skip client notification. See #2891.
+                                if is_renewal {
+                                    tracing::debug!(
+                                        tx = %tx,
+                                        contract = %key,
+                                        phase = "complete",
+                                        "Skipping client notification for standalone subscription renewal"
                                     );
                                     op_manager.completed(tx);
                                     continue;

@@ -524,7 +524,7 @@ async fn report_result(
                 );
             }
 
-            // Send to result router (skip for sub-operations - parent handles notification)
+            // Send to result router (skip for sub-operations and subscription renewals)
             if let Some(transaction) = tx {
                 // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
                 // the parent operation handles the client response.
@@ -532,6 +532,15 @@ async fn report_result(
                     tracing::debug!(
                         tx = %transaction,
                         "Skipping client notification for sub-operation"
+                    );
+                } else if op_res.is_subscription_renewal() {
+                    // Subscription renewals are node-internal operations spawned by the
+                    // renewal manager (ring/mod.rs). No client registered a transaction
+                    // for these, so sending to the session actor would just produce
+                    // "registered transactions: 0" noise. See #2891.
+                    tracing::debug!(
+                        tx = %transaction,
+                        "Skipping client notification for subscription renewal"
                     );
                 } else {
                     let host_result = op_res.to_host_result();
