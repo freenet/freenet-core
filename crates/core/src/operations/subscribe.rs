@@ -128,6 +128,7 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
         id,
         state,
         requester_addr: None, // Local operation, we are the originator
+        requester_pub_key: None,
         is_renewal,
     }
 }
@@ -147,6 +148,7 @@ pub(crate) fn start_op_with_id(
         id,
         state,
         requester_addr: None, // Local operation, we are the originator
+        requester_pub_key: None,
         is_renewal,
     }
 }
@@ -188,7 +190,7 @@ pub(crate) async fn request_subscribe(
                     phase = "local_complete",
                     "Peer not joined, but contract available locally - completing subscription locally"
                 );
-                return complete_local_subscription(op_manager, *id, key).await;
+                return complete_local_subscription(op_manager, *id, key, is_renewal).await;
             }
             tracing::warn!(
                 tx = %id,
@@ -266,7 +268,7 @@ pub(crate) async fn request_subscribe(
                         phase = "local_complete",
                         "Contract available locally and no network connections, completing subscription locally"
                     );
-                    return complete_local_subscription(op_manager, *id, key).await;
+                    return complete_local_subscription(op_manager, *id, key, is_renewal).await;
                 }
                 tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
                 return Err(RingError::NoCachingPeers(*instance_id).into());
@@ -312,6 +314,7 @@ pub(crate) async fn request_subscribe(
             instance_id: *instance_id,
         }),
         requester_addr: None, // We're the originator
+        requester_pub_key: None,
         is_renewal,
     };
 
@@ -338,10 +341,12 @@ async fn complete_local_subscription(
     op_manager: &OpManager,
     id: Transaction,
     key: ContractKey,
+    is_renewal: bool,
 ) -> Result<(), OpError> {
     tracing::debug!(
         %key,
         tx = %id,
+        is_renewal,
         "Local subscription completed - client will receive updates via executor notification channel"
     );
 
@@ -353,6 +358,7 @@ async fn complete_local_subscription(
             tx: id,
             key,
             subscribed: true,
+            is_renewal,
         })
         .await?;
 
@@ -366,6 +372,11 @@ pub(crate) struct SubscribeOp {
     /// The address of the peer that requested this subscription.
     /// Used for routing responses back and registering them as downstream subscribers.
     requester_addr: Option<std::net::SocketAddr>,
+    /// The public key of the requesting peer, resolved at op init time.
+    /// Used for interest registration instead of addr-based lookup, which can fail
+    /// during NAT traversal timing windows when the ring layer hasn't mapped the
+    /// transport address yet. See #2886.
+    requester_pub_key: Option<crate::transport::TransportPublicKey>,
     /// Whether this is a renewal (requester already has the contract).
     /// Preserved across request/response to avoid sending state to renewals.
     is_renewal: bool,
@@ -379,6 +390,11 @@ impl SubscribeOp {
             Some(SubscribeState::AwaitingResponse { instance_id, .. }) => Some(*instance_id),
             _ => None,
         }
+    }
+
+    /// Whether this is a subscription renewal (node-internal, no client waiting).
+    pub(crate) fn is_renewal(&self) -> bool {
+        self.is_renewal
     }
 
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
@@ -450,6 +466,12 @@ impl SubscribeOp {
                     );
                 }
             }
+        } else if self.is_renewal {
+            // Subscription renewal abort: no client waiting, just log. See #2891.
+            tracing::debug!(
+                tx = %self.id,
+                "Subscription renewal aborted, no client to notify"
+            );
         } else {
             // Standalone subscribe: client is waiting on this transaction directly.
             let error_result: crate::client_events::HostResult =
@@ -537,6 +559,16 @@ impl Operation for SubscribeOp {
                     } => (*is_renewal, *instance_id),
                     _ => unreachable!("Response case handled above"),
                 };
+                // Resolve requester's public key at init time, when the connection
+                // is freshest. This avoids addr->pubkey lookup failures during NAT
+                // traversal timing windows later at interest registration. (#2886)
+                let requester_pub_key = source_addr.and_then(|addr| {
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(addr)
+                        .map(|pkl| pkl.pub_key().clone())
+                });
                 Ok(OpInitialization {
                     op: Self {
                         id,
@@ -545,6 +577,7 @@ impl Operation for SubscribeOp {
                             instance_id: msg_instance_id,
                         }),
                         requester_addr: source_addr, // Store who sent us this request
+                        requester_pub_key,
                         is_renewal,
                     },
                     source_addr,
@@ -594,20 +627,33 @@ impl Operation for SubscribeOp {
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the subscribing peer in the interest manager so that
                             // update broadcasts include them as a target immediately.
-                            // Try requester_addr first, then source_addr as fallback (the
-                            // ring connection manager's address may differ from transport).
-                            let pkl = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_by_addr(requester_addr)
+                            // Use requester_pub_key (resolved at init time) when available,
+                            // falling back to addr lookup. The pub_key path avoids failures
+                            // during NAT traversal timing windows. (#2886)
+                            let peer_key = self
+                                .requester_pub_key
+                                .as_ref()
+                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
                                 .or_else(|| {
-                                    source_addr.and_then(|sa| {
-                                        op_manager.ring.connection_manager.get_peer_by_addr(sa)
-                                    })
+                                    op_manager
+                                        .ring
+                                        .connection_manager
+                                        .get_peer_by_addr(requester_addr)
+                                        .or_else(|| {
+                                            source_addr.and_then(|sa| {
+                                                op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .get_peer_by_addr(sa)
+                                            })
+                                        })
+                                        .map(|pkl| {
+                                            crate::ring::interest::PeerKey::from(
+                                                pkl.pub_key.clone(),
+                                            )
+                                        })
                                 });
-                            if let Some(pkl) = pkl {
-                                let peer_key =
-                                    crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                            if let Some(peer_key) = peer_key {
                                 op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
@@ -641,6 +687,7 @@ impl Operation for SubscribeOp {
                                     id: *id,
                                     state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
+                                    requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                 })),
                                 stream_data: None,
@@ -659,22 +706,33 @@ impl Operation for SubscribeOp {
                         // Contract arrived - respond to confirm subscription
                         // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the subscribing peer in the interest manager so that
-                            // update broadcasts include them as a target immediately.
-                            // Try requester_addr first, then source_addr as fallback (the
-                            // ring connection manager's address may differ from transport).
-                            let pkl = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_by_addr(requester_addr)
+                            // Register the subscribing peer in the interest manager.
+                            // Use requester_pub_key (resolved at init time) when available,
+                            // falling back to addr lookup. (#2886)
+                            let peer_key = self
+                                .requester_pub_key
+                                .as_ref()
+                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
                                 .or_else(|| {
-                                    source_addr.and_then(|sa| {
-                                        op_manager.ring.connection_manager.get_peer_by_addr(sa)
-                                    })
+                                    op_manager
+                                        .ring
+                                        .connection_manager
+                                        .get_peer_by_addr(requester_addr)
+                                        .or_else(|| {
+                                            source_addr.and_then(|sa| {
+                                                op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .get_peer_by_addr(sa)
+                                            })
+                                        })
+                                        .map(|pkl| {
+                                            crate::ring::interest::PeerKey::from(
+                                                pkl.pub_key.clone(),
+                                            )
+                                        })
                                 });
-                            if let Some(pkl) = pkl {
-                                let peer_key =
-                                    crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                            if let Some(peer_key) = peer_key {
                                 op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
@@ -706,6 +764,7 @@ impl Operation for SubscribeOp {
                                     id: *id,
                                     state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
+                                    requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                 })),
                                 stream_data: None,
@@ -770,6 +829,7 @@ impl Operation for SubscribeOp {
                                 instance_id: *instance_id,
                             }),
                             requester_addr: self.requester_addr,
+                            requester_pub_key: self.requester_pub_key,
                             is_renewal: self.is_renewal,
                         })),
                         stream_data: None,
@@ -888,6 +948,7 @@ impl Operation for SubscribeOp {
                                         id,
                                         state: Some(SubscribeState::Completed { key: *key }),
                                         requester_addr: None,
+                                        requester_pub_key: None,
                                         is_renewal: self.is_renewal,
                                     })),
                                     stream_data: None,
@@ -993,6 +1054,7 @@ impl Operation for SubscribeOp {
                                             id,
                                             state: Some(SubscribeState::Completed { key }),
                                             requester_addr: None,
+                                            requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                         })),
                                         stream_data: None,
@@ -1040,6 +1102,7 @@ impl Operation for SubscribeOp {
                                             id,
                                             state: None,
                                             requester_addr: None,
+                                            requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                         })),
                                         stream_data: None,

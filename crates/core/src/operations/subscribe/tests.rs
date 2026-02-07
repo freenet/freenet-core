@@ -472,6 +472,7 @@ async fn test_subscription_validates_k_closest_usage() {
                 instance_id: *contract_key.id(),
             }),
             requester_addr: None,
+            requester_pub_key: None,
             is_renewal: false,
         };
 
@@ -570,6 +571,7 @@ fn test_subscribe_op_state_lifecycle() {
             is_renewal: false,
         }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -590,6 +592,7 @@ fn test_subscribe_op_state_lifecycle() {
             instance_id,
         }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -612,6 +615,7 @@ fn test_subscribe_op_state_lifecycle() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -644,6 +648,7 @@ fn test_subscribe_op_failed_state_returns_error() {
         id: tx_id,
         state: None,
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -677,6 +682,7 @@ fn test_local_subscription_completion_state() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None, // Local subscription, no network requester
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -700,4 +706,56 @@ fn test_local_subscription_completion_state() {
             "Should indicate successful subscription"
         );
     }
+}
+
+#[test]
+fn test_is_renewal_flag() {
+    let instance_id = ContractInstanceId::new([20u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([21u8; 32]));
+    let tx = Transaction::new::<SubscribeMsg>();
+
+    let renewal_op = SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: true,
+    };
+    assert!(renewal_op.is_renewal());
+
+    let client_op = SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+    };
+    assert!(!client_op.is_renewal());
+}
+
+#[test]
+fn test_op_enum_is_subscription_renewal() {
+    use crate::operations::OpEnum;
+
+    let instance_id = ContractInstanceId::new([22u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([23u8; 32]));
+    let tx = Transaction::new::<SubscribeMsg>();
+
+    let renewal = OpEnum::Subscribe(SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: true,
+    });
+    assert!(renewal.is_subscription_renewal());
+
+    let non_renewal = OpEnum::Subscribe(SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+    });
+    assert!(!non_renewal.is_subscription_renewal());
 }

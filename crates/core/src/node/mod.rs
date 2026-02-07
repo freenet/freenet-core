@@ -524,7 +524,7 @@ async fn report_result(
                 );
             }
 
-            // Send to result router (skip for sub-operations - parent handles notification)
+            // Send to result router (skip for sub-operations and subscription renewals)
             if let Some(transaction) = tx {
                 // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
                 // the parent operation handles the client response.
@@ -532,6 +532,15 @@ async fn report_result(
                     tracing::debug!(
                         tx = %transaction,
                         "Skipping client notification for sub-operation"
+                    );
+                } else if op_res.is_subscription_renewal() {
+                    // Subscription renewals are node-internal operations spawned by the
+                    // renewal manager (ring/mod.rs). No client registered a transaction
+                    // for these, so sending to the session actor would just produce
+                    // "registered transactions: 0" noise. See #2891.
+                    tracing::debug!(
+                        tx = %transaction,
+                        "Skipping client notification for subscription renewal"
                     );
                 } else {
                     let host_result = op_res.to_host_result();
@@ -973,9 +982,22 @@ where
                 // Update propagation uses the proximity cache directly, and subscriptions
                 // are lease-based with automatic expiry.
 
+                // Resolve source SocketAddr to TransportPublicKey for proximity cache
+                let source_pub_key = op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(source)
+                    .map(|pkl| pkl.pub_key().clone());
+                let Some(source_pub_key) = source_pub_key else {
+                    tracing::warn!(
+                        %source,
+                        "ProximityCache: could not resolve source addr to pub_key, skipping"
+                    );
+                    break;
+                };
                 if let Some(response) = op_manager
                     .proximity_cache
-                    .handle_message(source, message.clone())
+                    .handle_message(&source_pub_key, message.clone())
                 {
                     // Send response back to sender
                     let response_msg =

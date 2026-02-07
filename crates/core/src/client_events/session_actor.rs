@@ -298,7 +298,7 @@ impl<T: TimeSource> SessionActor<T> {
         tx: Transaction,
         result: std::sync::Arc<crate::client_events::HostResult>,
     ) {
-        tracing::info!(
+        tracing::debug!(
             "Session actor attempting to deliver result for transaction {}, registered transactions: {}",
             tx,
             self.client_transactions.len()

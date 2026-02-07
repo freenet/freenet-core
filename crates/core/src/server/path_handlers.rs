@@ -88,11 +88,11 @@ pub(super) async fn contract_home(
             ..
         }) => match contract {
             Some(contract) => {
-                let key = contract.key();
-                let path = contract_web_path(key.id());
+                let contract_key = contract.key();
+                let path = contract_web_path(contract_key.id());
                 let state_bytes = state.as_ref();
                 let current_hash = hash_state(state_bytes);
-                let hash_path = state_hash_path(key.id());
+                let hash_path = state_hash_path(contract_key.id());
 
                 let needs_update = match tokio::fs::read(&hash_path).await {
                     Ok(stored_hash_bytes) if stored_hash_bytes.len() == 8 => {
@@ -137,7 +137,7 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                match get_web_body(&path, &assigned_token).await {
+                match get_web_body(&path, &assigned_token, &key).await {
                     Ok(b) => b.into_response(),
                     Err(err) => {
                         tracing::error!("Failed to read webapp after unpacking: {err}");
@@ -243,6 +243,7 @@ pub(super) async fn variable_content(
 async fn get_web_body(
     path: &Path,
     auth_token: &AuthToken,
+    contract_key: &str,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "get_web_body: Attempting to read index.html from path: {:?}",
@@ -266,6 +267,14 @@ async fn get_web_body(
         error_cause: format!("{err}"),
     })?;
 
+    // Rewrite root-relative asset paths so they resolve under the contract's web prefix.
+    // Dioxus generates paths like /./assets/app.js which browsers normalize to /assets/app.js
+    // (root-relative). These bypass the /v1/contract/web/{key}/ prefix and 404.
+    // Safety: contract_key is a base58-encoded contract ID (alphanumeric only).
+    let prefix = format!("/v1/contract/web/{contract_key}/");
+    body = body.replace("\"/./", &format!("\"{prefix}"));
+    body = body.replace("'/./", &format!("'{prefix}"));
+
     // Inject auth token into HTML so web apps can access it without re-fetching.
     // Safety: AuthToken uses base58 encoding which only produces alphanumeric characters
     // (0-9, A-Z, a-z excluding 0, O, I, l), so no escaping is needed for the JavaScript string.
@@ -280,7 +289,7 @@ async fn get_web_body(
         body.insert_str(pos, &token_script);
     } else {
         // Last resort: prepend to document
-        body = format!("{}{}", token_script, body);
+        body = format!("{token_script}{body}");
     }
 
     Ok(Html(body))
@@ -309,4 +318,103 @@ fn hash_state(state: &[u8]) -> u64 {
 
 fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
     webapp_cache_dir().join(format!("{}.hash", instance_id.encode()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn root_relative_asset_paths_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+        let html = r#"<!DOCTYPE html>
+<html>
+    <head>
+        <title>Test</title>
+    <link rel="preload" as="script" href="/./assets/app.js" crossorigin></head>
+    <body><div id="main"></div>
+    <script type="module" async src="/./assets/app.js"></script>
+    </body>
+</html>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let token = AuthToken::generate();
+        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let body = response.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let expected_href = format!("href=\"/v1/contract/web/{key}/assets/app.js\"");
+        assert!(
+            result.contains(&expected_href),
+            "href not rewritten.\nGot: {result}"
+        );
+
+        let expected_src = format!("src=\"/v1/contract/web/{key}/assets/app.js\"");
+        assert!(
+            result.contains(&expected_src),
+            "src not rewritten.\nGot: {result}"
+        );
+
+        // Original root-relative paths should be gone
+        assert!(
+            !result.contains("\"/./assets/"),
+            "original /./assets/ paths still present"
+        );
+
+        // Auth token script should also be present
+        assert!(
+            result.contains("__FREENET_AUTH_TOKEN__"),
+            "auth token not injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_quoted_paths_also_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let html = "<head><script src='/./assets/app.js'></script></head>";
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let token = AuthToken::generate();
+        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let body = response.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let expected = format!("'/v1/contract/web/{key}/assets/app.js'");
+        assert!(
+            result.contains(&expected),
+            "single-quoted path not rewritten.\nGot: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paths_without_dot_slash_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        // Paths like "/assets/app.js" (without /.) should NOT be rewritten,
+        // only the Dioxus-specific "/./assets/" pattern is targeted.
+        let html = r#"<head><link href="/assets/app.css"></head><body></body>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let token = AuthToken::generate();
+        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let body = response.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // The /assets/ path should remain unchanged (no /. prefix)
+        assert!(
+            result.contains("\"/assets/app.css\""),
+            "path without /. was incorrectly rewritten.\nGot: {result}"
+        );
+    }
 }
