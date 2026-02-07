@@ -472,6 +472,7 @@ async fn test_subscription_validates_k_closest_usage() {
                 instance_id: *contract_key.id(),
             }),
             requester_addr: None,
+            requester_pub_key: None,
             is_renewal: false,
         };
 
@@ -570,6 +571,7 @@ fn test_subscribe_op_state_lifecycle() {
             is_renewal: false,
         }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -590,6 +592,7 @@ fn test_subscribe_op_state_lifecycle() {
             instance_id,
         }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -612,6 +615,7 @@ fn test_subscribe_op_state_lifecycle() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -644,6 +648,7 @@ fn test_subscribe_op_failed_state_returns_error() {
         id: tx_id,
         state: None,
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -677,6 +682,7 @@ fn test_local_subscription_completion_state() {
         id: tx_id,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None, // Local subscription, no network requester
+        requester_pub_key: None,
         is_renewal: false,
     };
 
@@ -712,6 +718,7 @@ fn test_is_renewal_flag() {
         id: tx,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: true,
     };
     assert!(renewal_op.is_renewal());
@@ -720,6 +727,7 @@ fn test_is_renewal_flag() {
         id: tx,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     };
     assert!(!client_op.is_renewal());
@@ -737,6 +745,7 @@ fn test_op_enum_is_subscription_renewal() {
         id: tx,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: true,
     });
     assert!(renewal.is_subscription_renewal());
@@ -745,6 +754,7 @@ fn test_op_enum_is_subscription_renewal() {
         id: tx,
         state: Some(SubscribeState::Completed { key: contract_key }),
         requester_addr: None,
+        requester_pub_key: None,
         is_renewal: false,
     });
     assert!(!non_renewal.is_subscription_renewal());

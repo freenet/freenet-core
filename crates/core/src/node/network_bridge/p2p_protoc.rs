@@ -1140,7 +1140,7 @@ impl P2pConnManager {
                                     ctx.bridge
                                         .op_manager
                                         .proximity_cache
-                                        .on_peer_disconnected(&peer_addr);
+                                        .on_peer_disconnected(peer.pub_key());
 
                                     // Clean up interest tracking for disconnected peer
                                     ctx.bridge
@@ -3059,7 +3059,7 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .proximity_cache
-                    .on_ring_connection_established(peer_addr)
+                    .on_ring_connection_established(peer.pub_key())
                 {
                     let msg = NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg });
                     if let Err(e) = self.bridge.send(peer_addr, msg).await {
