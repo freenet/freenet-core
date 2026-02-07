@@ -1,6 +1,7 @@
 mod contract;
 mod contract_store;
 mod delegate;
+pub(crate) mod delegate_api;
 mod delegate_store;
 mod error;
 pub(crate) mod mock_state_storage;
