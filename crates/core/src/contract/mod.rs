@@ -37,10 +37,12 @@ const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 /// Handle a delegate request, including any contract request messages in the response.
 ///
 /// When a delegate emits contract request messages, this function:
-/// 1. For GET: Fetches the contract state and sends GetContractResponse back to the delegate
-/// 2. For PUT: Upserts the contract state (fire-and-forget, sends PutContractResponse back)
-/// 3. For UPDATE: Applies a state update (fire-and-forget, sends UpdateContractResponse back)
-/// 4. For SUBSCRIBE: Registers subscription (partial - sends SubscribeContractResponse back)
+/// 1. For GET: Fetches the contract state and sends GetContractResponse back
+/// 2. For PUT: Upserts the contract state via `upsert_contract_state` (which automatically
+///    propagates to the network via `BroadcastStateChange`), sends PutContractResponse back
+/// 3. For UPDATE: Applies a state update via `upsert_contract_state` (same propagation),
+///    sends UpdateContractResponse back
+/// 4. For SUBSCRIBE: Not yet implemented (returns error), sends SubscribeContractResponse back
 /// 5. Repeats until no more contract request messages
 ///
 /// Returns the final response with contract request messages filtered out.
@@ -146,10 +148,10 @@ where
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
 
-        // Process PUT requests (fire-and-forget: execute local upsert, send result back).
-        // Note: This stores the state locally via upsert_contract_state but does NOT
-        // propagate to the network via the PUT operation state machine. Network propagation
-        // would require going through the full ContractHandlerEvent::PutQuery path.
+        // Process PUT requests (fire-and-forget: upsert state, send result back).
+        // This calls upsert_contract_state which stores locally AND automatically
+        // propagates to the network via BroadcastStateChange — the same mechanism
+        // used by normal client PUT operations (ContractHandlerEvent::PutQuery).
         if !put_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
@@ -244,12 +246,12 @@ where
             }
         }
 
-        // Process UPDATE requests (fire-and-forget: apply local update, send result back).
-        // Note: Like PUT, this applies the update locally only and does NOT propagate
-        // to the network. Only UpdateData::State and UpdateData::Delta are supported;
-        // compound variants (StateAndDelta, Related*) are rejected because the delegate
-        // API doesn't currently provide the related contract information needed to
-        // resolve them. These could be added if there's demand.
+        // Process UPDATE requests (fire-and-forget: apply update, send result back).
+        // Like PUT, this calls upsert_contract_state which propagates to the network
+        // automatically via BroadcastStateChange when the state actually changes.
+        // Only UpdateData::State and UpdateData::Delta are supported; compound variants
+        // (StateAndDelta, Related*) are rejected because the delegate API doesn't
+        // currently provide the related contract information needed to resolve them.
         if !update_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
