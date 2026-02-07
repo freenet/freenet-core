@@ -390,11 +390,26 @@ impl ConnectionManager {
                 }
             }
         }
-        drop(connections);
 
-        // Check transient connections
-        // For transient connections, we don't have full peer info yet
-        // Return None since we don't have the public key
+        // Log diagnostic info when lookup fails but connections exist
+        let conn_count: usize = connections.values().map(|v| v.len()).sum();
+        if conn_count > 0 {
+            let known_addrs: Vec<_> = connections
+                .values()
+                .flat_map(|conns| conns.iter())
+                .filter_map(|conn| conn.location.socket_addr())
+                .collect();
+            tracing::debug!(
+                requested_addr = %addr,
+                connection_count = conn_count,
+                known_addrs = ?known_addrs,
+                in_location_for_peer = self.location_for_peer.read().contains_key(&addr),
+                transient_count = self.transient_connections.len(),
+                "get_peer_by_addr: no match found"
+            );
+        }
+
+        drop(connections);
         None
     }
 

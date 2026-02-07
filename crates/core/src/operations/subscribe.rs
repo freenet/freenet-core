@@ -594,16 +594,31 @@ impl Operation for SubscribeOp {
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the subscribing peer in the interest manager so that
                             // update broadcasts include them as a target immediately.
-                            if let Some(pkl) = op_manager
+                            // Try requester_addr first, then source_addr as fallback (the
+                            // ring connection manager's address may differ from transport).
+                            let pkl = op_manager
                                 .ring
                                 .connection_manager
                                 .get_peer_by_addr(requester_addr)
-                            {
+                                .or_else(|| {
+                                    source_addr.and_then(|sa| {
+                                        op_manager.ring.connection_manager.get_peer_by_addr(sa)
+                                    })
+                                });
+                            if let Some(pkl) = pkl {
                                 let peer_key =
                                     crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
                                 op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
+                            } else {
+                                tracing::warn!(
+                                    tx = %id,
+                                    contract = %key,
+                                    requester_addr = %requester_addr,
+                                    source_addr = ?source_addr,
+                                    "Subscribe: could not find peer to register interest"
+                                );
                             }
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult {
@@ -646,16 +661,31 @@ impl Operation for SubscribeOp {
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the subscribing peer in the interest manager so that
                             // update broadcasts include them as a target immediately.
-                            if let Some(pkl) = op_manager
+                            // Try requester_addr first, then source_addr as fallback (the
+                            // ring connection manager's address may differ from transport).
+                            let pkl = op_manager
                                 .ring
                                 .connection_manager
                                 .get_peer_by_addr(requester_addr)
-                            {
+                                .or_else(|| {
+                                    source_addr.and_then(|sa| {
+                                        op_manager.ring.connection_manager.get_peer_by_addr(sa)
+                                    })
+                                });
+                            if let Some(pkl) = pkl {
                                 let peer_key =
                                     crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
                                 op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
+                            } else {
+                                tracing::warn!(
+                                    tx = %id,
+                                    contract = %key,
+                                    requester_addr = %requester_addr,
+                                    source_addr = ?source_addr,
+                                    "Subscribe: could not find peer to register interest (after contract wait)"
+                                );
                             }
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {

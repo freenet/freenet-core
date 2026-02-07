@@ -1034,6 +1034,14 @@ impl OpManager {
             // Only include connected peers
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
                 targets.insert(pkl);
+            } else {
+                tracing::warn!(
+                    contract = %format!("{:.8}", key),
+                    proximity_neighbor = %addr,
+                    is_local = is_local_update_initiator,
+                    phase = "target_lookup_failed",
+                    "Proximity cache neighbor not found in connection manager"
+                );
             }
         }
 

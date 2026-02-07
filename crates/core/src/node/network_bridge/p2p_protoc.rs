@@ -1786,7 +1786,7 @@ impl P2pConnManager {
                                     continue;
                                 };
 
-                                let targets =
+                                let mut targets =
                                     op_manager.get_broadcast_targets_update(&key, &self_addr);
                                 tracing::debug!(
                                     contract = %key,
@@ -1795,15 +1795,37 @@ impl P2pConnManager {
                                     "BroadcastStateChange: found targets"
                                 );
 
-                                // If no targets exist (no proximity neighbors), skip broadcast.
-                                // This can happen when:
-                                // 1. Gateway just PUT a new contract (no subscribers yet)
-                                // 2. Isolated node with no connected peers seeding this contract
+                                // Fallback: if ring-level targeting found no targets but we have
+                                // transport connections, use them directly. The ring connection
+                                // manager's address index can get out of sync with the transport
+                                // layer (e.g., advertised vs actual address mismatch). The summary
+                                // comparison below will prevent unnecessary sends.
+                                if targets.is_empty() && !ctx.connections.is_empty() {
+                                    for (peer_addr, entry) in &ctx.connections {
+                                        if *peer_addr == self_addr {
+                                            continue;
+                                        }
+                                        if let Some(pub_key) = &entry.pub_key {
+                                            targets.push(crate::ring::PeerKeyLocation::new(
+                                                pub_key.clone(),
+                                                *peer_addr,
+                                            ));
+                                        }
+                                    }
+                                    if !targets.is_empty() {
+                                        tracing::info!(
+                                            contract = %key,
+                                            fallback_target_count = targets.len(),
+                                            "BroadcastStateChange: using transport connections as fallback targets"
+                                        );
+                                    }
+                                }
+
                                 if targets.is_empty() {
                                     tracing::warn!(
                                         contract = %key,
                                         self_addr = %self_addr,
-                                        "BROADCAST_NO_TARGETS: skipping broadcast - no proximity targets"
+                                        "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
                                     );
                                     continue;
                                 }
