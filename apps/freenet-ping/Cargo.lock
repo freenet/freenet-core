@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.112"
+version = "0.1.113"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1512,9 +1512,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.32"
+version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e3bbd528424decbabdb69699972b09182d7204413f07045763a3862c4d62e20"
+checksum = "131801dddf0ae5a1709d78e9f085570dfd4ea3dda8a3944a77982446d2c47453"
 dependencies = [
  "arbitrary",
  "bincode",
