@@ -458,6 +458,12 @@ impl SubscribeOp {
                     );
                 }
             }
+        } else if self.is_renewal {
+            // Subscription renewal abort: no client waiting, just log. See #2891.
+            tracing::debug!(
+                tx = %self.id,
+                "Subscription renewal aborted, no client to notify"
+            );
         } else {
             // Standalone subscribe: client is waiting on this transaction directly.
             let error_result: crate::client_events::HostResult =
