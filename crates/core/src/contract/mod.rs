@@ -31,17 +31,17 @@ pub use handler::reset_event_id_counter;
 use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;
 
-/// Maximum iterations when handling GetContractRequest to prevent infinite loops
+/// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 
-/// Handle a delegate request, including any GetContractRequest messages in the response.
+/// Handle a delegate request, including any contract request messages in the response.
 ///
-/// When a delegate emits GetContractRequest, this function:
-/// 1. Fetches the contract state from the local state store
-/// 2. Creates a GetContractResponse and sends it back to the delegate
-/// 3. Repeats until no more GetContractRequest messages
+/// When a delegate emits GetContractRequest or PutContractRequest, this function:
+/// 1. For GET: Fetches the contract state and sends GetContractResponse back to the delegate
+/// 2. For PUT: Upserts the contract state (fire-and-forget, sends PutContractResponse back)
+/// 3. Repeats until no more contract request messages
 ///
-/// Returns the final response with GetContractRequest messages filtered out.
+/// Returns the final response with contract request messages filtered out.
 async fn handle_delegate_with_contract_requests<CH>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
@@ -106,13 +106,17 @@ where
             }
         };
 
-        // Check for GetContractRequest messages
-        let mut contract_requests: Vec<GetContractRequest> = Vec::new();
+        // Check for contract request messages (GET and PUT)
+        let mut get_requests: Vec<GetContractRequest> = Vec::new();
+        let mut put_requests: Vec<PutContractRequest> = Vec::new();
 
         for msg in values {
             match msg {
                 OutboundDelegateMsg::GetContractRequest(req) => {
-                    contract_requests.push(req);
+                    get_requests.push(req);
+                }
+                OutboundDelegateMsg::PutContractRequest(req) => {
+                    put_requests.push(req);
                 }
                 other => {
                     // Accumulate non-contract-request messages
@@ -122,58 +126,105 @@ where
         }
 
         // If no contract requests, we're done - return all accumulated messages
-        if contract_requests.is_empty() {
+        if get_requests.is_empty() && put_requests.is_empty() {
             return accumulated_messages;
         }
 
-        tracing::debug!(
-            delegate_key = %delegate_key,
-            count = contract_requests.len(),
-            "Processing GetContractRequest messages from delegate"
-        );
-
-        // Process each contract request and build responses
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
-        for req in contract_requests {
-            let contract_id = req.contract_id;
-            let context = req.context;
 
-            // Look up the full key from the instance id
-            let state = match contract_handler.executor().lookup_key(&contract_id) {
-                Some(full_key) => {
-                    // Fetch the contract state
-                    match contract_handler
-                        .executor()
-                        .fetch_contract(full_key, false)
-                        .await
-                    {
-                        Ok((state, _)) => state,
-                        Err(err) => {
-                            tracing::warn!(
-                                contract = %contract_id,
-                                error = %err,
-                                "Failed to fetch contract for delegate GetContractRequest"
-                            );
-                            None
+        // Process PUT requests (fire-and-forget: execute upsert, send result back)
+        if !put_requests.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = put_requests.len(),
+                "Processing PutContractRequest messages from delegate"
+            );
+
+            for req in put_requests {
+                let contract_key = req.contract.key();
+                let context = req.context;
+
+                let result = contract_handler
+                    .executor()
+                    .upsert_contract_state(
+                        contract_key,
+                        Either::Left(req.state),
+                        req.related_contracts,
+                        Some(req.contract),
+                    )
+                    .await;
+
+                let put_result = match result {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        tracing::warn!(
+                            contract = %contract_key,
+                            error = %err,
+                            "Failed to upsert contract for delegate PutContractRequest"
+                        );
+                        Err(format!("{err}"))
+                    }
+                };
+
+                inbound_responses.push(InboundDelegateMsg::PutContractResponse(
+                    PutContractResponse {
+                        contract_id: *contract_key.id(),
+                        result: put_result,
+                        context,
+                    },
+                ));
+            }
+        }
+
+        // Process GET requests
+        if !get_requests.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = get_requests.len(),
+                "Processing GetContractRequest messages from delegate"
+            );
+
+            for req in get_requests {
+                let contract_id = req.contract_id;
+                let context = req.context;
+
+                // Look up the full key from the instance id
+                let state = match contract_handler.executor().lookup_key(&contract_id) {
+                    Some(full_key) => {
+                        // Fetch the contract state
+                        match contract_handler
+                            .executor()
+                            .fetch_contract(full_key, false)
+                            .await
+                        {
+                            Ok((state, _)) => state,
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %contract_id,
+                                    error = %err,
+                                    "Failed to fetch contract for delegate GetContractRequest"
+                                );
+                                None
+                            }
                         }
                     }
-                }
-                None => {
-                    tracing::debug!(
-                        contract = %contract_id,
-                        "Contract not found locally for delegate GetContractRequest"
-                    );
-                    None
-                }
-            };
+                    None => {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Contract not found locally for delegate GetContractRequest"
+                        );
+                        None
+                    }
+                };
 
-            inbound_responses.push(InboundDelegateMsg::GetContractResponse(
-                GetContractResponse {
-                    contract_id,
-                    state,
-                    context,
-                },
-            ));
+                inbound_responses.push(InboundDelegateMsg::GetContractResponse(
+                    GetContractResponse {
+                        contract_id,
+                        state,
+                        context,
+                    },
+                ));
+            }
         }
 
         // Create a new request to send the responses back to the delegate
