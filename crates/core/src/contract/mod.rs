@@ -71,7 +71,7 @@ where
             tracing::error!(
                 delegate_key = %delegate_key,
                 iterations = iterations,
-                "Exceeded maximum GetContractRequest iterations, possible infinite loop"
+                "Exceeded maximum contract request iterations, possible infinite loop"
             );
             // Return whatever we accumulated so far
             return accumulated_messages;
@@ -146,7 +146,10 @@ where
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
 
-        // Process PUT requests (fire-and-forget: execute upsert, send result back)
+        // Process PUT requests (fire-and-forget: execute local upsert, send result back).
+        // Note: This stores the state locally via upsert_contract_state but does NOT
+        // propagate to the network via the PUT operation state machine. Network propagation
+        // would require going through the full ContractHandlerEvent::PutQuery path.
         if !put_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
@@ -241,7 +244,12 @@ where
             }
         }
 
-        // Process UPDATE requests (fire-and-forget: apply update, send result back)
+        // Process UPDATE requests (fire-and-forget: apply local update, send result back).
+        // Note: Like PUT, this applies the update locally only and does NOT propagate
+        // to the network. Only UpdateData::State and UpdateData::Delta are supported;
+        // compound variants (StateAndDelta, Related*) are rejected because the delegate
+        // API doesn't currently provide the related contract information needed to
+        // resolve them. These could be added if there's demand.
         if !update_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
@@ -265,10 +273,15 @@ where
                             freenet_stdlib::prelude::UpdateData::Delta(delta) => {
                                 Either::Right(delta)
                             }
-                            _ => {
+                            // StateAndDelta, RelatedState, RelatedDelta, RelatedStateAndDelta
+                            // are not supported because the delegate API doesn't provide the
+                            // related contract context needed to resolve them.
+                            other => {
                                 tracing::warn!(
                                     contract = %contract_id,
-                                    "Unsupported UpdateData variant in delegate UpdateContractRequest"
+                                    variant = ?std::mem::discriminant(&other),
+                                    "Unsupported UpdateData variant in delegate UpdateContractRequest \
+                                     (only State and Delta are supported)"
                                 );
                                 inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
                                     UpdateContractResponse {
@@ -329,39 +342,28 @@ where
             }
         }
 
-        // Process SUBSCRIBE requests (register subscription, send result back)
-        // Note: This registers the subscription but notification delivery to the delegate
-        // is not yet implemented - it will require the async delegate v2 API.
+        // Process SUBSCRIBE requests
+        // Note: Subscription notification delivery to delegates is not yet implemented.
+        // The current delegate API has no mechanism to push notifications (it would
+        // require a ClientId and notification channel). Full implementation requires
+        // the async delegate v2 API. For now, we return an error so callers know
+        // subscriptions are not functional.
         if !subscribe_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 count = subscribe_requests.len(),
-                "Processing SubscribeContractRequest messages from delegate"
+                "Processing SubscribeContractRequest messages from delegate (not yet implemented)"
             );
 
             for req in subscribe_requests {
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // For now, we acknowledge the subscription request but cannot fully
-                // register a notifier because we don't have a ClientId or notification
-                // channel for the delegate. Full implementation requires async v2 API.
-                let subscribe_result = match contract_handler.executor().lookup_key(&contract_id) {
-                    Some(_full_key) => {
-                        tracing::debug!(
-                            contract = %contract_id,
-                            "Subscription request acknowledged for delegate (notification delivery pending v2 API)"
-                        );
-                        Ok(())
-                    }
-                    None => {
-                        tracing::debug!(
-                            contract = %contract_id,
-                            "Contract not found locally for delegate SubscribeContractRequest"
-                        );
-                        Err("Contract not found".to_string())
-                    }
-                };
+                let subscribe_result: Result<(), String> = Err(
+                    "Delegate subscription not yet implemented: notification delivery \
+                     requires the async delegate v2 API"
+                        .to_string(),
+                );
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {
