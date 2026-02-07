@@ -1,13 +1,15 @@
 //! Implementation of native API's exported and available in the WASM modules.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{DelegateKey, SecretsId};
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 use wasmer::{Function, Imports};
 
 use std::sync::LazyLock;
 
+use super::contract_store::ContractStore;
 use super::runtime::InstanceInfo;
 use super::secrets_store::SecretsStore;
+use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
 ///
@@ -69,6 +71,13 @@ pub(super) struct DelegateCallEnv {
     secret_store: *mut SecretsStore,
     /// The delegate key, needed to scope secret access.
     pub delegate_key: DelegateKey,
+    /// Read-only pointer to the ContractStore for index lookups
+    /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
+    contract_store: *const ContractStore,
+    /// Clone of the state storage backend (ReDb). Used by V2 delegates to read
+    /// contract state synchronously via host functions. ReDb is Arc<Database>
+    /// internally, so cloning is cheap.
+    state_store_db: Option<Storage>,
 }
 
 // SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
@@ -83,19 +92,23 @@ impl DelegateCallEnv {
     /// Create a new call environment.
     ///
     /// # Safety
-    /// The caller must ensure that `secret_store` remains valid for the entire
-    /// lifetime of this `DelegateCallEnv` (i.e., until it is removed from
-    /// `DELEGATE_ENV`). The caller must also ensure exclusive access to the
-    /// SecretsStore during this time (no other references exist).
+    /// The caller must ensure that `secret_store` and `contract_store` remain
+    /// valid for the entire lifetime of this `DelegateCallEnv` (i.e., until it
+    /// is removed from `DELEGATE_ENV`). The caller must also ensure exclusive
+    /// access to the SecretsStore during this time (no other references exist).
     pub unsafe fn new(
         context: Vec<u8>,
         secret_store: &mut SecretsStore,
+        contract_store: &ContractStore,
+        state_store_db: Option<Storage>,
         delegate_key: DelegateKey,
     ) -> Self {
         Self {
             context,
             secret_store: secret_store as *mut SecretsStore,
             delegate_key,
+            contract_store: contract_store as *const ContractStore,
+            state_store_db,
         }
     }
 
@@ -118,6 +131,48 @@ impl DelegateCallEnv {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
         unsafe { &mut *self.secret_store }
+    }
+
+    /// Access the contract store for index lookups.
+    /// Only safe during the synchronous process() call.
+    fn contract_store(&self) -> &ContractStore {
+        // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
+        unsafe { &*self.contract_store }
+    }
+
+    /// Look up contract state by instance ID using the local ReDb store.
+    ///
+    /// Returns `Some(state_bytes)` if found, `None` if the contract is not stored locally.
+    /// This is the synchronous fast path used by V2 delegates instead of the
+    /// GetContractRequest/Response round-trip.
+    fn get_contract_state_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(ref db) = self.state_store_db else {
+            return Err("state store not available (V2 contract access not configured)".into());
+        };
+
+        // Step 1: Look up CodeHash from the contract index
+        let code_hash = match self.contract_store().code_hash_from_id(instance_id) {
+            Some(ch) => ch,
+            None => return Ok(None),
+        };
+
+        // Step 2: Construct the full ContractKey
+        let contract_key = ContractKey::from_id_and_code(*instance_id, code_hash);
+
+        // Step 3: Read state directly from ReDb (synchronous)
+        // ReDb's StateStorage::get is async in signature but purely synchronous internally.
+        // We replicate the read logic here to avoid the async wrapper.
+        use crate::wasm_runtime::StateStorage;
+        let state = futures::executor::block_on(db.get(&contract_key));
+
+        match state {
+            Ok(Some(wrapped_state)) => Ok(Some(wrapped_state.as_ref().to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("state store read error: {e}")),
+        }
     }
 }
 
@@ -609,6 +664,205 @@ pub(crate) mod delegate_secrets {
             Err(e) => {
                 tracing::debug!("delegate remove_secret failed: {e}");
                 error_codes::ERR_SECRET_NOT_FOUND
+            }
+        }
+    }
+}
+
+/// Host functions for synchronous contract state access (V2 delegate API).
+///
+/// These allow a V2 delegate to read contract state directly during `process()`,
+/// eliminating the GetContractRequest/GetContractResponse round-trip.
+///
+/// The delegate passes a `ContractInstanceId` (32 bytes) and receives the
+/// contract state bytes back in a pre-allocated output buffer.
+///
+/// ## Usage Pattern (from WASM)
+///
+/// 1. Call `get_contract_state_len(id_ptr, 32)` to get the state size
+/// 2. Allocate a buffer of that size
+/// 3. Call `get_contract_state(id_ptr, 32, out_ptr, out_len)` to read the state
+///
+/// ## Error Codes
+/// - Non-negative values on success (byte counts)
+/// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
+/// - `ERR_INVALID_PARAM` (-4): invalid parameter
+/// - `ERR_BUFFER_TOO_SMALL` (-6): output buffer too small
+/// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
+/// - `ERR_STORE_ERROR` (-8): internal storage error
+pub(crate) mod delegate_contracts {
+    use super::*;
+    use crate::wasm_runtime::delegate_api::contract_error_codes;
+
+    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
+        let get_state = Function::new_typed(store, get_contract_state);
+        let get_state_len = Function::new_typed(store, get_contract_state_len);
+        imports.register_namespace(
+            "freenet_delegate_contracts",
+            [
+                (
+                    "__frnt__delegate__get_contract_state".to_owned(),
+                    get_state.into(),
+                ),
+                (
+                    "__frnt__delegate__get_contract_state_len".to_owned(),
+                    get_state_len.into(),
+                ),
+            ],
+        );
+    }
+
+    /// Get the size of a contract's state without retrieving it.
+    ///
+    /// The contract instance ID is read from WASM memory at `id_ptr` (must be 32 bytes).
+    ///
+    /// ## Returns
+    /// - Non-negative: state size in bytes
+    /// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
+    /// - `ERR_INVALID_PARAM` (-4): instance ID is not 32 bytes
+    /// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
+    /// - `ERR_STORE_ERROR` (-8): internal storage error
+    fn get_contract_state_len(id_ptr: i64, id_len: i32) -> i64 {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate get_contract_state_len called outside process()");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        }
+        if id_len != 32 {
+            tracing::warn!(
+                "delegate get_contract_state_len: expected 32-byte instance ID, got {id_len}"
+            );
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read the contract instance ID from WASM memory
+        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
+            .try_into()
+            .unwrap();
+        let contract_id = ContractInstanceId::new(id_bytes);
+
+        match env.get_contract_state_sync(&contract_id) {
+            Ok(Some(state_bytes)) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    size = state_bytes.len(),
+                    "V2 delegate: get_contract_state_len succeeded"
+                );
+                state_bytes.len() as i64
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: contract not found in local store"
+                );
+                contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
+            }
+            Err(e) => {
+                tracing::error!(
+                    contract = %contract_id,
+                    error = %e,
+                    "V2 delegate: state store error"
+                );
+                contract_error_codes::ERR_STORE_ERROR as i64
+            }
+        }
+    }
+
+    /// Read a contract's state into the WASM linear memory.
+    ///
+    /// The contract instance ID is read from `id_ptr` (32 bytes).
+    /// State bytes are written to `out_ptr` (max `out_len` bytes).
+    ///
+    /// ## Returns
+    /// - Non-negative: number of bytes written
+    /// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
+    /// - `ERR_INVALID_PARAM` (-4): bad parameters
+    /// - `ERR_BUFFER_TOO_SMALL` (-6): output buffer too small
+    /// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
+    /// - `ERR_STORE_ERROR` (-8): internal storage error
+    fn get_contract_state(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64 {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate get_contract_state called outside process()");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        }
+        if id_len != 32 {
+            tracing::warn!(
+                "delegate get_contract_state: expected 32-byte instance ID, got {id_len}"
+            );
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+        if out_len < 0 {
+            tracing::warn!("delegate get_contract_state: negative out_len={out_len}");
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read the contract instance ID from WASM memory
+        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
+            .try_into()
+            .unwrap();
+        let contract_id = ContractInstanceId::new(id_bytes);
+
+        match env.get_contract_state_sync(&contract_id) {
+            Ok(Some(state_bytes)) => {
+                let state_len = state_bytes.len();
+                let out_len_usize = out_len as usize;
+
+                if state_len > out_len_usize {
+                    tracing::debug!(
+                        "delegate get_contract_state buffer too small: need {state_len}, have {out_len_usize}"
+                    );
+                    return contract_error_codes::ERR_BUFFER_TOO_SMALL as i64;
+                }
+
+                if state_len == 0 {
+                    return 0;
+                }
+
+                let dst = compute_ptr::<u8>(out_ptr, info.start_ptr);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(state_bytes.as_ptr(), dst, state_len);
+                }
+
+                tracing::debug!(
+                    contract = %contract_id,
+                    bytes_written = state_len,
+                    "V2 delegate: get_contract_state succeeded"
+                );
+                state_len as i64
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: contract not found"
+                );
+                contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
+            }
+            Err(e) => {
+                tracing::error!(
+                    contract = %contract_id,
+                    error = %e,
+                    "V2 delegate: state store error"
+                );
+                contract_error_codes::ERR_STORE_ERROR as i64
             }
         }
     }

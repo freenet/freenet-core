@@ -97,11 +97,19 @@ impl Runtime {
         instance: &Instance,
         instance_id: i64,
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
-        // Set up the delegate call environment with context and secret store access.
-        // SAFETY: self.secret_store is valid for the duration of the synchronous
-        // process_func.call() below. The guard ensures cleanup even on panic.
-        let env =
-            unsafe { DelegateCallEnv::new(context, &mut self.secret_store, delegate_key.clone()) };
+        // Set up the delegate call environment with context, secret store, and
+        // contract store access. SAFETY: self.secret_store and self.contract_store
+        // are valid for the duration of the synchronous process_func.call() below.
+        // The guard ensures cleanup even on panic.
+        let env = unsafe {
+            DelegateCallEnv::new(
+                context,
+                &mut self.secret_store,
+                &self.contract_store,
+                self.state_store_db.clone(),
+                delegate_key.clone(),
+            )
+        };
 
         // Debug assertion: instance IDs should never collide (they come from a monotonic counter)
         debug_assert!(

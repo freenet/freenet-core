@@ -210,6 +210,11 @@ pub struct Runtime {
     pub(super) contract_modules: LruCache<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
     pub(super) max_execution_seconds: f64,
+
+    /// Optional state storage backend for V2 delegate contract access.
+    /// When set, V2 delegates can read contract state synchronously via host functions
+    /// instead of using the GetContractRequest/Response round-trip.
+    pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
 }
 
 impl Runtime {
@@ -217,6 +222,14 @@ impl Runtime {
     /// Returns false if the wasm_store has been lost (e.g., due to a panic).
     pub fn is_healthy(&self) -> bool {
         self.wasm_store.is_some()
+    }
+
+    /// Set the state storage backend for V2 delegate contract access.
+    ///
+    /// When set, V2 delegates can call `ctx.get_contract_state()` host functions
+    /// during `process()` to read contract state synchronously from the local store.
+    pub fn set_state_store_db(&mut self, db: crate::contract::storages::Storage) {
+        self.state_store_db = Some(db);
     }
 
     pub fn build_with_config(
@@ -243,6 +256,7 @@ impl Runtime {
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
         native_api::delegate_context::prepare_export(&mut store, &mut top_level_imports);
         native_api::delegate_secrets::prepare_export(&mut store, &mut top_level_imports);
+        native_api::delegate_contracts::prepare_export(&mut store, &mut top_level_imports);
 
         // SAFETY: DEFAULT_MODULE_CACHE_CAPACITY is non-zero
         let cache_capacity =
@@ -261,6 +275,7 @@ impl Runtime {
             delegate_modules: LruCache::new(cache_capacity),
             enabled_metering: config.enable_metering,
             max_execution_seconds: config.max_execution_seconds,
+            state_store_db: None,
         })
     }
 
