@@ -1367,35 +1367,6 @@ impl Executor<Runtime> {
                     }
                 }
             }
-            DelegateRequest::GetSecretRequest {
-                key,
-                params,
-                get_request,
-            } => {
-                tracing::debug!(
-                    delegate_key = %key,
-                    params_size = params.as_ref().len(),
-                    attested_contract = ?attested_contract,
-                    "Handling GetSecretRequest for delegate"
-                );
-                let attested = attested_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested.map(|c| c.as_bytes()),
-                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
-                    Err(err) => Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Delegate(key.clone())),
-                    )),
-                }
-            }
             DelegateRequest::ApplicationMessages {
                 key,
                 inbound,
