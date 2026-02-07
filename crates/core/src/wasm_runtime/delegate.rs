@@ -419,175 +419,45 @@ impl DelegateRuntimeInterface for Runtime {
         let mut context: Vec<u8> = Vec::new();
 
         for msg in inbound {
-            match msg {
+            // ApplicationMessage needs special handling to inject the current context
+            let msg = match msg {
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
                     app,
                     payload,
                     processed,
                     ..
-                }) => {
-                    let app_msg = InboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, payload)
-                            .processed(processed)
-                            .with_context(DelegateContext::new(context.clone())),
-                    );
+                }) => InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(app, payload)
+                        .processed(processed)
+                        .with_context(DelegateContext::new(context.clone())),
+                ),
+                other => other,
+            };
 
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &app_msg,
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
+            let (outbound, updated_context) = self.exec_inbound_with_env(
+                delegate_key,
+                params,
+                attested,
+                &msg,
+                context.clone(),
+                &process_func,
+                &running.instance,
+                instance_id,
+            )?;
+            context = updated_context;
 
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::UserResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::UserResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::GetContractResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::GetContractResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::PutContractResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::PutContractResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::UpdateContractResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::UpdateContractResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::SubscribeContractResponse(response) => {
-                    let (outbound, updated_context) = self.exec_inbound_with_env(
-                        delegate_key,
-                        params,
-                        attested,
-                        &InboundDelegateMsg::SubscribeContractResponse(response),
-                        context.clone(),
-                        &process_func,
-                        &running.instance,
-                        instance_id,
-                    )?;
-                    context = updated_context;
-
-                    let mut outbound_queue = VecDeque::from(outbound);
-                    self.process_outbound(
-                        delegate_key,
-                        &running.instance,
-                        instance_id,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound_queue,
-                        &mut context,
-                        &mut results,
-                    )?;
-                }
-            }
+            let mut outbound_queue = VecDeque::from(outbound);
+            self.process_outbound(
+                delegate_key,
+                &running.instance,
+                instance_id,
+                &process_func,
+                params,
+                attested,
+                &mut outbound_queue,
+                &mut context,
+                &mut results,
+            )?;
         }
 
         tracing::debug!(

@@ -27,6 +27,14 @@ struct DelegateState {
 }
 
 impl DelegateState {
+    /// Create a minimal state that only tracks the originating app for response routing.
+    fn for_app(app: &ContractInstanceId) -> Self {
+        Self {
+            operation_context: Some(app.as_bytes().to_vec()),
+            ..Default::default()
+        }
+    }
+
     fn to_context(&self) -> DelegateContext {
         DelegateContext::new(bincode::serialize(self).unwrap_or_default())
     }
@@ -37,6 +45,19 @@ impl DelegateState {
         } else {
             bincode::deserialize(ctx.as_ref()).unwrap_or_default()
         }
+    }
+
+    /// Extract the originating app ID from the operation context.
+    fn app_id(&self) -> ContractInstanceId {
+        self.operation_context
+            .as_ref()
+            .and_then(|bytes| {
+                ContractInstanceId::try_from(
+                    String::from_utf8(bytes.clone()).unwrap_or_default(),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]))
     }
 }
 
@@ -222,13 +243,7 @@ fn handle_application_message(
                 WrappedState::new(state),
                 RelatedContracts::default(),
             );
-            // Store context so the response handler can identify the originating app
-            let delegate_state = DelegateState {
-                pending_contract_get: None,
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
-                ..Default::default()
-            };
-            request.context = delegate_state.to_context();
+            request.context = DelegateState::for_app(&app_msg.app).to_context();
 
             Ok(vec![OutboundDelegateMsg::PutContractRequest(request)])
         }
@@ -239,24 +254,14 @@ fn handle_application_message(
         } => {
             let update = UpdateData::State(freenet_stdlib::prelude::State::from(state));
             let mut request = UpdateContractRequest::new(contract_id, update);
-            let delegate_state = DelegateState {
-                pending_contract_get: None,
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
-                ..Default::default()
-            };
-            request.context = delegate_state.to_context();
+            request.context = DelegateState::for_app(&app_msg.app).to_context();
 
             Ok(vec![OutboundDelegateMsg::UpdateContractRequest(request)])
         }
 
         DelegateCommand::SubscribeContract { contract_id } => {
             let mut request = SubscribeContractRequest::new(contract_id);
-            let delegate_state = DelegateState {
-                pending_contract_get: None,
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
-                ..Default::default()
-            };
-            request.context = delegate_state.to_context();
+            request.context = DelegateState::for_app(&app_msg.app).to_context();
 
             Ok(vec![OutboundDelegateMsg::SubscribeContractRequest(request)])
         }
@@ -317,14 +322,7 @@ fn handle_get_contract_response(
         )));
     }
 
-    // Get the original app ID from context
-    let app_id = state
-        .operation_context
-        .clone()
-        .and_then(|bytes| {
-            ContractInstanceId::try_from(String::from_utf8(bytes).unwrap_or_default()).ok()
-        })
-        .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
+    let app_id = state.app_id();
 
     // Check if this is a multi-contract fetch
     if !state.remaining_contracts.is_empty() || !state.accumulated_results.is_empty() {
@@ -374,28 +372,15 @@ fn handle_get_contract_response(
     Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
 }
 
-fn handle_put_contract_response(
-    response: PutContractResponse,
+/// Build an outbound ApplicationMessage from a contract operation response.
+///
+/// Extracts the app_id from the delegate state context and wraps the given
+/// DelegateResponse as a processed ApplicationMessage.
+fn build_contract_response(
+    context: &DelegateContext,
+    response_payload: DelegateResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let state = DelegateState::from_context(&response.context);
-
-    let app_id = state
-        .operation_context
-        .and_then(|bytes| {
-            ContractInstanceId::try_from(String::from_utf8(bytes).unwrap_or_default()).ok()
-        })
-        .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
-
-    let (success, error) = match response.result {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
-    };
-
-    let response_payload = DelegateResponse::ContractPutResult {
-        contract_id: response.contract_id,
-        success,
-        error,
-    };
+    let app_id = DelegateState::from_context(context).app_id();
 
     let payload = bincode::serialize(&response_payload)
         .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
@@ -405,72 +390,60 @@ fn handle_put_contract_response(
         .with_context(DelegateContext::default());
 
     Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
+}
+
+fn handle_put_contract_response(
+    response: PutContractResponse,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let (success, error) = match response.result {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+
+    build_contract_response(
+        &response.context,
+        DelegateResponse::ContractPutResult {
+            contract_id: response.contract_id,
+            success,
+            error,
+        },
+    )
 }
 
 fn handle_update_contract_response(
     response: UpdateContractResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let state = DelegateState::from_context(&response.context);
-
-    let app_id = state
-        .operation_context
-        .and_then(|bytes| {
-            ContractInstanceId::try_from(String::from_utf8(bytes).unwrap_or_default()).ok()
-        })
-        .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
-
     let (success, error) = match response.result {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e)),
     };
 
-    let response_payload = DelegateResponse::ContractUpdateResult {
-        contract_id: response.contract_id,
-        success,
-        error,
-    };
-
-    let payload = bincode::serialize(&response_payload)
-        .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
-
-    let app_msg = ApplicationMessage::new(app_id, payload)
-        .processed(true)
-        .with_context(DelegateContext::default());
-
-    Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
+    build_contract_response(
+        &response.context,
+        DelegateResponse::ContractUpdateResult {
+            contract_id: response.contract_id,
+            success,
+            error,
+        },
+    )
 }
 
 fn handle_subscribe_contract_response(
     response: SubscribeContractResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let state = DelegateState::from_context(&response.context);
-
-    let app_id = state
-        .operation_context
-        .and_then(|bytes| {
-            ContractInstanceId::try_from(String::from_utf8(bytes).unwrap_or_default()).ok()
-        })
-        .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
-
     let (success, error) = match response.result {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e)),
     };
 
-    let response_payload = DelegateResponse::ContractSubscribeResult {
-        contract_id: response.contract_id,
-        success,
-        error,
-    };
-
-    let payload = bincode::serialize(&response_payload)
-        .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
-
-    let app_msg = ApplicationMessage::new(app_id, payload)
-        .processed(true)
-        .with_context(DelegateContext::default());
-
-    Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
+    build_contract_response(
+        &response.context,
+        DelegateResponse::ContractSubscribeResult {
+            contract_id: response.contract_id,
+            success,
+            error,
+        },
+    )
 }
 
 #[cfg(test)]
