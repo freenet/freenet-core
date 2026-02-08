@@ -256,7 +256,8 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "freenet-macros"
 version = "0.1.3"
-source = "git+https://github.com/freenet/freenet-stdlib.git?branch=feat-delegate-contract-put#3b41708a11d14f39b5a0be8dd04d255cea673500"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a85156f071fa03221c5f166a6ad6d6a909caf1b61f1476e89f925b3663ce77bb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -265,8 +266,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.34"
-source = "git+https://github.com/freenet/freenet-stdlib.git?branch=feat-delegate-contract-put#3b41708a11d14f39b5a0be8dd04d255cea673500"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357b804497976dd4390d3079802d801ed62d1275baae23655fd12cee404efa1d"
 dependencies = [
  "bincode",
  "blake3",

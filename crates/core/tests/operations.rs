@@ -3504,7 +3504,7 @@ enum DelegateCommandResponse {
 
 /// E2E test: delegate issues PUT and UPDATE to a real contract via the WASM runtime.
 ///
-/// This test verifies the full delegate→contract capability pipeline:
+/// Verifies the full delegate→contract capability pipeline:
 /// 1. Register a real WASM delegate (test-delegate-capabilities)
 /// 2. The delegate issues a PutContractRequest for a real WASM contract (test-contract-integration)
 /// 3. The runtime processes the PUT via upsert_contract_state
@@ -3641,7 +3641,7 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
     // Step 4: UPDATE contract via delegate (add a task)
     tracing::info!("Step 4: Delegate UPDATE contract (add a task)");
     let updated_state = test_utils::create_todo_list_with_item("Delegate E2E test task");
-    let contract_instance_id = contract_key.id().clone();
+    let contract_instance_id = *contract_key.id();
 
     let update_cmd = DelegateCommand::UpdateContractState {
         contract_id: contract_instance_id,
@@ -3806,7 +3806,7 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
 
     // Step 3: GET contract via delegate
     tracing::info!("Step 3: Delegate GET contract state");
-    let contract_instance_id = contract_key.id().clone();
+    let contract_instance_id = *contract_key.id();
     let app_id = ContractInstanceId::new([42u8; 32]);
 
     let get_cmd = DelegateCommand::GetContractState {
