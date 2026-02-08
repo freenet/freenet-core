@@ -36,6 +36,17 @@ pub use app_packaging::WebApp;
 // Export types needed for integration testing
 pub use http_gateway::{AttestedContract, AttestedContractMap};
 
+/// API version for websocket and HTTP gateway routing.
+///
+/// V1 is the default for backwards compatibility. V2 currently behaves
+/// identically but provides a routing seam for future protocol changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ApiVersion {
+    #[default]
+    V1,
+    V2,
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientConnection {
@@ -48,6 +59,9 @@ pub(crate) enum ClientConnection {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         attested_contract: Option<ContractInstanceId>,
+        /// Plumbing for future V2-specific dispatch; not yet read.
+        #[allow(dead_code)]
+        api_version: ApiVersion,
     },
 }
 

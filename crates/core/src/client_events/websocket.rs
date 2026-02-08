@@ -48,7 +48,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     client_events::AuthToken,
-    server::{ClientConnection, HostCallbackResult},
+    server::{ApiVersion, ClientConnection, HostCallbackResult},
     util::EncodingProtocol,
 };
 
@@ -116,7 +116,8 @@ impl WebSocketProxy {
 
         // Using Extension instead of with_state to avoid changing the Router's type parameter
         let router = server_routing
-            .route("/v1/contract/command", get(websocket_commands))
+            .route("/v1/contract/command", get(websocket_commands_v1))
+            .route("/v2/contract/command", get(websocket_commands_v2))
             .layer(Extension(attested_contracts))
             .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
@@ -149,6 +150,7 @@ impl WebSocketProxy {
                 req,
                 auth_token,
                 attested_contract,
+                ..
             } => {
                 let open_req = match &*req {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
@@ -339,12 +341,49 @@ async fn connection_info(
     next.run(req).await
 }
 
+async fn websocket_commands_v1(
+    ws: WebSocketUpgrade,
+    auth_token: Extension<Option<AuthToken>>,
+    encoding_protoc: Extension<EncodingProtocol>,
+    rs: Extension<WebSocketRequest>,
+    attested_contracts: Extension<AttestedContractMap>,
+) -> Response {
+    websocket_commands(
+        ws,
+        auth_token,
+        encoding_protoc,
+        rs,
+        attested_contracts,
+        ApiVersion::V1,
+    )
+    .await
+}
+
+async fn websocket_commands_v2(
+    ws: WebSocketUpgrade,
+    auth_token: Extension<Option<AuthToken>>,
+    encoding_protoc: Extension<EncodingProtocol>,
+    rs: Extension<WebSocketRequest>,
+    attested_contracts: Extension<AttestedContractMap>,
+) -> Response {
+    websocket_commands(
+        ws,
+        auth_token,
+        encoding_protoc,
+        rs,
+        attested_contracts,
+        ApiVersion::V2,
+    )
+    .await
+}
+
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<AttestedContractMap>,
+    api_version: ApiVersion,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
@@ -404,6 +443,7 @@ async fn websocket_commands(
             auth_and_instance,
             token_is_invalid,
             encoding_protoc,
+            api_version,
             ws,
         )
         .await
@@ -430,6 +470,7 @@ async fn websocket_interface(
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
+    api_version: ApiVersion,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
     let (mut response_rx, client_id) =
@@ -519,6 +560,7 @@ async fn websocket_interface(
                 &mut auth_token.as_mut().map(|t| t.0.clone()),
                 auth_token.as_mut().map(|t| t.1),
                 encoding_protoc,
+                api_version,
             )
             .await
         };
@@ -541,6 +583,7 @@ async fn websocket_interface(
                                 req: Box::new(ClientRequest::Disconnect { cause: None }),
                                 auth_token: auth_token.as_ref().map(|t| t.0.clone()),
                                 attested_contract: auth_token.as_ref().map(|t| t.1),
+                                api_version,
                             })
                             .await;
                         let _ = server_sink.send(Message::Close(None)).await;
@@ -555,6 +598,7 @@ async fn websocket_interface(
                                 req: Box::new(ClientRequest::Disconnect { cause: None }),
                                 auth_token: auth_token.as_ref().map(|t| t.0.clone()),
                                 attested_contract: auth_token.as_ref().map(|t| t.1),
+                                api_version,
                             })
                             .await;
                         return Err(err)
@@ -598,6 +642,7 @@ async fn websocket_interface(
                             req: Box::new(ClientRequest::Disconnect { cause: None }),
                             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
                             attested_contract: auth_token.as_ref().map(|t| t.1),
+                            api_version,
                         })
                         .await;
                     return Err(err.into());
@@ -639,6 +684,7 @@ async fn process_client_request(
     auth_token: &mut Option<AuthToken>,
     attested_contract: Option<ContractInstanceId>,
     encoding_protoc: EncodingProtocol,
+    api_version: ApiVersion,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data.to_vec(),
@@ -693,6 +739,7 @@ async fn process_client_request(
             req: Box::new(req),
             auth_token: auth_token.clone(),
             attested_contract,
+            api_version,
         })
         .await
         .map_err(|err| Some(err.into()))?;

@@ -26,6 +26,7 @@ pub(super) async fn contract_home(
     key: String,
     request_sender: HttpGatewayRequest,
     assigned_token: AuthToken,
+    version_prefix: &str,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "contract_home: Converting string key to ContractInstanceId: {}",
@@ -71,6 +72,7 @@ pub(super) async fn contract_home(
             ),
             auth_token: None,
             attested_contract: None,
+            api_version: Default::default(),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -137,7 +139,7 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                match get_web_body(&path, &assigned_token, &key).await {
+                match get_web_body(&path, &assigned_token, &key, version_prefix).await {
                     Ok(b) => b.into_response(),
                     Err(err) => {
                         tracing::error!("Failed to read webapp after unpacking: {err}");
@@ -177,6 +179,7 @@ pub(super) async fn contract_home(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             attested_contract: None,
+            api_version: Default::default(),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -189,6 +192,7 @@ pub(super) async fn contract_home(
 pub(super) async fn variable_content(
     key: String,
     req_path: String,
+    version_prefix: &str,
 ) -> Result<impl IntoResponse, Box<WebSocketApiError>> {
     debug!(
         "variable_content: Processing request for key: {}, path: {}",
@@ -233,7 +237,7 @@ pub(super) async fn variable_content(
                 error_cause: format!("{err}"),
             }
         })?;
-        let prefix = format!("/v1/contract/web/{key}/");
+        let prefix = format!("/{version_prefix}/contract/web/{key}/");
         let rewritten = content
             .replace("\"/./", &format!("\"{prefix}"))
             .replace("'/./", &format!("'{prefix}"));
@@ -264,6 +268,7 @@ async fn get_web_body(
     path: &Path,
     auth_token: &AuthToken,
     contract_key: &str,
+    version_prefix: &str,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "get_web_body: Attempting to read index.html from path: {:?}",
@@ -291,7 +296,7 @@ async fn get_web_body(
     // Dioxus generates paths like /./assets/app.js which browsers normalize to /assets/app.js
     // (root-relative). These bypass the /v1/contract/web/{key}/ prefix and 404.
     // Safety: contract_key is a base58-encoded contract ID (alphanumeric only).
-    let prefix = format!("/v1/contract/web/{contract_key}/");
+    let prefix = format!("/{version_prefix}/contract/web/{contract_key}/");
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
 
@@ -360,7 +365,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await
@@ -400,7 +405,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await
@@ -424,7 +429,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key).await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await

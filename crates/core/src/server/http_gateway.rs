@@ -131,6 +131,7 @@ impl ClientEventsProxy for HttpGateway {
                         req,
                         auth_token,
                         attested_contract,
+                        ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
