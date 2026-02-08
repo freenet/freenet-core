@@ -4,7 +4,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetContractRequest, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, SecretsId,
+    OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId, SubscribeContractRequest,
+    UpdateContractRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -228,12 +229,14 @@ impl Runtime {
                     OutboundDelegateMsg::GetContractRequest(req) => {
                         format!("GetContractRequest(contract={})", req.contract_id)
                     }
-                    OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest".to_string(),
-                    OutboundDelegateMsg::UpdateContractRequest(_) => {
-                        "UpdateContractRequest".to_string()
+                    OutboundDelegateMsg::PutContractRequest(req) => {
+                        format!("PutContractRequest(contract={})", req.contract.key())
                     }
-                    OutboundDelegateMsg::SubscribeContractRequest(_) => {
-                        "SubscribeContractRequest".to_string()
+                    OutboundDelegateMsg::UpdateContractRequest(req) => {
+                        format!("UpdateContractRequest(contract={})", req.contract_id)
+                    }
+                    OutboundDelegateMsg::SubscribeContractRequest(req) => {
+                        format!("SubscribeContractRequest(contract={})", req.contract_id)
                     }
                 })
                 .collect::<Vec<String>>()
@@ -269,9 +272,9 @@ impl Runtime {
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
                         OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
-                        OutboundDelegateMsg::PutContractRequest(_) => "PutContractReq".to_string(),
-                        OutboundDelegateMsg::UpdateContractRequest(_) => "UpdateContractReq".to_string(),
-                        OutboundDelegateMsg::SubscribeContractRequest(_) => "SubscribeContractReq".to_string(),
+                        OutboundDelegateMsg::PutContractRequest(r) => format!("PutContractReq({})", r.contract.key()),
+                        OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -348,15 +351,59 @@ impl Runtime {
                     tracing::debug!("GetContractRequest processed");
                     *context = ctx.as_ref().to_vec();
                 }
-                msg @ (OutboundDelegateMsg::PutContractRequest(_)
-                | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_)) => {
-                    tracing::debug!("Passing contract request to executor for async handling");
-                    results.push(msg);
+                OutboundDelegateMsg::PutContractRequest(req) if !req.processed => {
+                    tracing::debug!(
+                        contract = %req.contract.key(),
+                        "Passing PutContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::PutContractRequest(req));
                     for remaining in outbound_msgs.drain(..) {
                         results.push(remaining);
                     }
                     break;
+                }
+                OutboundDelegateMsg::PutContractRequest(PutContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
+                    tracing::debug!("PutContractRequest processed");
+                    *context = ctx.as_ref().to_vec();
+                }
+                OutboundDelegateMsg::UpdateContractRequest(req) if !req.processed => {
+                    tracing::debug!(
+                        contract_id = %req.contract_id,
+                        "Passing UpdateContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::UpdateContractRequest(req));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
+                    tracing::debug!("UpdateContractRequest processed");
+                    *context = ctx.as_ref().to_vec();
+                }
+                OutboundDelegateMsg::SubscribeContractRequest(req) if !req.processed => {
+                    tracing::debug!(
+                        contract_id = %req.contract_id,
+                        "Passing SubscribeContractRequest to executor for async handling"
+                    );
+                    results.push(OutboundDelegateMsg::SubscribeContractRequest(req));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest {
+                    context: ctx,
+                    ..
+                }) => {
+                    tracing::debug!("SubscribeContractRequest processed");
+                    *context = ctx.as_ref().to_vec();
                 }
             }
         }
@@ -648,6 +695,17 @@ mod test {
                 contract_id: ContractInstanceId,
                 echo_message: String,
             },
+            PutContractState {
+                contract: ContractContainer,
+                state: Vec<u8>,
+            },
+            UpdateContractState {
+                contract_id: ContractInstanceId,
+                state: Vec<u8>,
+            },
+            SubscribeContract {
+                contract_id: ContractInstanceId,
+            },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -661,6 +719,21 @@ mod test {
             },
             Echo {
                 message: String,
+            },
+            ContractPutResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
+            },
+            ContractUpdateResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
+            },
+            ContractSubscribeResult {
+                contract_id: ContractInstanceId,
+                success: bool,
+                error: Option<String>,
             },
             Error {
                 message: String,
@@ -2046,6 +2119,210 @@ mod test {
             OutboundAppMessage::ContractState { .. } => {
                 panic!("Expected ContractNotFound for non-existent contract");
             }
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        let code = ContractCode::from(vec![0u8; 10]);
+        let params = Parameters::from(vec![]);
+        let wrapped = WrappedContract::new(Arc::new(code), params);
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+        let contract_key = contract.key();
+
+        let command = DelegateCommand::PutContractState {
+            contract,
+            state: vec![10, 20, 30],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let put_request = match &outbound[0] {
+            OutboundDelegateMsg::PutContractRequest(req) => req.clone(),
+            other => panic!("Expected PutContractRequest, got {:?}", other),
+        };
+        assert_eq!(put_request.contract.key(), contract_key);
+        assert!(!put_request.processed);
+
+        let response = InboundDelegateMsg::PutContractResponse(PutContractResponse {
+            contract_id: *contract_key.id(),
+            result: Ok(()),
+            context: put_request.context.clone(),
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+
+        assert_eq!(
+            final_outbound.len(),
+            1,
+            "Expected exactly one final message"
+        );
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractPutResult { success, error, .. } => {
+                assert!(success);
+                assert!(error.is_none());
+            }
+            other => panic!("Expected ContractPutResult, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        let command = DelegateCommand::UpdateContractState {
+            contract_id,
+            state: vec![10, 20, 30],
+        };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let update_request = match &outbound[0] {
+            OutboundDelegateMsg::UpdateContractRequest(req) => req.clone(),
+            other => panic!("Expected UpdateContractRequest, got {:?}", other),
+        };
+        assert_eq!(update_request.contract_id, contract_id);
+        assert!(!update_request.processed);
+
+        let response = InboundDelegateMsg::UpdateContractResponse(UpdateContractResponse {
+            contract_id,
+            result: Ok(()),
+            context: update_request.context.clone(),
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+
+        assert_eq!(
+            final_outbound.len(),
+            1,
+            "Expected exactly one final message"
+        );
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractUpdateResult {
+                contract_id: id,
+                success,
+                error,
+            } => {
+                assert_eq!(id, contract_id);
+                assert!(success);
+                assert!(error.is_none());
+            }
+            other => panic!("Expected ContractUpdateResult, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_subscribe_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        let command = DelegateCommand::SubscribeContract { contract_id };
+        let payload = bincode::serialize(&command)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let subscribe_request = match &outbound[0] {
+            OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
+            other => panic!("Expected SubscribeContractRequest, got {:?}", other),
+        };
+        assert_eq!(subscribe_request.contract_id, contract_id);
+        assert!(!subscribe_request.processed);
+
+        let response = InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+            contract_id,
+            result: Err("not yet implemented".to_string()),
+            context: subscribe_request.context.clone(),
+        });
+
+        let final_outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+
+        assert_eq!(
+            final_outbound.len(),
+            1,
+            "Expected exactly one final message"
+        );
+        let final_msg = match &final_outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(final_msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
+        match response {
+            DelegateResponse::ContractSubscribeResult {
+                contract_id: id,
+                success,
+                error,
+            } => {
+                assert_eq!(id, contract_id);
+                assert!(!success);
+                assert!(error.is_some());
+            }
+            other => panic!("Expected ContractSubscribeResult, got {:?}", other),
         }
 
         std::mem::drop(temp_dir);
