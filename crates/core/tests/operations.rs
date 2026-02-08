@@ -3507,7 +3507,7 @@ enum DelegateCommandResponse {
 /// Verifies the full delegate→contract capability pipeline:
 /// 1. Register a real WASM delegate (test-delegate-capabilities)
 /// 2. The delegate issues a PutContractRequest for a real WASM contract (test-contract-integration)
-/// 3. The runtime processes the PUT via upsert_contract_state
+/// 3. The runtime processes the PUT via upsert_contract_state (with BroadcastStateChange)
 /// 4. A direct GET confirms the contract state was stored
 /// 5. The delegate issues an UpdateContractRequest with new state
 /// 6. A direct GET confirms the updated state
