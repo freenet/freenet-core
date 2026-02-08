@@ -224,6 +224,26 @@ pub(super) async fn variable_content(
         file_path.exists()
     );
 
+    // For JavaScript files, rewrite root-relative asset paths just like we do for HTML.
+    // Dioxus embeds paths like "/./assets/app_bg.wasm" inside the JS bundle, which browsers
+    // normalize to "/assets/..." (root-relative), bypassing the contract web prefix.
+    if file_path.extension().is_some_and(|ext| ext == "js") {
+        let content = tokio::fs::read_to_string(&file_path).await.map_err(|err| {
+            WebSocketApiError::NodeError {
+                error_cause: format!("{err}"),
+            }
+        })?;
+        let prefix = format!("/v1/contract/web/{key}/");
+        let rewritten = content
+            .replace("\"/./", &format!("\"{prefix}"))
+            .replace("'/./", &format!("'{prefix}"));
+        return Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+            rewritten,
+        )
+            .into_response());
+    }
+
     // serve the file
     let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
     let fake_req = axum::http::Request::new(axum::body::Body::empty());
