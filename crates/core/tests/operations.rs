@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure};
 use freenet::test_utils::{
-    self, load_delegate, make_get, make_get_with_blocking, make_put, make_put_with_blocking,
-    make_subscribe, make_update, verify_contract_exists, TestContext,
+    self, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
+    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists, TestContext,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
@@ -3436,5 +3436,438 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
          PUT correctly triggers UPDATE for subscribers"
     );
 
+    Ok(())
+}
+
+// ============ Delegate Contract Capability Tests ============
+
+/// Commands matching test-delegate-capabilities DelegateCommand enum.
+/// Must stay in sync with tests/test-delegate-capabilities/src/lib.rs.
+#[derive(Debug, Serialize, Deserialize)]
+enum DelegateCommand {
+    GetContractState {
+        contract_id: ContractInstanceId,
+    },
+    GetMultipleContractStates {
+        contract_ids: Vec<ContractInstanceId>,
+    },
+    GetContractWithEcho {
+        contract_id: ContractInstanceId,
+        echo_message: String,
+    },
+    PutContractState {
+        contract: ContractContainer,
+        state: Vec<u8>,
+    },
+    UpdateContractState {
+        contract_id: ContractInstanceId,
+        state: Vec<u8>,
+    },
+    SubscribeContract {
+        contract_id: ContractInstanceId,
+    },
+}
+
+/// Responses matching test-delegate-capabilities DelegateResponse enum.
+/// Must stay in sync with tests/test-delegate-capabilities/src/lib.rs.
+#[derive(Debug, Serialize, Deserialize)]
+enum DelegateCommandResponse {
+    ContractState {
+        contract_id: ContractInstanceId,
+        state: Option<Vec<u8>>,
+    },
+    MultipleContractStates {
+        results: Vec<(ContractInstanceId, Option<Vec<u8>>)>,
+    },
+    Echo {
+        message: String,
+    },
+    ContractPutResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    ContractUpdateResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    ContractSubscribeResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// E2E test: delegate issues PUT and UPDATE to a real contract via the WASM runtime.
+///
+/// This test verifies the full delegate→contract capability pipeline:
+/// 1. Register a real WASM delegate (test-delegate-capabilities)
+/// 2. The delegate issues a PutContractRequest for a real WASM contract (test-contract-integration)
+/// 3. The runtime processes the PUT via upsert_contract_state
+/// 4. A direct GET confirms the contract state was stored
+/// 5. The delegate issues an UpdateContractRequest with new state
+/// 6. A direct GET confirms the updated state
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    // Load WASM modules
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Connect to gateway WebSocket
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 1: Register the delegate
+    tracing::info!("Step 1: Registering delegate");
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on register");
+            tracing::info!("Delegate registered: {key}");
+        }
+        other => bail!("Unexpected register response: {:?}", other),
+    }
+
+    // Step 2: PUT contract via delegate
+    let initial_state = test_utils::create_empty_todo_list();
+    tracing::info!("Step 2: Delegate PUT contract (empty todo list)");
+
+    let app_id = ContractInstanceId::new([42u8; 32]);
+    let put_cmd = DelegateCommand::PutContractState {
+        contract: contract.clone(),
+        state: initial_state.clone(),
+    };
+    let put_payload = bincode::serialize(&put_cmd)?;
+    let app_msg = ApplicationMessage::new(app_id, put_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+            },
+        ))
+        .await?;
+
+    // Wait for delegate response (the response includes PutContractResponse routed back)
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on PUT response");
+            tracing::info!("Delegate PUT response: {} outbound messages", values.len());
+
+            // Find the ApplicationMessage containing ContractPutResult
+            let put_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("No ApplicationMessage in delegate PUT response"))?;
+
+            match put_result {
+                DelegateCommandResponse::ContractPutResult { success, error, .. } => {
+                    ensure!(
+                        success,
+                        "Delegate PUT failed: {}",
+                        error.unwrap_or_default()
+                    );
+                    tracing::info!("Delegate PUT succeeded");
+                }
+                other => bail!("Expected ContractPutResult, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate PUT response: {:?}", other),
+    }
+
+    // Step 3: Verify contract state via direct GET
+    tracing::info!("Step 3: Direct GET to verify PUT state");
+    make_get(&mut client, contract_key, true, false).await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse {
+            state, contract, ..
+        }) => {
+            ensure!(contract.is_some(), "GET should return contract code");
+            let stored: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+            ensure!(
+                stored.tasks.is_empty(),
+                "Initial state should be empty todo list, got {} tasks",
+                stored.tasks.len()
+            );
+            tracing::info!(
+                "GET confirmed: empty todo list stored (version {})",
+                stored.version
+            );
+        }
+        other => bail!("Unexpected GET response: {:?}", other),
+    }
+
+    // Step 4: UPDATE contract via delegate (add a task)
+    tracing::info!("Step 4: Delegate UPDATE contract (add a task)");
+    let updated_state = test_utils::create_todo_list_with_item("Delegate E2E test task");
+    let contract_instance_id = contract_key.id().clone();
+
+    let update_cmd = DelegateCommand::UpdateContractState {
+        contract_id: contract_instance_id,
+        state: updated_state.clone(),
+    };
+    let update_payload = bincode::serialize(&update_cmd)?;
+    let update_msg = ApplicationMessage::new(app_id, update_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(update_msg)],
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(
+                key == delegate_key,
+                "Delegate key mismatch on UPDATE response"
+            );
+            tracing::info!(
+                "Delegate UPDATE response: {} outbound messages",
+                values.len()
+            );
+
+            let update_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No ApplicationMessage in delegate UPDATE response")
+                })?;
+
+            match update_result {
+                DelegateCommandResponse::ContractUpdateResult { success, error, .. } => {
+                    ensure!(
+                        success,
+                        "Delegate UPDATE failed: {}",
+                        error.unwrap_or_default()
+                    );
+                    tracing::info!("Delegate UPDATE succeeded");
+                }
+                other => bail!("Expected ContractUpdateResult, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate UPDATE response: {:?}", other),
+    }
+
+    // Step 5: Verify updated state via direct GET
+    tracing::info!("Step 5: Direct GET to verify UPDATE state");
+    make_get(&mut client, contract_key, false, false).await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+            let stored: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+            ensure!(
+                stored.tasks.len() == 1,
+                "Updated state should have 1 task, got {}",
+                stored.tasks.len()
+            );
+            ensure!(
+                stored.tasks[0].title == "Delegate E2E test task",
+                "Task title mismatch: {}",
+                stored.tasks[0].title
+            );
+            tracing::info!(
+                "GET confirmed: 1 task stored (version {}), title: {}",
+                stored.version,
+                stored.tasks[0].title
+            );
+        }
+        other => bail!("Unexpected GET response after UPDATE: {:?}", other),
+    }
+
+    tracing::info!("Delegate contract PUT and UPDATE E2E test passed");
+    Ok(())
+}
+
+/// E2E test: delegate issues GET to retrieve a contract's state.
+///
+/// This test verifies:
+/// 1. PUT a contract directly via the client API
+/// 2. Register a delegate
+/// 3. The delegate issues a GetContractRequest
+/// 4. The runtime fetches the state and sends GetContractResponse back to the delegate
+/// 5. The delegate wraps the result as an ApplicationMessage
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 1: PUT contract directly so state exists in the store
+    let initial_state = test_utils::create_todo_list_with_item("Pre-existing task");
+    tracing::info!("Step 1: Direct PUT of contract with initial state");
+    make_put(
+        &mut client,
+        WrappedState::from(initial_state.clone()),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            ensure!(key == contract_key, "PUT key mismatch");
+            tracing::info!("Direct PUT succeeded");
+        }
+        other => bail!("Unexpected PUT response: {:?}", other),
+    }
+
+    // Step 2: Register delegate
+    tracing::info!("Step 2: Registering delegate");
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on register");
+            tracing::info!("Delegate registered");
+        }
+        other => bail!("Unexpected register response: {:?}", other),
+    }
+
+    // Step 3: GET contract via delegate
+    tracing::info!("Step 3: Delegate GET contract state");
+    let contract_instance_id = contract_key.id().clone();
+    let app_id = ContractInstanceId::new([42u8; 32]);
+
+    let get_cmd = DelegateCommand::GetContractState {
+        contract_id: contract_instance_id,
+    };
+    let get_payload = bincode::serialize(&get_cmd)?;
+    let get_msg = ApplicationMessage::new(app_id, get_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(get_msg)],
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on GET response");
+
+            let get_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("No ApplicationMessage in delegate GET response"))?;
+
+            match get_result {
+                DelegateCommandResponse::ContractState { state, .. } => {
+                    let state_bytes =
+                        state.ok_or_else(|| anyhow::anyhow!("GET returned None state"))?;
+                    let todo: test_utils::TodoList = serde_json::from_slice(&state_bytes)?;
+                    ensure!(
+                        todo.tasks.len() == 1,
+                        "Expected 1 task from GET, got {}",
+                        todo.tasks.len()
+                    );
+                    ensure!(
+                        todo.tasks[0].title == "Pre-existing task",
+                        "Task title mismatch: {}",
+                        todo.tasks[0].title
+                    );
+                    tracing::info!(
+                        "Delegate GET returned correct state: {} tasks, version {}",
+                        todo.tasks.len(),
+                        todo.version
+                    );
+                }
+                other => bail!("Expected ContractState, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate GET response: {:?}", other),
+    }
+
+    tracing::info!("Delegate contract GET E2E test passed");
     Ok(())
 }
