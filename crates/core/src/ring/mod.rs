@@ -1084,6 +1084,13 @@ impl Ring {
                 last_backoff_cleanup = Instant::now();
             }
 
+            // Clean up stale pending reservations to prevent permanent isolation
+            // when CONNECT operations fail to complete cleanly.
+            let stale_removed = self.connection_manager.cleanup_stale_reservations();
+            if stale_removed > 0 {
+                tracing::warn!(stale_removed, "Cleaned up stale pending reservations");
+            }
+
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
             // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
             let active_count = live_tx_tracker.active_connect_transaction_count();

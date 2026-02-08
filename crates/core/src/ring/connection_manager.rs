@@ -19,10 +19,17 @@ pub(crate) struct TransientEntry {
     pub location: Option<Location>,
 }
 
+/// Maximum time a pending reservation can remain before being considered stale.
+/// Reservations that exceed this TTL are cleaned up by `cleanup_stale_reservations`
+/// to prevent permanent node isolation when CONNECT operations fail to complete.
+const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     /// Pending connection reservations, keyed by socket address.
-    pending_reservations: Arc<RwLock<BTreeMap<SocketAddr, Location>>>,
+    /// Each entry records the advertised location and the time the reservation was created,
+    /// allowing stale entries to be expired via `PENDING_RESERVATION_TTL`.
+    pending_reservations: Arc<RwLock<BTreeMap<SocketAddr, (Location, Instant)>>>,
     /// Mapping from socket address to location for established connections.
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<SocketAddr, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
@@ -200,7 +207,7 @@ impl ConnectionManager {
 
         {
             let mut pending = self.pending_reservations.write();
-            pending.insert(addr, location);
+            pending.insert(addr, (location, Instant::now()));
         }
 
         let total_conn = match reserved_before
@@ -766,6 +773,28 @@ impl ConnectionManager {
     #[allow(dead_code)]
     pub(crate) fn get_reserved_connections(&self) -> usize {
         self.pending_reservations.read().len()
+    }
+
+    /// Remove pending reservations that have exceeded `PENDING_RESERVATION_TTL`.
+    /// Returns the number of stale entries removed.
+    pub(crate) fn cleanup_stale_reservations(&self) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending_reservations.write();
+        let before = pending.len();
+        pending.retain(|addr, (_loc, created)| {
+            let age = now.duration_since(*created);
+            if age > PENDING_RESERVATION_TTL {
+                tracing::warn!(
+                    addr = %addr,
+                    age_secs = age.as_secs(),
+                    "Removing stale pending reservation"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        before - pending.len()
     }
 
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
@@ -1635,5 +1664,42 @@ mod tests {
         let cm_no_addr = make_connection_manager(None, 5, 20, false);
         assert_eq!(cm_no_addr.get_own_addr(), None);
         assert!(cm_no_addr.peer_addr().is_err());
+    }
+
+    // ============ pending_reservations TTL tests ============
+
+    #[test]
+    fn test_stale_pending_reservations_are_cleaned_up() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        let addr1 = make_addr(8001);
+        let addr2 = make_addr(8002);
+        let loc1 = Location::new(0.1);
+        let loc2 = Location::new(0.2);
+
+        // Create reservations via should_accept
+        assert!(cm.should_accept(loc1, addr1));
+        assert!(cm.should_accept(loc2, addr2));
+        assert_eq!(cm.get_reserved_connections(), 2);
+
+        // Cleanup should remove nothing when entries are fresh
+        let removed = cm.cleanup_stale_reservations();
+        assert_eq!(removed, 0);
+        assert_eq!(cm.get_reserved_connections(), 2);
+
+        // Backdate one entry to simulate expiration
+        {
+            let mut pending = cm.pending_reservations.write();
+            if let Some(entry) = pending.get_mut(&addr1) {
+                entry.1 = Instant::now() - Duration::from_secs(120);
+            }
+        }
+
+        // Cleanup should remove only the stale entry
+        let removed = cm.cleanup_stale_reservations();
+        assert_eq!(removed, 1);
+        assert_eq!(cm.get_reserved_connections(), 1);
+        assert!(!cm.has_connection_or_pending(addr1));
+        assert!(cm.has_connection_or_pending(addr2));
     }
 }
