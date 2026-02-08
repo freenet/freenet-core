@@ -1091,6 +1091,9 @@ impl Ring {
                 tracing::warn!(stale_removed, "Cleaned up stale pending reservations");
             }
 
+            // Expire old NAT traversal failure entries
+            self.connection_manager.cleanup_stale_failed_addrs();
+
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
             // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
             let active_count = live_tx_tracker.active_connect_transaction_count();
@@ -1352,6 +1355,7 @@ impl Ring {
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
+        let failed_addrs = self.connection_manager.recently_failed_addrs();
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner.clone(),
             query_target.clone(),
@@ -1359,6 +1363,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
+            &failed_addrs,
         );
 
         // Emit telemetry for initial connect request sent

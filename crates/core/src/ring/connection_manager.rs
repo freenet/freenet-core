@@ -30,6 +30,11 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// use `usize::MAX` since they see far fewer concurrent connects.
 const MAX_CONCURRENT_GATEWAY_CONNECTS: usize = 8;
 
+/// How long a peer address stays in the recently-failed cache after a NAT traversal
+/// failure. During this window the address is added to the CONNECT bloom filter so
+/// routing nodes avoid selecting the peer as an acceptor.
+const FAILED_ADDR_TTL: Duration = Duration::from_secs(300);
+
 /// RAII guard that releases a connect admission slot when dropped.
 ///
 /// This ensures the slot is always released, even when `?` operators cause early returns
@@ -101,6 +106,9 @@ pub(crate) struct ConnectionManager {
     /// Maximum concurrent CONNECT operations this node will route.
     /// Gateways use a bounded value; non-gateways use usize::MAX (unlimited).
     max_concurrent_connects: usize,
+    /// Addresses that recently failed NAT traversal. Pre-populated into the
+    /// CONNECT `visited` bloom filter so routing nodes skip these peers.
+    recently_failed_addrs: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
 }
 
 impl ConnectionManager {
@@ -208,6 +216,7 @@ impl ConnectionManager {
             } else {
                 usize::MAX
             },
+            recently_failed_addrs: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -960,6 +969,39 @@ impl ConnectionManager {
             "num_connections called"
         );
         total
+    }
+
+    /// Record that a transport-level connection to `addr` failed, so future
+    /// CONNECT requests will mark it as visited in the bloom filter.
+    pub fn record_failed_addr(&self, addr: SocketAddr) {
+        self.recently_failed_addrs
+            .write()
+            .insert(addr, Instant::now());
+    }
+
+    /// Remove `addr` from the failed cache (e.g., after a successful connection).
+    pub fn clear_failed_addr(&self, addr: SocketAddr) {
+        self.recently_failed_addrs.write().remove(&addr);
+    }
+
+    /// Return addresses that failed NAT traversal within `FAILED_ADDR_TTL`.
+    pub fn recently_failed_addrs(&self) -> Vec<SocketAddr> {
+        let now = Instant::now();
+        self.recently_failed_addrs
+            .read()
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) < FAILED_ADDR_TTL)
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// Remove entries older than `FAILED_ADDR_TTL`.
+    pub fn cleanup_stale_failed_addrs(&self) -> usize {
+        let now = Instant::now();
+        let mut map = self.recently_failed_addrs.write();
+        let before = map.len();
+        map.retain(|_, ts| now.duration_since(*ts) < FAILED_ADDR_TTL);
+        before - map.len()
     }
 
     #[allow(dead_code)]

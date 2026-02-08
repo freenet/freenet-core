@@ -931,6 +931,7 @@ impl ConnectOp {
         ttl: u8,
         target_connections: usize,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
+        recently_failed_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
 
@@ -942,6 +943,17 @@ impl ConnectOp {
         }
         if let Some(target_addr) = target.socket_addr() {
             visited.mark_visited(target_addr);
+        }
+
+        // Mark peers that recently failed NAT traversal so routing nodes skip them.
+        for addr in recently_failed_addrs {
+            visited.mark_visited(*addr);
+        }
+        if !recently_failed_addrs.is_empty() {
+            tracing::info!(
+                failed_addrs = recently_failed_addrs.len(),
+                "connect: pre-populated visited filter with recently failed peer addresses"
+            );
         }
 
         // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
@@ -1712,6 +1724,7 @@ pub(crate) async fn join_ring_request(
         .min(u8::MAX as usize) as u8;
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
+    let failed_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -1719,6 +1732,7 @@ pub(crate) async fn join_ring_request(
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
+        &failed_addrs,
     );
 
     // Emit telemetry for initial connect request sent
@@ -2337,6 +2351,7 @@ mod tests {
             ttl,
             2,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
+            &[],
         );
 
         match msg {
@@ -2971,6 +2986,7 @@ mod tests {
             10,
             3,
             estimator,
+            &[],
         );
 
         // Extract the request from the message

@@ -2677,9 +2677,14 @@ impl P2pConnManager {
                     "Outbound connection established"
                 );
 
-                // Clear backoff on successful connection
+                // Clear backoff and failed-addr tracking on successful connection
                 if !peer_addr.ip().is_unspecified() {
                     state.peer_backoff.record_success(peer_addr);
+                    self.bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .clear_failed_addr(peer_addr);
                 }
 
                 // For outbound connections, respect the transient flag from the handshake.
@@ -2721,6 +2726,22 @@ impl P2pConnManager {
                     .ring
                     .connection_manager
                     .prune_in_transit_connection(peer_addr);
+
+                // Only record transport-level failures (NAT traversal, timeout, I/O)
+                // so future CONNECT requests avoid routing to this peer. Protocol
+                // errors or rejections don't indicate the peer is unreachable.
+                if matches!(
+                    error,
+                    ConnectionError::TransportError(_)
+                        | ConnectionError::Timeout
+                        | ConnectionError::IOError(_)
+                ) {
+                    self.bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .record_failed_addr(peer_addr);
+                }
 
                 // Record failure for exponential backoff to prevent rapid retries
                 if !peer_addr.ip().is_unspecified() {
