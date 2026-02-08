@@ -531,10 +531,22 @@ impl ConfigArgs {
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
             },
             ws_api: WebsocketApiConfig {
-                address: self.ws_api.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_listening_address(),
-                }),
+                address: {
+                    let addr = self.ws_api.address.unwrap_or_else(|| match mode {
+                        OperationMode::Local => default_local_address(),
+                        OperationMode::Network => default_listening_address(),
+                    });
+                    // In local mode, 0.0.0.0 is normalized to localhost
+                    match (mode, addr) {
+                        (OperationMode::Local, IpAddr::V4(ip)) if ip == Ipv4Addr::UNSPECIFIED => {
+                            default_local_address()
+                        }
+                        (OperationMode::Local, IpAddr::V6(ip)) if ip.is_unspecified() => {
+                            default_local_address()
+                        }
+                        _ => addr,
+                    }
+                },
                 port: self
                     .ws_api
                     .ws_api_port
