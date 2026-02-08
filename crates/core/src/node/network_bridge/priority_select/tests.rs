@@ -16,6 +16,17 @@ impl Stream for MockHandshakeStream {
     }
 }
 
+/// Mock HandshakeStream that immediately returns None (closed)
+struct ClosedHandshakeStream;
+
+impl Stream for ClosedHandshakeStream {
+    type Item = crate::node::network_bridge::handshake::Event;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(None)
+    }
+}
+
 /// Create a mock HandshakeStream for testing
 fn create_mock_handshake_stream() -> MockHandshakeStream {
     MockHandshakeStream
@@ -1845,4 +1856,62 @@ async fn test_waker_survives_multiple_pending_polls() {
     drop(op_tx);
     drop(bridge_tx);
     drop(node_tx);
+}
+
+/// Regression test for diagnostic report 9F733U: closed handshake stream caused
+/// infinite log spam (~3,600 WARN messages/second) because it was re-polled every cycle.
+/// Verifies that a closed handshake stream produces exactly one Handshake(None) and
+/// does not spin, allowing other channels to continue working.
+#[tokio::test]
+#[test_log::test]
+async fn test_closed_handshake_stream_no_spin() {
+    let (notif_tx, notif_rx) = mpsc::channel(10);
+    let (_op_tx, op_rx) = mpsc::channel(10);
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
+    let (_bridge_tx, bridge_rx) = mpsc::channel(10);
+    let (_node_tx, node_rx) = mpsc::channel(10);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        ClosedHandshakeStream,
+        node_rx,
+        MockClientStream,
+        MockExecutorStream,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    // First poll should yield exactly one Handshake(None) closure notification
+    let result = timeout(Duration::from_millis(100), stream.as_mut().next()).await;
+    assert!(
+        result.is_ok(),
+        "Should get closure notification immediately"
+    );
+    match result.unwrap() {
+        Some(SelectResult::Handshake(None)) => {}
+        other => panic!("Expected Handshake(None), got {:?}", other),
+    }
+
+    // Next poll should NOT yield another Handshake(None) — it should pend
+    // (all other channels are open but empty)
+    let result = timeout(Duration::from_millis(50), stream.as_mut().next()).await;
+    assert!(
+        result.is_err(),
+        "Should not get another event — stream should be pending, not spinning"
+    );
+
+    // Verify other channels still work after handshake closes
+    let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+        crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+    ));
+    notif_tx.send(Either::Left(test_msg)).await.unwrap();
+
+    let result = timeout(Duration::from_millis(100), stream.as_mut().next()).await;
+    assert!(result.is_ok(), "Notification should still arrive");
+    match result.unwrap() {
+        Some(SelectResult::Notification(Some(_))) => {}
+        other => panic!("Expected Notification(Some(_)), got {:?}", other),
+    }
 }
