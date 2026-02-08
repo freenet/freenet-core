@@ -160,6 +160,9 @@ impl Runtime {
             InboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
             InboundDelegateMsg::UserResponse(_) => "UserResponse",
             InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
+            InboundDelegateMsg::PutContractResponse(_) => "PutContractResponse",
+            InboundDelegateMsg::UpdateContractResponse(_) => "UpdateContractResponse",
+            InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
         };
         tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
@@ -194,6 +197,13 @@ impl Runtime {
                     OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
                     OutboundDelegateMsg::GetContractRequest(req) => {
                         format!("GetContractRequest(contract={})", req.contract_id)
+                    }
+                    OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest".to_string(),
+                    OutboundDelegateMsg::UpdateContractRequest(_) => {
+                        "UpdateContractRequest".to_string()
+                    }
+                    OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                        "SubscribeContractRequest".to_string()
                     }
                 })
                 .collect::<Vec<String>>()
@@ -230,6 +240,9 @@ impl Runtime {
                         OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
                         OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
                         OutboundDelegateMsg::GetContractRequest(r) => format!("GetContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::PutContractRequest(_) => "PutContractReq".to_string(),
+                        OutboundDelegateMsg::UpdateContractRequest(_) => "UpdateContractReq".to_string(),
+                        OutboundDelegateMsg::SubscribeContractRequest(_) => "SubscribeContractReq".to_string(),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -316,6 +329,16 @@ impl Runtime {
                     // Processed contract request - just update context
                     tracing::debug!("GetContractRequest processed");
                     *context = ctx.as_ref().to_vec();
+                }
+                msg @ (OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_)) => {
+                    tracing::debug!("Passing contract request to executor for async handling");
+                    results.push(msg);
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
                 }
             }
         }
@@ -416,6 +439,34 @@ impl DelegateRuntimeInterface for Runtime {
                         params,
                         attested,
                         &InboundDelegateMsg::GetContractResponse(response),
+                        context.clone(),
+                        &process_func,
+                        &running.instance,
+                        instance_id,
+                    )?;
+                    context = updated_context;
+
+                    let mut outbound_queue = VecDeque::from(outbound);
+                    self.process_outbound(
+                        delegate_key,
+                        &running.instance,
+                        instance_id,
+                        &process_func,
+                        params,
+                        attested,
+                        &mut outbound_queue,
+                        &mut context,
+                        &mut results,
+                    )?;
+                }
+                msg @ (InboundDelegateMsg::PutContractResponse(_)
+                | InboundDelegateMsg::UpdateContractResponse(_)
+                | InboundDelegateMsg::SubscribeContractResponse(_)) => {
+                    let (outbound, updated_context) = self.exec_inbound_with_env(
+                        delegate_key,
+                        params,
+                        attested,
+                        &msg,
                         context.clone(),
                         &process_func,
                         &running.instance,
