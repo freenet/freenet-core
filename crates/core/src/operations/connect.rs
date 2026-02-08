@@ -1175,27 +1175,32 @@ impl Operation for ConnectOp {
                         ))
                     })?;
 
-                    // Admission control: limit concurrent connects at gateways
-                    if !op_manager.ring.connection_manager.try_admit_connect() {
-                        tracing::info!(
-                            tx = %self.id,
-                            desired_location = %payload.desired_location,
-                            upstream = %upstream_addr,
-                            "connect: gateway overloaded, rejecting request"
-                        );
-                        let reject_msg = ConnectMsg::Rejected {
-                            id: self.id,
-                            desired_location: payload.desired_location,
-                        };
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                            )
-                            .await?;
-                        self.state = Some(ConnectState::Completed);
-                        return Ok(store_operation_state(&mut self));
-                    }
+                    // Admission control: limit concurrent connects at gateways.
+                    // The guard is RAII — the slot is released when _guard is dropped,
+                    // even on early returns from ? operators below.
+                    let _guard = match op_manager.ring.connection_manager.try_admit_connect() {
+                        Some(guard) => guard,
+                        None => {
+                            tracing::info!(
+                                tx = %self.id,
+                                desired_location = %payload.desired_location,
+                                upstream = %upstream_addr,
+                                "connect: gateway overloaded, rejecting request"
+                            );
+                            let reject_msg = ConnectMsg::Rejected {
+                                id: self.id,
+                                desired_location: payload.desired_location,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                                )
+                                .await?;
+                            self.state = Some(ConnectState::Completed);
+                            return Ok(store_operation_state(&mut self));
+                        }
+                    };
 
                     let actions =
                         self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
@@ -1323,7 +1328,7 @@ impl Operation for ConnectOp {
                                 NetMessage::V1(NetMessageV1::Connect(reject_msg)),
                             )
                             .await?;
-                        op_manager.ring.connection_manager.release_connect();
+                        // _guard is dropped here, releasing the admission slot
                         self.state = Some(ConnectState::Completed);
                         return Ok(store_operation_state(&mut self));
                     }
@@ -1352,11 +1357,11 @@ impl Operation for ConnectOp {
                                 NetMessage::V1(NetMessageV1::Connect(response_msg)),
                             )
                             .await?;
-                        op_manager.ring.connection_manager.release_connect();
+                        // _guard is dropped here, releasing the admission slot
                         return Ok(store_operation_state(&mut self));
                     }
 
-                    op_manager.ring.connection_manager.release_connect();
+                    // _guard is dropped here, releasing the admission slot
                     Ok(store_operation_state(&mut self))
                 }
                 ConnectMsg::Response { payload, .. } => {
