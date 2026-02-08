@@ -1983,7 +1983,6 @@ dependencies = [
  "libc",
  "lru",
  "notify",
- "once_cell",
  "opentelemetry 0.31.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",

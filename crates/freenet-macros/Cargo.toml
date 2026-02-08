@@ -10,10 +10,10 @@ license = "MIT OR Apache-2.0"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
-quote = "1.0"
-proc-macro2 = "1.0"
-darling = "0.23"  # For easier attribute parsing
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+darling = { workspace = true }  # For easier attribute parsing
 
 [dev-dependencies]
-trybuild = "1.0"  # For testing macro expansions
+trybuild = { workspace = true }  # For testing macro expansions
