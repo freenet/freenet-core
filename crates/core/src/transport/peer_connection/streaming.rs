@@ -317,9 +317,18 @@ impl StreamHandle {
                 if let Some(data) = self.buffer.assemble() {
                     return Ok(data);
                 }
-                return Err(StreamError::InvalidFragment {
-                    message: "assembly failed".into(),
-                });
+                // Don't fail immediately - the overflow fragment may not have arrived yet.
+                // When fragment #1 has reduced payload (metadata embedded), the sender uses
+                // one extra fragment that goes in the overflow slot. is_complete() fires when
+                // min_complete_fragments are contiguous, but actual data may be insufficient
+                // until the overflow fragment arrives. Continue waiting.
+                tracing::debug!(
+                    stream_id = %self.stream_id.0,
+                    total_bytes = self.total_bytes,
+                    received_fragments = self.buffer.inserted_count(),
+                    total_fragments = self.buffer.total_fragments(),
+                    "Stream marked complete but assembly insufficient, waiting for overflow fragment"
+                );
             }
 
             // Wait for notification using buffer's lock-free Event
@@ -1342,5 +1351,70 @@ mod tests {
 
         // All memory freed
         assert_eq!(handle.buffer.inserted_count(), 0);
+    }
+
+    /// Regression test for the overflow fragment race condition.
+    ///
+    /// When fragment #1 has reduced payload (metadata embedded), the sender uses
+    /// one extra "overflow" fragment. The buffer's is_complete() fires when
+    /// min_complete_fragments are contiguous, but the overflow may not have
+    /// arrived yet. Previously, assemble() returned an error immediately instead
+    /// of waiting for the overflow fragment, causing "assembly failed" errors
+    /// in production (blank pages in River web app).
+    #[tokio::test]
+    async fn test_assemble_waits_for_overflow_fragment() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        // Simulate a stream where fragment #1 has reduced payload (metadata embedded).
+        // Total data = 3 full fragments worth, but fragment #1 carries less data,
+        // so 4 fragments are needed (3 base + 1 overflow actually used).
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Simulate what happens when metadata is embedded in fragment #1:
+        // Fragment #1 carries less than FRAGMENT_PAYLOAD_SIZE bytes
+        let reduced_payload = FRAGMENT_PAYLOAD_SIZE / 2;
+        let frag1_data = Bytes::from(vec![1u8; reduced_payload]);
+
+        // Remaining data distributed across fragments 2, 3, and 4 (overflow)
+        let remaining = total as usize - reduced_payload;
+        let frag2_data = Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]);
+        let frag3_data = Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]);
+        let overflow_size = remaining - 2 * FRAGMENT_PAYLOAD_SIZE;
+        let frag4_data = Bytes::from(vec![4u8; overflow_size]);
+
+        // Push base fragments (1, 2, 3) - this triggers is_complete()
+        // since min_complete_fragments = 3
+        handle.push_fragment(1, frag1_data).unwrap();
+        handle.push_fragment(2, frag2_data).unwrap();
+        handle.push_fragment(3, frag3_data).unwrap();
+
+        // At this point, is_complete() returns true but assemble() would fail
+        // because we only have reduced_payload + 2*FPS < total bytes
+        assert!(handle.is_complete());
+        assert!(handle.try_assemble().is_none()); // Not enough data yet
+
+        // Start assemble in background - it should NOT fail, it should wait
+        let handle_clone = handle.clone();
+        let assemble_task = GlobalExecutor::spawn(async move { handle_clone.assemble().await });
+
+        // Give it time to discover is_complete() == true but assemble() == None
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Task should still be running (waiting for overflow), not failed
+        assert!(!assemble_task.is_finished());
+
+        // Now push the overflow fragment
+        handle.push_fragment(4, frag4_data).unwrap();
+
+        // Assemble should now complete successfully
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(200), assemble_task)
+            .await
+            .expect("timeout waiting for assemble")
+            .expect("join error");
+
+        assert!(result.is_ok(), "assemble should succeed: {:?}", result);
+        let data = result.unwrap();
+        assert_eq!(data.len(), total as usize);
     }
 }
