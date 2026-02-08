@@ -246,7 +246,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
     // Start regular nodes simultaneously — gateway admission control and explicit
     // rejection messages prevent the thundering herd problem (see #2887).
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for _i in 0..NUM_REGULAR_NODES {
+    for _ in 0..NUM_REGULAR_NODES {
         let config = node_configs.remove(0);
         let regular_node_future = async move {
             let config = config.build().await?;
