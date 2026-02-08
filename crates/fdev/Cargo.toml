@@ -15,7 +15,7 @@ pkg-fmt = "tgz"
 bin-dir = "fdev"
 
 [dependencies]
-bytesize = { workspace = true }
+bytesize = "2.3"
 anyhow = { workspace = true }
 axum = { workspace = true, default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"] }
 bincode = { workspace = true }
@@ -25,8 +25,8 @@ clap = { workspace = true, features = ["derive", "env"] }
 dashmap = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
-glob = { workspace = true }
-prettytable-rs = { workspace = true }
+glob = "0.3"
+prettytable-rs = "0.10"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

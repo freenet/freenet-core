@@ -31,7 +31,7 @@ bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
-cookie = { workspace = true }
+cookie = "0.18"
 crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
@@ -47,8 +47,7 @@ semver = { workspace = true }
 headers = { workspace = true }
 hex = { workspace = true }
 hickory-resolver = { workspace = true }
-hostname = { workspace = true }
-itertools = { workspace = true }
+hostname = "0.4"
 notify = { workspace = true }
 pav_regression = { workspace = true }
 parking_lot = { workspace = true }

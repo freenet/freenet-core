@@ -17,27 +17,19 @@ arrayvec = { version = "0.7", features = ["serde"] }
 bincode = "1"
 byteorder = "1"
 bytes = { version = "1", features = ["serde"] }
-bytesize = "2.3"
 delegate = "0.13"
 either = "1"
 event-listener = "5"
-glob = "0.3"
 hex = "0.4"
-hostname = "0.4"
-humantime = "2.2.0"
-humantime-serde = "1"
-itertools = "0.14"
 parking_lot = "0.12"
 pav_regression = "0.6.1"
 pin-project = "1"
-prettytable-rs = "0.10"
 thiserror = "2"
 ulid = { version = "1.1", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Async/networking
 axum = { version = "0.8", default-features = false }
-cookie = "0.18"
 futures = "0.3"
 headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }

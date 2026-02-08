@@ -21,7 +21,7 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-humantime = { workspace = true }
+humantime = "2.2.0"
 
 [dev-dependencies]
 freenet = { path = "../../../crates/core" }
