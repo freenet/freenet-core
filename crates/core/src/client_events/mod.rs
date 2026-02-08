@@ -1677,33 +1677,17 @@ async fn process_open_request(
                     "Received disconnect request from client, triggering subscription cleanup"
                 );
 
-                // Notify the node to clean up this client's subscriptions and trigger tree pruning.
-                // Use try_notify (non-blocking) to avoid blocking the client event loop if the
-                // notification channel is full. This is critical because blocking here would
-                // freeze all HTTP/WebSocket processing. See issue #2594.
-                if let Err(err) =
-                    op_manager.try_notify_node_event(NodeEvent::ClientDisconnected { client_id })
-                {
-                    // If notification fails, clean up local subscriptions directly.
-                    // This removes the client's subscription state to prevent memory leaks.
-                    // Note: upstream prune notifications won't be sent (requires the event loop),
-                    // but local state is cleaned up and upstream peers will eventually time out
-                    // their subscription entries or clean up on their own disconnect paths.
-                    let result = op_manager
-                        .ring
-                        .remove_client_from_all_subscriptions(client_id);
-
-                    // Clean up interest tracking for affected contracts
-                    for contract in &result.affected_contracts {
-                        op_manager.interest_manager.remove_local_client(contract);
-                    }
-
-                    tracing::warn!(
+                let result = op_manager
+                    .ring
+                    .remove_client_from_all_subscriptions(client_id);
+                for contract in &result.affected_contracts {
+                    op_manager.interest_manager.remove_local_client(contract);
+                }
+                if !result.affected_contracts.is_empty() {
+                    tracing::debug!(
                         %client_id,
                         subscriptions_cleaned = result.affected_contracts.len(),
-                        "Notification channel full/closed, cleaned up {} subscriptions locally (prune notifications skipped): {}",
-                        result.affected_contracts.len(),
-                        err
+                        "Cleaned up client subscriptions and interest tracking"
                     );
                 }
             }

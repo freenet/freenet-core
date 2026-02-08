@@ -1017,6 +1017,10 @@ impl P2pConnManager {
                                             )
                                             .await;
 
+                                        if let Some(ref pub_key) = pub_key_opt {
+                                            ctx.bridge.op_manager.on_ring_connection_lost(pub_key);
+                                        }
+
                                         // Remove from connection map
                                         tracing::trace!(
                                             peer_addr = %peer_addr,
@@ -1136,19 +1140,9 @@ impl P2pConnManager {
                                         )
                                         .await;
 
-                                    // Clean up proximity cache for disconnected peer
                                     ctx.bridge
                                         .op_manager
-                                        .proximity_cache
-                                        .on_peer_disconnected(peer.pub_key());
-
-                                    // Clean up interest tracking for disconnected peer
-                                    ctx.bridge
-                                        .op_manager
-                                        .interest_manager
-                                        .remove_all_peer_interests(&PeerKey::from(
-                                            peer.pub_key().clone(),
-                                        ));
+                                        .on_ring_connection_lost(peer.pub_key());
 
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
@@ -1682,82 +1676,13 @@ impl P2pConnManager {
                                 }
                             }
                             NodeEvent::BroadcastProximityCache { message } => {
-                                // Broadcast ProximityCache message to all connected peers
-                                tracing::debug!(
-                                    message = ?message,
-                                    peer_count = ctx.connections.len(),
-                                    phase = "broadcast",
-                                    "Broadcasting proximity cache to connected peers"
-                                );
-
-                                let msg = crate::message::NetMessage::V1(
-                                    crate::message::NetMessageV1::ProximityCache {
-                                        message: message.clone(),
-                                    },
-                                );
-
-                                for peer_addr in ctx.connections.keys() {
-                                    tracing::trace!(
-                                        peer_addr = %peer_addr,
-                                        phase = "broadcast",
-                                        "Sending proximity cache to peer"
-                                    );
-                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
-                                        tracing::warn!(
-                                            peer_addr = %peer_addr,
-                                            error = %e,
-                                            phase = "error",
-                                            "Failed to send proximity cache to peer"
-                                        );
-                                    }
-                                }
+                                ctx.handle_broadcast_proximity_cache(message).await;
                             }
                             NodeEvent::BroadcastChangeInterests { added, removed } => {
-                                // Broadcast ChangeInterests message to all connected peers
-                                tracing::debug!(
-                                    added_count = added.len(),
-                                    removed_count = removed.len(),
-                                    peer_count = ctx.connections.len(),
-                                    "Broadcasting ChangeInterests to connected peers"
-                                );
-
-                                let msg = crate::message::NetMessage::V1(
-                                    crate::message::NetMessageV1::InterestSync {
-                                        message: crate::message::InterestMessage::ChangeInterests {
-                                            added,
-                                            removed,
-                                        },
-                                    },
-                                );
-
-                                for peer_addr in ctx.connections.keys() {
-                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
-                                        tracing::warn!(
-                                            peer_addr = %peer_addr,
-                                            error = %e,
-                                            "Failed to send ChangeInterests to peer"
-                                        );
-                                    }
-                                }
+                                ctx.handle_broadcast_change_interests(added, removed).await;
                             }
                             NodeEvent::SendInterestMessage { target, message } => {
-                                // Send an interest message to a specific peer
-                                tracing::debug!(
-                                    target = %target,
-                                    "Sending interest message to peer"
-                                );
-
-                                let msg = crate::message::NetMessage::V1(
-                                    crate::message::NetMessageV1::InterestSync { message },
-                                );
-
-                                if let Err(e) = ctx.bridge.send(target, msg).await {
-                                    tracing::warn!(
-                                        peer_addr = %target,
-                                        error = %e,
-                                        "Failed to send interest message to peer"
-                                    );
-                                }
+                                ctx.handle_send_interest_message(target, message).await;
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
@@ -1768,308 +1693,9 @@ impl P2pConnManager {
                                 graceful_shutdown = true;
                                 break;
                             }
-                            NodeEvent::ClientDisconnected { client_id } => {
-                                tracing::debug!(%client_id, "Client disconnected");
-
-                                let result = op_manager
-                                    .ring
-                                    .remove_client_from_all_subscriptions(client_id);
-
-                                // Clean up interest tracking for affected contracts
-                                for contract in &result.affected_contracts {
-                                    op_manager.interest_manager.remove_local_client(contract);
-                                }
-
-                                // Note: In the simplified 2026-01 architecture, subscriptions are lease-based
-                                // and expire automatically, so we don't need to send explicit prune notifications.
-                            }
                             NodeEvent::BroadcastStateChange { key, new_state } => {
-                                // Automatic network peer notification when state changes.
-                                // Echo-back is prevented by summary comparison: we skip peers
-                                // whose cached summary matches ours (they already have our state).
-                                tracing::debug!(
-                                    contract = %key,
-                                    state_size = new_state.size(),
-                                    "BroadcastStateChange event received"
-                                );
-                                let self_addr = op_manager.ring.connection_manager.get_own_addr();
-                                let Some(self_addr) = self_addr else {
-                                    tracing::warn!(
-                                        contract = %key,
-                                        "Cannot broadcast state change - no own address"
-                                    );
-                                    continue;
-                                };
-
-                                let targets =
-                                    op_manager.get_broadcast_targets_update(&key, &self_addr);
-                                tracing::debug!(
-                                    contract = %key,
-                                    target_count = targets.len(),
-                                    self_addr = %self_addr,
-                                    "BroadcastStateChange: found targets"
-                                );
-
-                                if targets.is_empty() {
-                                    tracing::warn!(
-                                        contract = %key,
-                                        self_addr = %self_addr,
-                                        "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
-                                    );
-                                    continue;
-                                }
-
-                                // Get our summary once for all targets
-                                let our_summary = op_manager
-                                    .interest_manager
-                                    .get_contract_summary(&op_manager, &key)
+                                ctx.handle_broadcast_state_change(&op_manager, key, new_state)
                                     .await;
-
-                                let update_tx = crate::message::Transaction::new::<
-                                    crate::operations::update::UpdateMsg,
-                                >();
-
-                                tracing::debug!(
-                                    tx = %update_tx,
-                                    contract = %key,
-                                    target_count = targets.len(),
-                                    "Broadcasting state change to network peers"
-                                );
-
-                                for target in targets {
-                                    let Some(peer_addr) = target.socket_addr() else {
-                                        continue;
-                                    };
-
-                                    let peer_key =
-                                        crate::ring::PeerKey::from(target.pub_key().clone());
-
-                                    // Get peer's cached summary
-                                    let their_summary = op_manager
-                                        .interest_manager
-                                        .get_peer_summary(&key, &peer_key);
-
-                                    // Skip if summaries are equal (no change to send)
-                                    if let (Some(ours), Some(theirs)) =
-                                        (&our_summary, &their_summary)
-                                    {
-                                        if ours.as_ref() == theirs.as_ref() {
-                                            tracing::trace!(
-                                                contract = %key,
-                                                peer = %peer_addr,
-                                                "Skipping broadcast - peer already has our state"
-                                            );
-                                            continue;
-                                        }
-                                    }
-
-                                    // Compute delta if we have their summary (uses memoization cache)
-                                    // Track whether we successfully computed a delta vs sent full state
-                                    let (payload, sent_delta) = match (&our_summary, &their_summary)
-                                    {
-                                        (Some(ours), Some(theirs)) => {
-                                            match op_manager
-                                                .interest_manager
-                                                .compute_delta(
-                                                    &op_manager,
-                                                    &key,
-                                                    theirs,
-                                                    ours,
-                                                    new_state.size(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(None) => {
-                                                    // Empty delta — no change needed for this peer.
-                                                    // Update their cached summary so we don't
-                                                    // re-check this pair every broadcast cycle.
-                                                    op_manager
-                                                        .interest_manager
-                                                        .update_peer_summary(
-                                                            &key,
-                                                            &peer_key,
-                                                            Some(ours.clone()),
-                                                        );
-                                                    continue;
-                                                }
-                                                Ok(Some(delta)) => (
-                                                    crate::message::DeltaOrFullState::Delta(
-                                                        delta.as_ref().to_vec(),
-                                                    ),
-                                                    true,
-                                                ),
-                                                Err(err) => {
-                                                    tracing::debug!(
-                                                        contract = %key,
-                                                        error = %err,
-                                                        "Delta computation failed, falling back to full state"
-                                                    );
-                                                    (
-                                                        crate::message::DeltaOrFullState::FullState(
-                                                            new_state.as_ref().to_vec(),
-                                                        ),
-                                                        false,
-                                                    )
-                                                }
-                                            }
-                                        }
-                                        _ => (
-                                            crate::message::DeltaOrFullState::FullState(
-                                                new_state.as_ref().to_vec(),
-                                            ),
-                                            false,
-                                        ),
-                                    };
-
-                                    // Save payload size before moving it into the message
-                                    let payload_size = payload.size();
-
-                                    // Check if we should use streaming for full state broadcasts
-                                    let use_streaming = matches!(
-                                        &payload,
-                                        crate::message::DeltaOrFullState::FullState(_)
-                                    )
-                                        && crate::operations::should_use_streaming(
-                                            op_manager.streaming_enabled,
-                                            op_manager.streaming_threshold,
-                                            payload_size,
-                                        );
-
-                                    let send_result = if use_streaming {
-                                        let sender_summary_bytes = our_summary
-                                            .as_ref()
-                                            .map(|s| s.as_ref().to_vec())
-                                            .unwrap_or_default();
-                                        let state_bytes = match payload {
-                                            crate::message::DeltaOrFullState::FullState(data) => {
-                                                data
-                                            }
-                                            _ => unreachable!("checked above"),
-                                        };
-                                        let streaming_payload =
-                                            crate::operations::update::BroadcastStreamingPayload {
-                                                state_bytes,
-                                                sender_summary_bytes,
-                                            };
-                                        let payload_bytes = match bincode::serialize(
-                                            &streaming_payload,
-                                        ) {
-                                            Ok(b) => b,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    tx = %update_tx,
-                                                    error = %e,
-                                                    "Failed to serialize BroadcastStreamingPayload, skipping"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        let sid = StreamId::next_operations();
-                                        tracing::debug!(
-                                            tx = %update_tx,
-                                            contract = %key,
-                                            peer = %peer_addr,
-                                            stream_id = %sid,
-                                            payload_size,
-                                            "Using streaming for BroadcastTo"
-                                        );
-                                        let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
-                                            id: update_tx,
-                                            stream_id: sid,
-                                            key,
-                                            total_size: payload_bytes.len() as u64,
-                                        };
-                                        let net_msg: NetMessage = msg.into();
-                                        // Serialize metadata for embedding in fragment #1 (fix #2757)
-                                        let metadata = match bincode::serialize(&net_msg) {
-                                            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    ?peer_addr,
-                                                    error = %e,
-                                                    "Failed to serialize BroadcastTo metadata for embedding"
-                                                );
-                                                None
-                                            }
-                                        };
-                                        let send_res = ctx.bridge.send(peer_addr, net_msg).await;
-                                        if send_res.is_ok() {
-                                            // Send the stream data after the metadata message
-                                            if let Err(err) = ctx
-                                                .bridge
-                                                .send_stream(
-                                                    peer_addr,
-                                                    sid,
-                                                    bytes::Bytes::from(payload_bytes),
-                                                    metadata,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    tx = %update_tx,
-                                                    peer = %peer_addr,
-                                                    error = %err,
-                                                    "Failed to send broadcast stream data"
-                                                );
-                                            }
-                                        }
-                                        send_res
-                                    } else {
-                                        let msg =
-                                            crate::operations::update::UpdateMsg::BroadcastTo {
-                                                id: update_tx,
-                                                key,
-                                                payload,
-                                                // Include our summary so peer doesn't echo back
-                                                sender_summary_bytes: our_summary
-                                                    .as_ref()
-                                                    .map(|s| s.as_ref().to_vec())
-                                                    .unwrap_or_default(),
-                                            };
-                                        ctx.bridge.send(peer_addr, msg.into()).await
-                                    };
-
-                                    if let Err(err) = send_result {
-                                        tracing::warn!(
-                                            tx = %update_tx,
-                                            peer = %peer_addr,
-                                            error = %err,
-                                            "Failed to send state change broadcast"
-                                        );
-                                    } else {
-                                        // Track delta vs full state sends for testing (PR #2763)
-                                        if sent_delta {
-                                            op_manager
-                                                .interest_manager
-                                                .record_delta_send(new_state.size(), payload_size);
-                                            crate::config::GlobalTestMetrics::record_delta_send();
-                                        } else {
-                                            op_manager.interest_manager.record_full_state_send();
-                                            crate::config::GlobalTestMetrics::record_full_state_send();
-                                        }
-                                    }
-
-                                    // PR #2763 FIX: Only update cached summary when we sent a delta.
-                                    // Delta sends mean we had accurate knowledge of the peer's previous state,
-                                    // so after they apply our delta, they should have our current state.
-                                    //
-                                    // We do NOT update when sending full state because:
-                                    // 1. The peer's resulting state depends on CRDT merge with their existing state
-                                    // 2. We don't know what state they had, so we can't predict the merge result
-                                    //
-                                    // This prevents incorrect delta computation: if we send full state to a peer
-                                    // and incorrectly cache our summary as theirs, later deltas will compute
-                                    // from the wrong base state, causing version mismatches and ResyncRequests.
-                                    if sent_delta {
-                                        if let Some(summary) = &our_summary {
-                                            op_manager.interest_manager.update_peer_summary(
-                                                &key,
-                                                &peer_key,
-                                                Some(summary.clone()),
-                                            );
-                                        }
-                                    }
-                                }
                             }
                         },
                     }
@@ -2410,6 +2036,20 @@ impl P2pConnManager {
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
+
+                for (target, msg) in self
+                    .bridge
+                    .op_manager
+                    .on_ring_connection_established(peer_addr, peer.pub_key())
+                {
+                    if let Err(e) = self.bridge.send(target, msg).await {
+                        tracing::warn!(
+                            %peer_addr,
+                            error = %e,
+                            "Failed to send lifecycle message on transient promotion"
+                        );
+                    }
+                }
             }
 
             // Now that we know the peer's identity (from ConnectRequest), update the
@@ -3062,45 +2702,17 @@ impl P2pConnManager {
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
 
-                // Send Interests message to newly connected peer for delta-based sync
-                let interest_hashes = self
+                // Run lifecycle hooks for new ring connection (#2730)
+                for (target, msg) in self
                     .bridge
                     .op_manager
-                    .interest_manager
-                    .get_all_interest_hashes();
-                if !interest_hashes.is_empty() {
-                    let interests_msg = NetMessage::V1(NetMessageV1::InterestSync {
-                        message: crate::message::InterestMessage::Interests {
-                            hashes: interest_hashes,
-                        },
-                    });
-                    if let Err(e) = self.bridge.send(peer_addr, interests_msg).await {
-                        tracing::warn!(
-                            %peer_addr,
-                            error = %e,
-                            "Failed to send Interests message to new peer"
-                        );
-                    } else {
-                        tracing::debug!(
-                            %peer_addr,
-                            "Sent Interests message to new peer"
-                        );
-                    }
-                }
-
-                // Let proximity cache manager handle new ring connection
-                if let Some(cache_msg) = self
-                    .bridge
-                    .op_manager
-                    .proximity_cache
-                    .on_ring_connection_established(peer.pub_key())
+                    .on_ring_connection_established(peer_addr, peer.pub_key())
                 {
-                    let msg = NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg });
-                    if let Err(e) = self.bridge.send(peer_addr, msg).await {
+                    if let Err(e) = self.bridge.send(target, msg).await {
                         tracing::warn!(
                             %peer_addr,
                             error = %e,
-                            "Failed to send proximity cache message to new peer"
+                            "Failed to send lifecycle message to new peer"
                         );
                     }
                 }
@@ -3299,6 +2911,10 @@ impl P2pConnManager {
                             &self.gateways,
                         )
                         .await;
+
+                    self.bridge
+                        .op_manager
+                        .on_ring_connection_lost(peer.pub_key());
 
                     if let Err(error) = handshake_commands
                         .send(HandshakeCommand::DropConnection { peer: peer.clone() })
@@ -3527,6 +3143,327 @@ impl P2pConnManager {
         };
         state.pending_from_executor.insert(id);
         EventResult::Continue
+    }
+
+    /// Broadcast a ProximityCache message to all connected peers.
+    async fn handle_broadcast_proximity_cache(
+        &mut self,
+        message: crate::message::ProximityCacheMessage,
+    ) {
+        tracing::debug!(
+            message = ?message,
+            peer_count = self.connections.len(),
+            phase = "broadcast",
+            "Broadcasting proximity cache to connected peers"
+        );
+
+        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::ProximityCache {
+            message: message.clone(),
+        });
+
+        for peer_addr in self.connections.keys() {
+            tracing::trace!(
+                peer_addr = %peer_addr,
+                phase = "broadcast",
+                "Sending proximity cache to peer"
+            );
+            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
+                tracing::warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    phase = "error",
+                    "Failed to send proximity cache to peer"
+                );
+            }
+        }
+    }
+
+    /// Broadcast ChangeInterests message to all connected peers.
+    async fn handle_broadcast_change_interests(&mut self, added: Vec<u32>, removed: Vec<u32>) {
+        tracing::debug!(
+            added_count = added.len(),
+            removed_count = removed.len(),
+            peer_count = self.connections.len(),
+            "Broadcasting ChangeInterests to connected peers"
+        );
+
+        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync {
+            message: crate::message::InterestMessage::ChangeInterests { added, removed },
+        });
+
+        for peer_addr in self.connections.keys() {
+            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
+                tracing::warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    "Failed to send ChangeInterests to peer"
+                );
+            }
+        }
+    }
+
+    /// Send an interest message to a specific peer.
+    async fn handle_send_interest_message(
+        &mut self,
+        target: SocketAddr,
+        message: crate::message::InterestMessage,
+    ) {
+        tracing::debug!(
+            target = %target,
+            "Sending interest message to peer"
+        );
+
+        let msg =
+            crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync { message });
+
+        if let Err(e) = self.bridge.send(target, msg).await {
+            tracing::warn!(
+                peer_addr = %target,
+                error = %e,
+                "Failed to send interest message to peer"
+            );
+        }
+    }
+
+    /// Handle BroadcastStateChange: notify interested network peers about state changes.
+    ///
+    /// Echo-back is prevented by summary comparison: we skip peers whose cached
+    /// summary matches ours (they already have our state).
+    async fn handle_broadcast_state_change(
+        &mut self,
+        op_manager: &Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+    ) {
+        tracing::debug!(
+            contract = %key,
+            state_size = new_state.size(),
+            "BroadcastStateChange event received"
+        );
+        let self_addr = op_manager.ring.connection_manager.get_own_addr();
+        let Some(self_addr) = self_addr else {
+            tracing::warn!(
+                contract = %key,
+                "Cannot broadcast state change - no own address"
+            );
+            return;
+        };
+
+        let targets = op_manager.get_broadcast_targets_update(&key, &self_addr);
+        tracing::debug!(
+            contract = %key,
+            target_count = targets.len(),
+            self_addr = %self_addr,
+            "BroadcastStateChange: found targets"
+        );
+
+        if targets.is_empty() {
+            tracing::warn!(
+                contract = %key,
+                self_addr = %self_addr,
+                "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
+            );
+            return;
+        }
+
+        // Get our summary once for all targets
+        let our_summary = op_manager
+            .interest_manager
+            .get_contract_summary(op_manager, &key)
+            .await;
+
+        let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+
+        tracing::debug!(
+            tx = %update_tx,
+            contract = %key,
+            target_count = targets.len(),
+            "Broadcasting state change to network peers"
+        );
+
+        for target in targets {
+            let Some(peer_addr) = target.socket_addr() else {
+                continue;
+            };
+
+            let peer_key = PeerKey::from(target.pub_key().clone());
+
+            // Get peer's cached summary
+            let their_summary = op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key);
+
+            // Skip if summaries are equal (no change to send)
+            if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
+                if ours.as_ref() == theirs.as_ref() {
+                    tracing::trace!(
+                        contract = %key,
+                        peer = %peer_addr,
+                        "Skipping broadcast - peer already has our state"
+                    );
+                    continue;
+                }
+            }
+
+            // Compute delta if we have their summary (uses memoization cache)
+            // Track whether we successfully computed a delta vs sent full state
+            let (payload, sent_delta) = match (&our_summary, &their_summary) {
+                (Some(ours), Some(theirs)) => {
+                    match op_manager
+                        .interest_manager
+                        .compute_delta(op_manager, &key, theirs, ours, new_state.size())
+                        .await
+                    {
+                        Ok(delta) => (
+                            crate::message::DeltaOrFullState::Delta(delta.as_ref().to_vec()),
+                            true,
+                        ),
+                        Err(err) => {
+                            tracing::debug!(
+                                contract = %key,
+                                error = %err,
+                                "Delta computation failed, falling back to full state"
+                            );
+                            (
+                                crate::message::DeltaOrFullState::FullState(
+                                    new_state.as_ref().to_vec(),
+                                ),
+                                false,
+                            )
+                        }
+                    }
+                }
+                _ => (
+                    crate::message::DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                    false,
+                ),
+            };
+
+            // Save payload size before moving it into the message
+            let payload_size = payload.size();
+
+            // Check if we should use streaming for full state broadcasts
+            let use_streaming = matches!(&payload, crate::message::DeltaOrFullState::FullState(_))
+                && crate::operations::should_use_streaming(
+                    op_manager.streaming_enabled,
+                    op_manager.streaming_threshold,
+                    payload_size,
+                );
+
+            let send_result = if use_streaming {
+                let sender_summary_bytes = our_summary
+                    .as_ref()
+                    .map(|s| s.as_ref().to_vec())
+                    .unwrap_or_default();
+                let state_bytes = match payload {
+                    crate::message::DeltaOrFullState::FullState(data) => data,
+                    _ => unreachable!("checked above"),
+                };
+                let streaming_payload = crate::operations::update::BroadcastStreamingPayload {
+                    state_bytes,
+                    sender_summary_bytes,
+                };
+                let payload_bytes = match bincode::serialize(&streaming_payload) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            tx = %update_tx,
+                            error = %e,
+                            "Failed to serialize BroadcastStreamingPayload, skipping"
+                        );
+                        continue;
+                    }
+                };
+                let sid = StreamId::next_operations();
+                tracing::debug!(
+                    tx = %update_tx,
+                    contract = %key,
+                    peer = %peer_addr,
+                    stream_id = %sid,
+                    payload_size,
+                    "Using streaming for BroadcastTo"
+                );
+                let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
+                    id: update_tx,
+                    stream_id: sid,
+                    key,
+                    total_size: payload_bytes.len() as u64,
+                };
+                let net_msg: NetMessage = msg.into();
+                // Serialize metadata for embedding in fragment #1 (fix #2757)
+                let metadata = match bincode::serialize(&net_msg) {
+                    Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                    Err(e) => {
+                        tracing::warn!(
+                            ?peer_addr,
+                            error = %e,
+                            "Failed to serialize BroadcastTo metadata for embedding"
+                        );
+                        None
+                    }
+                };
+                let send_res = self.bridge.send(peer_addr, net_msg).await;
+                if send_res.is_ok() {
+                    // Send the stream data after the metadata message
+                    if let Err(err) = self
+                        .bridge
+                        .send_stream(peer_addr, sid, bytes::Bytes::from(payload_bytes), metadata)
+                        .await
+                    {
+                        tracing::warn!(
+                            tx = %update_tx,
+                            peer = %peer_addr,
+                            error = %err,
+                            "Failed to send broadcast stream data"
+                        );
+                    }
+                }
+                send_res
+            } else {
+                let msg = crate::operations::update::UpdateMsg::BroadcastTo {
+                    id: update_tx,
+                    key,
+                    payload,
+                    // Include our summary so peer doesn't echo back
+                    sender_summary_bytes: our_summary
+                        .as_ref()
+                        .map(|s| s.as_ref().to_vec())
+                        .unwrap_or_default(),
+                };
+                self.bridge.send(peer_addr, msg.into()).await
+            };
+
+            if let Err(err) = send_result {
+                tracing::warn!(
+                    tx = %update_tx,
+                    peer = %peer_addr,
+                    error = %err,
+                    "Failed to send state change broadcast"
+                );
+            } else {
+                // Track delta vs full state sends for testing (PR #2763)
+                if sent_delta {
+                    op_manager
+                        .interest_manager
+                        .record_delta_send(new_state.size(), payload_size);
+                    crate::config::GlobalTestMetrics::record_delta_send();
+                } else {
+                    op_manager.interest_manager.record_full_state_send();
+                    crate::config::GlobalTestMetrics::record_full_state_send();
+                }
+            }
+
+            // PR #2763 FIX: Only update cached summary when we sent a delta.
+            if sent_delta {
+                if let Some(summary) = &our_summary {
+                    op_manager.interest_manager.update_peer_summary(
+                        &key,
+                        &peer_key,
+                        Some(summary.clone()),
+                    );
+                }
+            }
+        }
     }
 }
 

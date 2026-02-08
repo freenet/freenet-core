@@ -641,10 +641,6 @@ pub(crate) enum NodeEvent {
         target: SocketAddr,
         message: InterestMessage,
     },
-    /// A WebSocket client disconnected - clean up its subscriptions and trigger tree pruning.
-    ClientDisconnected {
-        client_id: ClientId,
-    },
     /// Broadcast state change to interested network peers.
     /// Emitted by executor when local state changes.
     /// Handled by p2p_protoc which has access to OpManager and network.
@@ -745,9 +741,6 @@ impl Display for NodeEvent {
             }
             NodeEvent::SendInterestMessage { target, message } => {
                 write!(f, "SendInterestMessage (to: {target}, msg: {message:?})")
-            }
-            NodeEvent::ClientDisconnected { client_id } => {
-                write!(f, "ClientDisconnected (client: {client_id})")
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")
