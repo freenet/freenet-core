@@ -4,21 +4,27 @@ use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::{BoxedClient, ClientError, ClientId, HostResult, OpenRequest};
 use crate::config::GlobalExecutor;
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-type ClientEventsFut =
-    BoxFuture<'static, (usize, Receiver<HostIncomingMsg>, Option<HostIncomingMsg>)>;
+type ClientEventsFut = BoxFuture<
+    'static,
+    (
+        usize,
+        UnboundedReceiver<HostIncomingMsg>,
+        Option<HostIncomingMsg>,
+    ),
+>;
 
 /// This type allows combining different sources of events into one and interoperation between them.
 pub struct ClientEventsCombinator<const N: usize> {
     pending_futs: FuturesUnordered<ClientEventsFut>,
     /// receiving end of the different client applications from the node
-    clients: [Sender<(ClientId, HostResult)>; N],
+    clients: [UnboundedSender<(ClientId, HostResult)>; N],
     /// a map of the individual protocols, external, sending client events ids to an internal list of ids
     external_clients: [HashMap<ClientId, ClientId>; N],
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
@@ -30,8 +36,8 @@ impl<const N: usize> ClientEventsCombinator<N> {
     pub fn new(clients: [BoxedClient; N]) -> Self {
         let pending_futs = FuturesUnordered::new();
         let channels = clients.map(|client| {
-            let (tx, rx) = channel(1);
-            let (tx_host, rx_host) = channel(1);
+            let (tx, rx) = unbounded_channel();
+            let (tx_host, rx_host) = unbounded_channel();
             GlobalExecutor::spawn(client_fn(client, rx, tx_host));
             (tx, rx_host)
         });
@@ -131,7 +137,6 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                 .ok_or(ErrorKind::UnknownClient(internal.0))?;
             self.clients[*idx]
                 .send((*external, response))
-                .await
                 .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
             Ok(())
         }
@@ -147,8 +152,8 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
 /// and if multiple are ready, the first one wins.
 async fn client_fn(
     mut client: BoxedClient,
-    mut rx: Receiver<(ClientId, HostResult)>,
-    tx_host: Sender<Result<OpenRequest<'static>, ClientError>>,
+    mut rx: UnboundedReceiver<(ClientId, HostResult)>,
+    tx_host: UnboundedSender<Result<OpenRequest<'static>, ClientError>>,
 ) {
     loop {
         tokio::select! {
@@ -193,7 +198,6 @@ async fn client_fn(
                                 token,
                                 attested_contract,
                             }))
-                            .await
                             .is_err()
                         {
                             break;
@@ -201,7 +205,7 @@ async fn client_fn(
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
                         tracing::debug!("disconnected client");
-                        let _ = tx_host.send(Err(err)).await;
+                        let _ = tx_host.send(Err(err));
                         break;
                     }
                     Err(err) => {
@@ -218,6 +222,7 @@ async fn client_fn(
 mod test {
     use freenet_stdlib::client_api::ClientRequest;
     use futures::try_join;
+    use tokio::sync::mpsc::{channel, Receiver, Sender};
 
     use super::*;
     use crate::client_events::ClientEventsProxy;
@@ -287,7 +292,7 @@ mod test {
         let mut combinator = ClientEventsCombinator::new(proxies);
 
         let sending = async {
-            for _ in 1..4 {
+            for _ in 0..3 {
                 for (id, tx) in senders.iter_mut().enumerate() {
                     tx.send(id).await?;
                 }
@@ -295,24 +300,18 @@ mod test {
             Ok::<_, Box<dyn std::error::Error>>(senders)
         };
 
-        let combinator = async {
-            let client_ids = combinator
-                .internal_clients
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for _ in 0..3 {
-                for id in client_ids.iter() {
-                    let OpenRequest {
-                        client_id: req_id, ..
-                    } = combinator.recv().await?;
-                    assert_eq!(*id, req_id);
-                }
+        let receiving = async {
+            // Receive 3 rounds of 3 requests each (one per proxy).
+            for _ in 0..9 {
+                combinator.recv().await?;
             }
+            // SampleProxy::recv() creates a new external ClientId each call,
+            // so 9 requests produce 9 distinct internal client mappings.
+            assert_eq!(combinator.internal_clients.len(), 9);
             Ok::<_, Box<dyn std::error::Error>>(())
         };
 
-        try_join!(sending, combinator).unwrap();
+        try_join!(sending, receiving).unwrap();
     }
 
     #[tokio::test]
@@ -358,5 +357,69 @@ mod test {
         };
 
         try_join!(sending, receiving).unwrap();
+    }
+
+    /// Regression test: concurrent bidirectional traffic must not deadlock.
+    ///
+    /// With `channel(1)` this would deadlock when `client_fn` blocks on
+    /// sending a request while the combinator blocks on sending a response.
+    #[tokio::test]
+    async fn test_bidirectional_no_deadlock() {
+        let (proxies, mut senders, mut receivers) = setup_proxies();
+        let mut combinator = ClientEventsCombinator::new(proxies);
+
+        // Populate internal_clients mapping.
+        for (idx, sender) in senders.iter_mut().enumerate() {
+            sender.send(idx).await.unwrap();
+            combinator.recv().await.unwrap();
+        }
+        let client_ids: Vec<_> = combinator.internal_clients.keys().cloned().collect();
+
+        let rounds = 20;
+
+        // Client side: send requests and drain responses concurrently.
+        let client_side = async {
+            let send_requests = async {
+                for _ in 0..rounds {
+                    for (id, tx) in senders.iter_mut().enumerate() {
+                        tx.send(id).await.unwrap();
+                    }
+                }
+            };
+            let drain_responses = async {
+                for _ in 0..rounds {
+                    for receiver in receivers.iter_mut() {
+                        receiver.recv().await.unwrap();
+                    }
+                }
+            };
+            futures::future::join(send_requests, drain_responses).await;
+        };
+
+        // Host side: interleave send and recv on the combinator since both
+        // require &mut self (can't split into concurrent futures).
+        let host_side = async {
+            for _ in 0..rounds {
+                // Send a response to each client.
+                for cli_id in &client_ids {
+                    combinator
+                        .send(*cli_id, Ok(HostResponse::Ok))
+                        .await
+                        .unwrap();
+                }
+                // Drain one request per client.
+                for _ in 0..3 {
+                    combinator.recv().await.unwrap();
+                }
+            }
+        };
+
+        // With channel(1) this would deadlock; with unbounded it completes.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(client_side, host_side),
+        )
+        .await
+        .expect("bidirectional traffic deadlocked");
     }
 }
