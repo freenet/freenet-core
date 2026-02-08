@@ -313,6 +313,12 @@ async fn report_op_init_error(
             "Failed to send {op_name} error to result router"
         );
     }
+
+    // Clean up request router so subsequent requests for the same resource
+    // create a fresh operation instead of reusing this failed transaction.
+    // Without this, the resource→transaction mapping persists and new clients
+    // get stale cached errors indefinitely (see diagnostic report 8TSMXY).
+    op_manager.completed(tx);
 }
 
 /// Process client events.
