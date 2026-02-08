@@ -15,18 +15,16 @@ use super::{
     app_packaging::{WebApp, WebContractError},
     errors::WebSocketApiError,
     http_gateway::HttpGatewayRequest,
-    ClientConnection, HostCallbackResult,
+    ApiVersion, ClientConnection, HostCallbackResult,
 };
 use tracing::{debug, instrument};
-
-mod v1;
 
 #[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
     request_sender: HttpGatewayRequest,
     assigned_token: AuthToken,
-    version_prefix: &str,
+    api_version: ApiVersion,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "contract_home: Converting string key to ContractInstanceId: {}",
@@ -139,7 +137,7 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                match get_web_body(&path, &assigned_token, &key, version_prefix).await {
+                match get_web_body(&path, &assigned_token, &key, api_version).await {
                     Ok(b) => b.into_response(),
                     Err(err) => {
                         tracing::error!("Failed to read webapp after unpacking: {err}");
@@ -192,7 +190,7 @@ pub(super) async fn contract_home(
 pub(super) async fn variable_content(
     key: String,
     req_path: String,
-    version_prefix: &str,
+    api_version: ApiVersion,
 ) -> Result<impl IntoResponse, Box<WebSocketApiError>> {
     debug!(
         "variable_content: Processing request for key: {}, path: {}",
@@ -215,7 +213,7 @@ pub(super) async fn variable_content(
             })?;
     debug!("variable_content: Parsed request URI: {:?}", req_uri);
 
-    let relative_path = v1::get_file_path(req_uri)?;
+    let relative_path = get_file_path(req_uri)?;
     debug!(
         "variable_content: Extracted relative path: {}",
         relative_path
@@ -237,7 +235,7 @@ pub(super) async fn variable_content(
                 error_cause: format!("{err}"),
             }
         })?;
-        let prefix = format!("/{version_prefix}/contract/web/{key}/");
+        let prefix = format!("/{}/contract/web/{key}/", api_version.prefix());
         let rewritten = content
             .replace("\"/./", &format!("\"{prefix}"))
             .replace("'/./", &format!("'{prefix}"));
@@ -268,7 +266,7 @@ async fn get_web_body(
     path: &Path,
     auth_token: &AuthToken,
     contract_key: &str,
-    version_prefix: &str,
+    api_version: ApiVersion,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "get_web_body: Attempting to read index.html from path: {:?}",
@@ -296,6 +294,7 @@ async fn get_web_body(
     // Dioxus generates paths like /./assets/app.js which browsers normalize to /assets/app.js
     // (root-relative). These bypass the /v1/contract/web/{key}/ prefix and 404.
     // Safety: contract_key is a base58-encoded contract ID (alphanumeric only).
+    let version_prefix = api_version.prefix();
     let prefix = format!("/{version_prefix}/contract/web/{contract_key}/");
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
@@ -318,6 +317,38 @@ async fn get_web_body(
     }
 
     Ok(Html(body))
+}
+
+/// Extracts the relative file path from a contract web URI.
+///
+/// Strips the version and contract key prefix (e.g. `/v1/contract/web/{key}/`)
+/// and returns the remaining path (e.g. `assets/app.js`).
+fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>> {
+    let path_str = uri.path();
+
+    let remainder = if let Some(rem) = path_str.strip_prefix("/v1/contract/web/") {
+        rem
+    } else if let Some(rem) = path_str.strip_prefix("/v1/contract/") {
+        rem
+    } else if let Some(rem) = path_str.strip_prefix("/v2/contract/web/") {
+        rem
+    } else if let Some(rem) = path_str.strip_prefix("/v2/contract/") {
+        rem
+    } else {
+        return Err(Box::new(WebSocketApiError::InvalidParam {
+            error_cause: format!(
+                "URI path '{path_str}' does not start with /v1/contract/ or /v2/contract/"
+            ),
+        }));
+    };
+
+    // remainder contains "{key}/{path}" or just "{key}"
+    let file_path = match remainder.split_once('/') {
+        Some((_key, path)) => path.to_string(),
+        None => "".to_string(),
+    };
+
+    Ok(file_path)
 }
 
 /// Returns the base directory for webapp cache.
@@ -365,7 +396,9 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+            .await
+            .unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await
@@ -398,6 +431,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_relative_asset_paths_rewritten_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+        let html = r#"<head><link href="/./assets/app.js"></head><body></body>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let token = AuthToken::generate();
+        let response = get_web_body(dir.path(), &token, key, ApiVersion::V2)
+            .await
+            .unwrap();
+        let body = response.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let expected = format!("href=\"/v2/contract/web/{key}/assets/app.js\"");
+        assert!(
+            result.contains(&expected),
+            "V2 href not rewritten.\nGot: {result}"
+        );
+        assert!(
+            !result.contains("\"/./assets/"),
+            "original /./assets/ paths still present in V2"
+        );
+    }
+
+    #[tokio::test]
     async fn single_quoted_paths_also_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let key = "testkey123";
@@ -405,7 +466,9 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+            .await
+            .unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await
@@ -429,7 +492,9 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, "v1").await.unwrap();
+        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+            .await
+            .unwrap();
         let body = response.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
             .await
@@ -441,5 +506,56 @@ mod tests {
             result.contains("\"/assets/app.css\""),
             "path without /. was incorrectly rewritten.\nGot: {result}"
         );
+    }
+
+    #[test]
+    fn get_path_v1() {
+        let req_path = "/v1/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html";
+        let base_dir = PathBuf::from(
+            "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/",
+        );
+        let uri: axum::http::Uri = req_path.parse().unwrap();
+        let parsed = get_file_path(uri).unwrap();
+        let result = base_dir.join(parsed);
+        assert_eq!(
+            PathBuf::from(
+                "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html"
+            ),
+            result
+        );
+    }
+
+    #[test]
+    fn get_path_v2() {
+        let req_path = "/v2/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html";
+        let base_dir = PathBuf::from(
+            "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/",
+        );
+        let uri: axum::http::Uri = req_path.parse().unwrap();
+        let parsed = get_file_path(uri).unwrap();
+        let result = base_dir.join(parsed);
+        assert_eq!(
+            PathBuf::from(
+                "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html"
+            ),
+            result
+        );
+    }
+
+    #[test]
+    fn get_path_v2_web() {
+        let req_path =
+            "/v2/contract/web/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/assets/app.js";
+        let uri: axum::http::Uri = req_path.parse().unwrap();
+        let parsed = get_file_path(uri).unwrap();
+        assert_eq!(parsed, "assets/app.js");
+    }
+
+    #[test]
+    fn get_file_path_rejects_unknown_version() {
+        let req_path = "/v3/contract/web/somekey/assets/app.js";
+        let uri: axum::http::Uri = req_path.parse().unwrap();
+        let result = get_file_path(uri);
+        assert!(result.is_err(), "expected error for /v3/ prefix");
     }
 }

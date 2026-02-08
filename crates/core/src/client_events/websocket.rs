@@ -114,12 +114,22 @@ impl WebSocketProxy {
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
-        // Using Extension instead of with_state to avoid changing the Router's type parameter
+        let ws_request = WebSocketRequest(proxy_request_sender);
+
+        // Each version route gets its own Extension<ApiVersion> via a nested router,
+        // eliminating the need for per-version wrapper functions.
+        let v1_route = Router::new()
+            .route("/v1/contract/command", get(websocket_commands))
+            .layer(Extension(ApiVersion::V1));
+        let v2_route = Router::new()
+            .route("/v2/contract/command", get(websocket_commands))
+            .layer(Extension(ApiVersion::V2));
+
         let router = server_routing
-            .route("/v1/contract/command", get(websocket_commands_v1))
-            .route("/v2/contract/command", get(websocket_commands_v2))
+            .merge(v1_route)
+            .merge(v2_route)
             .layer(Extension(attested_contracts))
-            .layer(Extension(WebSocketRequest(proxy_request_sender)))
+            .layer(Extension(ws_request))
             .layer(axum::middleware::from_fn(connection_info));
 
         (
@@ -341,49 +351,13 @@ async fn connection_info(
     next.run(req).await
 }
 
-async fn websocket_commands_v1(
-    ws: WebSocketUpgrade,
-    auth_token: Extension<Option<AuthToken>>,
-    encoding_protoc: Extension<EncodingProtocol>,
-    rs: Extension<WebSocketRequest>,
-    attested_contracts: Extension<AttestedContractMap>,
-) -> Response {
-    websocket_commands(
-        ws,
-        auth_token,
-        encoding_protoc,
-        rs,
-        attested_contracts,
-        ApiVersion::V1,
-    )
-    .await
-}
-
-async fn websocket_commands_v2(
-    ws: WebSocketUpgrade,
-    auth_token: Extension<Option<AuthToken>>,
-    encoding_protoc: Extension<EncodingProtocol>,
-    rs: Extension<WebSocketRequest>,
-    attested_contracts: Extension<AttestedContractMap>,
-) -> Response {
-    websocket_commands(
-        ws,
-        auth_token,
-        encoding_protoc,
-        rs,
-        attested_contracts,
-        ApiVersion::V2,
-    )
-    .await
-}
-
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<AttestedContractMap>,
-    api_version: ApiVersion,
+    Extension(api_version): Extension<ApiVersion>,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
