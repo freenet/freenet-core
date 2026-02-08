@@ -243,14 +243,12 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Start regular nodes with staggered startup to avoid overwhelming the
-    // gateway with simultaneous CONNECT handshakes (causes timeouts on CI).
+    // Start regular nodes simultaneously — gateway admission control and explicit
+    // rejection messages prevent the thundering herd problem (see #2887).
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for i in 0..NUM_REGULAR_NODES {
+    for _i in 0..NUM_REGULAR_NODES {
         let config = node_configs.remove(0);
         let regular_node_future = async move {
-            // Stagger node startup by 500ms each to prevent thundering herd
-            tokio::time::sleep(Duration::from_millis(i as u64 * 500)).await;
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
             let gateway_service = serve_gateway(config.ws_api).await?;

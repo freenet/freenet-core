@@ -109,7 +109,7 @@ use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
+use crate::ring::{ConnectionFailureReason, KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
@@ -144,6 +144,12 @@ pub(crate) enum ConnectMsg {
         id: Transaction,
         address: SocketAddr,
     },
+    /// Explicit rejection sent back when a relay at terminus can't accept and has
+    /// no routing options. Travels hop-by-hop back to the joiner like Response.
+    Rejected {
+        id: Transaction,
+        desired_location: Location,
+    },
 }
 
 impl InnerMessage for ConnectMsg {
@@ -151,13 +157,17 @@ impl InnerMessage for ConnectMsg {
         match self {
             ConnectMsg::Request { id, .. }
             | ConnectMsg::Response { id, .. }
-            | ConnectMsg::ObservedAddress { id, .. } => id,
+            | ConnectMsg::ObservedAddress { id, .. }
+            | ConnectMsg::Rejected { id, .. } => id,
         }
     }
 
     fn requested_location(&self) -> Option<Location> {
         match self {
             ConnectMsg::Request { payload, .. } => Some(payload.desired_location),
+            ConnectMsg::Rejected {
+                desired_location, ..
+            } => Some(*desired_location),
             _ => None,
         }
     }
@@ -176,6 +186,11 @@ impl fmt::Display for ConnectMsg {
             }
             ConnectMsg::ObservedAddress { address, .. } => {
                 write!(f, "ObservedAddress {{ address: {address} }}")
+            }
+            ConnectMsg::Rejected {
+                desired_location, ..
+            } => {
+                write!(f, "Rejected {{ desired: {desired_location} }}")
             }
         }
     }
@@ -278,6 +293,9 @@ pub(crate) struct RelayActions {
     pub expect_connection_from: Option<PeerKeyLocation>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
+    /// True when at terminus, cannot accept, and has no routing options.
+    /// Signals that an explicit Rejected message should be sent back.
+    pub rejected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -537,16 +555,18 @@ impl RelayState {
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         visited = ?self.request.visited,
-                        "connect: at terminus, cannot accept, no uphill peers available"
+                        "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
+                    actions.rejected = true;
                 }
             } else {
                 tracing::info!(
                     target = %self.request.desired_location,
                     ttl = self.request.ttl,
                     visited = ?self.request.visited,
-                    "connect: at terminus, cannot accept, TTL exhausted"
+                    "connect: at terminus, cannot accept, TTL exhausted — rejecting"
                 );
+                actions.rejected = true;
             }
         } else if is_terminus && self.forwarded_to.is_some() {
             tracing::debug!(
@@ -1154,6 +1174,29 @@ impl Operation for ConnectOp {
                             "ConnectMsg::Request received without source_addr".into(),
                         ))
                     })?;
+
+                    // Admission control: limit concurrent connects at gateways
+                    if !op_manager.ring.connection_manager.try_admit_connect() {
+                        tracing::info!(
+                            tx = %self.id,
+                            desired_location = %payload.desired_location,
+                            upstream = %upstream_addr,
+                            "connect: gateway overloaded, rejecting request"
+                        );
+                        let reject_msg = ConnectMsg::Rejected {
+                            id: self.id,
+                            desired_location: payload.desired_location,
+                        };
+                        network_bridge
+                            .send(
+                                upstream_addr,
+                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                            )
+                            .await?;
+                        self.state = Some(ConnectState::Completed);
+                        return Ok(store_operation_state(&mut self));
+                    }
+
                     let actions =
                         self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
 
@@ -1263,6 +1306,28 @@ impl Operation for ConnectOp {
                         }
                     }
 
+                    if actions.rejected {
+                        let reject_msg = ConnectMsg::Rejected {
+                            id: self.id,
+                            desired_location: payload.desired_location,
+                        };
+                        tracing::info!(
+                            tx = %self.id,
+                            desired_location = %payload.desired_location,
+                            upstream = %upstream_addr,
+                            "connect: sending explicit rejection upstream"
+                        );
+                        network_bridge
+                            .send(
+                                upstream_addr,
+                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                            )
+                            .await?;
+                        op_manager.ring.connection_manager.release_connect();
+                        self.state = Some(ConnectState::Completed);
+                        return Ok(store_operation_state(&mut self));
+                    }
+
                     if let Some(response) = actions.accept_response {
                         // Emit telemetry for response sent
                         if let Some(event) = NetEventLog::connect_response_sent(
@@ -1287,9 +1352,11 @@ impl Operation for ConnectOp {
                                 NetMessage::V1(NetMessageV1::Connect(response_msg)),
                             )
                             .await?;
+                        op_manager.ring.connection_manager.release_connect();
                         return Ok(store_operation_state(&mut self));
                     }
 
+                    op_manager.ring.connection_manager.release_connect();
                     Ok(store_operation_state(&mut self))
                 }
                 ConnectMsg::Response { payload, .. } => {
@@ -1479,6 +1546,59 @@ impl Operation for ConnectOp {
                         "connect: updated own_addr and location from observed address"
                     );
                     Ok(store_operation_state(&mut self))
+                }
+                ConnectMsg::Rejected {
+                    desired_location, ..
+                } => {
+                    if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
+                        // Joiner: explicit rejection received — record backoff and complete
+                        tracing::info!(
+                            tx = %self.id,
+                            desired_location = %desired_location,
+                            "connect: received explicit rejection from relay"
+                        );
+                        op_manager.ring.record_connection_failure(
+                            *desired_location,
+                            ConnectionFailureReason::Rejected,
+                        );
+                        if let Some(gw_addr) = self.get_next_hop_addr() {
+                            let mut backoff = op_manager.gateway_backoff.lock();
+                            backoff.record_failure(gw_addr);
+                            tracing::debug!(
+                                gateway_addr = %gw_addr,
+                                tx = %self.id,
+                                "Recorded gateway backoff on explicit rejection"
+                            );
+                        }
+                        self.state = Some(ConnectState::Completed);
+                        Ok(store_operation_state(&mut self))
+                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_ref() {
+                        // Relay: forward rejection upstream toward the joiner
+                        let upstream_addr = state.upstream_addr;
+                        tracing::debug!(
+                            tx = %self.id,
+                            upstream_addr = %upstream_addr,
+                            "connect: forwarding rejection upstream"
+                        );
+                        let reject_msg = ConnectMsg::Rejected {
+                            id: self.id,
+                            desired_location: *desired_location,
+                        };
+                        network_bridge
+                            .send(
+                                upstream_addr,
+                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                            )
+                            .await?;
+                        Ok(store_operation_state(&mut self))
+                    } else {
+                        tracing::warn!(
+                            tx = %self.id,
+                            state = ?self.state,
+                            "connect: received Rejected but not in expected state"
+                        );
+                        Ok(store_operation_state(&mut self))
+                    }
                 }
             }
         })
@@ -2900,5 +3020,99 @@ mod tests {
             !skip.has_element(other_addr),
             "unvisited address should not be in skip list"
         );
+    }
+
+    // ============ Rejection flag tests ============
+
+    #[test]
+    fn relay_rejects_when_no_uphill_peers_available() {
+        // At terminus, cannot accept, no uphill peers → rejected = true
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(None);
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        assert!(actions.rejected, "should reject when no uphill peers");
+        assert!(actions.accept_response.is_none());
+        assert!(actions.forward.is_none());
+    }
+
+    #[test]
+    fn relay_rejects_when_ttl_exhausted() {
+        // At terminus, cannot accept, TTL exhausted → rejected = true
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 0, // TTL exhausted
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc).accept(false);
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        assert!(actions.rejected, "should reject when TTL exhausted");
+        assert!(actions.accept_response.is_none());
+        assert!(actions.forward.is_none());
+    }
+
+    #[test]
+    fn relay_routes_uphill_when_available() {
+        // At terminus, cannot accept, uphill peer available → rejected = false, forward.is_some()
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let uphill = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(Some(uphill));
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        assert!(!actions.rejected, "should not reject when uphill available");
+        assert!(actions.forward.is_some(), "should forward uphill");
+        assert!(actions.accept_response.is_none());
     }
 }

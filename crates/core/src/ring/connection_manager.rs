@@ -49,6 +49,11 @@ pub(crate) struct ConnectionManager {
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
     pub pub_key: Arc<TransportPublicKey>,
+    /// Number of CONNECT operations currently being routed through this node.
+    connect_in_flight: Arc<AtomicUsize>,
+    /// Maximum concurrent CONNECT operations this node will route.
+    /// Gateways use a bounded value; non-gateways use usize::MAX (unlimited).
+    max_concurrent_connects: usize,
 }
 
 impl ConnectionManager {
@@ -150,7 +155,32 @@ impl ConnectionManager {
             max_connections,
             rnd_if_htl_above,
             pub_key: Arc::new(pub_key),
+            connect_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_connects: if is_gateway { 8 } else { usize::MAX },
         }
+    }
+
+    /// Try to admit a new connect operation for routing.
+    /// Returns false if the node is at capacity for concurrent connects.
+    pub fn try_admit_connect(&self) -> bool {
+        loop {
+            let current = self.connect_in_flight.load(Ordering::Acquire);
+            if current >= self.max_concurrent_connects {
+                return false;
+            }
+            if self
+                .connect_in_flight
+                .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Release a connect admission slot after the operation completes.
+    pub fn release_connect(&self) {
+        self.connect_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Whether a node should accept a new node connection or not based
@@ -1701,5 +1731,43 @@ mod tests {
         assert_eq!(cm.get_reserved_connections(), 1);
         assert!(!cm.has_connection_or_pending(addr1));
         assert!(cm.has_connection_or_pending(addr2));
+    }
+
+    // ============ Admission control tests ============
+
+    #[test]
+    fn test_admission_control_gateway_limit() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        // Gateway should have max_concurrent_connects = 8
+        for _ in 0..8 {
+            assert!(cm.try_admit_connect(), "should admit within limit");
+        }
+        assert!(!cm.try_admit_connect(), "should reject when at capacity");
+    }
+
+    #[test]
+    fn test_admission_control_release_frees_slot() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+
+        // Fill up all slots
+        for _ in 0..8 {
+            assert!(cm.try_admit_connect());
+        }
+        assert!(!cm.try_admit_connect());
+
+        // Release one slot
+        cm.release_connect();
+        assert!(cm.try_admit_connect(), "should admit after release");
+    }
+
+    #[test]
+    fn test_admission_control_non_gateway_unlimited() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        // Non-gateway should have unlimited admission
+        for _ in 0..100 {
+            assert!(cm.try_admit_connect());
+        }
     }
 }

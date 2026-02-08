@@ -14,31 +14,26 @@ use super::Location;
 /// Types of connection failures for backoff calculation.
 ///
 /// Different failure types may require different backoff strategies.
-/// Currently, only `RoutingFailed` and `Timeout` are actively recorded:
-/// - Routing failures: No peer available to route through (normal exponential backoff)
-/// - Timeouts: Operation exceeded TTL, including explicit rejections (escalated backoff)
+/// Active variants:
+/// - `RoutingFailed`: No peer available to route through (normal exponential backoff)
+/// - `Timeout`: Operation exceeded TTL (escalated backoff)
+/// - `Rejected`: Peer explicitly rejected connection at capacity (normal backoff)
 ///
 /// # Future Variants
 ///
-/// The following variants are defined for future protocol enhancements where explicit
-/// rejection messages will be sent by peers instead of relying on timeouts:
-/// - `Rejected`: Peer at capacity (apply normal backoff)
+/// The following variants are defined for future protocol enhancements:
 /// - `NatPunchFailed`: NAT hole punch failed (transient)
 /// - `HandshakeError`: Handshake failure after connection established
 /// - `TransientError`: Transient network issues
 ///
 /// See https://github.com/freenet/freenet-core/issues/2663 for discussion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Some variants prepared for future protocol enhancements
 pub enum ConnectionFailureReason {
     /// Routing failed - no peer available to route through
     RoutingFailed,
     /// Connect operation timed out waiting for response
-    /// (includes explicit rejections that currently manifest as timeouts)
     Timeout,
-    /// Remote peer rejected connection (at capacity, etc.)
-    /// Currently unused - rejections are detected as timeouts.
-    #[allow(dead_code)]
+    /// Remote peer explicitly rejected connection (at capacity, etc.)
     Rejected,
     /// NAT hole punch failed
     #[allow(dead_code)]
