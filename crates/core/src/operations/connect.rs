@@ -1551,7 +1551,7 @@ pub(crate) async fn join_ring_request(
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
-    let location = gateway.location().ok_or_else(|| {
+    let gateway_location = gateway.location().ok_or_else(|| {
         tracing::error!(
             phase = "error",
             "Gateway location not found, this should not be possible, report an error"
@@ -1567,12 +1567,21 @@ pub(crate) async fn join_ring_request(
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, gateway_addr)
+        .should_accept(gateway_location, gateway_addr)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
 
     let own = op_manager.ring.connection_manager.own_location();
+    // Use the joiner's own location as the desired_location so the gateway routes
+    // to diverse ring peers instead of always forwarding to its single closest neighbor.
+    // Fall back to a random location if own location is not yet known (peer behind NAT
+    // that hasn't received ObservedAddress yet).
+    let desired_location = op_manager
+        .ring
+        .connection_manager
+        .get_stored_location()
+        .unwrap_or_else(Location::random);
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -1583,7 +1592,7 @@ pub(crate) async fn join_ring_request(
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
-        location,
+        desired_location,
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
@@ -1593,7 +1602,7 @@ pub(crate) async fn join_ring_request(
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
         &op_manager.ring,
-        location,
+        desired_location,
         own,
         gateway.clone(),
         ttl,
