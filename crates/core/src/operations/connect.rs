@@ -1676,7 +1676,7 @@ pub(crate) async fn join_ring_request(
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
-    let location = gateway.location().ok_or_else(|| {
+    let gateway_location = gateway.location().ok_or_else(|| {
         tracing::error!(
             phase = "error",
             "Gateway location not found, this should not be possible, report an error"
@@ -1692,12 +1692,19 @@ pub(crate) async fn join_ring_request(
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, gateway_addr)
+        .should_accept(gateway_location, gateway_addr)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
 
     let own = op_manager.ring.connection_manager.own_location();
+    // Use a random desired_location so the gateway routes to diverse ring peers
+    // instead of always forwarding to its single closest neighbor (which caused
+    // cascading failures at scale when all joiners converged on one acceptor).
+    // A random location also varies on each retry, preventing deterministic routing
+    // to the same unreachable peer. Ring-optimal connections are established later
+    // through connection_maintenance/adjust_topology once the peer has bootstrapped.
+    let desired_location = Location::random();
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -1708,7 +1715,7 @@ pub(crate) async fn join_ring_request(
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
-        location,
+        desired_location,
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
@@ -1718,7 +1725,7 @@ pub(crate) async fn join_ring_request(
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
         &op_manager.ring,
-        location,
+        desired_location,
         own,
         gateway.clone(),
         ttl,
@@ -1801,11 +1808,9 @@ pub(crate) async fn initial_join_procedure(
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
-                // Design note: We track backoff per-gateway rather than per-acceptor because
-                // location-based routing is deterministic - the same gateway will route to
-                // the same acceptor for a given target location. So if a connect through
-                // gateway G fails (likely due to NAT issues with the acceptor it routes to),
-                // backing off G is equivalent to backing off that acceptor.
+                // Design note: We track backoff per-gateway because join_ring_request uses
+                // a random desired_location each time. Backing off the gateway gives the
+                // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut min_remaining: Option<Duration> = None;

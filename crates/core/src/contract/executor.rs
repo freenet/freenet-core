@@ -168,26 +168,13 @@ impl ExecutorError {
             });
         }
 
-        match error {
-            RuntimeInnerError::WasmCompileError(e) => match op {
+        if let RuntimeInnerError::WasmError(e) = error {
+            match op {
                 Some(InnerOpError::Upsert(key)) => {
                     return ExecutorError::request(StdContractError::update_exec_error(key, e))
                 }
                 _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
-            },
-            RuntimeInnerError::WasmExportError(e) => match op {
-                Some(InnerOpError::Upsert(key)) => {
-                    return ExecutorError::request(StdContractError::update_exec_error(key, e))
-                }
-                _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
-            },
-            RuntimeInnerError::WasmInstantiationError(e) => match op {
-                Some(InnerOpError::Upsert(key)) => {
-                    return ExecutorError::request(StdContractError::update_exec_error(key, e))
-                }
-                _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
-            },
-            _ => {}
+            }
         }
 
         let mut err = ExecutorError::other(outer_error);

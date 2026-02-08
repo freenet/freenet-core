@@ -285,7 +285,7 @@ impl RuntimePool {
     }
 
     /// Check if an executor is healthy and can be reused.
-    /// An executor is unhealthy if its wasm_store is None (lost due to panic).
+    /// An executor is unhealthy if the WASM engine is in a broken state (e.g., store lost due to panic).
     fn is_executor_healthy(executor: &Executor<Runtime>) -> bool {
         executor.runtime.is_healthy()
     }
@@ -1091,7 +1091,9 @@ impl Executor<Runtime> {
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
-        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        // Enable V2 delegate contract access by providing the state store DB
+        rt.set_state_store_db(state_store.storage());
         Executor::new(
             state_store,
             move || {
@@ -1120,8 +1122,11 @@ impl Executor<Runtime> {
         // Get the shared storage from the state store to share with runtime stores
         let db = shared_state_store.storage();
         // Create only the Runtime stores (contract, delegate, secrets) - NOT StateStore
-        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(&config, db)?;
-        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        let (contract_store, delegate_store, secret_store) =
+            Self::get_runtime_stores(&config, db.clone())?;
+        let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        // Enable V2 delegate contract access by providing the state store DB
+        rt.set_state_store_db(db);
         Executor::new(
             shared_state_store,
             || Ok(()), // No cleanup handler for pooled executors

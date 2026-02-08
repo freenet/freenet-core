@@ -7,7 +7,6 @@ use dashmap::DashMap;
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
-use axum::routing::get;
 use axum::{Extension, Router};
 use freenet_stdlib::client_api::{ClientError, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -19,9 +18,10 @@ use tracing::instrument;
 use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;
 
-use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnection};
+use super::{errors::WebSocketApiError, path_handlers, ApiVersion, AuthToken, ClientConnection};
 
 mod v1;
+mod v2;
 
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
@@ -74,11 +74,37 @@ impl HttpGateway {
     }
 
     /// Returns the uninitialized axum router with a provided attested_contracts map.
+    ///
+    /// Merges V1 and V2 HTTP routes; both currently share the same handler logic.
     pub fn as_router_with_attested_contracts(
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        Self::create_router_v1_with_attested_contracts(socket, attested_contracts)
+        let localhost = match socket.ip() {
+            IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => true,
+            IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => true,
+            _ => false,
+        };
+        let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
+        std::fs::create_dir_all(contract_web_path).unwrap();
+
+        let (proxy_request_sender, request_to_server) = mpsc::channel(1);
+
+        let config = Config { localhost };
+
+        let router = v1::routes(config.clone())
+            .merge(v2::routes(config))
+            .layer(Extension(attested_contracts.clone()))
+            .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
+
+        (
+            Self {
+                proxy_server_request: request_to_server,
+                attested_contracts: attested_contracts.clone(),
+                response_channels: HashMap::new(),
+            },
+            router,
+        )
     }
 
     /// Returns a reference to the attested contracts map (for integration testing).
@@ -96,6 +122,58 @@ struct Config {
 #[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
+}
+
+async fn web_home(
+    Path(key): Path<String>,
+    Extension(rs): Extension<HttpGatewayRequest>,
+    axum::extract::State(config): axum::extract::State<Config>,
+    api_version: ApiVersion,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    use headers::{Header, HeaderMapExt};
+
+    let domain = config
+        .localhost
+        .then_some("localhost")
+        .expect("non-local connections not supported yet");
+    let token = AuthToken::generate();
+
+    let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
+    let version_prefix = api_version.prefix();
+    let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
+        .domain(domain)
+        .path(format!("/{version_prefix}/contract/web/{key}"))
+        .same_site(cookie::SameSite::Strict)
+        .max_age(cookie::time::Duration::days(1))
+        .secure(!config.localhost)
+        .http_only(false)
+        .build();
+
+    let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
+    let contract_response =
+        path_handlers::contract_home(key, rs, token.clone(), api_version).await?;
+
+    let mut response = contract_response.into_response();
+    response.headers_mut().typed_insert(token_header);
+    response.headers_mut().insert(
+        headers::SetCookie::name(),
+        headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
+    );
+
+    Ok(response)
+}
+
+async fn web_subpages(
+    key: String,
+    last_path: String,
+    api_version: ApiVersion,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    let version_prefix = api_version.prefix();
+    let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
+    path_handlers::variable_content(key, full_path, api_version)
+        .await
+        .map_err(|e| *e)
+        .map(|r| r.into_response())
 }
 
 impl ClientEventsProxy for HttpGateway {
@@ -131,6 +209,7 @@ impl ClientEventsProxy for HttpGateway {
                         req,
                         auth_token,
                         attested_contract,
+                        ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)

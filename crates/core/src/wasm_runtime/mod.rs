@@ -1,7 +1,9 @@
 mod contract;
 mod contract_store;
 mod delegate;
+pub(crate) mod delegate_api;
 mod delegate_store;
+pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
 mod native_api;
@@ -12,7 +14,6 @@ mod state_store;
 mod store;
 #[cfg(test)]
 mod tests;
-mod tunables;
 
 pub(crate) use contract::ContractRuntimeInterface;
 pub use contract_store::ContractStore;

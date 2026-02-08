@@ -36,6 +36,35 @@ pub use app_packaging::WebApp;
 // Export types needed for integration testing
 pub use http_gateway::{AttestedContract, AttestedContractMap};
 
+/// API version for websocket and HTTP gateway **routing**.
+///
+/// This controls URL path prefixes (`/v1/...` vs `/v2/...`) and is used by
+/// the HTTP gateway and WebSocket proxy to version client-facing endpoints.
+///
+/// **Not to be confused with [`crate::wasm_runtime::delegate_api::DelegateApiVersion`]**,
+/// which governs WASM-level delegate host function availability and is
+/// auto-detected from the delegate module's imports. The two version axes are
+/// independent: a V1 HTTP client can invoke a V2 delegate, and vice versa.
+///
+/// V1 is the default for backwards compatibility. V2 currently behaves
+/// identically but provides a routing seam for future protocol changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ApiVersion {
+    #[default]
+    V1,
+    V2,
+}
+
+impl ApiVersion {
+    /// Returns the URL path prefix for this version (e.g. `"v1"` or `"v2"`).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientConnection {
@@ -48,6 +77,9 @@ pub(crate) enum ClientConnection {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         attested_contract: Option<ContractInstanceId>,
+        /// Plumbing for future V2-specific dispatch; not yet read.
+        #[allow(dead_code)]
+        api_version: ApiVersion,
     },
 }
 
