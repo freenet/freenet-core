@@ -1573,15 +1573,13 @@ pub(crate) async fn join_ring_request(
     }
 
     let own = op_manager.ring.connection_manager.own_location();
-    // Use the joiner's own location as the desired_location so the gateway routes
-    // to diverse ring peers instead of always forwarding to its single closest neighbor.
-    // Fall back to a random location if own location is not yet known (peer behind NAT
-    // that hasn't received ObservedAddress yet).
-    let desired_location = op_manager
-        .ring
-        .connection_manager
-        .get_stored_location()
-        .unwrap_or_else(Location::random);
+    // Use a random desired_location so the gateway routes to diverse ring peers
+    // instead of always forwarding to its single closest neighbor (which caused
+    // cascading failures at scale when all joiners converged on one acceptor).
+    // A random location also varies on each retry, preventing deterministic routing
+    // to the same unreachable peer. Ring-optimal connections are established later
+    // through connection_maintenance/adjust_topology once the peer has bootstrapped.
+    let desired_location = Location::random();
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -1685,11 +1683,9 @@ pub(crate) async fn initial_join_procedure(
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
-                // Design note: We track backoff per-gateway rather than per-acceptor because
-                // location-based routing is deterministic - the same gateway will route to
-                // the same acceptor for a given target location. So if a connect through
-                // gateway G fails (likely due to NAT issues with the acceptor it routes to),
-                // backing off G is equivalent to backing off that acceptor.
+                // Design note: We track backoff per-gateway because join_ring_request uses
+                // a random desired_location each time. Backing off the gateway gives the
+                // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut min_remaining: Option<Duration> = None;
