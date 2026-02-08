@@ -82,6 +82,7 @@ where
     conn_bridge_closed: bool,
     node_controller_closed: bool,
     conn_events_closed: bool,
+    handshake_closed: bool,
     client_transaction_closed: bool,
     executor_transaction_closed: bool,
 }
@@ -119,6 +120,7 @@ where
             conn_bridge_closed: false,
             node_controller_closed: false,
             conn_events_closed: false,
+            handshake_closed: false,
             client_transaction_closed: false,
             executor_transaction_closed: false,
         }
@@ -207,16 +209,19 @@ where
         }
 
         // Priority 5: Handshake handler (implements Stream directly)
-        match Pin::new(&mut this.handshake_handler).poll_next(cx) {
-            Poll::Ready(Some(event)) => {
-                return Poll::Ready(Some(SelectResult::Handshake(Some(event))))
-            }
-            Poll::Ready(None) => {
-                if first_closed_channel.is_none() {
-                    first_closed_channel = Some(SelectResult::Handshake(None));
+        if !this.handshake_closed {
+            match Pin::new(&mut this.handshake_handler).poll_next(cx) {
+                Poll::Ready(Some(event)) => {
+                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))))
                 }
+                Poll::Ready(None) => {
+                    this.handshake_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::Handshake(None));
+                    }
+                }
+                Poll::Pending => {}
             }
-            Poll::Pending => {}
         }
 
         // Priority 6: Node controller
