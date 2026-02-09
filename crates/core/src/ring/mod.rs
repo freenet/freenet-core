@@ -1124,14 +1124,11 @@ impl Ring {
                         "Zero ring connections detected — starting isolation timer"
                     );
                 }
-            } else {
-                if zero_connections_since.is_some() {
-                    tracing::info!(
-                        connections = current_conn_count,
-                        "Recovered from zero-connection state"
-                    );
-                }
-                zero_connections_since = None;
+            } else if zero_connections_since.take().is_some() {
+                tracing::info!(
+                    connections = current_conn_count,
+                    "Recovered from zero-connection state"
+                );
             }
 
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit

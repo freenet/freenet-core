@@ -464,15 +464,15 @@ impl OpManager {
         });
     }
 
+    /// Timeout for sending notifications to the event loop.
+    /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
+    const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// An early, fast path, return for communicating back changes of on-going operations
     /// in the node to the main message handler, without any transmission in the network whatsoever.
     ///
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.
-    /// Timeout for sending notifications to the event loop.
-    /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
-    const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
-
     pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
         let tx = *msg.id();
         let peer_id = &self.ring.connection_manager.pub_key;
