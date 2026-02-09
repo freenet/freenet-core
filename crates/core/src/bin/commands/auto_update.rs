@@ -276,6 +276,13 @@ pub fn should_attempt_update() -> bool {
     get_update_failure_count() < MAX_UPDATE_FAILURES
 }
 
+/// Returns true if the update check backoff has reached the maximum (1 hour).
+/// At that point, we've checked GitHub multiple times with no update found,
+/// so the version mismatch flag should be cleared to stop log spam.
+pub fn has_reached_max_backoff() -> bool {
+    get_current_backoff() >= MAX_BACKOFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

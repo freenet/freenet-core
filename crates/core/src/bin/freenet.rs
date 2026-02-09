@@ -115,8 +115,8 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, has_version_mismatch,
-        should_attempt_update, UpdateCheckResult, UpdateNeededError,
+        check_if_update_available, clear_version_mismatch, has_reached_max_backoff,
+        has_version_mismatch, UpdateCheckResult, UpdateNeededError,
     };
     use tokio::signal;
 
@@ -173,7 +173,7 @@ async fn run_network_node_with_signals(
                         // Will retry with exponential backoff (1min -> 2min -> ... -> 1hr max).
                         // After reaching max backoff with no update found, clear the flag
                         // to stop the every-60-second log spam (#2928).
-                        if !should_attempt_update() {
+                        if has_reached_max_backoff() {
                             tracing::info!(
                                 "Max update check failures reached with no update found — clearing version mismatch flag"
                             );

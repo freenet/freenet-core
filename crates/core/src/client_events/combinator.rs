@@ -4,27 +4,32 @@ use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, ClientId, HostResult, OpenRequest};
 use crate::config::GlobalExecutor;
 
+/// Channel capacity for communication between the combinator and client tasks.
+///
+/// Bounded channels prevent unbounded memory growth (OOM) when subscription notifications
+/// pile up faster than clients consume them (see #2928). The host side uses `try_send()`
+/// so it never blocks — if a client's buffer is full, the send fails and the client is
+/// treated as disconnected. The client→host direction uses `send().await` which is safe
+/// because the host never blocks on sends, so it always makes progress draining requests.
+///
+/// This avoids both the original `channel(1)` deadlock from #2915 and unbounded growth.
+const CHANNEL_CAPACITY: usize = 2048;
+
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-type ClientEventsFut = BoxFuture<
-    'static,
-    (
-        usize,
-        UnboundedReceiver<HostIncomingMsg>,
-        Option<HostIncomingMsg>,
-    ),
->;
+type ClientEventsFut =
+    BoxFuture<'static, (usize, Receiver<HostIncomingMsg>, Option<HostIncomingMsg>)>;
 
 /// This type allows combining different sources of events into one and interoperation between them.
 pub struct ClientEventsCombinator<const N: usize> {
     pending_futs: FuturesUnordered<ClientEventsFut>,
     /// receiving end of the different client applications from the node
-    clients: [UnboundedSender<(ClientId, HostResult)>; N],
+    clients: [Sender<(ClientId, HostResult)>; N],
     /// a map of the individual protocols, external, sending client events ids to an internal list of ids
     external_clients: [HashMap<ClientId, ClientId>; N],
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
@@ -36,8 +41,8 @@ impl<const N: usize> ClientEventsCombinator<N> {
     pub fn new(clients: [BoxedClient; N]) -> Self {
         let pending_futs = FuturesUnordered::new();
         let channels = clients.map(|client| {
-            let (tx, rx) = unbounded_channel();
-            let (tx_host, rx_host) = unbounded_channel();
+            let (tx, rx) = channel(CHANNEL_CAPACITY);
+            let (tx_host, rx_host) = channel(CHANNEL_CAPACITY);
             GlobalExecutor::spawn(client_fn(client, rx, tx_host));
             (tx, rx_host)
         });
@@ -135,9 +140,20 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                 .internal_clients
                 .get(&internal)
                 .ok_or(ErrorKind::UnknownClient(internal.0))?;
+            // Use try_send so the host event loop never blocks on sending to a slow client.
+            // This prevents the channel(1) deadlock from #2915 while keeping memory bounded.
             self.clients[*idx]
-                .send((*external, response))
-                .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
+                .try_send((*external, response))
+                .map_err(|e| {
+                    if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                        tracing::warn!(
+                            client_id = internal.0,
+                            capacity = CHANNEL_CAPACITY,
+                            "Response channel full — client not consuming fast enough, disconnecting"
+                        );
+                    }
+                    ClientError::from(ErrorKind::TransportProtocolDisconnect)
+                })?;
             Ok(())
         }
         .boxed()
@@ -150,10 +166,14 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
 /// processed before client disconnect errors, preventing lost responses.
 /// The `biased` modifier ensures futures are polled in declaration order,
 /// and if multiple are ready, the first one wins.
+///
+/// The client→host direction uses `send().await` on a bounded channel, which provides
+/// backpressure. This is safe because the host side uses `try_send()` (never blocks),
+/// so it always makes progress draining this channel. No circular wait = no deadlock.
 async fn client_fn(
     mut client: BoxedClient,
-    mut rx: UnboundedReceiver<(ClientId, HostResult)>,
-    tx_host: UnboundedSender<Result<OpenRequest<'static>, ClientError>>,
+    mut rx: Receiver<(ClientId, HostResult)>,
+    tx_host: Sender<Result<OpenRequest<'static>, ClientError>>,
 ) {
     loop {
         tokio::select! {
@@ -198,6 +218,7 @@ async fn client_fn(
                                 token,
                                 attested_contract,
                             }))
+                            .await
                             .is_err()
                         {
                             break;
@@ -205,7 +226,7 @@ async fn client_fn(
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
                         tracing::debug!("disconnected client");
-                        let _ = tx_host.send(Err(err));
+                        let _ = tx_host.send(Err(err)).await;
                         break;
                     }
                     Err(err) => {
@@ -414,7 +435,7 @@ mod test {
             }
         };
 
-        // With channel(1) this would deadlock; with unbounded it completes.
+        // With channel(1) this would deadlock; with bounded(2048) + try_send it completes.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             futures::future::join(client_side, host_side),

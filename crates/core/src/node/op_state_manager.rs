@@ -1318,6 +1318,42 @@ mod tests {
     }
 
     #[test]
+    fn contract_waiters_cleanup_removes_closed_senders() {
+        use std::collections::HashMap;
+
+        let mut waiters: HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>> = HashMap::new();
+        let id1 = ContractInstanceId::new([1; 32]);
+        let id2 = ContractInstanceId::new([2; 32]);
+
+        // Create waiters with live and dropped receivers
+        let (tx_live, _rx_live) = oneshot::channel();
+        let (tx_dead, _rx_dead) = oneshot::channel::<()>();
+        drop(_rx_dead); // Drop receiver so sender.is_closed() returns true
+
+        waiters.entry(id1).or_default().push(tx_live);
+        waiters.entry(id1).or_default().push(tx_dead);
+
+        // id2 has only dead waiters
+        let (tx_dead2, rx_dead2) = oneshot::channel::<()>();
+        drop(rx_dead2);
+        waiters.entry(id2).or_default().push(tx_dead2);
+
+        assert_eq!(waiters.len(), 2);
+
+        // Run the cleanup logic (same as in garbage_cleanup_task)
+        waiters.retain(|_id, senders| {
+            senders.retain(|sender| !sender.is_closed());
+            !senders.is_empty()
+        });
+
+        // id1 should remain (has one live sender), id2 should be removed
+        assert_eq!(waiters.len(), 1);
+        assert!(waiters.contains_key(&id1));
+        assert!(!waiters.contains_key(&id2));
+        assert_eq!(waiters[&id1].len(), 1);
+    }
+
+    #[test]
     fn sub_operation_tracker_registers_parent_child_relationship() {
         let tracker = SubOperationTracker::new();
         let parent = Transaction::ttl_transaction();
