@@ -129,7 +129,7 @@ libc = "0.2"
 gag = "1"
 winapi = "0.3"
 wmi = "0.18.1"
-zip = "7"
+zip = { version = "7", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
 freenet-stdlib = "0.1.35"
