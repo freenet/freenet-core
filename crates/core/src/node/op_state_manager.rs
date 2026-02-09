@@ -899,12 +899,8 @@ impl OpManager {
         self.streaming_enabled && payload_size > self.streaming_threshold
     }
 
-    /// Run subsystem hooks when a ring connection is established.
-    ///
-    /// Returns a list of (target_addr, message) pairs that should be sent to the peer.
-    /// Handles:
-    /// - InterestSync: sends our interest hashes for delta-based sync discovery
-    /// - ProximityCache: requests peer's cache state for UPDATE forwarding
+    /// Builds the messages we need to send to a peer that just joined the ring,
+    /// so it learns which contracts we're subscribed to and our cached state.
     pub(crate) fn on_ring_connection_established(
         &self,
         peer_addr: SocketAddr,
@@ -912,7 +908,6 @@ impl OpManager {
     ) -> Vec<(SocketAddr, NetMessage)> {
         let mut messages = Vec::with_capacity(2);
 
-        // InterestSync: send our interest hashes for delta-based sync discovery
         let interest_hashes = self.interest_manager.get_all_interest_hashes();
         if !interest_hashes.is_empty() {
             messages.push((
@@ -925,7 +920,6 @@ impl OpManager {
             ));
         }
 
-        // ProximityCache: request peer's cache state for UPDATE forwarding
         if let Some(cache_msg) = self.proximity_cache.on_ring_connection_established(pub_key) {
             messages.push((
                 peer_addr,
@@ -936,11 +930,7 @@ impl OpManager {
         messages
     }
 
-    /// Run subsystem cleanup when a ring connection is lost.
-    ///
-    /// Cleans up:
-    /// - ProximityCache: removes peer's cached contract state
-    /// - InterestManager: removes all peer interest entries
+    /// Removes all tracked state for a peer that left the ring.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
         self.proximity_cache.on_peer_disconnected(pub_key);
         self.interest_manager

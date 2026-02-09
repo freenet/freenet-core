@@ -1140,6 +1140,7 @@ impl P2pConnManager {
                                         )
                                         .await;
 
+                                    // forget this peer's subscriptions and cached contract state
                                     ctx.bridge
                                         .op_manager
                                         .on_ring_connection_lost(peer.pub_key());
@@ -2037,6 +2038,7 @@ impl P2pConnManager {
                     .await;
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
 
+                // tell the promoted peer about our subscriptions and cache
                 for (target, msg) in self
                     .bridge
                     .op_manager
@@ -2046,7 +2048,7 @@ impl P2pConnManager {
                         tracing::warn!(
                             %peer_addr,
                             error = %e,
-                            "Failed to send lifecycle message on transient promotion"
+                            "Failed to send interest/cache data on transient promotion"
                         );
                     }
                 }
@@ -2702,7 +2704,7 @@ impl P2pConnManager {
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
 
-                // Run lifecycle hooks for new ring connection (#2730)
+                // tell the new peer about our subscriptions and cache
                 for (target, msg) in self
                     .bridge
                     .op_manager
@@ -2712,7 +2714,7 @@ impl P2pConnManager {
                         tracing::warn!(
                             %peer_addr,
                             error = %e,
-                            "Failed to send lifecycle message to new peer"
+                            "Failed to send interest/cache data to new peer"
                         );
                     }
                 }
@@ -2912,6 +2914,7 @@ impl P2pConnManager {
                         )
                         .await;
 
+                    // forget this peer's subscriptions and cached contract state
                     self.bridge
                         .op_manager
                         .on_ring_connection_lost(peer.pub_key());
