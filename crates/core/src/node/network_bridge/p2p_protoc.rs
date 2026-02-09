@@ -1885,6 +1885,17 @@ impl P2pConnManager {
                                                         peer = %peer_addr,
                                                         "Skipping broadcast - empty delta (no change)"
                                                     );
+                                                    // Update peer's cached summary so we don't
+                                                    // re-check this pair every broadcast cycle
+                                                    if let Some(summary) = &our_summary {
+                                                        op_manager
+                                                            .interest_manager
+                                                            .update_peer_summary(
+                                                                &key,
+                                                                &peer_key,
+                                                                Some(summary.clone()),
+                                                            );
+                                                    }
                                                     continue;
                                                 }
                                                 Ok(delta) => (
