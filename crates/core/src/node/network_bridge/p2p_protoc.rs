@@ -3317,10 +3317,22 @@ impl P2pConnManager {
                         .compute_delta(op_manager, &key, theirs, ours, new_state.size())
                         .await
                     {
-                        Ok(delta) => (
+                        Ok(Some(delta)) => (
                             crate::message::DeltaOrFullState::Delta(delta.as_ref().to_vec()),
                             true,
                         ),
+                        Ok(None) => {
+                            tracing::debug!(
+                                contract = %key,
+                                "Delta computation returned no change, sending full state"
+                            );
+                            (
+                                crate::message::DeltaOrFullState::FullState(
+                                    new_state.as_ref().to_vec(),
+                                ),
+                                false,
+                            )
+                        }
                         Err(err) => {
                             tracing::debug!(
                                 contract = %key,
