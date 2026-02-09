@@ -293,6 +293,12 @@ impl Ring {
         self.connection_backoff.lock().cleanup_expired();
     }
 
+    /// Reset all connection backoff state. Used during isolation recovery
+    /// when the node has had zero ring connections for an extended period.
+    pub fn reset_all_connection_backoff(&self) {
+        self.connection_backoff.lock().clear();
+    }
+
     /// Register events with the event system.
     /// This is used by operations to emit failure and other events.
     pub async fn register_events<'a>(
@@ -1057,6 +1063,9 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = Instant::now();
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+        /// Duration of zero ring connections before escalating recovery.
+        const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+        let mut zero_connections_since: Option<Instant> = None;
         let mut this_peer = None;
         loop {
             let op_manager = match self.upgrade_op_manager() {
@@ -1093,6 +1102,37 @@ impl Ring {
 
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
+
+            // Gateway isolation recovery: when we have zero ring connections for too long,
+            // reset all backoff state so we can retry aggressively (#2928).
+            let current_conn_count = self.connection_manager.connection_count();
+            if current_conn_count == 0 {
+                if let Some(since) = zero_connections_since {
+                    if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
+                        tracing::warn!(
+                            is_gateway,
+                            isolated_for_secs = since.elapsed().as_secs(),
+                            "Node isolated with zero ring connections — resetting all connection backoff"
+                        );
+                        self.reset_all_connection_backoff();
+                        zero_connections_since = Some(Instant::now());
+                    }
+                } else {
+                    zero_connections_since = Some(Instant::now());
+                    tracing::warn!(
+                        is_gateway,
+                        "Zero ring connections detected — starting isolation timer"
+                    );
+                }
+            } else {
+                if zero_connections_since.is_some() {
+                    tracing::info!(
+                        connections = current_conn_count,
+                        "Recovered from zero-connection state"
+                    );
+                }
+                zero_connections_since = None;
+            }
 
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
             // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)

@@ -272,7 +272,7 @@ pub fn clear_update_failures() {
 }
 
 /// Check if we should attempt an update based on failure history.
-fn should_attempt_update() -> bool {
+pub fn should_attempt_update() -> bool {
     get_update_failure_count() < MAX_UPDATE_FAILURES
 }
 

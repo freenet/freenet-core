@@ -315,6 +315,9 @@ impl OpManager {
         let connect_forward_estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
         let request_router = Arc::new(OnceLock::new());
         let ch_outbound = Arc::new(ch_outbound);
+        let contract_waiters: Arc<
+            Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
+        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         GlobalExecutor::spawn(
             garbage_cleanup_task(
@@ -328,6 +331,7 @@ impl OpManager {
                 request_router.clone(),
                 ring.clone(),
                 ch_outbound.clone(),
+                contract_waiters.clone(),
             )
             .instrument(garbage_span),
         );
@@ -380,7 +384,7 @@ impl OpManager {
             peer_ready,
             is_gateway,
             sub_op_tracker,
-            contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            contract_waiters,
             proximity_cache,
             interest_manager,
             request_router,
@@ -465,6 +469,10 @@ impl OpManager {
     ///
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.
+    /// Timeout for sending notifications to the event loop.
+    /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
+    const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
         let tx = *msg.id();
         let peer_id = &self.ring.connection_manager.pub_key;
@@ -484,10 +492,27 @@ impl OpManager {
             "notify_op_change: Operation pushed, sending to event listener"
         );
 
-        self.to_event_listener
-            .notifications_sender()
-            .send(Either::Left(msg))
-            .await?;
+        match tokio::time::timeout(
+            Self::NOTIFICATION_SEND_TIMEOUT,
+            self.to_event_listener
+                .notifications_sender()
+                .send(Either::Left(msg)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(OpError::NotificationError),
+            Err(_) => {
+                tracing::error!(
+                    tx = %tx,
+                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
+                    "notify_op_change: Notification channel full for too long, event loop may be stuck"
+                );
+                return Err(OpError::NotificationChannelError(
+                    "notification channel send timed out — event loop is likely stuck".into(),
+                ));
+            }
+        }
 
         tracing::debug!(
             tx = %tx,
@@ -505,11 +530,26 @@ impl OpManager {
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
         tracing::info!(event = %msg, "notify_node_event: queuing node event");
-        self.to_event_listener
-            .notifications_sender
-            .send(Either::Right(msg))
-            .await
-            .map_err(Into::into)
+        match tokio::time::timeout(
+            Self::NOTIFICATION_SEND_TIMEOUT,
+            self.to_event_listener
+                .notifications_sender
+                .send(Either::Right(msg)),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => {
+                tracing::error!(
+                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
+                    "notify_node_event: Notification channel full for too long, event loop may be stuck"
+                );
+                Err(OpError::NotificationChannelError(
+                    "notification channel send timed out — event loop is likely stuck".into(),
+                ))
+            }
+        }
     }
 
     /// Get all active subscriptions.
@@ -881,6 +921,22 @@ impl OpManager {
         }
     }
 
+    /// Returns pending operation counts: [connect, put, get, subscribe, update].
+    pub fn pending_op_counts(&self) -> [u32; 5] {
+        [
+            self.ops.connect.len() as u32,
+            self.ops.put.len() as u32,
+            self.ops.get.len() as u32,
+            self.ops.subscribe.len() as u32,
+            self.ops.update.len() as u32,
+        ]
+    }
+
+    /// Returns the number of entries in the contract_waiters map.
+    pub fn contract_waiters_count(&self) -> u32 {
+        self.contract_waiters.lock().len() as u32
+    }
+
     /// Returns a reference to the orphan stream registry.
     ///
     /// Used by operations layer to claim orphan streams when RequestStreaming
@@ -1009,10 +1065,16 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
     ch_outbound: Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
+    contract_waiters: Arc<
+        Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
+    >,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+    /// How often to clean up stale contract_waiters entries (every N ticks).
+    const WAITER_CLEANUP_EVERY_N_TICKS: u32 = 12; // every 60s at 5s interval
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
     tick.tick().await;
+    let mut tick_count: u32 = 0;
 
     let mut ttl_set = BTreeSet::new();
 
@@ -1025,6 +1087,30 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
             },
             _ = tick.tick() => {
+                tick_count = tick_count.wrapping_add(1);
+
+                // Periodically clean up stale contract_waiters entries where the
+                // receiver has been dropped (e.g., operation timed out). Without this,
+                // the map grows unboundedly under sustained load (#2928).
+                if tick_count % WAITER_CLEANUP_EVERY_N_TICKS == 0 {
+                    let mut waiters = contract_waiters.lock();
+                    let before = waiters.len();
+                    waiters.retain(|_id, senders| {
+                        // Remove senders whose receiver was dropped
+                        senders.retain(|sender| !sender.is_closed());
+                        !senders.is_empty()
+                    });
+                    let after = waiters.len();
+                    if before != after {
+                        tracing::info!(
+                            before,
+                            after,
+                            removed = before - after,
+                            "Cleaned up stale contract_waiters entries"
+                        );
+                    }
+                }
+
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
                     if let Some(tx) = ops.completed.remove(&tx) {

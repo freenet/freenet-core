@@ -271,6 +271,11 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         });
     }
 
+    /// Remove all tracked entries, resetting backoff state entirely.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Get the number of tracked entries.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {

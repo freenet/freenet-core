@@ -115,8 +115,8 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, has_version_mismatch, UpdateCheckResult,
-        UpdateNeededError,
+        check_if_update_available, clear_version_mismatch, has_version_mismatch,
+        should_attempt_update, UpdateCheckResult, UpdateNeededError,
     };
     use tokio::signal;
 
@@ -169,8 +169,16 @@ async fn run_network_node_with_signals(
                         return;
                     }
                     UpdateCheckResult::Skipped => {
-                        // Don't clear the flag - either rate limited, no update yet, or error.
+                        // Don't clear the flag yet — either rate limited, no update yet, or error.
                         // Will retry with exponential backoff (1min -> 2min -> ... -> 1hr max).
+                        // After reaching max backoff with no update found, clear the flag
+                        // to stop the every-60-second log spam (#2928).
+                        if !should_attempt_update() {
+                            tracing::info!(
+                                "Max update check failures reached with no update found — clearing version mismatch flag"
+                            );
+                            clear_version_mismatch();
+                        }
                     }
                 }
             }
@@ -201,8 +209,10 @@ async fn run_network_node_with_signals(
     signal_task.abort();
     update_check_task.abort();
 
-    // Give a moment for final cleanup logging
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Allow time for channels to drain and tasks to clean up.
+    // 100ms was insufficient; 2s gives spawned tasks time to notice cancellation
+    // and complete their cleanup without being forcefully killed by SIGKILL.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     if result.is_ok() {
         tracing::info!("Graceful shutdown complete");
