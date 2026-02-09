@@ -1879,6 +1879,14 @@ impl P2pConnManager {
                                                 )
                                                 .await
                                             {
+                                                Ok(delta) if delta.as_ref().is_empty() => {
+                                                    tracing::trace!(
+                                                        contract = %key,
+                                                        peer = %peer_addr,
+                                                        "Skipping broadcast - empty delta (no change)"
+                                                    );
+                                                    continue;
+                                                }
                                                 Ok(delta) => (
                                                     crate::message::DeltaOrFullState::Delta(
                                                         delta.as_ref().to_vec(),
