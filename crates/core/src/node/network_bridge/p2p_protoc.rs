@@ -1879,14 +1879,10 @@ impl P2pConnManager {
                                                 )
                                                 .await
                                             {
-                                                Ok(delta) if delta.as_ref().is_empty() => {
-                                                    tracing::trace!(
-                                                        contract = %key,
-                                                        peer = %peer_addr,
-                                                        "Skipping broadcast - empty delta (no change)"
-                                                    );
-                                                    // Update peer's cached summary so we don't
-                                                    // re-check this pair every broadcast cycle
+                                                Ok(None) => {
+                                                    // Empty delta — no change needed for this peer.
+                                                    // Update their cached summary so we don't
+                                                    // re-check this pair every broadcast cycle.
                                                     if let Some(summary) = &our_summary {
                                                         op_manager
                                                             .interest_manager
@@ -1898,7 +1894,7 @@ impl P2pConnManager {
                                                     }
                                                     continue;
                                                 }
-                                                Ok(delta) => (
+                                                Ok(Some(delta)) => (
                                                     crate::message::DeltaOrFullState::Delta(
                                                         delta.as_ref().to_vec(),
                                                     ),

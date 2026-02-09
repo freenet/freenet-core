@@ -835,7 +835,7 @@ impl<T: TimeSource> InterestManager<T> {
         their_summary: &StateSummary<'static>,
         our_summary: &StateSummary<'static>,
         our_state_size: usize,
-    ) -> Result<StateDelta<'static>, String> {
+    ) -> Result<Option<StateDelta<'static>>, String> {
         use crate::contract::ContractHandlerEvent;
 
         // Use slices directly - cache methods hash internally, no allocation needed
@@ -848,7 +848,7 @@ impl<T: TimeSource> InterestManager<T> {
                 contract = %key,
                 "Using cached delta"
             );
-            return Ok(cached);
+            return Ok(Some(cached));
         }
 
         // Check if delta would be efficient
@@ -866,9 +866,18 @@ impl<T: TimeSource> InterestManager<T> {
             .await
         {
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
-                // Cache the result (includes contract key to prevent cross-contract pollution)
-                self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
-                Ok(d)
+                if d.as_ref().is_empty() {
+                    // Empty delta means no change needed — don't cache or broadcast
+                    tracing::trace!(
+                        contract = %key,
+                        "Contract returned empty delta (no change)"
+                    );
+                    Ok(None)
+                } else {
+                    // Cache the result (includes contract key to prevent cross-contract pollution)
+                    self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
+                    Ok(Some(d))
+                }
             }
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
                 Err(format!("Delta computation failed: {}", e))
