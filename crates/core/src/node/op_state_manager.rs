@@ -910,7 +910,7 @@ impl OpManager {
         peer_addr: SocketAddr,
         pub_key: &TransportPublicKey,
     ) -> Vec<(SocketAddr, NetMessage)> {
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(2);
 
         // InterestSync: send our interest hashes for delta-based sync discovery
         let interest_hashes = self.interest_manager.get_all_interest_hashes();
