@@ -16,9 +16,9 @@ bin-dir = "fdev"
 
 [dependencies]
 bytesize = "2.3"
-anyhow = "1"
-axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
-bincode = "1"
+anyhow = { workspace = true }
+axum = { workspace = true, default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"] }
+bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
@@ -28,20 +28,20 @@ futures = { workspace = true }
 glob = "0.3"
 prettytable-rs = "0.10"
 rand = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 serde_with = { workspace = true }
 semver = { workspace = true }
-tar = "0.4"
-thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
-tokio-tungstenite = "0.27.0"
-toml = { version = "0.9", features = ["default", "preserve_order"] }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
+tokio-tungstenite = { workspace = true }
+toml = { workspace = true, features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
-xz2 = { version = "0.1", features = ["tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-http = "1.4"
+xz2 = { workspace = true, features = ["tokio"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+http = { workspace = true }
 
 # internal
 freenet = { path = "../core", version = "0.1.106", features = ["testing"] }

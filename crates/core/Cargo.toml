@@ -19,15 +19,15 @@ name = "freenet"
 path = "src/bin/freenet.rs"
 
 [dependencies]
-ahash = "0.8"
-anyhow = "1"
-aes-gcm = "0.10"
+ahash = { workspace = true }
+anyhow = { workspace = true }
+aes-gcm = { workspace = true }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
-bincode = "1"
+bincode = { workspace = true }
 blake3 = { workspace = true }
-bs58 = "0.5"
-byteorder = "1"
-bytes = { version = "1", features = ["serde"] }
+bs58 = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
@@ -35,99 +35,97 @@ cookie = "0.18"
 crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
-delegate = "0.13"
-directories = "6"
-dirs = "6"
+delegate = { workspace = true }
+directories = { workspace = true }
+dirs = { workspace = true }
 either = { features = ["serde"], workspace = true }
-event-listener = "5"
-flate2 = "1"
-flatbuffers = "25.9"
-futures = "0.3"
-semver = { version = "1",  features = ["serde"] }
-headers = "0.4"
-hex = "0.4"
-hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
+event-listener = { workspace = true }
+flate2 = { workspace = true }
+flatbuffers = { workspace = true }
+futures = { workspace = true }
+semver = { workspace = true }
+headers = { workspace = true }
+hex = { workspace = true }
+hickory-resolver = { workspace = true }
 hostname = "0.4"
-itertools = "0.14"
-notify = "8"
-pav_regression = "0.6.1"
-parking_lot = "0.12"
-pin-project = "1"
+notify = { workspace = true }
+pav_regression = { workspace = true }
+parking_lot = { workspace = true }
+pin-project = { workspace = true }
 rand = { features = ["small_rng"], workspace = true }
-once_cell = "1"
-redb = { optional = true, version = "3" }
+redb = { workspace = true, optional = true }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
-toml = "0.9"
+toml = { workspace = true }
 serde_with = { workspace = true }
-sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version = "0.8" }
-stretto = { features = ["async", "sync"], version = "0.8" }
-tar = { version = "0.4" }
-tempfile = "3"
-thiserror = "2"
-tokio = { features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "process", "tracing", "time", "test-util"], version = "1" }
-tokio-tungstenite = "0.27.0"
-tower-http = { features = ["fs", "trace"], version = "0.6" }
-ulid = { features = ["serde"], version = "1.1" }
-zeroize = { version = "1.8", features = ["derive"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite"], optional = true }
+stretto = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "process", "tracing", "time", "test-util"] }
+tokio-tungstenite = { workspace = true }
+tower-http = { workspace = true }
+ulid = { workspace = true }
+zeroize = { workspace = true }
 wasmer = { features = ["sys", "experimental-async"], workspace = true }
-wasmer-middlewares = "7.0.1"
+wasmer-middlewares = { workspace = true }
 wasmer-compiler-singlepass = { workspace = true }
-xz2 = { version = "0.1" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+xz2 = { workspace = true }
+reqwest = { workspace = true }
 x25519-dalek = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 # Tracing deps
-opentelemetry = "0.31"
-opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
+opentelemetry = { workspace = true }
+opentelemetry-jaeger = { workspace = true, features = ["collector_client", "isahc", "rt-tokio"], optional = true }
 # In release builds, TRACE/DEBUG spans are compiled out entirely via
 # release_max_level_info, reducing the number of spans EnvFilter must evaluate.
 # Debug builds retain all levels. RUST_LOG can filter among compiled-in levels.
-tracing = { version = "0.1", features = ["release_max_level_info"] }
-tracing-opentelemetry = { optional = true, version = "0.32.1" }
-tracing-subscriber = { optional = true, version = "0.3", features = ["json"] }
-tracing-appender = { optional = true, version = "0.2" }
-opentelemetry-otlp = { optional = true, version = "0.31.0" }
-opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"] }
+tracing = { workspace = true, features = ["release_max_level_info"] }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["json"], optional = true }
+tracing-appender = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
-console-subscriber = { version = "0.5.0", optional = true }
-tokio-stream = "0.1.18"
-freenet-test-network = { version = "0.1.22", optional = true }
-turmoil = "0.7"  # Deterministic simulation scheduling (always enabled for SimNetwork)
-lru = "0.16.3"
+console-subscriber = { workspace = true, optional = true }
+tokio-stream = { workspace = true }
+freenet-test-network = { workspace = true, optional = true }
+turmoil = { workspace = true }  # Deterministic simulation scheduling (always enabled for SimNetwork)
+lru = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"  # For sendmmsg syscall batching on Linux
-gag = "1"  # For suppressing libunwind stderr warnings during WASM execution
+libc = { workspace = true }  # For sendmmsg syscall batching on Linux
+gag = { workspace = true }  # For suppressing libunwind stderr warnings during WASM execution
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["sysinfoapi"] }
-wmi = "0.18.1"
-serde = { version = "1.0", features = ["derive"] }
-zip = "7"
+winapi = { workspace = true, features = ["sysinfoapi"] }
+wmi = { workspace = true }
+serde = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
-arbitrary = { features = ["derive"], version = "1" }
-proptest = "1"
+arbitrary = { workspace = true }
+proptest = { workspace = true }
 chrono = { features = ["arbitrary"], workspace = true }
-criterion = { version = "0.8", features = ["async_tokio"] }
+criterion = { workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
-httptest = "0.16"
-libc = "0.2"  # For sendmmsg syscall batching benchmarks
-rstest = "0.26"
-statrs = "0.18"
-tempfile = "3"
-test-log = "0.2"
-testresult.workspace = true
-tokio-tungstenite = "0.27.0"
+httptest = { workspace = true }
+libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
+rstest = { workspace = true }
+statrs = { workspace = true }
+tempfile = { workspace = true }
+test-log = { workspace = true }
+testresult = { workspace = true }
+tokio-tungstenite = { workspace = true }
 # console-subscriber = { version = "0.4" }
-ureq = { version = "3.1", features = ["json"] }
-which = "8.0"
-regex = "1"
+ureq = { workspace = true }
+which = { workspace = true }
+regex = { workspace = true }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
@@ -160,7 +158,7 @@ harness = false
 required-features = ["bench", "bench_full"]
 
 [build-dependencies]
-chrono = "0.4"
+chrono = { workspace = true }
 
 [features]
 default = ["redb", "trace", "websocket"]

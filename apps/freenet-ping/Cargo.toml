@@ -6,8 +6,28 @@ members = ["contracts/ping", "app", "types"]
 # freenet-stdlib = { path = "./../../stdlib/rust", features = ["contract"] }
 freenet-stdlib = { version = "0.1.30" }
 freenet-ping-types = { path = "types", default-features = false }
+
+# Core dependencies
+anyhow = "1"
 chrono = { version = "0.4", default-features = false }
 clap = "4"
+futures = "0.3"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+# Async/networking
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27.0"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Testing
+serial_test = "3"
+test-log = "0.2"
 testresult = "0.4"
 
 [profile.dev.package."*"]

@@ -13,8 +13,8 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, NodeDiagnosticsConfig, NodeQuery, WebApi},
     prelude::*,
 };
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tracing::{error, info};
 
 use crate::util::workspace::get_workspace_target_dir;
@@ -1047,11 +1047,11 @@ mod test {
 }
 
 // Port reservation utilities for integration tests
-static RESERVED_PORTS: Lazy<DashSet<u16>> = Lazy::new(DashSet::new);
+static RESERVED_PORTS: LazyLock<DashSet<u16>> = LazyLock::new(DashSet::new);
 /// Holds sockets to keep ports reserved until explicitly released.
 /// The tuple stores (UdpSocket, TcpListener) for each port.
-static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
-    Lazy::new(DashMap::new);
+static RESERVED_SOCKETS: LazyLock<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
+    LazyLock::new(DashMap::new);
 
 /// Global counter for allocating unique node indices across all parallel tests.
 /// Each test allocates a contiguous block of indices for its nodes.

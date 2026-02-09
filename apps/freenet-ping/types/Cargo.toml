@@ -13,9 +13,9 @@ clap = ["dep:clap"]
 contract = ["freenet-stdlib/contract"]
 
 [dependencies]
-humantime = "2"
+humantime = "2.2.0"
 humantime-serde = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"], optional = true }
 

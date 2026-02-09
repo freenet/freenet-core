@@ -10,30 +10,128 @@ members = [
 ]
 
 [workspace.dependencies]
+# Core utilities
+ahash = "0.8"
+anyhow = "1"
 arrayvec = { version = "0.7", features = ["serde"] }
+bincode = "1"
+byteorder = "1"
+bytes = { version = "1", features = ["serde"] }
+delegate = "0.13"
+either = "1"
+event-listener = "5"
+hex = "0.4"
+parking_lot = "0.12"
+pav_regression = "0.6.1"
+pin-project = "1"
+thiserror = "2"
+ulid = { version = "1.1", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Async/networking
 axum = { version = "0.8", default-features = false }
+futures = "0.3"
+headers = "0.4"
+hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
+http = "1.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.18"
+tokio-tungstenite = "0.27.0"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+# Crypto
+aes-gcm = "0.10"
 blake3 = { version = "1", features = ["std", "traits-preview"] }
 bs58 = "0.5"
 chacha20poly1305 = "0.10"
+sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-chrono = { version = "0.4", default-features = true }
-clap = "4"
+
+# Data structures/storage
 crossbeam = "0.8"
-ctrlc = { version = "3" }
-dashmap = "^6.1"
-either = "1"
-futures = "0.3"
-rand = { version = "0.9" }
-semver = { version = "1",  features = ["serde"] }
+dashmap = "6.1"
+lru = "0.16.3"
+redb = "3"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+stretto = { version = "0.8", features = ["async", "sync"] }
+
+# File I/O
+directories = "6"
+dirs = "6"
+flate2 = "1"
+notify = "8"
+tar = "0.4"
+tempfile = "3"
+xz2 = "0.1"
+
+# Serialization
+flatbuffers = "25.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
-testresult = "0.4"
+toml = "0.9"
+
+# CLI
+clap = "4"
+ctrlc = "3"
+
+# Time
+chrono = { version = "0.4", default-features = true }
+
+# Random
+rand = "0.9"
+
+# Observability
+opentelemetry = "0.31"
+opentelemetry-jaeger = "0.22"
+opentelemetry-otlp = "0.31.0"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 tracing = "0.1"
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = "0.3"
+console-subscriber = "0.5.0"
+
+# WASM
 wasmer = "7.0.1"
 wasmer-compiler-singlepass = "7.0.1"
+wasmer-middlewares = "7.0.1"
 
+# Testing/simulation
+arbitrary = { version = "1", features = ["derive"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+freenet-test-network = "0.1.22"
+httptest = "0.16"
+proptest = "1"
+regex = "1"
+rstest = "0.26"
+serial_test = "3"
+statrs = "0.18"
+test-log = "0.2"
+testresult = "0.4"
+turmoil = "0.7"
+ureq = { version = "3.1", features = ["json"] }
+which = "8.0"
+
+# Versioning
+semver = { version = "1", features = ["serde"] }
+
+# Proc macros
+darling = "0.23"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
+trybuild = "1.0"
+
+# Platform-specific
+libc = "0.2"
+gag = "1"
+winapi = "0.3"
+wmi = "0.18.1"
+zip = "7"
+
+# Freenet
 freenet-stdlib = "0.1.35"
 
 [profile.dev.package."*"]

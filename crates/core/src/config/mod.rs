@@ -15,7 +15,6 @@ use std::{
 use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -390,7 +389,7 @@ impl ConfigArgs {
                         location: cfg.location,
                     })
                 })
-                .try_collect()?;
+                .collect::<Result<Vec<_>, _>>()?;
             Gateways { gateways }
         } else {
             Gateways::default()
