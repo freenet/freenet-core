@@ -126,6 +126,8 @@ trybuild = "1.0"
 
 # Platform-specific
 libc = "0.2"
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 gag = "1"
 winapi = "0.3"
 wmi = "0.18.1"

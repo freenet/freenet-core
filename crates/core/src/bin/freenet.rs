@@ -1,3 +1,7 @@
+#[cfg(all(unix, feature = "jemalloc-prof"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use freenet::{
@@ -146,6 +150,34 @@ async fn run_network_node_with_signals(
         })
     };
 
+    // Spawn a task to handle SIGUSR1 for on-demand jemalloc heap profile dumps.
+    // Send SIGUSR1 to dump a heap profile: kill -USR1 <pid>
+    #[cfg(all(unix, feature = "jemalloc-prof"))]
+    let heap_dump_task = {
+        let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())
+            .context("failed to install SIGUSR1 handler")?;
+        GlobalExecutor::spawn(async move {
+            loop {
+                sigusr1.recv().await;
+                let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let path = format!("/tmp/freenet-heap.{timestamp}.heap");
+                tracing::info!(%path, "SIGUSR1 received, dumping heap profile");
+                match std::ffi::CString::new(path.as_str()) {
+                    Ok(c_path) => {
+                        // prof.dump mallctl expects a *const c_char (pointer to filename)
+                        let ptr: *const libc::c_char = c_path.as_ptr();
+                        let result = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", ptr) };
+                        match result {
+                            Ok(()) => tracing::info!(%path, "Heap profile dumped"),
+                            Err(e) => tracing::error!(error = %e, "Failed to dump heap profile"),
+                        }
+                    }
+                    Err(e) => tracing::error!(error = %e, "Invalid heap dump path"),
+                }
+            }
+        })
+    };
+
     // Spawn a task to monitor for version mismatches and check for updates.
     // This is temporary alpha-testing infrastructure to reduce manual update burden.
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
@@ -208,6 +240,8 @@ async fn run_network_node_with_signals(
     // Clean up tasks
     signal_task.abort();
     update_check_task.abort();
+    #[cfg(all(unix, feature = "jemalloc-prof"))]
+    heap_dump_task.abort();
 
     // Allow time for channels to drain and tasks to clean up.
     // 100ms was insufficient; 2s gives spawned tasks time to notice cancellation

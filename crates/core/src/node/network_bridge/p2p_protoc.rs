@@ -667,6 +667,20 @@ impl P2pConnManager {
                     active_connections = ctx.connections.len(),
                     "Event loop stats"
                 );
+
+                #[cfg(all(unix, feature = "jemalloc-prof"))]
+                {
+                    use tikv_jemalloc_ctl::{epoch, stats};
+                    epoch::advance().ok();
+                    let allocated = stats::allocated::read().unwrap_or(0);
+                    let resident = stats::resident::read().unwrap_or(0);
+                    tracing::info!(
+                        allocated_mb = allocated / (1024 * 1024),
+                        resident_mb = resident / (1024 * 1024),
+                        "jemalloc memory stats"
+                    );
+                }
+
                 loop_iteration_count = 0;
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
