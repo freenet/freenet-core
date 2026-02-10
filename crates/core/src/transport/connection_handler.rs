@@ -1310,7 +1310,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                         // Failed gateway connection
                         Err((error, remote_addr)) => {
-                            tracing::debug!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
+                            tracing::info!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
                                 crate::transport::signal_version_mismatch();
