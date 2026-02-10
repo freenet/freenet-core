@@ -1069,19 +1069,20 @@ mod tests {
             let err = ExecutorError::other(anyhow::anyhow!("not a request"));
             let _unwrapped = err.unwrap_request(); // Should panic
         }
-    }
 
-    #[test]
-    fn test_max_compute_time_exceeded_is_not_fatal() {
-        use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
-        let contract_err: ContractError =
-            RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded).into();
-        // op: None simulates validate_state() path where the bug manifested
-        let err = ExecutorError::execution(contract_err, None);
-        assert!(
-            !err.is_fatal(),
-            "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
-        );
+        #[test]
+        fn test_max_compute_time_exceeded_is_not_fatal() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+                    .into();
+            // op: None simulates validate_state() path where the bug manifested
+            let err = ExecutorError::execution(contract_err, None);
+            assert!(
+                !err.is_fatal(),
+                "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
+            );
+        }
     }
 
     mod test_fixtures_tests {
