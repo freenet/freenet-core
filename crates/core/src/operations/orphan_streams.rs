@@ -40,15 +40,18 @@ use crate::transport::peer_connection::StreamId;
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.
-pub const ORPHAN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Must be >= STREAM_CLAIM_TIMEOUT to avoid races where a waiter registers
+/// just as the orphan is being cleaned up.
+pub const ORPHAN_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default timeout when waiting for a stream to arrive after metadata.
 ///
-/// On resource-constrained CI runners, stream fragments can be delayed by
-/// seconds due to CPU contention and network virtualization overhead.
-/// 30 seconds provides enough headroom while still failing promptly on
+/// On resource-constrained CI runners, stream fragments can be delayed
+/// significantly due to CPU contention (8 nodes doing WASM compilation
+/// simultaneously), transport-level rate limiting, and Docker NAT overhead.
+/// 60 seconds provides enough headroom while still failing promptly on
 /// genuinely broken connections.
-pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Registry for handling race conditions between stream fragments and metadata messages.
 ///
