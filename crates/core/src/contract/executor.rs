@@ -32,8 +32,8 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
-    ContractExecError, ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface,
-    DelegateStore, Runtime, SecretsStore, StateStorage, StateStore, StateStoreError,
+    ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
+    SecretsStore, StateStorage, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -137,11 +137,7 @@ impl ExecutorError {
         use crate::wasm_runtime::RuntimeInnerError;
         let error = outer_error.deref();
 
-        let mut fatal = false;
         if let RuntimeInnerError::ContractExecError(e) = error {
-            if matches!(e, ContractExecError::MaxComputeTimeExceeded) {
-                fatal = true;
-            }
             if let Some(InnerOpError::Upsert(key)) = &op {
                 return ExecutorError::request(StdContractError::update_exec_error(*key, e));
             }
@@ -177,9 +173,7 @@ impl ExecutorError {
             }
         }
 
-        let mut err = ExecutorError::other(outer_error);
-        err.fatal = fatal;
-        err
+        ExecutorError::other(outer_error)
     }
 
     pub fn is_request(&self) -> bool {
@@ -1075,6 +1069,19 @@ mod tests {
             let err = ExecutorError::other(anyhow::anyhow!("not a request"));
             let _unwrapped = err.unwrap_request(); // Should panic
         }
+    }
+
+    #[test]
+    fn test_max_compute_time_exceeded_is_not_fatal() {
+        use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+        let contract_err: ContractError =
+            RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded).into();
+        // op: None simulates validate_state() path where the bug manifested
+        let err = ExecutorError::execution(contract_err, None);
+        assert!(
+            !err.is_fatal(),
+            "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
+        );
     }
 
     mod test_fixtures_tests {
