@@ -240,6 +240,21 @@ impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
 
 impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
     fn drop(&mut self) {
+        // Cancel all active streaming handles so that any operation blocked on
+        // stream_handle.assemble().await will receive StreamError::Cancelled
+        // instead of waiting forever for fragments that will never arrive.
+        let stream_count = self.streaming_handles.len();
+        if stream_count > 0 {
+            tracing::debug!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_count,
+                "Cancelling streaming handles on connection drop"
+            );
+            for handle in self.streaming_handles.values() {
+                handle.cancel();
+            }
+        }
+
         if let Some(handle) = self.keep_alive_handle.take() {
             tracing::debug!(
                 peer_addr = %self.remote_conn.remote_addr,

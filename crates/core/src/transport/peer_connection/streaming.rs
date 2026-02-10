@@ -40,6 +40,14 @@ use tokio::sync::mpsc;
 use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
 
+/// No new fragments arrived within this duration → assume the stream is dead.
+///
+/// This covers cases where the sending peer's connection died but the local
+/// PeerConnection hasn't been torn down yet (e.g., one-directional path failure,
+/// slow liveness detection). 30 seconds is generous — even at the reduced 10%
+/// send rate, fragments arrive every few seconds for active transfers.
+pub const STREAM_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Error type for streaming operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
@@ -49,6 +57,8 @@ pub enum StreamError {
     NotFound,
     /// Invalid fragment received.
     InvalidFragment { message: String },
+    /// No fragments arrived within the inactivity timeout.
+    InactivityTimeout,
 }
 
 impl std::fmt::Display for StreamError {
@@ -58,6 +68,9 @@ impl std::fmt::Display for StreamError {
             StreamError::NotFound => write!(f, "stream not found in registry"),
             StreamError::InvalidFragment { message } => {
                 write!(f, "invalid fragment: {}", message)
+            }
+            StreamError::InactivityTimeout => {
+                write!(f, "no fragments received within inactivity timeout")
             }
         }
     }
@@ -305,6 +318,11 @@ impl StreamHandle {
     ///
     /// This is useful when you don't need incremental processing.
     /// Uses the buffer's built-in Notify for efficient async waiting.
+    ///
+    /// Includes an inactivity timeout ([`STREAM_INACTIVITY_TIMEOUT`]): if no new
+    /// fragment arrives within the timeout window, returns
+    /// [`StreamError::InactivityTimeout`]. This prevents operations from hanging
+    /// forever when the sending peer's connection dies mid-transfer.
     pub async fn assemble(&self) -> Result<Vec<u8>, StreamError> {
         loop {
             // Check cancelled state
@@ -331,9 +349,33 @@ impl StreamHandle {
                 );
             }
 
-            // Wait for notification using buffer's lock-free Event
-            // This is safe because we're not holding any lock across the await
-            self.buffer.notifier().listen().await;
+            // Wait for notification with inactivity timeout.
+            // Each arriving fragment triggers a notification, so the timeout resets
+            // on every fragment. Only fires when the stream is truly stalled.
+            match tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, self.buffer.notifier().listen())
+                .await
+            {
+                Ok(()) => { /* fragment arrived or stream cancelled — loop to check */ }
+                Err(_) => {
+                    // Re-check before declaring timeout — a fragment may have arrived
+                    // in the race window between is_complete()/listen() above (TOCTOU).
+                    if self.sync.read().cancelled {
+                        return Err(StreamError::Cancelled);
+                    }
+                    if let Some(data) = self.buffer.assemble() {
+                        return Ok(data);
+                    }
+                    tracing::warn!(
+                        stream_id = %self.stream_id.0,
+                        total_bytes = self.total_bytes,
+                        received_fragments = self.buffer.inserted_count(),
+                        total_fragments = self.buffer.total_fragments(),
+                        timeout_secs = STREAM_INACTIVITY_TIMEOUT.as_secs(),
+                        "Stream assembly timed out — no fragments received within inactivity window"
+                    );
+                    return Err(StreamError::InactivityTimeout);
+                }
+            }
         }
     }
 }
@@ -792,6 +834,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_assemble_inactivity_timeout() {
+        // Create a stream that will never receive all its fragments.
+        // assemble() should return InactivityTimeout after STREAM_INACTIVITY_TIMEOUT.
+        let handle = StreamHandle::new(make_stream_id(), 1000);
+
+        // Push one fragment but not enough to complete (needs ~1000 bytes)
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 100]))
+            .unwrap();
+
+        // Use tokio::time::pause to avoid actually waiting 30 seconds
+        tokio::time::pause();
+
+        let result = handle.assemble().await;
+        assert!(
+            matches!(result, Err(StreamError::InactivityTimeout)),
+            "Expected InactivityTimeout, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assemble_timeout_resets_per_fragment() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        // Verify the timeout is per-fragment (resets on each arrival), not absolute.
+        // Send fragments with 20-second gaps (under the 30s timeout) — should succeed.
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        tokio::time::pause();
+
+        let handle_clone = handle.clone();
+        let producer = GlobalExecutor::spawn(async move {
+            for i in 1..=3u32 {
+                // 20 seconds between fragments — under the 30s inactivity timeout
+                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                handle_clone
+                    .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+        });
+
+        // Total wall time: 60 seconds (3 × 20s), but no single gap exceeds 30s
+        let result = handle.assemble().await;
+        producer.await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "Slow-but-active stream should succeed: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap().len(), total as usize);
+    }
+
+    #[tokio::test]
     async fn test_multiple_independent_streams() {
         use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 
@@ -1186,6 +1284,12 @@ mod tests {
             message: "test error".into(),
         };
         assert_eq!(format!("{}", invalid), "invalid fragment: test error");
+
+        let timeout = StreamError::InactivityTimeout;
+        assert_eq!(
+            format!("{}", timeout),
+            "no fragments received within inactivity timeout"
+        );
     }
 
     // ==================== Auto-Reclaim Tests ====================
