@@ -354,7 +354,14 @@ impl Runtime {
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                cache.put(*key, module.clone());
+                if let Some((evicted_key, _)) = cache.push(*key, module.clone()) {
+                    tracing::warn!(
+                        evicted_contract = %evicted_key,
+                        cache_capacity = cache.cap().get(),
+                        "Module cache eviction — wasmer code_memory will grow. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                    );
+                }
                 module
             }
         };
@@ -393,7 +400,14 @@ impl Runtime {
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                cache.put(key.clone(), module.clone());
+                if let Some((evicted_key, _)) = cache.push(key.clone(), module.clone()) {
+                    tracing::warn!(
+                        evicted_delegate = %evicted_key,
+                        cache_capacity = cache.cap().get(),
+                        "Delegate cache eviction — wasmer code_memory will grow. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                    );
+                }
                 module
             }
         };
