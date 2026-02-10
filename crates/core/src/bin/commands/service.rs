@@ -155,14 +155,8 @@ fn has_user_service() -> bool {
 /// which service file exists, defaulting to user mode.
 #[cfg(target_os = "linux")]
 fn use_system_mode(system_flag: bool) -> bool {
-    if system_flag {
-        return true;
-    }
     // Auto-detect: if only system service exists, use system mode
-    if has_system_service() && !has_user_service() {
-        return true;
-    }
-    false
+    system_flag || (has_system_service() && !has_user_service())
 }
 
 /// Run a systemctl command, using --user or not based on system mode.
@@ -181,31 +175,37 @@ fn systemctl(system_mode: bool, args: &[&str]) -> Result<std::process::ExitStatu
 #[cfg(target_os = "linux")]
 fn systemctl_with_hint(system_mode: bool, args: &[&str], action: &str) -> Result<()> {
     let status = systemctl(system_mode, args)?;
-    if !status.success() && !system_mode {
-        // Check if this looks like a user session bus issue
-        let output = std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .stderr(std::process::Stdio::piped())
-            .output();
-        let hint = if let Ok(out) = output {
+    if status.success() {
+        return Ok(());
+    }
+
+    if system_mode {
+        anyhow::bail!("Failed to {action}");
+    }
+
+    // Check if this looks like a user session bus issue
+    let hint = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()
+        .and_then(|out| {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains("bus")
                 || stderr.contains("XDG_RUNTIME_DIR")
                 || stderr.contains("Failed to connect")
             {
-                "\n\nHint: User systemd session not available (common in containers/LXC).\n\
-                 Try: sudo freenet service install --system"
+                Some(
+                    "\n\nHint: User systemd session not available (common in containers/LXC).\n\
+                     Try: sudo freenet service install --system",
+                )
             } else {
-                ""
+                None
             }
-        } else {
-            ""
-        };
-        anyhow::bail!("Failed to {action}{hint}");
-    } else if !status.success() {
-        anyhow::bail!("Failed to {action}");
-    }
-    Ok(())
+        })
+        .unwrap_or("");
+
+    anyhow::bail!("Failed to {action}{hint}");
 }
 
 #[cfg(target_os = "linux")]
@@ -657,7 +657,7 @@ fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     )
 }
 
-/// Helper macro: bail with "--system not supported on macOS" for commands that don't apply.
+/// Bail with "--system not supported on macOS" for commands that don't apply.
 #[cfg(target_os = "macos")]
 fn check_no_system_flag(system: bool) -> Result<()> {
     if system {
