@@ -5,7 +5,7 @@ use super::{
     STALE_INIT_THRESHOLD,
 };
 use crate::node::OpManager;
-use crate::wasm_runtime::{SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY};
+use crate::wasm_runtime::{BackendEngine, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY};
 use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
 use std::collections::HashMap;
@@ -126,6 +126,13 @@ pub struct RuntimePool {
     shared_contract_modules: SharedModuleCache<ContractKey>,
     /// Shared compiled delegate module cache.
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
+    /// Shared backend engine (wasmer EngineInner via Arc) used by all executors.
+    ///
+    /// All executors MUST share the same backend engine because wasmer Artifacts
+    /// store function pointers and signature indices that reference the compiling
+    /// Engine's internal data structures. Using a Module compiled by one Engine
+    /// in a Store backed by a different Engine causes SIGSEGV.
+    shared_backend_engine: BackendEngine,
 }
 
 impl RuntimePool {
@@ -163,7 +170,26 @@ impl RuntimePool {
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
 
-        for i in 0..pool_size_usize {
+        // Create the first executor to obtain a backend engine, then share it
+        // with all subsequent executors. All executors MUST share the same backend
+        // engine because wasmer Artifacts store function pointers and signature
+        // indices tied to the compiling Engine's internal data structures.
+        let mut first_executor = Executor::from_config_with_shared_modules(
+            config.clone(),
+            shared_state_store.clone(),
+            Some(op_sender.clone()),
+            Some(op_manager.clone()),
+            shared_contract_modules.clone(),
+            shared_delegate_modules.clone(),
+            None, // No shared backend yet — this executor creates the engine
+        )
+        .await?;
+        let shared_backend_engine = first_executor.runtime.clone_backend_engine();
+        first_executor
+            .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+        runtimes.push(Some(first_executor));
+
+        for i in 1..pool_size_usize {
             let mut executor = Executor::from_config_with_shared_modules(
                 config.clone(),
                 shared_state_store.clone(),
@@ -171,6 +197,7 @@ impl RuntimePool {
                 Some(op_manager.clone()),
                 shared_contract_modules.clone(),
                 shared_delegate_modules.clone(),
+                Some(shared_backend_engine.clone()),
             )
             .await?;
 
@@ -202,6 +229,7 @@ impl RuntimePool {
             shared_summaries,
             shared_contract_modules,
             shared_delegate_modules,
+            shared_backend_engine,
         })
     }
 
@@ -322,6 +350,7 @@ impl RuntimePool {
             Some(self.op_manager.clone()),
             self.shared_contract_modules.clone(),
             self.shared_delegate_modules.clone(),
+            Some(self.shared_backend_engine.clone()),
         )
         .await?;
 
@@ -1134,7 +1163,12 @@ impl Executor<Runtime> {
         .await
     }
 
-    /// Create an executor that shares compiled module caches with other pool executors.
+    /// Create an executor that shares compiled module caches and backend engine
+    /// with other pool executors.
+    ///
+    /// If `shared_backend` is `None`, a new backend engine is created (used for
+    /// the first executor in a pool). If `Some`, the provided engine is shared
+    /// (used for subsequent executors and replacements).
     pub(crate) async fn from_config_with_shared_modules(
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
@@ -1142,6 +1176,7 @@ impl Executor<Runtime> {
         op_manager: Option<Arc<OpManager>>,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
+        shared_backend: Option<BackendEngine>,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
         let (contract_store, delegate_store, secret_store) =
@@ -1153,6 +1188,11 @@ impl Executor<Runtime> {
             false,
             contract_modules,
             delegate_modules,
+            shared_backend.unwrap_or_else(|| {
+                // First executor — create a fresh backend engine; RuntimePool
+                // will extract and share it with subsequent executors.
+                crate::wasm_runtime::engine::Engine::create_backend_engine()
+            }),
         )
         .unwrap();
         rt.set_state_store_db(db);

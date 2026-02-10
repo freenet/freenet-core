@@ -19,6 +19,7 @@ pub(crate) use contract::ContractRuntimeInterface;
 pub use contract_store::ContractStore;
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;
+pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub(crate) use runtime::SharedModuleCache;

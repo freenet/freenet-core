@@ -424,6 +424,62 @@ impl WasmEngine for WasmerEngine {
 // =============================================================================
 
 impl WasmerEngine {
+    /// Create a standalone backend engine with default configuration.
+    ///
+    /// Used by the first executor in a RuntimePool when no shared engine exists yet.
+    pub(crate) fn create_backend_engine() -> wasmer::Engine {
+        let store = Self::create_store(&RuntimeConfig::default());
+        store.engine().clone()
+    }
+
+    /// Get a clone of the underlying wasmer engine for sharing with other instances.
+    ///
+    /// The clone shares the same `EngineInner` (code_memory, signature registry,
+    /// compiler) via Arc. This is REQUIRED when sharing compiled Modules across
+    /// WasmerEngine instances, because wasmer `Artifact`s store function pointers
+    /// and signature indices that reference the compiling Engine's internal data.
+    pub(crate) fn clone_backend_engine(&self) -> wasmer::Engine {
+        self.store
+            .as_ref()
+            .expect("engine must be healthy to share")
+            .engine()
+            .clone()
+    }
+
+    /// Create a new WasmerEngine that shares the backend engine with other instances.
+    ///
+    /// The shared engine ensures all instances use the same code_memory and signature
+    /// registry, making it safe to share compiled Modules across instances.
+    pub(crate) fn new_with_shared_backend(
+        config: &RuntimeConfig,
+        host_mem: bool,
+        backend: wasmer::Engine,
+    ) -> Result<Self, ContractError> {
+        let mut store = Store::new(backend);
+        let (host_memory, mut top_level_imports) = if host_mem {
+            let mem = Self::create_host_memory(&mut store)?;
+            let imports = imports! {
+                "env" => {
+                    "memory" =>  mem.clone(),
+                },
+            };
+            (Some(mem), imports)
+        } else {
+            (None, imports! {})
+        };
+
+        Self::register_host_functions(&mut store, &mut top_level_imports);
+
+        Ok(Self {
+            store: Some(store),
+            imports: top_level_imports,
+            host_memory,
+            instances: HashMap::new(),
+            max_execution_seconds: config.max_execution_seconds,
+            enabled_metering: config.enable_metering,
+        })
+    }
+
     fn create_store(config: &RuntimeConfig) -> Store {
         fn get_cpu_cycles_per_second() -> (u64, f64) {
             const DEFAULT_CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;

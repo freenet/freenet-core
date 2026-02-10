@@ -197,3 +197,12 @@ pub(crate) trait WasmEngine: Send {
 
 // Backend selection via type alias — no generics leak outside wasm_runtime/
 pub(crate) type Engine = wasmer_engine::WasmerEngine;
+
+/// The underlying wasmer engine type shared across RuntimePool executors.
+///
+/// All executors in a pool MUST share the same backend engine because wasmer
+/// `Artifact`s store function pointers and signature indices that reference
+/// the compiling Engine's internal data structures (code_memory, SignatureRegistry).
+/// Using a Module compiled by one Engine in a Store backed by a different Engine
+/// can cause SIGSEGV.
+pub(crate) type BackendEngine = wasmer::Engine;

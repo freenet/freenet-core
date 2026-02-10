@@ -2,7 +2,7 @@ use super::{
     contract_store::ContractStore,
     delegate_api::DelegateApiVersion,
     delegate_store::DelegateStore,
-    engine::{Engine, InstanceHandle, WasmEngine},
+    engine::{BackendEngine, Engine, InstanceHandle, WasmEngine},
     error::RuntimeInnerError,
     native_api,
     secrets_store::SecretsStore,
@@ -196,6 +196,11 @@ impl Runtime {
         self.engine.is_healthy()
     }
 
+    /// Get a clone of the backend engine for sharing with other runtimes.
+    pub(crate) fn clone_backend_engine(&self) -> BackendEngine {
+        self.engine.clone_backend_engine()
+    }
+
     /// Set the state storage backend for V2 delegate contract access.
     pub fn set_state_store_db(&mut self, db: crate::contract::storages::Storage) {
         self.state_store_db = Some(db);
@@ -241,11 +246,21 @@ impl Runtime {
         )
     }
 
-    /// Build a runtime that shares compiled module caches with other runtimes.
+    /// Build a runtime that shares compiled module caches AND the backend engine
+    /// with other runtimes.
     ///
     /// Used by `RuntimePool` to avoid duplicating compiled WASM modules across
-    /// pool executors. Each executor gets its own `Engine` (wasmer Store +
-    /// instances), but all share the same compiled module cache.
+    /// pool executors. Each executor gets its own Store (wasmer runtime state:
+    /// memories, globals, instances), but all share the same backend engine
+    /// (code_memory, signature registry, compiler) and module cache.
+    ///
+    /// # Safety requirement
+    ///
+    /// All runtimes sharing a module cache MUST use the same backend engine.
+    /// Wasmer `Artifact`s store function pointers and signature indices that
+    /// reference the compiling Engine's internal data structures. Using a Module
+    /// compiled by one Engine in a Store backed by a different Engine causes
+    /// SIGSEGV.
     pub(crate) fn build_with_shared_module_caches(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
@@ -253,8 +268,10 @@ impl Runtime {
         host_mem: bool,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
+        shared_backend: BackendEngine,
     ) -> RuntimeResult<Self> {
-        let engine = Engine::new(&RuntimeConfig::default(), host_mem)?;
+        let engine =
+            Engine::new_with_shared_backend(&RuntimeConfig::default(), host_mem, shared_backend)?;
         Ok(Self {
             engine,
             secret_store,
