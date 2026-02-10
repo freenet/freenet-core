@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 /// Marker string used to identify EmptyRing errors without needing to modify freenet-stdlib.
 /// If this string changes in ring/mod.rs, update it here too.
 const EMPTY_RING_ERROR: &str = "No ring connections found";
+const PEER_NOT_JOINED_ERROR: &str = "PEER_NOT_JOINED";
 
 #[derive(Debug)]
 pub(super) enum WebSocketApiError {
@@ -64,10 +65,10 @@ impl From<WebSocketApiError> for Response {
 
 impl IntoResponse for WebSocketApiError {
     fn into_response(self) -> Response {
-        // Check for EmptyRing error (peer still connecting to network)
+        // Check for errors that indicate the peer is still connecting to the network
         if let WebSocketApiError::AxumError { ref error } = self {
             let error_str = format!("{error}");
-            if error_str.contains(EMPTY_RING_ERROR) {
+            if error_str.contains(EMPTY_RING_ERROR) || error_str.contains(PEER_NOT_JOINED_ERROR) {
                 return (StatusCode::SERVICE_UNAVAILABLE, Html(connecting_page())).into_response();
             }
         }
