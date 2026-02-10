@@ -32,8 +32,8 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
-    ContractExecError, ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface,
-    DelegateStore, Runtime, SecretsStore, StateStorage, StateStore, StateStoreError,
+    ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
+    SecretsStore, StateStorage, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -137,11 +137,7 @@ impl ExecutorError {
         use crate::wasm_runtime::RuntimeInnerError;
         let error = outer_error.deref();
 
-        let mut fatal = false;
         if let RuntimeInnerError::ContractExecError(e) = error {
-            if matches!(e, ContractExecError::MaxComputeTimeExceeded) {
-                fatal = true;
-            }
             if let Some(InnerOpError::Upsert(key)) = &op {
                 return ExecutorError::request(StdContractError::update_exec_error(*key, e));
             }
@@ -177,9 +173,7 @@ impl ExecutorError {
             }
         }
 
-        let mut err = ExecutorError::other(outer_error);
-        err.fatal = fatal;
-        err
+        ExecutorError::other(outer_error)
     }
 
     pub fn is_request(&self) -> bool {
@@ -690,6 +684,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// Notify all subscribed clients for a contract that the subscription has failed.
     fn notify_subscription_error(&self, key: ContractInstanceId, reason: String);
 
+    /// Remove all subscriptions for a disconnected client.
+    ///
+    /// Default implementation is a no-op (for mock executors that don't track subscriptions).
+    fn remove_client(&self, _client_id: ClientId) {}
+
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
         &mut self,
@@ -1074,6 +1073,20 @@ mod tests {
         fn test_unwrap_request_panics_for_other_error() {
             let err = ExecutorError::other(anyhow::anyhow!("not a request"));
             let _unwrapped = err.unwrap_request(); // Should panic
+        }
+
+        #[test]
+        fn test_max_compute_time_exceeded_is_not_fatal() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+                    .into();
+            // op: None simulates validate_state() path where the bug manifested
+            let err = ExecutorError::execution(contract_err, None);
+            assert!(
+                !err.is_fatal(),
+                "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
+            );
         }
     }
 

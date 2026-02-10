@@ -646,7 +646,11 @@ where
                     );
                 }
             }
-            _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
+            ContractHandlerEvent::ClientDisconnect { client_id } => {
+                contract_handler.executor().remove_client(client_id);
+                contract_handler.channel().drop_waiting_response(id);
+            }
+            _ => unreachable!("response events should not be received by the handler"),
         }
     }
 }

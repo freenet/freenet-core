@@ -236,9 +236,7 @@ pub enum SessionMessage {
         response: Arc<HostResult>,
         request_id: RequestId,
     },
-    #[allow(dead_code)]
     ClientDisconnect {
-        #[allow(dead_code)]
         client_id: ClientId,
     },
 }
@@ -331,6 +329,25 @@ impl ContractHandlerChannel<SenderHalve> {
             Ok(Ok((_, res))) => Ok(res),
             Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
         }
+    }
+
+    /// Send an event to the contract handler without waiting for a response.
+    ///
+    /// Used for fire-and-forget events like `ClientDisconnect` that don't
+    /// produce a response.
+    pub fn send_to_handler_fire_and_forget(
+        &self,
+        ev: ContractHandlerEvent,
+    ) -> Result<(), ContractError> {
+        let id = EV_ID.fetch_add(1, SeqCst);
+        // Create a oneshot but immediately drop the receiver — the handler
+        // won't send a response, and if it does, the send will harmlessly fail.
+        let (result, _) = tokio::sync::oneshot::channel();
+        self.end
+            .event_sender
+            .send(InternalCHEvent { ev, id, result })
+            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
+        Ok(())
     }
 
     /// Install session adapter for migration
@@ -455,6 +472,15 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
         }
     }
 
+    /// Drop the waiting-response entry for a fire-and-forget event.
+    ///
+    /// The sender side already dropped the oneshot receiver, so there is
+    /// nothing to send back. This just prevents the entry from leaking in
+    /// the `waiting_response` map.
+    pub fn drop_waiting_response(&mut self, id: EventId) {
+        self.end.waiting_response.remove(&id.id);
+    }
+
     pub async fn recv_from_sender(
         &mut self,
     ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
@@ -566,6 +592,11 @@ pub(crate) enum ContractHandlerEvent {
     },
     /// Response to NotifySubscriptionError
     NotifySubscriptionErrorResponse,
+    /// A client has disconnected — clean up its entries in shared_summaries
+    /// and shared_notifications. Fire-and-forget: no response is sent.
+    ClientDisconnect {
+        client_id: ClientId,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -679,6 +710,9 @@ impl std::fmt::Display for ContractHandlerEvent {
             }
             ContractHandlerEvent::NotifySubscriptionErrorResponse => {
                 write!(f, "notify subscription error response")
+            }
+            ContractHandlerEvent::ClientDisconnect { client_id } => {
+                write!(f, "client disconnect {{ {client_id} }}")
             }
         }
     }

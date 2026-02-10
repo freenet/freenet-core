@@ -33,26 +33,22 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 /// This limits how many compiled contract/delegate modules are kept in memory.
 /// When a cache is full, the least recently used module is evicted.
 ///
-/// **Current value: 128 modules per cache**
+/// **Current value: 1024 modules per cache**
 ///
 /// # Trade-offs
 ///
 /// - Higher capacity = more memory usage, but fewer recompilations
 /// - Lower capacity = less memory usage, but more recompilation overhead
 ///
-/// Recompilation is relatively expensive (~10-100ms per module), so the cache
-/// should be large enough to hold the "working set" of frequently-used contracts.
+/// Recompilation is expensive (~10-100ms per module) and wasmer's Engine
+/// accumulates compiled code in internal `code_memory` that is never freed
+/// until the Engine is dropped. Cache evictions trigger recompilation which
+/// grows `code_memory` without bound. The capacity should be large enough
+/// to hold the entire working set to avoid eviction-recompilation cycles.
 ///
-/// # Memory Impact
-///
-/// Each compiled `Module` consumes memory proportional to the contract's complexity.
-/// A typical compiled module is 100KB-1MB.
-///
-/// **Note:** The runtime maintains TWO separate caches (contracts and delegates),
-/// so total memory usage is approximately:
-/// - With 128 capacity: 2 × (12-128 MB) = **24-256 MB** total
-/// - With 256 capacity: 2 × (25-256 MB) = **50-512 MB** total
-pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 128;
+/// On production gateways (~92 contracts as of Feb 2026), 1024 is well above
+/// the working set and eliminates cache eviction entirely.
+pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 
 /// A live WASM instance with RAII cleanup.
 ///
@@ -326,8 +322,10 @@ impl Runtime {
         // Check shared cache first (lock held briefly for Arc clone)
         let cached = self.contract_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
+            tracing::debug!(contract = %key, "Module cache hit");
             module
         } else {
+            tracing::info!(contract = %key, "Module cache miss — compiling");
             // Cache miss — compile outside the lock to avoid blocking other executors
             let contract = self
                 .contract_store
@@ -379,8 +377,10 @@ impl Runtime {
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
         let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
+            tracing::debug!(delegate = %key, "Module cache hit");
             module
         } else {
+            tracing::info!(delegate = %key, "Module cache miss — compiling");
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)

@@ -543,6 +543,50 @@ impl ContractExecutor for RuntimePool {
         }
     }
 
+    /// Remove all subscriptions for a disconnected client.
+    ///
+    /// Cleans up both notification channels and stored summaries across all contracts.
+    /// Without this, disconnected clients leak entries in shared_summaries and
+    /// shared_notifications indefinitely.
+    fn remove_client(&self, client_id: ClientId) {
+        let mut removed_notifications = 0usize;
+        let mut removed_summaries = 0usize;
+
+        // Clean shared_notifications
+        {
+            let mut notifications = self.shared_notifications.write().unwrap();
+            for (_contract, channels) in notifications.iter_mut() {
+                if let Ok(i) = channels.binary_search_by_key(&&client_id, |(id, _)| id) {
+                    channels.remove(i);
+                    removed_notifications += 1;
+                }
+            }
+            // Remove contracts with no remaining subscribers
+            notifications.retain(|_, channels| !channels.is_empty());
+        }
+
+        // Clean shared_summaries
+        {
+            let mut summaries = self.shared_summaries.write().unwrap();
+            for (_contract, client_summaries) in summaries.iter_mut() {
+                if client_summaries.remove(&client_id).is_some() {
+                    removed_summaries += 1;
+                }
+            }
+            // Remove contracts with no remaining summaries
+            summaries.retain(|_, client_summaries| !client_summaries.is_empty());
+        }
+
+        if removed_notifications > 0 || removed_summaries > 0 {
+            tracing::info!(
+                client = %client_id,
+                removed_notifications,
+                removed_summaries,
+                "Cleaned up subscriptions for disconnected client"
+            );
+        }
+    }
+
     async fn summarize_contract_state(
         &mut self,
         key: ContractKey,

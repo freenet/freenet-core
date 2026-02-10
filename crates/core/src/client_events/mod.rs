@@ -1690,6 +1690,18 @@ async fn process_open_request(
                         "Cleaned up client subscriptions and interest tracking"
                     );
                 }
+
+                // Notify contract handler to clean up shared_summaries and
+                // shared_notifications for this client (fire-and-forget — no response needed).
+                if let Err(err) = op_manager.ch_outbound.send_to_handler_fire_and_forget(
+                    ContractHandlerEvent::ClientDisconnect { client_id },
+                ) {
+                    tracing::warn!(
+                        %client_id,
+                        error = %err,
+                        "Failed to notify contract handler of client disconnect"
+                    );
+                }
             }
             ClientRequest::NodeQueries(query) => {
                 tracing::debug!(
