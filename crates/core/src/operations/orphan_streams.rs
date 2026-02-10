@@ -43,7 +43,12 @@ use crate::transport::peer_connection::StreamId;
 pub const ORPHAN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default timeout when waiting for a stream to arrive after metadata.
-pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// On resource-constrained CI runners, stream fragments can be delayed by
+/// seconds due to CPU contention and network virtualization overhead.
+/// 30 seconds provides enough headroom while still failing promptly on
+/// genuinely broken connections.
+pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Registry for handling race conditions between stream fragments and metadata messages.
 ///

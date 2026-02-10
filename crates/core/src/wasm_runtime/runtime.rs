@@ -348,11 +348,15 @@ impl Runtime {
                 _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
-            self.contract_modules
-                .lock()
-                .unwrap()
-                .put(*key, module.clone());
-            module
+            // Re-check cache: another executor may have compiled this contract
+            // while we were blocked on the shared Engine Mutex during compilation.
+            let mut cache = self.contract_modules.lock().unwrap();
+            if let Some(existing) = cache.get(key).cloned() {
+                existing
+            } else {
+                cache.put(*key, module.clone());
+                module
+            }
         };
         RunningInstance::new(
             &mut self.engine,
@@ -383,11 +387,15 @@ impl Runtime {
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
             let module = self.engine.compile(&code)?;
-            self.delegate_modules
-                .lock()
-                .unwrap()
-                .put(key.clone(), module.clone());
-            module
+            // Re-check cache: another executor may have compiled this delegate
+            // while we were blocked on the shared Engine Mutex during compilation.
+            let mut cache = self.delegate_modules.lock().unwrap();
+            if let Some(existing) = cache.get(key).cloned() {
+                existing
+            } else {
+                cache.put(key.clone(), module.clone());
+                module
+            }
         };
 
         let api_version = if self.engine.module_has_async_imports(&module) {
