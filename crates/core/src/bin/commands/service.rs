@@ -1,7 +1,7 @@
 //! System service management for Freenet.
 //!
 //! Supports:
-//! - Linux: systemd user service
+//! - Linux: systemd user service (default) or system-wide service (--system)
 //! - macOS: launchd user agent
 
 use anyhow::{Context, Result};
@@ -61,17 +61,43 @@ fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::Pa
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
     /// Install Freenet as a system service
-    Install,
+    Install {
+        /// Install as a system-wide service instead of a user service.
+        /// Requires root. Use this for containers (LXC/Docker), headless
+        /// servers, or environments without a user session bus.
+        #[arg(long)]
+        system: bool,
+    },
     /// Uninstall the Freenet system service
-    Uninstall,
+    Uninstall {
+        /// Uninstall the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// Check the status of the Freenet service
-    Status,
+    Status {
+        /// Check the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// Start the Freenet service
-    Start,
+    Start {
+        /// Start the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// Stop the Freenet service
-    Stop,
+    Stop {
+        /// Stop the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// Restart the Freenet service
-    Restart,
+    Restart {
+        /// Restart the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// View service logs (follows new output)
     Logs {
         /// Show only error logs
@@ -92,12 +118,12 @@ impl ServiceCommand {
         config_dirs: Arc<ConfigPaths>,
     ) -> Result<()> {
         match self {
-            ServiceCommand::Install => install_service(),
-            ServiceCommand::Uninstall => uninstall_service(),
-            ServiceCommand::Status => service_status(),
-            ServiceCommand::Start => start_service(),
-            ServiceCommand::Stop => stop_service(),
-            ServiceCommand::Restart => restart_service(),
+            ServiceCommand::Install { system } => install_service(*system),
+            ServiceCommand::Uninstall { system } => uninstall_service(*system),
+            ServiceCommand::Status { system } => service_status(*system),
+            ServiceCommand::Start { system } => start_service(*system),
+            ServiceCommand::Stop { system } => stop_service(*system),
+            ServiceCommand::Restart { system } => restart_service(*system),
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
@@ -106,8 +132,93 @@ impl ServiceCommand {
     }
 }
 
+/// Path to the system-wide systemd service file.
 #[cfg(target_os = "linux")]
-fn install_service() -> Result<()> {
+const SYSTEM_SERVICE_PATH: &str = "/etc/systemd/system/freenet.service";
+
+/// Check if a system-wide Freenet service is installed.
+#[cfg(target_os = "linux")]
+fn has_system_service() -> bool {
+    Path::new(SYSTEM_SERVICE_PATH).exists()
+}
+
+/// Check if a user-level Freenet service is installed.
+#[cfg(target_os = "linux")]
+fn has_user_service() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".config/systemd/user/freenet.service").exists())
+        .unwrap_or(false)
+}
+
+/// Resolve whether to use system or user mode.
+/// If `--system` is passed, use system mode. Otherwise auto-detect based on
+/// which service file exists, defaulting to user mode.
+#[cfg(target_os = "linux")]
+fn use_system_mode(system_flag: bool) -> bool {
+    if system_flag {
+        return true;
+    }
+    // Auto-detect: if only system service exists, use system mode
+    if has_system_service() && !has_user_service() {
+        return true;
+    }
+    false
+}
+
+/// Run a systemctl command, using --user or not based on system mode.
+#[cfg(target_os = "linux")]
+fn systemctl(system_mode: bool, args: &[&str]) -> Result<std::process::ExitStatus> {
+    let mut cmd = std::process::Command::new("systemctl");
+    if !system_mode {
+        cmd.arg("--user");
+    }
+    cmd.args(args);
+    let status = cmd.status().context("Failed to run systemctl")?;
+    Ok(status)
+}
+
+/// Run a systemctl command with helpful error on user-session failures.
+#[cfg(target_os = "linux")]
+fn systemctl_with_hint(system_mode: bool, args: &[&str], action: &str) -> Result<()> {
+    let status = systemctl(system_mode, args)?;
+    if !status.success() && !system_mode {
+        // Check if this looks like a user session bus issue
+        let output = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let hint = if let Ok(out) = output {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("bus")
+                || stderr.contains("XDG_RUNTIME_DIR")
+                || stderr.contains("Failed to connect")
+            {
+                "\n\nHint: User systemd session not available (common in containers/LXC).\n\
+                 Try: sudo freenet service install --system"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+        anyhow::bail!("Failed to {action}{hint}");
+    } else if !status.success() {
+        anyhow::bail!("Failed to {action}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_service(system: bool) -> Result<()> {
+    if system {
+        install_system_service()
+    } else {
+        install_user_service()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_user_service() -> Result<()> {
     use std::fs;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -120,32 +231,18 @@ fn install_service() -> Result<()> {
     let log_dir = home_dir.join(".local/state/freenet");
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-    let service_content = generate_service_file(&exe_path, &log_dir);
+    let service_content = generate_user_service_file(&exe_path, &log_dir);
     let service_path = service_dir.join("freenet.service");
 
     fs::write(&service_path, service_content).context("Failed to write service file")?;
 
     // Reload systemd user daemon
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("Failed to reload systemd")?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to reload systemd daemon");
-    }
+    systemctl_with_hint(false, &["daemon-reload"], "reload systemd daemon")?;
 
     // Enable the service
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "freenet"])
-        .status()
-        .context("Failed to enable service")?;
+    systemctl_with_hint(false, &["enable", "freenet"], "enable service")?;
 
-    if !status.success() {
-        anyhow::bail!("Failed to enable service");
-    }
-
-    println!("Freenet service installed successfully.");
+    println!("Freenet user service installed successfully.");
     println!();
     println!("To start the service now:");
     println!("  freenet service start");
@@ -157,7 +254,71 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn generate_service_file(binary_path: &Path, log_dir: &Path) -> String {
+fn install_system_service() -> Result<()> {
+    use std::fs;
+
+    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+
+    // Get the user to run the service as.
+    // When running with sudo, SUDO_USER has the original (non-root) user.
+    let username = std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .context(
+            "Could not determine username. Set the USER environment variable \
+             or run with sudo (which sets SUDO_USER).",
+        )?;
+
+    // When running with sudo, dirs::home_dir() returns /root.
+    // We need the actual user's home directory.
+    let home_dir = if std::env::var("SUDO_USER").is_ok() {
+        // Look up the original user's home from /etc/passwd via HOME or fallback
+        std::env::var("SUDO_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(format!("/home/{username}")))
+    } else {
+        dirs::home_dir().context("Failed to get home directory")?
+    };
+
+    // Create log directory
+    let log_dir = home_dir.join(".local/state/freenet");
+    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+    let service_content = generate_system_service_file(&exe_path, &log_dir, &username, &home_dir);
+
+    fs::write(SYSTEM_SERVICE_PATH, &service_content).with_context(|| {
+        format!(
+            "Failed to write service file to {SYSTEM_SERVICE_PATH}. \
+             Are you running as root? Try: sudo freenet service install --system"
+        )
+    })?;
+
+    // Reload systemd daemon (system-level, no --user)
+    let status = systemctl(true, &["daemon-reload"])?;
+    if !status.success() {
+        anyhow::bail!("Failed to reload systemd daemon");
+    }
+
+    // Enable the service
+    let status = systemctl(true, &["enable", "freenet"])?;
+    if !status.success() {
+        anyhow::bail!("Failed to enable service");
+    }
+
+    println!("Freenet system service installed successfully.");
+    println!("  Service runs as user: {username}");
+    println!();
+    println!("To start the service now:");
+    println!("  sudo freenet service start --system");
+    println!();
+    println!("The service will start automatically on boot.");
+    println!("Logs will be written to: {}", log_dir.display());
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn generate_user_service_file(binary_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"[Unit]
 Description=Freenet Node
@@ -203,32 +364,86 @@ WantedBy=default.target
 }
 
 #[cfg(target_os = "linux")]
-fn uninstall_service() -> Result<()> {
+pub fn generate_system_service_file(
+    binary_path: &Path,
+    log_dir: &Path,
+    username: &str,
+    home_dir: &Path,
+) -> String {
+    format!(
+        r#"[Unit]
+Description=Freenet Node
+Documentation=https://freenet.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={username}
+Environment=HOME={home}
+ExecStart={binary} network
+Restart=always
+# Wait 10 seconds before restart to avoid rapid restart loops
+RestartSec=10
+# Allow 15 seconds for graceful shutdown before SIGKILL
+# The node handles SIGTERM to properly close peer connections
+TimeoutStopSec=15
+
+# Auto-update: if peer exits with code 42 (version mismatch with gateway),
+# run update before systemd restarts the service. The '-' prefix means
+# ExecStopPost failure won't affect service restart.
+ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+
+# Logging - write to files for systems without active user journald
+StandardOutput=append:{log_dir}/freenet.log
+StandardError=append:{log_dir}/freenet.error.log
+SyslogIdentifier=freenet
+
+# Resource limits to prevent runaway resource consumption
+# File descriptors needed for network connections
+LimitNOFILE=65536
+# Memory limit (2GB soft limit)
+MemoryMax=2G
+# CPU quota (200% = 2 cores max)
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        binary = binary_path.display(),
+        log_dir = log_dir.display(),
+        username = username,
+        home = home_dir.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_service(system: bool) -> Result<()> {
     use std::fs;
 
+    let system_mode = use_system_mode(system);
+
     // Stop the service if running
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "freenet"])
-        .status();
+    let _ = systemctl(system_mode, &["stop", "freenet"]);
 
     // Disable the service
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "freenet"])
-        .status();
+    let _ = systemctl(system_mode, &["disable", "freenet"]);
 
     // Remove the service file
-    let service_path = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join(".config/systemd/user/freenet.service");
+    let service_path = if system_mode {
+        std::path::PathBuf::from(SYSTEM_SERVICE_PATH)
+    } else {
+        dirs::home_dir()
+            .context("Failed to get home directory")?
+            .join(".config/systemd/user/freenet.service")
+    };
 
     if service_path.exists() {
         fs::remove_file(&service_path).context("Failed to remove service file")?;
     }
 
     // Reload systemd
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
+    let _ = systemctl(system_mode, &["daemon-reload"]);
 
     println!("Freenet service uninstalled.");
 
@@ -236,60 +451,33 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn service_status() -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "status", "freenet"])
-        .status()
-        .context("Failed to check service status")?;
-
+fn service_status(system: bool) -> Result<()> {
+    let system_mode = use_system_mode(system);
+    let status = systemctl(system_mode, &["status", "freenet"])?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(target_os = "linux")]
-fn start_service() -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "start", "freenet"])
-        .status()
-        .context("Failed to start service")?;
-
-    if status.success() {
-        println!("Freenet service started.");
-    } else {
-        anyhow::bail!("Failed to start service");
-    }
-
+fn start_service(system: bool) -> Result<()> {
+    let system_mode = use_system_mode(system);
+    systemctl_with_hint(system_mode, &["start", "freenet"], "start service")?;
+    println!("Freenet service started.");
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn stop_service() -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "freenet"])
-        .status()
-        .context("Failed to stop service")?;
-
-    if status.success() {
-        println!("Freenet service stopped.");
-    } else {
-        anyhow::bail!("Failed to stop service");
-    }
-
+fn stop_service(system: bool) -> Result<()> {
+    let system_mode = use_system_mode(system);
+    systemctl_with_hint(system_mode, &["stop", "freenet"], "stop service")?;
+    println!("Freenet service stopped.");
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn restart_service() -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "restart", "freenet"])
-        .status()
-        .context("Failed to restart service")?;
-
-    if status.success() {
-        println!("Freenet service restarted.");
-    } else {
-        anyhow::bail!("Failed to restart service");
-    }
-
+fn restart_service(system: bool) -> Result<()> {
+    let system_mode = use_system_mode(system);
+    systemctl_with_hint(system_mode, &["restart", "freenet"], "restart service")?;
+    println!("Freenet service restarted.");
     Ok(())
 }
 
@@ -325,8 +513,20 @@ fn service_logs(error_only: bool) -> Result<()> {
 }
 
 // macOS implementation using launchd
+// --system flag is not supported on macOS (launchd daemons need different setup)
 #[cfg(target_os = "macos")]
-fn install_service() -> Result<()> {
+fn install_service(system: bool) -> Result<()> {
+    if system {
+        anyhow::bail!(
+            "The --system flag is only supported on Linux.\n\
+             On macOS, use the default user agent: freenet service install"
+        );
+    }
+    install_macos_service()
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_service() -> Result<()> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -457,9 +657,23 @@ fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     )
 }
 
+/// Helper macro: bail with "--system not supported on macOS" for commands that don't apply.
 #[cfg(target_os = "macos")]
-fn uninstall_service() -> Result<()> {
+fn check_no_system_flag(system: bool) -> Result<()> {
+    if system {
+        anyhow::bail!(
+            "The --system flag is only supported on Linux.\n\
+             On macOS, use the default user agent commands without --system."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_service(system: bool) -> Result<()> {
     use std::fs;
+
+    check_no_system_flag(system)?;
 
     let plist_path = dirs::home_dir()
         .context("Failed to get home directory")?
@@ -488,7 +702,9 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn service_status() -> Result<()> {
+fn service_status(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+
     let output = std::process::Command::new("launchctl")
         .args(["list", "org.freenet.node"])
         .output()
@@ -508,7 +724,9 @@ fn service_status() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_service() -> Result<()> {
+fn start_service(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+
     let plist_path = dirs::home_dir()
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
@@ -536,7 +754,9 @@ fn start_service() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn stop_service() -> Result<()> {
+fn stop_service(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+
     let plist_path = dirs::home_dir()
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
@@ -560,9 +780,10 @@ fn stop_service() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn restart_service() -> Result<()> {
-    stop_service()?;
-    start_service()
+fn restart_service(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+    stop_service(false)?;
+    start_service(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -603,7 +824,14 @@ fn service_logs(error_only: bool) -> Result<()> {
 // For now, we provide Task Scheduler-based autostart
 
 #[cfg(target_os = "windows")]
-fn install_service() -> Result<()> {
+fn install_service(system: bool) -> Result<()> {
+    if system {
+        anyhow::bail!(
+            "The --system flag is only supported on Linux.\n\
+             On Windows, use the default scheduled task: freenet service install"
+        );
+    }
+
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
     let exe_path_str = exe_path
         .to_str()
@@ -645,7 +873,20 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn uninstall_service() -> Result<()> {
+fn check_no_system_flag_windows(system: bool) -> Result<()> {
+    if system {
+        anyhow::bail!(
+            "The --system flag is only supported on Linux.\n\
+             On Windows, use the default scheduled task commands without --system."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_service(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+
     // Stop if running
     let _ = std::process::Command::new("schtasks")
         .args(["/end", "/tn", "Freenet"])
@@ -667,7 +908,9 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn service_status() -> Result<()> {
+fn service_status(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+
     let output = std::process::Command::new("schtasks")
         .args(["/query", "/tn", "Freenet", "/v", "/fo", "list"])
         .output()
@@ -685,7 +928,9 @@ fn service_status() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn start_service() -> Result<()> {
+fn start_service(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+
     let status = std::process::Command::new("schtasks")
         .args(["/run", "/tn", "Freenet"])
         .status()
@@ -701,7 +946,9 @@ fn start_service() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn stop_service() -> Result<()> {
+fn stop_service(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+
     let status = std::process::Command::new("schtasks")
         .args(["/end", "/tn", "Freenet"])
         .status()
@@ -717,11 +964,12 @@ fn stop_service() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn restart_service() -> Result<()> {
-    let _ = stop_service();
+fn restart_service(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+    let _ = stop_service(false);
     // Give it a moment to stop
     std::thread::sleep(std::time::Duration::from_secs(2));
-    start_service()
+    start_service(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -737,32 +985,32 @@ fn service_logs(_error_only: bool) -> Result<()> {
 
 // Fallback for unsupported platforms
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn install_service() -> Result<()> {
+fn install_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service installation is not supported on this platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn uninstall_service() -> Result<()> {
+fn uninstall_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn service_status() -> Result<()> {
+fn service_status(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn start_service() -> Result<()> {
+fn start_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn stop_service() -> Result<()> {
+fn stop_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn restart_service() -> Result<()> {
+fn restart_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
@@ -778,10 +1026,10 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_systemd_service_file_generation() {
+    fn test_systemd_user_service_file_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
         let log_dir = PathBuf::from("/home/test/.local/state/freenet");
-        let service_content = generate_service_file(&binary_path, &log_dir);
+        let service_content = generate_user_service_file(&binary_path, &log_dir);
 
         // Verify the service file contains expected sections
         assert!(service_content.contains("[Unit]"));
@@ -809,6 +1057,41 @@ mod tests {
 
         // Verify graceful shutdown timeout is set
         assert!(service_content.contains("TimeoutStopSec=15"));
+
+        // Verify user service targets default.target
+        assert!(service_content.contains("WantedBy=default.target"));
+        // User service should NOT have User= directive
+        assert!(!service_content.contains("User="));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_system_service_file_generation() {
+        let binary_path = PathBuf::from("/home/test/.local/bin/freenet");
+        let log_dir = PathBuf::from("/home/test/.local/state/freenet");
+        let username = "testuser";
+        let home_dir = PathBuf::from("/home/test");
+        let service_content =
+            generate_system_service_file(&binary_path, &log_dir, username, &home_dir);
+
+        // Verify sections
+        assert!(service_content.contains("[Unit]"));
+        assert!(service_content.contains("[Service]"));
+        assert!(service_content.contains("[Install]"));
+
+        // Verify User= directive is set
+        assert!(service_content.contains("User=testuser"));
+
+        // Verify HOME environment is set (needed for config/data paths)
+        assert!(service_content.contains("Environment=HOME=/home/test"));
+
+        // Verify system service targets multi-user.target
+        assert!(service_content.contains("WantedBy=multi-user.target"));
+
+        // Verify it still has all the standard settings
+        assert!(service_content.contains("Restart=always"));
+        assert!(service_content.contains("LimitNOFILE=65536"));
+        assert!(service_content.contains("ExecStopPost="));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-use super::service::generate_service_file;
+use super::service::generate_user_service_file;
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
 
@@ -605,7 +605,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
 
     // Generate new service file content
     let log_dir = home_dir.join(".local/state/freenet");
-    let new_content = generate_service_file(binary_path, &log_dir);
+    let new_content = generate_user_service_file(binary_path, &log_dir);
 
     // Write the updated service file
     fs::write(&service_path, new_content).context("Failed to write updated service file")?;
