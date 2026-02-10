@@ -436,7 +436,7 @@ impl SubscribeOp {
     /// The subscription follows the contract's location in the ring, so when
     /// the connection drops, we notify the client of the failure so they can retry.
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
-        tracing::warn!(
+        tracing::debug!(
             tx = %self.id,
             "Subscribe operation aborted due to connection failure"
         );

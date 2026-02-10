@@ -274,7 +274,7 @@ async fn run_driver<S: crate::transport::Socket>(
                         let (peer, transaction, transient) = if let Some(entry) = entry {
                             (Some(entry.peer), entry.transaction, entry.transient)
                         } else {
-                            tracing::warn!(
+                            tracing::debug!(
                                 remote = %remote_addr,
                                 "Received unexpected inbound connection (no matching expectation)"
                             );

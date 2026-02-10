@@ -1160,7 +1160,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     continue;
                                                 }
                                                 Err(()) => {
-                                                    tracing::warn!(peer_addr = %remote_addr, "Connection closed");
+                                                    tracing::debug!(peer_addr = %remote_addr, "Connection closed");
                                                     continue;
                                                 }
                                             }
@@ -1236,7 +1236,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 let task = GlobalExecutor::spawn(gw_ongoing_connection
                                     .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                     .map_err(move |error| {
-                                        tracing::warn!(peer_addr = %remote_addr, error = %error, "Gateway connection error");
+                                        tracing::debug!(peer_addr = %remote_addr, error = %error, "Gateway connection error");
                                         (error, remote_addr)
                                     }));
                                 gw_connection_tasks.push(task);
@@ -1310,7 +1310,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                         // Failed gateway connection
                         Err((error, remote_addr)) => {
-                            tracing::error!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
+                            tracing::debug!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
                                 crate::transport::signal_version_mismatch();

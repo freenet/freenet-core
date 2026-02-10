@@ -414,7 +414,7 @@ where
 
                 let event_result = match update_result {
                     Ok(UpsertResult::NoChange) => {
-                        tracing::info!(
+                        tracing::debug!(
                             contract = %key,
                             phase = "update_no_change",
                             "UPDATE resulted in NoChange, fetching current state to return UpdateResponse"
@@ -423,7 +423,7 @@ where
                         // so the client gets a proper response
                         match contract_handler.executor().fetch_contract(key, false).await {
                             Ok((Some(current_state), _)) => {
-                                tracing::info!(
+                                tracing::debug!(
                                     contract = %key,
                                     phase = "fetch_complete",
                                     "Successfully fetched current state for NoChange update"

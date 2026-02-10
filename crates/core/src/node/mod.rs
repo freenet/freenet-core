@@ -989,7 +989,7 @@ where
                     .get_peer_by_addr(source)
                     .map(|pkl| pkl.pub_key().clone());
                 let Some(source_pub_key) = source_pub_key else {
-                    tracing::warn!(
+                    tracing::debug!(
                         %source,
                         "ProximityCache: could not resolve source addr to pub_key, skipping"
                     );

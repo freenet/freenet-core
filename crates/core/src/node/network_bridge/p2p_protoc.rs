@@ -271,9 +271,10 @@ impl NetworkBridge for P2pBridge {
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
             } else {
-                // Truly unknown peer - log warning and use own key as last resort
-                // This path should rarely be hit in normal operation
-                tracing::warn!(
+                // Truly unknown peer - use own key as last resort.
+                // This is a normal transient state during connection handshakes
+                // when the peer's public key hasn't been established yet.
+                tracing::debug!(
                     peer_addr = %target_addr,
                     phase = "send",
                     "Sending to unknown peer address with no known public key"
@@ -2742,7 +2743,7 @@ impl P2pConnManager {
                 }
             }
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 peer_id = ?peer_id,
                 %peer_addr,
                 pending_txs = ?pending_txs,
