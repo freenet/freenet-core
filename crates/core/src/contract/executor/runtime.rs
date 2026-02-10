@@ -1134,34 +1134,6 @@ impl Executor<Runtime> {
         .await
     }
 
-    /// Create an Executor with a pre-created shared StateStore.
-    /// Used by RuntimePool to share the same database connection across executors.
-    #[allow(dead_code)]
-    pub(crate) async fn from_config_with_shared_store(
-        config: Arc<Config>,
-        shared_state_store: StateStore<Storage>,
-        op_sender: Option<OpRequestSender>,
-        op_manager: Option<Arc<OpManager>>,
-    ) -> anyhow::Result<Self> {
-        // Get the shared storage from the state store to share with runtime stores
-        let db = shared_state_store.storage();
-        // Create only the Runtime stores (contract, delegate, secrets) - NOT StateStore
-        let (contract_store, delegate_store, secret_store) =
-            Self::get_runtime_stores(&config, db.clone())?;
-        let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-        // Enable V2 delegate contract access by providing the state store DB
-        rt.set_state_store_db(db);
-        Executor::new(
-            shared_state_store,
-            || Ok(()), // No cleanup handler for pooled executors
-            OperationMode::Local,
-            rt,
-            op_sender,
-            op_manager,
-        )
-        .await
-    }
-
     /// Create an executor that shares compiled module caches with other pool executors.
     pub(crate) async fn from_config_with_shared_modules(
         config: Arc<Config>,
