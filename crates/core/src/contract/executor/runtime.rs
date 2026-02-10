@@ -160,7 +160,7 @@ impl RuntimePool {
         let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
 
         // Create shared module caches so all pool executors share one set of compiled WASM modules.
-        // Without this, each of the N executors maintains its own 128-module LRU cache, causing
+        // Without this, each of the N executors would maintain its own LRU cache, causing
         // the same contracts to be compiled and stored N times (e.g., 16 executors × 92 contracts
         // × ~500KB-1MB = ~1.2 GB of duplicate compiled modules on the nova gateway).
         let cache_capacity =

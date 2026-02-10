@@ -35,19 +35,23 @@ static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 ///
 /// **Current value: 1024 modules per cache**
 ///
-/// # Trade-offs
+/// # Why 1024?
 ///
-/// - Higher capacity = more memory usage, but fewer recompilations
-/// - Lower capacity = less memory usage, but more recompilation overhead
+/// Wasmer's internal `code_memory: Vec<CodeMemory>` only grows — compiled machine
+/// code persists even after a `Module` is dropped. Memory is only freed when the
+/// entire `Engine` is dropped. Every eviction-recompilation cycle permanently grows
+/// `code_memory`, causing unbounded memory growth proportional to total compilations
+/// over the Engine's lifetime (see #2941).
 ///
-/// Recompilation is expensive (~10-100ms per module) and wasmer's Engine
-/// accumulates compiled code in internal `code_memory` that is never freed
-/// until the Engine is dropped. Cache evictions trigger recompilation which
-/// grows `code_memory` without bound. The capacity should be large enough
-/// to hold the entire working set to avoid eviction-recompilation cycles.
+/// A capacity of 1024 avoids evictions on production gateways (~92 contracts as of
+/// Feb 2026), preventing the eviction-recompilation cycles that drive `code_memory`
+/// growth.
 ///
-/// On production gateways (~92 contracts as of Feb 2026), 1024 is well above
-/// the working set and eliminates cache eviction entirely.
+/// # Memory Impact
+///
+/// Each compiled `Module` is typically 100KB-1MB. With shared caches (one instance
+/// per cache type across all pool executors), actual memory usage is bounded by the
+/// number of unique contracts/delegates on the network, not the capacity.
 pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 
 /// A live WASM instance with RAII cleanup.
@@ -352,7 +356,14 @@ impl Runtime {
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                cache.put(*key, module.clone());
+                if let Some((evicted_key, _)) = cache.push(*key, module.clone()) {
+                    tracing::warn!(
+                        evicted_contract = %evicted_key,
+                        cache_capacity = cache.cap().get(),
+                        "Module cache eviction — wasmer code_memory will grow. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                    );
+                }
                 module
             }
         };
@@ -393,7 +404,14 @@ impl Runtime {
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                cache.put(key.clone(), module.clone());
+                if let Some((evicted_key, _)) = cache.push(key.clone(), module.clone()) {
+                    tracing::warn!(
+                        evicted_delegate = %evicted_key,
+                        cache_capacity = cache.cap().get(),
+                        "Delegate cache eviction — wasmer code_memory will grow. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                    );
+                }
                 module
             }
         };
