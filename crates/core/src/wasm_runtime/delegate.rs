@@ -537,7 +537,7 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_modules.pop(key);
+        self.delegate_modules.lock().unwrap().pop(key);
         self.delegate_store.remove_delegate(key)
     }
 }

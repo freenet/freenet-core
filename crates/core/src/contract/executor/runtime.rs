@@ -5,11 +5,13 @@ use super::{
     STALE_INIT_THRESHOLD,
 };
 use crate::node::OpManager;
+use crate::wasm_runtime::{SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY};
 use freenet_stdlib::prelude::RelatedContract;
+use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Semaphore;
 
 // Type alias for shared notification storage
@@ -120,6 +122,10 @@ pub struct RuntimePool {
     shared_notifications: SharedNotifications,
     /// Shared subscriber summaries for computing deltas.
     shared_summaries: SharedSummaries,
+    /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
+    shared_contract_modules: SharedModuleCache<ContractKey>,
+    /// Shared compiled delegate module cache.
+    shared_delegate_modules: SharedModuleCache<DelegateKey>,
 }
 
 impl RuntimePool {
@@ -146,12 +152,25 @@ impl RuntimePool {
         let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
         let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
 
+        // Create shared module caches so all pool executors share one set of compiled WASM modules.
+        // Without this, each of the N executors maintains its own 128-module LRU cache, causing
+        // the same contracts to be compiled and stored N times (e.g., 16 executors × 92 contracts
+        // × ~500KB-1MB = ~1.2 GB of duplicate compiled modules on the nova gateway).
+        let cache_capacity =
+            NonZeroUsize::new(DEFAULT_MODULE_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        let shared_contract_modules: SharedModuleCache<ContractKey> =
+            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+        let shared_delegate_modules: SharedModuleCache<DelegateKey> =
+            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+
         for i in 0..pool_size_usize {
-            let mut executor = Executor::from_config_with_shared_store(
+            let mut executor = Executor::from_config_with_shared_modules(
                 config.clone(),
                 shared_state_store.clone(),
                 Some(op_sender.clone()),
                 Some(op_manager.clone()),
+                shared_contract_modules.clone(),
+                shared_delegate_modules.clone(),
             )
             .await?;
 
@@ -181,6 +200,8 @@ impl RuntimePool {
             shared_state_store,
             shared_notifications,
             shared_summaries,
+            shared_contract_modules,
+            shared_delegate_modules,
         })
     }
 
@@ -294,11 +315,13 @@ impl RuntimePool {
     /// Uses the shared StateStore to avoid opening a new database connection.
     async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
         tracing::warn!("Creating replacement executor due to previous failure");
-        let mut executor = Executor::from_config_with_shared_store(
+        let mut executor = Executor::from_config_with_shared_modules(
             self.config.clone(),
             self.shared_state_store.clone(),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
+            self.shared_contract_modules.clone(),
+            self.shared_delegate_modules.clone(),
         )
         .await?;
 
@@ -1113,6 +1136,7 @@ impl Executor<Runtime> {
 
     /// Create an Executor with a pre-created shared StateStore.
     /// Used by RuntimePool to share the same database connection across executors.
+    #[allow(dead_code)]
     pub(crate) async fn from_config_with_shared_store(
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
@@ -1130,6 +1154,39 @@ impl Executor<Runtime> {
         Executor::new(
             shared_state_store,
             || Ok(()), // No cleanup handler for pooled executors
+            OperationMode::Local,
+            rt,
+            op_sender,
+            op_manager,
+        )
+        .await
+    }
+
+    /// Create an executor that shares compiled module caches with other pool executors.
+    pub(crate) async fn from_config_with_shared_modules(
+        config: Arc<Config>,
+        shared_state_store: StateStore<Storage>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
+        contract_modules: SharedModuleCache<ContractKey>,
+        delegate_modules: SharedModuleCache<DelegateKey>,
+    ) -> anyhow::Result<Self> {
+        let db = shared_state_store.storage();
+        let (contract_store, delegate_store, secret_store) =
+            Self::get_runtime_stores(&config, db.clone())?;
+        let mut rt = Runtime::build_with_shared_module_caches(
+            contract_store,
+            delegate_store,
+            secret_store,
+            false,
+            contract_modules,
+            delegate_modules,
+        )
+        .unwrap();
+        rt.set_state_store_db(db);
+        Executor::new(
+            shared_state_store,
+            || Ok(()),
             OperationMode::Local,
             rt,
             op_sender,

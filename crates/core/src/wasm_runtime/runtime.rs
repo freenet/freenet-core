@@ -16,7 +16,15 @@ use freenet_stdlib::{
     prelude::*,
 };
 use lru::LruCache;
+use std::sync::{Arc, Mutex};
 use std::{num::NonZeroUsize, sync::atomic::AtomicI64};
+
+/// A compiled WASM module cache shared across multiple `Runtime` instances.
+///
+/// Wasmer `Module` wraps `Arc<Artifact>`, so clones are cheap (just an Arc
+/// refcount bump). Sharing the cache across the `RuntimePool` avoids compiling
+/// and storing the same contract N times (once per pool executor).
+pub(crate) type SharedModuleCache<K> = Arc<Mutex<LruCache<K, <Engine as WasmEngine>::Module>>>;
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
@@ -170,13 +178,13 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// LRU cache of compiled delegate modules.
-    pub(super) delegate_modules: LruCache<DelegateKey, <Engine as WasmEngine>::Module>,
+    /// LRU cache of compiled delegate modules (shared across pool executors).
+    pub(super) delegate_modules: SharedModuleCache<DelegateKey>,
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// LRU cache of compiled contract modules.
-    pub(super) contract_modules: LruCache<ContractKey, <Engine as WasmEngine>::Module>,
+    /// LRU cache of compiled contract modules (shared across pool executors).
+    pub(super) contract_modules: SharedModuleCache<ContractKey>,
 
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
@@ -210,10 +218,10 @@ impl Runtime {
 
             secret_store,
             delegate_store,
-            contract_modules: LruCache::new(cache_capacity),
+            contract_modules: Arc::new(Mutex::new(LruCache::new(cache_capacity))),
 
             contract_store,
-            delegate_modules: LruCache::new(cache_capacity),
+            delegate_modules: Arc::new(Mutex::new(LruCache::new(cache_capacity))),
             state_store_db: None,
         })
     }
@@ -231,6 +239,31 @@ impl Runtime {
             host_mem,
             RuntimeConfig::default(),
         )
+    }
+
+    /// Build a runtime that shares compiled module caches with other runtimes.
+    ///
+    /// Used by `RuntimePool` to avoid duplicating compiled WASM modules across
+    /// pool executors. Each executor gets its own `Engine` (wasmer Store +
+    /// instances), but all share the same compiled module cache.
+    pub(crate) fn build_with_shared_module_caches(
+        contract_store: ContractStore,
+        delegate_store: DelegateStore,
+        secret_store: SecretsStore,
+        host_mem: bool,
+        contract_modules: SharedModuleCache<ContractKey>,
+        delegate_modules: SharedModuleCache<DelegateKey>,
+    ) -> RuntimeResult<Self> {
+        let engine = Engine::new(&RuntimeConfig::default(), host_mem)?;
+        Ok(Self {
+            engine,
+            secret_store,
+            delegate_store,
+            contract_modules,
+            contract_store,
+            delegate_modules,
+            state_store_db: None,
+        })
     }
 
     /// Explicitly clean up a running instance from the engine.
@@ -273,9 +306,12 @@ impl Runtime {
         parameters: &Parameters,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
-        let module = if let Some(module) = self.contract_modules.get(key) {
-            module.clone()
+        // Check shared cache first (lock held briefly for Arc clone)
+        let cached = self.contract_modules.lock().unwrap().get(key).cloned();
+        let module = if let Some(module) = cached {
+            module
         } else {
+            // Cache miss — compile outside the lock to avoid blocking other executors
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
@@ -295,7 +331,10 @@ impl Runtime {
                 _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
-            self.contract_modules.put(*key, module.clone());
+            self.contract_modules
+                .lock()
+                .unwrap()
+                .put(*key, module.clone());
             module
         };
         RunningInstance::new(
@@ -317,8 +356,9 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
-        let module = if let Some(module) = self.delegate_modules.get(key) {
-            module.clone()
+        let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
+        let module = if let Some(module) = cached {
+            module
         } else {
             let delegate = self
                 .delegate_store
@@ -326,7 +366,10 @@ impl Runtime {
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
             let module = self.engine.compile(&code)?;
-            self.delegate_modules.put(key.clone(), module.clone());
+            self.delegate_modules
+                .lock()
+                .unwrap()
+                .put(key.clone(), module.clone());
             module
         };
 

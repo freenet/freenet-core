@@ -36,7 +36,7 @@ async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> 
         &Default::default(),
     );
     assert_eq!(
-        runtime.contract_modules.len(),
+        runtime.contract_modules.lock().unwrap().len(),
         1,
         "Cache should have 1 entry after first load"
     );
@@ -49,7 +49,7 @@ async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> 
         &Default::default(),
     );
     assert_eq!(
-        runtime.contract_modules.len(),
+        runtime.contract_modules.lock().unwrap().len(),
         1,
         "Cache should still have 1 entry (cache hit)"
     );
@@ -57,7 +57,7 @@ async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> 
     // We can't easily load a second different contract in this test setup,
     // but we can verify the cache size is bounded by checking the capacity
     assert!(
-        runtime.contract_modules.cap().get() == 2,
+        runtime.contract_modules.lock().unwrap().cap().get() == 2,
         "Cache capacity should be 2"
     );
 
@@ -88,12 +88,12 @@ async fn test_module_cache_zero_capacity() -> Result<(), Box<dyn std::error::Err
 
     // Verify cache was created with capacity 1 (NonZeroUsize::MIN)
     assert_eq!(
-        runtime.contract_modules.cap().get(),
+        runtime.contract_modules.lock().unwrap().cap().get(),
         1,
         "Zero capacity should fall back to 1"
     );
     assert_eq!(
-        runtime.delegate_modules.cap().get(),
+        runtime.delegate_modules.lock().unwrap().cap().get(),
         1,
         "Zero capacity should fall back to 1 for delegates too"
     );
@@ -132,12 +132,12 @@ async fn test_module_cache_capacity_one() -> Result<(), Box<dyn std::error::Erro
     );
 
     assert_eq!(
-        runtime.contract_modules.len(),
+        runtime.contract_modules.lock().unwrap().len(),
         1,
         "Cache should have exactly 1 entry"
     );
     assert_eq!(
-        runtime.contract_modules.cap().get(),
+        runtime.contract_modules.lock().unwrap().cap().get(),
         1,
         "Cache capacity should be 1"
     );
