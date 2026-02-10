@@ -53,7 +53,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
         with:

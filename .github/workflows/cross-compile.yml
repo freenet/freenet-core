@@ -24,7 +24,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.93.0
           targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
@@ -59,7 +59,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.93.0
           targets: aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
@@ -96,7 +96,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -142,7 +142,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
 

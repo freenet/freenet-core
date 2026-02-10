@@ -83,6 +83,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.93.0
           components: rustfmt
 
       - name: Check code formatting
@@ -110,6 +111,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.93.0
           components: clippy
           targets: wasm32-unknown-unknown
 
@@ -152,6 +154,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
@@ -237,6 +240,8 @@ jobs:
           path: river-src
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
         with:
