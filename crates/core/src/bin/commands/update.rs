@@ -8,10 +8,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(target_os = "linux")]
-use super::service::generate_user_service_file;
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
+#[cfg(target_os = "linux")]
+use super::service::{generate_system_service_file, generate_user_service_file};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
@@ -567,19 +567,36 @@ fn verify_binary(binary_path: &Path) -> Result<()> {
 /// This ensures users who installed before v0.1.75 get the ExecStopPost hook.
 #[cfg(target_os = "linux")]
 fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
-    let home_dir = match dirs::home_dir() {
-        Some(dir) => dir,
-        None => return Ok(()), // Can't update service file without home dir
-    };
+    // Try user service first
+    let home_dir = dirs::home_dir();
+    let user_service_path = home_dir
+        .as_ref()
+        .map(|h| h.join(".config/systemd/user/freenet.service"));
 
-    let service_path = home_dir.join(".config/systemd/user/freenet.service");
-
-    // Only update if service file exists (user has installed as service)
-    if !service_path.exists() {
-        return Ok(());
+    if let Some(ref service_path) = user_service_path {
+        if service_path.exists() {
+            return update_service_file(binary_path, service_path, false, quiet);
+        }
     }
 
-    let content = fs::read_to_string(&service_path).context("Failed to read service file")?;
+    // Try system service
+    let system_service_path = Path::new("/etc/systemd/system/freenet.service");
+    if system_service_path.exists() {
+        return update_service_file(binary_path, system_service_path, true, quiet);
+    }
+
+    Ok(())
+}
+
+/// Update a specific service file if it's missing the auto-update hook.
+#[cfg(target_os = "linux")]
+fn update_service_file(
+    binary_path: &Path,
+    service_path: &Path,
+    system_mode: bool,
+    quiet: bool,
+) -> Result<()> {
+    let content = fs::read_to_string(service_path).context("Failed to read service file")?;
 
     // Check if the auto-update hook is present
     if content.contains("ExecStopPost=") {
@@ -592,7 +609,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
 
     // Create backup of existing service file in case user had customizations
     let backup_path = service_path.with_extension("service.bak");
-    if let Err(e) = fs::copy(&service_path, &backup_path) {
+    if let Err(e) = fs::copy(service_path, &backup_path) {
         if !quiet {
             eprintln!(
                 "Warning: Failed to backup service file: {}. Continuing anyway.",
@@ -604,20 +621,44 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     }
 
     // Generate new service file content
-    let log_dir = home_dir.join(".local/state/freenet");
-    let new_content = generate_user_service_file(binary_path, &log_dir);
+    let new_content = if system_mode {
+        // Extract User= and Environment=HOME= from existing file
+        let username = content
+            .lines()
+            .find_map(|l| l.strip_prefix("User="))
+            .unwrap_or("freenet");
+        let home_dir = content
+            .lines()
+            .find_map(|l| l.strip_prefix("Environment=HOME="))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("/home/{username}")));
+        let log_dir = home_dir.join(".local/state/freenet");
+        generate_system_service_file(binary_path, &log_dir, username, &home_dir)
+    } else {
+        let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+        let log_dir = home_dir.join(".local/state/freenet");
+        generate_user_service_file(binary_path, &log_dir)
+    };
 
     // Write the updated service file
-    fs::write(&service_path, new_content).context("Failed to write updated service file")?;
+    fs::write(service_path, new_content).context("Failed to write updated service file")?;
 
     // Reload systemd daemon
-    let status = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("Failed to reload systemd")?;
+    let mut cmd = Command::new("systemctl");
+    if !system_mode {
+        cmd.arg("--user");
+    }
+    cmd.arg("daemon-reload");
+    let status = cmd.status().context("Failed to reload systemd")?;
 
     if !status.success() && !quiet {
-        eprintln!("Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually.");
+        if system_mode {
+            eprintln!(
+                "Warning: Failed to reload systemd daemon. Run 'systemctl daemon-reload' manually."
+            );
+        } else {
+            eprintln!("Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually.");
+        }
     } else if !quiet {
         println!("Service file updated with auto-update hook.");
     }

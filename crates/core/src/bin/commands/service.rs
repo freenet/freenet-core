@@ -7,7 +7,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use freenet::config::ConfigPaths;
-use std::{path::Path, sync::Arc};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::report::ReportCommand;
 
@@ -150,6 +151,38 @@ fn has_user_service() -> bool {
         .unwrap_or(false)
 }
 
+/// Recursively chown a directory to the given user (best-effort).
+/// Used after creating directories with sudo so the service user can write to them.
+#[cfg(target_os = "linux")]
+fn chown_to_user(path: &Path, username: &str) {
+    let _ = std::process::Command::new("chown")
+        .args(["-R", username, &path.display().to_string()])
+        .status();
+}
+
+/// Look up a user's home directory from /etc/passwd via `getent passwd`.
+/// Falls back to `/home/{username}` if getent is unavailable.
+#[cfg(target_os = "linux")]
+fn home_dir_for_user(username: &str) -> PathBuf {
+    // Try getent passwd which works with NSS (LDAP, NIS, etc.)
+    if let Ok(output) = std::process::Command::new("getent")
+        .args(["passwd", username])
+        .output()
+    {
+        if output.status.success() {
+            let line = String::from_utf8_lossy(&output.stdout);
+            // Format: username:x:uid:gid:gecos:home:shell
+            if let Some(home) = line.split(':').nth(5) {
+                let home = home.trim();
+                if !home.is_empty() {
+                    return PathBuf::from(home);
+                }
+            }
+        }
+    }
+    PathBuf::from(format!("/home/{username}"))
+}
+
 /// Resolve whether to use system or user mode.
 /// If `--system` is passed, use system mode. Otherwise auto-detect based on
 /// which service file exists, defaulting to user mode.
@@ -269,20 +302,23 @@ fn install_system_service() -> Result<()> {
              or run with sudo (which sets SUDO_USER).",
         )?;
 
-    // When running with sudo, dirs::home_dir() returns /root.
-    // We need the actual user's home directory.
-    let home_dir = if std::env::var("SUDO_USER").is_ok() {
-        // Look up the original user's home from /etc/passwd via HOME or fallback
-        std::env::var("SUDO_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from(format!("/home/{username}")))
-    } else {
-        dirs::home_dir().context("Failed to get home directory")?
-    };
+    if username == "root" {
+        anyhow::bail!(
+            "Refusing to install system service running as root.\n\
+             Run with sudo from a non-root user account so SUDO_USER is set,\n\
+             or set the USER environment variable to the desired service user."
+        );
+    }
 
-    // Create log directory
+    // Look up the user's home directory from /etc/passwd.
+    // When running with sudo, dirs::home_dir() returns /root which is wrong.
+    let home_dir = home_dir_for_user(&username);
+
+    // Create log directory and fix ownership (we're running as root via sudo,
+    // but the service will run as the target user).
     let log_dir = home_dir.join(".local/state/freenet");
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+    chown_to_user(&log_dir, &username);
 
     let service_content = generate_system_service_file(&exe_path, &log_dir, &username, &home_dir);
 
