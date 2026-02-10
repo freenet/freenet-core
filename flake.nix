@@ -46,7 +46,6 @@
           meta = with pkgs.lib; {
             homepage = "https://github.com/freenet/freenet-core";
             license = licenses.agpl3Only;
-            platforms = platforms.linux;
           };
         };
       in
