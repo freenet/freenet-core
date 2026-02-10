@@ -842,7 +842,7 @@ pub struct NetworkArgs {
     /// Congestion control algorithm for transport connections.
     ///
     /// Available algorithms:
-    /// - `fixedrate` (default): Fixed-rate transmission at 100 Mbps, ignores network feedback
+    /// - `fixedrate` (default): Fixed-rate transmission at 10 Mbps per connection, ignores network feedback
     /// - `bbr`: BBR (Bottleneck Bandwidth and RTT) - model-based, tolerates packet loss
     /// - `ledbat`: LEDBAT++ - delay-based, yields to foreground traffic
     ///
@@ -1003,7 +1003,7 @@ pub struct NetworkApiConfig {
     /// Congestion control algorithm for transport connections.
     ///
     /// Available algorithms:
-    /// - `fixedrate` (default): Fixed-rate transmission at 100 Mbps
+    /// - `fixedrate` (default): Fixed-rate transmission at 10 Mbps per connection
     /// - `bbr`: BBR (Bottleneck Bandwidth and RTT)
     /// - `ledbat`: LEDBAT++ (Low Extra Delay Background Transport)
     #[serde(default = "default_congestion_control", rename = "congestion-control")]

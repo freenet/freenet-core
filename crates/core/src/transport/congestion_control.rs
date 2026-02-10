@@ -14,8 +14,8 @@
 //! ## Supported Algorithms
 //!
 //! - **FixedRate** (default): Non-adaptive congestion control that transmits at
-//!   a constant rate (default 100 Mbps). A pragmatic fallback while adaptive
-//!   algorithms are being stabilized.
+//!   a constant rate (default 10 Mbps per connection). A pragmatic fallback
+//!   while adaptive algorithms are being stabilized.
 //! - **BBR**: Model-based congestion control that estimates bandwidth
 //!   and RTT, tolerating packet loss as long as bandwidth remains stable.
 //! - **LEDBAT++**: Low Extra Delay Background Transport, optimized for
@@ -85,7 +85,7 @@ pub enum CongestionControlAlgorithm {
     ///
     /// Transmits at a constant rate regardless of network feedback.
     /// A pragmatic fallback when adaptive algorithms have bugs or instabilities.
-    /// Default rate: 100 Mbps.
+    /// Default rate: 10 Mbps.
     #[default]
     FixedRate,
 }
@@ -833,7 +833,7 @@ pub enum AlgorithmConfig {
 
 impl Default for CongestionControlConfig {
     fn default() -> Self {
-        // Default to FixedRate (100 Mbps) - pragmatic choice while adaptive algorithms are unstable
+        // Default to FixedRate (10 Mbps) - pragmatic choice while adaptive algorithms are unstable
         use super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
         Self {
             algorithm: CongestionControlAlgorithm::FixedRate,

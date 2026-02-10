@@ -5,20 +5,22 @@ use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
 
-/// Default rate: 100 Mbps in bytes/sec (100 * 1_000_000 / 8)
+/// Default rate: 10 Mbps in bytes/sec (10 * 1_000_000 / 8)
 ///
 /// This rate is chosen to:
-/// - Support fast contract retrieval (user-visible critical path)
+/// - Support contract retrieval without saturating residential connections
 /// - Account for sequential multi-hop transfer (3-5x slower than single hop)
-/// - Remain conservative enough not to degrade other network usage
-/// - Work reliably across real network paths (validated on nova↔vega)
-pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 12_500_000;
+/// - With 10 connections, total throughput is ~100 Mbps — within most residential
+///   upload bandwidth limits
+/// - Previous 100 Mbps per-connection rate caused residential ISPs/routers to
+///   throttle or drop all connections (see diagnostic report MEB6RV)
+pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
 pub struct FixedRateConfig {
     /// Target transmission rate in bytes per second.
-    /// Default: 100 Mbps (12,500,000 bytes/sec)
+    /// Default: 10 Mbps (1,250,000 bytes/sec)
     pub rate_bytes_per_sec: usize,
 }
 
@@ -161,13 +163,13 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = FixedRateConfig::default();
-        assert_eq!(config.rate_bytes_per_sec, 12_500_000); // 100 Mbps
+        assert_eq!(config.rate_bytes_per_sec, 1_250_000); // 10 Mbps
     }
 
     #[test]
     fn test_from_mbps() {
-        let config = FixedRateConfig::from_mbps(100);
-        assert_eq!(config.rate_bytes_per_sec, 12_500_000); // 100 Mbps
+        let config = FixedRateConfig::from_mbps(10);
+        assert_eq!(config.rate_bytes_per_sec, 1_250_000); // 10 Mbps
     }
 
     #[test]
