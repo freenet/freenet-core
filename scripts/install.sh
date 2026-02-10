@@ -248,9 +248,186 @@ print_path_instructions() {
     echo ""
 }
 
+# Check if Freenet is installed
+is_freenet_installed() {
+    install_dir="${FREENET_INSTALL_DIR:-$HOME/.local/bin}"
+    [ -f "$install_dir/freenet" ] || [ -f "$install_dir/fdev" ]
+}
+
+# Check if Freenet service is installed
+is_service_installed() {
+    os=$(detect_os)
+    
+    if [ "$os" = "linux" ]; then
+        # Check systemd user service
+        if has_cmd systemctl; then
+            systemctl --user list-unit-files freenet.service >/dev/null 2>&1
+            return $?
+        fi
+    elif [ "$os" = "macos" ]; then
+        # Check launchd service
+        [ -f "$HOME/Library/LaunchAgents/org.freenet.node.plist" ]
+        return $?
+    fi
+    
+    return 1
+}
+
+# Check if Freenet service is running
+is_service_running() {
+    os=$(detect_os)
+    
+    if [ "$os" = "linux" ]; then
+        if has_cmd systemctl; then
+            systemctl --user is-active freenet >/dev/null 2>&1
+            return $?
+        fi
+    elif [ "$os" = "macos" ]; then
+        if has_cmd launchctl; then
+            launchctl list | grep -q org.freenet.node
+            return $?
+        fi
+    fi
+    
+    # Fallback: check if process is running
+    pgrep -x freenet >/dev/null 2>&1
+}
+
+# Uninstall Freenet
+uninstall_freenet() {
+    info "Freenet Uninstaller"
+    echo ""
+    
+    install_dir="${FREENET_INSTALL_DIR:-$HOME/.local/bin}"
+    os=$(detect_os)
+    
+    # Check if service is running and stop it
+    if is_service_running; then
+        warn "Freenet service is currently running. Stopping it..."
+        if [ "$os" = "linux" ] && has_cmd systemctl; then
+            systemctl --user stop freenet || warn "Failed to stop service"
+        elif [ "$os" = "macos" ] && has_cmd launchctl; then
+            launchctl stop org.freenet.node 2>/dev/null || warn "Failed to stop service"
+        fi
+    fi
+    
+    # Check if service is installed and remove it
+    if is_service_installed; then
+        info "Removing Freenet service..."
+        if [ -f "$install_dir/freenet" ]; then
+            "$install_dir/freenet" service uninstall 2>/dev/null || warn "Failed to uninstall service properly"
+        fi
+        
+        # Manual cleanup for systemd
+        if [ "$os" = "linux" ]; then
+            service_file="$HOME/.config/systemd/user/freenet.service"
+            if [ -f "$service_file" ]; then
+                rm -f "$service_file"
+                has_cmd systemctl && systemctl --user daemon-reload 2>/dev/null || true
+            fi
+        # Manual cleanup for launchd
+        elif [ "$os" = "macos" ]; then
+            plist_file="$HOME/Library/LaunchAgents/org.freenet.node.plist"
+            if [ -f "$plist_file" ]; then
+                launchctl unload "$plist_file" 2>/dev/null || true
+                rm -f "$plist_file"
+            fi
+        fi
+        success "Service removed"
+    fi
+    
+    # Remove binaries
+    if [ -f "$install_dir/freenet" ] || [ -f "$install_dir/fdev" ]; then
+        info "Removing binaries from $install_dir..."
+        rm -f "$install_dir/freenet" "$install_dir/fdev"
+        success "Binaries removed"
+    fi
+    
+    # Ask about data directory
+    echo ""
+    freenet_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/freenet"
+    if [ -d "$freenet_data_dir" ]; then
+        printf "${YELLOW}Warning:${NC} Freenet data directory exists at: $freenet_data_dir\n"
+        printf "Would you like to remove it? This will delete all your Freenet data. [y/N] "
+        read -r response </dev/tty
+        case "$response" in
+            [yY]|[yY][eE][sS])
+                info "Removing data directory..."
+                rm -rf "$freenet_data_dir"
+                success "Data directory removed"
+                ;;
+            *)
+                info "Keeping data directory at: $freenet_data_dir"
+                ;;
+        esac
+    fi
+    
+    echo ""
+    success "Freenet has been uninstalled successfully!"
+    echo ""
+    echo "Thank you for trying Freenet. We hope to see you again!"
+    echo "For more information, visit: https://freenet.org"
+}
+
 # Main installation logic
 main() {
     info "Freenet Installer"
+    echo ""
+
+    # Check if Freenet is already installed
+    if is_freenet_installed; then
+        install_dir="${FREENET_INSTALL_DIR:-$HOME/.local/bin}"
+        
+        # Get current version if possible
+        if [ -f "$install_dir/freenet" ]; then
+            current_version=$("$install_dir/freenet" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+            info "Freenet $current_version is currently installed"
+        else
+            info "Freenet is currently installed"
+        fi
+        
+        # Check if service is installed
+        if is_service_installed; then
+            if is_service_running; then
+                info "Freenet service is installed and running"
+            else
+                info "Freenet service is installed but not running"
+            fi
+        fi
+        
+        echo ""
+        printf "Would you like to:\n"
+        printf "  [r] Reinstall/upgrade Freenet\n"
+        printf "  [u] Uninstall Freenet\n"
+        printf "  [c] Cancel\n"
+        printf "Choice [r/u/c]: "
+        read -r choice </dev/tty
+        
+        case "$choice" in
+            [uU])
+                uninstall_freenet
+                exit 0
+                ;;
+            [rR])
+                info "Proceeding with reinstall/upgrade..."
+                echo ""
+                ;;
+            *)
+                info "Installation cancelled"
+                exit 0
+                ;;
+        esac
+    fi
+
+    # Telemetry disclosure
+    echo "${YELLOW}Note:${NC} Freenet collects anonymous telemetry data by default during alpha"
+    echo "      to help diagnose network issues. This includes:"
+    echo "      - Operation timing (connect, put, get, subscribe, update)"
+    echo "      - Network topology information"
+    echo "      - NO contract content is ever transmitted"
+    echo ""
+    echo "      To disable telemetry, run: freenet --telemetry-enabled=false"
+    echo "      Or set FREENET_TELEMETRY_ENABLED=false in your environment"
     echo ""
 
     # Detect platform
@@ -396,9 +573,21 @@ main() {
     mv -- "$tmp_dir/fdev" "$install_dir/fdev"
     chmod +x "$install_dir/freenet" "$install_dir/fdev"
 
+    # On macOS, remove quarantine attribute to allow unsigned binaries to run
+    if [ "$os" = "macos" ]; then
+        xattr -d com.apple.quarantine "$install_dir/freenet" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$install_dir/fdev" 2>/dev/null || true
+    fi
+
     # Verify the installed binary works
     if ! "$install_dir/freenet" --version >/dev/null 2>&1; then
-        error "Installed binary verification failed. The binary may be corrupted or incompatible with your system."
+        if [ "$os" = "macos" ]; then
+            error "Binary verification failed. macOS may be blocking the unsigned binary.
+Try running: xattr -d com.apple.quarantine $install_dir/freenet $install_dir/fdev
+Then run: $install_dir/freenet --version"
+        else
+            error "Installed binary verification failed. The binary may be corrupted or incompatible with your system."
+        fi
     fi
 
     success "Freenet $version installed successfully!"
@@ -412,14 +601,25 @@ main() {
     # Ask about service installation (unless FREENET_NO_SERVICE is set)
     if [ "${FREENET_NO_SERVICE:-0}" != "1" ]; then
         echo ""
-        printf "Would you like to install Freenet as a system service? [y/N] "
-        read -r response
+        printf "Would you like to install Freenet as a user service (auto-starts on login)? [y/N] "
+        read -r response </dev/tty
         case "$response" in
             [yY]|[yY][eE][sS])
                 info "Installing service..."
                 "$install_dir/freenet" service install
                 echo ""
-                success "Service installed! Start it with: freenet service start"
+                printf "Would you like to start the service now? [Y/n] "
+                read -r start_response </dev/tty
+                case "$start_response" in
+                    [nN]|[nN][oO])
+                        success "Service installed! Start it with: freenet service start"
+                        ;;
+                    *)
+                        info "Starting service..."
+                        "$install_dir/freenet" service start
+                        success "Freenet is now running!"
+                        ;;
+                esac
                 ;;
             *)
                 info "Skipping service installation"
