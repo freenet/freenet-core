@@ -1,4 +1,4 @@
-#[cfg(all(unix, feature = "jemalloc-prof"))]
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

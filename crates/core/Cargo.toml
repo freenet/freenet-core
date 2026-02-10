@@ -100,7 +100,7 @@ lru = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }  # For sendmmsg syscall batching on Linux
 gag = { workspace = true }  # For suppressing libunwind stderr warnings during WASM execution
-tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -177,9 +177,9 @@ bench_full = []  # Enables full benchmark suite (slow, ~78 min)
 simulation_tests = []
 # Feature to enable nightly-only tests (long-running, resource-intensive)
 nightly_tests = []
-# jemalloc with heap profiling support (unix only). Enable with MALLOC_CONF="prof:true,lg_prof_sample:19"
-# and send SIGUSR1 to dump heap profiles to /tmp/freenet-heap.<timestamp>.heap
-jemalloc-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# jemalloc heap profiling (unix only). Adds profiling support on top of the always-enabled jemalloc allocator.
+# Enable with MALLOC_CONF="prof:true,lg_prof_sample:19" and send SIGUSR1 to dump heap profiles.
+jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 
 # ==============================================================================
 # Lint Configuration
