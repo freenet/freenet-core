@@ -445,10 +445,18 @@ impl Ring {
                 // Mark as pending and spawn subscription request
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
+
+                    // Stagger spawns to avoid bursting 20 operations onto the
+                    // notification channel simultaneously. Each renewal gets a
+                    // random 0-500ms delay, spreading the load over ~10 seconds
+                    // instead of hitting the event loop all at once.
+                    let jitter_ms = GlobalRng::random_range(0u64..=500);
+
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
 
                     GlobalExecutor::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                         // Guard ensures complete_subscription_request is called even on panic
                         let guard =
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);

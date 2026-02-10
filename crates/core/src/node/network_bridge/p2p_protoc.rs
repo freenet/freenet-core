@@ -618,11 +618,61 @@ impl P2pConnManager {
         // vs unexpected stream end
         let mut graceful_shutdown = false;
 
+        // Event loop instrumentation: track processing stats for diagnostics
+        let mut loop_iteration_count: u64 = 0;
+        let mut slow_event_count: u64 = 0;
+        let mut last_stats_log = std::time::Instant::now();
+        const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
+
         while let Some(result) = select_stream.as_mut().next().await {
+            loop_iteration_count += 1;
+
+            let event_type = match &result {
+                priority_select::SelectResult::Notification(_) => "notification",
+                priority_select::SelectResult::OpExecution(_) => "op_execution",
+                priority_select::SelectResult::PeerConnection(_) => "peer_connection",
+                priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
+                priority_select::SelectResult::Handshake(_) => "handshake",
+                priority_select::SelectResult::NodeController(_) => "node_controller",
+                priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
+                priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+            };
+
+            let process_start = std::time::Instant::now();
+
             // Process the result using the existing handler
             let event = ctx
                 .process_select_result(result, &mut state, &handshake_cmd_sender)
                 .await?;
+
+            let elapsed = process_start.elapsed();
+            if elapsed > SLOW_EVENT_THRESHOLD {
+                slow_event_count += 1;
+                tracing::warn!(
+                    event_type,
+                    elapsed_ms = elapsed.as_millis(),
+                    "Slow event loop iteration"
+                );
+            }
+
+            // Periodic stats logging
+            if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
+                let notification_capacity =
+                    op_manager.to_event_listener.notifications_sender.capacity();
+                let notification_pending = 2048usize.saturating_sub(notification_capacity);
+                tracing::info!(
+                    iterations = loop_iteration_count,
+                    slow_events = slow_event_count,
+                    notification_channel_pending = notification_pending,
+                    notification_channel_capacity = notification_capacity,
+                    active_connections = ctx.connections.len(),
+                    "Event loop stats"
+                );
+                loop_iteration_count = 0;
+                slow_event_count = 0;
+                last_stats_log = std::time::Instant::now();
+            }
 
             match event {
                 EventResult::Continue => continue,

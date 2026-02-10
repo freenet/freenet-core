@@ -151,8 +151,8 @@ pub(crate) fn event_loop_notification_channel(
     use std::sync::atomic::Ordering;
 
     let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let (notification_tx, notification_rx) = mpsc::channel(100);
-    let (op_execution_tx, op_execution_rx) = mpsc::channel(100);
+    let (notification_tx, notification_rx) = mpsc::channel(2048);
+    let (op_execution_tx, op_execution_rx) = mpsc::channel(2048);
 
     tracing::info!(
         channel_id = _channel_id,
