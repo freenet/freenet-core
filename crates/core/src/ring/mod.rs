@@ -446,10 +446,8 @@ impl Ring {
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
 
-                    // Stagger spawns to avoid bursting 20 operations onto the
-                    // notification channel simultaneously. Each renewal gets a
-                    // random 0-500ms delay, spreading the load over ~10 seconds
-                    // instead of hitting the event loop all at once.
+                    // Stagger spawns to avoid bursting all renewals onto the
+                    // notification channel simultaneously.
                     let jitter_ms = GlobalRng::random_range(0u64..=500);
 
                     let op_manager_clone = op_manager.clone();

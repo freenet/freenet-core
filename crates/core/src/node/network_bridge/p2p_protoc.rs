@@ -618,10 +618,10 @@ impl P2pConnManager {
         // vs unexpected stream end
         let mut graceful_shutdown = false;
 
-        // Event loop instrumentation: track processing stats for diagnostics
-        let mut loop_iteration_count: u64 = 0;
-        let mut slow_event_count: u64 = 0;
-        let mut last_stats_log = std::time::Instant::now();
+        // Event loop instrumentation
+        let mut loop_iteration_count = 0u64;
+        let mut slow_event_count = 0u64;
+        let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
@@ -639,7 +639,7 @@ impl P2pConnManager {
                 priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
             };
 
-            let process_start = std::time::Instant::now();
+            let process_start = Instant::now();
 
             // Process the result using the existing handler
             let event = ctx
@@ -658,20 +658,18 @@ impl P2pConnManager {
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
-                let notification_capacity =
-                    op_manager.to_event_listener.notifications_sender.capacity();
-                let notification_pending = 2048usize.saturating_sub(notification_capacity);
+                let notifier = &op_manager.to_event_listener;
                 tracing::info!(
                     iterations = loop_iteration_count,
                     slow_events = slow_event_count,
-                    notification_channel_pending = notification_pending,
-                    notification_channel_capacity = notification_capacity,
+                    notification_channel_pending = notifier.notification_channel_pending(),
+                    notification_channel_capacity = notifier.notifications_sender.capacity(),
                     active_connections = ctx.connections.len(),
                     "Event loop stats"
                 );
                 loop_iteration_count = 0;
                 slow_event_count = 0;
-                last_stats_log = std::time::Instant::now();
+                last_stats_log = Instant::now();
             }
 
             match event {

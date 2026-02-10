@@ -146,13 +146,16 @@ pub fn reset_channel_id_counter() {
     CHANNEL_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Channel capacity for event loop notification and op execution channels.
+const EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
+
 pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     use std::sync::atomic::Ordering;
 
     let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let (notification_tx, notification_rx) = mpsc::channel(2048);
-    let (op_execution_tx, op_execution_rx) = mpsc::channel(2048);
+    let (notification_tx, notification_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
+    let (op_execution_tx, op_execution_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
 
     tracing::info!(
         channel_id = _channel_id,
@@ -196,6 +199,13 @@ pub(crate) struct EventLoopNotificationsSender {
 impl EventLoopNotificationsSender {
     pub(crate) fn notifications_sender(&self) -> &Sender<Either<NetMessage, NodeEvent>> {
         &self.notifications_sender
+    }
+
+    /// Returns the number of messages currently queued in the notification channel.
+    pub(crate) fn notification_channel_pending(&self) -> usize {
+        self.notifications_sender
+            .max_capacity()
+            .saturating_sub(self.notifications_sender.capacity())
     }
 
     #[allow(dead_code)] // FIXME: enable async sub-transactions

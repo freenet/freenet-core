@@ -503,13 +503,11 @@ impl OpManager {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(OpError::NotificationError),
             Err(_) => {
-                let remaining_capacity = self.to_event_listener.notifications_sender().capacity();
-                let pending = 2048usize.saturating_sub(remaining_capacity);
                 tracing::error!(
                     tx = %tx,
                     timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
-                    channel_pending = pending,
-                    channel_remaining = remaining_capacity,
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
                     "notify_op_change: Notification channel full for too long, event loop may be stuck"
                 );
                 return Err(OpError::NotificationChannelError(
@@ -545,12 +543,10 @@ impl OpManager {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
-                let remaining_capacity = self.to_event_listener.notifications_sender().capacity();
-                let pending = 2048usize.saturating_sub(remaining_capacity);
                 tracing::error!(
                     timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
-                    channel_pending = pending,
-                    channel_remaining = remaining_capacity,
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
                     "notify_node_event: Notification channel full for too long, event loop may be stuck"
                 );
                 Err(OpError::NotificationChannelError(
