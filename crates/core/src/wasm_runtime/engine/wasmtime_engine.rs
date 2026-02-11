@@ -1077,6 +1077,126 @@ mod tests {
         assert!(module.exports().count() > 0, "Module should have exports");
     }
 
+    /// Verify that host function namespaces and names match what freenet-stdlib
+    /// imports. This is a critical ABI contract test — if any name is wrong,
+    /// ALL WASM modules will fail to instantiate with import resolution errors.
+    ///
+    /// The WAT module imports one function from each namespace to validate the
+    /// registration. If register_host_functions changes a namespace or name,
+    /// this test will fail at instantiation time.
+    #[test]
+    fn test_host_function_abi_compatibility() {
+        // WAT module that imports one function per host namespace.
+        // Signatures must match the Rust host function types exactly.
+        // Rust type mapping: i32/u32 → wasm i32, i64 → wasm i64
+        let wat = r#"
+        (module
+          ;; log::info(id: i64, ptr: i64, len: i32)
+          (import "freenet_log" "__frnt__logger__info"
+            (func $log (param i64 i64 i32)))
+          ;; rand::rand_bytes(id: i64, ptr: i64, len: u32)
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          ;; time::utc_now(id: i64, ptr: i64)
+          (import "freenet_time" "__frnt__time__utc_now"
+            (func $time (param i64 i64)))
+          ;; context_len() -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_len"
+            (func $ctx_len (result i32)))
+          ;; context_read(ptr: i64, len: i32) -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_read"
+            (func $ctx_read (param i64 i32) (result i32)))
+          ;; context_write(ptr: i64, len: i32) -> i32
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_write"
+            (func $ctx_write (param i64 i32) (result i32)))
+          ;; get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__get_secret"
+            (func $get_secret (param i64 i32 i64 i32) (result i32)))
+          ;; get_secret_len(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__get_secret_len"
+            (func $get_secret_len (param i64 i32) (result i32)))
+          ;; set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__set_secret"
+            (func $set_secret (param i64 i32 i64 i32) (result i32)))
+          ;; has_secret(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__has_secret"
+            (func $has_secret (param i64 i32) (result i32)))
+          ;; remove_secret(key_ptr: i64, key_len: i32) -> i32
+          (import "freenet_delegate_secrets" "__frnt__delegate__remove_secret"
+            (func $remove_secret (param i64 i32) (result i32)))
+          ;; get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
+            (func $get_state (param i64 i32 i64 i64) (result i64)))
+          ;; get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "answer") (result i32) i32.const 42)
+        )
+        "#;
+
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+
+        let mut linker = Linker::new(&engine);
+        WasmtimeEngine::register_host_functions(&mut linker).expect("host function registration");
+
+        let module = Module::new(&engine, wat).expect("WAT compilation failed");
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+
+        let result = block_on_async(linker.instantiate_async(&mut store, &module));
+        assert!(
+            result.is_ok(),
+            "Instantiation failed — host function ABI mismatch: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Verify that ensure_memory grows WASM linear memory when req_bytes
+    /// exceeds the initial allocation.
+    #[test]
+    fn test_ensure_memory_grows_when_needed() {
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+
+        // WAT module with only 1 page (64 KB) of initial memory
+        let wat = r#"
+        (module
+          (memory (export "memory") 1 256)
+          (func (export "answer") (result i32) i32.const 42)
+        )
+        "#;
+        let module = Module::new(&engine, wat).unwrap();
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let linker = Linker::new(&engine);
+        let instance = block_on_async(linker.instantiate_async(&mut store, &module)).unwrap();
+
+        // Initial memory is 1 page = 64 KB
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        assert_eq!(memory.data_size(&store), 65536);
+
+        // Request 256 KB — should grow memory to at least 4 pages
+        WasmtimeEngine::ensure_memory(&mut store, &instance, 256 * 1024)
+            .expect("ensure_memory should grow successfully");
+
+        let new_size = memory.data_size(&store);
+        assert!(
+            new_size >= 256 * 1024,
+            "Memory should have grown to at least 256 KB, got {} bytes",
+            new_size
+        );
+
+        // Request less than current size — should be a no-op
+        let size_before = memory.data_size(&store);
+        WasmtimeEngine::ensure_memory(&mut store, &instance, 1024)
+            .expect("ensure_memory with small req should succeed");
+        assert_eq!(
+            memory.data_size(&store),
+            size_before,
+            "Memory should not change when req_bytes < current size"
+        );
+    }
+
     /// Test that demonstrates the memory difference between wasmer and wasmtime.
     ///
     /// This is a documentation test - run manually to observe memory behavior.
