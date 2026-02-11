@@ -1071,10 +1071,7 @@ impl Ring {
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
-        /// Time-jump threshold for detecting suspend/resume cycles.
-        /// If more wall-clock time than this has elapsed since the last maintenance
-        /// iteration, the machine was likely suspended. We clear all backoff state
-        /// to enable immediate reconnection rather than waiting for stale timers.
+        /// Time-jump threshold indicating a likely suspend/resume cycle.
         const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
         let mut zero_connections_since: Option<Instant> = None;
         let mut last_iteration_time = Instant::now();
@@ -1099,9 +1096,14 @@ impl Ring {
             let mut skip_list = HashSet::new();
             skip_list.insert(*this_addr);
 
-            // Detect suspend/resume: if wall-clock time jumped significantly since
-            // last iteration, the machine was likely suspended. Clear all backoff
-            // state (both connection and gateway) to enable immediate reconnection.
+            // Resets both connection (location-based) and gateway (address-based)
+            // backoff state. Used for suspend/resume recovery and isolation recovery.
+            let reset_all_backoff = || {
+                self.reset_all_connection_backoff();
+                op_manager.gateway_backoff.lock().clear();
+            };
+
+            // Detect suspend/resume via wall-clock time jump
             let elapsed_since_last = last_iteration_time.elapsed();
             last_iteration_time = Instant::now();
             if elapsed_since_last > SUSPEND_DETECTION_THRESHOLD {
@@ -1109,9 +1111,7 @@ impl Ring {
                     elapsed_secs = elapsed_since_last.as_secs(),
                     "Detected possible suspend/resume (large time jump) — clearing all backoff state"
                 );
-                self.reset_all_connection_backoff();
-                op_manager.gateway_backoff.lock().clear();
-                // Reset isolation timer so we don't immediately escalate
+                reset_all_backoff();
                 zero_connections_since = None;
             }
 
@@ -1131,7 +1131,7 @@ impl Ring {
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
-            // Gateway isolation recovery: when we have zero ring connections for too long,
+            // Isolation recovery: when we have zero ring connections for too long,
             // reset all backoff state so we can retry aggressively (#2928).
             let current_conn_count = self.connection_manager.connection_count();
             if current_conn_count == 0 {
@@ -1142,8 +1142,7 @@ impl Ring {
                             isolated_for_secs = since.elapsed().as_secs(),
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
-                        self.reset_all_connection_backoff();
-                        op_manager.gateway_backoff.lock().clear();
+                        reset_all_backoff();
                         zero_connections_since = Some(Instant::now());
                     }
                 } else {
