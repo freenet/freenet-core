@@ -1080,6 +1080,11 @@ impl Ring {
 
         let mut this_peer = None;
         loop {
+            // Update boot-time tracking at the top of every iteration (including
+            // early-continue paths) so elapsed time doesn't accumulate during startup.
+            let boot_elapsed = last_boot_time.elapsed();
+            last_boot_time = boot_time::Instant::now();
+
             let op_manager = match self.upgrade_op_manager() {
                 Some(op_manager) => op_manager,
                 None => {
@@ -1108,9 +1113,8 @@ impl Ring {
             };
 
             // Suspend/resume detection: if boot-time elapsed much more than
-            // the tick interval, we were likely suspended.
-            let boot_elapsed = last_boot_time.elapsed();
-            last_boot_time = boot_time::Instant::now();
+            // the tick interval, we were likely suspended. boot_elapsed was
+            // computed at the top of the loop so it includes early-continue time.
             if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
                 tracing::warn!(
                     boot_elapsed_secs = boot_elapsed.as_secs(),
