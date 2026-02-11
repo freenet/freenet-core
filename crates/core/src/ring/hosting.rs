@@ -475,7 +475,7 @@ impl HostingManager {
 
     /// Get all hosted contract keys.
     pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
-        self.hosting_cache.read().contract_keys()
+        self.hosting_cache.read().iter().collect()
     }
 
     /// Get the number of contracts in the hosting cache.

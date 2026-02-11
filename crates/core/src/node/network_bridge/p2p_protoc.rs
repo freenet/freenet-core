@@ -1561,6 +1561,8 @@ impl P2pConnManager {
                                 // Collect contract states.
                                 // When contract_keys is empty, return ALL hosting contracts.
                                 // When specific keys are provided, return only those.
+                                // Note: subscriber_peer_ids is always empty because we use
+                                // lease-based subscriptions rather than explicit subscriber tracking.
                                 if config.contract_keys.is_empty() {
                                     let hosting_contracts = op_manager.ring.hosting_contract_keys();
                                     for contract_key in hosting_contracts {

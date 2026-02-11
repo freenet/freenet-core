@@ -254,11 +254,6 @@ impl<T: TimeSource> HostingCache<T> {
         self.contracts.keys().cloned()
     }
 
-    /// Get all hosted contract keys as a Vec.
-    pub fn contract_keys(&self) -> Vec<ContractKey> {
-        self.contracts.keys().copied().collect()
-    }
-
     /// Sweep for contracts that are over budget and past TTL.
     ///
     /// The `should_retain` predicate is called for each candidate contract before eviction.
@@ -694,5 +689,27 @@ mod tests {
         cache.record_access(key, 150, AccessType::Put);
         assert_eq!(cache.current_bytes(), 150);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 150);
+    }
+
+    #[test]
+    fn test_iter_returns_all_hosted_keys() {
+        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+
+        // Empty cache yields no keys
+        assert_eq!(cache.iter().count(), 0);
+
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        cache.record_access(key1, 100, AccessType::Get);
+        cache.record_access(key2, 100, AccessType::Put);
+        cache.record_access(key3, 100, AccessType::Subscribe);
+
+        let keys: Vec<ContractKey> = cache.iter().collect();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&key1));
+        assert!(keys.contains(&key2));
+        assert!(keys.contains(&key3));
     }
 }
