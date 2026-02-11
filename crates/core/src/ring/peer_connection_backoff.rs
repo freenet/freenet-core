@@ -113,8 +113,8 @@ impl PeerConnectionBackoff {
         self.inner.cleanup_expired();
     }
 
-    /// Clear all backoff state. Used during isolation recovery or after detecting
-    /// a suspend/resume cycle, when all previous backoff timers are stale.
+    /// Clear all backoff state. Used during isolation recovery when all
+    /// previous backoff timers are stale.
     pub fn clear(&mut self) {
         self.inner.clear();
     }

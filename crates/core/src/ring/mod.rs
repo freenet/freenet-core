@@ -1071,10 +1071,7 @@ impl Ring {
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
-        /// Time-jump threshold indicating a likely suspend/resume cycle.
-        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
         let mut zero_connections_since: Option<Instant> = None;
-        let mut last_iteration_time = Instant::now();
         let mut this_peer = None;
         loop {
             let op_manager = match self.upgrade_op_manager() {
@@ -1097,23 +1094,12 @@ impl Ring {
             skip_list.insert(*this_addr);
 
             // Resets both connection (location-based) and gateway (address-based)
-            // backoff state. Used for suspend/resume recovery and isolation recovery.
+            // backoff state. Used during isolation recovery to ensure all gateways
+            // are retryable when the node has zero ring connections.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
             };
-
-            // Detect suspend/resume via wall-clock time jump
-            let elapsed_since_last = last_iteration_time.elapsed();
-            last_iteration_time = Instant::now();
-            if elapsed_since_last > SUSPEND_DETECTION_THRESHOLD {
-                tracing::warn!(
-                    elapsed_secs = elapsed_since_last.as_secs(),
-                    "Detected possible suspend/resume (large time jump) — clearing all backoff state"
-                );
-                reset_all_backoff();
-                zero_connections_since = None;
-            }
 
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
