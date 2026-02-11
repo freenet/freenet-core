@@ -864,9 +864,36 @@ pub(crate) enum ContractError {
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
+    #[error("Contract {0} appears to be compiled in debug mode (contains .debug_* sections). Please compile with --release for production use.")]
+    DebugWasm(ContractKey),
     #[error("fatal executor error for contract {key}: {error}")]
     FatalExecutorError {
         key: ContractKey,
         error: ExecutorError,
     },
+}
+
+impl ContractError {
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            ContractError::FatalExecutorError { error, .. } => error.is_fatal(),
+            _ => false,
+        }
+    }
+}
+
+/// Validate a contract container.
+///
+/// Currently checks if WASM contracts are compiled in debug mode.
+pub fn validate_contract(contract: &ContractContainer) -> Result<(), ContractError> {
+    if let ContractContainer::Wasm(api_version) = contract {
+        let code = match api_version {
+            ContractWasmAPIVersion::V1(contract) => contract.code(),
+            _ => unreachable!(),
+        };
+        if crate::wasm_runtime::is_debug_wasm(code.data()) {
+            return Err(ContractError::DebugWasm(contract.key()));
+        }
+    }
+    Ok(())
 }
