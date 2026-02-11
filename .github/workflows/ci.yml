@@ -202,6 +202,14 @@ jobs:
             --test simulation_smoke \
             -- --test-threads=1
 
+      - name: Test wasmtime backend
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        # Test the wasmtime backend to prevent regressions
+        # Runs wasmtime unit tests and basic integration tests
+        run: cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmtime-backend --lib
+
   six_peer_regression:
     name: six-peer-regression
     needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
