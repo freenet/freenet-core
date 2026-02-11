@@ -22,7 +22,18 @@
 //!   blocking thread with timeout. Used for contract operations that may take seconds.
 //!   The wasmer backend uses `spawn_blocking` + poll with timeout.
 
+// Ensure exactly one backend is selected
+#[cfg(all(feature = "wasmer-backend", feature = "wasmtime-backend"))]
+compile_error!("Cannot enable both wasmer-backend and wasmtime-backend. Choose one.");
+
+#[cfg(not(any(feature = "wasmer-backend", feature = "wasmtime-backend")))]
+compile_error!("Must enable exactly one WASM backend: wasmer-backend or wasmtime-backend");
+
+#[cfg(feature = "wasmer-backend")]
 mod wasmer_engine;
+
+#[cfg(feature = "wasmtime-backend")]
+mod wasmtime_engine;
 
 use super::runtime::RuntimeConfig;
 use super::ContractError;
@@ -128,7 +139,7 @@ pub(crate) trait WasmEngine: Send {
     // -- Memory --
 
     /// Get `(data_ptr, data_size)` of the instance's linear memory.
-    fn memory_info(&self, handle: &InstanceHandle) -> Result<(*const u8, usize), WasmError>;
+    fn memory_info(&mut self, handle: &InstanceHandle) -> Result<(*const u8, usize), WasmError>;
 
     /// Call `__frnt__initiate_buffer(size)` to allocate a WASM-side buffer.
     fn initiate_buffer(&mut self, handle: &InstanceHandle, size: u32) -> Result<i64, WasmError>;
@@ -196,13 +207,19 @@ pub(crate) trait WasmEngine: Send {
 }
 
 // Backend selection via type alias — no generics leak outside wasm_runtime/
+#[cfg(feature = "wasmer-backend")]
 pub(crate) type Engine = wasmer_engine::WasmerEngine;
 
-/// The underlying wasmer engine type shared across RuntimePool executors.
+#[cfg(feature = "wasmtime-backend")]
+pub(crate) type Engine = wasmtime_engine::WasmtimeEngine;
+
+/// The underlying backend engine type shared across RuntimePool executors.
 ///
-/// All executors in a pool MUST share the same backend engine because wasmer
-/// `Artifact`s store function pointers and signature indices that reference
-/// the compiling Engine's internal data structures (code_memory, SignatureRegistry).
-/// Using a Module compiled by one Engine in a Store backed by a different Engine
-/// can cause SIGSEGV.
+/// All executors in a pool MUST share the same backend engine because compiled
+/// modules store references to the compiling engine's internal data structures.
+/// Using a Module compiled by one Engine with a different Engine can cause errors.
+#[cfg(feature = "wasmer-backend")]
 pub(crate) type BackendEngine = wasmer::Engine;
+
+#[cfg(feature = "wasmtime-backend")]
+pub(crate) type BackendEngine = wasmtime::Engine;

@@ -21,8 +21,8 @@ use wasmer::sys::vm::{
 };
 use wasmer::sys::{BaseTunables, CompilerConfig, EngineBuilder, Tunables};
 use wasmer::{
-    imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Pages, Store, TableType,
-    TypedFunction,
+    imports, Bytes, Function, Imports, Instance, Memory, MemoryType, Module, Pages, Store,
+    TableType, TypedFunction,
 };
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
@@ -142,10 +142,10 @@ impl WasmEngine for WasmerEngine {
         MEM_ADDR.remove(&handle.id);
     }
 
-    fn memory_info(&self, handle: &InstanceHandle) -> Result<(*const u8, usize), WasmError> {
+    fn memory_info(&mut self, handle: &InstanceHandle) -> Result<(*const u8, usize), WasmError> {
         let store = self
             .store
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
         let instance = self
             .instances
@@ -533,12 +533,90 @@ impl WasmerEngine {
     }
 
     fn register_host_functions(store: &mut Store, imports: &mut Imports) {
-        native_api::log::prepare_export(store, imports);
-        native_api::rand::prepare_export(store, imports);
-        native_api::time::prepare_export(store, imports);
-        native_api::delegate_context::prepare_export(store, imports);
-        native_api::delegate_secrets::prepare_export(store, imports);
-        native_api::delegate_contracts::prepare_export(store, imports);
+        // Log namespace
+        let info = Function::new_typed(store, native_api::log::info);
+        imports.register_namespace(
+            "freenet_log",
+            [("__frnt__logger__info".to_owned(), info.into())],
+        );
+
+        // Rand namespace
+        let rand_bytes = Function::new_typed(store, native_api::rand::rand_bytes);
+        imports.register_namespace(
+            "freenet_rand",
+            [("__frnt__rand__rand_bytes".to_owned(), rand_bytes.into())],
+        );
+
+        // Time namespace
+        let utc_now = Function::new_typed(store, native_api::time::utc_now);
+        imports.register_namespace(
+            "freenet_time",
+            [("__frnt__time__utc_now".to_owned(), utc_now.into())],
+        );
+
+        // Delegate context namespace
+        let ctx_len = Function::new_typed(store, native_api::delegate_context::context_len);
+        let ctx_read = Function::new_typed(store, native_api::delegate_context::context_read);
+        let ctx_write = Function::new_typed(store, native_api::delegate_context::context_write);
+        imports.register_namespace(
+            "freenet_delegate_ctx",
+            [
+                ("__frnt__delegate__ctx_len".to_owned(), ctx_len.into()),
+                ("__frnt__delegate__ctx_read".to_owned(), ctx_read.into()),
+                ("__frnt__delegate__ctx_write".to_owned(), ctx_write.into()),
+            ],
+        );
+
+        // Delegate secrets namespace
+        let get_secret = Function::new_typed(store, native_api::delegate_secrets::get_secret);
+        let get_secret_len =
+            Function::new_typed(store, native_api::delegate_secrets::get_secret_len);
+        let set_secret = Function::new_typed(store, native_api::delegate_secrets::set_secret);
+        let has_secret = Function::new_typed(store, native_api::delegate_secrets::has_secret);
+        let remove_secret = Function::new_typed(store, native_api::delegate_secrets::remove_secret);
+        imports.register_namespace(
+            "freenet_delegate_secrets",
+            [
+                ("__frnt__delegate__get_secret".to_owned(), get_secret.into()),
+                (
+                    "__frnt__delegate__get_secret_len".to_owned(),
+                    get_secret_len.into(),
+                ),
+                ("__frnt__delegate__set_secret".to_owned(), set_secret.into()),
+                ("__frnt__delegate__has_secret".to_owned(), has_secret.into()),
+                (
+                    "__frnt__delegate__remove_secret".to_owned(),
+                    remove_secret.into(),
+                ),
+            ],
+        );
+
+        // Delegate contracts namespace (async host functions)
+        let get_state = Function::new_typed_async(
+            store,
+            |id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64| async move {
+                native_api::delegate_contracts::get_contract_state_impl(
+                    id_ptr, id_len, out_ptr, out_len,
+                )
+            },
+        );
+        let get_state_len =
+            Function::new_typed_async(store, |id_ptr: i64, id_len: i32| async move {
+                native_api::delegate_contracts::get_contract_state_len_impl(id_ptr, id_len)
+            });
+        imports.register_namespace(
+            "freenet_delegate_contracts",
+            [
+                (
+                    "__frnt__delegate__get_contract_state".to_owned(),
+                    get_state.into(),
+                ),
+                (
+                    "__frnt__delegate__get_contract_state_len".to_owned(),
+                    get_state_len.into(),
+                ),
+            ],
+        );
     }
 
     fn ensure_memory(
@@ -913,7 +991,7 @@ impl<T: Tunables> Tunables for LimitingTunables<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasmer-backend"))]
 mod tests {
     use super::*;
 

@@ -2,7 +2,6 @@
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
-use wasmer::{Function, Imports};
 
 use std::sync::LazyLock;
 
@@ -186,21 +185,13 @@ fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
     (start_ptr + ptr) as _
 }
 
-pub(crate) mod log {
+pub(super) mod log {
     use super::*;
-
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let utc_now = Function::new_typed(store, info);
-        imports.register_namespace(
-            "freenet_log",
-            [("__frnt__logger__info".to_owned(), utc_now.into())],
-        );
-    }
 
     // TODO: this API right now is just a patch, ideally we want to impl a tracing subscriber
     // that can be used in wasm and that under the hood will just pass data to the host via
     // functions like this in a structured way
-    fn info(id: i64, ptr: i64, len: i32) {
+    pub(crate) fn info(id: i64, ptr: i64, len: i32) {
         if id == -1 {
             panic!("unset module id");
         }
@@ -212,20 +203,12 @@ pub(crate) mod log {
     }
 }
 
-pub(crate) mod rand {
+pub(super) mod rand {
     use ::rand::{rng, RngCore};
 
     use super::*;
 
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let rand_bytes = Function::new_typed(store, rand_bytes);
-        imports.register_namespace(
-            "freenet_rand",
-            [("__frnt__rand__rand_bytes".to_owned(), rand_bytes.into())],
-        );
-    }
-
-    fn rand_bytes(id: i64, ptr: i64, len: u32) {
+    pub(crate) fn rand_bytes(id: i64, ptr: i64, len: u32) {
         if id == -1 {
             panic!("unset module id");
         }
@@ -237,19 +220,11 @@ pub(crate) mod rand {
     }
 }
 
-pub(crate) mod time {
+pub(super) mod time {
     use super::*;
     use chrono::{DateTime, Utc as UtcOriginal};
 
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let utc_now = Function::new_typed(store, utc_now);
-        imports.register_namespace(
-            "freenet_time",
-            [("__frnt__time__utc_now".to_owned(), utc_now.into())],
-        );
-    }
-
-    fn utc_now(id: i64, ptr: i64) {
+    pub(crate) fn utc_now(id: i64, ptr: i64) {
         if id == -1 {
             panic!("unset module id");
         }
@@ -277,22 +252,8 @@ pub(crate) mod time {
 /// - Returns `ERR_NOT_IN_PROCESS` (-1) if called outside process()
 /// - Returns `ERR_INVALID_PARAM` (-4) for invalid parameters (negative length)
 /// - Returns `ERR_CONTEXT_TOO_LARGE` (-5) if context exceeds i32::MAX bytes
-pub(crate) mod delegate_context {
+pub(super) mod delegate_context {
     use super::*;
-
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let ctx_len = Function::new_typed(store, context_len);
-        let ctx_read = Function::new_typed(store, context_read);
-        let ctx_write = Function::new_typed(store, context_write);
-        imports.register_namespace(
-            "freenet_delegate_ctx",
-            [
-                ("__frnt__delegate__ctx_len".to_owned(), ctx_len.into()),
-                ("__frnt__delegate__ctx_read".to_owned(), ctx_read.into()),
-                ("__frnt__delegate__ctx_write".to_owned(), ctx_write.into()),
-            ],
-        );
-    }
 
     /// Returns the current context length in bytes.
     ///
@@ -300,7 +261,7 @@ pub(crate) mod delegate_context {
     /// - Non-negative: context length in bytes
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_CONTEXT_TOO_LARGE`: context exceeds i32::MAX bytes
-    fn context_len() -> i32 {
+    pub(crate) fn context_len() -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate context_len called outside process()");
@@ -323,7 +284,7 @@ pub(crate) mod delegate_context {
     /// - Non-negative: number of bytes written (min of context length and `len`)
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
-    fn context_read(ptr: i64, len: i32) -> i32 {
+    pub(crate) fn context_read(ptr: i64, len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate context_read called outside process()");
@@ -359,7 +320,7 @@ pub(crate) mod delegate_context {
     /// - `SUCCESS` (0): write succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
-    fn context_write(ptr: i64, len: i32) -> i32 {
+    pub(crate) fn context_write(ptr: i64, len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate context_write called outside process()");
@@ -402,32 +363,8 @@ pub(crate) mod delegate_context {
 /// - Returns `ERR_STORAGE_FAILED` (-3) if storage operation failed
 /// - Returns `ERR_INVALID_PARAM` (-4) for invalid parameters (negative length)
 /// - Returns `ERR_BUFFER_TOO_SMALL` (-6) if output buffer is too small
-pub(crate) mod delegate_secrets {
+pub(super) mod delegate_secrets {
     use super::*;
-
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let get_secret = Function::new_typed(store, get_secret);
-        let get_secret_len = Function::new_typed(store, get_secret_len);
-        let set_secret = Function::new_typed(store, set_secret);
-        let has_secret = Function::new_typed(store, has_secret);
-        let remove_secret = Function::new_typed(store, remove_secret);
-        imports.register_namespace(
-            "freenet_delegate_secrets",
-            [
-                ("__frnt__delegate__get_secret".to_owned(), get_secret.into()),
-                (
-                    "__frnt__delegate__get_secret_len".to_owned(),
-                    get_secret_len.into(),
-                ),
-                ("__frnt__delegate__set_secret".to_owned(), set_secret.into()),
-                ("__frnt__delegate__has_secret".to_owned(), has_secret.into()),
-                (
-                    "__frnt__delegate__remove_secret".to_owned(),
-                    remove_secret.into(),
-                ),
-            ],
-        );
-    }
 
     /// Get the length of a secret without retrieving its value.
     /// This allows the caller to allocate the right buffer size before calling get_secret.
@@ -437,7 +374,7 @@ pub(crate) mod delegate_secrets {
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative key length)
-    fn get_secret_len(key_ptr: i64, key_len: i32) -> i32 {
+    pub(crate) fn get_secret_len(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_secret_len called outside process()");
@@ -485,7 +422,7 @@ pub(crate) mod delegate_secrets {
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     /// - `ERR_BUFFER_TOO_SMALL`: output buffer is too small (use get_secret_len first)
-    fn get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32 {
+    pub(crate) fn get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_secret called outside process()");
@@ -547,7 +484,7 @@ pub(crate) mod delegate_secrets {
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_STORAGE_FAILED`: storage operation failed
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
-    fn set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32 {
+    pub(crate) fn set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate set_secret called outside process()");
@@ -595,7 +532,7 @@ pub(crate) mod delegate_secrets {
     /// - 0: secret doesn't exist
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
-    fn has_secret(key_ptr: i64, key_len: i32) -> i32 {
+    pub(crate) fn has_secret(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate has_secret called outside process()");
@@ -632,7 +569,7 @@ pub(crate) mod delegate_secrets {
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
     /// - `ERR_STORAGE_FAILED`: storage operation failed
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
-    fn remove_secret(key_ptr: i64, key_len: i32) -> i32 {
+    pub(crate) fn remove_secret(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate remove_secret called outside process()");
@@ -695,45 +632,15 @@ pub(crate) mod delegate_secrets {
 /// - `ERR_BUFFER_TOO_SMALL` (-6): output buffer too small
 /// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
 /// - `ERR_STORE_ERROR` (-8): internal storage error
-pub(crate) mod delegate_contracts {
+pub(super) mod delegate_contracts {
     use super::*;
     use crate::wasm_runtime::delegate_api::contract_error_codes;
-
-    pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        // Register as async host functions using Function::new_typed_async.
-        // This means the WASM execution must use call_async() via a StoreAsync.
-        // The closures |args| async move { ... } satisfy the HostFunction trait:
-        //   Fn(Args) -> impl Future<Output = Rets> + Send + 'static
-        let get_state = Function::new_typed_async(
-            store,
-            |id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64| async move {
-                get_contract_state_impl(id_ptr, id_len, out_ptr, out_len)
-            },
-        );
-        let get_state_len =
-            Function::new_typed_async(store, |id_ptr: i64, id_len: i32| async move {
-                get_contract_state_len_impl(id_ptr, id_len)
-            });
-        imports.register_namespace(
-            "freenet_delegate_contracts",
-            [
-                (
-                    "__frnt__delegate__get_contract_state".to_owned(),
-                    get_state.into(),
-                ),
-                (
-                    "__frnt__delegate__get_contract_state_len".to_owned(),
-                    get_state_len.into(),
-                ),
-            ],
-        );
-    }
 
     /// Implementation of get_contract_state_len.
     ///
     /// Extracted as a free function so it can be called from the async wrapper.
     /// Accesses only global statics (MEM_ADDR, DELEGATE_ENV) which are Send + 'static.
-    fn get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
+    pub(crate) fn get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_contract_state_len called outside process()");
@@ -791,7 +698,12 @@ pub(crate) mod delegate_contracts {
     /// Implementation of get_contract_state.
     ///
     /// Extracted as a free function so it can be called from the async wrapper.
-    fn get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64 {
+    pub(crate) fn get_contract_state_impl(
+        id_ptr: i64,
+        id_len: i32,
+        out_ptr: i64,
+        out_len: i64,
+    ) -> i64 {
         let id = current_instance_id();
         if id == -1 {
             tracing::warn!("delegate get_contract_state called outside process()");

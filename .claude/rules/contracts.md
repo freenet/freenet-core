@@ -11,12 +11,22 @@ paths:
 ### Engine Abstraction (`wasm_runtime/engine/`)
 
 ```
-WasmEngine trait    → mod.rs      (backend-agnostic interface)
-WasmerEngine impl   → wasmer_engine.rs (ONLY file that imports wasmer::)
-Engine type alias   → mod.rs      (Engine = WasmerEngine)
+WasmEngine trait     → mod.rs             (backend-agnostic interface)
+WasmerEngine impl    → wasmer_engine.rs   (ONLY file that imports wasmer::)
+WasmtimeEngine impl  → wasmtime_engine.rs (ONLY file that imports wasmtime::)
+Engine type alias    → mod.rs             (selected by feature flag)
 ```
 
+**Backend Selection:** Choose WASM runtime at compile time via Cargo features:
+```
+default: wasmer-backend              # Wasmer 7.x (default, stable)
+--features wasmtime-backend          # Wasmtime 27.x (experimental)
+```
+
+**Exactly one backend MUST be enabled.** Compile error if both or neither selected.
+
 **All `wasmer::` imports MUST stay in `engine/wasmer_engine.rs`.**
+**All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
 ### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)

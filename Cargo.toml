@@ -97,6 +97,7 @@ console-subscriber = "0.5.0"
 wasmer = "7.0.1"
 wasmer-compiler-singlepass = "7.0.1"
 wasmer-middlewares = "7.0.1"
+wasmtime = "27"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }

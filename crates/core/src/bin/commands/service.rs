@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use freenet::config::ConfigPaths;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::report::ReportCommand;
