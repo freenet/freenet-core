@@ -12,7 +12,7 @@ mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
 mod store;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasmer-backend"))]
 mod tests;
 
 pub(crate) use contract::ContractRuntimeInterface;
