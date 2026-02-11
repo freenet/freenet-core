@@ -3461,7 +3461,7 @@ pub mod tracer {
                 // Clean up old log files (including legacy daily logs) on startup
                 cleanup_old_logs(log_dir);
 
-                // Create rolling file appender for main log (hourly rotation, 3 hour retention)
+                // Create rolling file appender for main log (hourly rotation)
                 let main_appender = RollingFileAppender::builder()
                     .rotation(Rotation::HOURLY)
                     .max_log_files(LOG_RETENTION_HOURS)
@@ -3470,7 +3470,7 @@ pub mod tracer {
                     .build(log_dir)
                     .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
 
-                // Create rolling file appender for error log (hourly rotation, 3 hour retention)
+                // Create rolling file appender for error log (hourly rotation)
                 let error_appender = RollingFileAppender::builder()
                     .rotation(Rotation::HOURLY)
                     .max_log_files(LOG_RETENTION_HOURS)
