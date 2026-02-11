@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use semver::Version;
 
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
+use super::utils::get_latest_release;
 
 #[derive(Args, Debug, Clone)]
 pub struct CheckVersionCommand {}
@@ -40,32 +40,18 @@ impl CheckVersionCommand {
     }
 }
 
-#[derive(serde::Deserialize, Debug)]
-struct Release {
-    tag_name: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn get_latest_release() -> Result<Release> {
-    let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        .build()?;
+    #[test]
+    fn test_version_comparison() {
+        let current = Version::parse("0.1.0").unwrap();
+        let newer = Version::parse("0.1.1").unwrap();
+        let older = Version::parse("0.0.9").unwrap();
 
-    let response = client
-        .get(GITHUB_API_URL)
-        .send()
-        .await
-        .context("Failed to fetch release info")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "GitHub API returned error: {} {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        );
+        assert!(newer > current);
+        assert!(older < current);
+        assert!(current == Version::parse("0.1.0").unwrap());
     }
-
-    response
-        .json::<Release>()
-        .await
-        .context("Failed to parse release info")
 }
