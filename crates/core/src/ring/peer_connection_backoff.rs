@@ -247,4 +247,24 @@ mod tests {
         assert!(remaining.unwrap() <= Duration::from_secs(10));
         assert!(remaining.unwrap() >= Duration::from_secs(9));
     }
+
+    #[test]
+    fn test_clear_removes_all_backoff_state() {
+        let mut backoff = PeerConnectionBackoff::with_config(
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+            1024,
+        );
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        backoff.record_failure(addr1);
+        backoff.record_failure(addr2);
+        assert!(backoff.is_in_backoff(addr1));
+        assert!(backoff.is_in_backoff(addr2));
+
+        backoff.clear();
+        assert!(!backoff.is_in_backoff(addr1));
+        assert!(!backoff.is_in_backoff(addr2));
+    }
 }
