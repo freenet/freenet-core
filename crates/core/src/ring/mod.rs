@@ -412,6 +412,18 @@ impl Ring {
                 continue;
             }
 
+            // Skip renewal entirely when we have no ring connections.
+            // Without connections we can't route Subscribe messages, so spawning
+            // tasks just fills the notification channel and can deadlock the
+            // event loop (see production incident 2026-02-11 on vega gateway).
+            if ring.open_connections() == 0 {
+                tracing::debug!(
+                    contracts = contracts_needing_renewal.len(),
+                    "Skipping subscription renewal: no ring connections available"
+                );
+                continue;
+            }
+
             // Shuffle to prevent starvation: without this, the same failing contracts
             // (first N in iteration order) would always be tried first, blocking later
             // contracts from ever being attempted when they hit the batch limit.

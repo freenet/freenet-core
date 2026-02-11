@@ -3299,9 +3299,9 @@ pub mod tracer {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{Layer, Registry};
 
-    /// Number of hours to keep log files (using hourly rotation)
-    /// Keeps logs small to prevent disk fill-up from log spam
-    const LOG_RETENTION_HOURS: usize = 3;
+    /// Number of hours to keep log files (using hourly rotation).
+    /// At typical gateway log rates (~500KB/hour), 72 hours ≈ 36MB.
+    const LOG_RETENTION_HOURS: usize = 72;
 
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
