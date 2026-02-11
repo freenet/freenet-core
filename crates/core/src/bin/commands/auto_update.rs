@@ -13,11 +13,12 @@
 //! This is temporary alpha-testing infrastructure to reduce the burden of
 //! frequent updates during rapid development.
 
-use anyhow::Result;
 use semver::Version;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+
+use super::utils::get_latest_release;
 
 // Re-export version mismatch detection from transport layer
 pub use freenet::transport::{clear_version_mismatch, has_version_mismatch};
@@ -34,9 +35,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Maximum consecutive update failures before disabling auto-update.
 const MAX_UPDATE_FAILURES: u32 = 3;
-
-/// GitHub API URL for latest release.
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
 /// Error returned when an update is needed.
 /// The main function catches this and exits with EXIT_CODE_UPDATE_NEEDED.
@@ -105,8 +103,9 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
     record_check_time();
 
     // Fetch latest version from GitHub
-    match get_latest_version().await {
+    match get_latest_release().await {
         Ok(latest) => {
+            let latest_version = latest.tag_name.trim_start_matches('v').to_string();
             let current = match Version::parse(current_version) {
                 Ok(v) => v,
                 Err(e) => {
@@ -121,10 +120,10 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 }
             };
 
-            let latest_ver = match Version::parse(&latest) {
+            let latest_ver = match Version::parse(&latest_version) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("Failed to parse latest version '{}': {}", latest, e);
+                    tracing::warn!("Failed to parse latest version '{}': {}", latest_version, e);
                     // Increase backoff and retry later
                     increase_backoff();
                     return UpdateCheckResult::Skipped;
@@ -134,17 +133,17 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             if latest_ver > current {
                 tracing::info!(
                     current = %current_version,
-                    latest = %latest,
+                    latest = %latest_version,
                     "Newer version confirmed on GitHub"
                 );
                 // Clear failure count and backoff since we found an update
                 clear_update_failures();
                 reset_backoff();
-                UpdateCheckResult::UpdateAvailable(latest)
+                UpdateCheckResult::UpdateAvailable(latest_version)
             } else {
                 tracing::debug!(
                     current = %current_version,
-                    latest = %latest,
+                    latest = %latest_version,
                     backoff_secs = current_backoff.as_secs(),
                     "No newer version on GitHub yet, will retry with increased backoff"
                 );
@@ -163,28 +162,6 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             UpdateCheckResult::Skipped
         }
     }
-}
-
-/// Fetch the latest version string from GitHub releases API.
-async fn get_latest_version() -> Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let response = client.get(GITHUB_API_URL).send().await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Release {
-        tag_name: String,
-    }
-
-    let release: Release = response.json().await?;
-    Ok(release.tag_name.trim_start_matches('v').to_string())
 }
 
 /// Get the state directory for update tracking files.
