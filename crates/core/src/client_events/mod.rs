@@ -600,6 +600,7 @@ async fn process_open_request(
                             "Received PUT request from client"
                         );
 
+                        crate::contract::validate_contract(&contract)?;
                         let contract_key = contract.key();
 
                         // Check if this will be a local-only PUT (no network peers available)
