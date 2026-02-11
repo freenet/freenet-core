@@ -187,7 +187,7 @@ jobs:
         # Run all tests in parallel using all 16 cores
         # Operations tests use dynamic port allocation with unique IPs (127.x.y.1) and are fully thread-safe
         # Simulation tests excluded via feature flag (run separately below due to global state)
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb,wasmer-backend
 
       - name: Test simulation (serial)
         env:
@@ -197,7 +197,7 @@ jobs:
         # and must run serially to avoid race conditions.
         # Includes: basic simulation, subscription topology validation
         run: |
-          cargo test -p freenet --no-default-features --features trace,websocket,redb,simulation_tests,testing \
+          cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmer-backend,simulation_tests,testing \
             --test simulation_integration \
             --test simulation_smoke \
             -- --test-threads=1

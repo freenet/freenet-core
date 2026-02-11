@@ -111,12 +111,14 @@ impl WasmEngine for WasmtimeEngine {
             store.set_fuel(max_fuel)?;
         }
 
-        // If host_mem is true, pre-define a memory in the linker.
-        // For simplicity, we'll skip host memory for now (most contracts define their own memory).
-        // If needed, we can add: linker.define("env", "memory", Memory::new(&mut store, ...)?)?;
+        // Host memory sharing is not yet implemented in the wasmtime backend.
+        // Fail explicitly rather than silently degrading.
         if host_mem {
-            // TODO: Implement host memory sharing if needed
-            tracing::warn!("host_mem=true not fully supported in wasmtime backend yet");
+            return Err(anyhow::anyhow!(
+                "host_mem=true is not supported in wasmtime backend. \
+                 Set host_mem=false or use wasmer-backend feature."
+            )
+            .into());
         }
 
         Ok(Self {
@@ -233,7 +235,8 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(), ()>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        func.call(&mut *store, ())
+        // Use call_async because async_support(true) is enabled in the engine Config
+        block_on_async(func.call_async(&mut *store, ()))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
     }
 
@@ -257,7 +260,8 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        func.call(&mut *store, (a, b, c))
+        // Use call_async because async_support(true) is enabled in the engine Config
+        block_on_async(func.call_async(&mut *store, (a, b, c)))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
     }
 
@@ -329,7 +333,8 @@ impl WasmEngine for WasmtimeEngine {
 
         let result = execute_wasm_blocking(
             move || {
-                let r = func.call(&mut store, (a, b));
+                // Use call_async because async_support(true) is enabled in the engine Config
+                let r = block_on_async(func.call_async(&mut store, (a, b)));
                 (r, store)
             },
             self.max_execution_seconds,
@@ -385,7 +390,8 @@ impl WasmEngine for WasmtimeEngine {
 
         let result = execute_wasm_blocking(
             move || {
-                let r = func.call(&mut store, (a, b, c));
+                // Use call_async because async_support(true) is enabled in the engine Config
+                let r = block_on_async(func.call_async(&mut store, (a, b, c)));
                 (r, store)
             },
             self.max_execution_seconds,
