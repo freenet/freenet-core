@@ -150,9 +150,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use wasmtime::{
-    Caller, Config, Engine, Error as WasmtimeError, Extern, Func, Instance,
-    InstanceAllocationStrategy, Linker, Module, OptLevel, PoolingAllocationConfig, ResourceLimiter,
-    Store, TypedFunc,
+    Caller, Config, Engine, Error as WasmtimeError, Instance, InstanceAllocationStrategy, Linker,
+    Module, OptLevel, PoolingAllocationConfig, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -311,29 +310,20 @@ impl WasmEngine for WasmtimeEngine {
             .map_err(|e| WasmError::Instantiation(e.to_string()))?;
 
         // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
+        // CRITICAL: Must use call_async() because async_support(true) is enabled
         if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
             let typed_func = set_id_func
                 .typed::<i64, ()>(&*store)
                 .map_err(|e| WasmError::Export(e.to_string()))?;
-            typed_func
-                .call(&mut *store, id)
+            block_on_async(typed_func.call_async(&mut *store, id))
                 .map_err(|e| WasmError::Runtime(e.to_string()))?;
         }
 
-        // Record memory address for host function pointer arithmetic
-        let memory = instance
-            .get_memory(&mut *store, "memory")
-            .ok_or_else(|| WasmError::Export("memory export not found".to_string()))?;
-        let data = memory.data(&*store);
-        native_api::MEM_ADDR.insert(
-            id,
-            crate::wasm_runtime::runtime::InstanceInfo {
-                start_ptr: data.as_ptr() as i64,
-                key: crate::wasm_runtime::runtime::Key::Contract(
-                    freenet_stdlib::prelude::ContractInstanceId::default(),
-                ),
-            },
-        );
+        // Note: MEM_ADDR insertion is handled by RunningInstance::new in runtime.rs
+        // which has the correct contract key. Do NOT insert here with a default key.
+
+        // Ensure sufficient memory for the request
+        Self::ensure_memory(store, &instance, req_bytes)?;
 
         self.instances.insert(id, instance);
 
@@ -373,7 +363,8 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        func.call(&mut *store, size)
+        // CRITICAL: Must use call_async() because async_support(true) is enabled
+        block_on_async(func.call_async(&mut *store, size))
             .map_err(|e| WasmError::Runtime(e.to_string()))
     }
 
@@ -604,7 +595,12 @@ impl WasmtimeEngine {
         }
 
         if host_mem {
-            tracing::warn!("host_mem=true not fully supported in wasmtime backend yet");
+            return Err(anyhow::anyhow!(
+                "host_mem=true is not supported in wasmtime backend. \
+                 Host-managed memory requires direct memory manipulation which is \
+                 incompatible with wasmtime's sandboxed memory model."
+            )
+            .into());
         }
 
         Ok(Self {
@@ -667,10 +663,10 @@ impl WasmtimeEngine {
 
         wasmtime_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
 
-        // Enable Cranelift optimizations for compact machine code
-        // SpeedAndSize balances performance with memory footprint.
-        // Expected to generate significantly more compact code than wasmer's ~10 MB per contract.
-        wasmtime_config.cranelift_opt_level(OptLevel::SpeedAndSize);
+        // Use OptLevel::None for maximum security with untrusted code
+        // Simpler compiler = smaller attack surface
+        // Memory benefits come from pooling and proper cleanup, not optimizations
+        wasmtime_config.cranelift_opt_level(OptLevel::None);
 
         let engine = Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(e.into()))?;
 
@@ -698,6 +694,38 @@ impl WasmtimeEngine {
         (config.max_execution_seconds * cpu_cycles_per_sec as f64 * (1.0 + safety_margin)) as u64
     }
 
+    /// Ensure WASM linear memory has sufficient pages for the request.
+    ///
+    /// If the instance's memory is smaller than required, this will attempt to grow it.
+    /// This prevents cryptic memory traps when contracts request more memory than initially allocated.
+    fn ensure_memory(
+        store: &mut Store<HostState>,
+        instance: &Instance,
+        req_bytes: usize,
+    ) -> Result<(), WasmError> {
+        const WASM_PAGE_SIZE: usize = 65536; // 64 KB
+
+        let memory = instance
+            .get_memory(&mut *store, "memory")
+            .ok_or_else(|| WasmError::Export("memory export not found".to_string()))?;
+
+        let current_bytes = memory.data_size(&*store);
+        if current_bytes < req_bytes {
+            let current_pages = (current_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+            let required_pages = (req_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+            let pages_to_grow = required_pages.saturating_sub(current_pages) as u64;
+
+            if let Err(err) = memory.grow(&mut *store, pages_to_grow) {
+                tracing::error!("WASM runtime failed with memory error: {err}");
+                return Err(WasmError::Memory(format!(
+                    "insufficient memory: requested {} bytes ({} pages) but had {} bytes ({} pages)",
+                    req_bytes, required_pages, current_bytes, current_pages
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), ContractError> {
         // Log namespace
         linker
@@ -707,8 +735,8 @@ impl WasmtimeEngine {
         // Rand namespace
         linker
             .func_wrap(
-                "freenet_random",
-                "__frnt__random_bytes",
+                "freenet_rand",
+                "__frnt__rand__rand_bytes",
                 native_api::rand::rand_bytes,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -725,24 +753,24 @@ impl WasmtimeEngine {
         // Delegate context namespace (synchronous)
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__len",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_len",
                 native_api::delegate_context::context_len,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
 
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__read",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_read",
                 native_api::delegate_context::context_read,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
 
         linker
             .func_wrap(
-                "freenet_delegate_context",
-                "__frnt__context__write",
+                "freenet_delegate_ctx",
+                "__frnt__delegate__ctx_write",
                 native_api::delegate_context::context_write,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -751,7 +779,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__get",
+                "__frnt__delegate__get_secret",
                 native_api::delegate_secrets::get_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -759,7 +787,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__get_len",
+                "__frnt__delegate__get_secret_len",
                 native_api::delegate_secrets::get_secret_len,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -767,7 +795,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__set",
+                "__frnt__delegate__set_secret",
                 native_api::delegate_secrets::set_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -775,7 +803,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__has",
+                "__frnt__delegate__has_secret",
                 native_api::delegate_secrets::has_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;
@@ -783,7 +811,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_secrets",
-                "__frnt__secrets__remove",
+                "__frnt__delegate__remove_secret",
                 native_api::delegate_secrets::remove_secret,
             )
             .map_err(|e| WasmError::Other(e.into()))?;

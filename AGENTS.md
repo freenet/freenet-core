@@ -24,7 +24,7 @@
 ### BEFORE committing
 
 ```
-1. Run: cargo fmt && cargo clippy --all-targets --all-features && cargo test
+1. Run: cargo fmt && cargo clippy --all-targets && cargo test
 2. Check: Does commit message follow conventional commits?
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```

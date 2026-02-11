@@ -427,9 +427,11 @@ impl WasmerEngine {
     /// Create a standalone backend engine with default configuration.
     ///
     /// Used by the first executor in a RuntimePool when no shared engine exists yet.
-    pub(crate) fn create_backend_engine() -> wasmer::Engine {
-        let store = Self::create_store(&RuntimeConfig::default());
-        store.engine().clone()
+    pub(crate) fn create_backend_engine(
+        config: &RuntimeConfig,
+    ) -> Result<wasmer::Engine, ContractError> {
+        let store = Self::create_store(config);
+        Ok(store.engine().clone())
     }
 
     /// Get a clone of the underlying wasmer engine for sharing with other instances.
