@@ -12,6 +12,7 @@ members = [
 [workspace.dependencies]
 # Core utilities
 ahash = "0.8"
+boot-time = "0.1.2"
 anyhow = "1"
 arrayvec = { version = "0.7", features = ["serde"] }
 bincode = "1"
