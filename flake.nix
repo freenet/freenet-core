@@ -11,12 +11,9 @@
       flake-utils,
       ...
     }:
-    let
-      package = import ./package.nix;
-    in
     {
       overlays.default = _: pkgs: {
-        freenet = pkgs.callPackage package { };
+        freenet = pkgs.callPackage (import ./package.nix) { };
       };
     }
     // flake-utils.lib.eachDefaultSystem (

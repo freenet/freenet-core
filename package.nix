@@ -21,15 +21,6 @@ rustPlatform.buildRustPackage {
 
   doCheck = false;
 
-  installPhase = ''
-    runHook preInstall
-
-    mkdir -p $out/bin
-    cp target/*/release/freenet $out/bin/
-
-    runHook postInstall
-  '';
-
   meta = with lib; {
     homepage = "https://github.com/freenet/freenet-core";
     license = licenses.agpl3Only;
