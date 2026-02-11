@@ -685,6 +685,24 @@ impl P2pConnManager {
                 loop_iteration_count = 0;
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
+
+                // Periodic cleanup of pending_op_results: remove entries where the
+                // receiver has been dropped (closed sender). This is a safety net for
+                // transactions that complete without emitting TransactionCompleted/TimedOut
+                // events, preventing unbounded HashMap growth.
+                if state.last_pending_op_cleanup.elapsed() > Duration::from_secs(60) {
+                    let before = state.pending_op_results.len();
+                    state.pending_op_results.retain(|_tx, sender| !sender.is_closed());
+                    let removed = before - state.pending_op_results.len();
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            remaining = state.pending_op_results.len(),
+                            "Cleaned up closed pending_op_results senders"
+                        );
+                    }
+                    state.last_pending_op_cleanup = Instant::now();
+                }
             }
 
             match event {
@@ -1672,10 +1690,16 @@ impl P2pConnManager {
                                         "Cleaned up client subscriptions for timed out transaction"
                                     );
                                 }
+                                // Clean up executor callback sender to prevent unbounded
+                                // HashMap growth (entries were inserted by handle_op_execution
+                                // but never removed — see #2941)
+                                state.pending_op_results.remove(&tx);
                             }
                             NodeEvent::TransactionCompleted(tx) => {
                                 // Clean up client subscription after successful completion
                                 state.tx_to_client.remove(&tx);
+                                // Clean up executor callback sender
+                                state.pending_op_results.remove(&tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -3605,6 +3629,8 @@ struct EventListenerState {
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
+    /// Last time pending_op_results was scanned for closed senders.
+    last_pending_op_cleanup: Instant,
     /// Per-peer backoff tracking for failed connection attempts.
     /// Prevents rapid repeated connection attempts to the same peer.
     peer_backoff: PeerConnectionBackoff,
@@ -3621,6 +3647,7 @@ impl EventListenerState {
             client_waiting_transaction: Vec::new(),
             awaiting_connection: HashMap::new(),
             pending_op_results: HashMap::new(),
+            last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
