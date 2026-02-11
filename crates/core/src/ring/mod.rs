@@ -1071,7 +1071,13 @@ impl Ring {
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+        /// Time-jump threshold for detecting suspend/resume cycles.
+        /// If more wall-clock time than this has elapsed since the last maintenance
+        /// iteration, the machine was likely suspended. We clear all backoff state
+        /// to enable immediate reconnection rather than waiting for stale timers.
+        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
         let mut zero_connections_since: Option<Instant> = None;
+        let mut last_iteration_time = Instant::now();
         let mut this_peer = None;
         loop {
             let op_manager = match self.upgrade_op_manager() {
@@ -1092,6 +1098,22 @@ impl Ring {
             // avoid connecting to the same peer multiple times
             let mut skip_list = HashSet::new();
             skip_list.insert(*this_addr);
+
+            // Detect suspend/resume: if wall-clock time jumped significantly since
+            // last iteration, the machine was likely suspended. Clear all backoff
+            // state (both connection and gateway) to enable immediate reconnection.
+            let elapsed_since_last = last_iteration_time.elapsed();
+            last_iteration_time = Instant::now();
+            if elapsed_since_last > SUSPEND_DETECTION_THRESHOLD {
+                tracing::warn!(
+                    elapsed_secs = elapsed_since_last.as_secs(),
+                    "Detected possible suspend/resume (large time jump) — clearing all backoff state"
+                );
+                self.reset_all_connection_backoff();
+                op_manager.gateway_backoff.lock().clear();
+                // Reset isolation timer so we don't immediately escalate
+                zero_connections_since = None;
+            }
 
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
@@ -1118,9 +1140,10 @@ impl Ring {
                         tracing::warn!(
                             is_gateway,
                             isolated_for_secs = since.elapsed().as_secs(),
-                            "Node isolated with zero ring connections — resetting all connection backoff"
+                            "Node isolated with zero ring connections — resetting all backoff state"
                         );
                         self.reset_all_connection_backoff();
+                        op_manager.gateway_backoff.lock().clear();
                         zero_connections_since = Some(Instant::now());
                     }
                 } else {

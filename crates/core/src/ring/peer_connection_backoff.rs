@@ -113,6 +113,12 @@ impl PeerConnectionBackoff {
         self.inner.cleanup_expired();
     }
 
+    /// Clear all backoff state. Used during isolation recovery or after detecting
+    /// a suspend/resume cycle, when all previous backoff timers are stale.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
     /// Get the consecutive failure count for a peer (for testing).
     #[cfg(test)]
     fn failure_count(&self, peer_addr: SocketAddr) -> u32 {
