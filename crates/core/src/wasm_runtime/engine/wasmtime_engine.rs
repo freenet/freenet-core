@@ -627,7 +627,9 @@ impl WasmtimeEngine {
         wasmtime_config.async_support(true);
 
         // Set memory limits via config
-        wasmtime_config.max_wasm_stack(8 * 1024 * 1024); // 8 MiB stack
+        // async_stack_size must exceed max_wasm_stack when async_support is enabled
+        wasmtime_config.max_wasm_stack(WASM_STACK_SIZE);
+        wasmtime_config.async_stack_size(WASM_STACK_SIZE * 2);
 
         // ==================================================================
         // MEMORY MANAGEMENT OPTIMIZATIONS (#2941, #2942, #2928)
@@ -1047,12 +1049,13 @@ mod tests {
         let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
 
         // Compile and instantiate multiple times - pooling should reuse memory
+        // Must use instantiate_async + block_on_async because async_support is enabled
         for _ in 0..5 {
             let module = Module::new(&engine, SIMPLE_WASM).unwrap();
             let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
-            let mut linker = Linker::new(&engine);
+            let linker = Linker::new(&engine);
 
-            let instance = linker.instantiate(&mut store, &module);
+            let instance = block_on_async(linker.instantiate_async(&mut store, &module));
             assert!(
                 instance.is_ok(),
                 "Instance creation should succeed with pooling"
