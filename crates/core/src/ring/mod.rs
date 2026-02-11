@@ -921,6 +921,11 @@ impl Ring {
             .remove_client_from_all_subscriptions(client_id)
     }
 
+    /// Get all hosted contract keys from the hosting cache.
+    pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
+        self.hosting_manager.hosting_contract_keys()
+    }
+
     /// Get the number of contracts in the hosting cache.
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {

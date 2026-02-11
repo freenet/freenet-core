@@ -254,6 +254,11 @@ impl<T: TimeSource> HostingCache<T> {
         self.contracts.keys().cloned()
     }
 
+    /// Get all hosted contract keys as a Vec.
+    pub fn contract_keys(&self) -> Vec<ContractKey> {
+        self.contracts.keys().copied().collect()
+    }
+
     /// Sweep for contracts that are over budget and past TTL.
     ///
     /// The `should_retain` predicate is called for each candidate contract before eviction.
