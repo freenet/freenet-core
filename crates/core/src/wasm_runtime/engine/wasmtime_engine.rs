@@ -14,7 +14,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use wasmtime::*;
+use wasmtime::{
+    Caller, Config, Engine, Error as WasmtimeError, Extern, Func, Instance,
+    InstanceAllocationStrategy, Linker, Module, OptLevel, PoolingAllocationConfig, ResourceLimiter,
+    Store, TypedFunc,
+};
 
 use super::{InstanceHandle, WasmEngine, WasmError};
 use crate::wasm_runtime::native_api::{self, MEM_ADDR};
@@ -68,7 +72,7 @@ impl ResourceLimiter for HostState {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool> {
+    ) -> anyhow::Result<bool> {
         if desired > self.memory_limit_bytes {
             tracing::warn!(
                 current_bytes = current,
@@ -87,7 +91,7 @@ impl ResourceLimiter for HostState {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool> {
+    ) -> anyhow::Result<bool> {
         // Allow table growth up to a reasonable limit
         const MAX_TABLE_ELEMENTS: usize = 10_000;
         Ok(desired <= MAX_TABLE_ELEMENTS)
@@ -484,6 +488,45 @@ impl WasmtimeEngine {
         // Set memory limits via config
         wasmtime_config.max_wasm_stack(8 * 1024 * 1024); // 8 MiB stack
 
+        // ==================================================================
+        // MEMORY MANAGEMENT OPTIMIZATIONS (#2941, #2942, #2928)
+        // ==================================================================
+        //
+        // Enable instance pooling for memory efficiency. This addresses wasmer's
+        // append-only Vec<CodeMemory> that never shrinks (consuming ~15.7 MB per
+        // contract: 10 MB code + 3.4 MB trap metadata + 2 MB address maps).
+        //
+        // Wasmtime advantages:
+        // 1. Actually frees compiled code when modules are dropped
+        // 2. Cranelift generates more compact machine code
+        // 3. Instance pooling reuses memory across instantiations
+        //
+        // Target: User peers with 20-30 contracts should use <200 MB (vs 300-500 MB with wasmer)
+        //
+        let mut pooling = PoolingAllocationConfig::default();
+
+        // Allow up to 100 concurrent core instances (WASM modules executing)
+        // User peers: 20-30 contracts, gateways: 50-100 contracts
+        pooling.total_core_instances(100);
+
+        // Most contracts use one linear memory and one table
+        pooling.max_memories_per_module(1);
+        pooling.max_tables_per_module(1);
+
+        // Set per-instance memory limits (256 MiB = 4096 pages * 64 KiB)
+        // This is the upper bound; actual usage is further limited by ResourceLimiter
+        pooling.max_memory_size(256 * 1024 * 1024);
+
+        // Keep a small amount of memory resident even when slots are unused, for faster reuse
+        pooling.linear_memory_keep_resident(64 * 1024); // 64 KB
+
+        wasmtime_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
+
+        // Enable Cranelift optimizations for compact machine code
+        // SpeedAndSize balances performance with memory footprint.
+        // Expected to generate significantly more compact code than wasmer's ~10 MB per contract.
+        wasmtime_config.cranelift_opt_level(OptLevel::SpeedAndSize);
+
         let engine = Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(e.into()))?;
 
         Ok((engine, max_fuel, config.enable_metering))
@@ -664,7 +707,7 @@ fn block_on_async<F: std::future::Future>(future: F) -> F::Output {
 fn classify_runtime_error(
     enabled_metering: bool,
     store: &mut Store<HostState>,
-    error: Error,
+    error: WasmtimeError,
 ) -> WasmError {
     if enabled_metering {
         // Check if we ran out of fuel
@@ -683,11 +726,11 @@ fn classify_runtime_error(
 // Blocking execution with timeout
 // =============================================================================
 
-type WasmResult = (Result<i64, Error>, Store<HostState>);
+type WasmResult = (Result<i64, WasmtimeError>, Store<HostState>);
 
 enum BlockingResult {
     Ok(i64, Store<HostState>),
-    WasmError(Error, Store<HostState>),
+    WasmError(WasmtimeError, Store<HostState>),
     Timeout,
     Panic(anyhow::Error),
 }
