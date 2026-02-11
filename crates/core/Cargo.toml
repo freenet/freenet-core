@@ -68,9 +68,10 @@ tokio-tungstenite = { workspace = true }
 tower-http = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
-wasmer = { features = ["sys", "experimental-async"], workspace = true }
-wasmer-middlewares = { workspace = true }
-wasmer-compiler-singlepass = { workspace = true }
+wasmer = { features = ["sys", "experimental-async"], workspace = true, optional = true }
+wasmer-middlewares = { workspace = true, optional = true }
+wasmer-compiler-singlepass = { workspace = true, optional = true }
+wasmtime = { workspace = true, optional = true }
 xz2 = { workspace = true }
 reqwest = { workspace = true }
 x25519-dalek = { workspace = true }
@@ -167,7 +168,7 @@ required-features = ["bench", "bench_full"]
 chrono = { workspace = true }
 
 [features]
-default = ["redb", "trace", "websocket"]
+default = ["redb", "trace", "websocket", "wasmer-backend"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
@@ -184,6 +185,9 @@ nightly_tests = []
 # jemalloc heap profiling (unix only). Adds profiling support on top of the always-enabled jemalloc allocator.
 # Enable with MALLOC_CONF="prof:true,lg_prof_sample:19" and send SIGUSR1 to dump heap profiles.
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
+# WASM runtime backends (exactly one must be selected)
+wasmer-backend = ["dep:wasmer", "dep:wasmer-middlewares", "dep:wasmer-compiler-singlepass"]
+wasmtime-backend = ["dep:wasmtime"]
 
 # ==============================================================================
 # Lint Configuration

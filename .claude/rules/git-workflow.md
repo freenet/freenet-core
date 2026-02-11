@@ -6,7 +6,7 @@
 
 ```
 1. Run: cargo fmt
-2. Run: cargo clippy --all-targets --all-features
+2. Run: cargo clippy --all-targets
 3. Run: cargo test
 4. Check: Any TODO-MUST-FIX markers in staged files?
    → If YES: CI will block. Either fix or create tracking issue first.

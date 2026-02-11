@@ -11,12 +11,22 @@ paths:
 ### Engine Abstraction (`wasm_runtime/engine/`)
 
 ```
-WasmEngine trait    → mod.rs      (backend-agnostic interface)
-WasmerEngine impl   → wasmer_engine.rs (ONLY file that imports wasmer::)
-Engine type alias   → mod.rs      (Engine = WasmerEngine)
+WasmEngine trait     → mod.rs             (backend-agnostic interface)
+WasmerEngine impl    → wasmer_engine.rs   (ONLY file that imports wasmer::)
+WasmtimeEngine impl  → wasmtime_engine.rs (ONLY file that imports wasmtime::)
+Engine type alias    → mod.rs             (selected by feature flag)
 ```
 
+**Backend Selection:** Choose WASM runtime at compile time via Cargo features:
+```
+default: wasmer-backend              # Wasmer 7.x (default, stable)
+--features wasmtime-backend          # Wasmtime 27.x (experimental)
+```
+
+**Exactly one backend MUST be enabled.** Compile error if both or neither selected.
+
 **All `wasmer::` imports MUST stay in `engine/wasmer_engine.rs`.**
+**All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
 ### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)
@@ -24,7 +34,9 @@ Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 ```
 V1: Synchronous process() — delegates use request/response for contract access
 V2: Async host functions — delegates call ctx.get_contract_state() directly
-    Uses wasmer experimental-async (Function::new_typed_async + call_async)
+    Backend-specific implementations:
+    - Wasmer: Function::new_typed_async + Store::into_async()
+    - Wasmtime: func_wrap_async (native async support)
     Selected when state_store_db is configured on Runtime
 ```
 
@@ -32,7 +44,7 @@ V2: Async host functions — delegates call ctx.get_contract_state() directly
 
 ```
 call_3i64()              — Sync, same thread (delegates V1)
-call_3i64_async_imports() — Async host fns via Store::into_async() (delegates V2)
+call_3i64_async_imports() — For modules with async host function imports (delegates V2)
 call_*_blocking()        — spawn_blocking + timeout (contracts)
 ```
 
@@ -42,7 +54,7 @@ call_*_blocking()        — spawn_blocking + timeout (contracts)
 
 ```
 ALWAYS:
-  - Execute in sandboxed Wasmer runtime
+  - Execute in sandboxed WASM runtime
   - Set memory limits (prevent DoS)
   - Set execution time limits
   - Validate WASM module before execution
@@ -52,7 +64,7 @@ NEVER:
   - Execute untrusted code outside sandbox
   - Allow contracts to access filesystem directly
   - Allow contracts to make network calls directly
-  - Import wasmer:: outside of engine/wasmer_engine.rs
+  - Import wasmer:: or wasmtime:: outside their respective engine files
 ```
 
 ### WHEN exposing host functions
@@ -63,11 +75,12 @@ Host functions (callable from WASM):
   - MUST handle panics gracefully
   - MUST NOT leak host memory to guest
   - SHOULD be idempotent where possible
-  - V2 async host functions: use Function::new_typed_async in wasmer_engine.rs
+  - Registration: backend-specific in wasmer_engine.rs / wasmtime_engine.rs
   - Logic implementations: keep in native_api.rs as pub(super) helpers
 
 Pattern:
-  fn host_function(ctx: &mut Ctx, args: ...) -> Result<...> {
+  pub(super) fn host_function(id: i64, ptr: i64, len: i32) -> i64 {
+      // Use MEM_ADDR map to access instance memory
       // Validate args
       // Execute in controlled manner
       // Return result (not host memory pointer)

@@ -312,7 +312,7 @@ impl Runtime {
         }
     }
 
-    pub(super) fn linear_mem(&self, handle: &InstanceHandle) -> RuntimeResult<WasmLinearMem> {
+    pub(super) fn linear_mem(&mut self, handle: &InstanceHandle) -> RuntimeResult<WasmLinearMem> {
         let (ptr, size) = self.engine.memory_info(handle)?;
         Ok(unsafe { WasmLinearMem::new(ptr, size as u64) })
     }

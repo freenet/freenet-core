@@ -438,6 +438,7 @@ mod tests {
     /// This tests the core mechanism: `Function::new_typed_async` +
     /// `Store::into_async()` + `TypedFunction::call_async()`.
     #[test]
+    #[cfg(feature = "wasmer-backend")]
     fn test_wasmer_async_host_function_roundtrip() {
         use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
 
@@ -477,6 +478,7 @@ mod tests {
 
     /// Verify that sync and async host functions can coexist in the same module.
     #[test]
+    #[cfg(feature = "wasmer-backend")]
     fn test_wasmer_mixed_sync_async_host_functions() {
         use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
 
@@ -532,6 +534,7 @@ mod tests {
     /// The `into_store()` round-trip is useful for operations that need
     /// `&mut Store` (e.g., creating new instances, growing memory).
     #[test]
+    #[cfg(feature = "wasmer-backend")]
     fn test_wasmer_store_async_roundtrip() {
         use wasmer::{imports, Function, Instance, Module, Store, TypedFunction};
 

@@ -5,7 +5,9 @@ use super::{
     STALE_INIT_THRESHOLD,
 };
 use crate::node::OpManager;
-use crate::wasm_runtime::{BackendEngine, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY};
+use crate::wasm_runtime::{
+    BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY,
+};
 use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
 use std::collections::HashMap;
@@ -1235,7 +1237,10 @@ impl Executor<Runtime> {
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.
-                crate::wasm_runtime::engine::Engine::create_backend_engine()
+                crate::wasm_runtime::engine::Engine::create_backend_engine(
+                        &RuntimeConfig::default(),
+                    )
+                    .expect("Failed to create WASM backend engine")
             }),
         )
         .unwrap();

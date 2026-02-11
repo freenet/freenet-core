@@ -86,10 +86,12 @@ See [operations/README.md](operations/README.md) for detailed documentation.
 
 WASM-based contract execution:
 
-- **Executor** – Loads and runs WASM binaries via Wasmer
+- **Executor** – Loads and runs WASM binaries (Wasmer or Wasmtime)
 - **Handler** – Orchestrates contract operations
 - **StateStore** – Persistent storage (redb/sqlite backends)
 - **Runtime** – Host functions exposed to WASM (network, storage)
+
+See [contracts/README.md](contracts/README.md) for detailed documentation on WASM runtime backends, security considerations, and memory management.
 
 ### Transport (`crates/core/src/transport/`)
 
@@ -234,6 +236,7 @@ cargo bench --bench transport_perf -- level0
 | [ring/README.md](ring/README.md) | Ring/DHT topology and routing |
 | [operations/README.md](operations/README.md) | Operation state machines |
 | [transport/README.md](transport/README.md) | Transport layer architecture |
+| [contracts/README.md](contracts/README.md) | Contract execution, WASM backends, security |
 
 ### Transport Details
 | Document | Description |

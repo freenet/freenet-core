@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use freenet::config::ConfigPaths;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::report::ReportCommand;
@@ -163,7 +163,7 @@ fn chown_to_user(path: &Path, username: &str) {
 /// Look up a user's home directory from /etc/passwd via `getent passwd`.
 /// Falls back to `/home/{username}` if getent is unavailable.
 #[cfg(target_os = "linux")]
-fn home_dir_for_user(username: &str) -> PathBuf {
+fn home_dir_for_user(username: &str) -> std::path::PathBuf {
     // Try getent passwd which works with NSS (LDAP, NIS, etc.)
     if let Ok(output) = std::process::Command::new("getent")
         .args(["passwd", username])
@@ -175,12 +175,12 @@ fn home_dir_for_user(username: &str) -> PathBuf {
             if let Some(home) = line.split(':').nth(5) {
                 let home = home.trim();
                 if !home.is_empty() {
-                    return PathBuf::from(home);
+                    return std::path::PathBuf::from(home);
                 }
             }
         }
     }
-    PathBuf::from(format!("/home/{username}"))
+    std::path::PathBuf::from(format!("/home/{username}"))
 }
 
 /// Resolve whether to use system or user mode.

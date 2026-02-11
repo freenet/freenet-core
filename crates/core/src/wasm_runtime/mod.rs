@@ -12,7 +12,7 @@ mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
 mod store;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasmer-backend"))]
 mod tests;
 
 pub(crate) use contract::ContractRuntimeInterface;
@@ -22,8 +22,8 @@ pub use delegate_store::DelegateStore;
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
-pub(crate) use runtime::SharedModuleCache;
 pub use runtime::{ContractExecError, Runtime, DEFAULT_MODULE_CACHE_CAPACITY};
+pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub(crate) use secrets_store::SecretStoreError;
 pub use secrets_store::SecretsStore;
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused

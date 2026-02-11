@@ -1098,6 +1098,14 @@ impl Ring {
             let mut skip_list = HashSet::new();
             skip_list.insert(*this_addr);
 
+            // Resets both connection (location-based) and gateway (address-based)
+            // backoff state. Used during isolation recovery to ensure all gateways
+            // are retryable when the node has zero ring connections.
+            let reset_all_backoff = || {
+                self.reset_all_connection_backoff();
+                op_manager.gateway_backoff.lock().clear();
+            };
+
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
                 self.cleanup_connection_backoff();
@@ -1114,7 +1122,7 @@ impl Ring {
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
-            // Gateway isolation recovery: when we have zero ring connections for too long,
+            // Isolation recovery: when we have zero ring connections for too long,
             // reset all backoff state so we can retry aggressively (#2928).
             let current_conn_count = self.connection_manager.connection_count();
             if current_conn_count == 0 {
@@ -1123,9 +1131,9 @@ impl Ring {
                         tracing::warn!(
                             is_gateway,
                             isolated_for_secs = since.elapsed().as_secs(),
-                            "Node isolated with zero ring connections — resetting all connection backoff"
+                            "Node isolated with zero ring connections — resetting all backoff state"
                         );
-                        self.reset_all_connection_backoff();
+                        reset_all_backoff();
                         zero_connections_since = Some(Instant::now());
                     }
                 } else {
