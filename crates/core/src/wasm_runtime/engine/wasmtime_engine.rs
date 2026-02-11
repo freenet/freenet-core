@@ -10,6 +10,141 @@
 //! - Fuel-based metering (gas) integration
 //! - Host function registration via Linker
 //! - Blocking execution with timeout
+//!
+//! # Security: Running Untrusted Code
+//!
+//! Freenet executes untrusted WASM contracts from any peer. This backend is configured
+//! for maximum security when running untrusted code.
+//!
+//! ## Cranelift Compiler Safety
+//!
+//! **Cranelift is explicitly designed for compiling untrusted WASM modules.**
+//!
+//! Unlike general-purpose compilers that assume trusted input, Cranelift is hardened
+//! against malicious compiler input:
+//!
+//! - **No undefined behavior in IR** (by design, unlike LLVM)
+//! - **Guards against JIT bombs** – pathological compilation that takes excessive time
+//!   - Avoids input-length-bounded recursion
+//!   - Avoids quadratic or higher algorithmic complexity
+//! - **Security-first optimizations** – consciously avoids riskier optimization techniques
+//! - **Production-vetted** for untrusted code at scale:
+//!   - Fastly Compute@Edge (serverless functions)
+//!   - Firefox SpiderMonkey (WebAssembly baseline compiler)
+//!   - Shopify Functions
+//!
+//! **References:**
+//! - <https://bytecodealliance.org/articles/security-and-correctness-in-wasmtime>
+//! - <https://www.fastly.com/blog/how-we-vetted-cranelift-for-secure-sandboxing-in-compute-edge>
+//! - <https://docs.wasmtime.dev/security.html>
+//!
+//! ## Optimization Level: None
+//!
+//! We configure Cranelift with `OptLevel::None` for maximum simplicity:
+//!
+//! ```rust,ignore
+//! wasmtime_config.cranelift_opt_level(OptLevel::None);
+//! ```
+//!
+//! **Rationale:**
+//! - Simpler compiler = smaller attack surface
+//! - Optimization passes add complexity (even though Cranelift's are security-hardened)
+//! - For untrusted code, we prioritize safety over performance
+//! - Memory benefits come from pooling and compact code generation, not optimizations
+//! - Similar philosophy to wasmer's singlepass compiler (fast, minimal optimization)
+//!
+//! **Alternatives considered:**
+//! - `OptLevel::SpeedAndSize` – more optimizations, slightly higher complexity
+//!   - Still safe (Cranelift's optimizations are security-hardened)
+//!   - We chose `None` to minimize risk for untrusted contracts
+//! - Winch compiler – Wasmtime's baseline compiler (analogous to wasmer singlepass)
+//!   - Even simpler than Cranelift with `OptLevel::None`
+//!   - Could be added as a future configuration option
+//!
+//! ## WebAssembly Sandbox
+//!
+//! Beyond compiler safety, WebAssembly itself provides strong isolation:
+//!
+//! - **Inaccessible call stack** – prevents stack-smashing attacks
+//! - **Memory isolation** – bounds-checked memory access
+//! - **Type-checked control transfers** – no arbitrary jumps
+//! - **Explicit I/O** – only through registered host functions
+//!
+//! ## Wasmtime Defense-in-Depth
+//!
+//! Additional runtime protections:
+//!
+//! - **2GB guard region** – protects against sign-extension bugs
+//! - **Stack overflow guard pages** – abort on stack overflow
+//! - **Memory zeroing** – clears memory between instantiations
+//! - **Spectre mitigations** – bounds check protection with dynamic memory
+//! - **Rust memory safety** – prevents entire classes of vulnerabilities
+//!
+//! # Memory Management
+//!
+//! This backend addresses wasmer's memory issues (#2941, #2942, #2928).
+//!
+//! ## Problem (Wasmer)
+//!
+//! - ~15.7 MB per contract (10 MB code + 3.4 MB trap metadata + 2 MB address maps)
+//! - 2.3 GB RSS for 92 contracts
+//! - **Memory never freed** – append-only `Vec<CodeMemory>` that never shrinks
+//!
+//! ## Solution (Wasmtime)
+//!
+//! ### 1. Instance Pooling (`PoolingAllocationStrategy`)
+//!
+//! Pre-allocates a pool of instances that can be reused:
+//!
+//! ```rust,ignore
+//! pooling.total_core_instances(100);  // Max concurrent instances
+//! pooling.max_memory_size(256 * 1024 * 1024);  // 256 MiB per instance
+//! pooling.linear_memory_keep_resident(64 * 1024);  // 64 KB resident for fast reuse
+//! ```
+//!
+//! ### 2. Compact Code Generation (Cranelift)
+//!
+//! Generates more efficient machine code than wasmer, reducing per-contract footprint.
+//!
+//! ### 3. Proper Memory Cleanup
+//!
+//! **Wasmtime actually frees compiled code when modules are dropped.**
+//! Unlike wasmer's permanent `code_memory` growth, wasmtime reclaims memory.
+//!
+//! ### Expected Impact
+//!
+//! - User peers (20-30 contracts): <200 MB (vs 300-500 MB with wasmer)
+//! - Gateway (50-100 contracts): <500 MB (vs 1+ GB with wasmer)
+//! - Memory is reclaimed when contracts are removed
+//!
+//! ### Memory Tests
+//!
+//! See tests at bottom of this file:
+//! - `test_module_drop_frees_memory` – Verifies memory is freed
+//! - `test_memory_leak_comparison` – Manual observation test
+//!
+//! # Async Support
+//!
+//! **CRITICAL: With `async_support(true)`, ALL function calls must use `call_async()`**
+//!
+//! We enable async support for V2 delegate async host functions:
+//!
+//! ```rust,ignore
+//! wasmtime_config.async_support(true);
+//! ```
+//!
+//! This changes wasmtime's Store type internally. Even for synchronous operations,
+//! we must use the async calling convention:
+//!
+//! ```rust,ignore
+//! // Correct (with async_support enabled):
+//! block_on_async(func.call_async(&mut store, args))
+//!
+//! // Incorrect (will panic at runtime):
+//! func.call(&mut store, args)
+//! ```
+//!
+//! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
 use std::time::Duration;
