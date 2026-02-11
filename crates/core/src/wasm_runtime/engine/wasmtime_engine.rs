@@ -1079,4 +1079,69 @@ mod tests {
         // Sleep to allow manual memory inspection
         thread::sleep(Duration::from_secs(5));
     }
+
+    /// Rigorous memory test for Linux CI that verifies memory cleanup.
+    ///
+    /// This test addresses issues #2941, #2942, #2928 where wasmer's append-only
+    /// Vec<CodeMemory> caused 2.3 GB RSS for 92 contracts (~15.7 MB per contract).
+    ///
+    /// The test verifies that wasmtime properly frees memory when modules are dropped,
+    /// unlike wasmer which accumulates memory indefinitely.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_memory_freed_after_module_drop() {
+        use std::thread;
+        use std::time::Duration;
+
+        /// Read RSS (Resident Set Size) from /proc/self/statm
+        fn get_rss_bytes() -> usize {
+            let statm = std::fs::read_to_string("/proc/self/statm")
+                .expect("Failed to read /proc/self/statm");
+            let fields: Vec<&str> = statm.split_whitespace().collect();
+            let rss_pages: usize = fields[1].parse().expect("Failed to parse RSS");
+            rss_pages * 4096 // Convert pages to bytes (4KB per page on Linux)
+        }
+
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+
+        // Measure baseline RSS
+        let baseline_rss = get_rss_bytes();
+
+        // Compile 50 modules (wasmer would accumulate ~785 MB for 50 × 15.7 MB)
+        let mut modules = Vec::new();
+        for _ in 0..50 {
+            modules.push(Module::new(&engine, SIMPLE_WASM).unwrap());
+        }
+
+        let peak_rss = get_rss_bytes();
+        let peak_growth = peak_rss.saturating_sub(baseline_rss);
+
+        // Drop all modules - wasmtime should free the memory
+        drop(modules);
+
+        // Give the allocator time to release memory to OS
+        thread::sleep(Duration::from_millis(100));
+
+        let after_rss = get_rss_bytes();
+        let leaked = after_rss.saturating_sub(baseline_rss);
+
+        // With wasmer, we would expect ~785 MB to remain (50 × 15.7 MB).
+        // With wasmtime pooling and proper cleanup, we expect < 100 MB overhead
+        // (accounting for allocator fragmentation and pool pre-allocation).
+        assert!(
+            leaked < 100 * 1024 * 1024,
+            "Memory leak detected: {} MB remained after dropping 50 modules (peak growth: {} MB). \
+             Expected < 100 MB with wasmtime pooling. This suggests memory is not being freed.",
+            leaked / (1024 * 1024),
+            peak_growth / (1024 * 1024)
+        );
+
+        // Sanity check: we should have actually allocated something
+        assert!(
+            peak_growth > 1024 * 1024,
+            "Peak growth was only {} KB - test may not be exercising memory allocation",
+            peak_growth / 1024
+        );
+    }
 }
