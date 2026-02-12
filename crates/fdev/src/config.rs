@@ -57,6 +57,8 @@ pub enum SubCommand {
     NetworkMetricsServer(crate::network_metrics_server::ServerConfig),
     /// Get the contract ID without publishing
     GetContractId(crate::commands::GetContractIdConfig),
+    /// Synchronize a directory with the Freenet network.
+    Sync(SyncConfig),
 }
 
 impl SubCommand {
@@ -86,6 +88,8 @@ pub enum NodeCommand {
     Put(PutConfig),
     Update(UpdateConfig),
     GetContractId(crate::commands::GetContractIdConfig),
+    /// Synchronize a directory with the Freenet network.
+    Sync(SyncConfig),
 }
 
 /// Updates a contract in the network.
@@ -227,4 +231,12 @@ pub(crate) enum ContractKind {
     WebApp,
     /// An standard contract.
     Contract,
+}
+
+/// Configuration for the sync command.
+#[derive(clap::Parser, Clone)]
+pub struct SyncConfig {
+    /// Path to the directory to synchronize.
+    #[arg(value_hint = clap::ValueHint::DirPath)]
+    pub(crate) path: PathBuf,
 }

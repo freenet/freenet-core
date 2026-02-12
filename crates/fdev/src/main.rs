@@ -5,13 +5,14 @@ use freenet_stdlib::client_api::ClientRequest;
 
 mod build;
 mod commands;
-mod config;
+pub(crate) mod config;
 mod diagnostics;
 mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
 mod query;
 mod testing;
+pub(crate) mod sync;
 mod util;
 mod wasm_runtime;
 
@@ -71,6 +72,9 @@ fn main() -> anyhow::Result<()> {
                 config::NodeCommand::GetContractId(get_contract_id_config) => {
                     commands::get_contract_id(get_contract_id_config).await
                 }
+                config::NodeCommand::Sync(sync_config) => {
+                    sync::sync(sync_config, config.additional).await
+                }
             },
             SubCommand::Test(_) => unreachable!("Test handled above"),
             SubCommand::NetworkMetricsServer(server_config) => {
@@ -79,6 +83,10 @@ fn main() -> anyhow::Result<()> {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = server => {}
                 }
+                Ok(())
+            }
+            SubCommand::Sync(sync_config) => {
+                sync::sync(sync_config, config.additional).await?;
                 Ok(())
             }
             SubCommand::Query {} => {

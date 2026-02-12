@@ -1,0 +1,18 @@
+[package]
+name = "fdev-sync-container"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+freenet-stdlib = { version = "0.1.35" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["freenet-main-contract", "contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
+
+[workspace]

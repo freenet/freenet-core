@@ -50,3 +50,6 @@ freenet-stdlib = { workspace = true }
 [features]
 trace-ot = ["freenet/trace-ot"]
 # testing feature is always enabled for fdev (it's a development tool)
+
+[dev-dependencies]
+tempfile = "3"
