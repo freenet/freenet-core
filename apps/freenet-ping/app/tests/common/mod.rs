@@ -176,7 +176,6 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             transient_ttl_secs: Some(120),
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
-            streaming_enabled: None,
             streaming_threshold: None,
             ledbat_min_ssthresh: None,
             congestion_control: None,

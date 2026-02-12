@@ -1013,7 +1013,6 @@ impl Operation for GetOp {
                                         })?;
                                     let payload_size = payload_bytes.len();
                                     if should_use_streaming(
-                                        op_manager.streaming_enabled,
                                         op_manager.streaming_threshold,
                                         payload_size,
                                     ) {
@@ -1068,7 +1067,6 @@ impl Operation for GetOp {
                                         })?;
                                     let payload_size = payload_bytes.len();
                                     if should_use_streaming(
-                                        op_manager.streaming_enabled,
                                         op_manager.streaming_threshold,
                                         payload_size,
                                     ) {
@@ -1997,18 +1995,6 @@ impl Operation for GetOp {
                     let stream_id = *stream_id;
                     let includes_contract = *includes_contract;
 
-                    // Check if streaming is enabled at runtime
-                    if !op_manager.streaming_enabled {
-                        tracing::warn!(
-                            tx = %id,
-                            %instance_id,
-                            contract = %key,
-                            stream_id = %stream_id,
-                            "GET ResponseStreaming received but streaming is disabled"
-                        );
-                        return Err(OpError::UnexpectedOpState);
-                    }
-
                     tracing::info!(
                         tx = %id,
                         %instance_id,
@@ -2055,7 +2041,6 @@ impl Operation for GetOp {
                             .expect("non-originator must have upstream");
                         // Check if streaming should be used based on the original stream size
                         if should_use_streaming(
-                            op_manager.streaming_enabled,
                             op_manager.streaming_threshold,
                             *total_size as usize,
                         ) {
@@ -2280,16 +2265,6 @@ impl Operation for GetOp {
                 } => {
                     let id = *msg_id;
                     let stream_id = *stream_id;
-
-                    // Check if streaming is enabled at runtime
-                    if !op_manager.streaming_enabled {
-                        tracing::warn!(
-                            tx = %id,
-                            stream_id = %stream_id,
-                            "GET ResponseStreamingAck received but streaming is disabled"
-                        );
-                        return Err(OpError::UnexpectedOpState);
-                    }
 
                     // The acknowledgment confirms the stream was received.
                     // For now, we just log it and clean up.

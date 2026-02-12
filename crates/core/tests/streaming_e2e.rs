@@ -43,7 +43,7 @@ async fn setup_streaming_network(
         seed,
     )
     .await;
-    sim.with_streaming(streaming_threshold);
+    sim.with_streaming_threshold(streaming_threshold);
     sim
 }
 

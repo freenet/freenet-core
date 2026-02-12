@@ -752,8 +752,6 @@ pub struct SimNetwork {
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
     all_gateway_configs: Vec<GatewayConfig>,
-    /// Whether streaming transport is enabled for operations
-    pub streaming_enabled: bool,
     /// Size threshold (bytes) above which streaming is used (default: system default 64KB)
     pub streaming_threshold: Option<usize>,
 }
@@ -811,7 +809,6 @@ impl SimNetwork {
             node_addresses: HashMap::new(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
-            streaming_enabled: false,
             streaming_threshold: None,
         };
         net.config_gateways(
@@ -842,13 +839,12 @@ impl SimNetwork {
         );
     }
 
-    /// Enables streaming transport for operations with the given threshold.
+    /// Sets the streaming threshold for operations.
     ///
-    /// When enabled, payloads larger than `threshold` bytes will use streaming
-    /// instead of inline messages. This retroactively updates all already-built
-    /// gateway and node configs.
-    pub fn with_streaming(&mut self, threshold: usize) {
-        self.streaming_enabled = true;
+    /// Payloads larger than `threshold` bytes will use streaming instead of
+    /// inline messages. This retroactively updates all already-built gateway
+    /// and node configs.
+    pub fn with_streaming_threshold(&mut self, threshold: usize) {
         self.streaming_threshold = Some(threshold);
 
         // Retroactively update already-built node configs (since config_gateways/config_nodes
@@ -856,7 +852,6 @@ impl SimNetwork {
         for (builder, _) in &mut self.gateways {
             let old_config = &*builder.config.config;
             let mut new_network_api = old_config.network_api.clone();
-            new_network_api.streaming_enabled = true;
             new_network_api.streaming_threshold = threshold;
             let mut new_config = old_config.clone();
             new_config.network_api = new_network_api;
@@ -865,7 +860,6 @@ impl SimNetwork {
         for (builder, _) in &mut self.nodes {
             let old_config = &*builder.config.config;
             let mut new_network_api = old_config.network_api.clone();
-            new_network_api.streaming_enabled = true;
             new_network_api.streaming_threshold = threshold;
             let mut new_config = old_config.clone();
             new_config.network_api = new_network_api;
@@ -1336,7 +1330,6 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },
@@ -1424,7 +1417,6 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_enabled: Some(self.streaming_enabled),
                     streaming_threshold: self.streaming_threshold,
                     ..Default::default()
                 },

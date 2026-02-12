@@ -429,43 +429,40 @@ impl Operation for PutOp {
                         })?;
                         let payload_size = payload_bytes.len();
 
-                        let (forward_msg, stream_data) = if should_use_streaming(
-                            op_manager.streaming_enabled,
-                            op_manager.streaming_threshold,
-                            payload_size,
-                        ) {
-                            let sid = StreamId::next_operations();
-                            tracing::info!(
-                                tx = %id,
-                                stream_id = %sid,
-                                payload_size,
-                                "PUT request using operations-level streaming"
-                            );
-                            (
-                                PutMsg::RequestStreaming {
-                                    id,
-                                    stream_id: sid,
-                                    contract_key: key,
-                                    total_size: payload_size as u64,
-                                    htl: new_htl,
-                                    skip_list: new_skip_list,
-                                    subscribe,
-                                },
-                                Some((sid, bytes::Bytes::from(payload_bytes))),
-                            )
-                        } else {
-                            (
-                                PutMsg::Request {
-                                    id,
-                                    contract: payload.contract,
-                                    related_contracts: payload.related_contracts,
-                                    value: payload.value,
-                                    htl: new_htl,
-                                    skip_list: new_skip_list,
-                                },
-                                None,
-                            )
-                        };
+                        let (forward_msg, stream_data) =
+                            if should_use_streaming(op_manager.streaming_threshold, payload_size) {
+                                let sid = StreamId::next_operations();
+                                tracing::info!(
+                                    tx = %id,
+                                    stream_id = %sid,
+                                    payload_size,
+                                    "PUT request using operations-level streaming"
+                                );
+                                (
+                                    PutMsg::RequestStreaming {
+                                        id,
+                                        stream_id: sid,
+                                        contract_key: key,
+                                        total_size: payload_size as u64,
+                                        htl: new_htl,
+                                        skip_list: new_skip_list,
+                                        subscribe,
+                                    },
+                                    Some((sid, bytes::Bytes::from(payload_bytes))),
+                                )
+                            } else {
+                                (
+                                    PutMsg::Request {
+                                        id,
+                                        contract: payload.contract,
+                                        related_contracts: payload.related_contracts,
+                                        value: payload.value,
+                                        htl: new_htl,
+                                        skip_list: new_skip_list,
+                                    },
+                                    None,
+                                )
+                            };
 
                         // Transition to AwaitingResponse, preserving subscribe flags for originator
                         // Store next_hop so handle_notification_msg can route the message
@@ -659,17 +656,6 @@ impl Operation for PutOp {
                     skip_list,
                     subscribe: msg_subscribe,
                 } => {
-                    // Check if streaming is enabled at runtime
-                    if !op_manager.streaming_enabled {
-                        tracing::warn!(
-                            tx = %id,
-                            contract = %contract_key,
-                            stream_id = %stream_id,
-                            "PUT RequestStreaming received but streaming is disabled"
-                        );
-                        return Err(OpError::UnexpectedOpState);
-                    }
-
                     tracing::info!(
                         tx = %id,
                         contract = %contract_key,
@@ -735,7 +721,6 @@ impl Operation for PutOp {
                         let next_addr = next_peer.socket_addr();
                         // Check if streaming should be used based on the original stream size
                         if should_use_streaming(
-                            op_manager.streaming_enabled,
                             op_manager.streaming_threshold,
                             *total_size as usize,
                         ) {
@@ -1071,16 +1056,6 @@ impl Operation for PutOp {
                     key,
                     continue_forwarding,
                 } => {
-                    // Check if streaming is enabled at runtime
-                    if !op_manager.streaming_enabled {
-                        tracing::warn!(
-                            tx = %id,
-                            contract = %key,
-                            "PUT ResponseStreaming received but streaming is disabled"
-                        );
-                        return Err(OpError::UnexpectedOpState);
-                    }
-
                     tracing::info!(
                         tx = %id,
                         contract = %key,
