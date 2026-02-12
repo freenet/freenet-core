@@ -902,7 +902,7 @@ where
 
             loop {
                 if task_handle.is_finished() {
-                    return match handle.block_on(task_handle) {
+                    return match tokio::task::block_in_place(|| handle.block_on(task_handle)) {
                         Ok((Ok(value), store)) => BlockingResult::Ok(value, store),
                         Ok((Err(err), store)) => BlockingResult::WasmError(err, store),
                         Err(e) => {

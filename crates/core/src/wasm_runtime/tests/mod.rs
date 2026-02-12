@@ -3,16 +3,10 @@ use std::{path::PathBuf, process::Command};
 use crate::util::workspace::get_workspace_target_dir;
 use tracing::info;
 
-// These modules use #[tokio::test] which conflicts with wasmtime's block_on_async
-// (nested runtime panic). Keep them wasmer-only until wasmtime's async story is resolved.
-#[cfg(feature = "wasmer-backend")]
 mod cache;
-#[cfg(feature = "wasmer-backend")]
 mod contract;
-#[cfg(feature = "wasmer-backend")]
 mod contract_metering;
 mod execution_handling;
-#[cfg(feature = "wasmer-backend")]
 mod time;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -51,7 +45,6 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
     Ok(std::fs::read(output_file)?)
 }
 
-#[cfg(feature = "wasmer-backend")]
 pub(crate) struct TestSetup {
     #[allow(unused)]
     temp_dir: tempfile::TempDir,
@@ -61,7 +54,6 @@ pub(crate) struct TestSetup {
     contract_key: freenet_stdlib::prelude::ContractKey,
 }
 
-#[cfg(feature = "wasmer-backend")]
 pub(crate) async fn setup_test_contract(
     name: &str,
 ) -> Result<TestSetup, Box<dyn std::error::Error>> {
