@@ -1558,21 +1558,35 @@ impl P2pConnManager {
                                     }
                                 }
 
-                                // Collect contract states for specified contracts
-                                // Note: In the simplified 2026-01 architecture, we use lease-based subscriptions
-                                // rather than explicit subscriber tracking.
-                                if !config.contract_keys.is_empty() {
+                                // Collect contract states.
+                                // When contract_keys is empty, return ALL hosting contracts.
+                                // When specific keys are provided, return only those.
+                                // Note: subscriber_peer_ids is always empty because we use
+                                // lease-based subscriptions rather than explicit subscriber tracking.
+                                if config.contract_keys.is_empty() {
+                                    let hosting_contracts = op_manager.ring.hosting_contract_keys();
+                                    for contract_key in hosting_contracts {
+                                        let is_subscribed =
+                                            op_manager.ring.is_subscribed(&contract_key);
+                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
+                                        response.contract_states.insert(
+                                            contract_key,
+                                            ContractState {
+                                                subscribers: subscriber_count as u32,
+                                                subscriber_peer_ids: Vec::new(),
+                                            },
+                                        );
+                                    }
+                                } else {
                                     for contract_key in &config.contract_keys {
-                                        // Check if we have an active subscription for this contract
                                         let is_subscribed =
                                             op_manager.ring.is_subscribed(contract_key);
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
-
                                         response.contract_states.insert(
                                             *contract_key,
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids: Vec::new(), // Not tracked in new model
+                                                subscriber_peer_ids: Vec::new(),
                                             },
                                         );
                                     }

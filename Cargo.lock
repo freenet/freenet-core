@@ -513,6 +513,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-time"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2b094c3b8fd302af9393806bb8af1b83a5a948ca7a91e87a92ea32167157f6"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2020,6 +2030,7 @@ dependencies = [
  "axum",
  "bincode",
  "blake3",
+ "boot-time",
  "bs58",
  "byteorder",
  "bytes 1.11.1",

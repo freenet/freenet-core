@@ -24,7 +24,7 @@ use common::{
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
-    wait_for_update_response, PingStats,
+    wait_for_update_notification, wait_for_update_response, PingStats,
 };
 
 /// Helper function to collect diagnostics from all nodes for debugging update propagation issues
@@ -1351,8 +1351,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
     // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
-        // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for gateway to start its network listener (20s for slow CI runners)
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
@@ -1366,8 +1366,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
     // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
-        // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for gateway to start its network listener (20s for slow CI runners)
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
@@ -1379,8 +1379,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
+    // Main test logic (240s timeout to accommodate 20s startup delay + 30s test + buffer for slow CI)
+    let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -1536,7 +1536,40 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?;
         println!("Node 2: subscribed successfully!");
 
-        // Step 5: Run the ping clients on all nodes simultaneously
+        // Step 5: Verify subscription propagation before starting pings.
+        // SubscribeResponse only means the local node accepted the subscription.
+        // The subscription tree across the network may not be fully built yet.
+        // Send a probe update from the gateway and verify both peers receive
+        // the UpdateNotification, confirming end-to-end subscription propagation.
+        println!("Verifying subscription propagation with probe update...");
+        {
+            let mut probe = Ping::default();
+            probe.insert("probe".to_string());
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&probe).unwrap())),
+                }))
+                .await?;
+            // Wait for gateway's own UpdateResponse (confirms update was accepted)
+            wait_for_update_response(&mut client_gw, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Gateway: probe update accepted");
+
+            // Wait for both peers to receive the UpdateNotification (60s each)
+            wait_for_update_notification(&mut client_node1, &contract_key, 60)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Node 1: received probe notification - subscription propagation confirmed");
+
+            wait_for_update_notification(&mut client_node2, &contract_key, 60)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Node 2: received probe notification - subscription propagation confirmed");
+        }
+        println!("Subscription propagation verified! Starting ping test...");
+
         // Create channels for controlled shutdown
         let (gw_shutdown_tx, gw_shutdown_rx) = tokio::sync::oneshot::channel();
         let (node1_shutdown_tx, node1_shutdown_rx) = tokio::sync::oneshot::channel();

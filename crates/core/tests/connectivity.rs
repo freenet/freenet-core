@@ -85,7 +85,7 @@ async fn query_connected_peers(
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4

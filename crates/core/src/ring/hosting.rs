@@ -473,6 +473,11 @@ impl HostingManager {
         self.hosting_cache.read().contains(key)
     }
 
+    /// Get all hosted contract keys.
+    pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
+        self.hosting_cache.read().iter().collect()
+    }
+
     /// Get the number of contracts in the hosting cache.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_cache.read().len()

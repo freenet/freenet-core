@@ -150,7 +150,7 @@ async fn test_current_thread_runtime(ctx: &mut TestContext) -> TestResult {
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
     timeout_secs = 120,
-    startup_wait_secs = 15
+    startup_wait_secs = 30
 )]
 async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
     // This test has two gateway nodes and two peer nodes
@@ -213,7 +213,7 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
     timeout_secs = 120,
-    startup_wait_secs = 15
+    startup_wait_secs = 30
 )]
 async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
     // With auto_connect_peers=true (now default), all peer nodes are configured to
@@ -242,7 +242,7 @@ async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
     timeout_secs = 120,
-    startup_wait_secs = 15
+    startup_wait_secs = 30
 )]
 async fn test_multi_gateway_auto_connect(ctx: &mut TestContext) -> TestResult {
     // With auto_connect_peers=true (now default) and multiple gateways,

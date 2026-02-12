@@ -214,7 +214,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(90), async move {
+    let test = tokio::time::timeout(Duration::from_secs(120), async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let mut client = connect_to_ws(peer_ws_port).await?;
@@ -240,27 +240,57 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
         info!("Starting gateway...");
         let _ = start_gateway_tx.send(());
 
-        info!("Waiting for peer to join network...");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-
-        info!("Sending PUT after join...");
+        info!("Waiting for peer to join network (polling with retry)...");
         let contract2 = load_contract("test-contract-integration", vec![1].into())?;
-        make_put(&mut client, state, contract2, false).await?;
 
-        let response = timeout(Duration::from_secs(30), client.recv()).await;
+        // Poll until the peer has joined and can successfully PUT, instead of a fixed sleep.
+        // On fast machines this completes in ~5s, on slow CI runners it may take up to 60s.
+        let max_join_wait = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(2);
+        let join_start = tokio::time::Instant::now();
+        let mut joined = false;
 
-        match response {
-            Ok(Ok(_)) => info!("PUT succeeded after join"),
-            Ok(Err(e)) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("PEER_NOT_JOINED") {
-                    return Err(anyhow::anyhow!(
-                        "Still getting PEER_NOT_JOINED after 15s wait - join may have failed"
-                    ));
+        while join_start.elapsed() < max_join_wait {
+            tokio::time::sleep(poll_interval).await;
+
+            make_put(&mut client, state.clone(), contract2.clone(), false).await?;
+            let response = timeout(Duration::from_secs(10), client.recv()).await;
+
+            match response {
+                Ok(Ok(_)) => {
+                    info!(
+                        "PUT succeeded after {:?} - peer has joined",
+                        join_start.elapsed()
+                    );
+                    joined = true;
+                    break;
                 }
-                return Err(anyhow::anyhow!("Unexpected error after join: {}", err_str));
+                Ok(Err(e)) => {
+                    let err_str = format!("{:?}", e);
+                    if err_str.contains("PEER_NOT_JOINED") {
+                        info!(
+                            "Still PEER_NOT_JOINED after {:?}, retrying...",
+                            join_start.elapsed()
+                        );
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("Unexpected error after join: {}", err_str));
+                }
+                Err(_) => {
+                    info!(
+                        "PUT timed out after {:?}, retrying...",
+                        join_start.elapsed()
+                    );
+                    continue;
+                }
             }
-            Err(_) => return Err(anyhow::anyhow!("Timeout waiting for PUT response")),
+        }
+
+        if !joined {
+            return Err(anyhow::anyhow!(
+                "Peer failed to join network within {:?}",
+                max_join_wait
+            ));
         }
 
         info!("Test completed successfully");

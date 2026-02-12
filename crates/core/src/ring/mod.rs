@@ -933,6 +933,11 @@ impl Ring {
             .remove_client_from_all_subscriptions(client_id)
     }
 
+    /// Get all hosted contract keys from the hosting cache.
+    pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
+        self.hosting_manager.hosting_contract_keys()
+    }
+
     /// Get the number of contracts in the hosting cache.
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
@@ -1084,8 +1089,19 @@ impl Ring {
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
         let mut zero_connections_since: Option<Instant> = None;
+
+        // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
+        // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
+        let mut last_boot_time = boot_time::Instant::now();
+        const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
+
         let mut this_peer = None;
         loop {
+            // Update boot-time tracking at the top of every iteration (including
+            // early-continue paths) so elapsed time doesn't accumulate during startup.
+            let boot_elapsed = last_boot_time.elapsed();
+            last_boot_time = boot_time::Instant::now();
+
             let op_manager = match self.upgrade_op_manager() {
                 Some(op_manager) => op_manager,
                 None => {
@@ -1112,6 +1128,18 @@ impl Ring {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
             };
+
+            // Suspend/resume detection: if boot-time elapsed much more than
+            // the tick interval, we were likely suspended. boot_elapsed was
+            // computed at the top of the loop so it includes early-continue time.
+            if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
+                tracing::warn!(
+                    boot_elapsed_secs = boot_elapsed.as_secs(),
+                    "Detected suspend/resume (boot-time jump) — clearing all backoff state"
+                );
+                reset_all_backoff();
+                zero_connections_since = None;
+            }
 
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {

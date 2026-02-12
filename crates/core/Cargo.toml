@@ -25,6 +25,7 @@ aes-gcm = { workspace = true }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
+boot-time = { workspace = true }
 bs58 = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
