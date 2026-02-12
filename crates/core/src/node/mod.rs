@@ -747,6 +747,13 @@ where
     }
 }
 
+/// Returns the exponential backoff delay for the given retry attempt.
+///
+/// Starts at 5ms and doubles each attempt, capped at 1000ms.
+fn op_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
+}
+
 /// Pure network message processing for V1 messages (no client concerns)
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
@@ -791,13 +798,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            let delay = op_retry_backoff(i);
                             tracing::debug!(
-                                delay_ms,
+                                delay_ms = delay.as_millis() as u64,
                                 attempt = i,
                                 "Pure network: Operation still running, backing off"
                             );
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -847,13 +854,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            let delay = op_retry_backoff(i);
                             tracing::debug!(
-                                delay_ms,
+                                delay_ms = delay.as_millis() as u64,
                                 attempt = i,
                                 "Pure network: Operation still running, backing off"
                             );
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -894,13 +901,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            let delay = op_retry_backoff(i);
                             tracing::debug!(
-                                delay_ms,
+                                delay_ms = delay.as_millis() as u64,
                                 attempt = i,
                                 "Pure network: Operation still running, backing off"
                             );
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -930,13 +937,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            let delay = op_retry_backoff(i);
                             tracing::debug!(
-                                delay_ms,
+                                delay_ms = delay.as_millis() as u64,
                                 attempt = i,
                                 "Pure network: Operation still running, backing off"
                             );
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -966,13 +973,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            let delay = op_retry_backoff(i);
                             tracing::debug!(
-                                delay_ms,
+                                delay_ms = delay.as_millis() as u64,
                                 attempt = i,
                                 "Pure network: Operation still running, backing off"
                             );
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
