@@ -339,10 +339,12 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             .await?;
 
         // Wait for put response on publisher.
-        // 90s budget: STREAM_CLAIM_TIMEOUT (30s) + WASM compilation (5-15s on CI)
-        // + stream assembly + routing. 30s was too tight and caused flaky failures.
+        // Budget: STREAM_CLAIM_TIMEOUT (30s) + WASM compilation across 8 nodes
+        // (serialized behind shared Engine mutex, 5-15s each on CI) + routing.
+        // The internal wait_for_put_response deadline is 120s; outer timeout
+        // must be higher to let it provide the more informative error message.
         let _key = timeout(
-            Duration::from_secs(90),
+            Duration::from_secs(150),
             wait_for_put_response(publisher, &contract_key),
         )
         .await

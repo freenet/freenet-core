@@ -46,8 +46,25 @@ pub async fn wait_for_put_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
 ) -> Result<ContractKey, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    // Use a deadline-based approach so that receiving unexpected messages
+    // (e.g. UpdateNotifications) doesn't reset the timeout window.
+    // 120s allows for WASM compilation under CI load (shared Engine mutex
+    // serializes compilation across executors within a node).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut skipped = 0u32;
+
     loop {
-        let resp = timeout(Duration::from_secs(60), client.recv()).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timeout waiting for put response (skipped {} other messages)",
+                skipped
+            )
+            .into());
+        }
+
+        let recv_timeout = remaining.min(Duration::from_secs(5));
+        let resp = timeout(recv_timeout, client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 if &key == expected_key {
@@ -73,13 +90,15 @@ pub async fn wait_for_put_response(
             }
             Ok(Ok(other)) => {
                 tracing::warn!("Unexpected response while waiting for put: {}", other);
+                skipped += 1;
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
                 return Err(err.into());
             }
             Err(_) => {
-                return Err("timeout waiting for put response".into());
+                // Per-recv timeout, continue checking overall deadline
+                continue;
             }
         }
     }
@@ -165,8 +184,21 @@ pub async fn wait_for_subscribe_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut skipped = 0u32;
+
     loop {
-        let resp = timeout(Duration::from_secs(60), client.recv()).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timeout waiting for subscribe response (skipped {} other messages)",
+                skipped
+            )
+            .into());
+        }
+
+        let recv_timeout = remaining.min(Duration::from_secs(5));
+        let resp = timeout(recv_timeout, client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
@@ -185,13 +217,15 @@ pub async fn wait_for_subscribe_response(
             }
             Ok(Ok(other)) => {
                 tracing::warn!("Unexpected response while waiting for subscribe: {}", other);
+                skipped += 1;
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
                 return Err(err.into());
             }
             Err(_) => {
-                return Err("timeout waiting for subscribe response".into());
+                // Per-recv timeout, continue checking overall deadline
+                continue;
             }
         }
     }
@@ -204,8 +238,21 @@ pub async fn wait_for_update_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
 ) -> Result<ContractKey, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut skipped = 0u32;
+
     loop {
-        let resp = timeout(Duration::from_secs(60), client.recv()).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timeout waiting for update response (skipped {} other messages)",
+                skipped
+            )
+            .into());
+        }
+
+        let recv_timeout = remaining.min(Duration::from_secs(5));
+        let resp = timeout(recv_timeout, client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                 key,
@@ -230,17 +277,20 @@ pub async fn wait_for_update_response(
             }))) => {
                 // Update notifications are expected when subscribed - just skip them
                 tracing::trace!("Received update notification for key: {}", key);
+                skipped += 1;
                 continue;
             }
             Ok(Ok(other)) => {
                 tracing::warn!("Unexpected response while waiting for update: {}", other);
+                skipped += 1;
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
                 return Err(err.into());
             }
             Err(_) => {
-                return Err("timeout waiting for update response".into());
+                // Per-recv timeout, continue checking overall deadline
+                continue;
             }
         }
     }
