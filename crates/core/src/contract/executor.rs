@@ -706,13 +706,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> impl Future<Output = Result<StateDelta<'static>, ExecutorError>> + Send;
 }
 
-/// Consumers of the executor are required to poll for new changes in order to be notified
-/// of changes or can alternatively use the notification channel.
-///
-/// The type parameters are:
-/// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
-/// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
-///
 /// Tracks contracts that have undergone corrupted-state recovery.
 ///
 /// When a contract's stored state is corrupted (e.g., WASM can't deserialize it),
@@ -740,6 +733,12 @@ type SharedSummaries = Arc<
     >,
 >;
 
+/// Consumers of the executor are required to poll for new changes in order to be notified
+/// of changes or can alternatively use the notification channel.
+///
+/// The type parameters are:
+/// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
+/// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
 pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     mode: OperationMode,
     runtime: R,

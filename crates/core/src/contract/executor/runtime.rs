@@ -1031,47 +1031,50 @@ impl ContractExecutor for Executor<Runtime> {
                 // Merge failed. If we have a validated full incoming state, try to recover
                 // by replacing the (likely corrupted) local state. The incoming state was
                 // already validated at entry to this function.
-                if let Some(ref valid_incoming) = incoming_full_state {
-                    let already_recovered = self
-                        .recovery_guard
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains(&key);
-
-                    if already_recovered {
-                        // Recovery was already attempted for this contract. The replacement
-                        // state also failed, so the contract is effectively broken.
-                        tracing::error!(
-                            contract = %key,
-                            error = %merge_err,
-                            event = "corrupted_state_recovery_exhausted",
-                            "State recovery already attempted, contract is broken - not retrying"
-                        );
-                        return Err(merge_err);
-                    }
-
-                    tracing::warn!(
-                        contract = %key,
-                        error = %merge_err,
-                        incoming_state_size = valid_incoming.size(),
-                        event = "corrupted_state_recovery",
-                        "Merge failed with validated incoming state - local state likely corrupted, \
-                         replacing with incoming state"
-                    );
-
-                    // Mark recovery attempted BEFORE replacing, so if the commit triggers
-                    // another update that also fails, we won't loop.
-                    self.recovery_guard
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(key);
-
-                    valid_incoming.clone()
-                } else {
+                let Some(ref valid_incoming) = incoming_full_state else {
                     // Delta update failed and we don't have a full state to recover with.
                     // Propagate the error (the caller may send a ResyncRequest).
                     return Err(merge_err);
+                };
+
+                // Check and mark recovery in a single lock acquisition.
+                let already_recovered = {
+                    let mut guard = self
+                        .recovery_guard
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if guard.contains(&key) {
+                        true
+                    } else {
+                        // Mark recovery attempted BEFORE replacing, so if the commit
+                        // triggers another update that also fails, we won't loop.
+                        guard.insert(key);
+                        false
+                    }
+                };
+
+                if already_recovered {
+                    // Recovery was already attempted for this contract. The replacement
+                    // state also failed, so the contract is effectively broken.
+                    tracing::error!(
+                        contract = %key,
+                        error = %merge_err,
+                        event = "corrupted_state_recovery_exhausted",
+                        "State recovery already attempted, contract is broken - not retrying"
+                    );
+                    return Err(merge_err);
                 }
+
+                tracing::warn!(
+                    contract = %key,
+                    error = %merge_err,
+                    incoming_state_size = valid_incoming.size(),
+                    event = "corrupted_state_recovery",
+                    "Merge failed with validated incoming state - local state likely corrupted, \
+                     replacing with incoming state"
+                );
+
+                valid_incoming.clone()
             }
         };
 
