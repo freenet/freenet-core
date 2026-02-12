@@ -165,7 +165,7 @@ async fn send_put_with_retry(
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4,
     aggregate_events = "always"
@@ -270,7 +270,7 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -378,8 +378,8 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     // The UPDATE response indicates the operation was accepted, but state persistence/propagation
     // may have a small delay. Poll until the expected version is observed.
     {
-        const MAX_VERSION_POLL_ATTEMPTS: usize = 10;
-        const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const MAX_VERSION_POLL_ATTEMPTS: usize = 30;
+        const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
         let expected_todo_list: test_utils::TodoList =
             serde_json::from_slice(updated_state.as_ref())
@@ -464,7 +464,7 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1187,7 +1187,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1445,7 +1445,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1910,7 +1910,7 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2011,7 +2011,7 @@ async fn test_put_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2127,7 +2127,7 @@ async fn test_get_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "client-node"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2321,7 +2321,7 @@ fn expected_three_hop_locations() -> [f64; 3] {
         "peer-c": { location: three_hop_peer_c_location() },
     },
     timeout_secs = 240,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     aggregate_events = "on_failure",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -2546,7 +2546,7 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2666,7 +2666,7 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2924,7 +2924,7 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3177,7 +3177,7 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]

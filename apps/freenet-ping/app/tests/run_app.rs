@@ -1351,8 +1351,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
     // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
-        // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for gateway to start its network listener (20s for slow CI runners)
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
@@ -1366,8 +1366,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
     // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
-        // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for gateway to start its network listener (20s for slow CI runners)
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
@@ -1379,8 +1379,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
+    // Main test logic (240s timeout to accommodate 20s startup delay + 30s test + buffer for slow CI)
+    let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");

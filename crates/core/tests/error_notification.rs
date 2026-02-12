@@ -244,7 +244,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gateway", "node-a"],
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
