@@ -589,7 +589,7 @@ impl DelegateRuntimeInterface for Runtime {
     }
 }
 
-#[cfg(all(test, feature = "wasmer-backend"))]
+#[cfg(all(test, any(feature = "wasmer-backend", feature = "wasmtime-backend")))]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use freenet_stdlib::prelude::*;

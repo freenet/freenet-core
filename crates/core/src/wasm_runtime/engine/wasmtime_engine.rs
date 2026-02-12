@@ -298,15 +298,12 @@ impl WasmEngine for WasmtimeEngine {
 
         // Reset fuel if metering is enabled
         if self.enabled_metering {
-            store
-                .set_fuel(self.max_fuel)
-                .map_err(|e| WasmError::Other(e.into()))?;
+            store.set_fuel(self.max_fuel).map_err(WasmError::Other)?;
         }
 
         // Instantiate the module using the pre-configured linker
-        let instance = self
-            .linker
-            .instantiate(&mut *store, module)
+        // CRITICAL: Must use instantiate_async() because async_support(true) is enabled
+        let instance = block_on_async(self.linker.instantiate_async(&mut *store, module))
             .map_err(|e| WasmError::Instantiation(e.to_string()))?;
 
         // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
@@ -670,7 +667,7 @@ impl WasmtimeEngine {
         // Memory benefits come from pooling and proper cleanup, not optimizations
         wasmtime_config.cranelift_opt_level(OptLevel::None);
 
-        let engine = Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(e.into()))?;
+        let engine = Engine::new(&wasmtime_config).map_err(WasmError::Other)?;
 
         Ok((engine, max_fuel, config.enable_metering))
     }
@@ -713,8 +710,8 @@ impl WasmtimeEngine {
 
         let current_bytes = memory.data_size(&*store);
         if current_bytes < req_bytes {
-            let current_pages = (current_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
-            let required_pages = (req_bytes + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+            let current_pages = current_bytes.div_ceil(WASM_PAGE_SIZE);
+            let required_pages = req_bytes.div_ceil(WASM_PAGE_SIZE);
             let pages_to_grow = required_pages.saturating_sub(current_pages) as u64;
 
             if let Err(err) = memory.grow(&mut *store, pages_to_grow) {
@@ -732,7 +729,7 @@ impl WasmtimeEngine {
         // Log namespace
         linker
             .func_wrap("freenet_log", "__frnt__logger__info", native_api::log::info)
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         // Rand namespace
         linker
@@ -741,7 +738,7 @@ impl WasmtimeEngine {
                 "__frnt__rand__rand_bytes",
                 native_api::rand::rand_bytes,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         // Time namespace
         linker
@@ -750,7 +747,7 @@ impl WasmtimeEngine {
                 "__frnt__time__utc_now",
                 native_api::time::utc_now,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         // Delegate context namespace (synchronous)
         linker
@@ -759,7 +756,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__ctx_len",
                 native_api::delegate_context::context_len,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -767,7 +764,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__ctx_read",
                 native_api::delegate_context::context_read,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -775,7 +772,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__ctx_write",
                 native_api::delegate_context::context_write,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         // Delegate secrets namespace (synchronous)
         linker
@@ -784,7 +781,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__get_secret",
                 native_api::delegate_secrets::get_secret,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -792,7 +789,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__get_secret_len",
                 native_api::delegate_secrets::get_secret_len,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -800,7 +797,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__set_secret",
                 native_api::delegate_secrets::set_secret,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -808,7 +805,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__has_secret",
                 native_api::delegate_secrets::has_secret,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap(
@@ -816,7 +813,7 @@ impl WasmtimeEngine {
                 "__frnt__delegate__remove_secret",
                 native_api::delegate_secrets::remove_secret,
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         // Delegate contracts namespace (async host functions for V2 delegates)
         // These are registered as async to support future async operations,
@@ -834,7 +831,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         linker
             .func_wrap_async(
@@ -846,7 +843,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(|e| WasmError::Other(e.into()))?;
+            .map_err(WasmError::Other)?;
 
         Ok(())
     }
@@ -1294,5 +1291,87 @@ mod tests {
             "Peak growth was only {} KB - test may not be exercising memory allocation",
             peak_growth / 1024
         );
+    }
+
+    #[test]
+    fn test_module_without_async_imports_detected_as_v1() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        let wat = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "process") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        assert!(
+            !engine.module_has_async_imports(&module),
+            "V1 module should not have freenet_delegate_contracts imports"
+        );
+    }
+
+    #[test]
+    fn test_module_with_async_imports_detected_as_v2() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        let wat = r#"
+        (module
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
+            (func $get_state (param i64 i32 i64 i64) (result i64)))
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "process") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        assert!(
+            engine.module_has_async_imports(&module),
+            "V2 module should have freenet_delegate_contracts imports"
+        );
+    }
+
+    #[test]
+    fn test_v2_async_call_path_end_to_end() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        let wat = r#"
+        (module
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
+            (func $get_state_len (param i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (global $instance_id (mut i64) (i64.const 0))
+          (func (export "__frnt_set_id") (param i64)
+            local.get 0
+            global.set $instance_id)
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            i64.const 100)
+          (func (export "process") (param i64 i64 i64) (result i64)
+            i64.const 0
+            i32.const 0
+            call $get_state_len))
+        "#;
+
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        assert!(
+            engine.module_has_async_imports(&module),
+            "module should be detected as V2"
+        );
+
+        let handle = engine
+            .create_instance(&module, 999, 1024)
+            .expect("create instance");
+
+        let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
+        assert!(
+            result.is_ok(),
+            "V2 async call path should succeed, got: {:?}",
+            result
+        );
+
+        engine.drop_instance(&handle);
     }
 }

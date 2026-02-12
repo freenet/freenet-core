@@ -2143,6 +2143,7 @@ name = "freenet-ping-app"
 version = "0.1.11"
 dependencies = [
  "anyhow",
+ "bincode",
  "chrono",
  "clap",
  "freenet",
