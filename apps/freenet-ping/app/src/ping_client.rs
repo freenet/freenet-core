@@ -246,6 +246,47 @@ pub async fn wait_for_update_response(
     }
 }
 
+/// Wait for an UpdateNotification from a subscribed contract.
+/// Used to verify subscription propagation before starting real tests.
+#[allow(dead_code)]
+pub async fn wait_for_update_notification(
+    client: &mut WebApi,
+    expected_key: &ContractKey,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("timeout waiting for update notification".into());
+        }
+        let resp = timeout(remaining.min(Duration::from_secs(5)), client.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
+                if &key == expected_key {
+                    return Ok(());
+                }
+                tracing::trace!("Notification for unexpected key: {}", key);
+            }
+            Ok(Ok(other)) => {
+                tracing::trace!("Skipping non-notification response: {}", other);
+                continue;
+            }
+            Ok(Err(err)) => {
+                tracing::error!(err=%err, "Error waiting for notification");
+                return Err(err.into());
+            }
+            Err(_) => {
+                // Per-recv timeout, continue checking overall deadline
+                continue;
+            }
+        }
+    }
+}
+
 /// WebSocket configuration with increased message size limit to match server (100MB)
 fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
