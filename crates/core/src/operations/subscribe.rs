@@ -318,12 +318,9 @@ pub(crate) async fn request_subscribe(
         is_renewal,
     };
 
-    // Subscription renewals are best-effort background operations with no
-    // client waiting for the result.  Use the non-blocking send path so a
-    // congested notification channel causes immediate failure + backoff
-    // instead of blocking the spawned task for 30 s and compounding the
-    // congestion.  Client-initiated subscribes still use the blocking path
-    // so the client gets a clear success/failure response.
+    // Renewals use non-blocking send to fail fast under congestion rather
+    // than blocking 30 s and compounding it. Client subscribes use the
+    // blocking path for a definitive success/failure response.
     if is_renewal {
         op_manager
             .notify_op_change_nonblocking(NetMessage::from(msg), OpEnum::Subscribe(op))

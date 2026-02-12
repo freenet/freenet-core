@@ -530,20 +530,15 @@ impl OpManager {
         Ok(())
     }
 
-    /// Non-blocking variant of [`notify_op_change`] for best-effort operations
-    /// (e.g. subscription renewals) that should fail fast when the notification
-    /// channel is congested rather than blocking for 30 seconds.
-    ///
-    /// On success the message is enqueued; on failure the pushed operation is
-    /// cleaned up and an error is returned so the caller can apply backoff.
+    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
+    /// notification channel is full instead of blocking for 30 seconds.
+    /// On failure the pushed operation is cleaned up so it does not leak.
     pub async fn notify_op_change_nonblocking(
         &self,
         msg: NetMessage,
         op: OpEnum,
     ) -> Result<(), OpError> {
         let tx = *msg.id();
-
-        // Push state first (same as blocking path).
         self.push(tx, op).await?;
 
         match self
@@ -553,12 +548,11 @@ impl OpManager {
         {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(
+                tracing::warn!(
                     tx = %tx,
                     channel_pending = self.to_event_listener.notification_channel_pending(),
                     "notify_op_change_nonblocking: channel full, failing fast"
                 );
-                // Remove the operation we just pushed so it doesn't leak.
                 self.completed(tx);
                 Err(OpError::NotificationChannelError(
                     "notification channel full (non-blocking send)".into(),
