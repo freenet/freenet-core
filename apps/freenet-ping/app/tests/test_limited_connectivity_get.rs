@@ -52,7 +52,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    ws_config,
+    wait_for_node_connected, ws_config,
 };
 
 /// Test that GET requests for non-existent contracts terminate gracefully
@@ -143,9 +143,8 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
     .boxed_local();
 
     let test = timeout(Duration::from_secs(120), async {
-        println!("Waiting for nodes to start up...");
+        // Wait for nodes to start their WebSocket servers
         tokio::time::sleep(Duration::from_secs(10)).await;
-        println!("✓ Nodes should be up");
 
         // Connect to peer's WebSocket API
         let uri_peer = format!(
@@ -155,7 +154,10 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
             connect_async_with_config(&uri_peer, Some(ws_config()), false).await?;
         let mut client_peer = WebApi::start(stream_peer);
 
-        println!("✓ Connected to peer node");
+        // Verify peer has joined the ring before sending GET
+        println!("Waiting for peer to join the ring...");
+        wait_for_node_connected(&mut client_peer, "Peer", 1, 120).await?;
+        println!("✓ Peer connected to the ring");
 
         // Generate a random contract ID that definitely doesn't exist
         // Use a random hash to ensure it doesn't match any existing contract
