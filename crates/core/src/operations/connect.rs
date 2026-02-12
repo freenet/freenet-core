@@ -1686,6 +1686,7 @@ fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
 pub(crate) async fn join_ring_request(
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
+    ttl_override: Option<u8>,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
     let gateway_location = gateway.location().ok_or_else(|| {
@@ -1717,11 +1718,12 @@ pub(crate) async fn join_ring_request(
     // to the same unreachable peer. Ring-optimal connections are established later
     // through connection_maintenance/adjust_topology once the peer has bootstrapped.
     let desired_location = Location::random();
-    let ttl = op_manager
+    let default_ttl = op_manager
         .ring
         .max_hops_to_live
         .max(1)
         .min(u8::MAX as usize) as u8;
+    let ttl = ttl_override.unwrap_or(default_ttl);
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
     let failed_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
@@ -1884,15 +1886,29 @@ pub(crate) async fn initial_join_procedure(
                     unconnected_count - eligible_count
                 );
                 let select_all = FuturesUnordered::new();
-                for gateway in eligible_gateways
+                let no_open_connections = open_conns == 0;
+                for (i, gateway) in eligible_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
+                    .enumerate()
                 {
+                    let ttl_override = if no_open_connections && i == 0 {
+                        tracing::info!(
+                            %gateway,
+                            "Sending TTL=0 request for fast gateway-direct bootstrap"
+                        );
+                        Some(0)
+                    } else {
+                        None
+                    };
                     tracing::info!(%gateway, "Attempting connection to gateway");
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager).await, gateway)
+                        (
+                            join_ring_request(gateway, &op_manager, ttl_override).await,
+                            gateway,
+                        )
                     });
                 }
                 select_all
