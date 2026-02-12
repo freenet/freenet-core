@@ -752,7 +752,10 @@ pub struct SimNetwork {
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
     all_gateway_configs: Vec<GatewayConfig>,
-    /// Size threshold (bytes) above which streaming is used (default: system default 64KB)
+    /// Size threshold (bytes) above which streaming is used.
+    /// Default: `None` → uses `usize::MAX` so tests don't stream unless explicitly opted in
+    /// via `with_streaming_threshold()`. This preserves the pre-streaming-always-on behavior
+    /// where simulation tests used inline messages for all payloads.
     pub streaming_threshold: Option<usize>,
 }
 
@@ -1330,7 +1333,9 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_threshold: self.streaming_threshold,
+                    // Default to usize::MAX so tests don't trigger streaming unless
+                    // explicitly opted in via with_streaming_threshold().
+                    streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1417,7 +1422,9 @@ impl SimNetwork {
                 id: Some(format!("{label}")),
                 mode: Some(OperationMode::Local),
                 network_api: crate::config::NetworkArgs {
-                    streaming_threshold: self.streaming_threshold,
+                    // Default to usize::MAX so tests don't trigger streaming unless
+                    // explicitly opted in via with_streaming_threshold().
+                    streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
                     ..Default::default()
                 },
                 ..Default::default()
