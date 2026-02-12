@@ -135,6 +135,8 @@ pub struct RuntimePool {
     /// Engine's internal data structures. Using a Module compiled by one Engine
     /// in a Store backed by a different Engine causes SIGSEGV.
     shared_backend_engine: BackendEngine,
+    /// Shared recovery guard for corrupted-state self-healing across all pool executors.
+    shared_recovery_guard: super::CorruptedStateRecoveryGuard,
 }
 
 impl RuntimePool {
@@ -239,6 +241,7 @@ impl RuntimePool {
             shared_contract_modules,
             shared_delegate_modules,
             shared_backend_engine,
+            shared_recovery_guard,
         })
     }
 
@@ -368,6 +371,7 @@ impl RuntimePool {
             self.shared_notifications.clone(),
             self.shared_summaries.clone(),
         );
+        executor.set_recovery_guard(self.shared_recovery_guard.clone());
 
         Ok(executor)
     }
@@ -1013,6 +1017,7 @@ impl ContractExecutor for Executor<Runtime> {
             });
         }
 
+        let mut recovery_performed = false;
         let updated_state = match self
             .attempt_state_update(&params, &current_state, &key, &updates)
             .await
@@ -1074,13 +1079,15 @@ impl ContractExecutor for Executor<Runtime> {
                      replacing with incoming state"
                 );
 
+                recovery_performed = true;
                 valid_incoming.clone()
             }
         };
 
-        // If this contract had a prior recovery and the merge just succeeded,
-        // clear the guard — the contract is healthy again.
-        if incoming_full_state.is_some() {
+        // Clear the recovery guard for this contract on a successful merge
+        // (NOT on the same call that performed recovery — the guard must persist
+        // so a subsequent failure is detected as a broken contract).
+        if incoming_full_state.is_some() && !recovery_performed {
             self.recovery_guard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
