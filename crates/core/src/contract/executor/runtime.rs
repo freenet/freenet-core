@@ -1034,7 +1034,12 @@ impl ContractExecutor for Executor<Runtime> {
                     cause: "invalid outcome state".into(),
                 },
             )),
-            ValidateResult::RequestRelated(_) => todo!(),
+            ValidateResult::RequestRelated(_) => Err(ExecutorError::request(
+                freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                },
+            )),
         }
     }
 
@@ -2072,7 +2077,11 @@ impl Executor<Runtime> {
             }
         };
 
-        // Validate before persisting or broadcasting
+        // Validate before persisting or broadcasting.
+        // Note: We pass empty RelatedContracts here because this local-mode path
+        // doesn't maintain a RelatedContracts structure (related data is passed as
+        // UpdateData entries to update_state). Contracts that need related contracts
+        // for validation will get RequestRelated, which is handled as an error below.
         match self
             .runtime
             .validate_state(&key, parameters, &new_state, &RelatedContracts::default())
