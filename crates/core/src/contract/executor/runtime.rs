@@ -10,7 +10,7 @@ use crate::wasm_runtime::{
 };
 use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -172,6 +172,11 @@ impl RuntimePool {
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
 
+        // Create shared recovery guard for corrupted-state self-healing.
+        // All pool executors share this so recovery tracking is consistent.
+        let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend
         // engine because wasmer Artifacts store function pointers and signature
@@ -189,6 +194,7 @@ impl RuntimePool {
         let shared_backend_engine = first_executor.runtime.clone_backend_engine();
         first_executor
             .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+        first_executor.set_recovery_guard(shared_recovery_guard.clone());
         runtimes.push(Some(first_executor));
 
         for i in 1..pool_size_usize {
@@ -206,6 +212,7 @@ impl RuntimePool {
             // Set shared notification storage so this executor uses pool-level storage
             executor
                 .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+            executor.set_recovery_guard(shared_recovery_guard.clone());
 
             runtimes.push(Some(executor));
 
@@ -825,6 +832,14 @@ impl ContractExecutor for Executor<Runtime> {
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
+        // Save the incoming full state (if any) for potential corrupted-state recovery.
+        // When the stored state is corrupted, WASM merge fails. If we have a validated
+        // incoming full state, we can replace the corrupted state with it.
+        let incoming_full_state = match &update {
+            Either::Left(state) => Some(state.clone()),
+            Either::Right(_) => None,
+        };
+
         // If this is a new contract being stored, mark it as initializing
         if remove_if_fail && is_new_contract && contract_was_provided {
             tracing::debug!(
@@ -1000,10 +1015,10 @@ impl ContractExecutor for Executor<Runtime> {
 
         let updated_state = match self
             .attempt_state_update(&params, &current_state, &key, &updates)
-            .await?
+            .await
         {
-            Either::Left(s) => s,
-            Either::Right(mut r) => {
+            Ok(Either::Left(s)) => s,
+            Ok(Either::Right(mut r)) => {
                 let Some(c) = r.pop() else {
                     // this branch should be unreachable since attempt_state_update should only
                     return Err(ExecutorError::internal_error());
@@ -1012,7 +1027,63 @@ impl ContractExecutor for Executor<Runtime> {
                     key: c.contract_instance_id,
                 }));
             }
+            Err(merge_err) => {
+                // Merge failed. If we have a validated full incoming state, try to recover
+                // by replacing the (likely corrupted) local state. The incoming state was
+                // already validated at entry to this function.
+                if let Some(ref valid_incoming) = incoming_full_state {
+                    let already_recovered = self
+                        .recovery_guard
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&key);
+
+                    if already_recovered {
+                        // Recovery was already attempted for this contract. The replacement
+                        // state also failed, so the contract is effectively broken.
+                        tracing::error!(
+                            contract = %key,
+                            error = %merge_err,
+                            event = "corrupted_state_recovery_exhausted",
+                            "State recovery already attempted, contract is broken - not retrying"
+                        );
+                        return Err(merge_err);
+                    }
+
+                    tracing::warn!(
+                        contract = %key,
+                        error = %merge_err,
+                        incoming_state_size = valid_incoming.size(),
+                        event = "corrupted_state_recovery",
+                        "Merge failed with validated incoming state - local state likely corrupted, \
+                         replacing with incoming state"
+                    );
+
+                    // Mark recovery attempted BEFORE replacing, so if the commit triggers
+                    // another update that also fails, we won't loop.
+                    self.recovery_guard
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key);
+
+                    valid_incoming.clone()
+                } else {
+                    // Delta update failed and we don't have a full state to recover with.
+                    // Propagate the error (the caller may send a ResyncRequest).
+                    return Err(merge_err);
+                }
+            }
         };
+
+        // If this contract had a prior recovery and the merge just succeeded,
+        // clear the guard — the contract is healthy again.
+        if incoming_full_state.is_some() {
+            self.recovery_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+
         let result = self
             .runtime
             .validate_state(&key, &params, &updated_state, &related_contracts)

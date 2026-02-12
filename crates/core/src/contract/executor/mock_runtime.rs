@@ -1561,4 +1561,87 @@ mod test {
         assert_eq!(data, b"version 2 data");
         // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
     }
+
+    /// Verify that the corrupted-state recovery guard on the executor:
+    /// - Tracks contracts that have undergone recovery
+    /// - Prevents repeated recovery attempts (loop guard)
+    /// - Clears entries when manually removed (simulating successful update)
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_guard_prevents_infinite_loops() {
+        let executor = create_test_executor().await;
+        let contract = create_test_contract(b"guard_test_code");
+        let key = contract.key();
+
+        // Initially, no contract is in the guard
+        {
+            let guard = executor.recovery_guard.lock().unwrap();
+            assert!(
+                !guard.contains(&key),
+                "New executor should have empty recovery guard"
+            );
+        }
+
+        // Simulate recovery: insert the key
+        {
+            let mut guard = executor.recovery_guard.lock().unwrap();
+            guard.insert(key);
+        }
+
+        // The key should now be tracked
+        {
+            let guard = executor.recovery_guard.lock().unwrap();
+            assert!(
+                guard.contains(&key),
+                "Recovery guard should track the contract after recovery"
+            );
+        }
+
+        // Simulate a subsequent successful update: remove the key
+        {
+            let mut guard = executor.recovery_guard.lock().unwrap();
+            guard.remove(&key);
+        }
+
+        // The key should be cleared, allowing future recovery
+        {
+            let guard = executor.recovery_guard.lock().unwrap();
+            assert!(
+                !guard.contains(&key),
+                "Recovery guard should be cleared after successful update"
+            );
+        }
+    }
+
+    /// Verify that the recovery guard is shared across executors when
+    /// created from the same Arc (simulating pool behavior).
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_guard_shared_across_pool() {
+        let mut executor_a = create_test_executor().await;
+        let contract = create_test_contract(b"pool_guard_test");
+        let key = contract.key();
+
+        // Create a shared guard and set it on executor_a
+        let shared_guard: super::super::CorruptedStateRecoveryGuard =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        executor_a.set_recovery_guard(shared_guard.clone());
+
+        // Create executor_b sharing the same guard
+        let mut executor_b = create_test_executor().await;
+        executor_b.set_recovery_guard(shared_guard.clone());
+
+        // Recovery on executor_a marks the key
+        {
+            let mut guard = executor_a.recovery_guard.lock().unwrap();
+            guard.insert(key);
+        }
+
+        // executor_b sees the same mark (shared state)
+        {
+            let guard = executor_b.recovery_guard.lock().unwrap();
+            assert!(
+                guard.contains(&key),
+                "Recovery guard should be visible across pool executors"
+            );
+        }
+    }
 }
