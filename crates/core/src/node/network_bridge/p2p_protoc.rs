@@ -1574,6 +1574,7 @@ impl P2pConnManager {
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
+                                                size_bytes: op_manager.ring.hosting_contract_size(&contract_key),
                                             },
                                         );
                                     }
@@ -1587,6 +1588,7 @@ impl P2pConnManager {
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
+                                                size_bytes: op_manager.ring.hosting_contract_size(contract_key),
                                             },
                                         );
                                     }

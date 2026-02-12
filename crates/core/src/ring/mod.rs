@@ -938,6 +938,11 @@ impl Ring {
         self.hosting_manager.hosting_contract_keys()
     }
 
+    /// Get the cached state size in bytes for a hosted contract.
+    pub fn hosting_contract_size(&self, key: &ContractKey) -> u64 {
+        self.hosting_manager.hosting_contract_size(key)
+    }
+
     /// Get the number of contracts in the hosting cache.
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
