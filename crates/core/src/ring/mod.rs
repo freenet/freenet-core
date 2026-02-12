@@ -1124,9 +1124,11 @@ impl Ring {
             // Resets both connection (location-based) and gateway (address-based)
             // backoff state. Used during isolation recovery to ensure all gateways
             // are retryable when the node has zero ring connections.
+            // Also wakes initial_join_procedure if it's sleeping on backoff.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
+                op_manager.gateway_backoff_cleared.notify_waiters();
             };
 
             // Suspend/resume detection: if boot-time elapsed much more than

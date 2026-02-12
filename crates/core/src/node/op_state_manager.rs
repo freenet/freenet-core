@@ -259,6 +259,9 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
+    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
+    /// so it can wake from a long backoff sleep and retry immediately.
+    pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
 }
 
 impl Clone for OpManager {
@@ -282,6 +285,7 @@ impl Clone for OpManager {
             streaming_enabled: self.streaming_enabled,
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
+            gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
         }
     }
 }
@@ -392,6 +396,7 @@ impl OpManager {
             streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
+            gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
         })
     }
 

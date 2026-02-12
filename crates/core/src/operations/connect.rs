@@ -1857,14 +1857,21 @@ pub(crate) async fn initial_join_procedure(
                 let eligible_count = eligible_gateways.len();
 
                 if eligible_count == 0 {
-                    // All gateways are in backoff - wait for the shortest one
+                    // All gateways are in backoff - wait for the shortest one,
+                    // but also wake up if connection_maintenance clears the backoff
+                    // (e.g. during isolation recovery or suspend detection).
                     if let Some(min_wait) = min_backoff {
                         tracing::info!(
                             wait_secs = min_wait.as_secs(),
                             total_gateways = unconnected_count,
                             "All gateways in backoff, waiting for shortest backoff to expire"
                         );
-                        tokio::time::sleep(min_wait).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(min_wait) => {},
+                            _ = op_manager.gateway_backoff_cleared.notified() => {
+                                tracing::info!("Gateway backoff cleared externally, retrying immediately");
+                            },
+                        }
                         continue;
                     }
                 }
