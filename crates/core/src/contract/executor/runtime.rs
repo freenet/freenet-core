@@ -1556,10 +1556,13 @@ impl Executor<Runtime> {
                 .update_state(&key, &params, &current_state, &[update])
                 .map_err(|err| ExecutorError::execution(err, Some(InnerOpError::Upsert(key))))?;
 
+            // If update_state produced no new state, or the merged state is identical
+            // to current, return early with the current summary (no work to persist).
             let new_state = match update_result.new_state {
-                Some(s) => WrappedState::new(s.into_bytes()),
-                None => {
-                    // No change or missing related contracts — return current state
+                Some(s) if s.as_ref() != current_state.as_ref() => {
+                    WrappedState::new(s.into_bytes())
+                }
+                _ => {
                     let summary = self
                         .runtime
                         .summarize_state(&key, &params, &current_state)
@@ -1567,14 +1570,6 @@ impl Executor<Runtime> {
                     return Ok(ContractResponse::UpdateResponse { key, summary }.into());
                 }
             };
-
-            if new_state.as_ref() == current_state.as_ref() {
-                let summary = self
-                    .runtime
-                    .summarize_state(&key, &params, &current_state)
-                    .map_err(|e| ExecutorError::execution(e, None))?;
-                return Ok(ContractResponse::UpdateResponse { key, summary }.into());
-            }
 
             // Validate before persisting
             match self
@@ -1612,22 +1607,7 @@ impl Executor<Runtime> {
                     })
                 })?;
 
-            // Broadcast to network peers (async, non-blocking)
-            if let Some(op_manager) = &self.op_manager {
-                if let Err(err) = op_manager
-                    .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                        key,
-                        new_state: new_state.clone(),
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        contract = %key,
-                        error = %err,
-                        "Failed to broadcast state change to network peers"
-                    );
-                }
-            }
+            self.broadcast_state_change(key, new_state.clone()).await;
 
             let summary = self
                 .runtime
@@ -1648,22 +1628,7 @@ impl Executor<Runtime> {
                 })
             })?;
 
-        // Notify network peers of state change (automatic propagation)
-        if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key,
-                    new_state: state.clone(),
-                })
-                .await
-            {
-                tracing::warn!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers"
-                );
-            }
-        }
+        self.broadcast_state_change(key, state.clone()).await;
 
         Ok(ContractResponse::PutResponse { key }.into())
     }
@@ -2300,6 +2265,28 @@ impl Executor<Runtime> {
             }));
         }
         Ok(())
+    }
+
+    /// Broadcasts a state change to network peers via the op_manager.
+    ///
+    /// This is fire-and-forget: failures are logged but do not propagate errors,
+    /// since peers will eventually sync via their next subscription renewal.
+    async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key,
+                    new_state,
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
     }
 
     /// Delivers update notifications to LOCAL client subscriptions via websocket channels.
