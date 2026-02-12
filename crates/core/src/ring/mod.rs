@@ -368,8 +368,12 @@ impl Ring {
     }
 
     /// Maximum number of subscription recovery attempts per interval.
-    /// This prevents spawning too many concurrent tasks if there are many orphaned contracts.
-    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 20;
+    /// Keep this small to avoid overwhelming the notification channel — each
+    /// spawned task pushes a message and blocks up to 30 s if the channel is full.
+    /// Production gateways can host 250+ contracts; even 5 concurrent subscribe
+    /// operations per 30 s cycle is sufficient with exponential backoff handling
+    /// the rest.  (Previous value of 20 caused channel saturation within ~30 min.)
+    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 5;
 
     /// Periodically attempt to recover "orphaned seeders" - contracts we're seeding
     /// but don't have an upstream subscription for.
@@ -435,6 +439,29 @@ impl Ring {
                 continue;
             };
 
+            // --- Backpressure: skip this cycle if the notification channel is
+            //     already congested.  Renewals are best-effort; they will be
+            //     retried on the next 30 s tick.  This prevents the renewal
+            //     loop from worsening an already-saturated event loop
+            //     (production incident 2026-02-12 on both gateways).
+            let channel_remaining = op_manager
+                .to_event_listener
+                .notifications_sender()
+                .capacity();
+            let channel_max = op_manager
+                .to_event_listener
+                .notifications_sender()
+                .max_capacity();
+            if channel_remaining < channel_max / 2 {
+                tracing::warn!(
+                    channel_remaining,
+                    channel_max,
+                    contracts = contracts_needing_renewal.len(),
+                    "Notification channel >50% full, deferring subscription renewals"
+                );
+                continue;
+            }
+
             let mut attempted = 0;
             let mut skipped = 0;
 
@@ -444,6 +471,21 @@ impl Ring {
                     tracing::debug!(
                         limit = Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
                         "Reached max renewal attempts for this interval, remaining will be tried next cycle"
+                    );
+                    break;
+                }
+
+                // Stop spawning within a cycle if the channel is getting full from
+                // our own spawns or concurrent activity.
+                let remaining_now = op_manager
+                    .to_event_listener
+                    .notifications_sender()
+                    .capacity();
+                if remaining_now < channel_max / 4 {
+                    tracing::info!(
+                        channel_remaining = remaining_now,
+                        attempted,
+                        "Notification channel >75% full during renewal spawning, stopping early"
                     );
                     break;
                 }
@@ -458,9 +500,11 @@ impl Ring {
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
 
-                    // Stagger spawns to avoid bursting all renewals onto the
-                    // notification channel simultaneously.
-                    let jitter_ms = GlobalRng::random_range(0u64..=500);
+                    // Spread spawned tasks across the full interval to avoid
+                    // thundering-herd bursts on the notification channel.
+                    // Previous value of 0–500 ms meant all tasks woke within
+                    // ~1 s; spreading over 0–15 s keeps the channel load smooth.
+                    let jitter_ms = GlobalRng::random_range(0u64..=15_000);
 
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
