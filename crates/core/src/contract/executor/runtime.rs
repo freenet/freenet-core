@@ -1543,6 +1543,12 @@ impl Executor<Runtime> {
             // (e.g. fdev publish), the client needs a timely response. The network
             // broadcast is fire-and-forget — if it fails, subscribers will still get
             // the update via their next sync.
+            //
+            // NOTE: This simplified path does not handle contracts that require related
+            // contracts for update_state or validate_state. If update_state returns
+            // MissingRelated (new_state=None with non-empty related), it is treated as
+            // "no change". This is acceptable because no current contracts use related
+            // contracts (see issue #2870 for completing that mechanism).
             let current_state = self
                 .state_store
                 .get(&key)
