@@ -765,7 +765,7 @@ where
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
 
-    const MAX_RETRIES: usize = 10usize;
+    const MAX_RETRIES: usize = 15usize;
     for i in 0..MAX_RETRIES {
         let tx = Some(*msg.id());
         tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
@@ -791,8 +791,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            tracing::debug!(
+                                delay_ms,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -842,8 +847,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            tracing::debug!(
+                                delay_ms,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -884,8 +894,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            tracing::debug!(
+                                delay_ms,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -915,8 +930,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            tracing::debug!(
+                                delay_ms,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -946,8 +966,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay_ms = (5u64 << i.min(8)).min(1_000);
+                            tracing::debug!(
+                                delay_ms,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -1034,7 +1059,11 @@ where
         }
     }
 
-    // If we reach here, no operation was processed
+    // If we reach here, retries were exhausted waiting for a concurrent operation to finish
+    tracing::warn!(
+        tx = %msg.id(),
+        "Dropping message after {MAX_RETRIES} retry attempts (operation busy)"
+    );
     Ok(None)
 }
 
