@@ -513,22 +513,34 @@ impl Ring {
                         )
                         .await;
 
-                        let success = result.is_ok();
-                        if success {
-                            tracing::info!(
-                                %contract_key,
-                                "Subscription renewal succeeded"
-                            );
-                        } else if let Err(ref e) = result {
-                            tracing::debug!(
-                                %contract_key,
-                                error = %e,
-                                "Subscription renewal failed (will retry with backoff)"
-                            );
+                        match &result {
+                            Ok(()) => {
+                                tracing::info!(
+                                    %contract_key,
+                                    "Subscription renewal succeeded"
+                                );
+                                guard.complete(true);
+                            }
+                            Err(crate::operations::OpError::NotificationChannelError(_)) => {
+                                // Channel congestion is a local resource issue, not a
+                                // protocol failure. Don't penalize with backoff — just
+                                // clear the pending mark so the contract is eligible on
+                                // the next cycle.
+                                tracing::debug!(
+                                    %contract_key,
+                                    "Subscription renewal skipped (channel full), will retry next cycle"
+                                );
+                                guard.complete(true);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    %contract_key,
+                                    error = %e,
+                                    "Subscription renewal failed (will retry with backoff)"
+                                );
+                                guard.complete(false);
+                            }
                         }
-
-                        // Mark as completed so guard doesn't treat it as failure
-                        guard.complete(success);
                     });
                 }
             }
