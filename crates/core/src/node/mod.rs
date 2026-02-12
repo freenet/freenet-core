@@ -1065,7 +1065,7 @@ where
                 }
                 return Ok(None);
             }
-            _ => return Ok(None),
+            NetMessageV1::Aborted(_) => return Ok(None),
         }
     }
 
