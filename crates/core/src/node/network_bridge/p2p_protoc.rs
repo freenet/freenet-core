@@ -1166,102 +1166,10 @@ impl P2pConnManager {
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer_addr) => {
-                                // Look up the connection entry by address
-                                if let Some(entry) = ctx.connections.get(&peer_addr) {
-                                    // Construct PeerKeyLocation from stored pub_key or fallback
-                                    let peer = if let Some(ref pub_key) = entry.pub_key {
-                                        PeerKeyLocation::new(pub_key.clone(), peer_addr)
-                                    } else {
-                                        PeerKeyLocation::new(
-                                            (*ctx
-                                                .bridge
-                                                .op_manager
-                                                .ring
-                                                .connection_manager
-                                                .pub_key)
-                                                .clone(),
-                                            peer_addr,
-                                        )
-                                    };
-                                    let pub_key_to_remove = entry.pub_key.clone();
-
-                                    tracing::trace!(
-                                        peer_addr = %peer_addr,
-                                        conn_map_size = ctx.connections.len(),
-                                        reason = "drop_requested",
-                                        "Removing connection from tracking map"
-                                    );
-                                    if let Err(error) = handshake_cmd_sender
-                                        .send(HandshakeCommand::DropConnection {
-                                            peer: peer.clone(),
-                                        })
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            peer = %peer,
-                                            error = ?error,
-                                            phase = "disconnect",
-                                            "Failed to enqueue drop connection command"
-                                        );
-                                    }
-                                    // Immediately prune topology counters so we don't leak open connection slots.
-                                    let prune_result = ctx
-                                        .bridge
-                                        .op_manager
-                                        .ring
-                                        .prune_connection(PeerId::new(
-                                            peer_addr,
-                                            peer.pub_key().clone(),
-                                        ))
-                                        .await;
-
-                                    // Handle orphaned transactions immediately (retry via alternate routes)
-                                    ctx.bridge
-                                        .handle_orphaned_transactions(
-                                            prune_result.orphaned_transactions,
-                                            &ctx.gateways,
-                                        )
-                                        .await;
-
-                                    // forget this peer's subscriptions and cached contract state
-                                    ctx.bridge
-                                        .op_manager
-                                        .on_ring_connection_lost(peer.pub_key());
-
-                                    if let Some(conn) = ctx.connections.remove(&peer_addr) {
-                                        // Also remove from reverse lookup
-                                        if let Some(pub_key) = pub_key_to_remove {
-                                            ctx.addr_by_pub_key.remove(&pub_key);
-                                        }
-                                        // TODO: review: this could potentially leave garbage tasks in the background with peer listener
-                                        match timeout(
-                                            Duration::from_secs(1),
-                                            conn.sender.send(Right(ConnEvent::NodeAction(
-                                                NodeEvent::DropConnection(peer_addr),
-                                            ))),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(send_error)) => {
-                                                tracing::error!(
-                                                    peer_addr = %peer_addr,
-                                                    error = ?send_error,
-                                                    phase = "error",
-                                                    "Failed to send drop connection message to peer"
-                                                );
-                                            }
-                                            Err(elapsed) => {
-                                                tracing::error!(
-                                                    peer_addr = %peer_addr,
-                                                    error = ?elapsed,
-                                                    phase = "timeout",
-                                                    "Timeout while sending drop connection message"
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else {
+                                if !ctx
+                                    .drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
+                                    .await
+                                {
                                     tracing::debug!(
                                         peer_addr = %peer_addr,
                                         phase = "disconnect",
@@ -1277,63 +1185,8 @@ impl P2pConnManager {
                                     "DropAllConnections: closing all connections (suspend/resume recovery)"
                                 );
                                 for peer_addr in all_addrs {
-                                    if let Some(entry) = ctx.connections.get(&peer_addr) {
-                                        let peer = if let Some(ref pub_key) = entry.pub_key {
-                                            PeerKeyLocation::new(pub_key.clone(), peer_addr)
-                                        } else {
-                                            PeerKeyLocation::new(
-                                                (*ctx
-                                                    .bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key)
-                                                    .clone(),
-                                                peer_addr,
-                                            )
-                                        };
-                                        let pub_key_to_remove = entry.pub_key.clone();
-
-                                        let _ = handshake_cmd_sender
-                                            .send(HandshakeCommand::DropConnection {
-                                                peer: peer.clone(),
-                                            })
-                                            .await;
-
-                                        let prune_result = ctx
-                                            .bridge
-                                            .op_manager
-                                            .ring
-                                            .prune_connection(PeerId::new(
-                                                peer_addr,
-                                                peer.pub_key().clone(),
-                                            ))
-                                            .await;
-
-                                        ctx.bridge
-                                            .handle_orphaned_transactions(
-                                                prune_result.orphaned_transactions,
-                                                &ctx.gateways,
-                                            )
-                                            .await;
-
-                                        ctx.bridge
-                                            .op_manager
-                                            .on_ring_connection_lost(peer.pub_key());
-
-                                        if let Some(conn) = ctx.connections.remove(&peer_addr) {
-                                            if let Some(pub_key) = pub_key_to_remove {
-                                                ctx.addr_by_pub_key.remove(&pub_key);
-                                            }
-                                            let _ = timeout(
-                                                Duration::from_secs(1),
-                                                conn.sender.send(Right(ConnEvent::NodeAction(
-                                                    NodeEvent::DropConnection(peer_addr),
-                                                ))),
-                                            )
-                                            .await;
-                                        }
-                                    }
+                                    ctx.drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
+                                        .await;
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -1889,6 +1742,104 @@ impl P2pConnManager {
         } else {
             Err(EventLoopExitReason::UnexpectedStreamEnd.into())
         }
+    }
+
+    /// Drop a single connection by socket address: notifies the handshake handler,
+    /// prunes topology, handles orphaned transactions, cleans up subscriptions,
+    /// and forwards a DropConnection event to the per-peer listener.
+    ///
+    /// Returns `true` if the connection existed and was dropped.
+    async fn drop_connection_by_addr(
+        &mut self,
+        peer_addr: SocketAddr,
+        handshake_cmd_sender: &HandshakeCommandSender,
+    ) -> bool {
+        let Some(entry) = self.connections.get(&peer_addr) else {
+            return false;
+        };
+
+        let peer = if let Some(ref pub_key) = entry.pub_key {
+            PeerKeyLocation::new(pub_key.clone(), peer_addr)
+        } else {
+            PeerKeyLocation::new(
+                (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
+                peer_addr,
+            )
+        };
+        let pub_key_to_remove = entry.pub_key.clone();
+
+        tracing::trace!(
+            peer_addr = %peer_addr,
+            conn_map_size = self.connections.len(),
+            reason = "drop_requested",
+            "Removing connection from tracking map"
+        );
+
+        if let Err(error) = handshake_cmd_sender
+            .send(HandshakeCommand::DropConnection { peer: peer.clone() })
+            .await
+        {
+            tracing::warn!(
+                peer = %peer,
+                error = ?error,
+                phase = "disconnect",
+                "Failed to enqueue drop connection command"
+            );
+        }
+
+        // Immediately prune topology counters so we don't leak open connection slots.
+        let prune_result = self
+            .bridge
+            .op_manager
+            .ring
+            .prune_connection(PeerId::new(peer_addr, peer.pub_key().clone()))
+            .await;
+
+        // Handle orphaned transactions immediately (retry via alternate routes)
+        self.bridge
+            .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
+            .await;
+
+        // Forget this peer's subscriptions and cached contract state
+        self.bridge
+            .op_manager
+            .on_ring_connection_lost(peer.pub_key());
+
+        if let Some(conn) = self.connections.remove(&peer_addr) {
+            if let Some(pub_key) = pub_key_to_remove {
+                self.addr_by_pub_key.remove(&pub_key);
+            }
+            // TODO: review: this could potentially leave garbage tasks in the background with peer listener
+            match timeout(
+                Duration::from_secs(1),
+                conn.sender
+                    .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
+                        peer_addr,
+                    )))),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(send_error)) => {
+                    tracing::error!(
+                        peer_addr = %peer_addr,
+                        error = ?send_error,
+                        phase = "error",
+                        "Failed to send drop connection message to peer"
+                    );
+                }
+                Err(elapsed) => {
+                    tracing::error!(
+                        peer_addr = %peer_addr,
+                        error = ?elapsed,
+                        phase = "timeout",
+                        "Timeout while sending drop connection message"
+                    );
+                }
+            }
+        }
+
+        true
     }
 
     /// Process a SelectResult from the priority select stream
