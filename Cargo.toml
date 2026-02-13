@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
 	"crates/*",
+"crates/fdev/src/sync/container",
 	"apps/freenet-ping/app",
 	"apps/freenet-ping/types",
 	"apps/freenet-ping/contracts/ping",

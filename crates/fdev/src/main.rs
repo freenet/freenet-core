@@ -11,6 +11,7 @@ mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
 mod query;
+mod sync;
 mod testing;
 mod util;
 mod wasm_runtime;
@@ -68,6 +69,9 @@ fn main() -> anyhow::Result<()> {
                 config::NodeCommand::Update(update_config) => {
                     update(update_config, config.additional).await
                 }
+                config::NodeCommand::Sync(sync_config) => {
+                    sync::sync(sync_config, config.additional).await
+                }
                 config::NodeCommand::GetContractId(get_contract_id_config) => {
                     commands::get_contract_id(get_contract_id_config).await
                 }
@@ -81,6 +85,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            SubCommand::Sync(sync_config) => sync::sync(sync_config, config.additional).await,
             SubCommand::Query {} => {
                 query::query(config.additional).await?;
                 Ok(())

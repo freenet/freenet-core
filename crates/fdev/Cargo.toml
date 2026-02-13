@@ -33,6 +33,8 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 semver = { workspace = true }
 tar = { workspace = true }
+notify = { workspace = true }
+ignore = "0.4"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
 tokio-tungstenite = { workspace = true }
