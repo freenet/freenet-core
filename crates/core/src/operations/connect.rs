@@ -1602,26 +1602,20 @@ impl Operation for ConnectOp {
                         let upstream_addr = state.upstream_addr;
                         let failed_peer = state.forwarded_to.clone();
 
-                        // Record failure in estimator so future routing avoids this peer
+                        // Record failure in estimator so future routing avoids this peer.
+                        // This requires &mut self, so we must drop the state borrow first.
                         if let Some(ref fwd) = failed_peer {
                             self.record_forward_outcome(fwd, *desired_location, false);
                         }
 
-                        // Reset forwarded_to so handle_request can try another uphill peer
-                        if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                            state.forwarded_to = None;
-                            state.forwarded_at = None;
-                        }
-
-                        // Re-run handle_request to try a different uphill peer
-                        // The previously-tried peer is in recency, so select_uphill_hop skips it
+                        // Re-borrow state to reset forwarded_to and retry with a new peer.
+                        // The previously-tried peer is in recency, so select_uphill_hop skips it.
                         let env = RelayEnv::new(op_manager);
-                        let estimator = {
-                            let estimator_guard = self.connect_forward_estimator.read();
-                            estimator_guard.clone()
-                        };
+                        let estimator = self.connect_forward_estimator.read().clone();
                         let retry_actions =
                             if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                                state.forwarded_to = None;
+                                state.forwarded_at = None;
                                 state.handle_request(
                                     &env,
                                     &self.recency,
@@ -1629,7 +1623,7 @@ impl Operation for ConnectOp {
                                     &estimator,
                                 )
                             } else {
-                                RelayActions::default()
+                                unreachable!("state was Relaying at branch entry")
                             };
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
