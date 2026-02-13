@@ -41,7 +41,11 @@ use std::{
     time::Duration,
 };
 
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{
+    local_node::NodeConfig,
+    server::serve_gateway,
+    test_utils::{allocate_test_node_block, test_ip_for_node},
+};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -65,9 +69,10 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
     println!("🔧 Testing GET for non-existent contract with limited connectivity");
     println!("   Network: Gateway + 1 peer (peer only connected to gateway)");
 
-    // Use unique IPs for each node
-    let gw_ip = test_ip_for_node(0);
-    let peer_ip = test_ip_for_node(1);
+    // Use globally unique IPs to avoid conflicts with parallel tests on CI
+    let base_node_idx = allocate_test_node_block(2);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let peer_ip = test_ip_for_node(base_node_idx + 1);
 
     // Create sockets for the network
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;

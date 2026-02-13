@@ -2,7 +2,7 @@
 //! Communicates with the `ContractHandler` and potentially the `OpManager` (via `ExecutorToEventLoopChannel`).
 //! See `architecture.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
@@ -706,12 +706,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ) -> impl Future<Output = Result<StateDelta<'static>, ExecutorError>> + Send;
 }
 
-/// Consumers of the executor are required to poll for new changes in order to be notified
-/// of changes or can alternatively use the notification channel.
+/// Tracks contracts that have undergone corrupted-state recovery.
 ///
-/// The type parameters are:
-/// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
-/// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
+/// When a contract's stored state is corrupted (e.g., WASM can't deserialize it),
+/// the executor replaces it with a valid incoming state. This guard prevents infinite
+/// recovery loops: if the replacement state also causes failures, the contract is
+/// considered broken and no further recovery is attempted.
+///
+/// Entries are removed on subsequent successful updates, allowing future recovery
+/// if corruption happens again later.
+pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<ContractKey>>>;
+
 // Type alias for shared notification storage (used by RuntimePool)
 // Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
 // never during WASM execution (get_state_delta)
@@ -728,6 +733,12 @@ type SharedSummaries = Arc<
     >,
 >;
 
+/// Consumers of the executor are required to poll for new changes in order to be notified
+/// of changes or can alternatively use the notification channel.
+///
+/// The type parameters are:
+/// - `R`: The runtime type (default: `Runtime` for production, `MockRuntime` for testing)
+/// - `S`: The state storage type (default: `Storage` for disk-based, can use `MockStateStorage` for in-memory)
 pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     mode: OperationMode,
     runtime: R,
@@ -757,6 +768,9 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     shared_notifications: Option<SharedNotifications>,
     /// Shared subscriber summaries at pool level (when running in a pool).
     shared_summaries: Option<SharedSummaries>,
+    /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
+    /// See [`CorruptedStateRecoveryGuard`] for details.
+    pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
 }
 
 impl<R, S> Executor<R, S>
@@ -788,6 +802,7 @@ where
             op_manager,
             shared_notifications: None,
             shared_summaries: None,
+            recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -811,6 +826,13 @@ where
     ) {
         self.shared_notifications = Some(notifications);
         self.shared_summaries = Some(summaries);
+    }
+
+    /// Set a shared recovery guard for pool-based operation.
+    /// All executors in a pool should share the same guard so that recovery
+    /// tracking is consistent regardless of which executor handles a request.
+    pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
+        self.recovery_guard = guard;
     }
 
     /// Create all stores including StateStore. Used when creating a standalone executor.

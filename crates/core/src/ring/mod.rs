@@ -367,9 +367,17 @@ impl Ring {
         }
     }
 
-    /// Maximum number of subscription recovery attempts per interval.
-    /// This prevents spawning too many concurrent tasks if there are many orphaned contracts.
-    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 20;
+    /// Maximum renewal tasks spawned per tick. Keep small to avoid saturating
+    /// the notification channel; exponential backoff handles the remainder.
+    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 5;
+
+    /// Skip renewal cycle when channel remaining capacity falls below this
+    /// fraction of max (i.e. channel is more than 50% full).
+    const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
+
+    /// Stop spawning mid-cycle when remaining capacity falls below this
+    /// fraction of max (i.e. channel is more than 75% full).
+    const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
 
     /// Periodically attempt to recover "orphaned seeders" - contracts we're seeding
     /// but don't have an upstream subscription for.
@@ -435,6 +443,21 @@ impl Ring {
                 continue;
             };
 
+            // Backpressure: skip this cycle if the notification channel is
+            // already congested. Renewals will be retried next tick.
+            let sender = op_manager.to_event_listener.notifications_sender();
+            let channel_remaining = sender.capacity();
+            let channel_max = sender.max_capacity();
+            if channel_remaining < channel_max / Self::RENEWAL_DEFER_CAPACITY_FRACTION {
+                tracing::warn!(
+                    channel_remaining,
+                    channel_max,
+                    contracts = contracts_needing_renewal.len(),
+                    "Notification channel >50% full, deferring subscription renewals"
+                );
+                continue;
+            }
+
             let mut attempted = 0;
             let mut skipped = 0;
 
@@ -444,6 +467,17 @@ impl Ring {
                     tracing::debug!(
                         limit = Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
                         "Reached max renewal attempts for this interval, remaining will be tried next cycle"
+                    );
+                    break;
+                }
+
+                // Stop early if the channel is filling from our own spawns.
+                let remaining_now = sender.capacity();
+                if remaining_now < channel_max / Self::RENEWAL_STOP_CAPACITY_FRACTION {
+                    tracing::warn!(
+                        channel_remaining = remaining_now,
+                        attempted,
+                        "Notification channel >75% full during renewal spawning, stopping early"
                     );
                     break;
                 }
@@ -458,9 +492,8 @@ impl Ring {
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
 
-                    // Stagger spawns to avoid bursting all renewals onto the
-                    // notification channel simultaneously.
-                    let jitter_ms = GlobalRng::random_range(0u64..=500);
+                    // Spread tasks across the interval to avoid thundering-herd bursts.
+                    let jitter_ms = GlobalRng::random_range(0u64..=15_000);
 
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
@@ -480,22 +513,34 @@ impl Ring {
                         )
                         .await;
 
-                        let success = result.is_ok();
-                        if success {
-                            tracing::info!(
-                                %contract_key,
-                                "Subscription renewal succeeded"
-                            );
-                        } else if let Err(ref e) = result {
-                            tracing::debug!(
-                                %contract_key,
-                                error = %e,
-                                "Subscription renewal failed (will retry with backoff)"
-                            );
+                        match &result {
+                            Ok(()) => {
+                                tracing::info!(
+                                    %contract_key,
+                                    "Subscription renewal succeeded"
+                                );
+                                guard.complete(true);
+                            }
+                            Err(crate::operations::OpError::NotificationChannelError(_)) => {
+                                // Channel congestion is a local resource issue, not a
+                                // protocol failure. Don't penalize with backoff — just
+                                // clear the pending mark so the contract is eligible on
+                                // the next cycle.
+                                tracing::debug!(
+                                    %contract_key,
+                                    "Subscription renewal skipped (channel full), will retry next cycle"
+                                );
+                                guard.complete(true);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    %contract_key,
+                                    error = %e,
+                                    "Subscription renewal failed (will retry with backoff)"
+                                );
+                                guard.complete(false);
+                            }
                         }
-
-                        // Mark as completed so guard doesn't treat it as failure
-                        guard.complete(success);
                     });
                 }
             }
@@ -1124,9 +1169,13 @@ impl Ring {
             // Resets both connection (location-based) and gateway (address-based)
             // backoff state. Used during isolation recovery to ensure all gateways
             // are retryable when the node has zero ring connections.
+            // Also wakes initial_join_procedure if it's sleeping on backoff.
+            // Uses notify_one() which stores a permit if nobody is currently waiting,
+            // so the bootstrap loop will wake immediately on its next notified().await.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
+                op_manager.gateway_backoff_cleared.notify_one();
             };
 
             // Suspend/resume detection: if boot-time elapsed much more than

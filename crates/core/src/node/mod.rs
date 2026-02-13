@@ -997,12 +997,15 @@ where
                 )
                 .await;
             }
+            // Non-transactional message types: process once and return immediately.
+            // These must NOT fall through to the post-loop "Dropping message" warning,
+            // which is only meant for operation retry exhaustion.
             NetMessageV1::ProximityCache { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!(
                         "Received ProximityCache message without source address (pure network)"
                     );
-                    break;
+                    return Ok(None);
                 };
                 tracing::debug!(
                     from = %source,
@@ -1025,7 +1028,7 @@ where
                         %source,
                         "ProximityCache: could not resolve source addr to pub_key, skipping"
                     );
-                    break;
+                    return Ok(None);
                 };
                 if let Some(response) = op_manager
                     .proximity_cache
@@ -1038,12 +1041,12 @@ where
                         tracing::error!(%err, %source, "Failed to send ProximityCache response");
                     }
                 }
-                break;
+                return Ok(None);
             }
             NetMessageV1::InterestSync { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!("Received InterestSync message without source address");
-                    break;
+                    return Ok(None);
                 };
                 tracing::debug!(
                     from = %source,
@@ -1060,9 +1063,9 @@ where
                         tracing::error!(%err, %source, "Failed to send InterestSync response");
                     }
                 }
-                break;
+                return Ok(None);
             }
-            _ => break, // Exit the loop if no applicable message type is found
+            NetMessageV1::Aborted(_) => return Ok(None),
         }
     }
 

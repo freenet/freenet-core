@@ -259,6 +259,9 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
+    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
+    /// so it can wake from a long backoff sleep and retry immediately.
+    pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
 }
 
 impl Clone for OpManager {
@@ -282,6 +285,7 @@ impl Clone for OpManager {
             streaming_enabled: self.streaming_enabled,
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
+            gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
         }
     }
 }
@@ -392,6 +396,7 @@ impl OpManager {
             streaming_enabled,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
+            gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -523,6 +528,41 @@ impl OpManager {
         );
 
         Ok(())
+    }
+
+    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
+    /// notification channel is full instead of blocking for 30 seconds.
+    /// On failure the pushed operation is cleaned up so it does not leak.
+    pub async fn notify_op_change_nonblocking(
+        &self,
+        msg: NetMessage,
+        op: OpEnum,
+    ) -> Result<(), OpError> {
+        let tx = *msg.id();
+        self.push(tx, op).await?;
+
+        match self
+            .to_event_listener
+            .notifications_sender()
+            .try_send(Either::Left(msg))
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    tx = %tx,
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    "notify_op_change_nonblocking: channel full, failing fast"
+                );
+                self.completed(tx);
+                Err(OpError::NotificationChannelError(
+                    "notification channel full (non-blocking send)".into(),
+                ))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.completed(tx);
+                Err(OpError::NotificationError)
+            }
+        }
     }
 
     // An early, fast path, return for communicating events in the node to the main message handler,

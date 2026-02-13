@@ -147,6 +147,14 @@ impl ContractHandler for NetworkContractHandler {
             }
         }
 
+        // Populate proximity cache from hosted contracts so CacheStateResponse
+        // reports our full contract set when ring connections establish.
+        let hosted_keys = op_manager.ring.hosting_contract_keys();
+        let hosted_ids = hosted_keys.iter().map(|k| *k.id());
+        op_manager
+            .proximity_cache
+            .initialize_from_hosting_cache(hosted_ids);
+
         Ok(Self { executor, channel })
     }
 
