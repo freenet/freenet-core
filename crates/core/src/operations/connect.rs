@@ -3237,5 +3237,111 @@ mod tests {
         assert!(!actions.rejected, "should not reject when uphill available");
         assert!(actions.forward.is_some(), "should forward uphill");
         assert!(actions.accept_response.is_none());
+        assert!(
+            state.forwarded_at.is_some(),
+            "forwarded_at should be set after forwarding"
+        );
+    }
+
+    #[test]
+    fn relay_retries_different_uphill_peer_after_rejection() {
+        // Simulate the retry sequence that process_message performs on Rejected:
+        // 1. Forward to peer_a (uphill)
+        // 2. Rejection arrives → reset forwarded_to, call handle_request again
+        // 3. Context provides peer_b → should forward to peer_b
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let peer_b = make_peer(7000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // Step 1: Initial forward to peer_a
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a.clone()));
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        assert!(actions.forward.is_some(), "should forward to peer_a");
+        assert_eq!(
+            state.forwarded_to.as_ref().unwrap().pub_key(),
+            peer_a.pub_key()
+        );
+
+        // Step 2: Simulate rejection — reset forwarded_to (as process_message does)
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+
+        // Step 3: Retry with peer_b available
+        let ctx_b = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(Some(peer_b.clone()));
+        let retry_actions =
+            state.handle_request(&ctx_b, &recency, &mut forward_attempts, &estimator);
+        assert!(
+            retry_actions.forward.is_some(),
+            "should forward to peer_b on retry"
+        );
+        let (fwd_peer, _) = retry_actions.forward.unwrap();
+        assert_eq!(fwd_peer.pub_key(), peer_b.pub_key());
+    }
+
+    #[test]
+    fn relay_rejects_when_no_uphill_peers_on_retry() {
+        // After rejection from uphill peer, if no more uphill peers available → rejected
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // Step 1: Initial forward to peer_a
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a));
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        assert!(actions.forward.is_some());
+
+        // Step 2: Reset forwarded_to (simulating rejection receipt)
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+
+        // Step 3: No uphill peers available on retry → should reject
+        let ctx_none = TestRelayContext::new(self_loc).accept(false);
+        let retry_actions =
+            state.handle_request(&ctx_none, &recency, &mut forward_attempts, &estimator);
+        assert!(
+            retry_actions.rejected,
+            "should reject when no uphill peers on retry"
+        );
+        assert!(retry_actions.forward.is_none());
+        assert!(retry_actions.accept_response.is_none());
     }
 }
