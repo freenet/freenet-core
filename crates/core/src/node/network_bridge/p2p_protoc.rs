@@ -1269,6 +1269,73 @@ impl P2pConnManager {
                                     );
                                 }
                             }
+                            NodeEvent::DropAllConnections => {
+                                let all_addrs: Vec<SocketAddr> =
+                                    ctx.connections.keys().copied().collect();
+                                tracing::warn!(
+                                    count = all_addrs.len(),
+                                    "DropAllConnections: closing all connections (suspend/resume recovery)"
+                                );
+                                for peer_addr in all_addrs {
+                                    if let Some(entry) = ctx.connections.get(&peer_addr) {
+                                        let peer = if let Some(ref pub_key) = entry.pub_key {
+                                            PeerKeyLocation::new(pub_key.clone(), peer_addr)
+                                        } else {
+                                            PeerKeyLocation::new(
+                                                (*ctx
+                                                    .bridge
+                                                    .op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .pub_key)
+                                                    .clone(),
+                                                peer_addr,
+                                            )
+                                        };
+                                        let pub_key_to_remove = entry.pub_key.clone();
+
+                                        let _ = handshake_cmd_sender
+                                            .send(HandshakeCommand::DropConnection {
+                                                peer: peer.clone(),
+                                            })
+                                            .await;
+
+                                        let prune_result = ctx
+                                            .bridge
+                                            .op_manager
+                                            .ring
+                                            .prune_connection(PeerId::new(
+                                                peer_addr,
+                                                peer.pub_key().clone(),
+                                            ))
+                                            .await;
+
+                                        ctx.bridge
+                                            .handle_orphaned_transactions(
+                                                prune_result.orphaned_transactions,
+                                                &ctx.gateways,
+                                            )
+                                            .await;
+
+                                        ctx.bridge
+                                            .op_manager
+                                            .on_ring_connection_lost(peer.pub_key());
+
+                                        if let Some(conn) = ctx.connections.remove(&peer_addr) {
+                                            if let Some(pub_key) = pub_key_to_remove {
+                                                ctx.addr_by_pub_key.remove(&pub_key);
+                                            }
+                                            let _ = timeout(
+                                                Duration::from_secs(1),
+                                                conn.sender.send(Right(ConnEvent::NodeAction(
+                                                    NodeEvent::DropConnection(peer_addr),
+                                                ))),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
                             NodeEvent::ConnectPeer {
                                 peer,
                                 tx,

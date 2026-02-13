@@ -1004,6 +1004,12 @@ impl ConnectionManager {
         before - map.len()
     }
 
+    /// Clear all recently-failed addresses. Used after suspend/resume when
+    /// previously-unreachable peers may be reachable again.
+    pub fn cleanup_all_failed_addrs(&self) {
+        self.recently_failed_addrs.write().clear();
+    }
+
     #[allow(dead_code)]
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = SocketAddr> {
         let read = self.location_for_peer.read();
