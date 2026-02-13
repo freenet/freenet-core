@@ -1628,6 +1628,7 @@ impl Operation for ConnectOp {
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             // Found a different uphill peer — forward to it
+                            self.recency.insert(peer.clone(), Instant::now());
                             tracing::info!(
                                 tx = %self.id,
                                 failed_peer = ?failed_peer,
@@ -1643,8 +1644,26 @@ impl Operation for ConnectOp {
                                     .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
                                     .await?;
                             }
+                        } else if let Some(response) = retry_actions.accept_response {
+                            // Relay decided to accept on retry — send response upstream
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_peer = ?failed_peer,
+                                acceptor = %response.acceptor.pub_key(),
+                                "connect: relay accepting locally after uphill rejection"
+                            );
+                            let response_msg = ConnectMsg::Response {
+                                id: self.id,
+                                payload: response,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                                )
+                                .await?;
                         } else {
-                            // No more uphill peers — forward rejection upstream
+                            // No more uphill peers and can't accept — forward rejection upstream
                             tracing::info!(
                                 tx = %self.id,
                                 upstream_addr = %upstream_addr,
