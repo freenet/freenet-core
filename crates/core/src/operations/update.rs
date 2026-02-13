@@ -648,6 +648,22 @@ impl Operation for UpdateOp {
                                 stream_id = %stream_id,
                                 "UPDATE RequestUpdateStreaming skipped — stream already claimed (dedup)"
                             );
+                            // Push the operation state back since load_or_init popped it.
+                            // Without this, duplicate metadata messages (from embedded fragment #1)
+                            // permanently lose the operation state.
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        *id,
+                                        OpEnum::Update(UpdateOp {
+                                            id: *id,
+                                            state: self.state,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OpNotPresent(*id));
                         }
                         Err(e) => {
@@ -657,6 +673,20 @@ impl Operation for UpdateOp {
                                 error = %e,
                                 "Failed to claim stream from orphan registry for UPDATE"
                             );
+                            // Push the operation state back to prevent loss
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        *id,
+                                        OpEnum::Update(UpdateOp {
+                                            id: *id,
+                                            state: self.state,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
                     };
@@ -831,6 +861,22 @@ impl Operation for UpdateOp {
                                 stream_id = %stream_id,
                                 "UPDATE BroadcastToStreaming skipped — stream already claimed (dedup)"
                             );
+                            // Push the operation state back since load_or_init popped it.
+                            // Without this, duplicate metadata messages (from embedded fragment #1)
+                            // permanently lose the operation state.
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        *id,
+                                        OpEnum::Update(UpdateOp {
+                                            id: *id,
+                                            state: self.state,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OpNotPresent(*id));
                         }
                         Err(e) => {
@@ -840,6 +886,20 @@ impl Operation for UpdateOp {
                                 error = %e,
                                 "Failed to claim stream from orphan registry for broadcast"
                             );
+                            // Push the operation state back to prevent loss
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        *id,
+                                        OpEnum::Update(UpdateOp {
+                                            id: *id,
+                                            state: self.state,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
                     };
