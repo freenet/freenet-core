@@ -339,6 +339,25 @@ impl ProximityCacheManager {
         Some(ProximityCacheMessage::CacheStateRequest)
     }
 
+    /// Initialize my_cache from contracts loaded from disk.
+    /// Must be called after load_hosting_cache() and before ring connections establish.
+    pub fn initialize_from_hosting_cache(
+        &self,
+        contract_ids: impl Iterator<Item = ContractInstanceId>,
+    ) {
+        let mut count = 0;
+        for id in contract_ids {
+            self.my_cache.insert(id);
+            count += 1;
+        }
+        if count > 0 {
+            info!(
+                count,
+                "PROXIMITY_CACHE: Initialized local cache from hosted contracts"
+            );
+        }
+    }
+
     /// Check if we have a contract cached locally.
     #[allow(dead_code)]
     pub fn is_cached_locally(&self, contract_key: &ContractKey) -> bool {
@@ -1027,5 +1046,35 @@ mod tests {
         assert_eq!(b_neighbors[0], key_a);
 
         // SUCCESS: Both peers now have bidirectional awareness and can forward updates
+    }
+
+    #[test]
+    fn test_initialize_from_hosting_cache() {
+        let manager = ProximityCacheManager::new();
+        let key1 = test_contract_key();
+        let key2 = test_contract_key_2();
+
+        // Initially empty
+        assert_eq!(manager.local_cache_size(), 0);
+
+        // Initialize from hosting cache
+        manager.initialize_from_hosting_cache(vec![*key1.id(), *key2.id()].into_iter());
+
+        // Should now report both contracts
+        assert_eq!(manager.local_cache_size(), 2);
+        assert!(manager.is_cached_locally(&key1));
+        assert!(manager.is_cached_locally(&key2));
+
+        // CacheStateRequest should return both
+        let neighbor = make_pub_key(1);
+        let response = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
+        if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = response {
+            assert_eq!(contracts.len(), 2);
+        } else {
+            panic!("Expected CacheStateResponse");
+        }
+
+        // Caching an already-initialized contract should return None (no duplicate announcement)
+        assert!(manager.on_contract_cached(&key1).is_none());
     }
 }
