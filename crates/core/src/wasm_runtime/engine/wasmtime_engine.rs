@@ -97,7 +97,7 @@
 //! Pre-allocates a pool of instances that can be reused:
 //!
 //! ```rust,ignore
-//! pooling.total_core_instances(100);  // Max concurrent instances
+//! pooling.total_core_instances(200);  // Max concurrent instances
 //! pooling.max_memory_size(256 * 1024 * 1024);  // 256 MiB per instance
 //! pooling.linear_memory_keep_resident(64 * 1024);  // 64 KB resident for fast reuse
 //! ```
@@ -174,7 +174,7 @@ pub(crate) struct WasmtimeEngine {
     /// The wasmtime Engine (shared, Arc-wrapped internally).
     engine: Engine,
     /// The Store holds runtime state (memory, globals, etc).
-    /// Taken during blocking operations, restored after.
+    /// Taken during blocking operations, restored after. Recreated on timeout/panic.
     store: Option<Store<HostState>>,
     /// Linker pre-configured with all host functions.
     linker: Linker<HostState>,
@@ -493,8 +493,14 @@ impl WasmEngine for WasmtimeEngine {
                 self.store = Some(store);
                 Err(wasm_err)
             }
-            BlockingResult::Timeout => Err(WasmError::Timeout),
-            BlockingResult::Panic(err) => Err(WasmError::Other(err)),
+            BlockingResult::Timeout => {
+                self.recover_store();
+                Err(WasmError::Timeout)
+            }
+            BlockingResult::Panic(err) => {
+                self.recover_store();
+                Err(WasmError::Other(err))
+            }
         }
     }
 
@@ -550,8 +556,14 @@ impl WasmEngine for WasmtimeEngine {
                 self.store = Some(store);
                 Err(wasm_err)
             }
-            BlockingResult::Timeout => Err(WasmError::Timeout),
-            BlockingResult::Panic(err) => Err(WasmError::Other(err)),
+            BlockingResult::Timeout => {
+                self.recover_store();
+                Err(WasmError::Timeout)
+            }
+            BlockingResult::Panic(err) => {
+                self.recover_store();
+                Err(WasmError::Other(err))
+            }
         }
     }
 }
@@ -645,9 +657,10 @@ impl WasmtimeEngine {
         //
         let mut pooling = PoolingAllocationConfig::default();
 
-        // Allow up to 100 concurrent core instances (WASM modules executing)
-        // User peers: 20-30 contracts, gateways: 50-100 contracts
-        pooling.total_core_instances(100);
+        // Allow up to 200 concurrent core instances (WASM modules executing).
+        // Six-peer regression tests run many contracts concurrently; 100 can be
+        // exhausted if timeouts or errors temporarily leave slots in-flight.
+        pooling.total_core_instances(200);
 
         // Most contracts use one linear memory and one table
         pooling.max_memories_per_module(1);
@@ -670,6 +683,29 @@ impl WasmtimeEngine {
         let engine = Engine::new(&wasmtime_config).map_err(WasmError::Other)?;
 
         Ok((engine, max_fuel, config.enable_metering))
+    }
+
+    /// Recover the engine after a timeout or panic that consumed the store.
+    ///
+    /// Creates a fresh Store and clears all instance references (they were tied
+    /// to the old store and are now invalid). The pooling allocator reclaims
+    /// those instance slots when the old Store is dropped by the abandoned task.
+    fn recover_store(&mut self) {
+        tracing::warn!(
+            orphaned_instances = self.instances.len(),
+            "Recovering engine store after timeout/panic — creating fresh store"
+        );
+        let mut store = Store::new(&self.engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        store.limiter(|state| state);
+        if self.enabled_metering {
+            if let Err(e) = store.set_fuel(self.max_fuel) {
+                tracing::error!("Failed to set fuel on recovery store: {e}");
+            }
+        }
+        // Old instances are invalid without their store — clear them so the
+        // pooling allocator can reclaim the slots when the old store drops.
+        self.instances.clear();
+        self.store = Some(store);
     }
 
     fn compute_max_fuel(config: &RuntimeConfig) -> u64 {
