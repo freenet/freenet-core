@@ -929,6 +929,7 @@ where
                         elapsed_ms = start.elapsed().as_millis(),
                         "WASM execution timed out"
                     );
+                    task_handle.abort();
                     return BlockingResult::Timeout;
                 }
 
