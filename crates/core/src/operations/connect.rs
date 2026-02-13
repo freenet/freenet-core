@@ -250,6 +250,9 @@ pub(crate) struct RelayState {
     pub upstream_addr: SocketAddr,
     pub request: ConnectRequest,
     pub forwarded_to: Option<PeerKeyLocation>,
+    /// When the request was forwarded to `forwarded_to` peer.
+    /// Used for GC timeout logging and diagnostics.
+    pub forwarded_at: Option<Instant>,
     pub observed_sent: bool,
     pub accepted_locally: bool,
 }
@@ -372,6 +375,7 @@ impl RelayState {
         // forward_to_peer is called, so no need to mark it again here.
         let forward_snapshot = forward_req.clone();
         self.forwarded_to = Some(peer.clone());
+        self.forwarded_at = Some(Instant::now());
         self.request = forward_req;
         forward_attempts.insert(
             peer.clone(),
@@ -874,6 +878,7 @@ impl ConnectOp {
             upstream_addr,
             request,
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         }));
@@ -1052,6 +1057,7 @@ impl ConnectOp {
                 upstream_addr,
                 request: request.clone(),
                 forwarded_to: None,
+                forwarded_at: None,
                 observed_sent: false,
                 accepted_locally: false,
             })));
@@ -1494,14 +1500,16 @@ impl Operation for ConnectOp {
                                 st.upstream_addr,
                             )
                         };
-                        if let Some(fwd) = forwarded {
-                            self.record_forward_outcome(&fwd, desired, true);
+                        if let Some(ref fwd) = forwarded {
+                            self.record_forward_outcome(fwd, desired, true);
                         }
 
-                        tracing::debug!(
+                        tracing::info!(
+                            tx = %self.id,
                             upstream_addr = %upstream_addr,
                             acceptor_pub_key = %payload.acceptor.pub_key(),
-                            "connect: forwarding response towards joiner"
+                            forwarded_from = ?forwarded,
+                            "connect: relay forwarding response towards joiner"
                         );
                         // Forward response toward the joiner via upstream using hop-by-hop routing
                         let forward_msg = ConnectMsg::Response {
@@ -1589,24 +1597,77 @@ impl Operation for ConnectOp {
                         }
                         self.state = Some(ConnectState::Completed);
                         Ok(store_operation_state(&mut self))
-                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_ref() {
-                        // Relay: forward rejection upstream toward the joiner
+                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                        // Relay: received rejection from uphill peer — try another before giving up
                         let upstream_addr = state.upstream_addr;
-                        tracing::debug!(
-                            tx = %self.id,
-                            upstream_addr = %upstream_addr,
-                            "connect: forwarding rejection upstream"
-                        );
-                        let reject_msg = ConnectMsg::Rejected {
-                            id: self.id,
-                            desired_location: *desired_location,
+                        let failed_peer = state.forwarded_to.clone();
+
+                        // Record failure in estimator so future routing avoids this peer
+                        if let Some(ref fwd) = failed_peer {
+                            self.record_forward_outcome(fwd, *desired_location, false);
+                        }
+
+                        // Reset forwarded_to so handle_request can try another uphill peer
+                        if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                            state.forwarded_to = None;
+                            state.forwarded_at = None;
+                        }
+
+                        // Re-run handle_request to try a different uphill peer
+                        // The previously-tried peer is in recency, so select_uphill_hop skips it
+                        let env = RelayEnv::new(op_manager);
+                        let estimator = {
+                            let estimator_guard = self.connect_forward_estimator.read();
+                            estimator_guard.clone()
                         };
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                            )
-                            .await?;
+                        let retry_actions =
+                            if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                                state.handle_request(
+                                    &env,
+                                    &self.recency,
+                                    &mut self.forward_attempts,
+                                    &estimator,
+                                )
+                            } else {
+                                RelayActions::default()
+                            };
+
+                        if let Some((peer, forward_req)) = retry_actions.forward {
+                            // Found a different uphill peer — forward to it
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_peer = ?failed_peer,
+                                retry_peer = %peer.pub_key(),
+                                "connect: relay retrying with different uphill peer after rejection"
+                            );
+                            let forward_msg = ConnectMsg::Request {
+                                id: self.id,
+                                payload: forward_req,
+                            };
+                            if let Some(addr) = peer.socket_addr() {
+                                network_bridge
+                                    .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
+                                    .await?;
+                            }
+                        } else {
+                            // No more uphill peers — forward rejection upstream
+                            tracing::info!(
+                                tx = %self.id,
+                                upstream_addr = %upstream_addr,
+                                failed_peer = ?failed_peer,
+                                "connect: relay forwarding rejection upstream (no retry peers available)"
+                            );
+                            let reject_msg = ConnectMsg::Rejected {
+                                id: self.id,
+                                desired_location: *desired_location,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                                )
+                                .await?;
+                        }
                         Ok(store_operation_state(&mut self))
                     } else {
                         tracing::warn!(
@@ -2065,6 +2126,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2108,6 +2170,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2148,6 +2211,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2186,6 +2250,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2246,6 +2311,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2308,6 +2374,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2477,6 +2544,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2616,6 +2684,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2684,6 +2753,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2724,6 +2794,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2779,6 +2850,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2833,6 +2905,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2878,6 +2951,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3071,6 +3145,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3102,6 +3177,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3132,6 +3208,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };

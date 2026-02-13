@@ -808,7 +808,11 @@ where
                             continue;
                         }
                         OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
+                            tracing::debug!(
+                                tx = %msg.id(),
+                                tx_type = ?msg.id().transaction_type(),
+                                "Pure network: Operation already completed"
+                            );
                             return Ok(None);
                         }
                     }
@@ -1072,6 +1076,7 @@ where
     // If we reach here, retries were exhausted waiting for a concurrent operation to finish
     tracing::warn!(
         tx = %msg.id(),
+        tx_type = ?msg.id().transaction_type(),
         "Dropping message after {MAX_RETRIES} retry attempts (operation busy)"
     );
     Ok(None)

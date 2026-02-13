@@ -30,8 +30,13 @@ use crate::{
         TransactionType,
     },
     operations::{
-        connect::ConnectForwardEstimator, get::GetOp, orphan_streams::OrphanStreamRegistry,
-        put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
+        connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
+        get::GetOp,
+        orphan_streams::OrphanStreamRegistry,
+        put::PutOp,
+        subscribe::SubscribeOp,
+        update::UpdateOp,
+        OpEnum, OpError,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -1109,6 +1114,27 @@ fn remove_subscribe_and_notify_timeout(
     Some(())
 }
 
+/// Log when a connect operation in Relaying state with an outstanding uphill forward times out.
+/// This directly counts lost uphill routes and identifies which peers are unresponsive.
+fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
+    if let Some(ConnectState::Relaying(state)) = &op.state {
+        if let Some(ref peer) = state.forwarded_to {
+            let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
+                fwd_at.elapsed().as_secs()
+            } else {
+                tx.elapsed().as_secs()
+            };
+            tracing::warn!(
+                tx = %tx,
+                forwarded_to = %peer.pub_key(),
+                forwarded_to_addr = ?peer.socket_addr(),
+                pending_secs,
+                "connect: uphill route timed out with no response"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
@@ -1180,6 +1206,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let still_waiting = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Log uphill routes that timed out with no response
+                                log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
@@ -1260,6 +1288,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let removed = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Log uphill routes that timed out with no response
+                                log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
