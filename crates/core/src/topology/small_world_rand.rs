@@ -1,12 +1,14 @@
+#[cfg(test)]
 use crate::config::GlobalRng;
+#[cfg(test)]
 use crate::ring::Distance;
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
 ///
 /// Used for small-world topology formation: most connections are short-range
 /// with occasional long-range links, following an inverse power law.
-#[allow(dead_code)] // Available for topology module use beyond tests
-pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
+#[cfg(test)]
+pub(in crate::topology) fn random_link_distance(d_min: Distance) -> Distance {
     let d_max = 0.5;
 
     // Generate a uniform random number between 0 and 1 using GlobalRng
@@ -23,7 +25,11 @@ pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
 
 #[cfg(test)]
 pub(super) mod test_utils {
-    pub(in crate::topology) use super::random_link_distance;
+    pub(in crate::topology) fn random_link_distance(
+        d_min: crate::ring::Distance,
+    ) -> crate::ring::Distance {
+        super::random_link_distance(d_min)
+    }
 }
 
 #[cfg(test)]
