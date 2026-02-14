@@ -278,11 +278,16 @@ pub(crate) async fn serve_client_api_in(
         config.token_cleanup_interval_seconds,
     );
 
+    let localhost_only = config.address.is_loopback();
+
     // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) =
         HttpClientApi::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
-    let (ws_proxy, ws_router) =
-        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
+    let (ws_proxy, ws_router) = WebSocketProxy::create_router_with_attested_contracts(
+        gw_router,
+        attested_contracts,
+        localhost_only,
+    );
 
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http())).await?;
     Ok((gw, ws_proxy))
