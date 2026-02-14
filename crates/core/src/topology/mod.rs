@@ -423,7 +423,7 @@ impl TopologyManager {
                 // If we have 5+ connections, use density-based selection
                 else {
                     return self
-                        .select_connections_to_add(neighbor_locations)
+                        .select_connections_to_add(neighbor_locations, my_location)
                         .unwrap_or_else(|e| {
                             debug!(
                                 error = ?e,
@@ -480,7 +480,7 @@ impl TopologyManager {
                     "Resource usage below threshold, adding connections"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                self.select_connections_to_add(neighbor_locations)
+                self.select_connections_to_add(neighbor_locations, my_location)
             } else if usage_proportion > decrease_usage_if_above {
                 debug!(
                     resource_type = ?resource_type,
@@ -565,6 +565,7 @@ impl TopologyManager {
     fn select_connections_to_add(
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        my_location: &Option<Location>,
     ) -> anyhow::Result<TopologyAdjustment> {
         if neighbor_locations.is_empty() {
             tracing::warn!("select_connections_to_add: neighbor map empty, skipping adjustment");
@@ -580,16 +581,31 @@ impl TopologyManager {
             .create_density_map(neighbor_locations)?;
         debug!("Density map computed successfully");
 
+        // Phase 3 of topology formation: with 5+ connections, use density-weighted
+        // selection. When our location is known, bias toward nearby high-density areas
+        // (Kleinberg small-world weighting). Otherwise fall back to global max density.
         debug!("Attempting to get max density location");
-        let max_density_location = match density_map.get_max_density() {
-            Ok(location) => {
-                debug!(location = %location, "Max density location found");
-                location
-            }
-            Err(e) => {
-                error!(error = ?e, "Failed to get max density location");
-                return Err(anyhow!(e));
-            }
+        let max_density_location = match my_location {
+            Some(loc) => match density_map.get_max_density_weighted(*loc) {
+                Ok(location) => {
+                    debug!(location = %location, my_location = %loc, "Weighted max density location found");
+                    location
+                }
+                Err(e) => {
+                    error!(error = ?e, "Failed to get weighted max density location");
+                    return Err(anyhow!(e));
+                }
+            },
+            None => match density_map.get_max_density() {
+                Ok(location) => {
+                    debug!(location = %location, "Max density location found (no own location)");
+                    location
+                }
+                Err(e) => {
+                    error!(error = ?e, "Failed to get max density location");
+                    return Err(anyhow!(e));
+                }
+            },
         };
 
         info!(location = %max_density_location, "Adding new connection");
