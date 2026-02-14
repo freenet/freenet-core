@@ -114,6 +114,9 @@ fn is_client_disconnect_error(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Clone)]
+struct LocalhostOnly(bool);
+
+#[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
 impl std::ops::Deref for WebSocketRequest {
@@ -135,12 +138,13 @@ impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
         let attested_contracts = Arc::new(DashMap::new());
-        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts, true)
     }
 
     pub fn create_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
+        localhost_only: bool,
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
@@ -160,6 +164,7 @@ impl WebSocketProxy {
             .merge(v2_route)
             .layer(Extension(attested_contracts))
             .layer(Extension(ws_request))
+            .layer(Extension(LocalhostOnly(localhost_only)))
             .layer(axum::middleware::from_fn(connection_info));
 
         (
@@ -373,24 +378,32 @@ async fn connection_info(
     };
 
     // Check Origin header — browsers always send this on WS upgrade, CLI tools don't.
-    // This blocks cross-origin attacks from malicious websites while allowing:
+    // When localhost_only, block cross-origin attacks from malicious websites while allowing:
     // - fdev/CLI tools (no Origin header sent by tokio-tungstenite)
     // - Contract web apps served from localhost (Origin: http://127.0.0.1:PORT)
-    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-        if let Ok(origin_str) = origin.to_str() {
-            if !is_localhost_origin(origin_str) {
-                tracing::warn!(
-                    origin = origin_str,
-                    "Rejected WebSocket connection from non-localhost origin"
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    "WebSocket connections from external origins are not allowed",
-                )
-                    .into_response();
+    // When not localhost_only (e.g. gateway on 0.0.0.0), allow any origin so remote
+    // browsers can connect.
+    let localhost_only = req
+        .extensions()
+        .get::<LocalhostOnly>()
+        .map_or(true, |l| l.0);
+    if localhost_only {
+        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+            if let Ok(origin_str) = origin.to_str() {
+                if !is_localhost_origin(origin_str) {
+                    tracing::warn!(
+                        origin = origin_str,
+                        "Rejected WebSocket connection from non-localhost origin"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "WebSocket connections from external origins are not allowed",
+                    )
+                        .into_response();
+                }
+            } else {
+                return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
             }
-        } else {
-            return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
         }
     }
 

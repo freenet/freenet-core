@@ -11,7 +11,7 @@ pub(crate) mod errors;
 pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -278,11 +278,19 @@ pub(crate) async fn serve_gateway_in(
         config.token_cleanup_interval_seconds,
     );
 
+    let localhost_only = match config.address {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    };
+
     // Pass the shared map to both HttpGateway and WebSocketProxy
     let (gw, gw_router) =
         HttpGateway::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
-    let (ws_proxy, ws_router) =
-        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
+    let (ws_proxy, ws_router) = WebSocketProxy::create_router_with_attested_contracts(
+        gw_router,
+        attested_contracts,
+        localhost_only,
+    );
 
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http())).await?;
     Ok((gw, ws_proxy))
