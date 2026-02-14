@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.125"
+version = "0.1.126"
 dependencies = [
  "aes-gcm",
  "ahash",

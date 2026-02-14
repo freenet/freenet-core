@@ -977,3 +977,38 @@ async fn test_topology_infrastructure() {
 
     tracing::info!("Topology infrastructure test passed");
 }
+
+// =============================================================================
+// Stale Reservation TTL Recovery (Issue #2888)
+// =============================================================================
+
+/// Stale pending reservations become invisible after TTL expiration,
+/// preventing permanent node isolation from failed ConnectOps.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_stale_reservation_ttl_expiry() {
+    let mut sim = SimNetwork::new("stale-reservation-ttl", 1, 2, 7, 3, 10, 2, 0x2888_0001).await;
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(0x2888_0001, 1, 1)
+        .await;
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    let gw = freenet::dev_tool::NodeLabel::gateway("stale-reservation-ttl", 0);
+    assert!(sim.connection_count(&gw).is_some());
+
+    let phantom_addr: std::net::SocketAddr = "127.99.99.1:9999".parse().unwrap();
+    let phantom_loc = freenet::dev_tool::Location::new(0.42);
+
+    // Fresh reservation (age=0) is visible
+    assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::ZERO));
+    assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
+
+    // Expired reservation (age=120s > 60s TTL) is invisible
+    assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::from_secs(120),));
+    assert_eq!(
+        sim.has_connection_or_pending(&gw, phantom_addr),
+        Some(false)
+    );
+
+    // Established connections are unaffected
+    assert!(sim.connection_count(&gw).unwrap_or(0) > 0);
+}

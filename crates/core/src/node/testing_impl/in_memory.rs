@@ -213,6 +213,10 @@ impl<ER> Builder<ER> {
         let _guard = parent_span.enter();
         let connection_manager = ConnectionManager::new(&self.config);
 
+        if let Some(out) = &self.shared_cm {
+            *out.lock() = Some(connection_manager.clone());
+        }
+
         // Create result router channel
         let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
 
