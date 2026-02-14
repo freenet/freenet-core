@@ -2493,6 +2493,48 @@ impl SimNetwork {
         result.converged.len() as f64 / total as f64
     }
 
+    /// Run the state verifier on all collected telemetry events.
+    ///
+    /// This linearizes the state transitions for every contract across all peers
+    /// and detects anomalies such as:
+    /// - Missing broadcasts (emitted but never received)
+    /// - Unapplied broadcasts (received but never applied)
+    /// - Unexpected state changes (merge produced an unknown hash)
+    /// - Final divergence (peers disagree after all events) with root-cause analysis
+    ///
+    /// Unlike `check_convergence()`, which only checks the final state snapshot,
+    /// this traces the full causal history to pinpoint WHERE divergence originated.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let report = sim.verify_state().await;
+    /// if !report.is_clean() {
+    ///     eprintln!("{}", report.display());
+    ///     for anomaly in &report.anomalies {
+    ///         eprintln!("  {}", anomaly);
+    ///     }
+    /// }
+    /// ```
+    pub async fn verify_state(&self) -> crate::tracing::VerificationReport {
+        let logs = self.event_listener.logs.lock().await;
+        let verifier = crate::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    }
+
+    /// Assert that state verification passes with no anomalies.
+    ///
+    /// Panics with a detailed report if any anomalies are detected.
+    pub async fn assert_state_verified(&self) {
+        let report = self.verify_state().await;
+        if !report.is_clean() {
+            panic!(
+                "State verification failed with {} anomalies:\n{}",
+                report.anomalies.len(),
+                report.display()
+            );
+        }
+    }
+
     /// Returns the number of unique contracts that have been subscribed to.
     ///
     /// Counts distinct contracts from SubscribeSuccess events. Use this to verify

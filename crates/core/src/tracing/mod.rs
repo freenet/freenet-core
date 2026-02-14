@@ -33,6 +33,7 @@ pub use event_aggregator::{
     AOFEventSource, EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent,
     WebSocketEventCollector,
 };
+pub use state_verifier::{StateVerifier, VerificationReport};
 
 use crate::node::OpManager;
 
@@ -45,6 +46,9 @@ pub mod event_aggregator;
 /// Telemetry reporting to central collector.
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
+
+/// Automatic state verification through telemetry linearization.
+pub mod state_verifier;
 
 /// Compute a full hash of contract state for convergence verification.
 /// Returns all 32 bytes of Blake3 hash as 64 hex characters.

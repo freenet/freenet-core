@@ -88,6 +88,9 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
+    // Re-export state verification for telemetry-based consistency analysis
+    pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
+
     // Re-export topology registry for subscription validation in tests
     pub use ring::topology_registry::{
         clear_all_topology_snapshots, clear_current_network_name, clear_topology_snapshots,
