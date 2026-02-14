@@ -85,6 +85,30 @@ fn is_localhost_origin(origin: &str) -> bool {
     prefixes.iter().any(|p| origin.starts_with(p)) || exact.contains(&origin)
 }
 
+/// Checks if the WebSocket Origin header matches the request's Host header (same-origin check).
+///
+/// Extracts the host portion from the Origin URL (e.g. "nova.locut.us:7509" from
+/// "http://nova.locut.us:7509") and compares it against the Host header. This allows
+/// remote browsers to connect back to the same server while blocking cross-site attacks.
+fn is_same_origin(origin: &str, headers: &axum::http::HeaderMap) -> bool {
+    let host_header = match headers.get(axum::http::header::HOST) {
+        Some(h) => match h.to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        },
+        None => return false,
+    };
+    // Extract host from origin URL: "http://host:port" -> "host:port"
+    let origin_host = origin
+        .find("://")
+        .map(|i| &origin[i + 3..])
+        .unwrap_or(origin);
+    // Strip any trailing path from origin host
+    let origin_host = origin_host.split('/').next().unwrap_or(origin_host);
+
+    origin_host.eq_ignore_ascii_case(host_header)
+}
+
 /// Checks if an error represents a client-side disconnect rather than a server error.
 ///
 /// Client disconnects are expected behavior when clients timeout, crash, or close
@@ -378,32 +402,37 @@ async fn connection_info(
     };
 
     // Check Origin header — browsers always send this on WS upgrade, CLI tools don't.
-    // When localhost_only, block cross-origin attacks from malicious websites while allowing:
-    // - fdev/CLI tools (no Origin header sent by tokio-tungstenite)
-    // - Contract web apps served from localhost (Origin: http://127.0.0.1:PORT)
-    // When not localhost_only (e.g. gateway on 0.0.0.0), allow any origin so remote
-    // browsers can connect.
+    // This blocks cross-site WebSocket hijacking (evil.com connecting to our gateway)
+    // while allowing both localhost and legitimate remote access.
+    //
+    // When localhost_only: only allow localhost origins (127.0.0.1, [::1], localhost).
+    // When not localhost_only: allow any origin whose host matches the request's Host header
+    // (same-origin check), so remote browsers serving the UI can connect back.
+    // CLI tools (no Origin header) are always allowed.
     let localhost_only = req
         .extensions()
         .get::<LocalhostOnly>()
         .map_or(true, |l| l.0);
-    if localhost_only {
-        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-            if let Ok(origin_str) = origin.to_str() {
-                if !is_localhost_origin(origin_str) {
-                    tracing::warn!(
-                        origin = origin_str,
-                        "Rejected WebSocket connection from non-localhost origin"
-                    );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        "WebSocket connections from external origins are not allowed",
-                    )
-                        .into_response();
-                }
+    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin.to_str() {
+            let allowed = if localhost_only {
+                is_localhost_origin(origin_str)
             } else {
-                return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
+                is_same_origin(origin_str, req.headers())
+            };
+            if !allowed {
+                tracing::warn!(
+                    origin = origin_str,
+                    "Rejected WebSocket connection from disallowed origin"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "WebSocket connections from this origin are not allowed",
+                )
+                    .into_response();
             }
+        } else {
+            return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
         }
     }
 
@@ -1182,5 +1211,41 @@ mod tests {
         // Reject empty/garbage
         assert!(!is_localhost_origin(""));
         assert!(!is_localhost_origin("localhost"));
+    }
+
+    #[test]
+    fn test_is_same_origin() {
+        fn headers_with_host(host: &str) -> axum::http::HeaderMap {
+            let mut map = axum::http::HeaderMap::new();
+            map.insert(
+                axum::http::header::HOST,
+                axum::http::HeaderValue::from_str(host).unwrap(),
+            );
+            map
+        }
+
+        // Same origin — should be allowed
+        let h = headers_with_host("nova.locut.us:7509");
+        assert!(is_same_origin("http://nova.locut.us:7509", &h));
+        assert!(is_same_origin("http://nova.locut.us:7509/path", &h));
+
+        // Different host — cross-site attack
+        assert!(!is_same_origin("http://evil.com", &h));
+        assert!(!is_same_origin("http://evil.com:7509", &h));
+
+        // Same host, different port
+        assert!(!is_same_origin("http://nova.locut.us:8080", &h));
+
+        // Case-insensitive host comparison
+        assert!(is_same_origin("http://Nova.Locut.Us:7509", &h));
+
+        // No Host header — reject
+        let empty = axum::http::HeaderMap::new();
+        assert!(!is_same_origin("http://nova.locut.us:7509", &empty));
+
+        // Localhost same-origin
+        let h = headers_with_host("localhost:7509");
+        assert!(is_same_origin("http://localhost:7509", &h));
+        assert!(!is_same_origin("http://evil.com", &h));
     }
 }
