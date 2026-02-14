@@ -54,7 +54,9 @@ pub mod error_codes {
     pub const ERR_CONTEXT_TOO_LARGE: i32 = -5;
     /// Buffer too small to hold the secret (use get_secret_len first).
     pub const ERR_BUFFER_TOO_SMALL: i32 = -6;
-    /// Memory bounds violation (pointer out of range).
+    /// Memory bounds violation (pointer out of range). Returned when a WASM module
+    /// attempts to access memory outside its allocated linear memory region via
+    /// host function calls.
     pub const ERR_MEMORY_BOUNDS: i32 = -7;
 }
 
@@ -188,22 +190,24 @@ fn current_instance_id() -> InstanceId {
 /// This function validates that the pointer arithmetic is safe. It checks for:
 /// - Negative offsets (which would access memory before WASM linear memory)
 /// - Overflow when adding offset + size
-/// - Offset + size exceeding WASM32's 4GB address space limit
+/// - Access exceeding the maximum allowed WASM memory limit
+/// - Overflow when adding start_ptr + ptr
 ///
-/// Note: WASM memory can grow dynamically, so we validate against the theoretical
-/// maximum (4GB for WASM32) rather than a potentially stale cached size. The OS
-/// and wasmtime's guard pages provide additional protection against actual
-/// out-of-bounds access.
+/// Note: WASM memory can grow dynamically via the `memory.grow` instruction between
+/// host function calls. The cached mem_size from instance creation may become stale,
+/// so we validate against the runtime's maximum memory limit (256 MiB by default)
+/// rather than the initial allocation. Wasmtime's guard pages provide additional
+/// protection against actual out-of-bounds access.
 ///
 /// # Arguments
 /// * `ptr` - Offset from the start of WASM memory (provided by WASM module)
 /// * `start_ptr` - Base address of WASM linear memory (from InstanceInfo)
 /// * `size` - Size of the data to be accessed (in bytes)
-/// * `_mem_size` - Initial memory size (unused; kept for API compatibility)
+/// * `_mem_size` - Initial memory size (not used due to dynamic growth; kept for API compatibility)
 ///
 /// # Returns
-/// * `Some(*mut T)` - Valid pointer
-/// * `None` - Pointer would be invalid (negative or overflow)
+/// * `Some(*mut T)` - Valid pointer within maximum memory limit
+/// * `None` - Pointer would be out of bounds or overflow
 #[inline(always)]
 fn validate_and_compute_ptr<T>(
     ptr: i64,
@@ -222,21 +226,25 @@ fn validate_and_compute_ptr<T>(
     // Check for overflow when adding size to offset
     let end_offset = ptr_usize.checked_add(size)?;
 
-    // WASM32 has a maximum 4GB address space (2^32 bytes)
-    // Validate that the access doesn't exceed this theoretical maximum
-    const WASM32_MAX_MEMORY: usize = 1 << 32; // 4GB
-    if end_offset > WASM32_MAX_MEMORY {
+    // Maximum memory limit enforced by the runtime (matches DEFAULT_MAX_MEMORY_PAGES in wasmtime_engine.rs)
+    // 4096 pages * 64 KiB per page = 256 MiB
+    const MAX_WASM_MEMORY: usize = 4096 * 65536;
+
+    // Verify the entire access range is within the maximum allowed memory
+    if end_offset > MAX_WASM_MEMORY {
         tracing::warn!(
-            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds WASM32 max {WASM32_MAX_MEMORY}"
+            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds max memory limit {MAX_WASM_MEMORY}"
         );
         return None;
     }
 
-    // Safe to compute the actual pointer
-    // Additional protection provided by:
-    // - OS memory protection (segfault on invalid access)
-    // - Wasmtime guard pages (catches out-of-bounds in WASM linear memory region)
-    Some((start_ptr + ptr) as *mut T)
+    // Check for overflow when computing the host pointer
+    // start_ptr is the host address (i64), ptr is the WASM offset (i64)
+    let host_ptr = start_ptr.checked_add(ptr)?;
+
+    // Safe to return the computed pointer
+    // Wasmtime's guard pages will trap if the access is truly out of bounds
+    Some(host_ptr as *mut T)
 }
 
 pub(super) mod log {

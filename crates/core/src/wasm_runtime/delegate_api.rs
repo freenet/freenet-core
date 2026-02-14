@@ -144,7 +144,9 @@ pub mod contract_error_codes {
     pub const ERR_INVALID_PARAM: i32 = -4;
     /// Internal state store error.
     pub const ERR_STORE_ERROR: i32 = -8;
-    /// Memory bounds violation (pointer out of range).
+    /// Memory bounds violation (pointer out of range). Returned when a WASM module
+    /// attempts to access memory outside its allocated linear memory region via
+    /// host function calls.
     pub const ERR_MEMORY_BOUNDS: i32 = -9;
 }
 
