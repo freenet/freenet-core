@@ -132,16 +132,13 @@ async fn web_home(
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
-    let domain = config
-        .localhost
-        .then_some("localhost")
-        .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
+    // Don't set a cookie domain — the browser will default to the request's origin host,
+    // which works for both localhost and remote access.
     let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
-        .domain(domain)
         .path(format!("/{version_prefix}/contract/web/{key}"))
         .same_site(cookie::SameSite::Strict)
         .max_age(cookie::time::Duration::days(1))
