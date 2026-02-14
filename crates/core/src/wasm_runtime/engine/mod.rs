@@ -54,8 +54,7 @@ pub(crate) const WASM_PAGE_SIZE: usize = 65536;
 
 /// Maximum WASM memory in bytes (256 MiB by default).
 /// Calculated from DEFAULT_MAX_MEMORY_PAGES * WASM_PAGE_SIZE.
-pub(crate) const MAX_WASM_MEMORY_BYTES: usize =
-    DEFAULT_MAX_MEMORY_PAGES as usize * WASM_PAGE_SIZE;
+pub(crate) const MAX_WASM_MEMORY_BYTES: usize = DEFAULT_MAX_MEMORY_PAGES as usize * WASM_PAGE_SIZE;
 
 /// Opaque handle to a live WASM instance managed by the engine.
 ///
