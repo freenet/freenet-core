@@ -218,6 +218,28 @@ pub(crate) fn start_op_with_id(
     }
 }
 
+/// Create a SubscribeOp for routing an Unsubscribe message to a target peer.
+///
+/// The operation is created in `AwaitingResponse` state so `peek_next_hop_addr`
+/// resolves the target address for the event loop's message router.
+/// The caller should mark it completed immediately after sending.
+pub(crate) fn create_unsubscribe_op(
+    instance_id: ContractInstanceId,
+    tx: Transaction,
+    target_addr: std::net::SocketAddr,
+) -> SubscribeOp {
+    SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::AwaitingResponse {
+            next_hop: Some(target_addr),
+            instance_id,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+    }
+}
+
 /// Request to subscribe to value changes from a contract.
 ///
 /// # Errors
@@ -619,10 +641,10 @@ impl Operation for SubscribeOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let id = *msg.id();
-        let msg_type = if matches!(msg, SubscribeMsg::Request { .. }) {
-            "Request"
-        } else {
-            "Response"
+        let msg_type = match msg {
+            SubscribeMsg::Request { .. } => "Request",
+            SubscribeMsg::Response { .. } => "Response",
+            SubscribeMsg::Unsubscribe { .. } => "Unsubscribe",
         };
         tracing::debug!(
             tx = %id,
@@ -656,20 +678,21 @@ impl Operation for SubscribeOp {
                 if matches!(msg, SubscribeMsg::Response { .. }) {
                     tracing::debug!(
                         tx = %id,
+                        %msg_type,
                         phase = "load_or_init",
-                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation (likely timed out or race)"
+                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation"
                     );
                     return Err(OpError::OpNotPresent(id));
                 }
 
-                // New request from another peer - we're an intermediate/terminal node
-                // Extract is_renewal and instance_id from the Request message
+                // New Request or Unsubscribe from another peer
                 let (is_renewal, msg_instance_id) = match msg {
                     SubscribeMsg::Request {
                         is_renewal,
                         instance_id,
                         ..
                     } => (*is_renewal, *instance_id),
+                    SubscribeMsg::Unsubscribe { instance_id, .. } => (false, *instance_id),
                     _ => unreachable!("Response case handled above"),
                 };
                 // Resolve requester's public key at init time, when the connection
@@ -689,7 +712,7 @@ impl Operation for SubscribeOp {
                             next_hop: None, // Will be determined during processing
                             instance_id: msg_instance_id,
                         }),
-                        requester_addr: source_addr, // Store who sent us this request
+                        requester_addr: source_addr, // Store who sent us this message
                         requester_pub_key,
                         is_renewal,
                         stats: None,
@@ -769,6 +792,9 @@ impl Operation for SubscribeOp {
                                 });
                             if let Some(peer_key) = peer_key {
                                 op_manager
+                                    .ring
+                                    .add_downstream_subscriber(&key, peer_key.clone());
+                                op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
                             } else {
@@ -844,6 +870,9 @@ impl Operation for SubscribeOp {
                                         })
                                 });
                             if let Some(peer_key) = peer_key {
+                                op_manager
+                                    .ring
+                                    .add_downstream_subscriber(&key, peer_key.clone());
                                 op_manager
                                     .interest_manager
                                     .register_peer_interest(&key, peer_key, None, false);
@@ -1215,6 +1244,69 @@ impl Operation for SubscribeOp {
                         }
                     }
                 }
+
+                SubscribeMsg::Unsubscribe { id, instance_id } => {
+                    tracing::debug!(
+                        tx = %id,
+                        %instance_id,
+                        source_addr = ?source_addr,
+                        "received unsubscribe notification"
+                    );
+
+                    // Resolve the sender's PeerKey
+                    let sender_peer = self
+                        .requester_pub_key
+                        .as_ref()
+                        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+                        .or_else(|| {
+                            source_addr.and_then(|addr| {
+                                op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(addr)
+                                    .map(|pkl| {
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone())
+                                    })
+                            })
+                        });
+
+                    // Look up the full ContractKey from storage
+                    if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+                        if let Some(peer) = &sender_peer {
+                            op_manager.ring.remove_downstream_subscriber(&key, peer);
+                            op_manager.interest_manager.remove_peer_interest(&key, peer);
+                        }
+
+                        // Chain propagation: if no more interest, unsubscribe upstream
+                        if op_manager.ring.should_unsubscribe_upstream(&key) {
+                            tracing::debug!(
+                                tx = %id,
+                                contract = %key,
+                                "No remaining subscribers, propagating unsubscribe upstream"
+                            );
+                            op_manager.send_unsubscribe_upstream(&key).await;
+                        } else {
+                            tracing::debug!(
+                                tx = %id,
+                                contract = %key,
+                                "Still have subscribers, not propagating unsubscribe"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %instance_id,
+                            "Contract not found locally, ignoring unsubscribe"
+                        );
+                    }
+
+                    Ok(OperationResult {
+                        return_msg: None,
+                        next_hop: None,
+                        state: None,
+                        stream_data: None,
+                    })
+                }
             }
         })
     }
@@ -1273,20 +1365,28 @@ mod messages {
             instance_id: ContractInstanceId,
             result: SubscribeMsgResult,
         },
+        /// Explicit unsubscribe notification sent upstream for fast cleanup.
+        /// Fire-and-forget: does not require a response or existing operation state.
+        Unsubscribe {
+            id: Transaction,
+            instance_id: ContractInstanceId,
+        },
     }
 
     impl InnerMessage for SubscribeMsg {
         fn id(&self) -> &Transaction {
             match self {
-                Self::Request { id, .. } | Self::Response { id, .. } => id,
+                Self::Request { id, .. }
+                | Self::Response { id, .. }
+                | Self::Unsubscribe { id, .. } => id,
             }
         }
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { instance_id, .. } | Self::Response { instance_id, .. } => {
-                    Some(Location::from(instance_id))
-                }
+                Self::Request { instance_id, .. }
+                | Self::Response { instance_id, .. }
+                | Self::Unsubscribe { instance_id, .. } => Some(Location::from(instance_id)),
             }
         }
     }
@@ -1310,6 +1410,12 @@ mod messages {
                     write!(
                         f,
                         "Subscribe::Response(id: {id}, instance_id: {instance_id}, result: {result_str})"
+                    )
+                }
+                Self::Unsubscribe { instance_id, .. } => {
+                    write!(
+                        f,
+                        "Subscribe::Unsubscribe(id: {id}, contract: {instance_id})"
                     )
                 }
             }

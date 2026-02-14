@@ -823,6 +823,31 @@ impl Ring {
                 );
             }
 
+            // Expire stale downstream subscribers
+            let ds_expired = ring.expire_stale_downstream_subscribers();
+            if !ds_expired.is_empty() {
+                tracing::debug!(
+                    expired_count = ds_expired.len(),
+                    "Expired downstream subscribers for {} contracts",
+                    ds_expired.len()
+                );
+            }
+
+            // Send Unsubscribe upstream for contracts that lost all downstream subscribers
+            if !ds_expired.is_empty() {
+                if let Some(op_manager) = ring.upgrade_op_manager() {
+                    for contract in &ds_expired {
+                        if ring.should_unsubscribe_upstream(contract) {
+                            let op_mgr = op_manager.clone();
+                            let contract = *contract;
+                            GlobalExecutor::spawn(async move {
+                                op_mgr.send_unsubscribe_upstream(&contract).await;
+                            });
+                        }
+                    }
+                }
+            }
+
             // Get contracts that need subscription renewal (have client subscriptions)
             let mut contracts_needing_renewal = ring.contracts_needing_renewal();
 
@@ -1404,6 +1429,37 @@ impl Ring {
     /// Should be called periodically by a background task.
     pub fn expire_stale_subscriptions(&self) -> Vec<ContractKey> {
         self.hosting_manager.expire_stale_subscriptions()
+    }
+
+    // ==================== Downstream Subscriber Tracking ====================
+
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) {
+        self.hosting_manager
+            .add_downstream_subscriber(contract, peer)
+    }
+
+    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    pub fn renew_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        self.hosting_manager
+            .renew_downstream_subscriber(contract, peer)
+    }
+
+    pub fn remove_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        self.hosting_manager
+            .remove_downstream_subscriber(contract, peer)
+    }
+
+    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.has_downstream_subscribers(contract)
+    }
+
+    pub fn expire_stale_downstream_subscribers(&self) -> Vec<ContractKey> {
+        self.hosting_manager.expire_stale_downstream_subscribers()
+    }
+
+    pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.should_unsubscribe_upstream(contract)
     }
 
     /// Check if we should continue hosting a contract.

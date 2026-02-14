@@ -36,10 +36,12 @@ use cache::{HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, info};
+
+use super::interest::PeerKey;
 
 // =============================================================================
 // Constants
@@ -135,6 +137,10 @@ pub(crate) struct HostingManager {
     /// This is the single source of truth for which contracts we're hosting.
     hosting_cache: RwLock<HostingCache<InstantTimeSrc>>,
 
+    /// Downstream peers subscribed to contracts we host.
+    /// Used to determine when it's safe to unsubscribe upstream.
+    downstream_subscribers: DashMap<ContractKey, HashMap<PeerKey, Instant>>,
+
     /// Contracts with subscription requests currently in-flight.
     pending_subscription_requests: DashSet<ContractKey>,
 
@@ -161,6 +167,7 @@ impl HostingManager {
                 DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
+            downstream_subscribers: DashMap::new(),
             pending_subscription_requests: DashSet::new(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
@@ -398,6 +405,95 @@ impl HostingManager {
         );
 
         ClientDisconnectResult { affected_contracts }
+    }
+
+    // =========================================================================
+    // Downstream Subscriber Tracking
+    // =========================================================================
+
+    /// Record that a downstream peer is subscribed to a contract we host.
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) {
+        self.downstream_subscribers
+            .entry(*contract)
+            .or_default()
+            .insert(peer, Instant::now());
+    }
+
+    /// Renew a downstream peer's subscription lease.
+    /// Returns false if the peer is not currently tracked.
+    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    pub fn renew_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
+            if peers.contains_key(peer) {
+                peers.insert(peer.clone(), Instant::now());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a downstream peer's subscription for a contract.
+    /// Returns true if the peer was found and removed.
+    pub fn remove_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
+            let removed = peers.remove(peer).is_some();
+            if peers.is_empty() {
+                drop(peers);
+                self.downstream_subscribers.remove(contract);
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
+    /// Check whether any downstream peers are subscribed to this contract.
+    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
+        self.downstream_subscribers
+            .get(contract)
+            .is_some_and(|peers| !peers.is_empty())
+    }
+
+    /// Remove downstream subscribers whose leases have expired.
+    /// Returns the contracts that lost all downstream subscribers.
+    pub fn expire_stale_downstream_subscribers(&self) -> Vec<ContractKey> {
+        let now = Instant::now();
+        let mut fully_unsubscribed = Vec::new();
+
+        let keys: Vec<ContractKey> = self
+            .downstream_subscribers
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+
+        for key in keys {
+            if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
+                peers.retain(|_, last_renewed| {
+                    now.duration_since(*last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                });
+                if peers.is_empty() {
+                    drop(peers);
+                    self.downstream_subscribers.remove(&key);
+                    fully_unsubscribed.push(key);
+                }
+            }
+        }
+
+        fully_unsubscribed
+    }
+
+    /// Check if a contract has no local clients and no downstream subscribers,
+    /// meaning we can safely unsubscribe upstream.
+    pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
+        let has_clients = self
+            .client_subscriptions
+            .iter()
+            .any(|entry| *entry.key() == *contract.id());
+        if has_clients {
+            return false;
+        }
+        !self.has_downstream_subscribers(contract)
     }
 
     // =========================================================================
@@ -1337,5 +1433,302 @@ mod tests {
                 SUBSCRIPTION_LEASE_DURATION
             );
         }
+    }
+
+    fn make_peer_key(seed: u8) -> PeerKey {
+        PeerKey(crate::transport::TransportPublicKey::from_bytes([seed; 32]))
+    }
+
+    #[test]
+    fn test_downstream_subscriber_add_and_check() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(10);
+
+        assert!(!manager.has_downstream_subscribers(&contract));
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert!(manager.has_downstream_subscribers(&contract));
+
+        // Adding same peer again just refreshes the timestamp
+        manager.add_downstream_subscriber(&contract, peer);
+        assert!(manager.has_downstream_subscribers(&contract));
+    }
+
+    #[test]
+    fn test_downstream_subscriber_remove() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let peer1 = make_peer_key(10);
+        let peer2 = make_peer_key(20);
+
+        manager.add_downstream_subscriber(&contract, peer1.clone());
+        manager.add_downstream_subscriber(&contract, peer2.clone());
+
+        assert!(manager.remove_downstream_subscriber(&contract, &peer1));
+        assert!(manager.has_downstream_subscribers(&contract));
+
+        assert!(manager.remove_downstream_subscriber(&contract, &peer2));
+        assert!(!manager.has_downstream_subscribers(&contract));
+
+        // Removing non-existent peer returns false
+        assert!(!manager.remove_downstream_subscriber(&contract, &peer1));
+    }
+
+    #[test]
+    fn test_downstream_subscriber_renew() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(10);
+
+        // Renewing non-existent returns false
+        assert!(!manager.renew_downstream_subscriber(&contract, &peer));
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert!(manager.renew_downstream_subscriber(&contract, &peer));
+    }
+
+    #[test]
+    fn test_should_unsubscribe_upstream() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(10);
+        let client_id = crate::client_events::ClientId::next();
+
+        // No clients, no downstream -> should unsubscribe
+        assert!(manager.should_unsubscribe_upstream(&contract));
+
+        // Add downstream subscriber -> should NOT unsubscribe
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+
+        // Remove downstream -> should unsubscribe again
+        manager.remove_downstream_subscriber(&contract, &peer);
+        assert!(manager.should_unsubscribe_upstream(&contract));
+
+        // Add client subscription -> should NOT unsubscribe
+        manager.add_client_subscription(contract.id(), client_id);
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+    }
+
+    // =========================================================================
+    // Upstream Unsubscribe Decision Logic Tests
+    // =========================================================================
+
+    /// Simulate chain propagation: downstream peer unsubscribes, node checks
+    /// whether it should propagate the unsubscribe upstream.
+    ///
+    /// Scenario: A -> B -> C (subscription tree). C unsubscribes from B.
+    /// B has no other downstream subscribers and no local clients, so B
+    /// should propagate the unsubscribe to A.
+    #[test]
+    fn test_chain_propagation_single_downstream() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let downstream_c = make_peer_key(30);
+
+        // B is hosting the contract with C as the only downstream subscriber
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, downstream_c.clone());
+
+        // C unsubscribes from B
+        assert!(manager.remove_downstream_subscriber(&contract, &downstream_c));
+
+        // B has no local clients and no remaining downstream -> should propagate
+        assert!(
+            manager.should_unsubscribe_upstream(&contract),
+            "Node with no clients and no downstream should propagate unsubscribe upstream"
+        );
+    }
+
+    /// Scenario: A -> B, C -> B. C unsubscribes, but A is still subscribed.
+    /// B should NOT propagate upstream because A remains as a downstream subscriber.
+    #[test]
+    fn test_no_propagation_with_remaining_downstream() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let downstream_a = make_peer_key(10);
+        let downstream_c = make_peer_key(30);
+
+        // B hosts contract with both A and C as downstream subscribers
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, downstream_a.clone());
+        manager.add_downstream_subscriber(&contract, downstream_c.clone());
+
+        // C unsubscribes
+        assert!(manager.remove_downstream_subscriber(&contract, &downstream_c));
+
+        // A is still subscribed -> should NOT propagate
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract),
+            "Node with remaining downstream should NOT propagate unsubscribe"
+        );
+    }
+
+    /// Scenario: Local client still interested even after all downstream peers leave.
+    /// Node should NOT propagate upstream because a local WebSocket client is subscribed.
+    #[test]
+    fn test_no_propagation_with_local_client() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let downstream_peer = make_peer_key(10);
+        let client_id = crate::client_events::ClientId::next();
+
+        // Node has both a downstream subscriber and a local client
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, downstream_peer.clone());
+        manager.add_client_subscription(contract.id(), client_id);
+
+        // Downstream peer unsubscribes
+        assert!(manager.remove_downstream_subscriber(&contract, &downstream_peer));
+
+        // Local client still subscribed -> should NOT propagate
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract),
+            "Node with local client should NOT propagate unsubscribe even if downstream is empty"
+        );
+    }
+
+    /// Simulate client disconnect: when a WebSocket client disconnects, check
+    /// that affected contracts can be identified and the unsubscribe decision
+    /// is correct.
+    #[test]
+    fn test_client_disconnect_triggers_unsubscribe_decision() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let client_id = crate::client_events::ClientId::next();
+
+        // Client subscribes to a contract (no downstream peers)
+        manager.subscribe(contract);
+        manager.add_client_subscription(contract.id(), client_id);
+
+        // Client should prevent unsubscribe
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+
+        // Client disconnects
+        let result = manager.remove_client_from_all_subscriptions(client_id);
+        assert_eq!(
+            result.affected_contracts.len(),
+            1,
+            "Disconnect should report the affected contract"
+        );
+        assert_eq!(result.affected_contracts[0], contract);
+
+        // Now with no client and no downstream -> should unsubscribe
+        assert!(
+            manager.should_unsubscribe_upstream(&contract),
+            "After client disconnect with no downstream, should propagate unsubscribe"
+        );
+    }
+
+    /// Simulate client disconnect with multiple contracts: only contracts with
+    /// no remaining interest should trigger the unsubscribe decision.
+    #[test]
+    fn test_client_disconnect_partial_unsubscribe() {
+        let manager = HostingManager::new();
+        let contract_a = make_contract_key(10);
+        let contract_b = make_contract_key(20);
+        let client_id = crate::client_events::ClientId::next();
+        let downstream_peer = make_peer_key(50);
+
+        // Client subscribes to both contracts
+        manager.subscribe(contract_a);
+        manager.subscribe(contract_b);
+        manager.add_client_subscription(contract_a.id(), client_id);
+        manager.add_client_subscription(contract_b.id(), client_id);
+
+        // contract_b also has a downstream subscriber
+        manager.add_downstream_subscriber(&contract_b, downstream_peer.clone());
+
+        // Client disconnects
+        let result = manager.remove_client_from_all_subscriptions(client_id);
+        assert_eq!(result.affected_contracts.len(), 2);
+
+        // contract_a: no client, no downstream -> should unsubscribe
+        assert!(
+            manager.should_unsubscribe_upstream(&contract_a),
+            "Contract with no remaining interest should trigger unsubscribe"
+        );
+
+        // contract_b: no client, but has downstream -> should NOT unsubscribe
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract_b),
+            "Contract with downstream subscribers should NOT trigger unsubscribe"
+        );
+    }
+
+    /// Simulate downstream subscriber expiry triggering unsubscribe decisions.
+    /// Uses manual timestamp manipulation via DashMap to simulate time passing.
+    #[test]
+    fn test_expire_downstream_triggers_unsubscribe_decision() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let peer = make_peer_key(10);
+
+        // Add a downstream subscriber
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, peer.clone());
+
+        // Not expired yet -> should NOT unsubscribe
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+
+        // Manually set the subscriber's lease to the past
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            peers.insert(
+                peer.clone(),
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1),
+            );
+        }
+
+        // Run expiry sweep
+        let expired = manager.expire_stale_downstream_subscribers();
+        assert_eq!(
+            expired.len(),
+            1,
+            "Should detect one contract with fully expired downstream"
+        );
+        assert_eq!(expired[0], contract);
+
+        // Now should unsubscribe (no client, no downstream)
+        assert!(
+            manager.should_unsubscribe_upstream(&contract),
+            "After all downstream subscribers expire, should propagate unsubscribe"
+        );
+    }
+
+    /// Partial expiry: some downstream subscribers expire but others remain.
+    /// Should NOT trigger unsubscribe.
+    #[test]
+    fn test_partial_downstream_expiry_no_unsubscribe() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(10);
+        let stale_peer = make_peer_key(10);
+        let fresh_peer = make_peer_key(20);
+
+        // Add two downstream subscribers
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, stale_peer.clone());
+        manager.add_downstream_subscriber(&contract, fresh_peer.clone());
+
+        // Make one subscriber stale
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            peers.insert(
+                stale_peer,
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1),
+            );
+        }
+
+        // Run expiry sweep - contract should NOT be in the fully-unsubscribed list
+        let expired = manager.expire_stale_downstream_subscribers();
+        assert!(
+            expired.is_empty(),
+            "Contract with remaining fresh downstream should not appear in expired list"
+        );
+
+        // fresh_peer still present -> should NOT unsubscribe
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract),
+            "Contract with remaining downstream should NOT trigger unsubscribe"
+        );
     }
 }

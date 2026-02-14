@@ -1046,3 +1046,102 @@ fn test_subscribe_renewal_reports_outcome() {
         _ => panic!("Expected ContractOpSuccessUntimed for renewal subscribe"),
     }
 }
+
+// =============================================================================
+// Upstream Unsubscribe Tests
+// =============================================================================
+
+/// Verify that SubscribeMsg::Unsubscribe serializes and deserializes correctly via bincode.
+#[test]
+fn test_unsubscribe_message_roundtrip() {
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+
+    let msg = SubscribeMsg::Unsubscribe {
+        id: tx,
+        instance_id,
+    };
+
+    let serialized = bincode::serialize(&msg).expect("serialize Unsubscribe");
+    let deserialized: SubscribeMsg =
+        bincode::deserialize(&serialized).expect("deserialize Unsubscribe");
+
+    match deserialized {
+        SubscribeMsg::Unsubscribe {
+            id,
+            instance_id: deser_iid,
+        } => {
+            assert_eq!(id, tx, "Transaction ID must survive roundtrip");
+            assert_eq!(
+                deser_iid, instance_id,
+                "ContractInstanceId must survive roundtrip"
+            );
+        }
+        other => panic!(
+            "Expected SubscribeMsg::Unsubscribe, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Verify that create_unsubscribe_op produces the correct operation state.
+#[test]
+fn test_create_unsubscribe_op() {
+    let instance_id = ContractInstanceId::new([77u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+    let target_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    let op = create_unsubscribe_op(instance_id, tx, target_addr);
+
+    assert_eq!(op.id, tx, "Operation must use provided transaction");
+    assert!(!op.is_renewal, "Unsubscribe op must not be a renewal");
+    assert!(
+        op.requester_addr.is_none(),
+        "Unsubscribe op must have no requester"
+    );
+
+    match &op.state {
+        Some(SubscribeState::AwaitingResponse {
+            next_hop,
+            instance_id: state_iid,
+        }) => {
+            assert_eq!(
+                *next_hop,
+                Some(target_addr),
+                "next_hop must be the target address"
+            );
+            assert_eq!(
+                *state_iid, instance_id,
+                "instance_id must match the contract"
+            );
+        }
+        other => panic!("Expected AwaitingResponse state, got {:?}", other),
+    }
+
+    // peek_next_hop_addr should return the target
+    assert_eq!(
+        op.get_next_hop_addr(),
+        Some(target_addr),
+        "get_next_hop_addr must return target for routing"
+    );
+}
+
+/// Verify that an Unsubscribe message carries the correct InnerMessage trait fields.
+#[test]
+fn test_unsubscribe_message_inner_message_trait() {
+    use crate::message::InnerMessage;
+
+    let instance_id = ContractInstanceId::new([55u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+
+    let msg = SubscribeMsg::Unsubscribe {
+        id: tx,
+        instance_id,
+    };
+
+    assert_eq!(*msg.id(), tx, "id() must return the transaction");
+    assert!(
+        msg.requested_location().is_some(),
+        "Unsubscribe must provide a location for routing"
+    );
+}
