@@ -259,7 +259,13 @@ impl ConnectionManager {
             }
         }
         let open = self.connection_count();
-        let reserved_before = self.pending_reservations.read().len();
+        let now = Instant::now();
+        let reserved_before = self
+            .pending_reservations
+            .read()
+            .iter()
+            .filter(|(_, (_, created))| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+            .count();
 
         tracing::debug!(
             addr = %addr,
