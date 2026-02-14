@@ -41,6 +41,22 @@ mod wasmtime_engine;
 use super::runtime::RuntimeConfig;
 use super::ContractError;
 
+/// Default maximum memory limit in WASM pages (64 KiB each).
+/// 4096 pages = 256 MiB.
+///
+/// This limit is enforced by the engine's ResourceLimiter and used by
+/// host function bounds validation. Both Wasmer and Wasmtime engines
+/// apply this limit.
+pub(crate) const DEFAULT_MAX_MEMORY_PAGES: u32 = 4096;
+
+/// WASM page size in bytes (64 KiB).
+pub(crate) const WASM_PAGE_SIZE: usize = 65536;
+
+/// Maximum WASM memory in bytes (256 MiB by default).
+/// Calculated from DEFAULT_MAX_MEMORY_PAGES * WASM_PAGE_SIZE.
+pub(crate) const MAX_WASM_MEMORY_BYTES: usize =
+    DEFAULT_MAX_MEMORY_PAGES as usize * WASM_PAGE_SIZE;
+
 /// Opaque handle to a live WASM instance managed by the engine.
 ///
 /// Instances are created via [`WasmEngine::create_instance`] and must be

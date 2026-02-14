@@ -6,6 +6,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, Secr
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
+use super::engine::MAX_WASM_MEMORY_BYTES;
 use super::runtime::InstanceInfo;
 use super::secrets_store::SecretsStore;
 use crate::contract::storages::Storage;
@@ -38,7 +39,32 @@ thread_local! {
 pub(super) type InstanceId = i64;
 
 /// Error codes returned by host functions.
+///
 /// Negative values indicate errors, non-negative values are success/data.
+///
+/// # Error Code Ranges
+///
+/// - `0`: Success (or returned count/length)
+/// - `-1`: Not in process context (host function called outside delegate execution)
+/// - `-2`: Secret not found
+/// - `-3`: Storage operation failed
+/// - `-4`: Invalid parameter (e.g., negative length)
+/// - `-5`: Context too large (exceeds i32::MAX)
+/// - `-6`: Buffer too small (use length query functions first)
+/// - `-7`: Memory bounds violation (WASM module passed invalid pointer)
+///
+/// # Memory Bounds Violations (`ERR_MEMORY_BOUNDS = -7`)
+///
+/// This error is returned when a WASM module attempts to access memory outside
+/// its allocated linear memory region via host function calls. This can occur when:
+///
+/// - A negative offset is passed (would access before WASM memory)
+/// - Pointer arithmetic overflows (offset + size exceeds usize::MAX)
+/// - Access range exceeds the runtime's maximum memory limit (256 MiB by default)
+///
+/// The validation prevents potentially unsafe pointer arithmetic while allowing
+/// legitimate memory growth via the `memory.grow` instruction. The WASM engine's
+/// guard pages provide an additional layer of protection.
 pub mod error_codes {
     /// Operation succeeded (or returned count/length).
     pub const SUCCESS: i32 = 0;
@@ -196,7 +222,7 @@ fn current_instance_id() -> InstanceId {
 /// Note: WASM memory can grow dynamically via the `memory.grow` instruction between
 /// host function calls. The cached mem_size from instance creation may become stale,
 /// so we validate against the runtime's maximum memory limit (256 MiB by default)
-/// rather than the initial allocation. Wasmtime's guard pages provide additional
+/// rather than the initial allocation. The WASM engine's guard pages provide additional
 /// protection against actual out-of-bounds access.
 ///
 /// # Arguments
@@ -226,14 +252,11 @@ fn validate_and_compute_ptr<T>(
     // Check for overflow when adding size to offset
     let end_offset = ptr_usize.checked_add(size)?;
 
-    // Maximum memory limit enforced by the runtime (matches DEFAULT_MAX_MEMORY_PAGES in wasmtime_engine.rs)
-    // 4096 pages * 64 KiB per page = 256 MiB
-    const MAX_WASM_MEMORY: usize = 4096 * 65536;
-
-    // Verify the entire access range is within the maximum allowed memory
-    if end_offset > MAX_WASM_MEMORY {
+    // Verify the entire access range is within the maximum allowed memory.
+    // Uses the same limit enforced by the engine's ResourceLimiter (256 MiB by default).
+    if end_offset > MAX_WASM_MEMORY_BYTES {
         tracing::warn!(
-            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds max memory limit {MAX_WASM_MEMORY}"
+            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds max memory limit {MAX_WASM_MEMORY_BYTES}"
         );
         return None;
     }
@@ -243,7 +266,7 @@ fn validate_and_compute_ptr<T>(
     let host_ptr = start_ptr.checked_add(ptr)?;
 
     // Safe to return the computed pointer
-    // Wasmtime's guard pages will trap if the access is truly out of bounds
+    // The WASM engine's guard pages will trap if the access is truly out of bounds
     Some(host_ptr as *mut T)
 }
 

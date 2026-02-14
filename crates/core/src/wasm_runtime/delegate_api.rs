@@ -130,6 +130,22 @@ impl fmt::Display for DelegateApiVersion {
 /// Error codes for contract state host functions.
 ///
 /// These extend the existing error code scheme in `native_api::error_codes`.
+///
+/// # Error Code Ranges
+///
+/// - `0`: Success (contract state read succeeded)
+/// - `-1`: Not in process context
+/// - `-4`: Invalid parameter (e.g., wrong instance ID length)
+/// - `-6`: Output buffer too small for the state data
+/// - `-7`: Contract not found in local store
+/// - `-8`: Internal state store error
+/// - `-9`: Memory bounds violation (WASM module passed invalid pointer)
+///
+/// # Memory Bounds Violations (`ERR_MEMORY_BOUNDS = -9`)
+///
+/// This error is returned when a WASM module attempts to access memory outside
+/// its allocated linear memory region via contract state host function calls.
+/// See `native_api::error_codes` documentation for details on validation logic.
 #[allow(dead_code)] // Public API — error codes for host function implementations
 pub mod contract_error_codes {
     /// Contract state read succeeded.

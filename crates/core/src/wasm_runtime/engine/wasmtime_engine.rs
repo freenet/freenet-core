@@ -155,12 +155,9 @@ use crate::wasm_runtime::native_api::{self, MEM_ADDR};
 use crate::wasm_runtime::runtime::RuntimeConfig;
 use crate::wasm_runtime::ContractError;
 
-/// Default maximum memory limit in WASM pages (64 KiB each).
-/// 4096 pages = 256 MiB.
-const DEFAULT_MAX_MEMORY_PAGES: u32 = 4096;
-
-/// WASM page size in bytes.
-const WASM_PAGE_SIZE: usize = 65536;
+// Use shared constants from parent module to ensure consistency
+// with host function bounds validation
+use super::{DEFAULT_MAX_MEMORY_PAGES, WASM_PAGE_SIZE};
 
 /// WASM stack size in bytes (8 MiB).
 const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
