@@ -55,6 +55,36 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::http_gateway::AttestedContractMap;
 
+/// Checks if a WebSocket Origin header value refers to localhost.
+///
+/// Delimiter-aware: rejects origins like `http://localhost.evil.com` by requiring
+/// the hostname to be followed by `:`, `/`, or end-of-string.
+fn is_localhost_origin(origin: &str) -> bool {
+    let prefixes = [
+        "http://localhost:",
+        "http://localhost/",
+        "https://localhost:",
+        "https://localhost/",
+        "http://127.0.0.1:",
+        "http://127.0.0.1/",
+        "https://127.0.0.1:",
+        "https://127.0.0.1/",
+        "http://[::1]:",
+        "http://[::1]/",
+        "https://[::1]:",
+        "https://[::1]/",
+    ];
+    let exact = [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "https://[::1]",
+    ];
+    prefixes.iter().any(|p| origin.starts_with(p)) || exact.contains(&origin)
+}
+
 /// Checks if an error represents a client-side disconnect rather than a server error.
 ///
 /// Client disconnects are expected behavior when clients timeout, crash, or close
@@ -341,6 +371,28 @@ async fn connection_info(
                 .into_response()
         }
     };
+
+    // Check Origin header — browsers always send this on WS upgrade, CLI tools don't.
+    // This blocks cross-origin attacks from malicious websites while allowing:
+    // - fdev/CLI tools (no Origin header sent by tokio-tungstenite)
+    // - Contract web apps served from localhost (Origin: http://127.0.0.1:PORT)
+    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin.to_str() {
+            if !is_localhost_origin(origin_str) {
+                tracing::warn!(
+                    origin = origin_str,
+                    "Rejected WebSocket connection from non-localhost origin"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "WebSocket connections from external origins are not allowed",
+                )
+                    .into_response();
+            }
+        } else {
+            return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
+        }
+    }
 
     tracing::debug!(
         ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
@@ -694,6 +746,34 @@ async fn process_client_request(
             },
         }
     };
+
+    // Scope check: contract web apps (identified by attested_contract) cannot use NodeQueries.
+    // This prevents malicious contracts from exfiltrating peer topology data.
+    if attested_contract.is_some() {
+        if let ClientRequest::NodeQueries(_) = &req {
+            tracing::warn!(
+                %client_id,
+                contract = ?attested_contract,
+                "Blocked NodeQueries from contract web app"
+            );
+            let error: ClientError = ErrorKind::Unhandled {
+                cause: std::borrow::Cow::Borrowed(
+                    "NodeQueries is not available to contract web applications",
+                ),
+            }
+            .into();
+            let serialized = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))
+                        .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?
+                }
+            };
+            return Ok(Some(Message::Binary(serialized.into())));
+        }
+    }
 
     // Intercept explicit disconnect requests sent by the client as data messages
     if matches!(req, ClientRequest::Disconnect { .. }) {
@@ -1055,5 +1135,39 @@ mod tests {
         assert!(!is_client_disconnect_error(&anyhow::anyhow!(
             "permission denied"
         )));
+    }
+
+    #[test]
+    fn test_is_localhost_origin() {
+        // Valid localhost origins
+        assert!(is_localhost_origin("http://localhost"));
+        assert!(is_localhost_origin("https://localhost"));
+        assert!(is_localhost_origin("http://localhost:3000"));
+        assert!(is_localhost_origin("https://localhost:8080"));
+        assert!(is_localhost_origin("http://localhost/path"));
+
+        // Valid 127.0.0.1 origins
+        assert!(is_localhost_origin("http://127.0.0.1"));
+        assert!(is_localhost_origin("https://127.0.0.1"));
+        assert!(is_localhost_origin("http://127.0.0.1:50509"));
+        assert!(is_localhost_origin("http://127.0.0.1/path"));
+
+        // Valid IPv6 loopback origins
+        assert!(is_localhost_origin("http://[::1]"));
+        assert!(is_localhost_origin("https://[::1]"));
+        assert!(is_localhost_origin("http://[::1]:3000"));
+        assert!(is_localhost_origin("http://[::1]/path"));
+
+        // Reject external origins
+        assert!(!is_localhost_origin("http://evil.com"));
+        assert!(!is_localhost_origin("https://attacker.io:8080"));
+
+        // Reject hostname spoofing (delimiter-aware)
+        assert!(!is_localhost_origin("http://localhost.evil.com"));
+        assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
+
+        // Reject empty/garbage
+        assert!(!is_localhost_origin(""));
+        assert!(!is_localhost_origin("localhost"));
     }
 }
