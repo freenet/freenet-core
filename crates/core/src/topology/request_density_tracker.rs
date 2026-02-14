@@ -1,3 +1,4 @@
+use crate::config::GlobalRng;
 use crate::ring::{Connection, Location};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
@@ -212,13 +213,9 @@ impl DensityMap {
     /// Like `get_max_density()`, but biases toward locations closer to `my_location`
     /// using distance-weighted scoring: score = density / distance.
     ///
-    /// This favors nearby high-density areas over distant ones, encouraging
-    /// connections in the local neighborhood while still allowing sufficiently
-    /// high-demand distant locations to win.
-    ///
-    /// Note: this is a deterministic argmax, not stochastic sampling. All peers
-    /// with similar density maps will select the same target. A future improvement
-    /// could sample from the score distribution to diversify connection targets.
+    /// Samples stochastically from the score distribution rather than returning
+    /// the deterministic argmax. This ensures connection diversity — different
+    /// calls produce different targets, weighted by their density/distance score.
     ///
     /// MIN_DISTANCE (0.001) prevents division-by-near-zero for candidates very close
     /// to `my_location`.
@@ -237,8 +234,8 @@ impl DensityMap {
             return Ok(*self.neighbor_request_counts.keys().next().unwrap());
         }
 
-        let mut best_location = Location::new(0.0);
-        let mut best_score: f64 = -1.0;
+        // Collect (location, score) for each candidate midpoint
+        let mut candidates: Vec<(Location, f64)> = Vec::new();
 
         // Score each adjacent-pair midpoint by density / distance_to_me
         for ((prev_loc, prev_count), (next_loc, next_count)) in self
@@ -250,18 +247,13 @@ impl DensityMap {
             let midpoint = Location::new((prev_loc.as_f64() + next_loc.as_f64()) / 2.0);
             let distance = my_location.distance(midpoint).as_f64().max(MIN_DISTANCE);
             let score = combined_density / distance;
-
-            if score > best_score {
-                best_score = score;
-                best_location = midpoint;
-            }
+            candidates.push((midpoint, score));
         }
 
         // Wrap-around: check first and last neighbor pair
         let first = self.neighbor_request_counts.iter().next();
         let last = self.neighbor_request_counts.iter().next_back();
         if let (Some((first_loc, first_count)), Some((last_loc, last_count))) = (first, last) {
-            // Only meaningful if there are at least 2 entries (otherwise first == last)
             if first_loc != last_loc {
                 let combined_density = (first_count + last_count) as f64;
                 let wrap_distance = first_loc.distance(*last_loc);
@@ -272,14 +264,37 @@ impl DensityMap {
                 let midpoint = Location::new(mp);
                 let distance = my_location.distance(midpoint).as_f64().max(MIN_DISTANCE);
                 let score = combined_density / distance;
-
-                if score > best_score {
-                    best_location = midpoint;
-                }
+                candidates.push((midpoint, score));
             }
         }
 
-        Ok(best_location)
+        if candidates.is_empty() {
+            return Err(DensityMapError::EmptyNeighbors);
+        }
+
+        // Sample from score distribution: probability proportional to score
+        let total_score: f64 = candidates.iter().map(|(_, s)| s).sum();
+        if total_score <= 0.0 {
+            // All scores zero/negative — fall back to first candidate
+            return Ok(candidates[0].0);
+        }
+
+        let u: f64 = GlobalRng::with_rng(|rng| {
+            use rand::Rng;
+            rng.random()
+        });
+        let threshold = u * total_score;
+
+        let mut cumulative = 0.0;
+        for (location, score) in &candidates {
+            cumulative += score;
+            if cumulative >= threshold {
+                return Ok(*location);
+            }
+        }
+
+        // Floating point edge case — return last candidate
+        Ok(candidates.last().unwrap().0)
     }
 }
 
@@ -596,8 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_density_closer_wins_at_equal_density() {
-        // Two pairs with equal density — the one closer to my_location should win
+    fn test_weighted_density_closer_preferred_statistically() {
+        // Two pairs with equal density — closer one should be selected more often.
+        // Midpoint 0.3 (distance 0.05 from me) vs midpoint 0.8 (distance 0.45).
+        // Score ratio = (0.45/0.05) = 9:1 in favor of closer.
         let mut density_map = DensityMap {
             neighbor_request_counts: BTreeMap::new(),
         };
@@ -616,17 +633,30 @@ mod tests {
             .insert(Location::new(0.9), 3); // midpoint 0.8
 
         let my_location = Location::new(0.25);
-        let result = density_map.get_max_density_weighted(my_location).unwrap();
-        // Midpoint 0.3 is at distance 0.05, midpoint 0.8 is at distance 0.45
-        // Equal density (6 each), so closer one (0.3) should win
-        assert_eq!(result, Location::new(0.3));
+        let mut close_count = 0;
+        let trials = 1000;
+        for _ in 0..trials {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            if my_location.distance(result).as_f64() < 0.1 {
+                close_count += 1;
+            }
+        }
+        // Close midpoint (0.3) has score 120, but wrap-around and other candidates
+        // add up to ~65% probability for the closest. Should be selected majority.
+        assert!(
+            close_count > 500,
+            "Expected close location to be selected most often, got {close_count}/{trials}"
+        );
+        // But not ALL the time — stochastic sampling should pick distant one sometimes
+        assert!(
+            close_count < trials,
+            "Expected some diversity, but close was selected every time"
+        );
     }
 
     #[test]
-    fn test_weighted_density_high_density_overcomes_distance() {
-        // A distant pair with much higher density should beat a close pair with low density.
-        // Carefully constructed so the wrap-around pair doesn't interfere:
-        // first=0.1(1) and last=0.95(100) wrap midpoint is at 0.025, far from my_location=0.4.
+    fn test_weighted_density_high_density_overcomes_distance_statistically() {
+        // High density at distance should be selected more often than low density nearby.
         let mut density_map = DensityMap {
             neighbor_request_counts: BTreeMap::new(),
         };
@@ -645,12 +675,20 @@ mod tests {
             .insert(Location::new(0.95), 100); // midpoint 0.75, density=101
 
         let my_location = Location::new(0.4);
-        let result = density_map.get_max_density_weighted(my_location).unwrap();
-        // Close midpoint 0.5: score = 2/0.1 = 20
-        // Distant midpoint 0.75: score = 101/0.35 ≈ 289
-        // Wrap midpoint 0.025: score = 101/0.375 ≈ 269
-        // High density at distance wins
-        assert_eq!(result, Location::new(0.75));
+        let mut high_density_count = 0;
+        let trials = 1000;
+        for _ in 0..trials {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            // midpoint 0.75 or wrap midpoint 0.025 both have high density
+            if result == Location::new(0.75) || my_location.distance(result).as_f64() > 0.3 {
+                high_density_count += 1;
+            }
+        }
+        // High density locations should dominate (~96% combined)
+        assert!(
+            high_density_count > 800,
+            "Expected high density to dominate, got {high_density_count}/{trials}"
+        );
     }
 
     #[test]
@@ -680,36 +718,39 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_density_wrap_around_wins() {
-        // The wrap-around pair (first + last) should win when it has the best
-        // density/distance ratio relative to my_location near the wrap boundary
+    fn test_weighted_density_produces_diverse_results() {
+        // The key property: repeated calls should produce DIFFERENT targets
         let mut density_map = DensityMap {
             neighbor_request_counts: BTreeMap::new(),
         };
 
-        // Wrap-around pair: 0.05(50) and 0.95(50) → midpoint ≈ 0.0, density=100
-        // Interior pair: 0.4(1) and 0.6(1) → midpoint 0.5, density=2
         density_map
             .neighbor_request_counts
-            .insert(Location::new(0.05), 50);
+            .insert(Location::new(0.1), 5);
         density_map
             .neighbor_request_counts
-            .insert(Location::new(0.4), 1);
+            .insert(Location::new(0.3), 5);
         density_map
             .neighbor_request_counts
-            .insert(Location::new(0.6), 1);
+            .insert(Location::new(0.5), 5);
         density_map
             .neighbor_request_counts
-            .insert(Location::new(0.95), 50);
+            .insert(Location::new(0.7), 5);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 5);
 
-        // my_location=0.0 is right at the wrap midpoint
-        let my_location = Location::new(0.0);
-        let result = density_map.get_max_density_weighted(my_location).unwrap();
-        // Wrap midpoint is at ~0.0 (or 1.0 due to float precision at the boundary).
-        // Both represent the same ring position. Score = 100/0.001 = 100000, dominates.
+        let my_location = Location::new(0.5);
+        let mut unique_results = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            unique_results.insert(result.as_f64().to_bits());
+        }
+        // With 5 equal-density candidates at various distances, we should see multiple
         assert!(
-            my_location.distance(result).as_f64() < 0.01,
-            "Expected wrap midpoint near 0.0, got {result}"
+            unique_results.len() >= 2,
+            "Expected diverse results, got only {} unique locations",
+            unique_results.len()
         );
     }
 
@@ -731,8 +772,13 @@ mod tests {
         // my_location is essentially at the midpoint (distance < MIN_DISTANCE)
         let my_location = Location::new(0.5);
         let result = density_map.get_max_density_weighted(my_location);
-        // Should succeed without panic or overflow
+        // Should succeed without panic or overflow. Result will be near 0.5
+        // (either the adjacent midpoint at 0.5 or the wrap midpoint at 0.498).
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Location::new(0.5));
+        let loc = result.unwrap();
+        assert!(
+            my_location.distance(loc).as_f64() < 0.01,
+            "Expected location near 0.5, got {loc}"
+        );
     }
 }

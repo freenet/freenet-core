@@ -973,6 +973,8 @@ mod tests {
     // Test that density-based selection uses distance weighting when my_location is known.
     // With 5+ connections (above DENSITY_SELECTION_THRESHOLD), adjust_topology should call
     // select_connections_to_add which uses get_max_density_weighted.
+    // Since the selection is stochastic, we run multiple iterations and check that
+    // close locations are preferred on average.
     #[test_log::test]
     fn test_density_selection_uses_weighted_when_location_known() {
         let mut resource_manager = setup_topology_manager(1000.0);
@@ -996,28 +998,32 @@ mod tests {
         }
 
         let my_location = peers[0].location().unwrap();
-        let adjustment = resource_manager.adjust_topology(
-            &neighbor_locations,
-            &Some(my_location),
-            Instant::now(),
-            peers.len(),
-        );
+        let mut close_count = 0;
+        let trials = 20;
+        for _ in 0..trials {
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &Some(my_location),
+                Instant::now(),
+                peers.len(),
+            );
 
-        match adjustment {
-            TopologyAdjustment::AddConnections(locations) => {
-                assert_eq!(locations.len(), 1);
-                // The chosen location should be biased toward my_location due to
-                // distance weighting. It should be between the first two peers
-                // (where requests are concentrated and closest to my_location).
-                let dist_to_me = my_location.distance(locations[0]).as_f64();
-                assert!(
-                    dist_to_me < 0.3,
-                    "Expected location near my_location ({my_location}), got {} (dist={dist_to_me})",
-                    locations[0]
-                );
+            match adjustment {
+                TopologyAdjustment::AddConnections(locations) => {
+                    assert_eq!(locations.len(), 1);
+                    let dist_to_me = my_location.distance(locations[0]).as_f64();
+                    if dist_to_me < 0.3 {
+                        close_count += 1;
+                    }
+                }
+                _ => panic!("Expected AddConnections, got {adjustment:?}"),
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
+        // Most selections should be close (distance-weighted bias)
+        assert!(
+            close_count > trials / 2,
+            "Expected most selections near my_location, got {close_count}/{trials} close"
+        );
     }
 
     fn setup_topology_manager(max_downstream_rate: f64) -> TopologyManager {
