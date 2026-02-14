@@ -408,16 +408,8 @@ impl TopologyManager {
                 // If we have 1-4 connections, target own location to build local neighborhood
                 else if current_connections < DENSITY_SELECTION_THRESHOLD {
                     match my_location {
-                        Some(location) => {
-                            for _i in 0..below_threshold {
-                                locations.push(*location);
-                            }
-                        }
-                        None => {
-                            for _i in 0..below_threshold {
-                                locations.push(Location::random());
-                            }
-                        }
+                        Some(location) => locations.resize(below_threshold, *location),
+                        None => locations.extend((0..below_threshold).map(|_| Location::random())),
                     }
                 }
                 // If we have 5+ connections, use density-based selection
@@ -430,11 +422,9 @@ impl TopologyManager {
                                 fallback_count = below_threshold,
                                 "Density-based selection failed, falling back to random locations"
                             );
-                            let mut fallback_locations = Vec::new();
-                            for _i in 0..below_threshold {
-                                fallback_locations.push(Location::random());
-                            }
-                            TopologyAdjustment::AddConnections(fallback_locations)
+                            let fallback: Vec<_> =
+                                (0..below_threshold).map(|_| Location::random()).collect();
+                            TopologyAdjustment::AddConnections(fallback)
                         });
                 }
             }
@@ -584,31 +574,15 @@ impl TopologyManager {
         // Phase 3 of topology formation: with 5+ connections, use density-weighted
         // selection. When our location is known, bias toward nearby high-density areas
         // (Kleinberg small-world weighting). Otherwise fall back to global max density.
-        debug!("Attempting to get max density location");
         let max_density_location = match my_location {
-            Some(loc) => match density_map.get_max_density_weighted(*loc) {
-                Ok(location) => {
-                    debug!(location = %location, my_location = %loc, "Weighted max density location found");
-                    location
-                }
-                Err(e) => {
-                    error!(error = ?e, "Failed to get weighted max density location");
-                    return Err(anyhow!(e));
-                }
-            },
-            None => match density_map.get_max_density() {
-                Ok(location) => {
-                    debug!(location = %location, "Max density location found (no own location)");
-                    location
-                }
-                Err(e) => {
-                    error!(error = ?e, "Failed to get max density location");
-                    return Err(anyhow!(e));
-                }
-            },
-        };
-
-        info!(location = %max_density_location, "Adding new connection");
+            Some(loc) => density_map.get_max_density_weighted(*loc),
+            None => density_map.get_max_density(),
+        }
+        .map_err(|e| {
+            error!(error = ?e, "Failed to get max density location");
+            anyhow!(e)
+        })?;
+        info!(location = %max_density_location, ?my_location, "Adding new connection");
         Ok(TopologyAdjustment::AddConnections(vec![
             max_density_location,
         ]))
