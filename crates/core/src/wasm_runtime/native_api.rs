@@ -54,6 +54,8 @@ pub mod error_codes {
     pub const ERR_CONTEXT_TOO_LARGE: i32 = -5;
     /// Buffer too small to hold the secret (use get_secret_len first).
     pub const ERR_BUFFER_TOO_SMALL: i32 = -6;
+    /// Memory bounds violation (pointer out of range).
+    pub const ERR_MEMORY_BOUNDS: i32 = -7;
 }
 
 /// State available to a delegate during a single `process()` call.
@@ -180,9 +182,61 @@ fn current_instance_id() -> InstanceId {
     CURRENT_DELEGATE_INSTANCE.with(|c| c.get())
 }
 
+/// Validates memory bounds and computes a pointer within WASM linear memory.
+///
+/// # Safety
+/// This function validates that the pointer arithmetic is safe. It checks for:
+/// - Negative offsets (which would access memory before WASM linear memory)
+/// - Overflow when adding offset + size
+/// - Offset + size exceeding WASM32's 4GB address space limit
+///
+/// Note: WASM memory can grow dynamically, so we validate against the theoretical
+/// maximum (4GB for WASM32) rather than a potentially stale cached size. The OS
+/// and wasmtime's guard pages provide additional protection against actual
+/// out-of-bounds access.
+///
+/// # Arguments
+/// * `ptr` - Offset from the start of WASM memory (provided by WASM module)
+/// * `start_ptr` - Base address of WASM linear memory (from InstanceInfo)
+/// * `size` - Size of the data to be accessed (in bytes)
+/// * `_mem_size` - Initial memory size (unused; kept for API compatibility)
+///
+/// # Returns
+/// * `Some(*mut T)` - Valid pointer
+/// * `None` - Pointer would be invalid (negative or overflow)
 #[inline(always)]
-fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
-    (start_ptr + ptr) as _
+fn validate_and_compute_ptr<T>(
+    ptr: i64,
+    start_ptr: i64,
+    size: usize,
+    _mem_size: usize,
+) -> Option<*mut T> {
+    // Check for negative offset (invalid - would access before WASM memory)
+    if ptr < 0 {
+        tracing::warn!("Memory bounds violation: negative offset {ptr}");
+        return None;
+    }
+
+    let ptr_usize = ptr as usize;
+
+    // Check for overflow when adding size to offset
+    let end_offset = ptr_usize.checked_add(size)?;
+
+    // WASM32 has a maximum 4GB address space (2^32 bytes)
+    // Validate that the access doesn't exceed this theoretical maximum
+    const WASM32_MAX_MEMORY: usize = 1 << 32; // 4GB
+    if end_offset > WASM32_MAX_MEMORY {
+        tracing::warn!(
+            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds WASM32 max {WASM32_MAX_MEMORY}"
+        );
+        return None;
+    }
+
+    // Safe to compute the actual pointer
+    // Additional protection provided by:
+    // - OS memory protection (segfault on invalid access)
+    // - Wasmtime guard pages (catches out-of-bounds in WASM linear memory region)
+    Some((start_ptr + ptr) as *mut T)
 }
 
 pub(super) mod log {
@@ -196,7 +250,12 @@ pub(super) mod log {
             panic!("unset module id");
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(ptr) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in freenet_log::info");
+            return;
+        };
         let msg =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
@@ -213,7 +272,12 @@ pub(super) mod rand {
             panic!("unset module id");
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(ptr) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in freenet_rand::rand_bytes");
+            return;
+        };
         let slice = unsafe { &mut *std::ptr::slice_from_raw_parts_mut(ptr, len as usize) };
         let mut rng = rng();
         rng.fill_bytes(slice);
@@ -230,7 +294,15 @@ pub(super) mod time {
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let now = UtcOriginal::now();
-        let ptr = compute_ptr::<DateTime<UtcOriginal>>(ptr, info.start_ptr);
+        let Some(ptr) = validate_and_compute_ptr::<DateTime<UtcOriginal>>(
+            ptr,
+            info.start_ptr,
+            std::mem::size_of::<DateTime<UtcOriginal>>(),
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in freenet_time::utc_now");
+            return;
+        };
         unsafe {
             ptr.write(now);
         };
@@ -306,7 +378,11 @@ pub(super) mod delegate_context {
         if to_copy == 0 {
             return 0;
         }
-        let dst = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(dst) = validate_and_compute_ptr::<u8>(ptr, info.start_ptr, to_copy, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate context_read");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(env.context.as_ptr(), dst, to_copy);
         }
@@ -342,7 +418,12 @@ pub(super) mod delegate_context {
             env.context.clear();
             return error_codes::SUCCESS;
         }
-        let src = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(src) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate context_write");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let bytes = unsafe { std::slice::from_raw_parts(src, len as usize) };
         env.context = bytes.to_vec();
         error_codes::SUCCESS
@@ -394,7 +475,15 @@ pub(super) mod delegate_secrets {
         };
 
         // Read the secret key from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate get_secret_len");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -444,7 +533,15 @@ pub(super) mod delegate_secrets {
         };
 
         // Read the secret key from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate get_secret (key)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -466,7 +563,15 @@ pub(super) mod delegate_secrets {
                     return 0;
                 }
 
-                let dst = compute_ptr::<u8>(out_ptr, info.start_ptr);
+                let Some(dst) = validate_and_compute_ptr::<u8>(
+                    out_ptr,
+                    info.start_ptr,
+                    secret_len,
+                    info.mem_size,
+                ) else {
+                    tracing::error!("Memory bounds violation in delegate get_secret (output)");
+                    return error_codes::ERR_MEMORY_BOUNDS;
+                };
                 unsafe {
                     std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
                 }
@@ -506,11 +611,27 @@ pub(super) mod delegate_secrets {
         };
 
         // Read key and value from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate set_secret (key)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        let val_src = compute_ptr::<u8>(val_ptr, info.start_ptr);
+        let Some(val_src) = validate_and_compute_ptr::<u8>(
+            val_ptr,
+            info.start_ptr,
+            val_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate set_secret (value)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
 
         match env
@@ -551,7 +672,15 @@ pub(super) mod delegate_secrets {
             return error_codes::ERR_NOT_IN_PROCESS;
         };
 
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate has_secret");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -588,7 +717,15 @@ pub(super) mod delegate_secrets {
             return error_codes::ERR_NOT_IN_PROCESS;
         };
 
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate remove_secret");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -662,7 +799,12 @@ pub(super) mod delegate_contracts {
         };
 
         // Read the contract instance ID from WASM memory
-        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let Some(id_src) =
+            validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate get_contract_state_len");
+            return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+        };
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -729,7 +871,12 @@ pub(super) mod delegate_contracts {
         };
 
         // Read the contract instance ID from WASM memory
-        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let Some(id_src) =
+            validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate get_contract_state (id)");
+            return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+        };
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -751,7 +898,17 @@ pub(super) mod delegate_contracts {
                     return 0;
                 }
 
-                let dst = compute_ptr::<u8>(out_ptr, info.start_ptr);
+                let Some(dst) = validate_and_compute_ptr::<u8>(
+                    out_ptr,
+                    info.start_ptr,
+                    state_len,
+                    info.mem_size,
+                ) else {
+                    tracing::error!(
+                        "Memory bounds violation in delegate get_contract_state (output)"
+                    );
+                    return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+                };
                 unsafe {
                     std::ptr::copy_nonoverlapping(state_bytes.as_ptr(), dst, state_len);
                 }
