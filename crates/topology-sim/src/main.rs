@@ -11,11 +11,16 @@ use network::Network;
 use strategy::Strategy;
 
 fn main() {
-    let scales = [300, 3_000, 30_000];
+    let scales: Vec<(usize, usize, usize)> = vec![
+        // (num_peers, min_connections, max_connections)
+        (300, 10, 20),
+        (3_000, 10, 20),
+        (30_000, 15, 30),
+    ];
 
-    for &n in &scales {
+    for &(n, min_conn, max_conn) in &scales {
         println!("\n{}", "=".repeat(60));
-        println!("  SCALE: {} peers", n);
+        println!("  SCALE: {} peers  (connections: {}-{})", n, min_conn, max_conn);
         println!("{}", "=".repeat(60));
 
         let strategies: Vec<(&str, Strategy)> = vec![
@@ -24,13 +29,17 @@ fn main() {
         ];
 
         for (name, strat) in strategies {
-            println!("\n--- Strategy: {} ---", name);
-            let mut net = Network::new(n, 10, 20, strat);
+            let start = std::time::Instant::now();
+            let mut net = Network::new(n, min_conn, max_conn, strat);
 
-            // Run simulation: 500 ticks of connection formation + maintenance
-            for _ in 0..500 {
+            // Scale ticks with network size for convergence
+            let ticks = if n <= 1000 { 500 } else { 1000 };
+            for _ in 0..ticks {
                 net.tick();
             }
+
+            let elapsed = start.elapsed();
+            println!("\n--- Strategy: {} ({:.1}s) ---", name, elapsed.as_secs_f64());
 
             let m = metrics::compute(&net);
             println!("  Connections:  {}", m.total_connections);

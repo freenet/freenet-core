@@ -123,11 +123,18 @@ impl Network {
 
         for i in 0..n {
             let current_conns = self.peers[i].connections.len();
-            if current_conns >= self.min_connections {
+            if current_conns >= self.max_connections {
                 continue;
             }
 
-            let attempts = ((self.min_connections - current_conns) / 2).clamp(1, 3);
+            // Below min: seek aggressively. Between min and max: seek occasionally.
+            let attempts = if current_conns < self.min_connections {
+                ((self.min_connections - current_conns) / 2).clamp(1, 3)
+            } else if self.rng.random::<f64>() < 0.05 {
+                1 // 5% chance per tick to seek an additional connection
+            } else {
+                continue;
+            };
             for _ in 0..attempts {
                 let ctx = self.build_peer_context(i);
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
@@ -245,9 +252,9 @@ impl Network {
     }
 
     /// Simulate the CONNECT routing process: greedy-forward through existing topology
-    /// toward `target_loc` with a TTL.
+    /// toward `target_loc` with a TTL scaled to network size.
     fn route_to_peer(&self, from_id: usize, target_loc: f64) -> Option<usize> {
-        let ttl = 10;
+        let ttl = ((self.peers.len() as f64).log2() as usize * 2).max(10);
         let mut current = from_id;
         let mut visited: HashSet<usize> = HashSet::new();
         visited.insert(from_id);
