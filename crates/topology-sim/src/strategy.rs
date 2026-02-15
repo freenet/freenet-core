@@ -41,6 +41,16 @@ impl Strategy {
             Strategy::SmallWorld(s) => s.select_drop(ctx, rng),
         }
     }
+
+    /// Fraction of connection attempts that should use direct introduction (sorted
+    /// location lookup) instead of routing through existing topology. Models gateway
+    /// introductions or peer exchange protocol.
+    pub fn introduction_rate(&self) -> f64 {
+        match self {
+            Strategy::Current(_) => 0.0,
+            Strategy::SmallWorld(_) => 0.5,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +198,8 @@ impl Current {
 // Proposed small-world strategy
 // ---------------------------------------------------------------------------
 
-/// Proposed strategy: Kleinberg 1/d link generation + distance-aware acceptance
-/// + nearest-neighbor protection.
+/// Proposed strategy: Kleinberg 1/d link generation + peer introduction mechanism
+/// + nearest-neighbor protection + redundancy-based drop selection.
 pub struct SmallWorld;
 
 impl Default for SmallWorld {
@@ -216,24 +226,11 @@ impl SmallWorld {
         }
     }
 
-    fn k_nearest_indices(ctx: &PeerContext, k: usize) -> Vec<usize> {
-        let mut indexed: Vec<(usize, f64)> = ctx
-            .all_peer_locations
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != ctx.peer_id)
-            .map(|(i, &loc)| (i, ring_distance(ctx.location, loc)))
-            .collect();
-        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        indexed.into_iter().take(k).map(|(i, _)| i).collect()
-    }
-
     fn select_target(&self, ctx: &PeerContext, rng: &mut impl Rng) -> f64 {
         // First priority: connect to nearest neighbors if not connected
-        let nearest = Self::k_nearest_indices(ctx, 3);
-        for &idx in &nearest {
-            if !ctx.connection_ids.contains(&idx) {
-                return ctx.all_peer_locations[idx];
+        for &(id, loc) in &ctx.nearest_peers {
+            if !ctx.connection_ids.contains(&id) {
+                return loc;
             }
         }
 
@@ -243,47 +240,54 @@ impl SmallWorld {
     fn accept_connection(
         &self,
         ctx: &PeerContext,
-        candidate_loc: f64,
-        min_connections: usize,
+        _candidate_loc: f64,
+        _min_connections: usize,
         max_connections: usize,
-        rng: &mut impl Rng,
+        _rng: &mut impl Rng,
     ) -> bool {
-        // Always accept first few connections (need *something*)
-        if ctx.connection_count < 3 {
-            return true;
-        }
-        if ctx.connection_count >= max_connections {
-            return false;
-        }
-
-        // Distance-biased acceptance: strongly prefer short connections.
-        // Even below min_connections, reject very distant peers to shape topology
-        // from the start rather than accepting random connections and trying to
-        // fix them later via maintenance.
-        let dist = ring_distance(ctx.location, candidate_loc);
-
-        // Scale acceptance based on how full we are
-        let fullness = ctx.connection_count as f64 / min_connections as f64;
-        // At 3 connections (fullness ~0.3): accept_prob = 1/(1 + 3*d) — mild bias
-        // At min_connections (fullness 1.0): accept_prob = 1/(1 + 20*d) — strong bias
-        let strength = 3.0 + 17.0 * fullness.min(1.0);
-        let accept_prob = 1.0 / (1.0 + strength * dist);
-        rng.random::<f64>() < accept_prob
+        // Simple capacity-based acceptance. The topology is shaped by target
+        // selection (Kleinberg 1/d), not by acceptance filtering. Filtering
+        // here would destroy the carefully-chosen distance distribution.
+        ctx.connection_count < max_connections
     }
 
     fn select_drop(&self, ctx: &PeerContext, _rng: &mut impl Rng) -> Option<usize> {
         let nearest_3: std::collections::HashSet<usize> =
-            Self::k_nearest_indices(ctx, 3).into_iter().collect();
+            ctx.nearest_peers.iter().map(|(id, _)| *id).collect();
 
-        ctx.connection_ids
+        // Collect droppable connections with their distances, sorted by distance
+        let mut droppable: Vec<(usize, f64)> = ctx
+            .connection_ids
             .iter()
             .zip(ctx.neighbor_locations.iter())
             .filter(|(id, _)| !nearest_3.contains(id))
-            .max_by(|(_, loc_a), (_, loc_b)| {
-                ring_distance(ctx.location, **loc_a)
-                    .partial_cmp(&ring_distance(ctx.location, **loc_b))
-                    .unwrap()
-            })
-            .map(|(id, _)| *id)
+            .map(|(&id, &loc)| (id, ring_distance(ctx.location, loc)))
+            .collect();
+
+        if droppable.is_empty() {
+            return None;
+        }
+
+        droppable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // Drop the most redundant connection: the one with the smallest distance
+        // gap to its neighbor in distance-space. This preserves distance diversity
+        // (keeping both short and long-range links) instead of always killing the
+        // longest connection.
+        if droppable.len() >= 2 {
+            let mut most_redundant_idx = 0;
+            let mut min_gap = f64::MAX;
+            for i in 0..droppable.len() - 1 {
+                let gap = droppable[i + 1].1 - droppable[i].1;
+                if gap < min_gap {
+                    min_gap = gap;
+                    // Drop the further one of the redundant pair (it's more replaceable)
+                    most_redundant_idx = i + 1;
+                }
+            }
+            Some(droppable[most_redundant_idx].0)
+        } else {
+            Some(droppable[0].0)
+        }
     }
 }

@@ -38,7 +38,6 @@ pub struct Network {
     sorted_locations: Vec<(f64, usize)>,
     strategy: Strategy,
     rng: rand::rngs::ThreadRng,
-    tick_count: usize,
 }
 
 impl Network {
@@ -83,14 +82,11 @@ impl Network {
             sorted_locations,
             strategy,
             rng,
-            tick_count: 0,
         }
     }
 
     /// One simulation tick: generate requests, seek connections, maintain topology.
     pub fn tick(&mut self) {
-        self.tick_count += 1;
-
         // 1. Generate random request traffic to build density maps
         self.generate_requests();
 
@@ -122,6 +118,7 @@ impl Network {
 
     fn seek_connections(&mut self) {
         let n = self.peers.len();
+        let intro_rate = self.strategy.introduction_rate();
         let mut new_connections: Vec<(usize, usize)> = Vec::new();
 
         for i in 0..n {
@@ -135,7 +132,15 @@ impl Network {
                 let ctx = self.build_peer_context(i);
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
 
-                if let Some(target_peer) = self.route_to_peer(i, target_loc) {
+                // Choose between routing and direct introduction
+                let use_introduction = self.rng.random::<f64>() < intro_rate;
+                let target_peer = if use_introduction {
+                    self.find_peer_near(i, target_loc)
+                } else {
+                    self.route_to_peer(i, target_loc)
+                };
+
+                if let Some(target_peer) = target_peer {
                     let target_ctx = self.build_peer_context(target_peer);
                     if self.strategy.accept_connection(
                         &target_ctx,
@@ -161,11 +166,10 @@ impl Network {
     }
 
     /// Active topology improvement: peers at/above min_connections periodically try
-    /// to replace their worst connection with a better one. This is crucial because
-    /// routed connections are noisy — the initial connection set is semi-random and
-    /// needs ongoing refinement.
+    /// to replace their worst connection with a better one.
     fn improve_connections(&mut self) {
         let n = self.peers.len();
+        let intro_rate = self.strategy.introduction_rate();
         let mut replacements: Vec<(usize, usize, usize)> = Vec::new(); // (peer, drop, add)
 
         for i in 0..n {
@@ -173,21 +177,27 @@ impl Network {
                 continue;
             }
 
-            // Only attempt improvement with some probability per tick (not every tick)
+            // Only attempt improvement with some probability per tick
             if self.rng.random::<f64>() > 0.1 {
                 continue;
             }
 
             let ctx = self.build_peer_context(i);
 
-            // Find the worst (most distant, non-protected) connection
             if let Some(worst_id) = self.strategy.select_drop(&ctx, &mut self.rng) {
                 let worst_dist =
                     ring_distance(self.peers[i].location, self.peers[worst_id].location);
 
-                // Try to find a better connection via routing
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
-                if let Some(candidate) = self.route_to_peer(i, target_loc) {
+
+                let use_introduction = self.rng.random::<f64>() < intro_rate;
+                let candidate = if use_introduction {
+                    self.find_peer_near(i, target_loc)
+                } else {
+                    self.route_to_peer(i, target_loc)
+                };
+
+                if let Some(candidate) = candidate {
                     let candidate_dist =
                         ring_distance(self.peers[i].location, self.peers[candidate].location);
 
@@ -279,6 +289,18 @@ impl Network {
         })
     }
 
+    /// Find a peer near `target_loc` using the sorted location index. Models a
+    /// peer introduction mechanism (gateway introductions, peer exchange) where
+    /// a peer learns about another peer's location and address out-of-band.
+    fn find_peer_near(&self, from_id: usize, target_loc: f64) -> Option<usize> {
+        let results = self.k_nearest(target_loc, 5, from_id);
+        // Return the first result that isn't already connected
+        results
+            .into_iter()
+            .find(|(id, _)| !self.peers[from_id].connections.contains(id))
+            .map(|(id, _)| id)
+    }
+
     /// Find the k nearest peers to `location` using binary search on sorted locations.
     /// Returns Vec of (peer_id, distance). Much faster than scanning all peers.
     pub fn k_nearest(&self, location: f64, k: usize, exclude: usize) -> Vec<(usize, f64)> {
@@ -334,6 +356,12 @@ impl Network {
             .map(|&id| self.peers[id].location)
             .collect();
 
+        let nearest_peers: Vec<(usize, f64)> = self
+            .k_nearest(peer.location, 3, peer_id)
+            .into_iter()
+            .map(|(id, _dist)| (id, self.peers[id].location))
+            .collect();
+
         PeerContext {
             peer_id,
             location: peer.location,
@@ -341,7 +369,7 @@ impl Network {
             neighbor_locations: neighbor_locs,
             recent_requests: peer.recent_requests.clone(),
             connection_ids: peer.connections.iter().copied().collect(),
-            all_peer_locations: self.peers.iter().map(|p| p.location).collect(),
+            nearest_peers,
         }
     }
 }
@@ -354,6 +382,6 @@ pub struct PeerContext {
     pub neighbor_locations: Vec<f64>,
     pub recent_requests: Vec<f64>,
     pub connection_ids: Vec<usize>,
-    /// All peer locations in the network (for nearest-neighbor calculations).
-    pub all_peer_locations: Vec<f64>,
+    /// Nearest peers on the ring: (id, location), pre-computed via O(log n) lookup.
+    pub nearest_peers: Vec<(usize, f64)>,
 }
