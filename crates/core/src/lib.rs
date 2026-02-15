@@ -109,6 +109,9 @@ pub mod dev_tool {
         WakeupId,
     };
 
+    // Re-export fault injector for mid-simulation fault injection in Turmoil tests
+    pub use crate::node::{get_fault_injector, set_fault_injector, FaultInjectorState};
+
     // Re-export counter reset functions for deterministic simulation testing
     pub use crate::client_events::RequestId;
     pub use crate::contract::reset_event_id_counter;

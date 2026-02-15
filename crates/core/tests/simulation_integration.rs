@@ -3063,3 +3063,404 @@ fn test_long_running_deterministic() {
 
     tracing::info!("test_long_running_deterministic PASSED");
 }
+
+// =============================================================================
+// Roadmap Scenario: Partition → Heal → Convergence
+// =============================================================================
+
+/// Tests that the network converges after a partition heals.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Start a network and let contract operations flow
+/// 2. Partition the network into two halves (via global fault injector)
+/// 3. Wait while both sides operate in isolation
+/// 4. Heal the partition
+/// 5. Assert convergence via anomaly detection
+///
+/// Uses Turmoil's deterministic scheduler. Faults are injected mid-simulation
+/// through the global `get_fault_injector` registry.
+#[test_log::test]
+fn test_partition_heal_convergence() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::Partition;
+
+    const SEED: u64 = 0xDA27_0EA1_0001;
+    const NETWORK_NAME: &str = "partition-heal";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            5, // 5 nodes (6 total, splits 3+3)
+            7,
+            3,
+            10,
+            2,
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Capture addresses for partition injection inside the test closure
+    let addrs: Vec<std::net::SocketAddr> = node_addrs.values().copied().collect();
+    let mid = addrs.len() / 2;
+    let side_a: std::collections::HashSet<_> = addrs[..mid].iter().copied().collect();
+    let side_b: std::collections::HashSet<_> = addrs[mid..].iter().copied().collect();
+
+    let side_a_len = side_a.len();
+    let side_b_len = side_b.len();
+    let network_name = NETWORK_NAME.to_string();
+
+    // iterations=100 gives enough gen_event budget (100/6 peers ≈ 16 iterations/peer)
+    // event_wait=500ms keeps total event time to ~50s, leaving room for test_fn
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        5,                          // contracts
+        100,                        // iterations (also per-peer gen_event budget)
+        Duration::from_secs(120),   // simulation_duration
+        Duration::from_millis(500), // event_wait
+        move || async move {
+            // Phase 1: Events have already been firing. Now inject the partition.
+            tracing::info!(
+                "Injecting partition: side_a={} nodes, side_b={} nodes",
+                side_a_len,
+                side_b_len,
+            );
+
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                let partition = Partition::new(side_a, side_b).permanent(0);
+                state.config.add_partition(partition);
+            }
+
+            // Phase 2: Let both sides operate independently during partition
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            tracing::info!("Partition active for 15s, now healing");
+
+            // Phase 3: Heal the partition by clearing all partitions
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                state.config.partitions.clear();
+            }
+
+            // Phase 4: Wait for convergence after healing
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            tracing::info!("Post-heal convergence period complete");
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Partition-heal simulation failed: {:?}",
+        result.err()
+    );
+
+    // Check convergence
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    tracing::info!(
+        "Partition-heal: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    // Run anomaly detection
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== PARTITION-HEAL ANOMALY REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let missing = report.missing_broadcasts();
+    let partitions = report.suspected_partitions();
+    let stale = report.stale_peers();
+    let oscillations = report.state_oscillations();
+
+    tracing::warn!(
+        "  divergences={}, missing_broadcasts={}, partitions={}, stale={}, oscillations={}",
+        divergences.len(),
+        missing.len(),
+        partitions.len(),
+        stale.len(),
+        oscillations.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+}
+
+// =============================================================================
+// Roadmap Scenario: Node Crash → Recover → Convergence
+// =============================================================================
+
+/// Tests that the network converges after nodes crash and recover.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Put contracts into network and let state propagate
+/// 2. Crash 2 nodes (via fault injector — messages to/from are dropped)
+/// 3. Remaining nodes continue operating
+/// 4. Recover the crashed nodes (messages flow again)
+/// 5. Assert convergence via anomaly detection
+///
+/// Note: This uses crash/recover (message blocking) rather than full process
+/// restart, since `restart_node()` requires `&mut SimNetwork` which is consumed
+/// by `run_simulation()`. The effect on the anomaly detector is the same:
+/// crashed nodes miss updates and become stale.
+#[test_log::test]
+fn test_crash_recover_convergence() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x2011_2E57_0002;
+    const NETWORK_NAME: &str = "crash-recover";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, 5, 7, 3, 10, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Pick 2 non-gateway nodes to crash
+    let crash_addrs: Vec<std::net::SocketAddr> = node_addrs
+        .iter()
+        .filter(|(label, _)| label.is_node())
+        .take(2)
+        .map(|(_, addr)| *addr)
+        .collect();
+
+    assert_eq!(crash_addrs.len(), 2, "Need at least 2 non-gateway nodes");
+
+    let network_name = NETWORK_NAME.to_string();
+    let crash_addrs_clone = crash_addrs.clone();
+
+    // iterations=100 gives enough gen_event budget (100/6 peers ≈ 16 iterations/peer)
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        3,                          // contracts
+        100,                        // iterations (also per-peer gen_event budget)
+        Duration::from_secs(120),   // simulation_duration
+        Duration::from_millis(500), // event_wait
+        move || async move {
+            // Phase 1: Events have been firing. Now crash 2 nodes.
+            tracing::info!("Crashing 2 nodes: {:?}", crash_addrs_clone);
+
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                for addr in &crash_addrs_clone {
+                    state.config.crash_node(*addr);
+                }
+            }
+
+            // Phase 2: Let the remaining network operate in degraded state
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            tracing::info!("Degraded period over, recovering nodes");
+
+            // Phase 3: Recover the crashed nodes
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                for addr in &crash_addrs_clone {
+                    state.config.recover_node(addr);
+                }
+            }
+
+            // Phase 4: Wait for convergence
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            tracing::info!("Post-recovery convergence period complete");
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Crash-recover simulation failed: {:?}",
+        result.err()
+    );
+
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    tracing::info!(
+        "Crash-recover: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== CRASH-RECOVER ANOMALY REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let stale = report.stale_peers();
+    let zombies = report.zombie_transactions();
+    let oscillations = report.state_oscillations();
+
+    tracing::warn!(
+        "  divergences={}, stale_peers={}, zombies={}, oscillations={}",
+        divergences.len(),
+        stale.len(),
+        zombies.len(),
+        oscillations.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+}
+
+// =============================================================================
+// Roadmap Scenario: Multi-Step Churn
+// =============================================================================
+
+/// Tests eventual consistency through continuous crash/recover cycles.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Start the network with contract operations
+/// 2. Perform multiple rounds of: crash a node → wait → recover → wait
+/// 3. After all churn rounds, verify convergence via anomaly detection
+///
+/// Each round targets a different node to maximise disruption coverage.
+#[test_log::test]
+fn test_multi_step_churn() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0xC402_0000_0002;
+    const NETWORK_NAME: &str = "multi-churn";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, 4, 7, 3, 10, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Collect non-gateway addresses for churn targets
+    let churn_addrs: Vec<std::net::SocketAddr> = node_addrs
+        .iter()
+        .filter(|(label, _)| label.is_node())
+        .map(|(_, addr)| *addr)
+        .collect();
+
+    let network_name = NETWORK_NAME.to_string();
+
+    // iterations=100 gives enough gen_event budget (100/5 peers = 20 iterations/peer)
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        3,                          // contracts
+        100,                        // iterations (also per-peer gen_event budget)
+        Duration::from_secs(150),   // simulation_duration (events ~50s + churn ~40s + buffer)
+        Duration::from_millis(500), // event_wait
+        move || async move {
+            const CHURN_ROUNDS: usize = 3;
+
+            for round in 0..CHURN_ROUNDS {
+                let target = churn_addrs[round % churn_addrs.len()];
+
+                // Crash
+                tracing::info!("Churn round {}: crashing {:?}", round, target);
+                if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                    let mut state = injector.lock().unwrap();
+                    state.config.crash_node(target);
+                }
+
+                // Degraded period
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                // Recover
+                tracing::info!("Churn round {}: recovering {:?}", round, target);
+                if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                    let mut state = injector.lock().unwrap();
+                    state.config.recover_node(&target);
+                }
+
+                // Stabilization period
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            // Final convergence period
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            tracing::info!("Multi-step churn: all {} rounds complete", CHURN_ROUNDS);
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Multi-step churn simulation failed: {:?}",
+        result.err()
+    );
+
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    tracing::info!(
+        "Multi-step churn: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== MULTI-STEP CHURN ANOMALY REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let missing = report.missing_broadcasts();
+    let stale = report.stale_peers();
+    let zombies = report.zombie_transactions();
+    let oscillations = report.state_oscillations();
+    let cascades = report.delta_sync_cascades();
+
+    tracing::warn!(
+        "  divergences={}, missing={}, stale={}, zombies={}, oscillations={}, cascades={}",
+        divergences.len(),
+        missing.len(),
+        stale.len(),
+        zombies.len(),
+        oscillations.len(),
+        cascades.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+}

@@ -69,6 +69,11 @@ pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod message_processor;
 mod network_bridge;
+
+// Re-export fault injection types for test infrastructure.
+// No cfg gate: underlying items are unconditionally compiled and integration
+// tests compile the lib without cfg(test).
+pub use network_bridge::in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState};
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod proximity_cache;
