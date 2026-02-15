@@ -2287,14 +2287,48 @@ use freenet::dev_tool::{
 /// Parametrized CRDT convergence test.
 ///
 /// All nodes subscribe then update simultaneously. Verifies convergence.
+/// Each (nodes, gateways) combo is tested with 5 different seeds to detect
+/// topology-dependent failures. See #3028.
+///
 /// Run with: cargo test -p freenet --features simulation_tests,testing test_crdt_convergence -- --test-threads=1
 #[rstest::rstest]
-#[case::n3_g1("crdt-3n-1gw", 0x2773_0003_0001, 1, 3)]
-#[case::n4_g1("crdt-4n-1gw", 0x2773_0004_0001, 1, 4)]
-#[case::n5_g1("crdt-5n-1gw", 0x2773_0005_0001, 1, 5)]
-#[case::n7_g1("crdt-7n-1gw", 0x2773_0007_0001, 1, 7)]
-#[case::n5_g2("crdt-5n-2gw", 0x2773_0005_0002, 2, 5)]
-#[case::n6_g2("crdt-6n-2gw", 0x2773_0006_0002, 2, 6)]
+#[case::n3_g1_s1("crdt-3n-1gw-s1", 0x2773_0003_0001, 1, 3)]
+#[case::n3_g1_s2("crdt-3n-1gw-s2", 0x2773_0003_0002, 1, 3)]
+#[case::n3_g1_s3("crdt-3n-1gw-s3", 0x2773_0003_0003, 1, 3)]
+#[case::n3_g1_s4("crdt-3n-1gw-s4", 0x2773_0003_0004, 1, 3)]
+#[case::n3_g1_s5("crdt-3n-1gw-s5", 0x2773_0003_0005, 1, 3)]
+#[case::n4_g1_s1("crdt-4n-1gw-s1", 0x2773_0004_0001, 1, 4)]
+#[case::n4_g1_s2("crdt-4n-1gw-s2", 0x2773_0004_0002, 1, 4)]
+#[case::n4_g1_s3("crdt-4n-1gw-s3", 0x2773_0004_0003, 1, 4)]
+#[case::n4_g1_s4("crdt-4n-1gw-s4", 0x2773_0004_0004, 1, 4)]
+#[case::n4_g1_s5("crdt-4n-1gw-s5", 0x2773_0004_0005, 1, 4)]
+#[case::n5_g1_s1("crdt-5n-1gw-s1", 0x2773_0005_0001, 1, 5)]
+#[case::n5_g1_s2("crdt-5n-1gw-s2", 0x2773_0005_0002, 1, 5)]
+#[case::n5_g1_s3("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5)]
+#[case::n5_g1_s4("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5)]
+#[case::n5_g1_s5("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5)]
+#[case::n6_g1_s3("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6)]
+#[case::n6_g1_s4("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6)]
+#[case::n6_g1_s5("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6)]
+#[case::n7_g1_s1("crdt-7n-1gw-s1", 0x2773_0007_0001, 1, 7)]
+#[case::n7_g1_s2("crdt-7n-1gw-s2", 0x2773_0007_0002, 1, 7)]
+#[case::n7_g1_s3("crdt-7n-1gw-s3", 0x2773_0007_0003, 1, 7)]
+#[case::n7_g1_s4("crdt-7n-1gw-s4", 0x2773_0007_0004, 1, 7)]
+#[case::n7_g1_s5("crdt-7n-1gw-s5", 0x2773_0007_0005, 1, 7)]
+#[case::n8_g1_s2("crdt-8n-1gw-s2", 0x2773_0008_0002, 1, 8)]
+#[case::n8_g1_s3("crdt-8n-1gw-s3", 0x2773_0008_0003, 1, 8)]
+#[case::n8_g1_s4("crdt-8n-1gw-s4", 0x2773_0008_0004, 1, 8)]
+#[case::n8_g1_s5("crdt-8n-1gw-s5", 0x2773_0008_0005, 1, 8)]
+#[case::n5_g2_s1("crdt-5n-2gw-s1", 0x2773_0005_1001, 2, 5)]
+#[case::n5_g2_s2("crdt-5n-2gw-s2", 0x2773_0005_1002, 2, 5)]
+#[case::n5_g2_s3("crdt-5n-2gw-s3", 0x2773_0005_1003, 2, 5)]
+#[case::n5_g2_s4("crdt-5n-2gw-s4", 0x2773_0005_1004, 2, 5)]
+#[case::n5_g2_s5("crdt-5n-2gw-s5", 0x2773_0005_1005, 2, 5)]
+#[case::n6_g2_s1("crdt-6n-2gw-s1", 0x2773_0006_1001, 2, 6)]
+#[case::n6_g2_s2("crdt-6n-2gw-s2", 0x2773_0006_1002, 2, 6)]
+#[case::n6_g2_s3("crdt-6n-2gw-s3", 0x2773_0006_1003, 2, 6)]
+#[case::n6_g2_s4("crdt-6n-2gw-s4", 0x2773_0006_1004, 2, 6)]
+#[case::n6_g2_s5("crdt-6n-2gw-s5", 0x2773_0006_1005, 2, 6)]
 fn test_crdt_convergence(
     #[case] name: &'static str,
     #[case] seed: u64,
@@ -2402,25 +2436,25 @@ fn test_crdt_convergence(
     clear_crdt_contracts();
 }
 
-// TODO-MUST-FIX: CRDT convergence fails for specific seed/topology combinations.
-// Seeds 0x2773_0006_0001 (6n/1gw) and 0x2773_0008_0001 (8n/1gw) produce
-// topologies where not all CRDT updates propagate within 90s convergence
-// window. Other node counts (3-5, 7) and multi-gateway configs converge fine.
-// Pre-existing on main — not a regression. Likely a broadcast propagation
-// issue with certain ring topologies. Needs GitHub issue.
-
-/// CRDT convergence: 6 nodes, 1 gateway — known failing seed/topology.
+// Known-failing seeds: topologies where CRDT updates don't propagate to all
+// subscribers due to Location::random() in join_ring_request (PR #2907).
+// Tracked in #3028.
 #[test_log::test]
 #[ignore]
-fn test_crdt_convergence_n6_g1() {
-    test_crdt_convergence("crdt-6n-1gw", 0x2773_0006_0001, 1, 6);
+fn test_crdt_convergence_n6_g1_s1() {
+    test_crdt_convergence("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6);
 }
 
-/// CRDT convergence: 8 nodes, 1 gateway — known failing seed/topology.
 #[test_log::test]
 #[ignore]
-fn test_crdt_convergence_n8_g1() {
-    test_crdt_convergence("crdt-8n-1gw", 0x2773_0008_0001, 1, 8);
+fn test_crdt_convergence_n6_g1_s2() {
+    test_crdt_convergence("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6);
+}
+
+#[test_log::test]
+#[ignore]
+fn test_crdt_convergence_n8_g1_s1() {
+    test_crdt_convergence("crdt-8n-1gw-s1", 0x2773_0008_0001, 1, 8);
 }
 
 /// Test: CRDT convergence with N nodes updating simultaneously.

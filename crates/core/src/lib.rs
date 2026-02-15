@@ -144,6 +144,9 @@ pub mod dev_tool {
     pub fn reset_all_simulation_state() {
         // Reset RNG (caller should set seed after this)
         crate::config::GlobalRng::clear_seed();
+        // Reset thread index counter so new threads get deterministic indices.
+        // Safe when running with --test-threads=1 (no concurrent test threads).
+        crate::config::GlobalRng::reset_thread_index_counter();
 
         // Reset simulation time (caller should set time after this if needed)
         crate::config::GlobalSimulationTime::clear_time();
