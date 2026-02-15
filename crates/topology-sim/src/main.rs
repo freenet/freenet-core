@@ -11,7 +11,7 @@ use network::Network;
 use strategy::Strategy;
 
 fn main() {
-    let scales = [300, 3_000];
+    let scales = [300, 3_000, 30_000];
 
     for &n in &scales {
         println!("\n{}", "=".repeat(60));
