@@ -153,14 +153,13 @@ impl Network {
                 let target_peer = if uses_intro && current_conns < self.min_connections {
                     self.find_peer_near(i, target_loc)
                 } else {
-                    let routed = self.route_to_peer(i, target_loc);
-                    if routed.is_some() {
-                        routed
-                    } else if uses_intro {
-                        self.find_peer_near(i, target_loc)
-                    } else {
-                        None
-                    }
+                    self.route_to_peer(i, target_loc).or_else(|| {
+                        if uses_intro {
+                            self.find_peer_near(i, target_loc)
+                        } else {
+                            None
+                        }
+                    })
                 };
 
                 if let Some(target_peer) = target_peer {

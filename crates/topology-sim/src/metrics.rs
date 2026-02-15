@@ -1,6 +1,7 @@
 //! Topology quality metrics: distance distribution, routing efficiency, neighbor connectivity.
 
 use crate::network::{ring_distance, Network};
+use rand::Rng;
 use std::collections::HashSet;
 
 pub struct HistogramBin {
@@ -55,17 +56,16 @@ pub fn compute(net: &Network) -> Metrics {
         distances.iter().sum::<f64>() / distances.len() as f64
     };
 
-    let short_pct = if distances.is_empty() {
-        0.0
-    } else {
-        distances.iter().filter(|&&d| d < 0.1).count() as f64 / distances.len() as f64 * 100.0
+    let pct_matching = |predicate: fn(&f64) -> bool| -> f64 {
+        if distances.is_empty() {
+            0.0
+        } else {
+            distances.iter().filter(|&d| predicate(d)).count() as f64 / distances.len() as f64
+                * 100.0
+        }
     };
-
-    let long_pct = if distances.is_empty() {
-        0.0
-    } else {
-        distances.iter().filter(|&&d| d > 0.3).count() as f64 / distances.len() as f64 * 100.0
-    };
+    let short_pct = pct_matching(|&d| d < 0.1);
+    let long_pct = pct_matching(|&d| d > 0.3);
 
     // Nearest-3 connectivity
     let nearest_3_pct = compute_nearest_3(net);
@@ -114,18 +114,10 @@ fn compute_nearest_3(net: &Network) -> f64 {
     let mut checked = 0;
 
     for peer in &net.peers {
-        // Find 3 nearest by ring distance
-        let mut others: Vec<(usize, f64)> = net
-            .peers
-            .iter()
-            .filter(|p| p.id != peer.id)
-            .map(|p| (p.id, ring_distance(peer.location, p.location)))
-            .collect();
-        others.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-        for &(id, _) in others.iter().take(3) {
+        let nearest = net.k_nearest(peer.location, 3, peer.id);
+        for (id, _) in &nearest {
             checked += 1;
-            if peer.connections.contains(&id) {
+            if peer.connections.contains(id) {
                 connected += 1;
             }
         }
@@ -153,7 +145,6 @@ fn compute_greedy_routing(net: &Network) -> (f64, f64) {
     let max_hops = (n as f64).log2() as usize * 5; // generous limit
 
     for _ in 0..num_trials {
-        use rand::Rng;
         let src = rng.random_range(0..n);
         let mut dst = rng.random_range(0..n);
         while dst == src {

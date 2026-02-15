@@ -101,12 +101,6 @@ const DENSITY_SELECTION_THRESHOLD: usize = 5;
 /// Reimplementation of the current Freenet connection selection algorithm.
 pub struct Current;
 
-impl Default for Current {
-    fn default() -> Self {
-        Self
-    }
-}
-
 impl Current {
     /// Build a density map from request history, attributing each request to the nearest
     /// neighbor. Returns sorted vec of (location, count) pairs.
@@ -240,12 +234,6 @@ impl Current {
 /// Proposed strategy based on Kleinberg (2000). See module-level documentation
 /// for theoretical justification of each design decision.
 pub struct SmallWorld;
-
-impl Default for SmallWorld {
-    fn default() -> Self {
-        Self
-    }
-}
 
 impl SmallWorld {
     /// Generate a random link distance following Kleinberg's d^{-1} distribution.
