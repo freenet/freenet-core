@@ -248,15 +248,26 @@ impl SmallWorld {
         max_connections: usize,
         rng: &mut impl Rng,
     ) -> bool {
-        if ctx.connection_count < min_connections {
+        // Always accept first few connections (need *something*)
+        if ctx.connection_count < 3 {
             return true;
         }
         if ctx.connection_count >= max_connections {
             return false;
         }
 
+        // Distance-biased acceptance: strongly prefer short connections.
+        // Even below min_connections, reject very distant peers to shape topology
+        // from the start rather than accepting random connections and trying to
+        // fix them later via maintenance.
         let dist = ring_distance(ctx.location, candidate_loc);
-        let accept_prob = 1.0 / (1.0 + 10.0 * dist);
+
+        // Scale acceptance based on how full we are
+        let fullness = ctx.connection_count as f64 / min_connections as f64;
+        // At 3 connections (fullness ~0.3): accept_prob = 1/(1 + 3*d) — mild bias
+        // At min_connections (fullness 1.0): accept_prob = 1/(1 + 20*d) — strong bias
+        let strength = 3.0 + 17.0 * fullness.min(1.0);
+        let accept_prob = 1.0 / (1.0 + strength * dist);
         rng.random::<f64>() < accept_prob
     }
 

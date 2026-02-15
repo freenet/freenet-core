@@ -37,6 +37,9 @@ pub struct Network {
     strategy: Strategy,
     rng: rand::rngs::ThreadRng,
     tick_count: usize,
+    /// Index of the gateway peer (first peer, well-connected).
+    #[allow(dead_code)]
+    gateway_id: usize,
 }
 
 impl Network {
@@ -51,11 +54,26 @@ impl Network {
             .map(|id| Peer::new(id, rng.random::<f64>()))
             .collect();
 
-        // Sort by location for efficient neighbor lookups
+        // Sort by location for consistent ordering
         peers.sort_by(|a, b| a.location.partial_cmp(&b.location).unwrap());
-        // Reassign IDs to match sorted order
         for (i, p) in peers.iter_mut().enumerate() {
             p.id = i;
+        }
+
+        // Bootstrap: each peer joins through a gateway and gets routed to 2 random
+        // initial connections. This gives minimal connectivity for routing to work,
+        // while leaving most connection slots empty for the strategy to fill.
+        let gateway_id = 0;
+        for i in 1..num_peers {
+            let mut targets: Vec<usize> = (0..i).collect();
+            for j in (1..targets.len()).rev() {
+                let k = rng.random_range(0..=j);
+                targets.swap(j, k);
+            }
+            for &t in targets.iter().take(2) {
+                peers[i].connections.insert(t);
+                peers[t].connections.insert(i);
+            }
         }
 
         Self {
@@ -65,6 +83,7 @@ impl Network {
             strategy,
             rng,
             tick_count: 0,
+            gateway_id,
         }
     }
 
@@ -84,7 +103,6 @@ impl Network {
 
     fn generate_requests(&mut self) {
         let n = self.peers.len();
-        // Each peer gets a few random request targets per tick
         for i in 0..n {
             let num_requests = 2 + self.rng.random_range(0..3u32);
             for _ in 0..num_requests {
@@ -102,35 +120,35 @@ impl Network {
 
     fn seek_connections(&mut self) {
         let n = self.peers.len();
-        // Collect connection targets first, then apply (borrow-checker friendly)
         let mut new_connections: Vec<(usize, usize)> = Vec::new();
 
         for i in 0..n {
-            if self.peers[i].connections.len() >= self.min_connections {
+            let current_conns = self.peers[i].connections.len();
+            if current_conns >= self.min_connections {
                 continue;
             }
 
-            // Build context for strategy
-            let ctx = self.build_peer_context(i);
-            let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
+            // Try multiple connection attempts per tick when far below target
+            let attempts = ((self.min_connections - current_conns) / 2).clamp(1, 3);
+            for _ in 0..attempts {
+                let ctx = self.build_peer_context(i);
+                let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
 
-            // Find the best unconnected peer near target_loc
-            if let Some(target_peer) = self.find_peer_near(i, target_loc) {
-                // Check if target accepts the connection
-                let target_ctx = self.build_peer_context(target_peer);
-                if self.strategy.accept_connection(
-                    &target_ctx,
-                    self.peers[i].location,
-                    self.min_connections,
-                    self.max_connections,
-                    &mut self.rng,
-                ) {
-                    new_connections.push((i, target_peer));
+                if let Some(target_peer) = self.route_to_peer(i, target_loc) {
+                    let target_ctx = self.build_peer_context(target_peer);
+                    if self.strategy.accept_connection(
+                        &target_ctx,
+                        self.peers[i].location,
+                        self.min_connections,
+                        self.max_connections,
+                        &mut self.rng,
+                    ) {
+                        new_connections.push((i, target_peer));
+                    }
                 }
             }
         }
 
-        // Apply connections
         for (a, b) in new_connections {
             if self.peers[a].connections.len() < self.max_connections
                 && self.peers[b].connections.len() < self.max_connections
@@ -157,20 +175,61 @@ impl Network {
         }
     }
 
-    /// Find the closest unconnected peer to `target_loc`, excluding `self_id`.
-    fn find_peer_near(&self, self_id: usize, target_loc: f64) -> Option<usize> {
-        self.peers
-            .iter()
-            .filter(|p| p.id != self_id && !self.peers[self_id].connections.contains(&p.id))
-            .min_by(|a, b| {
-                ring_distance(a.location, target_loc)
-                    .partial_cmp(&ring_distance(b.location, target_loc))
-                    .unwrap()
-            })
-            .map(|p| p.id)
+    /// Simulate the CONNECT routing process: greedy-forward through existing topology
+    /// toward `target_loc` with a TTL. Like real Freenet, each hop decrements TTL and
+    /// forwards to the neighbor closest to the target. When TTL expires or routing gets
+    /// stuck, we connect to wherever we landed.
+    ///
+    /// Key realism feature: this naturally adds noise — the peer you reach depends on
+    /// the current topology, not on omniscient knowledge. If the topology has poor
+    /// coverage in some ring region, connections to that region will land on random
+    /// nearby peers instead.
+    fn route_to_peer(&self, from_id: usize, target_loc: f64) -> Option<usize> {
+        let ttl = 10;
+        let mut current = from_id;
+        let mut visited: HashSet<usize> = HashSet::new();
+        visited.insert(from_id);
+        let mut best_candidate = None;
+        let mut best_dist = f64::MAX;
+
+        for _ in 0..ttl {
+            // Find the neighbor of `current` closest to target_loc
+            let next = self.peers[current]
+                .connections
+                .iter()
+                .filter(|&&id| !visited.contains(&id) && id != from_id)
+                .min_by(|&&a, &&b| {
+                    ring_distance(self.peers[a].location, target_loc)
+                        .partial_cmp(&ring_distance(self.peers[b].location, target_loc))
+                        .unwrap()
+                })
+                .copied();
+
+            match next {
+                Some(next_id) => {
+                    visited.insert(next_id);
+                    let d = ring_distance(self.peers[next_id].location, target_loc);
+                    // Track best candidate we've seen that isn't already connected to us
+                    if d < best_dist && !self.peers[from_id].connections.contains(&next_id) {
+                        best_dist = d;
+                        best_candidate = Some(next_id);
+                    }
+                    current = next_id;
+                }
+                None => break,
+            }
+        }
+
+        // Return best peer found along the route, or the terminal peer
+        best_candidate.or_else(|| {
+            if current != from_id && !self.peers[from_id].connections.contains(&current) {
+                Some(current)
+            } else {
+                None
+            }
+        })
     }
 
-    /// Build a strategy context for a given peer.
     pub fn build_peer_context(&self, peer_id: usize) -> PeerContext {
         let peer = &self.peers[peer_id];
         let neighbor_locs: Vec<f64> = peer

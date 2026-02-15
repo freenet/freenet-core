@@ -27,8 +27,8 @@ fn main() {
             println!("\n--- Strategy: {} ---", name);
             let mut net = Network::new(n, 10, 20, strat);
 
-            // Run simulation: 200 ticks of connection formation + maintenance
-            for _ in 0..200 {
+            // Run simulation: 500 ticks of connection formation + maintenance
+            for _ in 0..500 {
                 net.tick();
             }
 
