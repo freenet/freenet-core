@@ -16,11 +16,15 @@ fn main() {
         (300, 10, 20),
         (3_000, 10, 20),
         (30_000, 15, 30),
+        (100_000, 15, 30),
     ];
 
     for &(n, min_conn, max_conn) in &scales {
         println!("\n{}", "=".repeat(60));
-        println!("  SCALE: {} peers  (connections: {}-{})", n, min_conn, max_conn);
+        println!(
+            "  SCALE: {} peers  (connections: {}-{})",
+            n, min_conn, max_conn
+        );
         println!("{}", "=".repeat(60));
 
         let strategies: Vec<(&str, Strategy)> = vec![
@@ -39,7 +43,11 @@ fn main() {
             }
 
             let elapsed = start.elapsed();
-            println!("\n--- Strategy: {} ({:.1}s) ---", name, elapsed.as_secs_f64());
+            println!(
+                "\n--- Strategy: {} ({:.1}s) ---",
+                name,
+                elapsed.as_secs_f64()
+            );
 
             let m = metrics::compute(&net);
             println!("  Connections:  {}", m.total_connections);

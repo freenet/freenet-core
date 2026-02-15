@@ -51,7 +51,6 @@ impl Strategy {
             Strategy::SmallWorld(_) => 0.5,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -211,15 +210,19 @@ impl Default for SmallWorld {
 
 impl SmallWorld {
     /// Generate a random link distance following Kleinberg's d^{-1} distribution.
-    fn random_link_distance(rng: &mut impl Rng) -> f64 {
-        let d_min: f64 = 0.001;
+    /// d_min is scaled to the nearest-neighbor distance so there's no gap between
+    /// short-range (nearest-3) and long-range (Kleinberg) connections.
+    fn random_link_distance(nearest_neighbor_dist: f64, rng: &mut impl Rng) -> f64 {
+        // d_min should be slightly above nearest-neighbor distance (those are
+        // handled by the nearest-3 protection). Use 3x nearest to avoid overlap.
+        let d_min: f64 = (nearest_neighbor_dist * 3.0).max(0.0001);
         let d_max: f64 = 0.5;
         let u: f64 = rng.random();
         d_min * (d_max / d_min).powf(u)
     }
 
-    fn kleinberg_target(location: f64, rng: &mut impl Rng) -> f64 {
-        let dist = Self::random_link_distance(rng);
+    fn kleinberg_target(location: f64, nearest_neighbor_dist: f64, rng: &mut impl Rng) -> f64 {
+        let dist = Self::random_link_distance(nearest_neighbor_dist, rng);
         if rng.random::<bool>() {
             (location + dist) % 1.0
         } else {
@@ -235,7 +238,14 @@ impl SmallWorld {
             }
         }
 
-        Self::kleinberg_target(ctx.location, rng)
+        // Estimate nearest-neighbor distance from the context
+        let nn_dist = ctx
+            .nearest_peers
+            .first()
+            .map(|(_, loc)| ring_distance(ctx.location, *loc))
+            .unwrap_or(0.001);
+
+        Self::kleinberg_target(ctx.location, nn_dist, rng)
     }
 
     fn accept_connection(
