@@ -441,6 +441,19 @@ async fn test_eventual_consistency_state_hashes() {
             convergence_rate * 100.0
         );
     }
+
+    // Run anomaly detection on the simulation event logs
+    let report = sim.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (eventual-consistency): {} events, {} state events, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::warn!("  anomaly[{}] = {:?}", i, anomaly);
+    }
 }
 
 // =============================================================================
@@ -467,6 +480,19 @@ async fn test_fault_injection_bridge() {
 
     let normal_events = sim_normal.get_event_counts().await;
     let normal_total: usize = normal_events.values().sum();
+
+    // Run anomaly detection on normal run
+    let normal_report = sim_normal.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (normal run): {} events, {} state events, {} anomalies ===",
+        normal_report.total_events,
+        normal_report.state_events,
+        normal_report.anomalies.len()
+    );
+    for (i, anomaly) in normal_report.anomalies.iter().enumerate() {
+        tracing::warn!("  normal anomaly[{}] = {:?}", i, anomaly);
+    }
+
     sim_normal.clear_fault_injection();
 
     tracing::info!("Normal run completed: {} events", normal_total);
@@ -487,6 +513,26 @@ async fn test_fault_injection_bridge() {
 
     let lossy_events = sim_lossy.get_event_counts().await;
     let lossy_total: usize = lossy_events.values().sum();
+
+    // Run anomaly detection on lossy run - expect MORE anomalies than normal
+    let lossy_report = sim_lossy.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (50% loss run): {} events, {} state events, {} anomalies ===",
+        lossy_report.total_events,
+        lossy_report.state_events,
+        lossy_report.anomalies.len()
+    );
+    for (i, anomaly) in lossy_report.anomalies.iter().enumerate() {
+        tracing::warn!("  lossy anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    // Compare anomaly counts between normal and lossy runs
+    tracing::info!(
+        "=== ANOMALY COMPARISON: normal={} anomalies vs lossy={} anomalies ===",
+        normal_report.anomalies.len(),
+        lossy_report.anomalies.len()
+    );
+
     sim_lossy.clear_fault_injection();
 
     tracing::info!("Lossy run (50% loss) completed: {} events", lossy_total);

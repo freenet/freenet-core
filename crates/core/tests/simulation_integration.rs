@@ -509,6 +509,71 @@ impl TestResult {
 
         self
     }
+
+    /// Run anomaly detection on the simulation event logs and report findings.
+    ///
+    /// This is exploratory: it logs all detected anomalies without asserting
+    /// that the report is clean. This lets us see what the detectors find
+    /// against real simulation data.
+    fn verify_state_report(self) -> Self {
+        let rt = create_runtime();
+        let report = rt.block_on(async {
+            let logs = self.logs_handle.lock().await;
+            let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+            verifier.verify()
+        });
+
+        tracing::info!("=== ANOMALY DETECTION REPORT: {} ===", self.name);
+        tracing::info!(
+            "Events analyzed: {} total, {} state-mutating",
+            report.total_events,
+            report.state_events
+        );
+        tracing::info!("Contracts analyzed: {}", report.contracts_analyzed);
+        tracing::info!("Total anomalies: {}", report.anomalies.len());
+
+        if report.anomalies.is_empty() {
+            tracing::info!(
+                "{}: State verification CLEAN - no anomalies detected",
+                self.name
+            );
+        } else {
+            // Break down by category
+            let divergences = report.divergences();
+            let missing = report.missing_broadcasts();
+            let unapplied = report.unapplied_broadcasts();
+            let partitions = report.suspected_partitions();
+            let stale = report.stale_peers();
+            let oscillations = report.state_oscillations();
+            let zombies = report.zombie_transactions();
+            let storms = report.broadcast_storms();
+            let cascades = report.delta_sync_cascades();
+
+            tracing::warn!(
+                "{}: {} anomalies detected: divergences={}, missing_broadcasts={}, \
+                 unapplied_broadcasts={}, partitions={}, stale_peers={}, oscillations={}, \
+                 zombies={}, storms={}, cascades={}",
+                self.name,
+                report.anomalies.len(),
+                divergences.len(),
+                missing.len(),
+                unapplied.len(),
+                partitions.len(),
+                stale.len(),
+                oscillations.len(),
+                zombies.len(),
+                storms.len(),
+                cascades.len(),
+            );
+
+            // Log each anomaly at debug level for detailed inspection
+            for (i, anomaly) in report.anomalies.iter().enumerate() {
+                tracing::debug!("{}: anomaly[{}] = {:?}", self.name, i, anomaly);
+            }
+        }
+
+        self
+    }
 }
 
 // =============================================================================
@@ -933,7 +998,8 @@ fn ci_quick_simulation() {
         .run()
         .assert_ok()
         .verify_operation_coverage()
-        .check_convergence();
+        .check_convergence()
+        .verify_state_report();
 }
 
 /// CI simulation test - medium network with more operations.
@@ -943,7 +1009,8 @@ fn ci_medium_simulation() {
         .run()
         .assert_ok()
         .verify_operation_coverage()
-        .check_convergence();
+        .check_convergence()
+        .verify_state_report();
 }
 
 // =============================================================================
@@ -967,7 +1034,8 @@ fn replica_validation_and_stepwise_consistency() {
         .run()
         .assert_ok()
         .verify_operation_coverage()
-        .check_convergence();
+        .check_convergence()
+        .verify_state_report();
 }
 
 /// Dense network test with high connectivity.
@@ -979,7 +1047,8 @@ fn dense_network_replication() {
         .run()
         .assert_ok()
         .verify_operation_coverage()
-        .check_convergence();
+        .check_convergence()
+        .verify_state_report();
 }
 
 // =============================================================================
@@ -1586,7 +1655,8 @@ fn test_concurrent_updates_convergence() {
         .run()
         .assert_ok()
         .verify_operation_coverage()
-        .check_convergence();
+        .check_convergence()
+        .verify_state_report();
 }
 
 // =============================================================================
