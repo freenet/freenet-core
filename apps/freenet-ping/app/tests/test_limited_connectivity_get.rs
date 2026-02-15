@@ -43,7 +43,7 @@ use std::{
 
 use freenet::{
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
     test_utils::{allocate_test_node_block, test_ip_for_node},
 };
 use freenet_stdlib::{
@@ -127,7 +127,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -140,7 +140,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

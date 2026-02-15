@@ -3,7 +3,7 @@ mod common;
 use std::{net::TcpListener, time::Duration};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_client_api};
 use freenet_stdlib::{
     client_api::{ClientRequest, HostResponse},
     prelude::*,
@@ -81,7 +81,7 @@ async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

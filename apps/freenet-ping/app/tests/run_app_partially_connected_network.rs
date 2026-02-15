@@ -21,7 +21,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -233,7 +233,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let gateway_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_service = serve_gateway(config.ws_api).await?;
+            let gateway_service = serve_client_api(config.ws_api).await?;
             let node = node.build(gateway_service).await?;
             node.run().await
         }
@@ -251,7 +251,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let regular_node_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_service = serve_gateway(config.ws_api).await?;
+            let gateway_service = serve_client_api(config.ws_api).await?;
             let node = node.build(gateway_service).await?;
             node.run().await
         }

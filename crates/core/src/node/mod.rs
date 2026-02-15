@@ -1811,7 +1811,7 @@ pub async fn run_local_node(
         _ => {}
     }
 
-    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await?;
+    let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
 
     // TODO: use combinator instead
     // let mut all_clients =
@@ -1849,7 +1849,7 @@ pub async fn run_local_node(
                     .await
             }
             ClientRequest::DelegateOp(op) => {
-                // Use the attested_contract already resolved by WebSocket/HttpGateway
+                // Use the attested_contract already resolved by the WebSocket/HTTP client API
                 // instead of re-looking up from gw.attested_contracts (which could fail
                 // if the token expired between WebSocket connect and this request)
                 let op_name = match op {

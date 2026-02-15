@@ -3,7 +3,7 @@ mod common;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_client_api};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{
@@ -264,7 +264,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -275,7 +275,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
         let config = config_node.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -642,7 +642,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -658,7 +658,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -673,7 +673,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1343,7 +1343,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1358,7 +1358,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1373,7 +1373,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

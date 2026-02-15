@@ -7,8 +7,8 @@
 //! See [`../architecture.md`](../architecture.md) for its place in the overall architecture.
 
 pub(crate) mod app_packaging;
+pub(crate) mod client_api;
 pub(crate) mod errors;
-pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use http_gateway::HttpGateway;
+use client_api::HttpClientApi;
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -34,12 +34,12 @@ use crate::{
 pub use app_packaging::WebApp;
 
 // Export types needed for integration testing
-pub use http_gateway::{AttestedContract, AttestedContractMap};
+pub use client_api::{AttestedContract, AttestedContractMap};
 
-/// API version for websocket and HTTP gateway **routing**.
+/// API version for websocket and HTTP client API **routing**.
 ///
 /// This controls URL path prefixes (`/v1/...` vs `/v2/...`) and is used by
-/// the HTTP gateway and WebSocket proxy to version client-facing endpoints.
+/// the HTTP client API and WebSocket proxy to version client-facing endpoints.
 ///
 /// **Not to be confused with [`crate::wasm_runtime::delegate_api::DelegateApiVersion`]**,
 /// which governs WASM-level delegate host function availability and is
@@ -107,7 +107,7 @@ async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> 
                 std::io::ErrorKind::AddrInUse,
                 format!(
                     "Port {} is already in use. Another freenet process may be running. \
-                     Use 'pkill freenet' to stop it, or specify a different port with --gateway-port.",
+                     Use 'pkill freenet' to stop it, or specify a different port with --ws-api-port.",
                     socket.port()
                 ),
             )
@@ -115,10 +115,10 @@ async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> 
             e
         }
     })?;
-    tracing::info!("HTTP gateway listening on {}", socket);
+    tracing::info!("HTTP client API listening on {}", socket);
     GlobalExecutor::spawn(async move {
         axum::serve(listener, router).await.map_err(|e| {
-            tracing::error!("Error while running HTTP gateway server: {e}");
+            tracing::error!("Error while running HTTP client API server: {e}");
         })
     });
     Ok(())
@@ -134,7 +134,7 @@ pub mod local_node {
         contract::{Executor, ExecutorError},
     };
 
-    use super::{http_gateway::HttpGateway, serve};
+    use super::{client_api::HttpClientApi, serve};
 
     pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
         match socket.ip() {
@@ -146,7 +146,7 @@ pub mod local_node {
             }
             _ => {}
         }
-        let (mut gw, gw_router) = HttpGateway::as_router(&socket);
+        let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
 
         serve(socket, ws_router.layer(TraceLayer::new_for_http())).await?;
@@ -247,25 +247,25 @@ pub mod local_node {
     }
 }
 
-pub async fn serve_gateway(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
-    let (gw, ws_proxy) = serve_gateway_in(config).await?;
+pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
+    let (gw, ws_proxy) = serve_client_api_in(config).await?;
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
-/// Serves the gateway and returns the concrete types (for integration testing).
+/// Serves the client API and returns the concrete types (for integration testing).
 /// This allows tests to access internal state like the attested_contracts map.
-pub async fn serve_gateway_for_test(
+pub async fn serve_client_api_for_test(
     config: WebsocketApiConfig,
 ) -> std::io::Result<(
-    http_gateway::HttpGateway,
+    client_api::HttpClientApi,
     crate::client_events::websocket::WebSocketProxy,
 )> {
-    serve_gateway_in(config).await
+    serve_client_api_in(config).await
 }
 
-pub(crate) async fn serve_gateway_in(
+pub(crate) async fn serve_client_api_in(
     config: WebsocketApiConfig,
-) -> std::io::Result<(HttpGateway, WebSocketProxy)> {
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
     // Create a shared attested_contracts map with token expiration support
@@ -278,9 +278,9 @@ pub(crate) async fn serve_gateway_in(
         config.token_cleanup_interval_seconds,
     );
 
-    // Pass the shared map to both HttpGateway and WebSocketProxy
+    // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) =
-        HttpGateway::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
+        HttpClientApi::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 

@@ -24,9 +24,9 @@ mod v1;
 mod v2;
 
 #[derive(Clone)]
-pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
+pub(super) struct HttpClientApiRequest(mpsc::Sender<ClientConnection>);
 
-impl std::ops::Deref for HttpGatewayRequest {
+impl std::ops::Deref for HttpClientApiRequest {
     type Target = mpsc::Sender<ClientConnection>;
 
     fn deref(&self) -> &Self::Target {
@@ -59,14 +59,14 @@ impl AttestedContract {
 /// Maps authentication tokens to attested contract metadata.
 pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
 
-/// A gateway to access and interact with contracts through an HTTP interface.
-pub struct HttpGateway {
+/// Handles HTTP client requests for contract access and interaction.
+pub struct HttpClientApi {
     pub(crate) attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
 
-impl HttpGateway {
+impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
         let attested_contracts = Arc::new(DashMap::new());
@@ -95,7 +95,7 @@ impl HttpGateway {
         let router = v1::routes(config.clone())
             .merge(v2::routes(config))
             .layer(Extension(attested_contracts.clone()))
-            .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
+            .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
             Self {
@@ -126,7 +126,7 @@ async fn home() -> axum::response::Response {
 
 async fn web_home(
     Path(key): Path<String>,
-    Extension(rs): Extension<HttpGatewayRequest>,
+    Extension(rs): Extension<HttpClientApiRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
     api_version: ApiVersion,
 ) -> Result<axum::response::Response, WebSocketApiError> {
@@ -176,7 +176,7 @@ async fn web_subpages(
         .map(|r| r.into_response())
 }
 
-impl ClientEventsProxy for HttpGateway {
+impl ClientEventsProxy for HttpClientApi {
     #[instrument(level = "debug", skip(self))]
     fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         async move {
@@ -217,7 +217,7 @@ impl ClientEventsProxy for HttpGateway {
                     }
                 }
             }
-            tracing::warn!("Shutting down http gateway receiver");
+            tracing::warn!("Shutting down HTTP client API receiver");
             Err(ErrorKind::Disconnect.into())
         }
         .boxed()

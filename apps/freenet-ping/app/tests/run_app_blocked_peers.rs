@@ -50,7 +50,7 @@ use common::{
 };
 use freenet::{
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
     test_utils::{allocate_test_node_block, test_ip_for_node},
 };
 use freenet_ping_app::ping_client::{
@@ -261,7 +261,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -271,7 +271,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -281,7 +281,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

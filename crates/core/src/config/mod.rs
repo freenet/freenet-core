@@ -128,7 +128,7 @@ impl Default for ConfigArgs {
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
-                ws_api_port: Some(default_http_gateway_port()),
+                ws_api_port: Some(default_ws_api_port()),
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
             },
@@ -546,10 +546,7 @@ impl ConfigArgs {
                         _ => addr,
                     }
                 },
-                port: self
-                    .ws_api
-                    .ws_api_port
-                    .unwrap_or(default_http_gateway_port()),
+                port: self.ws_api.ws_api_port.unwrap_or(default_ws_api_port()),
                 token_ttl_seconds: self
                     .ws_api
                     .token_ttl_seconds
@@ -1232,7 +1229,7 @@ pub struct WebsocketApiConfig {
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_http_gateway_port", rename = "ws-api-port")]
+    #[serde(default = "default_ws_api_port", rename = "ws-api-port")]
     pub port: u16,
 
     /// Token time-to-live in seconds
@@ -1273,7 +1270,7 @@ impl Default for WebsocketApiConfig {
     fn default() -> Self {
         Self {
             address: default_listening_address(),
-            port: default_http_gateway_port(),
+            port: default_ws_api_port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
         }
@@ -1291,7 +1288,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-const fn default_http_gateway_port() -> u16 {
+const fn default_ws_api_port() -> u16 {
     7509
 }
 

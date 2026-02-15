@@ -9,7 +9,7 @@
 
 use freenet::{
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
     test_utils::{load_contract, make_get, make_subscribe, TestContext},
 };
 use freenet_macros::freenet_test;
@@ -445,7 +445,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -457,7 +457,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
 
         // Run node until we receive shutdown signal

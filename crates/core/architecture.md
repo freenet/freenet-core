@@ -133,7 +133,7 @@ graph LR
 
 **Key Components & Communication:**
 
-- **[Server](src/server/mod.rs):** Handles HTTP and WebSocket endpoints for client connections. The `ClientConnection` enum in [http_gateway.rs](src/server/http_gateway.rs) defines the interface between the server and client events system. The server manages the WebSocket API and passes client requests to the ClientEvents subsystem.
+- **[Server](src/server/mod.rs):** Handles HTTP and WebSocket endpoints for client connections. The `ClientConnection` enum in [client_api.rs](src/server/client_api.rs) defines the interface between the server and client events system. The server manages the WebSocket API and passes client requests to the ClientEvents subsystem.
 
 - **[Node](src/node.rs):** Central coordinator with the main event loop implemented in `run_event_loop()`. This function contains the core `tokio::select!` loop that dispatches events to appropriate handlers like `handle_network_message()`, `handle_node_event()`, and `handle_client_request()`. 
 

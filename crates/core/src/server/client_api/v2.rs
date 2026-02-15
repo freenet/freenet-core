@@ -2,7 +2,7 @@ use axum::{extract::Path, routing::get, Extension, Router};
 
 use super::*;
 
-/// Registers V2-specific HTTP gateway routes.
+/// Registers V2-specific HTTP client API routes.
 ///
 /// Currently identical in behavior to V1; exists as a routing seam for
 /// future V2-specific protocol changes.
@@ -16,7 +16,7 @@ pub(super) fn routes(config: Config) -> Router {
 
 async fn web_home_v2(
     key: Path<String>,
-    rs: Extension<HttpGatewayRequest>,
+    rs: Extension<HttpClientApiRequest>,
     config: axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_home(key, rs, config, ApiVersion::V2).await

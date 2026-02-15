@@ -53,7 +53,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
-use crate::server::http_gateway::AttestedContractMap;
+use crate::server::client_api::AttestedContractMap;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
 ///
