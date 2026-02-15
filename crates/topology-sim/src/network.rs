@@ -397,7 +397,6 @@ impl Network {
             .collect();
 
         PeerContext {
-            peer_id,
             location: peer.location,
             connection_count: peer.connections.len(),
             neighbor_locations: neighbor_locs,
@@ -410,7 +409,6 @@ impl Network {
 
 /// Context passed to strategy functions for decision-making.
 pub struct PeerContext {
-    pub peer_id: usize,
     pub location: f64,
     pub connection_count: usize,
     pub neighbor_locations: Vec<f64>,
