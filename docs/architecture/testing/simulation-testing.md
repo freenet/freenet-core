@@ -195,11 +195,103 @@ if let Some(stats) = sim.get_network_stats() {
 }
 ```
 
+### Mid-Simulation Fault Injection (Turmoil Tests)
+
+For Turmoil-based tests using `run_simulation()`, faults can be injected from the
+test closure via the global fault injector registry:
+
+```rust
+let result = sim.run_simulation::<SmallRng, _, _>(
+    SEED, 5, 100,
+    Duration::from_secs(120),
+    Duration::from_millis(500),
+    move || async move {
+        // Inject partition mid-simulation
+        if let Some(injector) = freenet::dev_tool::get_fault_injector("network-name") {
+            let mut state = injector.lock().unwrap();
+            let partition = Partition::new(side_a, side_b).permanent(0);
+            state.config.add_partition(partition);
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        // Heal the partition
+        if let Some(injector) = freenet::dev_tool::get_fault_injector("network-name") {
+            let mut state = injector.lock().unwrap();
+            state.config.partitions.clear();
+        }
+        Ok(())
+    },
+);
+```
+
+Available fault operations inside the closure:
+- `state.config.add_partition(partition)` — block messages between node groups
+- `state.config.partitions.clear()` — heal all partitions
+- `state.config.crash_node(addr)` — stop all messages to/from a node
+- `state.config.recover_node(&addr)` — restore message delivery
+
+**Important:** `run_simulation()` consumes `self`, so capture node addresses
+and the network name *before* calling it.
+
+## Anomaly Detection
+
+The simulation framework includes a `StateVerifier` that analyzes event logs to
+detect consistency anomalies. This is used to validate convergence beyond simple
+state hash comparison.
+
+### Anomaly Types Detected
+
+| Anomaly | Description |
+|---------|-------------|
+| `FinalDivergence` | Nodes disagree on final state for a contract |
+| `MissingBroadcast` | A state update was not propagated to all subscribers |
+| `BroadcastNotApplied` | A node received but did not apply a broadcast |
+| `SuspectedPartition` | Message patterns suggest a network partition |
+| `StalePeer` | A node missed multiple consecutive updates |
+| `StateOscillation` | A node's state flips back and forth |
+| `UpdateOrderingAnomaly` | Updates applied in inconsistent order |
+| `ZombieTransaction` | A completed transaction is still referenced |
+| `BroadcastStorm` | Excessive broadcast messages detected |
+| `DeltaSyncFailureCascade` | Cascading failures in delta sync |
+
+### Using Anomaly Detection in Tests
+
+```rust
+// After simulation completes, analyze event logs
+let report = rt.block_on(async {
+    let logs = logs_handle.lock().await;
+    let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+    verifier.verify()
+});
+
+// Inspect results
+tracing::info!(
+    "{} events, {} state, {} contracts, {} anomalies",
+    report.total_events, report.state_events,
+    report.contracts_analyzed, report.anomalies.len()
+);
+
+// Query specific anomaly categories
+let divergences = report.divergences();
+let stale = report.stale_peers();
+let oscillations = report.state_oscillations();
+```
+
+The `TestResult::verify_state_report()` method chains anomaly detection onto
+any `TestConfig`-based test (non-asserting, logs findings).
+
+### Typical Findings
+
+From production simulation tests, the most common anomalies are:
+- **StateOscillation** — dominant pattern; state flip counts of 2–12
+- **StalePeer** — 2–11 missed updates per peer, common during fault injection
+- **FinalDivergence = 0** — the network consistently self-heals
+
 ## Test Files
 
 | File | Purpose |
 |------|---------|
-| `simulation_integration.rs` | Deterministic replay, fault injection, convergence, long-duration tests |
+| `simulation_integration.rs` | Deterministic replay, fault injection, convergence, anomaly detection, long-duration tests |
 | `simulation_smoke.rs` | Quick smoke tests using plain tokio (non-deterministic) |
 | `simulation_determinism.rs` | Unit tests for simulation primitives |
 | `sim_network.rs` | CI-focused tests with strict assertions |
@@ -301,13 +393,23 @@ The following fault injection tests run in **regular CI** (not nightly) via `sim
 
 These run with every PR and don't need nightly scheduling.
 
-### Missing Test Scenarios (not yet implemented)
+### Fault Tolerance Integration Tests (Turmoil)
 
-| Scenario | Description | Priority |
-|----------|-------------|----------|
-| **Partition → Heal → Convergence** | Partition network → both sides update → heal → assert all converge to same state | High |
-| **Rolling restart with convergence** | Put contracts → crash 2 nodes → verify remaining serve → restart → assert state recovered | High |
-| **Multi-step churn** | Continuous crash/restart cycle while operations run, verify eventual consistency | Medium |
+These scenarios use Turmoil's deterministic scheduler with mid-simulation fault
+injection via the global fault injector registry. All include anomaly detection.
+
+| Test | Description | Results |
+|------|-------------|---------|
+| `test_partition_heal_convergence` | Partition network → both sides update → heal → verify convergence | 48 state events, 3 contracts, 4 anomalies (oscillation) |
+| `test_crash_recover_convergence` | Crash 2 nodes → remaining operate → recover → verify state | 106 state events, 4 contracts, 9 anomalies (oscillation) |
+| `test_multi_step_churn` | 3 rounds of crash→wait→recover→wait, verify eventual consistency | 109 state events, 4 contracts, 10 anomalies (oscillation + stale) |
+
+All three converge with 0 `FinalDivergence` despite injected faults.
+
+**Key parameter note:** The `iterations` parameter to `run_simulation()` serves
+dual purpose as both the event signal count and the per-peer `gen_event` budget.
+Use at least `iterations >= num_peers * 15` to ensure enough budget for contract
+creation (only 5% probability per iteration).
 
 ### Missing Property Tests
 

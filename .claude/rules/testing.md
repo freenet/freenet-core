@@ -87,3 +87,53 @@ See: `crates/core/src/ring/location.rs:68`
 SimulationSocket::bind(addr).await
 ```
 See: `crates/core/src/transport/in_memory_socket.rs`
+
+## Fault Injection in Turmoil Tests
+
+When testing fault tolerance scenarios with `run_simulation()`:
+
+```rust
+// 1. Capture addresses BEFORE run_simulation consumes self
+let node_addrs = sim.all_node_addresses().clone();
+let network_name = "my-test".to_string();
+
+// 2. Inject faults from the test closure via global registry
+let result = sim.run_simulation::<SmallRng, _, _>(
+    SEED, contracts, iterations, duration, event_wait,
+    move || async move {
+        if let Some(inj) = freenet::dev_tool::get_fault_injector(&network_name) {
+            let mut state = inj.lock().unwrap();
+            state.config.crash_node(addr);       // or add_partition, etc.
+        }
+        // ... wait, then recover ...
+        Ok(())
+    },
+);
+```
+
+**Key:** Use `iterations >= num_peers * 15` to ensure enough `gen_event`
+budget for contract creation (the `iterations` parameter controls both
+event signal count and per-peer generation budget).
+
+See: `crates/core/tests/simulation_integration.rs` — `test_partition_heal_convergence`,
+`test_crash_recover_convergence`, `test_multi_step_churn`
+
+## Anomaly Detection
+
+After any simulation test, use `StateVerifier` to check for consistency anomalies:
+
+```rust
+let report = rt.block_on(async {
+    let logs = logs_handle.lock().await;
+    let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+    verifier.verify()
+});
+// Check: report.anomalies, report.divergences(), report.stale_peers(), etc.
+```
+
+Or chain `.verify_state_report()` on `TestResult` for non-asserting anomaly logging.
+
+Common findings: `StateOscillation` (dominant), `StalePeer` during faults,
+`FinalDivergence = 0` (network self-heals).
+
+See: `crates/core/src/tracing/state_verifier.rs`
