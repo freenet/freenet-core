@@ -196,6 +196,12 @@ impl Network {
     /// and select_target draws from the ideal 1/d distribution. Replacing
     /// redundancy with a fresh Kleinberg sample improves distribution fit by
     /// construction.
+    ///
+    /// Improvement uses introduction (gateway/peer exchange) rather than routing
+    /// for peer discovery. Rationale: improvement exists specifically to maintain
+    /// the 1/d distribution quality. Routing through a partially-converged topology
+    /// provides approximate placement; introduction provides precise placement near
+    /// the sampled target. For distribution maintenance, precision matters.
     fn improve_connections(&mut self) {
         let n = self.peers.len();
         let uses_intro = self.strategy.uses_introduction();
@@ -217,15 +223,14 @@ impl Network {
             if let Some(drop_id) = self.strategy.select_drop(&ctx, &mut self.rng) {
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
 
-                // Route through existing topology; fall back to introduction if
-                // routing fails (same principled mechanism as seek_connections).
-                let candidate = self.route_to_peer(i, target_loc).or_else(|| {
-                    if uses_intro {
-                        self.find_peer_near(i, target_loc)
-                    } else {
-                        None
-                    }
-                });
+                // Use introduction for precise 1/d placement. Improvement's purpose
+                // is distribution quality, so we use the precise mechanism.
+                // For strategies without introduction, fall back to routing.
+                let candidate = if uses_intro {
+                    self.find_peer_near(i, target_loc)
+                } else {
+                    self.route_to_peer(i, target_loc)
+                };
 
                 if let Some(candidate) = candidate {
                     if candidate != drop_id {

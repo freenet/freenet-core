@@ -13,6 +13,9 @@ use strategy::Strategy;
 fn main() {
     let scales: Vec<(usize, usize, usize)> = vec![
         // (num_peers, min_connections, max_connections)
+        (300, 10, 20),
+        (3_000, 10, 20),
+        (30_000, 15, 30),
         (100_000, 15, 30),
     ];
 
