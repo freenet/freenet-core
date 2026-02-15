@@ -39,6 +39,15 @@
 //!    through the established 1/d topology is used, with introduction as fallback when
 //!    routing fails. This is self-regulating: bad topology → routing fails → more
 //!    introductions → better topology → routing succeeds → fewer introductions.
+//!
+//! ## Simulation model limitations
+//!
+//! The introduction mechanism (`find_peer_near`) uses a global sorted index, which is
+//! an upper bound on what a real gateway can achieve. The `Current` strategy does not
+//! use introduction (matching current Freenet behavior), making the comparison asymmetric
+//! in discovery capability. The SmallWorld results demonstrate what is achievable *given*
+//! a gateway that can place connections near Kleinberg-sampled targets — the production
+//! gateway protocol must approximate this capability for the results to transfer.
 
 use crate::network::{ring_distance, PeerContext};
 use rand::Rng;
@@ -50,7 +59,7 @@ pub enum Strategy {
 }
 
 impl Strategy {
-    pub fn select_target(&self, ctx: &PeerContext, rng: &mut rand::rngs::ThreadRng) -> f64 {
+    pub fn select_target(&self, ctx: &PeerContext, rng: &mut rand::rngs::StdRng) -> f64 {
         match self {
             Strategy::Current(s) => s.select_target(ctx, rng),
             Strategy::SmallWorld(s) => s.select_target(ctx, rng),
@@ -63,7 +72,7 @@ impl Strategy {
         candidate_loc: f64,
         min_connections: usize,
         max_connections: usize,
-        rng: &mut rand::rngs::ThreadRng,
+        rng: &mut rand::rngs::StdRng,
     ) -> bool {
         match self {
             Strategy::Current(s) => {
@@ -75,7 +84,7 @@ impl Strategy {
         }
     }
 
-    pub fn select_drop(&self, ctx: &PeerContext, rng: &mut rand::rngs::ThreadRng) -> Option<usize> {
+    pub fn select_drop(&self, ctx: &PeerContext, rng: &mut rand::rngs::StdRng) -> Option<usize> {
         match self {
             Strategy::Current(s) => s.select_drop(ctx, rng),
             Strategy::SmallWorld(s) => s.select_drop(ctx, rng),
@@ -332,7 +341,8 @@ impl SmallWorld {
                 let log_gap = droppable[i + 1].1.ln() - droppable[i].1.ln();
                 if log_gap < min_log_gap {
                     min_log_gap = log_gap;
-                    // Drop the further one of the redundant pair (it's more replaceable)
+                    // Either peer in the redundant pair could be dropped; we pick the
+                    // further one as an arbitrary but consistent tie-breaker.
                     most_redundant_idx = i + 1;
                 }
             }

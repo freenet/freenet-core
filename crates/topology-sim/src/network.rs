@@ -1,7 +1,8 @@
 //! Core network simulation: peers on a ring forming and maintaining connections.
 
 use crate::strategy::Strategy;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 
 /// A peer in the simulated network.
@@ -37,7 +38,7 @@ pub struct Network {
     /// Sorted peer locations for efficient nearest-neighbor lookups.
     sorted_locations: Vec<(f64, usize)>,
     strategy: Strategy,
-    rng: rand::rngs::ThreadRng,
+    rng: StdRng,
 }
 
 impl Network {
@@ -46,8 +47,9 @@ impl Network {
         min_connections: usize,
         max_connections: usize,
         strategy: Strategy,
+        seed: u64,
     ) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut peers: Vec<Peer> = (0..num_peers)
             .map(|id| Peer::new(id, rng.random::<f64>()))
             .collect();
@@ -351,8 +353,11 @@ impl Network {
         let mut left = if pos > 0 { pos - 1 } else { n - 1 };
         let mut right = pos % n;
         let mut added = HashSet::new();
+        let mut iterations = 0;
+        let max_iterations = 2 * n;
 
-        while result.len() < k {
+        while result.len() < k && iterations < max_iterations {
+            iterations += 1;
             let (loc_l, id_l) = self.sorted_locations[left];
             let (loc_r, id_r) = self.sorted_locations[right];
             let dl = ring_distance(location, loc_l);
@@ -372,7 +377,6 @@ impl Network {
                 right = (right + 1) % n;
             }
 
-            // Safety: avoid infinite loop if we've exhausted all peers
             if added.len() >= n - 1 {
                 break;
             }

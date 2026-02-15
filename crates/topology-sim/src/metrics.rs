@@ -1,7 +1,8 @@
 //! Topology quality metrics: distance distribution, routing efficiency, neighbor connectivity.
 
 use crate::network::{ring_distance, Network};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 
 pub struct HistogramBin {
@@ -22,7 +23,7 @@ pub struct Metrics {
     pub histogram: Vec<HistogramBin>,
 }
 
-pub fn compute(net: &Network) -> Metrics {
+pub fn compute(net: &Network, seed: u64) -> Metrics {
     let n = net.peers.len();
 
     // Collect all unique connection distances
@@ -71,7 +72,7 @@ pub fn compute(net: &Network) -> Metrics {
     let nearest_3_pct = compute_nearest_3(net);
 
     // Greedy routing
-    let (greedy_success_pct, avg_greedy_hops) = compute_greedy_routing(net);
+    let (greedy_success_pct, avg_greedy_hops) = compute_greedy_routing(net, seed);
 
     // Histogram
     let bins: Vec<(f64, f64)> = (0..10)
@@ -80,7 +81,11 @@ pub fn compute(net: &Network) -> Metrics {
     let histogram = bins
         .iter()
         .map(|&(lo, hi)| {
-            let count = distances.iter().filter(|&&d| d >= lo && d < hi).count();
+            // Use <= for the last bin to include d=0.5 (max ring distance)
+            let count = distances
+                .iter()
+                .filter(|&&d| d >= lo && if hi >= 0.5 { d <= hi } else { d < hi })
+                .count();
             let pct = if distances.is_empty() {
                 0.0
             } else {
@@ -132,14 +137,14 @@ fn compute_nearest_3(net: &Network) -> f64 {
 
 /// Greedy routing: from random source to random target, always forward to the
 /// neighbor closest to the target. Measure success rate and hop count.
-fn compute_greedy_routing(net: &Network) -> (f64, f64) {
+fn compute_greedy_routing(net: &Network, seed: u64) -> (f64, f64) {
     let n = net.peers.len();
     if n < 10 {
         return (0.0, 0.0);
     }
 
     let num_trials = (n * 2).min(2000);
-    let mut rng = rand::rng();
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
     let mut successes = 0;
     let mut total_hops: usize = 0;
     let max_hops = (n as f64).log2() as usize * 5; // generous limit
