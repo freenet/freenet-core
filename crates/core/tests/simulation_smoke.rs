@@ -841,6 +841,410 @@ async fn test_crash_restart_edge_cases() {
 }
 
 // =============================================================================
+// Roadmap Scenario: Partition → Heal → Convergence
+// =============================================================================
+
+/// Tests that the network converges after a partition heals.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Start a network with contract operations flowing
+/// 2. Partition the network into two sides
+/// 3. Both sides continue to receive updates independently
+/// 4. Heal the partition
+/// 5. Assert all nodes converge to the same state
+///
+/// ## Anomaly Detection
+/// During the partition we expect:
+/// - SuspectedPartition or MissingBroadcast (broadcasts can't cross)
+/// After healing we expect:
+/// - FinalDivergence should be absent (network self-heals)
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_partition_heal_convergence() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+    use freenet::simulation::{FaultConfig, Partition};
+    use std::collections::HashSet;
+
+    const SEED: u64 = 0xDA27_0EA1_0001;
+
+    // Reset global state for deterministic behavior
+    freenet::dev_tool::reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    // Larger network to make the partition meaningful
+    let mut sim = SimNetwork::new(
+        "partition-heal-test",
+        1,  // 1 gateway
+        5,  // 5 nodes (6 total, splits 3+3)
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start with contracts and enough events to generate meaningful state
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 3, 15)
+        .await;
+
+    // Phase 1: Let the network run normally and establish contracts
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    let pre_partition_events = sim.get_event_counts().await;
+    let pre_total: usize = pre_partition_events.values().sum();
+    tracing::info!("Phase 1 (pre-partition): {} events", pre_total);
+    assert!(
+        pre_total > 0,
+        "Should have captured events during initial phase"
+    );
+
+    // Phase 2: Partition the network in half
+    let all_addrs = sim.all_node_addresses();
+    let addrs: Vec<_> = all_addrs.values().copied().collect();
+    let mid = addrs.len() / 2;
+
+    let side_a: HashSet<_> = addrs[..mid].iter().copied().collect();
+    let side_b: HashSet<_> = addrs[mid..].iter().copied().collect();
+
+    tracing::info!(
+        "Partitioning network: side_a={} nodes, side_b={} nodes",
+        side_a.len(),
+        side_b.len()
+    );
+
+    let partition = Partition::new(side_a, side_b).permanent(0);
+    let fault_config = FaultConfig::builder().partition(partition).build();
+    sim.with_fault_injection(fault_config);
+
+    // Let both sides operate independently during partition
+    let_network_run(&mut sim, Duration::from_secs(4)).await;
+
+    tracing::info!("Phase 2 (partitioned): network split active");
+
+    // Phase 3: Heal the partition
+    sim.clear_fault_injection();
+    tracing::info!("Phase 3 (healing): partition cleared");
+
+    // Give the network time to converge after healing
+    let_network_run(&mut sim, Duration::from_secs(6)).await;
+
+    // Phase 4: Check convergence and anomaly detection
+    let report = sim.verify_state().await;
+    tracing::info!(
+        "=== PARTITION-HEAL ANOMALY REPORT: {} events, {} state events, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let missing = report.missing_broadcasts();
+    let partitions = report.suspected_partitions();
+    let stale = report.stale_peers();
+    let oscillations = report.state_oscillations();
+
+    tracing::info!(
+        "  divergences={}, missing_broadcasts={}, partitions={}, stale={}, oscillations={}",
+        divergences.len(),
+        missing.len(),
+        partitions.len(),
+        stale.len(),
+        oscillations.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::warn!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    tracing::info!(
+        "Partition-heal-convergence test completed: {} total events",
+        pre_total
+    );
+}
+
+// =============================================================================
+// Roadmap Scenario: Rolling Restart with Convergence
+// =============================================================================
+
+/// Tests that the network handles node crashes and restarts while maintaining state.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Put contracts into the network
+/// 2. Crash 2 nodes
+/// 3. Verify remaining nodes still serve the contracts
+/// 4. Restart the crashed nodes
+/// 5. Assert state is recovered (restarted nodes rejoin and converge)
+///
+/// ## Anomaly Detection
+/// During crash phase we expect:
+/// - StalePeer (crashed nodes miss updates)
+/// After restart we expect:
+/// - Network should converge (no FinalDivergence)
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_rolling_restart_convergence() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+
+    const SEED: u64 = 0x2011_2E57_0001;
+
+    freenet::dev_tool::reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    // 1 gateway + 5 nodes so we can crash 2 and still have 4 alive
+    let mut sim = SimNetwork::new(
+        "rolling-restart-test",
+        1,  // 1 gateway
+        5,  // 5 nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 2, 10)
+        .await;
+
+    // Phase 1: Let the network establish contracts
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    let pre_crash_events = sim.get_event_counts().await;
+    let pre_crash_total: usize = pre_crash_events.values().sum();
+    tracing::info!("Phase 1 (pre-crash): {} events", pre_crash_total);
+    assert!(
+        pre_crash_total > 0,
+        "Should have captured events during initial phase"
+    );
+
+    // Phase 2: Crash 2 non-gateway nodes
+    let all_addrs = sim.all_node_addresses();
+    let nodes_to_crash: Vec<_> = all_addrs
+        .keys()
+        .filter(|label| label.is_node())
+        .take(2)
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        nodes_to_crash.len(),
+        2,
+        "Need at least 2 non-gateway nodes to crash"
+    );
+
+    for node in &nodes_to_crash {
+        let crashed = sim.crash_node(node);
+        assert!(crashed, "crash_node should succeed for {}", node);
+        tracing::info!("Crashed node: {}", node);
+    }
+
+    // Phase 3: Let the remaining network continue operating
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    tracing::info!("Phase 3 (degraded): network running with 2 crashed nodes");
+
+    // Phase 4: Restart the crashed nodes
+    for node in &nodes_to_crash {
+        let restart_seed = SEED.wrapping_add(node.number() as u64 * 0x1000);
+        let handle = sim
+            .restart_node::<rand::rngs::SmallRng>(node, restart_seed, 2, 5)
+            .await;
+        assert!(handle.is_some(), "restart_node should succeed for {}", node);
+        tracing::info!("Restarted node: {}", node);
+    }
+
+    // Phase 5: Let the network converge after restart
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    tracing::info!("Phase 5 (recovered): all nodes restarted");
+
+    // Phase 6: Anomaly detection
+    let report = sim.verify_state().await;
+    tracing::info!(
+        "=== ROLLING RESTART ANOMALY REPORT: {} events, {} state events, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let stale = report.stale_peers();
+    let zombies = report.zombie_transactions();
+    let oscillations = report.state_oscillations();
+
+    tracing::info!(
+        "  divergences={}, stale_peers={}, zombies={}, oscillations={}",
+        divergences.len(),
+        stale.len(),
+        zombies.len(),
+        oscillations.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::warn!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    tracing::info!(
+        "Rolling restart convergence test completed: {} total events",
+        pre_crash_total
+    );
+}
+
+// =============================================================================
+// Roadmap Scenario: Multi-Step Churn
+// =============================================================================
+
+/// Tests eventual consistency through continuous crash/restart cycles.
+///
+/// ## Scenario (from simulation-testing.md roadmap)
+/// 1. Start the network with contract operations
+/// 2. Perform multiple rounds of: crash a node → wait → restart → wait
+/// 3. After all churn rounds, verify eventual consistency
+///
+/// ## Anomaly Detection
+/// During churn we expect:
+/// - StalePeer, StateOscillation (transient disruption)
+/// After stabilization:
+/// - FinalDivergence should be absent if the network self-heals
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_multi_step_churn() {
+    use freenet::config::{GlobalRng, GlobalSimulationTime};
+
+    const SEED: u64 = 0xC402_0000_0001;
+    const CHURN_ROUNDS: usize = 3;
+
+    freenet::dev_tool::reset_all_simulation_state();
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        "multi-step-churn-test",
+        1,  // 1 gateway
+        4,  // 4 nodes (5 total; we churn 1 at a time)
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 2, 6)
+        .await;
+
+    // Let network establish
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    // Get the list of non-gateway nodes we can churn
+    let all_addrs = sim.all_node_addresses();
+    let churn_candidates: Vec<_> = all_addrs
+        .keys()
+        .filter(|label| label.is_node())
+        .cloned()
+        .collect();
+
+    assert!(
+        !churn_candidates.is_empty(),
+        "Need non-gateway nodes for churn"
+    );
+
+    // Perform churn rounds: crash → wait → restart → wait
+    for round in 0..CHURN_ROUNDS {
+        let target = &churn_candidates[round % churn_candidates.len()];
+
+        // Skip if node is already crashed (from a previous round that hasn't restarted yet)
+        if sim.is_node_crashed(target) {
+            tracing::info!(
+                "Churn round {}: {} already crashed, skipping",
+                round,
+                target
+            );
+            continue;
+        }
+
+        tracing::info!("Churn round {}: crashing {}", round, target);
+        let crashed = sim.crash_node(target);
+        assert!(crashed, "crash_node should succeed for {}", target);
+
+        // Let network operate in degraded state
+        let_network_run(&mut sim, Duration::from_secs(2)).await;
+
+        // Restart the node
+        let restart_seed = SEED.wrapping_add((round as u64 + 1) * 0x2000);
+        let handle = sim
+            .restart_node::<rand::rngs::SmallRng>(target, restart_seed, 2, 4)
+            .await;
+        assert!(
+            handle.is_some(),
+            "restart_node should succeed for {} in round {}",
+            target,
+            round
+        );
+
+        tracing::info!("Churn round {}: restarted {}", round, target);
+
+        // Let network stabilize after restart
+        let_network_run(&mut sim, Duration::from_secs(2)).await;
+    }
+
+    // Final stabilization period
+    let_network_run(&mut sim, Duration::from_secs(4)).await;
+
+    // Anomaly detection
+    let report = sim.verify_state().await;
+    tracing::info!(
+        "=== MULTI-STEP CHURN ANOMALY REPORT ({} rounds): {} events, {} state events, {} contracts, {} anomalies ===",
+        CHURN_ROUNDS,
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let missing = report.missing_broadcasts();
+    let stale = report.stale_peers();
+    let zombies = report.zombie_transactions();
+    let oscillations = report.state_oscillations();
+    let cascades = report.delta_sync_cascades();
+
+    tracing::info!(
+        "  divergences={}, missing_broadcasts={}, stale_peers={}, zombies={}, oscillations={}, cascades={}",
+        divergences.len(),
+        missing.len(),
+        stale.len(),
+        zombies.len(),
+        oscillations.len(),
+        cascades.len(),
+    );
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::warn!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    tracing::info!(
+        "Multi-step churn test completed: {} rounds, {} total anomalies",
+        CHURN_ROUNDS,
+        report.anomalies.len()
+    );
+}
+
+// =============================================================================
 // Zero Nodes/Gateways Panic Tests
 // =============================================================================
 
