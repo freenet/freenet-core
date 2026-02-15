@@ -982,33 +982,78 @@ async fn test_topology_infrastructure() {
 // Stale Reservation TTL Recovery (Issue #2888)
 // =============================================================================
 
-/// Stale pending reservations become invisible after TTL expiration,
-/// preventing permanent node isolation from failed ConnectOps.
+/// Verifies the core #2888 fix: a gateway accepts retry connections after
+/// a stale reservation expires.
+///
+/// Scenario: ConnectOp reserves a gateway slot → connection fails →
+/// reservation ages past TTL → node retries → gateway accepts.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_stale_reservation_ttl_expiry() {
-    let mut sim = SimNetwork::new("stale-reservation-ttl", 1, 2, 7, 3, 10, 2, 0x2888_0001).await;
+async fn test_stale_reservation_allows_gateway_retry() {
+    let mut sim = SimNetwork::new("stale-retry", 1, 2, 7, 3, 10, 2, 0x2888_0001).await;
     let _handles = sim
         .start_with_rand_gen::<rand::rngs::SmallRng>(0x2888_0001, 1, 1)
         .await;
     let_network_run(&mut sim, Duration::from_secs(3)).await;
 
-    let gw = freenet::dev_tool::NodeLabel::gateway("stale-reservation-ttl", 0);
-    assert!(sim.connection_count(&gw).is_some());
-
+    let gw = freenet::dev_tool::NodeLabel::gateway("stale-retry", 0);
     let phantom_addr: std::net::SocketAddr = "127.99.99.1:9999".parse().unwrap();
-    let phantom_loc = freenet::dev_tool::Location::new(0.42);
+    let phantom_loc = freenet::dev_tool::Location::new(0.55);
 
-    // Fresh reservation (age=0) is visible
+    // Fresh reservation blocks duplicate connect
     assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::ZERO));
     assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
 
-    // Expired reservation (age=120s > 60s TTL) is invisible
+    // Expired reservation becomes invisible — allows retry
     assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::from_secs(120),));
     assert_eq!(
         sim.has_connection_or_pending(&gw, phantom_addr),
         Some(false)
     );
 
-    // Established connections are unaffected
-    assert!(sim.connection_count(&gw).unwrap_or(0) > 0);
+    // Gateway accepts the retry (the core fix for is_not_connected filtering)
+    assert_eq!(
+        sim.should_accept(&gw, phantom_loc, phantom_addr),
+        Some(true)
+    );
+
+    // Re-accepted reservation is visible again
+    assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
+}
+
+/// Verifies that stale reservations don't consume capacity and that
+/// cleanup removes them from the map.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_stale_reservation_cleanup_frees_capacity() {
+    let mut sim = SimNetwork::new("cleanup-cap", 1, 1, 7, 3, 5, 1, 0x2888_0002).await;
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(0x2888_0002, 1, 1)
+        .await;
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    let gw = freenet::dev_tool::NodeLabel::gateway("cleanup-cap", 0);
+    let established = sim.connection_count(&gw).unwrap_or(0);
+
+    // Fill remaining capacity with expired reservations
+    let stale_count = 5usize.saturating_sub(established);
+    for i in 0..stale_count {
+        let addr: std::net::SocketAddr =
+            format!("127.88.88.{}:{}", i + 1, 7000 + i).parse().unwrap();
+        let loc = freenet::dev_tool::Location::new(0.1 + (i as f64) * 0.1);
+        assert!(sim.inject_stale_reservation(&gw, addr, loc, Duration::from_secs(120)));
+    }
+
+    let reserved_before = sim.reserved_connections_count(&gw).unwrap();
+    assert!(reserved_before >= stale_count);
+
+    // Expired reservations don't block new connections
+    let new_addr: std::net::SocketAddr = "127.77.77.1:6000".parse().unwrap();
+    let new_loc = freenet::dev_tool::Location::new(0.75);
+    assert_eq!(sim.should_accept(&gw, new_loc, new_addr), Some(true));
+
+    // Cleanup removes stale entries from the map
+    let removed = sim.cleanup_stale_reservations(&gw).unwrap();
+    assert!(removed >= stale_count);
+
+    let reserved_after = sim.reserved_connections_count(&gw).unwrap();
+    assert!(reserved_after < reserved_before);
 }

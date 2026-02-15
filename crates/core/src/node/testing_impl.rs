@@ -1335,6 +1335,34 @@ impl SimNetwork {
             .map(|cm| cm.connection_count())
     }
 
+    /// Returns the number of pending reservations (including stale ones) for a node.
+    pub fn reserved_connections_count(&self, label: &NodeLabel) -> Option<usize> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.get_reserved_connections())
+    }
+
+    /// Runs cleanup on stale pending reservations for a node.
+    /// Returns the number of stale entries removed.
+    pub fn cleanup_stale_reservations(&self, label: &NodeLabel) -> Option<usize> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.cleanup_stale_reservations())
+    }
+
+    /// Tests whether the node's connection manager would accept a new connection
+    /// from the given address and location.
+    pub fn should_accept(
+        &self,
+        label: &NodeLabel,
+        location: Location,
+        addr: SocketAddr,
+    ) -> Option<bool> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.should_accept(location, addr))
+    }
+
     /// Checks if a node has a saved configuration for restart.
     pub fn can_restart(&self, label: &NodeLabel) -> bool {
         self.restartable_configs.contains_key(label)
