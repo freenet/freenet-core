@@ -258,7 +258,9 @@ impl SmallWorld {
     ///
     /// d_max = 0.5 is the maximum possible ring distance.
     fn random_link_distance(protection_boundary: f64, rng: &mut impl Rng) -> f64 {
-        let d_min: f64 = protection_boundary.max(0.0001);
+        // d_min matches the protection boundary — Kleinberg long-range links
+        // start just beyond the nearest-3 protected zone, with no gap.
+        let d_min: f64 = protection_boundary.max(1e-8);
         let d_max: f64 = 0.5;
         // Inverse CDF of 1/d distribution on [d_min, d_max]:
         // CDF(d) = ln(d/d_min) / ln(d_max/d_min)

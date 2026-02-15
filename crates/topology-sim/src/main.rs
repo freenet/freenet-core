@@ -13,9 +13,6 @@ use strategy::Strategy;
 fn main() {
     let scales: Vec<(usize, usize, usize)> = vec![
         // (num_peers, min_connections, max_connections)
-        (300, 10, 20),
-        (3_000, 10, 20),
-        (30_000, 15, 30),
         (100_000, 15, 30),
     ];
 
@@ -36,7 +33,6 @@ fn main() {
             let start = std::time::Instant::now();
             let mut net = Network::new(n, min_conn, max_conn, strat);
 
-            // Scale ticks with network size for convergence
             let ticks = if n <= 1000 { 500 } else { 1000 };
             for _ in 0..ticks {
                 net.tick();
