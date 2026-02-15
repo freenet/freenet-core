@@ -1,4 +1,44 @@
 //! Connection strategies: current Freenet algorithm and proposed small-world improvement.
+//!
+//! ## SmallWorld strategy — theoretical basis
+//!
+//! Based on Kleinberg (2000): on a 1D ring with n nodes, if each node's long-range
+//! contacts follow a d^{-1} distance distribution, greedy routing succeeds in
+//! O(log²n) hops. Any other exponent gives polynomial routing time.
+//!
+//! **Design decisions and their justifications:**
+//!
+//! 1. **Target selection: Kleinberg 1/d** — Proven optimal for greedy routing on a ring.
+//!    Inverse CDF sampling: d = d_min × (d_max/d_min)^U, U ~ Uniform(0,1).
+//!
+//! 2. **d_min = distance to k-th nearest protected neighbor** — The k nearest ring
+//!    neighbors are deterministically connected (nearest-neighbor protection). Kleinberg
+//!    long-range links should cover distances beyond this protected zone. Using the
+//!    actual observed distance (not a multiplier) scales naturally with network density
+//!    (k-th nearest ≈ k/n on a uniform ring).
+//!
+//! 3. **d_max = 0.5** — Maximum possible ring distance. Not a parameter.
+//!
+//! 4. **k = 3 nearest-neighbor protection** — Minimum 2 for ring connectivity (left +
+//!    right neighbor). k=3 adds one layer of redundancy. Protected peers are never
+//!    dropped, ensuring local connectivity.
+//!
+//! 5. **Capacity-only acceptance** — The topology is shaped entirely by target selection
+//!    (Kleinberg 1/d). Acceptance filtering would distort the distribution.
+//!
+//! 6. **Log-distance redundancy drop** — The 1/d distribution is uniform in log-distance
+//!    space (CDF ∝ ln d). Ideal connections are equally spaced in log(d). Drop the
+//!    connection with the smallest log-distance gap to its neighbor — it contributes
+//!    least to the distribution's coverage of distance scales.
+//!
+//! 7. **Introduction (gateway-assisted discovery)** — Kleinberg's model assumes contacts
+//!    drawn directly from 1/d. In practice, discovery happens via routing (which depends
+//!    on existing topology) or external mechanisms (gateways, peer exchange). During
+//!    bootstrap (below min_connections), routing through sparse connections is unreliable,
+//!    so introduction (modeling gateway discovery) is used. At steady state, routing
+//!    through the established 1/d topology is used, with introduction as fallback when
+//!    routing fails. This is self-regulating: bad topology → routing fails → more
+//!    introductions → better topology → routing succeeds → fewer introductions.
 
 use crate::network::{ring_distance, PeerContext};
 use rand::Rng;
@@ -42,13 +82,12 @@ impl Strategy {
         }
     }
 
-    /// Fraction of connection attempts that should use direct introduction (sorted
-    /// location lookup) instead of routing through existing topology. Models gateway
-    /// introductions or peer exchange protocol.
-    pub fn introduction_rate(&self) -> f64 {
+    /// Whether this strategy uses introduction (gateway-assisted discovery) during
+    /// bootstrap (below min_connections) and as fallback when routing fails.
+    pub fn uses_introduction(&self) -> bool {
         match self {
-            Strategy::Current(_) => 0.0,
-            Strategy::SmallWorld(_) => 0.5,
+            Strategy::Current(_) => false,
+            Strategy::SmallWorld(_) => true,
         }
     }
 }
@@ -198,8 +237,8 @@ impl Current {
 // Proposed small-world strategy
 // ---------------------------------------------------------------------------
 
-/// Proposed strategy: Kleinberg 1/d link generation + peer introduction mechanism
-/// + nearest-neighbor protection + redundancy-based drop selection.
+/// Proposed strategy based on Kleinberg (2000). See module-level documentation
+/// for theoretical justification of each design decision.
 pub struct SmallWorld;
 
 impl Default for SmallWorld {
@@ -210,19 +249,26 @@ impl Default for SmallWorld {
 
 impl SmallWorld {
     /// Generate a random link distance following Kleinberg's d^{-1} distribution.
-    /// d_min is scaled to the nearest-neighbor distance so there's no gap between
-    /// short-range (nearest-3) and long-range (Kleinberg) connections.
-    fn random_link_distance(nearest_neighbor_dist: f64, rng: &mut impl Rng) -> f64 {
-        // d_min should be slightly above nearest-neighbor distance (those are
-        // handled by the nearest-3 protection). Use 3x nearest to avoid overlap.
-        let d_min: f64 = (nearest_neighbor_dist * 3.0).max(0.0001);
+    ///
+    /// d_min is set to the distance to the k-th protected nearest neighbor.
+    /// This is principled: the nearest-k peers are connected via deterministic
+    /// protection, so Kleinberg sampling starts just beyond that boundary.
+    /// On a uniform ring, the k-th nearest is at ~k/n, which scales naturally
+    /// with network density.
+    ///
+    /// d_max = 0.5 is the maximum possible ring distance.
+    fn random_link_distance(protection_boundary: f64, rng: &mut impl Rng) -> f64 {
+        let d_min: f64 = protection_boundary.max(0.0001);
         let d_max: f64 = 0.5;
+        // Inverse CDF of 1/d distribution on [d_min, d_max]:
+        // CDF(d) = ln(d/d_min) / ln(d_max/d_min)
+        // Inverse: d = d_min * (d_max/d_min)^u, u ~ Uniform(0,1)
         let u: f64 = rng.random();
         d_min * (d_max / d_min).powf(u)
     }
 
-    fn kleinberg_target(location: f64, nearest_neighbor_dist: f64, rng: &mut impl Rng) -> f64 {
-        let dist = Self::random_link_distance(nearest_neighbor_dist, rng);
+    fn kleinberg_target(location: f64, protection_boundary: f64, rng: &mut impl Rng) -> f64 {
+        let dist = Self::random_link_distance(protection_boundary, rng);
         if rng.random::<bool>() {
             (location + dist) % 1.0
         } else {
@@ -238,14 +284,15 @@ impl SmallWorld {
             }
         }
 
-        // Estimate nearest-neighbor distance from the context
-        let nn_dist = ctx
+        // Protection boundary: distance to the k-th (furthest) protected neighbor.
+        // Kleinberg long-range links start beyond this boundary.
+        let protection_boundary = ctx
             .nearest_peers
-            .first()
+            .last()
             .map(|(_, loc)| ring_distance(ctx.location, *loc))
             .unwrap_or(0.001);
 
-        Self::kleinberg_target(ctx.location, nn_dist, rng)
+        Self::kleinberg_target(ctx.location, protection_boundary, rng)
     }
 
     fn accept_connection(
@@ -281,17 +328,20 @@ impl SmallWorld {
 
         droppable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-        // Drop the most redundant connection: the one with the smallest distance
-        // gap to its neighbor in distance-space. This preserves distance diversity
-        // (keeping both short and long-range links) instead of always killing the
-        // longest connection.
+        // Drop the most redundant connection using LOG-distance gaps.
+        //
+        // The ideal Kleinberg 1/d distribution is uniform in log-distance space
+        // (since P(d) ∝ 1/d means CDF ∝ ln(d)). So connections should be equally
+        // spaced in log(d). The most redundant connection is the one with the
+        // smallest log-distance gap to its neighbor — it contributes least to
+        // the distribution's coverage of distance scales.
         if droppable.len() >= 2 {
             let mut most_redundant_idx = 0;
-            let mut min_gap = f64::MAX;
+            let mut min_log_gap = f64::MAX;
             for i in 0..droppable.len() - 1 {
-                let gap = droppable[i + 1].1 - droppable[i].1;
-                if gap < min_gap {
-                    min_gap = gap;
+                let log_gap = droppable[i + 1].1.ln() - droppable[i].1.ln();
+                if log_gap < min_log_gap {
+                    min_log_gap = log_gap;
                     // Drop the further one of the redundant pair (it's more replaceable)
                     most_redundant_idx = i + 1;
                 }

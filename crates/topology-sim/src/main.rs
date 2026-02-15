@@ -66,7 +66,7 @@ fn main() {
             for bin in &m.histogram {
                 let bar: String = std::iter::repeat_n('#', (bin.pct * 2.0) as usize).collect();
                 println!(
-                    "    [{:.2}-{:.2}): {:5.1}% {}",
+                    "    [{:.02}-{:.02}): {:5.1}% {}",
                     bin.lo, bin.hi, bin.pct, bar
                 );
             }

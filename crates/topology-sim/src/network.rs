@@ -118,7 +118,7 @@ impl Network {
 
     fn seek_connections(&mut self) {
         let n = self.peers.len();
-        let intro_rate = self.strategy.introduction_rate();
+        let uses_intro = self.strategy.uses_introduction();
         let mut new_connections: Vec<(usize, usize)> = Vec::new();
 
         for i in 0..n {
@@ -127,11 +127,13 @@ impl Network {
                 continue;
             }
 
-            // Below min: seek aggressively. Between min and max: seek occasionally.
+            // Below min: seek aggressively (multiple attempts per tick).
+            // Above min but below max: seek occasionally (simulation rate knob,
+            // not a design parameter — controls convergence speed, not steady state).
             let attempts = if current_conns < self.min_connections {
                 ((self.min_connections - current_conns) / 2).clamp(1, 3)
             } else if self.rng.random::<f64>() < 0.05 {
-                1 // 5% chance per tick to seek an additional connection
+                1
             } else {
                 continue;
             };
@@ -139,12 +141,26 @@ impl Network {
                 let ctx = self.build_peer_context(i);
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
 
-                // Choose between routing and direct introduction
-                let use_introduction = self.rng.random::<f64>() < intro_rate;
-                let target_peer = if use_introduction {
+                // Connection discovery mechanism:
+                // - Below min_connections: use introduction (models gateway-assisted
+                //   bootstrap — a joining peer discovers contacts via the gateway's
+                //   global knowledge, not through its own sparse connections).
+                // - Above min_connections: route through existing topology, with
+                //   introduction as fallback if routing fails to find a candidate.
+                //   This is self-regulating: bad topology → routing fails → more
+                //   introductions → better topology → routing succeeds → fewer
+                //   introductions.
+                let target_peer = if uses_intro && current_conns < self.min_connections {
                     self.find_peer_near(i, target_loc)
                 } else {
-                    self.route_to_peer(i, target_loc)
+                    let routed = self.route_to_peer(i, target_loc);
+                    if routed.is_some() {
+                        routed
+                    } else if uses_intro {
+                        self.find_peer_near(i, target_loc)
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(target_peer) = target_peer {
@@ -172,11 +188,17 @@ impl Network {
         }
     }
 
-    /// Active topology improvement: peers at/above min_connections periodically try
-    /// to replace their worst connection with a better one.
+    /// Active topology improvement: peers at/above min_connections periodically
+    /// replace their most redundant connection with a Kleinberg-sampled one.
+    ///
+    /// No improvement threshold is needed: select_drop identifies the connection
+    /// contributing least to the 1/d distribution (smallest log-distance gap),
+    /// and select_target draws from the ideal 1/d distribution. Replacing
+    /// redundancy with a fresh Kleinberg sample improves distribution fit by
+    /// construction.
     fn improve_connections(&mut self) {
         let n = self.peers.len();
-        let intro_rate = self.strategy.introduction_rate();
+        let uses_intro = self.strategy.uses_introduction();
         let mut replacements: Vec<(usize, usize, usize)> = Vec::new(); // (peer, drop, add)
 
         for i in 0..n {
@@ -184,32 +206,29 @@ impl Network {
                 continue;
             }
 
-            // Only attempt improvement with some probability per tick
+            // Simulation rate knob: controls convergence speed, not steady-state
+            // topology. In real Freenet, improvement runs during periodic maintenance.
             if self.rng.random::<f64>() > 0.1 {
                 continue;
             }
 
             let ctx = self.build_peer_context(i);
 
-            if let Some(worst_id) = self.strategy.select_drop(&ctx, &mut self.rng) {
-                let worst_dist =
-                    ring_distance(self.peers[i].location, self.peers[worst_id].location);
-
+            if let Some(drop_id) = self.strategy.select_drop(&ctx, &mut self.rng) {
                 let target_loc = self.strategy.select_target(&ctx, &mut self.rng);
 
-                let use_introduction = self.rng.random::<f64>() < intro_rate;
-                let candidate = if use_introduction {
-                    self.find_peer_near(i, target_loc)
-                } else {
-                    self.route_to_peer(i, target_loc)
-                };
+                // Route through existing topology; fall back to introduction if
+                // routing fails (same principled mechanism as seek_connections).
+                let candidate = self.route_to_peer(i, target_loc).or_else(|| {
+                    if uses_intro {
+                        self.find_peer_near(i, target_loc)
+                    } else {
+                        None
+                    }
+                });
 
                 if let Some(candidate) = candidate {
-                    let candidate_dist =
-                        ring_distance(self.peers[i].location, self.peers[candidate].location);
-
-                    // Only replace if the candidate is meaningfully closer
-                    if candidate_dist < worst_dist * 0.7 {
+                    if candidate != drop_id {
                         let target_ctx = self.build_peer_context(candidate);
                         if self.strategy.accept_connection(
                             &target_ctx,
@@ -218,7 +237,7 @@ impl Network {
                             self.max_connections,
                             &mut self.rng,
                         ) {
-                            replacements.push((i, worst_id, candidate));
+                            replacements.push((i, drop_id, candidate));
                         }
                     }
                 }
@@ -296,12 +315,15 @@ impl Network {
         })
     }
 
-    /// Find a peer near `target_loc` using the sorted location index. Models a
-    /// peer introduction mechanism (gateway introductions, peer exchange) where
-    /// a peer learns about another peer's location and address out-of-band.
+    /// Find a peer near `target_loc` using the sorted location index. Models
+    /// gateway introduction: the gateway knows about peers at various locations
+    /// and can introduce us to one near our target.
     fn find_peer_near(&self, from_id: usize, target_loc: f64) -> Option<usize> {
-        let results = self.k_nearest(target_loc, 5, from_id);
-        // Return the first result that isn't already connected
+        // Check enough candidates to guarantee finding a non-connected peer.
+        // With degree d, we need at most d+1 candidates (pigeonhole principle).
+        let degree = self.peers[from_id].connections.len();
+        let k = (degree + 1).min(self.peers.len() - 1);
+        let results = self.k_nearest(target_loc, k, from_id);
         results
             .into_iter()
             .find(|(id, _)| !self.peers[from_id].connections.contains(id))
