@@ -1449,14 +1449,12 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            let needs_fast_tick = current_connections < self.connection_manager.min_connections
-                || !pending_conn_adds.is_empty();
+            let needs_fast_tick = current_connections < self.connection_manager.min_connections;
 
             if needs_fast_tick {
-                // Uses sleep() instead of an interval so we don't need a second
-                // Interval object. check_interval accumulates missed ticks during
-                // this phase; with MissedTickBehavior::Skip the first steady-state
-                // tick fires immediately on transition (which is desirable).
+                // Uses sleep() instead of the check_interval so we don't need a
+                // second Interval object. We reset check_interval on transition
+                // back to steady-state to avoid an immediate burst tick.
                 crate::deterministic_select! {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
@@ -1464,6 +1462,9 @@ impl Ring {
                   _ = tokio::time::sleep(FAST_CHECK_TICK_DURATION) => {},
                 }
             } else {
+                // Reset the interval on transition from fast to normal tick so
+                // accumulated missed ticks don't cause an immediate burst.
+                check_interval.reset();
                 crate::deterministic_select! {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
