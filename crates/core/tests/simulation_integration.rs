@@ -2330,6 +2330,7 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n5_g1_s3("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5)]
 #[case::n5_g1_s4("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5)]
 #[case::n5_g1_s5("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5)]
+#[case::n6_g1_s1("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6)]
 #[case::n6_g1_s3("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6)]
 #[case::n6_g1_s4("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6)]
 #[case::n6_g1_s5("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6)]
@@ -2455,12 +2456,6 @@ fn test_crdt_convergence(
         convergence.converged.len(),
         resync_count
     );
-}
-
-// Was ignored (#3028) but now passes — un-ignoring to validate in CI.
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s1() {
-    test_crdt_convergence("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6);
 }
 
 #[test_log::test]
