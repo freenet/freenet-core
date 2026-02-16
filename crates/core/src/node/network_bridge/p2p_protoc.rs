@@ -2886,24 +2886,23 @@ impl P2pConnManager {
                         "Registered transient connection (not added to ring topology)"
                     );
                     let ttl = connection_manager.transient_ttl();
-                    let drop_tx = self.bridge.ev_listener_tx.clone();
                     let cm = connection_manager.clone();
                     GlobalExecutor::spawn(async move {
                         sleep(ttl).await;
                         if cm.drop_transient(peer_addr).is_some() {
-                            tracing::info!(%peer_addr, "Transient connection expired; dropping");
-                            if let Err(err) = drop_tx
-                                .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
-                                    peer_addr,
-                                )))
-                                .await
-                            {
-                                tracing::warn!(
-                                    %peer_addr,
-                                    ?err,
-                                    "Failed to dispatch DropConnection for expired transient"
-                                );
-                            }
+                            // Only remove the transient tracking entry. Do NOT
+                            // dispatch DropConnection — that tears down the
+                            // underlying transport, killing any in-progress
+                            // CONNECT handshake. If the CONNECT succeeds later,
+                            // add_connection() will promote it to a ring
+                            // connection normally (the transient entry is already
+                            // gone so the remove there is a no-op). If it never
+                            // succeeds, the transport idle timeout handles cleanup.
+                            tracing::info!(
+                                %peer_addr,
+                                "Transient connection expired; removed tracking entry \
+                                 (transport connection preserved for in-progress CONNECT)"
+                            );
                         }
                     });
                 }
