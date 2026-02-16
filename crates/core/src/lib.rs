@@ -122,24 +122,21 @@ pub mod dev_tool {
 
     /// Reset all simulation state for deterministic testing.
     ///
-    /// All ID counters are thread-local with per-thread offset blocks, so this
-    /// function is safe for parallel test execution — each thread resets only its
-    /// own counters.
+    /// All state is thread-local or per-network-name keyed, so this function is
+    /// safe for parallel test execution — each thread only resets its own state.
     ///
     /// Call this at the start of each simulation run, AFTER setting the RNG seed
     /// with `GlobalRng::set_seed()`.
     ///
     /// # What gets reset:
+    /// - Thread-local RNG seed
     /// - Thread-local ID counters (RequestId, ClientId, EventId, ChannelId, StreamId, Nonce, NodeIndex)
-    /// - Thread index counter (for deterministic spawn_blocking thread seeding)
-    /// - Socket registries
-    /// - Address network mappings
     /// - Simulation time
-    /// - Topology snapshots
+    /// - Socket registries, address network mappings, topology snapshots
     pub fn reset_all_simulation_state() {
         // Reset RNG (caller should set seed after this)
         crate::config::GlobalRng::clear_seed();
-        // Reset thread index counter so new threads get deterministic indices.
+        // Reset thread index counter for spawn_blocking thread determinism.
         crate::config::GlobalRng::reset_thread_index_counter();
 
         // Reset simulation time (caller should set time after this if needed)
@@ -154,7 +151,7 @@ pub mod dev_tool {
         crate::transport::reset_nonce_counter();
         crate::test_utils::reset_global_node_index();
 
-        // Reset global registries
+        // Reset global registries (keyed by network name, so per-test)
         crate::transport::in_memory_socket::clear_all_socket_registries();
         crate::transport::in_memory_socket::clear_all_address_networks();
         crate::transport::in_memory_socket::clear_all_network_time_sources();

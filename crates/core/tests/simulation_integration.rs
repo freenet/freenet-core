@@ -595,19 +595,17 @@ impl TestResult {
 /// Per-network state (sockets, topology, fault injectors) is cleaned up by
 /// `SimNetwork::Drop`, so no scorched-earth registry clear is needed.
 fn setup_deterministic_state(seed: u64) {
-    // Thread-local state (safe for parallel tests — each thread has its own copy)
+    // All state below is thread-local — safe for parallel tests.
     GlobalRng::set_seed(seed);
     const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
     GlobalTestMetrics::reset();
 
-    // Clear CRDT contract registrations from prior tests.
+    // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();
 
-    // Reset thread index counter so spawned blocking threads get deterministic indices.
-    // Without this, spawn_blocking threads from previous tests advance the counter,
-    // changing the RNG seed derivation for new threads in subsequent tests.
+    // Reset thread index counter for spawn_blocking thread determinism.
     GlobalRng::reset_thread_index_counter();
 
     // Reset all thread-local ID counters for exact event sequence reproducibility.

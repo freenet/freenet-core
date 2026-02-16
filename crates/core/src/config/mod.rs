@@ -1682,14 +1682,8 @@ impl GlobalExecutor {
 // GlobalRng - Deterministic RNG abstraction for simulation testing
 // =============================================================================
 
-use parking_lot::Mutex;
 use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
-
-/// Global seed for deterministic simulation.
-/// Set this before any RNG operations to ensure reproducibility.
-/// Note: For test isolation, prefer using set_seed() which sets the thread-local seed.
-static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Counter for deterministic thread indexing.
 /// Each thread gets a unique, deterministic index for RNG seeding.
@@ -1701,8 +1695,8 @@ std::thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
     // Deterministic thread index assigned at first RNG access
     static THREAD_INDEX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    // Thread-local seed for test isolation. When set, takes precedence over SIMULATION_SEED.
-    // This prevents parallel tests from interfering with each other's RNG sequences.
+    // Thread-local seed for deterministic simulation testing.
+    // Each thread gets its own seed, ensuring parallel tests are fully isolated.
     static THREAD_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1768,40 +1762,34 @@ impl Drop for SeedGuard {
 }
 
 impl GlobalRng {
-    /// Sets the global seed for deterministic RNG.
+    /// Sets the thread-local seed for deterministic RNG.
     ///
     /// **Warning:** For test isolation, prefer `scoped_seed()` or `seed_guard()`
     /// which automatically clean up the seed state.
     ///
     /// Call this at test/simulation startup for reproducibility.
     /// Must call `clear_seed()` when done to avoid affecting other tests.
+    ///
+    /// This is purely thread-local — parallel tests on different threads are fully isolated.
     pub fn set_seed(seed: u64) {
         // Set thread-local seed for test isolation. This prevents parallel tests from
         // interfering with each other's RNG sequences.
         // See: https://github.com/freenet/freenet-core/issues/2733
         THREAD_SEED.with(|s| s.set(Some(seed)));
-        // Also set global seed for code that spawns new threads (they'll inherit the seed)
-        *SIMULATION_SEED.lock() = Some(seed);
         // Clear thread-local RNG so it gets re-seeded with the new seed
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        // NOTE: We intentionally do NOT reset THREAD_INDEX_COUNTER or clear THREAD_INDEX.
-        // Thread indices remain stable across set_seed() calls to ensure determinism.
     }
 
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
         // Clear thread-local seed
         THREAD_SEED.with(|s| s.set(None));
-        // Clear global seed
-        *SIMULATION_SEED.lock() = None;
         // Clear thread-local RNG
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        // NOTE: We do NOT reset THREAD_INDEX_COUNTER here to avoid race conditions
-        // with parallel tests. Thread indices remain stable. See set_seed() for details.
     }
 
     /// Resets the thread index counter for deterministic simulation.
@@ -1831,10 +1819,9 @@ impl GlobalRng {
         })
     }
 
-    /// Returns true if a simulation seed is set (either thread-local or global).
+    /// Returns true if a simulation seed is set for the current thread.
     pub fn is_seeded() -> bool {
-        // Check thread-local seed first, then global
-        THREAD_SEED.with(|s| s.get()).is_some() || SIMULATION_SEED.lock().is_some()
+        THREAD_SEED.with(|s| s.get()).is_some()
     }
 
     /// Creates a RAII guard that sets the seed and clears it on drop.
@@ -1876,18 +1863,16 @@ impl GlobalRng {
         f()
     }
 
-    /// Executes a closure with access to the global RNG.
-    /// Uses seeded RNG if set (thread-local or global), otherwise system RNG.
+    /// Executes a closure with access to the RNG.
+    /// Uses seeded RNG if set via `set_seed()`, otherwise system RNG.
     #[inline]
     pub fn with_rng<F, R>(f: F) -> R
     where
         F: FnOnce(&mut dyn RngCore) -> R,
     {
-        // Check thread-local seed first for test isolation, then fall back to global seed.
-        // This prevents parallel tests from interfering with each other's RNG sequences.
-        let seed = THREAD_SEED
-            .with(|s| s.get())
-            .or_else(|| *SIMULATION_SEED.lock());
+        // Thread-local seed only — no global fallback. This ensures parallel tests
+        // on different threads are fully isolated.
+        let seed = THREAD_SEED.with(|s| s.get());
 
         if let Some(seed) = seed {
             // Simulation mode: use thread-local seeded RNG
