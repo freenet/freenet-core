@@ -2457,11 +2457,8 @@ fn test_crdt_convergence(
     );
 }
 
-// Known-failing seeds: topologies where CRDT updates don't propagate to all
-// subscribers due to Location::random() in join_ring_request (PR #2907).
-// Tracked in #3028.
+// Was ignored (#3028) but now passes — un-ignoring to validate in CI.
 #[test_log::test]
-#[ignore]
 fn test_crdt_convergence_n6_g1_s1() {
     test_crdt_convergence("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6);
 }
