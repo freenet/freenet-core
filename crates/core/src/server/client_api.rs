@@ -80,6 +80,11 @@ impl HttpClientApi {
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
+        // Controls the cookie Secure flag: when true, cookies are sent over HTTP
+        // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
+        // (network mode) allow HTTP cookies — most home users lack TLS.
+        // Note: this is intentionally different from `localhost_only` in mod.rs,
+        // which uses only is_loopback() to control WebSocket origin restrictions.
         let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
