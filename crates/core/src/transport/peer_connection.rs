@@ -903,30 +903,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // Re-read count after cleanup
                     let pending_ping_count = self.pending_pings.read().len();
 
-                    // Check for bidirectional liveness failure (too many unanswered pings).
-                    // This catches asymmetric failures where we receive packets from remote
-                    // (so last_received is updated) but our packets don't reach the remote
-                    // (so our pings never get ponged back).
-                    //
-                    // However, if we've received ANY data recently, the connection is at least
-                    // partially working. In Docker NAT and under congestion, small ping/pong
-                    // packets can be dropped while larger data packets succeed. Only trigger
-                    // the bidirectional liveness failure when we have BOTH unanswered pings
-                    // AND no recent data reception.
-                    let ping_timeout_nanos = (MAX_UNANSWERED_PINGS as u64) * KEEP_ALIVE_INTERVAL.as_nanos() as u64;
-                    if pending_ping_count > MAX_UNANSWERED_PINGS && elapsed_nanos > ping_timeout_nanos {
-                        tracing::warn!(
-                            target: "freenet_core::transport::keepalive_timeout",
+                    // Log unanswered pings for diagnostics but do NOT kill the connection.
+                    // The idle timeout (connection_idle_timeout, typically 120s) is the sole
+                    // connection liveness check. A separate bidirectional liveness check was
+                    // previously here but caused premature connection drops in Docker NAT
+                    // environments where small ping/pong UDP packets are lost while larger
+                    // data packets succeed, or where gateway connections become idle because
+                    // data routes through the P2P mesh instead.
+                    if pending_ping_count > MAX_UNANSWERED_PINGS {
+                        tracing::debug!(
+                            target: "freenet_core::transport::keepalive_health",
                             remote = ?self.remote_conn.remote_addr,
                             pending_pings = pending_ping_count,
                             max_unanswered = MAX_UNANSWERED_PINGS,
                             time_since_last_received_secs = elapsed.as_secs_f64(),
-                            "BIDIRECTIONAL LIVENESS FAILURE - {} pings unanswered (max {}), \
-                             connection appears asymmetric",
+                            "Many unanswered pings ({} > {}), relying on idle timeout for liveness",
                             pending_ping_count,
                             MAX_UNANSWERED_PINGS
                         );
-                        return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
                     let remaining_nanos = kill_connection_after_nanos.saturating_sub(elapsed_nanos);
