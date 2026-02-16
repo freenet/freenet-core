@@ -6,20 +6,10 @@
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::{GlobalRng, GlobalSimulationTime};
-use freenet::dev_tool::{
-    reset_channel_id_counter, reset_event_id_counter, reset_global_node_index, reset_nonce_counter,
-    RequestId, SimNetwork, StreamId,
-};
+use freenet::dev_tool::SimNetwork;
 use std::time::Duration;
 
 fn reset_counters() {
-    RequestId::reset_counter();
-    freenet::dev_tool::ClientId::reset_counter();
-    reset_event_id_counter();
-    reset_channel_id_counter();
-    StreamId::reset_counter();
-    reset_nonce_counter();
-    reset_global_node_index();
     GlobalRng::reset_thread_index_counter();
 }
 

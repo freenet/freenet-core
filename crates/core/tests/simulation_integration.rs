@@ -595,7 +595,7 @@ impl TestResult {
 /// Per-network state (sockets, topology, fault injectors) is cleaned up by
 /// `SimNetwork::Drop`, so no scorched-earth registry clear is needed.
 fn setup_deterministic_state(seed: u64) {
-    // Thread-local state
+    // Thread-local state (safe for parallel tests — each thread has its own copy)
     GlobalRng::set_seed(seed);
     const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
@@ -605,7 +605,23 @@ fn setup_deterministic_state(seed: u64) {
     // Clear CRDT contract registrations from prior tests.
     freenet::dev_tool::clear_crdt_contracts();
 
-    // Shared atomic counters — reset for deterministic ID generation.
+    // Reset thread index counter so spawned blocking threads get deterministic indices.
+    // Without this, spawn_blocking threads from previous tests advance the counter,
+    // changing the RNG seed derivation for new threads in subsequent tests.
+    GlobalRng::reset_thread_index_counter();
+}
+
+/// Reset ALL shared state for strict determinism tests that compare exact event sequences.
+///
+/// This resets shared atomic counters (RequestId, ClientId, etc.) which is NOT safe
+/// for parallel execution — concurrent tests would race on the same counters.
+/// Only use with `--test-threads=1`.
+fn setup_strict_deterministic_state(seed: u64) {
+    setup_deterministic_state(seed);
+
+    // Shared atomic counters — reset for exact event sequence reproducibility.
+    // WARNING: NOT safe for parallel tests. Counter resets in one test will
+    // corrupt IDs in concurrently running tests.
     RequestId::reset_counter();
     freenet::dev_tool::ClientId::reset_counter();
     reset_event_id_counter();
@@ -613,11 +629,6 @@ fn setup_deterministic_state(seed: u64) {
     StreamId::reset_counter();
     reset_nonce_counter();
     reset_global_node_index();
-
-    // Reset thread index counter so spawned blocking threads get deterministic indices.
-    // Without this, spawn_blocking threads from previous tests advance the counter,
-    // changing the RNG seed derivation for new threads in subsequent tests.
-    GlobalRng::reset_thread_index_counter();
 }
 
 /// Create a tokio runtime for running simulation setup.
@@ -661,7 +672,7 @@ fn test_strict_determinism_exact_event_equality() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
-        setup_deterministic_state(seed);
+        setup_strict_deterministic_state(seed);
 
         let rt = create_runtime();
 
@@ -822,7 +833,7 @@ fn test_strict_determinism_multi_gateway() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, SimulationTrace) {
-        setup_deterministic_state(seed);
+        setup_strict_deterministic_state(seed);
 
         let rt = create_runtime();
 
@@ -911,7 +922,7 @@ fn test_deterministic_replay_events() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, ReplayTrace) {
-        setup_deterministic_state(seed);
+        setup_strict_deterministic_state(seed);
 
         let rt = create_runtime();
 
@@ -1092,7 +1103,7 @@ fn test_turmoil_determinism_verification() {
     const SEED: u64 = 0xDE7E_2A11_0001;
 
     fn run_simulation(name: &'static str, seed: u64) -> Vec<String> {
-        setup_deterministic_state(seed);
+        setup_strict_deterministic_state(seed);
         let rt = create_runtime();
 
         let (sim, logs_handle) = rt.block_on(async {
@@ -3541,8 +3552,9 @@ fn test_determinism_parallel_safe() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, Trace) {
-        // NO reset_all_simulation_state() — only thread-local + per-network cleanup
-        setup_deterministic_state(seed);
+        // Uses strict state reset for exact sequence comparison, but NO
+        // reset_all_simulation_state() — per-network cleanup via SimNetwork::Drop.
+        setup_strict_deterministic_state(seed);
 
         let rt = create_runtime();
 

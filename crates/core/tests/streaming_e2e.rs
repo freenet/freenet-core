@@ -15,8 +15,7 @@
 
 use freenet::config::{GlobalRng, GlobalSimulationTime};
 use freenet::dev_tool::{
-    reset_channel_id_counter, reset_event_id_counter, reset_global_node_index, reset_nonce_counter,
-    MockStateStorage, NodeLabel, RequestId, ScheduledOperation, SimNetwork, SimOperation, StreamId,
+    MockStateStorage, NodeLabel, ScheduledOperation, SimNetwork, SimOperation,
 };
 use freenet_stdlib::prelude::*;
 use std::time::Duration;
@@ -37,13 +36,6 @@ async fn setup_streaming_network(
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
-    RequestId::reset_counter();
-    freenet::dev_tool::ClientId::reset_counter();
-    reset_event_id_counter();
-    reset_channel_id_counter();
-    StreamId::reset_counter();
-    reset_nonce_counter();
-    reset_global_node_index();
     GlobalRng::reset_thread_index_counter();
 
     let mut sim = SimNetwork::new(

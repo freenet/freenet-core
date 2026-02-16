@@ -63,13 +63,6 @@ async fn test_smoke_event_types_consistency() {
         const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
-        freenet::dev_tool::RequestId::reset_counter();
-        freenet::dev_tool::ClientId::reset_counter();
-        freenet::dev_tool::reset_event_id_counter();
-        freenet::dev_tool::reset_channel_id_counter();
-        freenet::dev_tool::StreamId::reset_counter();
-        freenet::dev_tool::reset_nonce_counter();
-        freenet::dev_tool::reset_global_node_index();
         GlobalRng::reset_thread_index_counter();
 
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
