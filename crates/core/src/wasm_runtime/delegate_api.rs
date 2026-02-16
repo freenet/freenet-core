@@ -164,6 +164,9 @@ pub mod contract_error_codes {
     /// attempts to access memory outside its allocated linear memory region via
     /// host function calls.
     pub const ERR_MEMORY_BOUNDS: i32 = -9;
+    /// Contract code not registered in the ContractStore index.
+    /// The delegate passed a contract instance ID whose CodeHash cannot be resolved.
+    pub const ERR_CONTRACT_CODE_NOT_REGISTERED: i32 = -10;
 }
 
 #[cfg(test)]
@@ -448,6 +451,129 @@ mod tests {
         let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
         assert_eq!(result.len(), 1_000_000);
         assert_eq!(result, large_state);
+    }
+
+    // ============ ReDb store_state_sync tests ============
+
+    /// Verify store_state_sync writes and get_state_sync reads back correctly.
+    #[tokio::test]
+    async fn test_redb_store_state_sync_basic() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(40);
+        let state_data = vec![10, 20, 30, 40, 50];
+
+        // Store via sync path
+        db.store_state_sync(&key, WrappedState::new(state_data.clone()))
+            .unwrap();
+
+        // Read via sync path
+        let result = db.get_state_sync(&key).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().as_ref(), &state_data);
+    }
+
+    /// Verify store_state_sync can overwrite existing state.
+    #[tokio::test]
+    async fn test_redb_store_state_sync_overwrite() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(41);
+
+        db.store_state_sync(&key, WrappedState::new(vec![1, 1, 1]))
+            .unwrap();
+        db.store_state_sync(&key, WrappedState::new(vec![9, 9, 9]))
+            .unwrap();
+
+        let result = db.get_state_sync(&key).unwrap().unwrap();
+        assert_eq!(result.as_ref(), &[9, 9, 9]);
+    }
+
+    // ============ DelegateCallEnv PUT/UPDATE/SUBSCRIBE tests ============
+
+    /// V2 delegate can PUT contract state.
+    #[tokio::test]
+    async fn test_env_put_contract_state() {
+        let mut env_holder = TestEnv::new().await;
+        // store_contract registers the code hash + stores initial state
+        let contract_id = env_holder.store_contract(80, &[1, 2, 3]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        // PUT new state
+        let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6]);
+        assert!(result.is_ok(), "put should succeed: {:?}", result);
+
+        // Verify the new state
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(state, Some(vec![4, 5, 6]));
+    }
+
+    /// V2 delegate PUT fails for unregistered contract code.
+    #[tokio::test]
+    async fn test_env_put_contract_state_unregistered() {
+        let mut env_holder = TestEnv::new().await;
+
+        let env = unsafe { env_holder.make_env() };
+        let missing_id = ContractInstanceId::new([88u8; 32]);
+        let result = env.put_contract_state_sync(&missing_id, vec![1, 2, 3]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not registered"));
+    }
+
+    /// V2 delegate can UPDATE existing contract state.
+    #[tokio::test]
+    async fn test_env_update_contract_state() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(81, &[10, 20, 30]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.update_contract_state_sync(&contract_id, vec![40, 50, 60]);
+        assert!(result.is_ok(), "update should succeed: {:?}", result);
+
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(state, Some(vec![40, 50, 60]));
+    }
+
+    /// V2 delegate UPDATE fails when there's no existing state.
+    #[tokio::test]
+    async fn test_env_update_contract_state_nonexistent() {
+        let mut env_holder = TestEnv::new().await;
+        // Register contract code but don't store any state
+        let code = ContractCode::from(vec![82, 83, 84]);
+        let params = Parameters::from(vec![92, 93]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let contract_id = *key.id();
+        env_holder.contract_store.ensure_key_indexed(&key).unwrap();
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no existing state"));
+    }
+
+    /// V2 delegate can subscribe to a known contract.
+    #[tokio::test]
+    async fn test_env_subscribe_known() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(90, &[1]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.subscribe_contract_sync(&contract_id);
+        assert!(result.is_ok());
+    }
+
+    /// V2 delegate subscribe fails for unknown contract.
+    #[tokio::test]
+    async fn test_env_subscribe_unknown() {
+        let mut env_holder = TestEnv::new().await;
+
+        let env = unsafe { env_holder.make_env() };
+        let missing_id = ContractInstanceId::new([99u8; 32]);
+        let result = env.subscribe_contract_sync(&missing_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not registered"));
     }
 
     // ============ Wasmer async host function integration tests ============

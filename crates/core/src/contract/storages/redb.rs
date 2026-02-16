@@ -338,6 +338,25 @@ impl ReDb {
         }
     }
 
+    /// Store a contract's state synchronously.
+    ///
+    /// This is the same as `StateStorage::store` but without the async wrapper
+    /// and without hosting metadata updates (caller is responsible for metadata).
+    /// Used by V2 delegate host functions that need synchronous writes during
+    /// WASM `process()` execution.
+    pub fn store_state_sync(
+        &self,
+        key: &ContractKey,
+        state: WrappedState,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(STATE_TABLE)?;
+            tbl.insert(key.as_bytes(), state.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
     /// Read a contract's state synchronously.
     ///
     /// This is the same as `StateStorage::get` but without the async wrapper.

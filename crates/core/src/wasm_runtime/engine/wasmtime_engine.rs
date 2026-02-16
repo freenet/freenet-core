@@ -859,6 +859,48 @@ impl WasmtimeEngine {
             )
             .map_err(WasmError::Other)?;
 
+        linker
+            .func_wrap_async(
+                "freenet_delegate_contracts",
+                "__frnt__delegate__put_contract_state",
+                |_caller: Caller<'_, HostState>,
+                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
+                    Box::new(async move {
+                        native_api::delegate_contracts::put_contract_state_impl(
+                            id_ptr, id_len, state_ptr, state_len,
+                        )
+                    })
+                },
+            )
+            .map_err(WasmError::Other)?;
+
+        linker
+            .func_wrap_async(
+                "freenet_delegate_contracts",
+                "__frnt__delegate__update_contract_state",
+                |_caller: Caller<'_, HostState>,
+                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
+                    Box::new(async move {
+                        native_api::delegate_contracts::update_contract_state_impl(
+                            id_ptr, id_len, state_ptr, state_len,
+                        )
+                    })
+                },
+            )
+            .map_err(WasmError::Other)?;
+
+        linker
+            .func_wrap_async(
+                "freenet_delegate_contracts",
+                "__frnt__delegate__subscribe_contract",
+                |_caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                    Box::new(async move {
+                        native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
+                    })
+                },
+            )
+            .map_err(WasmError::Other)?;
+
         Ok(())
     }
 }
@@ -1142,6 +1184,15 @@ mod tests {
           ;; get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
             (func $get_state_len (param i64 i32) (result i64)))
+          ;; put_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__put_contract_state"
+            (func $put_state (param i64 i32 i64 i64) (result i64)))
+          ;; update_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__update_contract_state"
+            (func $update_state (param i64 i32 i64 i64) (result i64)))
+          ;; subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64
+          (import "freenet_delegate_contracts" "__frnt__delegate__subscribe_contract"
+            (func $subscribe (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (func (export "answer") (result i32) i32.const 42)
         )
