@@ -119,47 +119,6 @@ pub mod dev_tool {
     pub use crate::test_utils::reset_global_node_index;
     pub use crate::transport::reset_nonce_counter;
     pub use crate::transport::StreamId;
-
-    /// Reset all simulation state for deterministic testing.
-    ///
-    /// All state is thread-local or per-network-name keyed, so this function is
-    /// safe for parallel test execution — each thread only resets its own state.
-    ///
-    /// Call this at the start of each simulation run, AFTER setting the RNG seed
-    /// with `GlobalRng::set_seed()`.
-    ///
-    /// # What gets reset:
-    /// - Thread-local RNG seed
-    /// - Thread-local ID counters (RequestId, ClientId, EventId, ChannelId, StreamId, Nonce, NodeIndex)
-    /// - Simulation time
-    /// - Socket registries, address network mappings, topology snapshots
-    pub fn reset_all_simulation_state() {
-        // Reset RNG (caller should set seed after this)
-        crate::config::GlobalRng::clear_seed();
-        // Reset thread index counter for spawn_blocking thread determinism.
-        crate::config::GlobalRng::reset_thread_index_counter();
-
-        // Reset simulation time (caller should set time after this if needed)
-        crate::config::GlobalSimulationTime::clear_time();
-
-        // Reset all thread-local ID counters
-        crate::client_events::RequestId::reset_counter();
-        crate::client_events::ClientId::reset_counter();
-        crate::contract::reset_event_id_counter();
-        crate::node::reset_channel_id_counter();
-        crate::transport::StreamId::reset_counter();
-        crate::transport::reset_nonce_counter();
-        crate::test_utils::reset_global_node_index();
-
-        // Reset global registries (keyed by network name, so per-test)
-        crate::transport::in_memory_socket::clear_all_socket_registries();
-        crate::transport::in_memory_socket::clear_all_address_networks();
-        crate::transport::in_memory_socket::clear_all_network_time_sources();
-        crate::node::clear_all_fault_injectors();
-
-        // Clear topology snapshots from previous simulation runs
-        crate::ring::topology_registry::clear_all_topology_snapshots();
-    }
 }
 
 pub mod test_utils;

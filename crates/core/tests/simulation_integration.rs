@@ -3517,9 +3517,8 @@ fn test_multi_step_churn() {
 // Parallel Safety & Determinism Verification
 // =============================================================================
 
-/// Proves that removing scorched-earth `reset_all_simulation_state()` doesn't break
-/// determinism. Runs the same simulation 3x with the same seed, relying only on
-/// per-network cleanup via `SimNetwork::Drop` and thread-local state.
+/// Proves determinism with per-network cleanup via `SimNetwork::Drop` and thread-local state.
+/// Runs the same simulation 3x with the same seed.
 ///
 /// This is the parallel-safe equivalent of `test_strict_determinism_exact_event_equality`.
 #[test_log::test]
@@ -3534,8 +3533,7 @@ fn test_determinism_parallel_safe() {
     }
 
     fn run_and_trace(name: &str, seed: u64) -> (turmoil::Result, Trace) {
-        // Uses strict state reset for exact sequence comparison, but NO
-        // reset_all_simulation_state() — per-network cleanup via SimNetwork::Drop.
+        // Per-network cleanup via SimNetwork::Drop, thread-local counter resets.
         setup_deterministic_state(seed);
 
         let rt = create_runtime();
