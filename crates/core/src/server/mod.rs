@@ -101,20 +101,34 @@ pub(crate) enum HostCallbackResult {
 }
 
 async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(socket).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!(
-                    "Port {} is already in use. Another freenet process may be running. \
-                     Use 'pkill freenet' to stop it, or specify a different port with --ws-api-port.",
-                    socket.port()
-                ),
-            )
-        } else {
-            e
+    serve_with_listener(socket, router, None).await
+}
+
+async fn serve_with_listener(
+    socket: SocketAddr,
+    router: axum::Router,
+    pre_bound: Option<std::net::TcpListener>,
+) -> std::io::Result<()> {
+    let listener = match pre_bound {
+        Some(std_listener) => {
+            std_listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(std_listener)?
         }
-    })?;
+        None => tokio::net::TcpListener::bind(socket).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "Port {} is already in use. Another freenet process may be running. \
+                         Use 'pkill freenet' to stop it, or specify a different port with --ws-api-port.",
+                        socket.port()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?,
+    };
     tracing::info!("HTTP client API listening on {}", socket);
     GlobalExecutor::spawn(async move {
         axum::serve(listener, router).await.map_err(|e| {
@@ -248,7 +262,17 @@ pub mod local_node {
 }
 
 pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
-    let (gw, ws_proxy) = serve_client_api_in(config).await?;
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, None).await?;
+    Ok([Box::new(gw), Box::new(ws_proxy)])
+}
+
+/// Like [`serve_client_api`] but accepts a pre-bound TCP listener to avoid
+/// a release-then-rebind race window in parallel tests.
+pub async fn serve_client_api_with_listener(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<[BoxedClient; 2]> {
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener)).await?;
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
@@ -260,11 +284,18 @@ pub async fn serve_client_api_for_test(
     client_api::HttpClientApi,
     crate::client_events::websocket::WebSocketProxy,
 )> {
-    serve_client_api_in(config).await
+    serve_client_api_in_impl(config, None).await
 }
 
 pub(crate) async fn serve_client_api_in(
     config: WebsocketApiConfig,
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
+    serve_client_api_in_impl(config, None).await
+}
+
+async fn serve_client_api_in_impl(
+    config: WebsocketApiConfig,
+    pre_bound: Option<std::net::TcpListener>,
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
@@ -278,6 +309,13 @@ pub(crate) async fn serve_client_api_in(
         config.token_cleanup_interval_seconds,
     );
 
+    // Whether to restrict WebSocket connections to localhost-only origins.
+    // Uses is_loopback() without is_unspecified() intentionally: when binding
+    // to 0.0.0.0 (network mode), remote browsers need to connect, so we use
+    // a same-origin check instead of a localhost-only allowlist.
+    // Note: client_api.rs has a separate `localhost` flag that also includes
+    // is_unspecified() — that controls the cookie Secure flag, which is a
+    // different concern (allowing HTTP cookies for home users without TLS).
     let localhost_only = config.address.is_loopback();
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
@@ -289,7 +327,12 @@ pub(crate) async fn serve_client_api_in(
         localhost_only,
     );
 
-    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http())).await?;
+    serve_with_listener(
+        ws_socket,
+        ws_router.layer(TraceLayer::new_for_http()),
+        pre_bound,
+    )
+    .await?;
     Ok((gw, ws_proxy))
 }
 

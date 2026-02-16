@@ -484,14 +484,17 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
-            // Release reserved ports just before binding to minimize race window
+            // Release the network port reservation (UDP, used by transport layer)
             freenet::test_utils::release_local_port(#network_port_var);
-            freenet::test_utils::release_local_port(#ws_port_var);
+            // Take the pre-bound TCP listener for the WS port to avoid a
+            // release-then-rebind race window in parallel tests
+            let ws_listener = freenet::test_utils::take_reserved_tcp_listener(#ws_port_var)
+                .expect("ws port should have been reserved");
             let built_config = #config_var.build().await?;
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             #connection_tuning
             let (#node_var, #flush_handle_var) = node_config
-                .build_with_flush_handle(freenet::server::serve_client_api(built_config.ws_api).await?)
+                .build_with_flush_handle(freenet::server::serve_client_api_with_listener(built_config.ws_api, ws_listener).await?)
                 .await?;
         });
     }
