@@ -1274,8 +1274,7 @@ mod tests {
                 );
 
                 // Remaining targets should be spread across the ring at evenly
-                // spaced offsets from own location. Verify they are distinct and
-                // cover the ring.
+                // spaced offsets from own location.
                 for (i, loc) in locations.iter().enumerate().skip(1) {
                     let expected_offset = i as f64 / 24.0;
                     let expected = Location::new_rounded(my_location.as_f64() + expected_offset);
@@ -1284,6 +1283,16 @@ mod tests {
                         "Connection {i} should be at offset {expected_offset} from own location"
                     );
                 }
+
+                // All locations must be distinct so they survive BTreeSet
+                // deduplication in the caller's pending connection queue.
+                let as_set: std::collections::BTreeSet<Location> =
+                    locations.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    locations.len(),
+                    "All target locations must be distinct"
+                );
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }

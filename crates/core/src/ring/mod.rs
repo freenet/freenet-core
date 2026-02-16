@@ -1272,6 +1272,8 @@ impl Ring {
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
                     );
+                    // Intentionally not re-queued: adjust_topology will re-request
+                    // this location on the next cycle if still below min_connections.
                     continue;
                 }
                 if active_count >= MAX_CONCURRENT_CONNECTIONS {
@@ -1451,6 +1453,10 @@ impl Ring {
                 || !pending_conn_adds.is_empty();
 
             if needs_fast_tick {
+                // Uses sleep() instead of an interval so we don't need a second
+                // Interval object. check_interval accumulates missed ticks during
+                // this phase; with MissedTickBehavior::Skip the first steady-state
+                // tick fires immediately on transition (which is desirable).
                 crate::deterministic_select! {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
