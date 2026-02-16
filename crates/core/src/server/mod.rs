@@ -101,20 +101,34 @@ pub(crate) enum HostCallbackResult {
 }
 
 async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(socket).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!(
-                    "Port {} is already in use. Another freenet process may be running. \
-                     Use 'pkill freenet' to stop it, or specify a different port with --gateway-port.",
-                    socket.port()
-                ),
-            )
-        } else {
-            e
+    serve_with_listener(socket, router, None).await
+}
+
+async fn serve_with_listener(
+    socket: SocketAddr,
+    router: axum::Router,
+    pre_bound: Option<std::net::TcpListener>,
+) -> std::io::Result<()> {
+    let listener = match pre_bound {
+        Some(std_listener) => {
+            std_listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(std_listener)?
         }
-    })?;
+        None => tokio::net::TcpListener::bind(socket).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "Port {} is already in use. Another freenet process may be running. \
+                         Use 'pkill freenet' to stop it, or specify a different port with --gateway-port.",
+                        socket.port()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?,
+    };
     tracing::info!("HTTP gateway listening on {}", socket);
     GlobalExecutor::spawn(async move {
         axum::serve(listener, router).await.map_err(|e| {
@@ -248,7 +262,17 @@ pub mod local_node {
 }
 
 pub async fn serve_gateway(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
-    let (gw, ws_proxy) = serve_gateway_in(config).await?;
+    let (gw, ws_proxy) = serve_gateway_in_impl(config, None).await?;
+    Ok([Box::new(gw), Box::new(ws_proxy)])
+}
+
+/// Like [`serve_gateway`] but accepts a pre-bound TCP listener to avoid
+/// a release-then-rebind race window in parallel tests.
+pub async fn serve_gateway_with_listener(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<[BoxedClient; 2]> {
+    let (gw, ws_proxy) = serve_gateway_in_impl(config, Some(listener)).await?;
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
@@ -260,11 +284,18 @@ pub async fn serve_gateway_for_test(
     http_gateway::HttpGateway,
     crate::client_events::websocket::WebSocketProxy,
 )> {
-    serve_gateway_in(config).await
+    serve_gateway_in_impl(config, None).await
 }
 
 pub(crate) async fn serve_gateway_in(
     config: WebsocketApiConfig,
+) -> std::io::Result<(HttpGateway, WebSocketProxy)> {
+    serve_gateway_in_impl(config, None).await
+}
+
+async fn serve_gateway_in_impl(
+    config: WebsocketApiConfig,
+    pre_bound: Option<std::net::TcpListener>,
 ) -> std::io::Result<(HttpGateway, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
@@ -292,7 +323,12 @@ pub(crate) async fn serve_gateway_in(
         localhost_only,
     );
 
-    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http())).await?;
+    serve_with_listener(
+        ws_socket,
+        ws_router.layer(TraceLayer::new_for_http()),
+        pre_bound,
+    )
+    .await?;
     Ok((gw, ws_proxy))
 }
 
