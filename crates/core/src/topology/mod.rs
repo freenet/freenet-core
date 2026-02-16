@@ -431,23 +431,13 @@ impl TopologyManager {
             return TopologyAdjustment::AddConnections(locations);
         }
 
-        // Skip resource-based adjustment when the peer has fewer connections than both:
-        // - DENSITY_SELECTION_THRESHOLD (minimum for meaningful density-based decisions)
-        // - min_connections + 1 (never remove connections at or near the configured minimum)
-        //
-        // The +1 ensures we don't enter the removal path when at exactly min_connections,
-        // since removing one connection would put us below the minimum.
-        let removal_threshold = self
-            .limits
-            .min_connections
-            .saturating_add(1)
-            .max(DENSITY_SELECTION_THRESHOLD);
-        if current_connections < removal_threshold {
+        // Skip resource-based adjustment in very small networks to avoid destabilizing them.
+        // During startup or in small test networks, we need stability more than optimization.
+        // Note: the removal branch below has its own guard against dropping below min_connections.
+        if current_connections < DENSITY_SELECTION_THRESHOLD {
             debug!(
                 current_connections,
-                removal_threshold,
-                min_connections = self.limits.min_connections,
-                "Skipping resource-based topology adjustment — too few connections"
+                "Skipping resource-based topology adjustment for small network"
             );
             return TopologyAdjustment::NoChange;
         }
@@ -838,12 +828,11 @@ mod tests {
     #[test_log::test]
     fn test_remove_connections() {
         let mut resource_manager = setup_topology_manager(1000.0);
-        // Need enough peers to exceed the removal threshold:
-        // removal_threshold = max(min_connections + 1, DENSITY_SELECTION_THRESHOLD) = max(6, 5) = 6
-        // So we need at least 7 peers to be above the threshold and eligible for removal.
-        let peers = generate_random_peers(7);
+        // Need 6+ peers because the removal guard prevents dropping below min_connections (5).
+        // With 6 peers: current_connections=6 > min_connections=5, so removal is allowed.
+        let peers = generate_random_peers(6);
         // Total bw usage will be way higher than the limit of 1000
-        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600, 1300, 1400];
+        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600, 1300];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
@@ -852,7 +841,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![20, 19, 18, 9, 9, 15, 12];
+        let requests_per_peer = vec![20, 19, 18, 9, 9, 15];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
         let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
         assert_eq!(worst_ix, 3);
@@ -880,14 +869,12 @@ mod tests {
     #[test_log::test]
     fn test_add_connections() {
         let mut resource_manager = setup_topology_manager(1000.0);
-        // Need enough peers to exceed the removal threshold so we reach resource evaluation.
-        // removal_threshold = max(min_connections + 1, DENSITY_SELECTION_THRESHOLD) = max(6, 5) = 6
-        // With 7 peers (current_connections=7 >= 6), low usage triggers AddConnections.
-        let peers: Vec<PeerKeyLocation> = generate_random_peers(7);
+        // Generate 5 peers with locations specified in a vec!
+        let peers: Vec<PeerKeyLocation> = generate_random_peers(5);
 
         // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
         // the TopologyManager to add a connection
-        let bw_usage_by_peer = vec![10, 20, 30, 25, 30, 15, 20];
+        let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
@@ -896,7 +883,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![20, 19, 18, 9, 9, 12, 8];
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
         let mut neighbor_locations = BTreeMap::new();
@@ -919,16 +906,13 @@ mod tests {
         }
     }
 
-    // Test with no adjustment because the usage is within acceptable bounds (50-90%)
+    // Test with no adjustment because the usage is within acceptable bounds
     #[test_log::test]
     fn test_no_adjustment() {
         let mut resource_manager = setup_topology_manager(1000.0);
-        // Need enough peers to pass the removal threshold and reach resource evaluation.
-        // removal_threshold = max(min_connections + 1, DENSITY_SELECTION_THRESHOLD) = max(6, 5) = 6
-        // With 7 peers at moderate bandwidth (total ~700/1000 = 70%), usage is in the
-        // 50-90% "no change" band.
-        let peers = generate_random_peers(7);
-        let bw_usage_by_peer = vec![100, 100, 100, 100, 100, 100, 100];
+        let peers = generate_random_peers(5);
+        // Total bw usage 750/1000 = 75%, within the 50-90% "no change" band
+        let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
@@ -937,7 +921,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![20, 19, 18, 9, 9, 12, 10];
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
         let mut neighbor_locations = BTreeMap::new();
@@ -959,17 +943,18 @@ mod tests {
     // in small networks where every connection is critical.
     #[test_log::test]
     fn test_no_removal_at_min_connections() {
-        // Create a manager with min_connections = 4
+        // Use min_connections = 5 so it matches DENSITY_SELECTION_THRESHOLD,
+        // allowing us to test the inner guard in the removal branch.
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(100000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
             max_connections: 200,
-            min_connections: 4,
+            min_connections: 5,
         };
         let mut resource_manager = TopologyManager::new(limits);
-        let peers = generate_random_peers(4);
+        let peers = generate_random_peers(5);
         // Very high bandwidth usage (way above the 90% threshold)
-        let bw_usage_by_peer = vec![2000, 2000, 2000, 2000];
+        let bw_usage_by_peer = vec![2000, 2000, 2000, 2000, 2000];
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
             &mut resource_manager,
@@ -977,7 +962,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![5, 5, 5, 5];
+        let requests_per_peer = vec![5, 5, 5, 5, 5];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
         let mut neighbor_locations = BTreeMap::new();
@@ -985,12 +970,15 @@ mod tests {
             neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
-        // At min_connections (4), should never suggest removal
+        // At min_connections (5) with 5 connections:
+        // - Passes DENSITY_SELECTION_THRESHOLD check (5 < 5 is false)
+        // - Enters resource evaluation, high usage triggers removal branch
+        // - Inner guard: current(5) <= min(5) → NoChange (not removal)
         let adjustment = resource_manager.adjust_topology(
             &neighbor_locations,
             &None,
             Instant::now(),
-            4, // exactly at min_connections
+            5, // exactly at min_connections
         );
         assert!(
             !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
@@ -1009,10 +997,18 @@ mod tests {
             _ => panic!("Expected AddConnections when below min, got {adjustment:?}"),
         }
 
-        // With 5 connections and min=4: removal_threshold = max(4+1, 5) = 5.
-        // 5 < 5 is false, so we enter resource evaluation. Since current(5) > min(4),
-        // the inner guard allows removal if usage is high. This is correct — we only
-        // need to protect connections AT or BELOW the minimum.
+        // With 6 connections and min=5: passes threshold, enters resource eval.
+        // Since current(6) > min(5), the inner guard allows removal.
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            6, // above min_connections
+        );
+        assert!(
+            matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "Should allow removal when above min_connections, got {adjustment:?}"
+        );
     }
 
     // Test with no peers
