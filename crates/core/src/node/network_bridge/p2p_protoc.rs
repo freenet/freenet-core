@@ -3382,20 +3382,37 @@ impl P2pConnManager {
             return;
         };
 
-        let targets = op_manager.get_broadcast_targets_update(&key, &self_addr);
+        let target_result = op_manager.get_broadcast_targets_update(&key, &self_addr);
         tracing::debug!(
             contract = %key,
-            target_count = targets.len(),
+            target_count = target_result.targets.len(),
             self_addr = %self_addr,
             "BroadcastStateChange: found targets"
         );
 
-        if targets.is_empty() {
+        if target_result.targets.is_empty() {
             tracing::warn!(
                 contract = %key,
                 self_addr = %self_addr,
                 "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
             );
+            // Still emit delivery summary even when no targets, for diagnostics
+            let update_tx =
+                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+            if let Some(log) = NetEventLog::broadcast_delivery_summary(
+                &update_tx,
+                &op_manager.ring,
+                key,
+                &target_result,
+                0,
+                0,
+                0,
+            ) {
+                self.bridge
+                    .log_register
+                    .register_events(Either::Left(log))
+                    .await;
+            }
             return;
         }
 
@@ -3410,11 +3427,15 @@ impl P2pConnManager {
         tracing::debug!(
             tx = %update_tx,
             contract = %key,
-            target_count = targets.len(),
+            target_count = target_result.targets.len(),
             "Broadcasting state change to network peers"
         );
 
-        for target in targets {
+        let mut skipped_summary_match: usize = 0;
+        let mut send_success: usize = 0;
+        let mut send_failed: usize = 0;
+
+        for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
                 continue;
             };
@@ -3434,6 +3455,7 @@ impl P2pConnManager {
                         peer = %peer_addr,
                         "Skipping broadcast - peer already has our state"
                     );
+                    skipped_summary_match += 1;
                     continue;
                 }
             }
@@ -3579,6 +3601,7 @@ impl P2pConnManager {
             };
 
             if let Err(err) = send_result {
+                send_failed += 1;
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -3586,6 +3609,7 @@ impl P2pConnManager {
                     "Failed to send state change broadcast"
                 );
             } else {
+                send_success += 1;
                 // Track delta vs full state sends for testing (PR #2763)
                 if sent_delta {
                     op_manager
@@ -3608,6 +3632,22 @@ impl P2pConnManager {
                     );
                 }
             }
+        }
+
+        // Emit broadcast delivery summary telemetry (issue #3046)
+        if let Some(log) = NetEventLog::broadcast_delivery_summary(
+            &update_tx,
+            &op_manager.ring,
+            key,
+            &target_result,
+            skipped_summary_match,
+            send_success,
+            send_failed,
+        ) {
+            self.bridge
+                .log_register
+                .register_events(Either::Left(log))
+                .await;
         }
     }
 }

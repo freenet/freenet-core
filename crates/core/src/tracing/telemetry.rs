@@ -509,6 +509,9 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 UpdateEvent::BroadcastComplete { .. } => "update_broadcast_complete".to_string(),
                 UpdateEvent::BroadcastReceived { .. } => "update_broadcast_received".to_string(),
                 UpdateEvent::BroadcastApplied { .. } => "update_broadcast_applied".to_string(),
+                UpdateEvent::BroadcastDeliverySummary { .. } => {
+                    "update_broadcast_delivery_summary".to_string()
+                }
             }
         }
         EventKind::Transfer(transfer_event) => {
@@ -1135,6 +1138,34 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         json["state_hash_after"] = serde_json::Value::String(hash.clone());
                     }
                     json
+                }
+                UpdateEvent::BroadcastDeliverySummary {
+                    key,
+                    proximity_found,
+                    proximity_resolve_failed,
+                    interest_found,
+                    interest_resolve_failed,
+                    skipped_self,
+                    skipped_sender,
+                    skipped_summary_match,
+                    targets_sent,
+                    send_failed,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "broadcast_delivery_summary",
+                        "key": key.to_string(),
+                        "proximity_found": proximity_found,
+                        "proximity_resolve_failed": proximity_resolve_failed,
+                        "interest_found": interest_found,
+                        "interest_resolve_failed": interest_resolve_failed,
+                        "skipped_self": skipped_self,
+                        "skipped_sender": skipped_sender,
+                        "skipped_summary_match": skipped_summary_match,
+                        "targets_sent": targets_sent,
+                        "send_failed": send_failed,
+                        "timestamp": timestamp,
+                    })
                 }
             }
         }

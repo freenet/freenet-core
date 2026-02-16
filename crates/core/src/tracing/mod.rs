@@ -821,6 +821,37 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a broadcast delivery summary event with the full breakdown of
+    /// why each potential target was or was not sent the broadcast (issue #3046).
+    pub fn broadcast_delivery_summary(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target_result: &crate::operations::update::BroadcastTargetResult,
+        skipped_summary_match: usize,
+        targets_sent: usize,
+        send_failed: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastDeliverySummary {
+                key,
+                proximity_found: target_result.proximity_found,
+                proximity_resolve_failed: target_result.proximity_resolve_failed,
+                interest_found: target_result.interest_found,
+                interest_resolve_failed: target_result.interest_resolve_failed,
+                skipped_self: target_result.skipped_self,
+                skipped_sender: target_result.skipped_sender,
+                skipped_summary_match,
+                targets_sent,
+                send_failed,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     /// Create a peer startup event.
     ///
     /// This should be called once when the node starts and is ready to participate in the network.
@@ -2847,6 +2878,22 @@ pub(crate) enum UpdateEvent {
         /// Whether the local state actually changed after applying the update.
         changed: bool,
     },
+    /// Emitted after handle_broadcast_state_change() completes with a full
+    /// breakdown of why each potential peer was or was not sent the broadcast.
+    /// This enables diagnosing missed broadcast deliveries (issue #3046).
+    BroadcastDeliverySummary {
+        key: ContractKey,
+        proximity_found: usize,
+        proximity_resolve_failed: usize,
+        interest_found: usize,
+        interest_resolve_failed: usize,
+        skipped_self: usize,
+        skipped_sender: usize,
+        skipped_summary_match: usize,
+        targets_sent: usize,
+        send_failed: usize,
+        timestamp: u64,
+    },
 }
 
 impl UpdateEvent {
@@ -2858,7 +2905,8 @@ impl UpdateEvent {
             | UpdateEvent::BroadcastEmitted { key, .. }
             | UpdateEvent::BroadcastComplete { key, .. }
             | UpdateEvent::BroadcastReceived { key, .. }
-            | UpdateEvent::BroadcastApplied { key, .. } => *key,
+            | UpdateEvent::BroadcastApplied { key, .. }
+            | UpdateEvent::BroadcastDeliverySummary { key, .. } => *key,
         }
     }
 

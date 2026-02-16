@@ -18,6 +18,18 @@ use crate::{
 };
 use std::net::SocketAddr;
 
+/// Result of `get_broadcast_targets_update()` with skip-reason counters
+/// for broadcast delivery diagnostics (issue #3046).
+pub(crate) struct BroadcastTargetResult {
+    pub targets: Vec<PeerKeyLocation>,
+    pub proximity_found: usize,
+    pub proximity_resolve_failed: usize,
+    pub interest_found: usize,
+    pub interest_resolve_failed: usize,
+    pub skipped_self: usize,
+    pub skipped_sender: usize,
+}
+
 pub(crate) struct UpdateOp {
     pub id: Transaction,
     pub(crate) state: Option<UpdateState>,
@@ -1070,18 +1082,22 @@ impl OpManager {
         &self,
         key: &ContractKey,
         sender: &SocketAddr,
-    ) -> Vec<PeerKeyLocation> {
+    ) -> BroadcastTargetResult {
         use std::collections::HashSet;
 
         let self_addr = self.ring.connection_manager.get_own_addr();
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
+        let mut proximity_resolve_failed: usize = 0;
+        let mut interest_resolve_failed: usize = 0;
+        let mut skipped_self: usize = 0;
+        let mut skipped_sender: usize = 0;
 
         // Source 1: Proximity cache (peers who announced they seed this contract)
         // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
         let proximity_pub_keys = self.proximity_cache.neighbors_with_contract(key);
-        let proximity_count = proximity_pub_keys.len();
+        let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
             // Resolve pub_key to PeerKeyLocation (which includes current address)
@@ -1089,15 +1105,18 @@ impl OpManager {
                 // Skip sender to avoid echo (unless we're the originator)
                 if let Some(pkl_addr) = pkl.socket_addr() {
                     if &pkl_addr == sender && !is_local_update_initiator {
+                        skipped_sender += 1;
                         continue;
                     }
                     // Skip ourselves if not local originator
                     if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        skipped_self += 1;
                         continue;
                     }
                 }
                 targets.insert(pkl);
             } else {
+                proximity_resolve_failed += 1;
                 tracing::warn!(
                     contract = %format!("{:.8}", key),
                     proximity_neighbor = %pub_key,
@@ -1110,7 +1129,7 @@ impl OpManager {
 
         // Source 2: Interest manager (peers who expressed interest via protocol)
         let interested_peers = self.interest_manager.get_interested_peers(key);
-        let interest_count = interested_peers.len();
+        let interest_found = interested_peers.len();
 
         for (peer_key, _interest) in interested_peers {
             // Look up peer by public key
@@ -1122,14 +1141,25 @@ impl OpManager {
                 // Skip sender to avoid echo
                 if let Some(pkl_addr) = pkl.socket_addr() {
                     if &pkl_addr == sender && !is_local_update_initiator {
+                        skipped_sender += 1;
                         continue;
                     }
                     // Skip ourselves
                     if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                        skipped_self += 1;
                         continue;
                     }
                 }
                 targets.insert(pkl);
+            } else {
+                interest_resolve_failed += 1;
+                tracing::warn!(
+                    contract = %format!("{:.8}", key),
+                    interest_peer = %peer_key.0,
+                    is_local = is_local_update_initiator,
+                    phase = "target_lookup_failed",
+                    "Interest manager peer not found in connection manager"
+                );
             }
         }
 
@@ -1149,8 +1179,8 @@ impl OpManager {
                     .collect::<Vec<_>>()
                     .join(","),
                 count = result.len(),
-                proximity_sources = proximity_count,
-                interest_sources = interest_count,
+                proximity_sources = proximity_found,
+                interest_sources = interest_found,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
@@ -1159,14 +1189,22 @@ impl OpManager {
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
-                proximity_sources = proximity_count,
-                interest_sources = interest_count,
+                proximity_sources = proximity_found,
+                interest_sources = interest_found,
                 phase = "warning",
                 "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );
         }
 
-        result
+        BroadcastTargetResult {
+            targets: result,
+            proximity_found,
+            proximity_resolve_failed,
+            interest_found,
+            interest_resolve_failed,
+            skipped_self,
+            skipped_sender,
+        }
     }
 }
 
