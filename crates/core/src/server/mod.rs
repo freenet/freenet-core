@@ -266,8 +266,8 @@ pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[Bo
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
-/// Like [`serve_client_api`] but accepts a pre-bound TCP listener to avoid
-/// a release-then-rebind race window in parallel tests.
+/// Like [`serve_client_api`] but reuses a pre-bound TCP listener, avoiding the
+/// release-then-rebind race window that causes port conflicts in parallel tests.
 pub async fn serve_client_api_with_listener(
     config: WebsocketApiConfig,
     listener: std::net::TcpListener,
