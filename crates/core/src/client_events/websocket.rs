@@ -137,9 +137,6 @@ fn is_client_disconnect_error(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Clone)]
-struct LocalhostOnly(bool);
-
-#[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
 impl std::ops::Deref for WebSocketRequest {
@@ -161,13 +158,12 @@ impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
         let attested_contracts = Arc::new(DashMap::new());
-        Self::create_router_with_attested_contracts(server_routing, attested_contracts, true)
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
     }
 
     pub fn create_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
-        localhost_only: bool,
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
@@ -187,7 +183,6 @@ impl WebSocketProxy {
             .merge(v2_route)
             .layer(Extension(attested_contracts))
             .layer(Extension(ws_request))
-            .layer(Extension(LocalhostOnly(localhost_only)))
             .layer(axum::middleware::from_fn(connection_info));
 
         (
@@ -404,24 +399,23 @@ async fn connection_info(
     // This blocks cross-site WebSocket hijacking (evil.com connecting to our gateway)
     // while allowing both localhost and legitimate remote access.
     //
-    // When localhost_only: only allow localhost origins (127.0.0.1, [::1], localhost).
-    // When not localhost_only: allow any origin whose host matches the request's Host header
-    // (same-origin check), so remote browsers serving the UI can connect back.
+    // Localhost origins are always allowed (the request is local).
+    // Non-localhost origins are allowed if they pass the same-origin check
+    // (Origin host == Host header), which blocks cross-site attacks while
+    // supporting remote access, port-forwarded setups, and VirtualBox networking.
     // CLI tools (no Origin header) are always allowed.
-    let localhost_only = req
-        .extensions()
-        .get::<LocalhostOnly>()
-        .map_or(true, |l| l.0);
     if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
         if let Ok(origin_str) = origin.to_str() {
-            let allowed = if localhost_only {
-                is_localhost_origin(origin_str)
-            } else {
-                is_same_origin(origin_str, req.headers())
-            };
+            let allowed =
+                is_localhost_origin(origin_str) || is_same_origin(origin_str, req.headers());
             if !allowed {
+                let host_header = req
+                    .headers()
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok());
                 tracing::warn!(
                     origin = origin_str,
+                    host = ?host_header,
                     "Rejected WebSocket connection from disallowed origin"
                 );
                 return (
