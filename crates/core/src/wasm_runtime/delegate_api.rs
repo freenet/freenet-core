@@ -172,6 +172,7 @@ pub mod contract_error_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::native_api::DelegateEnvError;
 
     #[test]
     fn test_version_display() {
@@ -436,8 +437,7 @@ mod tests {
         };
 
         let result = env.get_contract_state_sync(&ContractInstanceId::new([1u8; 32]));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not configured"));
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
     }
 
     /// V2 delegate can read large contract state (1 MB).
@@ -493,6 +493,48 @@ mod tests {
 
     // ============ DelegateCallEnv PUT/UPDATE/SUBSCRIBE tests ============
 
+    /// PUT fails when state store is not configured.
+    #[tokio::test]
+    async fn test_env_put_contract_state_no_store() {
+        let mut env_holder = TestEnv::new().await;
+
+        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut env_holder.secret_store,
+                &env_holder.contract_store,
+                None,
+                delegate_key,
+            )
+        };
+
+        let result =
+            env.put_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
+    }
+
+    /// UPDATE fails when state store is not configured.
+    #[tokio::test]
+    async fn test_env_update_contract_state_no_store() {
+        let mut env_holder = TestEnv::new().await;
+
+        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut env_holder.secret_store,
+                &env_holder.contract_store,
+                None,
+                delegate_key,
+            )
+        };
+
+        let result =
+            env.update_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
+    }
+
     /// V2 delegate can PUT contract state.
     #[tokio::test]
     async fn test_env_put_contract_state() {
@@ -518,8 +560,10 @@ mod tests {
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([88u8; 32]);
         let result = env.put_contract_state_sync(&missing_id, vec![1, 2, 3]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not registered"));
+        assert!(matches!(
+            result,
+            Err(DelegateEnvError::ContractCodeNotRegistered)
+        ));
     }
 
     /// V2 delegate can UPDATE existing contract state.
@@ -549,8 +593,7 @@ mod tests {
 
         let env = unsafe { env_holder.make_env() };
         let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no existing state"));
+        assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
     }
 
     /// V2 delegate can subscribe to a known contract.
@@ -572,8 +615,10 @@ mod tests {
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([99u8; 32]);
         let result = env.subscribe_contract_sync(&missing_id);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not registered"));
+        assert!(matches!(
+            result,
+            Err(DelegateEnvError::ContractCodeNotRegistered)
+        ));
     }
 
     // ============ Wasmer async host function integration tests ============

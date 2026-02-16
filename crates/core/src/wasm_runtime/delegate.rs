@@ -1925,7 +1925,20 @@ mod test {
 
         #[derive(Debug, Serialize, Deserialize)]
         pub enum InboundAppMessage {
-            GetContractState { contract_id: [u8; 32] },
+            GetContractState {
+                contract_id: [u8; 32],
+            },
+            PutContractState {
+                contract_id: [u8; 32],
+                state: Vec<u8>,
+            },
+            UpdateContractState {
+                contract_id: [u8; 32],
+                state: Vec<u8>,
+            },
+            SubscribeContract {
+                contract_id: [u8; 32],
+            },
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -1935,6 +1948,13 @@ mod test {
                 state: Vec<u8>,
             },
             ContractNotFound {
+                contract_id: [u8; 32],
+                error_code: i64,
+            },
+            Success {
+                contract_id: [u8; 32],
+            },
+            Failed {
                 contract_id: [u8; 32],
                 error_code: i64,
             },
@@ -2038,11 +2058,8 @@ mod test {
                     "V2 delegate should read contract state via host functions"
                 );
             }
-            OutboundAppMessage::ContractNotFound { error_code, .. } => {
-                panic!(
-                    "V2 delegate returned ContractNotFound with error code {error_code} — \
-                     expected ContractState"
-                );
+            other => {
+                panic!("V2 delegate returned {other:?} — expected ContractState");
             }
         }
 
@@ -2116,12 +2133,241 @@ mod test {
                     "Expected negative error code for not-found, got {error_code}"
                 );
             }
-            OutboundAppMessage::ContractState { .. } => {
-                panic!("Expected ContractNotFound for non-existent contract");
+            other => {
+                panic!("Expected ContractNotFound for non-existent contract, got {other:?}");
             }
         }
 
         std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Helper: set up a V2 delegate runtime with a registered contract.
+    async fn setup_v2_runtime_with_contract(
+        contract_id_byte: u8,
+        initial_state: Option<&[u8]>,
+    ) -> Result<
+        (
+            DelegateContainer,
+            Runtime,
+            ContractInstanceId,
+            tempfile::TempDir,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use crate::contract::storages::Storage;
+        use crate::wasm_runtime::StateStorage;
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        runtime.set_state_store_db(db.clone());
+
+        // Register the contract
+        let contract_instance_id = ContractInstanceId::new([contract_id_byte; 32]);
+        let contract_code = ContractCode::from(vec![contract_id_byte, 2, 3]);
+        let contract_key =
+            ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
+        runtime.contract_store.ensure_key_indexed(&contract_key)?;
+
+        if let Some(state) = initial_state {
+            db.store(contract_key, WrappedState::new(state.to_vec()))
+                .await?;
+        }
+
+        // Load the V2 delegate
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
+        };
+        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _ = runtime
+            .secret_store
+            .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        Ok((delegate, runtime, contract_instance_id, temp_dir))
+    }
+
+    /// Helper: send a message to the V2 delegate and deserialize the response.
+    fn send_v2_message(
+        runtime: &mut Runtime,
+        delegate: &DelegateContainer,
+        message: &v2_contracts_messages::InboundAppMessage,
+    ) -> Result<v2_contracts_messages::OutboundAppMessage, Box<dyn std::error::Error>> {
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let payload = bincode::serialize(message)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let response_msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(response_msg.processed);
+
+        Ok(bincode::deserialize(&response_msg.payload)?)
+    }
+
+    /// V2 E2E: PUT state via delegate, then GET it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_put_then_get() -> Result<(), Box<dyn std::error::Error>> {
+        use v2_contracts_messages::*;
+
+        let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+            setup_v2_runtime_with_contract(50, None).await?;
+        let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+        // PUT state
+        let put_response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::PutContractState {
+                contract_id: cid,
+                state: vec![100, 200, 150],
+            },
+        )?;
+        match put_response {
+            OutboundAppMessage::Success { contract_id } => {
+                assert_eq!(contract_id, cid);
+            }
+            other => panic!("Expected Success from PUT, got {:?}", other),
+        }
+
+        // GET it back
+        let get_response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::GetContractState { contract_id: cid },
+        )?;
+        match get_response {
+            OutboundAppMessage::ContractState { contract_id, state } => {
+                assert_eq!(contract_id, cid);
+                assert_eq!(state, vec![100, 200, 150]);
+            }
+            other => panic!("Expected ContractState from GET, got {:?}", other),
+        }
+
+        Ok(())
+    }
+
+    /// V2 E2E: UPDATE existing state via delegate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_update_existing_state() -> Result<(), Box<dyn std::error::Error>> {
+        use v2_contracts_messages::*;
+
+        let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+            setup_v2_runtime_with_contract(51, Some(&[1, 2, 3])).await?;
+        let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+        // UPDATE the existing state
+        let update_response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::UpdateContractState {
+                contract_id: cid,
+                state: vec![7, 8, 9],
+            },
+        )?;
+        match update_response {
+            OutboundAppMessage::Success { contract_id } => {
+                assert_eq!(contract_id, cid);
+            }
+            other => panic!("Expected Success from UPDATE, got {:?}", other),
+        }
+
+        // Verify via GET
+        let get_response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::GetContractState { contract_id: cid },
+        )?;
+        match get_response {
+            OutboundAppMessage::ContractState { state, .. } => {
+                assert_eq!(state, vec![7, 8, 9]);
+            }
+            other => panic!("Expected ContractState, got {:?}", other),
+        }
+
+        Ok(())
+    }
+
+    /// V2 E2E: UPDATE non-existent state returns error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_update_nonexistent_fails() -> Result<(), Box<dyn std::error::Error>> {
+        use v2_contracts_messages::*;
+
+        let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+            setup_v2_runtime_with_contract(52, None).await?;
+        let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+        let response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::UpdateContractState {
+                contract_id: cid,
+                state: vec![1, 2, 3],
+            },
+        )?;
+        match response {
+            OutboundAppMessage::Failed { error_code, .. } => {
+                assert!(
+                    error_code < 0,
+                    "Expected negative error code, got {error_code}"
+                );
+            }
+            other => panic!(
+                "Expected Failed from UPDATE on non-existent, got {:?}",
+                other
+            ),
+        }
+
+        Ok(())
+    }
+
+    /// V2 E2E: SUBSCRIBE to a known contract succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_v2_delegate_subscribe_known() -> Result<(), Box<dyn std::error::Error>> {
+        use v2_contracts_messages::*;
+
+        let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+            setup_v2_runtime_with_contract(53, Some(&[1])).await?;
+        let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+        let response = send_v2_message(
+            &mut runtime,
+            &delegate,
+            &InboundAppMessage::SubscribeContract { contract_id: cid },
+        )?;
+        match response {
+            OutboundAppMessage::Success { contract_id } => {
+                assert_eq!(contract_id, cid);
+            }
+            other => panic!("Expected Success from SUBSCRIBE, got {:?}", other),
+        }
+
         Ok(())
     }
 

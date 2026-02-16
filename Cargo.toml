@@ -136,7 +136,7 @@ wmi = "0.18.1"
 zip = { version = "7", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.1.35"
+freenet-stdlib = "0.1.36"
 
 [profile.dev.package."*"]
 opt-level = 3
