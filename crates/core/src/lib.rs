@@ -120,23 +120,18 @@ pub mod dev_tool {
     pub use crate::transport::reset_nonce_counter;
     pub use crate::transport::StreamId;
 
-    /// Reset all global simulation state for deterministic testing.
+    /// Reset all simulation state for deterministic testing.
     ///
-    /// This function resets all atomic counters and global registries to their
-    /// initial state, ensuring that simulation runs with the same seed produce
-    /// identical results.
+    /// All ID counters are thread-local with per-thread offset blocks, so this
+    /// function is safe for parallel test execution — each thread resets only its
+    /// own counters.
     ///
     /// Call this at the start of each simulation run, AFTER setting the RNG seed
     /// with `GlobalRng::set_seed()`.
     ///
     /// # What gets reset:
-    /// - Request ID counter
-    /// - Client ID counter
-    /// - Event ID counter
-    /// - Channel ID counter
-    /// - Stream ID counter
-    /// - Nonce counter
-    /// - Global node index
+    /// - Thread-local ID counters (RequestId, ClientId, EventId, ChannelId, StreamId, Nonce, NodeIndex)
+    /// - Thread index counter (for deterministic spawn_blocking thread seeding)
     /// - Socket registries
     /// - Address network mappings
     /// - Simulation time
@@ -145,13 +140,12 @@ pub mod dev_tool {
         // Reset RNG (caller should set seed after this)
         crate::config::GlobalRng::clear_seed();
         // Reset thread index counter so new threads get deterministic indices.
-        // Safe when running with --test-threads=1 (no concurrent test threads).
         crate::config::GlobalRng::reset_thread_index_counter();
 
         // Reset simulation time (caller should set time after this if needed)
         crate::config::GlobalSimulationTime::clear_time();
 
-        // Reset all atomic counters
+        // Reset all thread-local ID counters
         crate::client_events::RequestId::reset_counter();
         crate::client_events::ClientId::reset_counter();
         crate::contract::reset_event_id_counter();

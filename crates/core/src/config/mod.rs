@@ -1816,6 +1816,21 @@ impl GlobalRng {
         THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Returns the deterministic thread index for the current thread.
+    ///
+    /// Each thread gets a unique index from the global `THREAD_INDEX_COUNTER`.
+    /// This is used by thread-local ID counters to compute non-overlapping offset blocks.
+    pub fn thread_index() -> u64 {
+        THREAD_INDEX.with(|c| match c.get() {
+            Some(idx) => idx,
+            None => {
+                let idx = THREAD_INDEX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                c.set(Some(idx));
+                idx
+            }
+        })
+    }
+
     /// Returns true if a simulation seed is set (either thread-local or global).
     pub fn is_seeded() -> bool {
         // Check thread-local seed first, then global

@@ -10,8 +10,8 @@ use freenet_stdlib::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
+use std::cell::Cell;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
@@ -49,17 +49,29 @@ pub type HostResult = Result<HostResponse, ClientError>;
 #[repr(transparent)]
 pub struct RequestId(u64);
 
-static REQUEST_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+const COUNTER_BLOCK: u64 = 1_000_000;
+
+thread_local! {
+    static REQUEST_ID_COUNTER: Cell<u64> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(1 + idx * COUNTER_BLOCK)
+    };
+}
 
 impl RequestId {
     pub fn new() -> Self {
-        Self(REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
+        Self(REQUEST_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
-    /// Reset the request ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the request ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        REQUEST_ID_COUNTER.store(1, Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        REQUEST_ID_COUNTER.with(|c| c.set(1 + idx * COUNTER_BLOCK));
     }
 }
 
@@ -85,19 +97,29 @@ impl From<ClientId> for usize {
     }
 }
 
-static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+thread_local! {
+    static CLIENT_ID_COUNTER: Cell<usize> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(1 + (idx as usize) * (COUNTER_BLOCK as usize))
+    };
+}
 
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
 
     pub fn next() -> Self {
-        ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        ClientId(CLIENT_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
-    /// Reset the client ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the client ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        CLIENT_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        CLIENT_ID_COUNTER.with(|c| c.set(1 + (idx as usize) * (COUNTER_BLOCK as usize)));
     }
 }
 

@@ -6,11 +6,11 @@
 //!
 //! See [`../architecture.md`](../architecture.md) for its role and communication patterns.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -298,12 +298,20 @@ pub(crate) fn contract_handler_channel() -> (
     )
 }
 
-static EV_ID: AtomicU64 = AtomicU64::new(0);
+const EV_ID_BLOCK: u64 = 1_000_000;
 
-/// Reset the event ID counter to initial state.
-/// Used for deterministic simulation testing.
+thread_local! {
+    static EV_ID: Cell<u64> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(idx * EV_ID_BLOCK)
+    };
+}
+
+/// Reset the event ID counter to initial state for this thread.
+/// Thread-local, so safe for parallel test execution.
 pub fn reset_event_id_counter() {
-    EV_ID.store(0, SeqCst);
+    let idx = crate::config::GlobalRng::thread_index();
+    EV_ID.with(|c| c.set(idx * EV_ID_BLOCK));
 }
 
 impl Stream for ContractHandlerChannel<WaitingResolution> {
@@ -327,7 +335,11 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         ev: ContractHandlerEvent,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        let id = EV_ID.fetch_add(1, SeqCst);
+        let id = EV_ID.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
         let (result, result_receiver) = tokio::sync::oneshot::channel();
         self.end
             .event_sender
@@ -347,7 +359,11 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         ev: ContractHandlerEvent,
     ) -> Result<(), ContractError> {
-        let id = EV_ID.fetch_add(1, SeqCst);
+        let id = EV_ID.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
         // Create a oneshot but immediately drop the receiver — the handler
         // won't send a response, and if it does, the send will harmlessly fail.
         let (result, _) = tokio::sync::oneshot::channel();

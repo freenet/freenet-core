@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -126,8 +127,14 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
 #[serde(transparent)]
 pub struct StreamId(u32);
 
-/// Static counter for StreamId generation - must be at module level for reset access
-static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+const STREAM_ID_BLOCK: u32 = 100_000;
+
+thread_local! {
+    static STREAM_ID_COUNTER: Cell<u32> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new((idx as u32) * STREAM_ID_BLOCK)
+    };
+}
 
 impl StreamId {
     /// Marker bit that distinguishes operations-level streams from transport-level streams.
@@ -136,7 +143,11 @@ impl StreamId {
     const OPS_STREAM_BIT: u32 = 0x8000_0000;
 
     pub fn next() -> Self {
-        Self(STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release))
+        Self(STREAM_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
     /// Generate a new StreamId for operations-level streaming.
@@ -144,7 +155,11 @@ impl StreamId {
     /// and skip the legacy `InboundStream` decode path (which would fail because the bytes
     /// are a streaming payload, not a `NetMessage`).
     pub fn next_operations() -> Self {
-        let id = STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let id = STREAM_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
         Self(id | Self::OPS_STREAM_BIT)
     }
 
@@ -153,10 +168,11 @@ impl StreamId {
         self.0 & Self::OPS_STREAM_BIT != 0
     }
 
-    /// Reset the stream ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the stream ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        STREAM_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
     }
 }
 
