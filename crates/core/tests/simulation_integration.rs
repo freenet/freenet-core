@@ -2331,6 +2331,7 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n5_g1_s4("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5)]
 #[case::n5_g1_s5("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5)]
 #[case::n6_g1_s1("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6)]
+#[case::n6_g1_s2("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6)]
 #[case::n6_g1_s3("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6)]
 #[case::n6_g1_s4("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6)]
 #[case::n6_g1_s5("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6)]
@@ -2458,12 +2459,9 @@ fn test_crdt_convergence(
     );
 }
 
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n6_g1_s2() {
-    test_crdt_convergence("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6);
-}
-
+// Known-failing: convergence failure with 8-node 1-gateway topology.
+// Location::random() in join_ring_request (PR #2907) causes CRDT updates
+// not to propagate to all subscribers. Tracked in #3028.
 #[test_log::test]
 #[ignore]
 fn test_crdt_convergence_n8_g1_s1() {
