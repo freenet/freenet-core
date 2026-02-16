@@ -126,13 +126,13 @@ impl DensityMap {
                 next_neighbor_prop * *previous_neighbor_count as f64
                     + previous_neighbor_prop * *next_neighbor_count as f64
             }
-            // The None cases have been removed as they should not occur given the new logic
             _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_request_counts is not empty"),
         };
 
         Ok(count_estimate)
     }
 
+    #[allow(dead_code)]
     pub fn get_max_density(&self) -> Result<Location, DensityMapError> {
         tracing::debug!("get_max_density called");
 
@@ -220,6 +220,7 @@ impl DensityMap {
     ///
     /// MIN_DISTANCE (0.001) prevents division-by-near-zero for candidates very close
     /// to `my_location`.
+    #[allow(dead_code)]
     pub fn get_max_density_weighted(
         &self,
         my_location: Location,
