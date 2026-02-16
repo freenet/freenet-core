@@ -1112,6 +1112,15 @@ impl Ring {
         #[cfg(test)]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(2);
 
+        /// Faster tick used when below min_connections to accelerate initial
+        /// mesh formation. Without this, peers process one pending connection
+        /// per 60-second tick, making it impossible to reach min_connections
+        /// within typical test timeouts (90s).
+        #[cfg(not(test))]
+        const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(5);
+        #[cfg(test)]
+        const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(1);
+
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         /// Maximum number of concurrent connection acquisition attempts.
@@ -1256,22 +1265,31 @@ impl Ring {
                 );
             }
 
-            // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
-            // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
-            let active_count = live_tx_tracker.active_connect_transaction_count();
-            if let Some(ideal_location) = pending_conn_adds.pop_first() {
-                // Check if this target is in backoff due to previous failures
-                if self.is_in_connection_backoff(ideal_location) {
-                    tracing::debug!(
-                        target_location = %ideal_location,
-                        "Skipping connection attempt - target in backoff"
-                    );
-                    // Intentionally do NOT re-queue here:
-                    // - Avoids repeatedly popping and checking the same location while it is
-                    //   under backoff, which would waste work in this tight maintenance loop.
-                    // - The topology manager will re-request connections to this location
-                    //   in the next cycle if we're still below min_connections.
-                } else if active_count < MAX_CONCURRENT_CONNECTIONS {
+            // Drain pending connections up to MAX_CONCURRENT_CONNECTIONS limit.
+            // Processing multiple targets per iteration (instead of just one) is
+            // critical for fast mesh formation: with diverse target locations queued
+            // by adjust_topology, we can initiate several connection attempts in a
+            // single tick rather than waiting one full tick per attempt.
+            {
+                let mut active_count = live_tx_tracker.active_connect_transaction_count();
+                while let Some(ideal_location) = pending_conn_adds.pop_first() {
+                    if self.is_in_connection_backoff(ideal_location) {
+                        tracing::debug!(
+                            target_location = %ideal_location,
+                            "Skipping connection attempt - target in backoff"
+                        );
+                        continue;
+                    }
+                    if active_count >= MAX_CONCURRENT_CONNECTIONS {
+                        tracing::debug!(
+                            active_connections = active_count,
+                            max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                            target_location = %ideal_location,
+                            "At max concurrent connections, re-queuing location"
+                        );
+                        pending_conn_adds.insert(ideal_location);
+                        break;
+                    }
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
@@ -1301,29 +1319,17 @@ impl Ring {
                             target_location = %ideal_location,
                             "acquire_new returned None - likely no peers to query through"
                         );
-                        // Record failure for exponential backoff
                         self.record_connection_failure(
                             ideal_location,
                             ConnectionFailureReason::RoutingFailed,
                         );
                     } else {
+                        active_count += 1;
                         tracing::info!(
-                            active_connections = active_count + 1,
+                            active_connections = active_count,
                             "Successfully initiated connection acquisition"
                         );
-                        // Note: Backoff is only cleared when the connection actually completes
-                        // successfully in ConnectOp::handle_msg when acceptance.satisfied is true.
-                        // We don't clear it here at initiation because the connection could still
-                        // timeout or be rejected before completing.
                     }
-                } else {
-                    tracing::debug!(
-                        active_connections = active_count,
-                        max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        target_location = %ideal_location,
-                        "At max concurrent connections, re-queuing location"
-                    );
-                    pending_conn_adds.insert(ideal_location);
                 }
             }
 
@@ -1448,11 +1454,26 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            crate::deterministic_select! {
-              _ = refresh_density_map.tick() => {
-                self.refresh_density_request_cache();
-              },
-              _ = check_interval.tick() => {},
+            // Use a faster tick when below min_connections or pending connections
+            // exist, so that initial mesh formation doesn't bottleneck on the
+            // 60-second steady-state interval.
+            let needs_fast_tick = current_connections < self.connection_manager.min_connections
+                || !pending_conn_adds.is_empty();
+
+            if needs_fast_tick {
+                crate::deterministic_select! {
+                  _ = refresh_density_map.tick() => {
+                    self.refresh_density_request_cache();
+                  },
+                  _ = tokio::time::sleep(FAST_CHECK_TICK_DURATION) => {},
+                }
+            } else {
+                crate::deterministic_select! {
+                  _ = refresh_density_map.tick() => {
+                    self.refresh_density_request_cache();
+                  },
+                  _ = check_interval.tick() => {},
+                }
             }
         }
     }
