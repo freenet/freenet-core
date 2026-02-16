@@ -19,7 +19,7 @@
 //!
 //! | Connections | Target Location Strategy |
 //! |-------------|-------------------------|
-//! | 0 to DENSITY_SELECTION_THRESHOLD-1 | Own location (if known), else random |
+//! | 0 to DENSITY_SELECTION_THRESHOLD-1 | Own location + evenly spaced ring targets (if known), else random |
 //! | DENSITY_SELECTION_THRESHOLD+       | Distance-weighted density (score = density/distance, biased toward own location) |
 //!
 //! See `constants::DENSITY_SELECTION_THRESHOLD` (currently 5).
@@ -1237,10 +1237,11 @@ mod tests {
         );
     }
 
-    // Test that with 1 connection (below DENSITY_SELECTION_THRESHOLD), we target our own
-    // location to build a local neighborhood. This is critical for small-world topology.
+    // Test that with 1 connection (below DENSITY_SELECTION_THRESHOLD), we spread targets
+    // across the ring: first at own location, rest evenly spaced. This ensures all targets
+    // survive BTreeSet deduplication in the pending connection queue.
     #[test_log::test]
-    fn test_early_connections_target_own_location() {
+    fn test_early_connections_spread_across_ring() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1292,6 +1293,91 @@ mod tests {
                     as_set.len(),
                     locations.len(),
                     "All target locations must be distinct"
+                );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
+
+    // Test that with 4 connections (below_threshold=1), we still produce a valid single target.
+    #[test_log::test]
+    fn test_early_connections_single_target() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for _ in 0..4 {
+            let peer = PeerKeyLocation::random();
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        let my_location = Location::new(0.25);
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            4, // 4 connections, threshold is 5, so below_threshold = 1
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 1);
+                assert_eq!(
+                    locations[0], my_location,
+                    "Single target should be own location"
+                );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
+
+    // Test that location wrapping works correctly near the ring boundary (1.0 wraps to 0.0).
+    #[test_log::test]
+    fn test_early_connections_wrap_around_ring() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let peer = PeerKeyLocation::random();
+        neighbor_locations.insert(peer.location().unwrap(), vec![]);
+
+        // Location near the ring boundary — offsets should wrap via rem_euclid
+        let my_location = Location::new(0.9);
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            1,
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations[0], my_location);
+
+                // All locations must be valid (in [0, 1)) and distinct
+                for loc in &locations {
+                    let v = loc.as_f64();
+                    assert!(
+                        (0.0..1.0).contains(&v),
+                        "Location {v} outside valid ring range [0, 1)"
+                    );
+                }
+                let as_set: std::collections::BTreeSet<Location> =
+                    locations.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    locations.len(),
+                    "All target locations must be distinct even when wrapping"
                 );
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
