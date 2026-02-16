@@ -608,33 +608,47 @@ async fn websocket_interface(
             }
         };
 
-        let client_req_task = async {
-            let next_msg = match client_stream
-                .next()
-                .await
-                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
-            {
-                Err(err) => {
-                    tracing::debug!(err = %err, "client channel error");
-                    return Err(Some(err.into()));
-                }
-                Ok(v) => v,
-            };
-            process_client_request(
-                client_id,
-                next_msg,
-                &request_sender,
-                &mut auth_token.as_mut().map(|t| t.0.clone()),
-                auth_token.as_mut().map(|t| t.1),
-                encoding_protoc,
-                api_version,
-            )
-            .await
-        };
-
+        // IMPORTANT: client_stream.next() is the only part inside the select future.
+        // process_client_request runs in the branch handler AFTER the select resolves,
+        // so it cannot be cancelled by other branches (listeners, responses, pings).
+        // Previously, process_client_request ran inside the select future and could be
+        // cancelled mid-execution if a subscription notification or host response arrived
+        // during an .await point (e.g., waiting_for_transaction_result). This left
+        // operations registered in the router but never started — a silent hang.
         tokio::select! { biased;
-            process_client_request = client_req_task => {
-                match process_client_request {
+            next_msg = client_stream.next() => {
+                let next_msg = match next_msg
+                    .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
+                {
+                    Err(err) => {
+                        tracing::debug!(err = %err, "client channel error");
+                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
+                        let _ = request_sender
+                            .send(ClientConnection::Request {
+                                client_id,
+                                req: Box::new(ClientRequest::Disconnect { cause: None }),
+                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+                                attested_contract: auth_token.as_ref().map(|t| t.1),
+                                api_version,
+                            })
+                            .await;
+                        let _ = server_sink.send(Message::Close(None)).await;
+                        return Ok(());
+                    }
+                    Ok(v) => v,
+                };
+                // Process the request outside the select — runs to completion
+                match process_client_request(
+                    client_id,
+                    next_msg,
+                    &request_sender,
+                    &mut auth_token.as_mut().map(|t| t.0.clone()),
+                    auth_token.as_mut().map(|t| t.1),
+                    encoding_protoc,
+                    api_version,
+                )
+                .await
+                {
                     Ok(Some(error)) => {
                         server_sink.send(error).await.inspect_err(|err| {
                             tracing::debug!(err = %err, "error sending message to client");
@@ -642,8 +656,7 @@ async fn websocket_interface(
                     }
                     Ok(None) => continue,
                     Err(None) => {
-                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
-                        // Notify node about client disconnect to trigger subscription cleanup
+                        tracing::debug!(%client_id, "Client channel closed during request processing");
                         let _ = request_sender
                             .send(ClientConnection::Request {
                                 client_id,
@@ -657,8 +670,7 @@ async fn websocket_interface(
                         return Ok(())
                     },
                     Err(Some(err)) => {
-                        tracing::debug!(%client_id, err = %err, "Client channel error, notifying node for subscription cleanup");
-                        // Notify node about client disconnect to trigger subscription cleanup even on error
+                        tracing::debug!(%client_id, err = %err, "Client request error, notifying node for subscription cleanup");
                         let _ = request_sender
                             .send(ClientConnection::Request {
                                 client_id,
