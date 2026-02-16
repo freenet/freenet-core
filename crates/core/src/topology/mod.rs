@@ -405,12 +405,10 @@ impl TopologyManager {
                         }
                     }
                 }
-                // If we have 1-4 connections, spread targets across the ring to form
-                // a diverse mesh quickly. First target is own location (for local
-                // clustering), additional targets are evenly spaced around the ring.
-                // Using distinct locations avoids BTreeSet deduplication in the
-                // pending connection queue (which would collapse identical targets
-                // into a single entry, throttling connection formation).
+                // With 1-4 connections, spread targets across the ring: first at
+                // own location (local clustering), rest evenly spaced. Distinct
+                // locations ensure all targets survive BTreeSet deduplication in
+                // the caller's pending queue.
                 else if current_connections < DENSITY_SELECTION_THRESHOLD {
                     match my_location {
                         Some(location) => {

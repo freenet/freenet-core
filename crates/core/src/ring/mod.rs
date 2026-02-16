@@ -1112,10 +1112,8 @@ impl Ring {
         #[cfg(test)]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(2);
 
-        /// Faster tick used when below min_connections to accelerate initial
-        /// mesh formation. Without this, peers process one pending connection
-        /// per 60-second tick, making it impossible to reach min_connections
-        /// within typical test timeouts (90s).
+        // Faster tick when below min_connections, so initial mesh formation
+        // doesn't bottleneck on the 60-second steady-state interval.
         #[cfg(not(test))]
         const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(5);
         #[cfg(test)]
@@ -1265,71 +1263,66 @@ impl Ring {
                 );
             }
 
-            // Drain pending connections up to MAX_CONCURRENT_CONNECTIONS limit.
-            // Processing multiple targets per iteration (instead of just one) is
-            // critical for fast mesh formation: with diverse target locations queued
-            // by adjust_topology, we can initiate several connection attempts in a
-            // single tick rather than waiting one full tick per attempt.
-            {
-                let mut active_count = live_tx_tracker.active_connect_transaction_count();
-                while let Some(ideal_location) = pending_conn_adds.pop_first() {
-                    if self.is_in_connection_backoff(ideal_location) {
-                        tracing::debug!(
-                            target_location = %ideal_location,
-                            "Skipping connection attempt - target in backoff"
-                        );
-                        continue;
-                    }
-                    if active_count >= MAX_CONCURRENT_CONNECTIONS {
-                        tracing::debug!(
-                            active_connections = active_count,
-                            max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                            target_location = %ideal_location,
-                            "At max concurrent connections, re-queuing location"
-                        );
-                        pending_conn_adds.insert(ideal_location);
-                        break;
-                    }
+            // Drain pending connections, initiating multiple attempts per tick
+            // (up to MAX_CONCURRENT_CONNECTIONS) for faster mesh formation.
+            let mut active_count = live_tx_tracker.active_connect_transaction_count();
+            while let Some(ideal_location) = pending_conn_adds.pop_first() {
+                if self.is_in_connection_backoff(ideal_location) {
+                    tracing::debug!(
+                        target_location = %ideal_location,
+                        "Skipping connection attempt - target in backoff"
+                    );
+                    continue;
+                }
+                if active_count >= MAX_CONCURRENT_CONNECTIONS {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
                         target_location = %ideal_location,
-                        "Attempting to acquire new connection"
+                        "At max concurrent connections, re-queuing location"
                     );
-                    let tx = self
-                        .acquire_new(
-                            ideal_location,
-                            &skip_list,
-                            &notifier,
-                            &live_tx_tracker,
-                            &op_manager,
-                        )
-                        .await
-                        .map_err(|error| {
-                            tracing::error!(
-                                ?error,
-                                "FATAL: Connection maintenance task failed - shutting down"
-                            );
-                            error
-                        })?;
-                    if tx.is_none() {
-                        let conns = self.connection_manager.connection_count();
-                        tracing::warn!(
-                            connections = conns,
-                            target_location = %ideal_location,
-                            "acquire_new returned None - likely no peers to query through"
+                    pending_conn_adds.insert(ideal_location);
+                    break;
+                }
+                tracing::debug!(
+                    active_connections = active_count,
+                    max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                    target_location = %ideal_location,
+                    "Attempting to acquire new connection"
+                );
+                let tx = self
+                    .acquire_new(
+                        ideal_location,
+                        &skip_list,
+                        &notifier,
+                        &live_tx_tracker,
+                        &op_manager,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(
+                            ?error,
+                            "FATAL: Connection maintenance task failed - shutting down"
                         );
-                        self.record_connection_failure(
-                            ideal_location,
-                            ConnectionFailureReason::RoutingFailed,
-                        );
-                    } else {
-                        active_count += 1;
-                        tracing::info!(
-                            active_connections = active_count,
-                            "Successfully initiated connection acquisition"
-                        );
-                    }
+                        error
+                    })?;
+                if tx.is_none() {
+                    let conns = self.connection_manager.connection_count();
+                    tracing::warn!(
+                        connections = conns,
+                        target_location = %ideal_location,
+                        "acquire_new returned None - likely no peers to query through"
+                    );
+                    self.record_connection_failure(
+                        ideal_location,
+                        ConnectionFailureReason::RoutingFailed,
+                    );
+                } else {
+                    active_count += 1;
+                    tracing::info!(
+                        active_connections = active_count,
+                        "Successfully initiated connection acquisition"
+                    );
                 }
             }
 
@@ -1454,9 +1447,6 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            // Use a faster tick when below min_connections or pending connections
-            // exist, so that initial mesh formation doesn't bottleneck on the
-            // 60-second steady-state interval.
             let needs_fast_tick = current_connections < self.connection_manager.min_connections
                 || !pending_conn_adds.is_empty();
 
