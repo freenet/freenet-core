@@ -1169,10 +1169,10 @@ pub fn release_local_port(port: u16) {
 
 /// Take the reserved TCP listener for a port without dropping it.
 ///
-/// This removes the port from the reservation tracking and returns the
-/// `TcpListener` so it can be converted to a `tokio::net::TcpListener`
-/// and reused directly, avoiding a release-then-rebind race window.
-/// The UDP socket for the port is dropped.
+/// Returns the `TcpListener` that was held to reserve this port, removing
+/// it from tracking. The caller can convert it to a `tokio::net::TcpListener`
+/// via `TcpListener::from_std()`, avoiding a release-then-rebind race window
+/// where another process could claim the port. The UDP socket is dropped.
 pub fn take_reserved_tcp_listener(port: u16) -> Option<std::net::TcpListener> {
     RESERVED_PORTS.remove(&port);
     RESERVED_SOCKETS.remove(&port).map(|(_, (_udp, tcp))| tcp)
