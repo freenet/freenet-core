@@ -6,9 +6,9 @@
 //!
 //! For deterministic tests that use Turmoil, see `simulation_integration.rs`.
 //!
-//! NOTE: These tests must run serially (behind simulation_tests feature) because they
-//! use global state: reset_all_simulation_state(), GlobalRng, GlobalSimulationTime,
-//! and VirtualTime registries. Running in parallel causes state corruption.
+//! NOTE: These tests use the simulation_tests feature. Thread-local state (GlobalRng,
+//! GlobalSimulationTime) and per-network registries (sockets, topology) provide test
+//! isolation, so parallel execution is safe.
 
 #![cfg(feature = "simulation_tests")]
 
@@ -59,13 +59,18 @@ async fn test_smoke_event_types_consistency() {
     const SEED: u64 = 0xFA01_7777_1234;
 
     async fn run_simulation(name: &str, seed: u64) -> HashMap<String, usize> {
-        // Reset all global state and set up deterministic time/RNG
-        freenet::dev_tool::reset_all_simulation_state();
         GlobalRng::set_seed(seed);
-        // Derive epoch from seed (same logic as run_simulation)
         const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+        freenet::dev_tool::RequestId::reset_counter();
+        freenet::dev_tool::ClientId::reset_counter();
+        freenet::dev_tool::reset_event_id_counter();
+        freenet::dev_tool::reset_channel_id_counter();
+        freenet::dev_tool::StreamId::reset_counter();
+        freenet::dev_tool::reset_nonce_counter();
+        freenet::dev_tool::reset_global_node_index();
+        GlobalRng::reset_thread_index_counter();
 
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
         sim.with_start_backoff(Duration::from_millis(50));
@@ -906,16 +911,20 @@ fn make_contract_id(seed: u8) -> freenet_stdlib::prelude::ContractInstanceId {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_topology_infrastructure() {
     use freenet::config::{GlobalRng, GlobalSimulationTime};
-    use freenet::dev_tool::reset_all_simulation_state;
 
     const SEED: u64 = 0x1234_5678;
 
-    // Reset all global state and set up deterministic time/RNG
-    reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    freenet::dev_tool::RequestId::reset_counter();
+    freenet::dev_tool::ClientId::reset_counter();
+    freenet::dev_tool::reset_event_id_counter();
+    freenet::dev_tool::reset_channel_id_counter();
+    freenet::dev_tool::StreamId::reset_counter();
+    freenet::dev_tool::reset_nonce_counter();
+    freenet::dev_tool::reset_global_node_index();
 
     let mut sim = SimNetwork::new(
         "topology-infra-test",

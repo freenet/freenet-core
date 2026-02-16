@@ -5,10 +5,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc, LazyLock,
-    },
+    sync::{atomic::AtomicBool, Arc, LazyLock},
     time::Duration,
 };
 
@@ -1965,14 +1962,11 @@ impl GlobalRng {
 // Global Simulation Time
 // =============================================================================
 
-/// Global simulation time base in milliseconds since Unix epoch.
-/// When set, ULID generation uses this instead of system time.
-/// Combined with GlobalRng seeding, this allows fully deterministic transaction IDs.
-static SIMULATION_TIME_MS: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
-
-/// Counter for deterministic time progression within a single millisecond.
-/// Increments with each ULID generation to ensure uniqueness.
-static SIMULATION_TIME_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Thread-local simulation time: allows parallel simulation tests without interference.
+std::thread_local! {
+    static SIMULATION_TIME_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static SIMULATION_TIME_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Global simulation time configuration for deterministic testing.
 ///
@@ -1996,18 +1990,18 @@ static SIMULATION_TIME_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct GlobalSimulationTime;
 
 impl GlobalSimulationTime {
-    /// Sets the global simulation time base in milliseconds since Unix epoch.
+    /// Sets the simulation time base in milliseconds since Unix epoch (thread-local).
     ///
-    /// All subsequent ULID generations will use this time (with auto-increment).
+    /// All subsequent ULID generations on this thread will use this time (with auto-increment).
     pub fn set_time_ms(time_ms: u64) {
-        *SIMULATION_TIME_MS.lock() = Some(time_ms);
-        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        SIMULATION_TIME_MS.with(|t| t.set(Some(time_ms)));
+        SIMULATION_TIME_COUNTER.with(|c| c.set(0));
     }
 
-    /// Clears the simulation time, reverting to system time.
+    /// Clears the simulation time, reverting to system time (thread-local).
     pub fn clear_time() {
-        *SIMULATION_TIME_MS.lock() = None;
-        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        SIMULATION_TIME_MS.with(|t| t.set(None));
+        SIMULATION_TIME_COUNTER.with(|c| c.set(0));
     }
 
     /// Returns the current time in milliseconds for ULID generation.
@@ -2015,18 +2009,22 @@ impl GlobalSimulationTime {
     /// If simulation time is set, returns simulation time + counter increment.
     /// Otherwise, returns real system time.
     pub fn current_time_ms() -> u64 {
-        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
-            // Deterministic time: base + counter for uniqueness
-            let counter = SIMULATION_TIME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            base_time.saturating_add(counter)
-        } else {
-            // Production: use real system time
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_millis() as u64
-        }
+        SIMULATION_TIME_MS.with(|t| {
+            if let Some(base_time) = t.get() {
+                let counter = SIMULATION_TIME_COUNTER.with(|c| {
+                    let val = c.get();
+                    c.set(val + 1);
+                    val
+                });
+                base_time.saturating_add(counter)
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time before unix epoch")
+                    .as_millis() as u64
+            }
+        })
     }
 
     /// Returns the current time in milliseconds WITHOUT incrementing the counter.
@@ -2034,23 +2032,23 @@ impl GlobalSimulationTime {
     /// Use this for read-only time checks like elapsed time calculations.
     /// For ULID generation, use `current_time_ms()` which ensures uniqueness.
     pub fn read_time_ms() -> u64 {
-        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
-            // Return base time + current counter (without incrementing)
-            let counter = SIMULATION_TIME_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
-            base_time.saturating_add(counter)
-        } else {
-            // Production: use real system time
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_millis() as u64
-        }
+        SIMULATION_TIME_MS.with(|t| {
+            if let Some(base_time) = t.get() {
+                let counter = SIMULATION_TIME_COUNTER.with(|c| c.get());
+                base_time.saturating_add(counter)
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time before unix epoch")
+                    .as_millis() as u64
+            }
+        })
     }
 
-    /// Returns true if simulation time is set.
+    /// Returns true if simulation time is set (thread-local).
     pub fn is_simulation_time() -> bool {
-        SIMULATION_TIME_MS.lock().is_some()
+        SIMULATION_TIME_MS.with(|t| t.get().is_some())
     }
 
     /// Generates a deterministic ULID using GlobalRng and simulation time.
@@ -2100,17 +2098,12 @@ impl GlobalSimulationTime {
 // Global Test Metrics (for simulation testing)
 // =============================================================================
 
-/// Global counter for ResyncRequests received across all nodes.
-/// Used in simulation tests to verify correct summary caching behavior.
-static GLOBAL_RESYNC_REQUESTS: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for delta sends across all nodes.
-/// Incremented when a state change broadcast uses delta encoding.
-static GLOBAL_DELTA_SENDS: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for full state sends across all nodes.
-/// Incremented when a state change broadcast sends full state (not delta).
-static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
+// Thread-local test metrics: allows parallel simulation tests without interference.
+std::thread_local! {
+    static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Global test metrics for tracking events across the simulation network.
 ///
@@ -2134,44 +2127,44 @@ static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
 pub struct GlobalTestMetrics;
 
 impl GlobalTestMetrics {
-    /// Resets all test metrics to zero. Call at the start of each test.
+    /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
-        GLOBAL_RESYNC_REQUESTS.store(0, std::sync::atomic::Ordering::SeqCst);
-        GLOBAL_DELTA_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
-        GLOBAL_FULL_STATE_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
+        GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
     /// Called from production code when handling ResyncRequest messages.
     pub fn record_resync_request() {
-        GLOBAL_RESYNC_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of ResyncRequests received since last reset.
     pub fn resync_requests() -> u64 {
-        GLOBAL_RESYNC_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
     }
 
     /// Records that a delta was sent in a state change broadcast.
     /// Called from p2p_protoc.rs when sent_delta = true.
     pub fn record_delta_send() {
-        GLOBAL_DELTA_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of delta sends since last reset.
     pub fn delta_sends() -> u64 {
-        GLOBAL_DELTA_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
     /// Records that full state was sent in a state change broadcast.
     /// Called from p2p_protoc.rs when sent_delta = false.
     pub fn record_full_state_send() {
-        GLOBAL_FULL_STATE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
-        GLOBAL_FULL_STATE_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
     }
 }
 

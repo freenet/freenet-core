@@ -6,8 +6,22 @@
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::{GlobalRng, GlobalSimulationTime};
-use freenet::dev_tool::SimNetwork;
+use freenet::dev_tool::{
+    reset_channel_id_counter, reset_event_id_counter, reset_global_node_index, reset_nonce_counter,
+    RequestId, SimNetwork, StreamId,
+};
 use std::time::Duration;
+
+fn reset_counters() {
+    RequestId::reset_counter();
+    freenet::dev_tool::ClientId::reset_counter();
+    reset_event_id_counter();
+    reset_channel_id_counter();
+    StreamId::reset_counter();
+    reset_nonce_counter();
+    reset_global_node_index();
+    GlobalRng::reset_thread_index_counter();
+}
 
 async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
     let step = Duration::from_millis(100);
@@ -29,9 +43,9 @@ async fn test_verify_state_produces_report() {
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
 
-    freenet::dev_tool::reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    reset_counters();
 
     let mut sim = SimNetwork::new("verify-state-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));
@@ -74,9 +88,9 @@ async fn test_verify_state_filter_methods() {
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
 
-    freenet::dev_tool::reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    reset_counters();
 
     let mut sim = SimNetwork::new("verify-filter-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));

@@ -4007,18 +4007,22 @@ impl std::fmt::Debug for SimNetwork {
 
 impl Drop for SimNetwork {
     fn drop(&mut self) {
-        // Clean up the fault injector for this network
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
             clear_current_network_name, clear_topology_snapshots,
         };
+        use crate::transport::in_memory_socket::{
+            clear_network_address_mappings, clear_network_sockets,
+        };
+
+        // Per-network cleanup (safe for parallel tests)
         set_fault_injector(&self.name, None);
-
-        // Clean up the VirtualTime registration for this network
         unregister_network_time_source(&self.name);
-
-        // Clean up topology registry for this network
         clear_topology_snapshots(&self.name);
+        clear_network_sockets(&self.name);
+        clear_network_address_mappings(&self.name);
+
+        // Thread-local cleanup
         clear_current_network_name();
 
         if self.clean_up_tmp_dirs {

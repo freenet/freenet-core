@@ -16,8 +16,8 @@
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use parking_lot::RwLock;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::LazyLock,
@@ -29,27 +29,27 @@ use std::{
 static TOPOLOGY_REGISTRY: LazyLock<DashMap<(String, SocketAddr), TopologySnapshot>> =
     LazyLock::new(DashMap::new);
 
-/// Global current network name for simulation testing.
-/// Set by SimNetwork before starting nodes so that Ring can register topology snapshots
-/// with the correct network name.
-static CURRENT_NETWORK_NAME: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+// Thread-local current network name: allows parallel simulation tests.
+thread_local! {
+    static CURRENT_NETWORK_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
-/// Set the current simulation network name.
+/// Set the current simulation network name (thread-local).
 /// Called by SimNetwork before starting nodes.
 pub fn set_current_network_name(name: &str) {
-    *CURRENT_NETWORK_NAME.write() = Some(name.to_string());
+    CURRENT_NETWORK_NAME.with(|n| *n.borrow_mut() = Some(name.to_string()));
 }
 
-/// Get the current simulation network name.
+/// Get the current simulation network name (thread-local).
 /// Returns None if not in a simulation context.
 pub fn get_current_network_name() -> Option<String> {
-    CURRENT_NETWORK_NAME.read().clone()
+    CURRENT_NETWORK_NAME.with(|n| n.borrow().clone())
 }
 
-/// Clear the current simulation network name.
+/// Clear the current simulation network name (thread-local).
 /// Called when SimNetwork is dropped or test ends.
 pub fn clear_current_network_name() {
-    *CURRENT_NETWORK_NAME.write() = None;
+    CURRENT_NETWORK_NAME.with(|n| *n.borrow_mut() = None);
 }
 
 /// A snapshot of a peer's subscription topology for a contract.
