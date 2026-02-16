@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -80,11 +80,7 @@ impl HttpClientApi {
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        let localhost = match socket.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            _ => false,
-        };
+        let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -100,7 +96,7 @@ impl HttpClientApi {
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: attested_contracts.clone(),
+                attested_contracts,
                 response_channels: HashMap::new(),
             },
             router,

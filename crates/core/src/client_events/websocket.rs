@@ -91,12 +91,11 @@ fn is_localhost_origin(origin: &str) -> bool {
 /// "http://nova.locut.us:7509") and compares it against the Host header. This allows
 /// remote browsers to connect back to the same server while blocking cross-site attacks.
 fn is_same_origin(origin: &str, headers: &axum::http::HeaderMap) -> bool {
-    let host_header = match headers.get(axum::http::header::HOST) {
-        Some(h) => match h.to_str() {
-            Ok(s) => s,
-            Err(_) => return false,
-        },
-        None => return false,
+    let Some(host_header) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
     };
     // Extract host from origin URL: "http://host:port" -> "host:port"
     let origin_host = origin
