@@ -265,6 +265,9 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
     }
 }
 
+/// Interval between keep-alive ping packets.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Maximum number of unanswered pings before considering the connection dead.
 ///
 /// With 5-second ping interval, 5 unanswered pings means 25 seconds of no response.
@@ -281,8 +284,6 @@ const MAX_UNANSWERED_PINGS: usize = 5;
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
         let socket = remote_conn.socket.clone();
@@ -906,7 +907,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // This catches asymmetric failures where we receive packets from remote
                     // (so last_received is updated) but our packets don't reach the remote
                     // (so our pings never get ponged back).
-                    if pending_ping_count > MAX_UNANSWERED_PINGS {
+                    //
+                    // However, if we've received ANY data recently, the connection is at least
+                    // partially working. In Docker NAT and under congestion, small ping/pong
+                    // packets can be dropped while larger data packets succeed. Only trigger
+                    // the bidirectional liveness failure when we have BOTH unanswered pings
+                    // AND no recent data reception.
+                    let ping_timeout_nanos = (MAX_UNANSWERED_PINGS as u64) * KEEP_ALIVE_INTERVAL.as_nanos() as u64;
+                    if pending_ping_count > MAX_UNANSWERED_PINGS && elapsed_nanos > ping_timeout_nanos {
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_timeout",
                             remote = ?self.remote_conn.remote_addr,
