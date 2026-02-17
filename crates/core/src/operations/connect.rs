@@ -607,6 +607,19 @@ impl RelayContext for RelayEnv<'_> {
     fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool {
         let addr = joiner.socket_addr();
         let location = joiner.location();
+
+        // Check blocklist before capacity. If we block this peer, return false
+        // so the uphill hop mechanism can route to an alternate acceptor.
+        if let Some(blocked) = &self.op_manager.blocked_addresses {
+            if blocked.contains(&addr) {
+                tracing::info!(
+                    joiner_addr = %addr,
+                    "connect: rejecting join from blocked peer at routing level"
+                );
+                return false;
+            }
+        }
+
         self.op_manager
             .ring
             .connection_manager
@@ -1896,7 +1909,7 @@ pub(crate) async fn initial_join_procedure(
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
                 // Design note: We track backoff per-gateway because join_ring_request uses
-                // a random desired_location each time. Backing off the gateway gives the
+                // the joiner's own desired_location each time. Backing off the gateway gives the
                 // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
