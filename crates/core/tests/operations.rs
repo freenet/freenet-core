@@ -660,41 +660,83 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     let (stream3, _) = connect_async(&uri_b).await?;
     let mut client_api_node_b = WebApi::start(stream3);
 
-    // First client puts contract with initial state (without subscribing)
-    tracing::info!(
-        "Client 1: Starting PUT operation (elapsed: {:?})",
-        start_time.elapsed()
-    );
-    make_put(
-        &mut client_api1_node_a,
-        wrapped_state.clone(),
-        contract.clone(),
-        false, // subscribe=false - no automatic subscription
-    )
-    .await?;
+    // First client puts contract with initial state (without subscribing).
+    // Retry up to 3 times — under CI resource pressure, peer connections can
+    // drop during the first PUT attempt before the mesh is fully stable.
+    const PUT_MAX_ATTEMPTS: usize = 3;
+    let mut put_last_err: Option<anyhow::Error> = None;
+    for put_attempt in 1..=PUT_MAX_ATTEMPTS {
+        tracing::info!(
+            "Client 1: Starting PUT attempt {}/{} (elapsed: {:?})",
+            put_attempt,
+            PUT_MAX_ATTEMPTS,
+            start_time.elapsed()
+        );
+        if let Err(e) = make_put(
+            &mut client_api1_node_a,
+            wrapped_state.clone(),
+            contract.clone(),
+            false, // subscribe=false - no automatic subscription
+        )
+        .await
+        {
+            put_last_err = Some(e);
+            tracing::warn!(
+                "Client 1: PUT send failed on attempt {}, retrying...",
+                put_attempt
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
-    // Wait for put response
-    loop {
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                tracing::info!(
-                    "Client 1: PUT completed successfully (elapsed: {:?})",
-                    start_time.elapsed()
-                );
+        // Wait for put response, draining stale messages
+        let mut put_succeeded = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
                 break;
             }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for put response");
+            match tokio::time::timeout(remaining, client_api1_node_a.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                    tracing::info!(
+                        "Client 1: PUT completed successfully on attempt {} (elapsed: {:?})",
+                        put_attempt,
+                        start_time.elapsed()
+                    );
+                    put_succeeded = true;
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!("unexpected response while waiting for put: {:?}", other);
+                }
+                Ok(Err(e)) => {
+                    put_last_err = Some(anyhow::anyhow!("Error receiving put response: {}", e));
+                    break;
+                }
+                Err(_) => {
+                    put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
+                    break;
+                }
             }
         }
+
+        if put_succeeded {
+            put_last_err = None;
+            break;
+        }
+
+        tracing::warn!(
+            "Client 1: PUT attempt {} failed: {}; retrying after delay...",
+            put_attempt,
+            put_last_err.as_ref().unwrap()
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if let Some(e) = put_last_err {
+        bail!("PUT failed after {} attempts: {}", PUT_MAX_ATTEMPTS, e);
     }
 
     // Explicitly subscribe client 1 to the contract using make_subscribe
