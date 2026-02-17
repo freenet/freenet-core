@@ -1838,6 +1838,10 @@ pub(crate) mod test {
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
+        /// Keeps subscription notification receivers alive so the sender half
+        /// (passed as `notification_channel`) isn't immediately broken.
+        #[allow(dead_code)]
+        subscription_receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<HostResult>>,
     }
 
     impl<R> MemoryEventsGen<R>
@@ -1855,6 +1859,7 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
+                subscription_receivers: Vec::new(),
             }
         }
 
@@ -1905,6 +1910,7 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
+                subscription_receivers: Vec::new(),
             }
         }
     }
@@ -1918,8 +1924,31 @@ pub(crate) mod test {
             self.events_to_gen.extend(events)
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'_>> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'static>> {
             self.events_to_gen.remove(id)
+        }
+
+        /// Creates a notification channel for Subscribe and Put-with-subscribe requests.
+        /// The receiver is stored so the sender half stays alive.
+        fn make_notification_channel_if_needed(
+            request: &ClientRequest<'_>,
+            subscription_receivers: &mut Vec<tokio::sync::mpsc::UnboundedReceiver<HostResult>>,
+        ) -> Option<tokio::sync::mpsc::UnboundedSender<HostResult>> {
+            let needs_channel = matches!(
+                request,
+                ClientRequest::ContractOp(ContractRequest::Subscribe { .. })
+                    | ClientRequest::ContractOp(ContractRequest::Put {
+                        subscribe: true,
+                        ..
+                    })
+            );
+            if needs_channel {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                subscription_receivers.push(rx);
+                Some(tx)
+            } else {
+                None
+            }
         }
     }
 
@@ -1933,28 +1962,38 @@ pub(crate) mod test {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
                         if self.rng.is_some() && pk == self.key {
+                            let request: Box<ClientRequest<'static>> = self
+                                .generate_rand_event()
+                                .await
+                                .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
+                                .into();
+                            let notification_channel = Self::make_notification_channel_if_needed(
+                                &request,
+                                &mut self.subscription_receivers,
+                            );
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request_id: RequestId::new(),
-                                request: self
-                                    .generate_rand_event()
-                                    .await
-                                    .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
-                                    .into(),
-                                notification_channel: None,
+                                request,
+                                notification_channel,
                                 token: None,
                                 attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         } else if pk == self.key {
+                            let request: Box<ClientRequest<'static>> = self
+                                .generate_deterministic_event(&ev_id)
+                                .expect("event not found")
+                                .into();
+                            let notification_channel = Self::make_notification_channel_if_needed(
+                                &request,
+                                &mut self.subscription_receivers,
+                            );
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request_id: RequestId::new(),
-                                request: self
-                                    .generate_deterministic_event(&ev_id)
-                                    .expect("event not found")
-                                    .into(),
-                                notification_channel: None,
+                                request,
+                                notification_channel,
                                 token: None,
                                 attested_contract: None,
                             };
@@ -2037,18 +2076,24 @@ pub(crate) mod test {
                             {
                                 tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
                                 if pub_key == self.id {
+                                    let request: Box<ClientRequest<'static>> = self
+                                        .memory_event_generator
+                                        .generate_rand_event()
+                                        .await
+                                        .ok_or_else(|| {
+                                            ClientError::from(ErrorKind::Disconnect)
+                                        })?
+                                        .into();
+                                    let notification_channel =
+                                        MemoryEventsGen::<R>::make_notification_channel_if_needed(
+                                            &request,
+                                            &mut self.memory_event_generator.subscription_receivers,
+                                        );
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
                                         request_id: RequestId::new(),
-                                        request: self
-                                            .memory_event_generator
-                                            .generate_rand_event()
-                                            .await
-                                            .ok_or_else(|| {
-                                                ClientError::from(ErrorKind::Disconnect)
-                                            })?
-                                            .into(),
-                                        notification_channel: None,
+                                        request,
+                                        notification_channel,
                                         token: None,
                                         attested_contract: None,
                                     };

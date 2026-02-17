@@ -605,8 +605,12 @@ fn setup_deterministic_state(seed: u64) {
     // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();
 
-    // Reset thread index counter for spawn_blocking thread determinism.
-    GlobalRng::reset_thread_index_counter();
+    // NOTE: Do NOT call GlobalRng::reset_thread_index_counter() here.
+    // THREAD_INDEX_COUNTER is a global atomic (not thread-local), so resetting it
+    // while other tests run in parallel causes race conditions that break
+    // determinism. Thread indices are cached in thread-local storage anyway,
+    // so resetting the counter is ineffective for existing threads and harmful
+    // for new ones. See issue #2733.
 
     // Reset all thread-local ID counters for exact event sequence reproducibility.
     RequestId::reset_counter();
