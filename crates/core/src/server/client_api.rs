@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -24,9 +24,9 @@ mod v1;
 mod v2;
 
 #[derive(Clone)]
-pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
+pub(super) struct HttpClientApiRequest(mpsc::Sender<ClientConnection>);
 
-impl std::ops::Deref for HttpGatewayRequest {
+impl std::ops::Deref for HttpClientApiRequest {
     type Target = mpsc::Sender<ClientConnection>;
 
     fn deref(&self) -> &Self::Target {
@@ -59,14 +59,14 @@ impl AttestedContract {
 /// Maps authentication tokens to attested contract metadata.
 pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
 
-/// A gateway to access and interact with contracts through an HTTP interface.
-pub struct HttpGateway {
+/// Handles HTTP client requests for contract access and interaction.
+pub struct HttpClientApi {
     pub(crate) attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
 
-impl HttpGateway {
+impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
         let attested_contracts = Arc::new(DashMap::new());
@@ -80,11 +80,12 @@ impl HttpGateway {
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        let localhost = match socket.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => true,
-            _ => false,
-        };
+        // Controls the cookie Secure flag: when true, cookies are sent over HTTP
+        // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
+        // (network mode) allow HTTP cookies — most home users lack TLS.
+        // Note: this is intentionally different from `localhost_only` in mod.rs,
+        // which uses only is_loopback() to control WebSocket origin restrictions.
+        let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -95,12 +96,12 @@ impl HttpGateway {
         let router = v1::routes(config.clone())
             .merge(v2::routes(config))
             .layer(Extension(attested_contracts.clone()))
-            .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
+            .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: attested_contracts.clone(),
+                attested_contracts,
                 response_channels: HashMap::new(),
             },
             router,
@@ -126,22 +127,19 @@ async fn home() -> axum::response::Response {
 
 async fn web_home(
     Path(key): Path<String>,
-    Extension(rs): Extension<HttpGatewayRequest>,
+    Extension(rs): Extension<HttpClientApiRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
     api_version: ApiVersion,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
-    let domain = config
-        .localhost
-        .then_some("localhost")
-        .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
+    // Don't set a cookie domain — the browser will default to the request's origin host,
+    // which works for both localhost and remote access.
     let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
-        .domain(domain)
         .path(format!("/{version_prefix}/contract/web/{key}"))
         .same_site(cookie::SameSite::Strict)
         .max_age(cookie::time::Duration::days(1))
@@ -176,7 +174,7 @@ async fn web_subpages(
         .map(|r| r.into_response())
 }
 
-impl ClientEventsProxy for HttpGateway {
+impl ClientEventsProxy for HttpClientApi {
     #[instrument(level = "debug", skip(self))]
     fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         async move {
@@ -217,7 +215,7 @@ impl ClientEventsProxy for HttpGateway {
                     }
                 }
             }
-            tracing::warn!("Shutting down http gateway receiver");
+            tracing::warn!("Shutting down HTTP client API receiver");
             Err(ErrorKind::Disconnect.into())
         }
         .boxed()

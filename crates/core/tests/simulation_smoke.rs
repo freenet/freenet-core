@@ -6,9 +6,9 @@
 //!
 //! For deterministic tests that use Turmoil, see `simulation_integration.rs`.
 //!
-//! NOTE: These tests must run serially (behind simulation_tests feature) because they
-//! use global state: reset_all_simulation_state(), GlobalRng, GlobalSimulationTime,
-//! and VirtualTime registries. Running in parallel causes state corruption.
+//! NOTE: These tests use the simulation_tests feature. Thread-local state (GlobalRng,
+//! GlobalSimulationTime) and per-network registries (sockets, topology) provide test
+//! isolation, so parallel execution is safe.
 
 #![cfg(feature = "simulation_tests")]
 
@@ -59,10 +59,7 @@ async fn test_smoke_event_types_consistency() {
     const SEED: u64 = 0xFA01_7777_1234;
 
     async fn run_simulation(name: &str, seed: u64) -> HashMap<String, usize> {
-        // Reset all global state and set up deterministic time/RNG
-        freenet::dev_tool::reset_all_simulation_state();
         GlobalRng::set_seed(seed);
-        // Derive epoch from seed (same logic as run_simulation)
         const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
@@ -441,6 +438,19 @@ async fn test_eventual_consistency_state_hashes() {
             convergence_rate * 100.0
         );
     }
+
+    // Run anomaly detection on the simulation event logs
+    let report = sim.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (eventual-consistency): {} events, {} state events, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::warn!("  anomaly[{}] = {:?}", i, anomaly);
+    }
 }
 
 // =============================================================================
@@ -467,6 +477,19 @@ async fn test_fault_injection_bridge() {
 
     let normal_events = sim_normal.get_event_counts().await;
     let normal_total: usize = normal_events.values().sum();
+
+    // Run anomaly detection on normal run
+    let normal_report = sim_normal.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (normal run): {} events, {} state events, {} anomalies ===",
+        normal_report.total_events,
+        normal_report.state_events,
+        normal_report.anomalies.len()
+    );
+    for (i, anomaly) in normal_report.anomalies.iter().enumerate() {
+        tracing::warn!("  normal anomaly[{}] = {:?}", i, anomaly);
+    }
+
     sim_normal.clear_fault_injection();
 
     tracing::info!("Normal run completed: {} events", normal_total);
@@ -487,6 +510,26 @@ async fn test_fault_injection_bridge() {
 
     let lossy_events = sim_lossy.get_event_counts().await;
     let lossy_total: usize = lossy_events.values().sum();
+
+    // Run anomaly detection on lossy run - expect MORE anomalies than normal
+    let lossy_report = sim_lossy.verify_state().await;
+    tracing::info!(
+        "=== ANOMALY DETECTION (50% loss run): {} events, {} state events, {} anomalies ===",
+        lossy_report.total_events,
+        lossy_report.state_events,
+        lossy_report.anomalies.len()
+    );
+    for (i, anomaly) in lossy_report.anomalies.iter().enumerate() {
+        tracing::warn!("  lossy anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    // Compare anomaly counts between normal and lossy runs
+    tracing::info!(
+        "=== ANOMALY COMPARISON: normal={} anomalies vs lossy={} anomalies ===",
+        normal_report.anomalies.len(),
+        lossy_report.anomalies.len()
+    );
+
     sim_lossy.clear_fault_injection();
 
     tracing::info!("Lossy run (50% loss) completed: {} events", lossy_total);
@@ -860,16 +903,20 @@ fn make_contract_id(seed: u8) -> freenet_stdlib::prelude::ContractInstanceId {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_topology_infrastructure() {
     use freenet::config::{GlobalRng, GlobalSimulationTime};
-    use freenet::dev_tool::reset_all_simulation_state;
 
     const SEED: u64 = 0x1234_5678;
 
-    // Reset all global state and set up deterministic time/RNG
-    reset_all_simulation_state();
     GlobalRng::set_seed(SEED);
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    freenet::dev_tool::RequestId::reset_counter();
+    freenet::dev_tool::ClientId::reset_counter();
+    freenet::dev_tool::reset_event_id_counter();
+    freenet::dev_tool::reset_channel_id_counter();
+    freenet::dev_tool::StreamId::reset_counter();
+    freenet::dev_tool::reset_nonce_counter();
+    freenet::dev_tool::reset_global_node_index();
 
     let mut sim = SimNetwork::new(
         "topology-infra-test",
@@ -928,4 +975,84 @@ async fn test_topology_infrastructure() {
     );
 
     tracing::info!("Topology infrastructure test passed");
+}
+
+// =============================================================================
+// Stale Reservation TTL Recovery (Issue #2888)
+// =============================================================================
+
+/// Verifies the core #2888 fix: a gateway accepts retry connections after
+/// a stale reservation expires.
+///
+/// Scenario: ConnectOp reserves a gateway slot → connection fails →
+/// reservation ages past TTL → node retries → gateway accepts.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_stale_reservation_allows_gateway_retry() {
+    let mut sim = SimNetwork::new("stale-retry", 1, 2, 7, 3, 10, 2, 0x2888_0001).await;
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(0x2888_0001, 1, 1)
+        .await;
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    let gw = freenet::dev_tool::NodeLabel::gateway("stale-retry", 0);
+    let phantom_addr: std::net::SocketAddr = "127.99.99.1:9999".parse().unwrap();
+    let phantom_loc = freenet::dev_tool::Location::new(0.55);
+
+    // Fresh reservation blocks duplicate connect
+    assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::ZERO));
+    assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
+
+    // Expired reservation becomes invisible — allows retry
+    assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::from_secs(120),));
+    assert_eq!(
+        sim.has_connection_or_pending(&gw, phantom_addr),
+        Some(false)
+    );
+
+    // Gateway accepts the retry (the core fix for is_not_connected filtering)
+    assert_eq!(
+        sim.should_accept(&gw, phantom_loc, phantom_addr),
+        Some(true)
+    );
+
+    // Re-accepted reservation is visible again
+    assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
+}
+
+/// Verifies that stale reservations don't consume capacity and that
+/// cleanup removes them from the map.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_stale_reservation_cleanup_frees_capacity() {
+    let mut sim = SimNetwork::new("cleanup-cap", 1, 1, 7, 3, 5, 1, 0x2888_0002).await;
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(0x2888_0002, 1, 1)
+        .await;
+    let_network_run(&mut sim, Duration::from_secs(3)).await;
+
+    let gw = freenet::dev_tool::NodeLabel::gateway("cleanup-cap", 0);
+    let established = sim.connection_count(&gw).unwrap_or(0);
+
+    // Fill remaining capacity with expired reservations
+    let stale_count = 5usize.saturating_sub(established);
+    for i in 0..stale_count {
+        let addr: std::net::SocketAddr =
+            format!("127.88.88.{}:{}", i + 1, 7000 + i).parse().unwrap();
+        let loc = freenet::dev_tool::Location::new(0.1 + (i as f64) * 0.1);
+        assert!(sim.inject_stale_reservation(&gw, addr, loc, Duration::from_secs(120)));
+    }
+
+    let reserved_before = sim.reserved_connections_count(&gw).unwrap();
+    assert!(reserved_before >= stale_count);
+
+    // Expired reservations don't block new connections
+    let new_addr: std::net::SocketAddr = "127.77.77.1:6000".parse().unwrap();
+    let new_loc = freenet::dev_tool::Location::new(0.75);
+    assert_eq!(sim.should_accept(&gw, new_loc, new_addr), Some(true));
+
+    // Cleanup removes stale entries from the map
+    let removed = sim.cleanup_stale_reservations(&gw).unwrap();
+    assert!(removed >= stale_count);
+
+    let reserved_after = sim.reserved_connections_count(&gw).unwrap();
+    assert!(reserved_after < reserved_before);
 }

@@ -1,4 +1,6 @@
+use crate::config::GlobalRng;
 use crate::ring::{Connection, Location};
+use rand::Rng;
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
@@ -124,13 +126,13 @@ impl DensityMap {
                 next_neighbor_prop * *previous_neighbor_count as f64
                     + previous_neighbor_prop * *next_neighbor_count as f64
             }
-            // The None cases have been removed as they should not occur given the new logic
             _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_request_counts is not empty"),
         };
 
         Ok(count_estimate)
     }
 
+    #[allow(dead_code)]
     pub fn get_max_density(&self) -> Result<Location, DensityMapError> {
         tracing::debug!("get_max_density called");
 
@@ -207,6 +209,90 @@ impl DensityMap {
 
         tracing::debug!(location = %max_density_location, "Returning max density location");
         Ok(max_density_location)
+    }
+
+    /// Like `get_max_density()`, but biases toward locations closer to `my_location`
+    /// using distance-weighted scoring: score = density / distance.
+    ///
+    /// Samples stochastically from the score distribution rather than returning
+    /// the deterministic argmax. This ensures connection diversity — different
+    /// calls produce different targets, weighted by their density/distance score.
+    ///
+    /// MIN_DISTANCE (0.001) prevents division-by-near-zero for candidates very close
+    /// to `my_location`.
+    #[allow(dead_code)]
+    pub fn get_max_density_weighted(
+        &self,
+        my_location: Location,
+    ) -> Result<Location, DensityMapError> {
+        const MIN_DISTANCE: f64 = 0.001;
+
+        if self.neighbor_request_counts.is_empty() {
+            return Err(DensityMapError::EmptyNeighbors);
+        }
+
+        // Single entry: no adjacent pairs exist, return the only location we have
+        if self.neighbor_request_counts.len() == 1 {
+            return Ok(*self.neighbor_request_counts.keys().next().unwrap());
+        }
+
+        // Collect (location, score) for each candidate midpoint
+        let mut candidates: Vec<(Location, f64)> = Vec::new();
+
+        // Score each adjacent-pair midpoint by density / distance_to_me
+        for ((prev_loc, prev_count), (next_loc, next_count)) in self
+            .neighbor_request_counts
+            .iter()
+            .zip(self.neighbor_request_counts.iter().skip(1))
+        {
+            let combined_density = (prev_count + next_count) as f64;
+            let midpoint = Location::new((prev_loc.as_f64() + next_loc.as_f64()) / 2.0);
+            let distance = my_location.distance(midpoint).as_f64().max(MIN_DISTANCE);
+            let score = combined_density / distance;
+            candidates.push((midpoint, score));
+        }
+
+        // Wrap-around: check first and last neighbor pair
+        let first = self.neighbor_request_counts.iter().next();
+        let last = self.neighbor_request_counts.iter().next_back();
+        if let (Some((first_loc, first_count)), Some((last_loc, last_count))) = (first, last) {
+            if first_loc != last_loc {
+                let combined_density = (first_count + last_count) as f64;
+                let wrap_distance = first_loc.distance(*last_loc);
+                let mut mp = first_loc.as_f64() - (wrap_distance.as_f64() / 2.0);
+                if mp < 0.0 {
+                    mp += 1.0;
+                }
+                let midpoint = Location::new(mp);
+                let distance = my_location.distance(midpoint).as_f64().max(MIN_DISTANCE);
+                let score = combined_density / distance;
+                candidates.push((midpoint, score));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(DensityMapError::EmptyNeighbors);
+        }
+
+        // Sample from score distribution: probability proportional to score
+        let total_score: f64 = candidates.iter().map(|(_, s)| s).sum();
+        if total_score <= 0.0 {
+            return Ok(candidates[0].0);
+        }
+
+        let random_value: f64 = GlobalRng::with_rng(|rng| rng.random());
+        let threshold = random_value * total_score;
+
+        let mut cumulative = 0.0;
+        for (location, score) in &candidates {
+            cumulative += score;
+            if cumulative >= threshold {
+                return Ok(*location);
+            }
+        }
+
+        // Floating-point rounding edge case
+        Ok(candidates.last().unwrap().0)
     }
 }
 
@@ -520,5 +606,177 @@ mod tests {
 
         let result = density_map.get_max_density();
         assert!(matches!(result, Err(DensityMapError::EmptyNeighbors)));
+    }
+
+    #[test]
+    fn test_weighted_density_closer_preferred_statistically() {
+        // Two adjacent pairs with equal density — closer midpoint should be selected
+        // more often due to distance weighting (score = density / distance).
+        // Midpoint 0.3 is distance 0.05 from me; midpoint 0.8 is distance 0.45.
+        // The wrap-around pair also contributes, diluting the ratio somewhat.
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.2), 3);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.4), 3); // midpoint 0.3
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.7), 3);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 3); // midpoint 0.8
+
+        let my_location = Location::new(0.25);
+        let mut close_count = 0;
+        let trials = 1000;
+        for _ in 0..trials {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            if my_location.distance(result).as_f64() < 0.1 {
+                close_count += 1;
+            }
+        }
+        // Close midpoint (0.3) has score 120, but wrap-around and other candidates
+        // add up to ~65% probability for the closest. Should be selected majority.
+        assert!(
+            close_count > 500,
+            "Expected close location to be selected most often, got {close_count}/{trials}"
+        );
+        // But not ALL the time — stochastic sampling should pick distant one sometimes
+        assert!(
+            close_count < trials,
+            "Expected some diversity, but close was selected every time"
+        );
+    }
+
+    #[test]
+    fn test_weighted_density_high_density_overcomes_distance_statistically() {
+        // High density at distance should be selected more often than low density nearby.
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.1), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.45), 1); // midpoint 0.275, density=2
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.55), 1); // midpoint 0.5, density=2
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.95), 100); // midpoint 0.75, density=101
+
+        let my_location = Location::new(0.4);
+        let mut high_density_count = 0;
+        let trials = 1000;
+        for _ in 0..trials {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            // High-density midpoints (0.75 and wrap ~0.025) are both far from my_location
+            if my_location.distance(result).as_f64() > 0.3 {
+                high_density_count += 1;
+            }
+        }
+        // High density locations should dominate (~96% combined)
+        assert!(
+            high_density_count > 800,
+            "Expected high density to dominate, got {high_density_count}/{trials}"
+        );
+    }
+
+    #[test]
+    fn test_weighted_density_empty_error() {
+        let density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        let result = density_map.get_max_density_weighted(Location::new(0.5));
+        assert!(matches!(result, Err(DensityMapError::EmptyNeighbors)));
+    }
+
+    #[test]
+    fn test_weighted_density_single_entry() {
+        // Single entry should return that entry's location (no pairs to compute midpoints)
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.7), 5);
+
+        let result = density_map
+            .get_max_density_weighted(Location::new(0.3))
+            .unwrap();
+        assert_eq!(result, Location::new(0.7));
+    }
+
+    #[test]
+    fn test_weighted_density_produces_diverse_results() {
+        // The key property: repeated calls should produce DIFFERENT targets
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.1), 5);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.3), 5);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.5), 5);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.7), 5);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 5);
+
+        let my_location = Location::new(0.5);
+        let mut unique_results = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let result = density_map.get_max_density_weighted(my_location).unwrap();
+            unique_results.insert(result.as_f64().to_bits());
+        }
+        // With 5 equal-density candidates at various distances, we should see multiple
+        assert!(
+            unique_results.len() >= 2,
+            "Expected diverse results, got only {} unique locations",
+            unique_results.len()
+        );
+    }
+
+    #[test]
+    fn test_weighted_density_min_distance_clamp() {
+        // When my_location is extremely close to a midpoint, MIN_DISTANCE (0.001)
+        // should clamp the distance, preventing infinite scores
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.499), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.501), 1); // midpoint = 0.5
+
+        // my_location is essentially at the midpoint (distance < MIN_DISTANCE)
+        let my_location = Location::new(0.5);
+        let loc = density_map
+            .get_max_density_weighted(my_location)
+            .expect("should succeed without panic or overflow");
+        // Result will be near 0.5 (either the adjacent midpoint or the wrap midpoint)
+        assert!(
+            my_location.distance(loc).as_f64() < 0.01,
+            "Expected location near 0.5, got {loc}"
+        );
     }
 }

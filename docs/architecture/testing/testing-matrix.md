@@ -42,10 +42,14 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 | State persistence | ✅ mocks | ✅ | ✅ | ✅ | ✅ |
 | State convergence | - | - | ✅ | ✅ | - |
 | State size edge cases | - | ✅ 6 | - | - | - |
+| Anomaly detection | - | - | ✅ | - | - |
 | **Fault Tolerance** |
 | Message loss | - | - | ✅ | ✅ | - |
 | Network partitions | - | - | ✅ | ✅ | - |
+| Partition → heal → convergence | - | - | ✅ | - | - |
 | Node crashes | - | - | ✅ | - | - |
+| Crash → recover → convergence | - | - | ✅ | - | - |
+| Multi-step churn | - | - | ✅ | - | - |
 | Latency injection | - | - | ✅ | ✅ | - |
 | **Network Behavior** |
 | Peer discovery | - | ✅ | ✅ | ✅ | ✅ |
@@ -689,6 +693,9 @@ let ws_url = network.gateway(0).ws_url();
    - Add operation sequence generators
 
 2. **Expand SimNetwork fault scenarios**
+   - ~~Partition → heal → convergence~~ ✅ Implemented
+   - ~~Crash → recover → convergence~~ ✅ Implemented
+   - ~~Multi-step churn~~ ✅ Implemented
    - Add clock skew simulation
    - Add slow node simulation
 
@@ -724,7 +731,7 @@ let ws_url = network.gateway(0).ws_url();
 | `edge_case_state_sizes.rs` | 6 | Macro |
 | `connectivity.rs` | 4 | Macro |
 | `operations.rs` | 18+ | Manual |
-| `simulation_integration.rs` | 17 | SimNetwork |
+| `simulation_integration.rs` | 20 | SimNetwork (includes 3 fault-tolerance + anomaly detection tests) |
 | `simulation_determinism.rs` | 7 | SimNetwork |
 | `sim_network.rs` | 6 | SimNetwork |
 | `test_network_integration.rs` | 3 | test-network |

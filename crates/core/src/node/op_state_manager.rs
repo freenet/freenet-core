@@ -30,8 +30,13 @@ use crate::{
         TransactionType,
     },
     operations::{
-        connect::ConnectForwardEstimator, get::GetOp, orphan_streams::OrphanStreamRegistry,
-        put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
+        connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
+        get::GetOp,
+        orphan_streams::OrphanStreamRegistry,
+        put::PutOp,
+        subscribe::SubscribeOp,
+        update::UpdateOp,
+        OpEnum, OpError,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -255,6 +260,13 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
+    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
+    /// so it can wake from a long backoff sleep and retry immediately.
+    pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
+    /// Addresses blocked by local policy. Used by the connect protocol to reject
+    /// join requests from blocked peers at the routing level, allowing the uphill
+    /// hop mechanism to find alternate acceptors.
+    pub blocked_addresses: Option<Arc<HashSet<SocketAddr>>>,
 }
 
 impl Clone for OpManager {
@@ -277,6 +289,8 @@ impl Clone for OpManager {
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
+            gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
+            blocked_addresses: self.blocked_addresses.clone(),
         }
     }
 }
@@ -380,6 +394,11 @@ impl OpManager {
             orphan_stream_registry,
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
+            gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
+            blocked_addresses: config
+                .blocked_addresses
+                .as_ref()
+                .map(|a| Arc::new(a.clone())),
         })
     }
 
@@ -511,6 +530,41 @@ impl OpManager {
         );
 
         Ok(())
+    }
+
+    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
+    /// notification channel is full instead of blocking for 30 seconds.
+    /// On failure the pushed operation is cleaned up so it does not leak.
+    pub async fn notify_op_change_nonblocking(
+        &self,
+        msg: NetMessage,
+        op: OpEnum,
+    ) -> Result<(), OpError> {
+        let tx = *msg.id();
+        self.push(tx, op).await?;
+
+        match self
+            .to_event_listener
+            .notifications_sender()
+            .try_send(Either::Left(msg))
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    tx = %tx,
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    "notify_op_change_nonblocking: channel full, failing fast"
+                );
+                self.completed(tx);
+                Err(OpError::NotificationChannelError(
+                    "notification channel full (non-blocking send)".into(),
+                ))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.completed(tx);
+                Err(OpError::NotificationError)
+            }
+        }
     }
 
     // An early, fast path, return for communicating events in the node to the main message handler,
@@ -1056,6 +1110,27 @@ fn remove_subscribe_and_notify_timeout(
     Some(())
 }
 
+/// Log when a connect operation in Relaying state with an outstanding uphill forward times out.
+/// This directly counts lost uphill routes and identifies which peers are unresponsive.
+fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
+    if let Some(ConnectState::Relaying(state)) = &op.state {
+        if let Some(ref peer) = state.forwarded_to {
+            let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
+                fwd_at.elapsed().as_secs()
+            } else {
+                tx.elapsed().as_secs()
+            };
+            tracing::warn!(
+                tx = %tx,
+                forwarded_to = %peer.pub_key(),
+                forwarded_to_addr = ?peer.socket_addr(),
+                pending_secs,
+                "connect: uphill route timed out with no response"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
@@ -1127,6 +1202,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let still_waiting = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Log uphill routes that timed out with no response
+                                log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
@@ -1207,6 +1284,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let removed = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, op)) = ops.connect.remove(&tx) {
+                                // Log uphill routes that timed out with no response
+                                log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);

@@ -83,7 +83,7 @@ use crate::{
     config::{ConfigArgs, GlobalExecutor, GlobalRng},
     dev_tool::TransportKeypair,
     node::{InitPeerNode, NetEventRegister, NodeConfig},
-    ring::{Distance, Location, PeerKeyLocation},
+    ring::{ConnectionManager, Distance, Location, PeerKeyLocation},
     simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
     transport::{
@@ -667,6 +667,8 @@ pub(super) struct Builder<ER> {
     pub rng_seed: u64,
     /// Network name for scoped fault injection
     pub network_name: String,
+    /// Shared handle for capturing the live `ConnectionManager` after node start.
+    pub shared_cm: Option<Arc<parking_lot::Mutex<Option<crate::ring::ConnectionManager>>>>,
 }
 
 impl<ER: NetEventRegister> Builder<ER> {
@@ -686,6 +688,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             contract_subscribers: HashMap::new(),
             rng_seed,
             network_name,
+            shared_cm: None,
         }
     }
 }
@@ -757,6 +760,7 @@ pub struct SimNetwork {
     /// via `with_streaming_threshold()`. This preserves the pre-streaming-always-on behavior
     /// where simulation tests used inline messages for all payloads.
     pub streaming_threshold: Option<usize>,
+    connection_managers: HashMap<NodeLabel, ConnectionManager>,
 }
 
 impl SimNetwork {
@@ -813,6 +817,7 @@ impl SimNetwork {
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
             streaming_threshold: None,
+            connection_managers: HashMap::new(),
         };
         net.config_gateways(
             gateways
@@ -1293,6 +1298,68 @@ impl SimNetwork {
         Some(handle)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn connection_manager(&self, label: &NodeLabel) -> Option<&ConnectionManager> {
+        self.connection_managers.get(label)
+    }
+
+    pub fn has_connection_or_pending(&self, label: &NodeLabel, addr: SocketAddr) -> Option<bool> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.has_connection_or_pending(addr))
+    }
+
+    /// Injects a pending reservation backdated by `age`, simulating a failed ConnectOp.
+    pub fn inject_stale_reservation(
+        &self,
+        label: &NodeLabel,
+        addr: SocketAddr,
+        location: Location,
+        age: Duration,
+    ) -> bool {
+        if let Some(cm) = self.connection_managers.get(label) {
+            let created = tokio::time::Instant::now() - age;
+            cm.inject_reservation(addr, location, created);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn connection_count(&self, label: &NodeLabel) -> Option<usize> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.connection_count())
+    }
+
+    /// Returns the number of pending reservations (including stale ones) for a node.
+    pub fn reserved_connections_count(&self, label: &NodeLabel) -> Option<usize> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.get_reserved_connections())
+    }
+
+    /// Runs cleanup on stale pending reservations for a node.
+    /// Returns the number of stale entries removed.
+    pub fn cleanup_stale_reservations(&self, label: &NodeLabel) -> Option<usize> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.cleanup_stale_reservations())
+    }
+
+    /// Tests whether the node's connection manager would accept a new connection
+    /// from the given address and location.
+    pub fn should_accept(
+        &self,
+        label: &NodeLabel,
+        location: Location,
+        addr: SocketAddr,
+    ) -> Option<bool> {
+        self.connection_managers
+            .get(label)
+            .map(|cm| cm.should_accept(location, addr))
+    }
+
     /// Checks if a node has a saved configuration for restart.
     pub fn can_restart(&self, label: &NodeLabel) -> bool {
         self.restartable_configs.contains_key(label)
@@ -1509,7 +1576,7 @@ impl SimNetwork {
         let gateways: Vec<_> = self.gateways.drain(..).collect();
         let mut gateway_addrs = Vec::with_capacity(gateways.len());
 
-        for (node, config) in gateways {
+        for (mut node, config) in gateways {
             let label = config.label.clone();
             // Use the peer_key_location address from GatewayConfig - this is the address
             // that will be registered in the peer registry
@@ -1548,6 +1615,10 @@ impl SimNetwork {
             self.labels
                 .push((label.clone(), node.config.key_pair.public().clone()));
 
+            let shared_cm: Arc<parking_lot::Mutex<Option<ConnectionManager>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            node.shared_cm = Some(shared_cm.clone());
+
             // Use shared in-memory storage for state persistence across restarts
             let node_task = async move {
                 node.run_node_with_shared_storage(user_events, span, shared_storage)
@@ -1568,6 +1639,11 @@ impl SimNetwork {
             peers.push(handle);
 
             tokio::time::sleep(self.start_backoff).await;
+
+            let captured_cm = shared_cm.lock().take();
+            if let Some(cm) = captured_cm {
+                self.connection_managers.insert(label, cm);
+            }
         }
 
         // Phase 2: Wait for all gateways to be registered in the peer registry
@@ -1616,7 +1692,7 @@ impl SimNetwork {
 
         // Phase 3: Start all regular nodes
         let nodes: Vec<_> = self.nodes.drain(..).collect();
-        for (node, label) in nodes {
+        for (mut node, label) in nodes {
             // Get node address from tracked addresses
             let node_addr = self
                 .node_addresses
@@ -1652,6 +1728,10 @@ impl SimNetwork {
             self.labels
                 .push((label.clone(), node.config.key_pair.public().clone()));
 
+            let shared_cm: Arc<parking_lot::Mutex<Option<ConnectionManager>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            node.shared_cm = Some(shared_cm.clone());
+
             // Use shared in-memory storage for state persistence across restarts
             let node_task = async move {
                 node.run_node_with_shared_storage(user_events, span, shared_storage)
@@ -1672,6 +1752,11 @@ impl SimNetwork {
             peers.push(handle);
 
             tokio::time::sleep(self.start_backoff).await;
+
+            let captured_cm = shared_cm.lock().take();
+            if let Some(cm) = captured_cm {
+                self.connection_managers.insert(label, cm);
+            }
         }
 
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -2490,6 +2575,48 @@ impl SimNetwork {
             return 1.0; // No contracts replicated yet
         }
         result.converged.len() as f64 / total as f64
+    }
+
+    /// Run the state verifier on all collected telemetry events.
+    ///
+    /// This linearizes the state transitions for every contract across all peers
+    /// and detects anomalies such as:
+    /// - Missing broadcasts (emitted but never received)
+    /// - Unapplied broadcasts (received but never applied)
+    /// - Unexpected state changes (merge produced an unknown hash)
+    /// - Final divergence (peers disagree after all events) with root-cause analysis
+    ///
+    /// Unlike `check_convergence()`, which only checks the final state snapshot,
+    /// this traces the full causal history to pinpoint WHERE divergence originated.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let report = sim.verify_state().await;
+    /// if !report.is_clean() {
+    ///     eprintln!("{}", report.display());
+    ///     for anomaly in &report.anomalies {
+    ///         eprintln!("  {}", anomaly);
+    ///     }
+    /// }
+    /// ```
+    pub async fn verify_state(&self) -> crate::tracing::VerificationReport {
+        let logs = self.event_listener.logs.lock().await;
+        let verifier = crate::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    }
+
+    /// Assert that state verification passes with no anomalies.
+    ///
+    /// Panics with a detailed report if any anomalies are detected.
+    pub async fn assert_state_verified(&self) {
+        let report = self.verify_state().await;
+        if !report.is_clean() {
+            panic!(
+                "State verification failed with {} anomalies:\n{}",
+                report.anomalies.len(),
+                report.display()
+            );
+        }
     }
 
     /// Returns the number of unique contracts that have been subscribed to.
@@ -3964,18 +4091,22 @@ impl std::fmt::Debug for SimNetwork {
 
 impl Drop for SimNetwork {
     fn drop(&mut self) {
-        // Clean up the fault injector for this network
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
             clear_current_network_name, clear_topology_snapshots,
         };
+        use crate::transport::in_memory_socket::{
+            clear_network_address_mappings, clear_network_sockets,
+        };
+
+        // Per-network cleanup (safe for parallel tests)
         set_fault_injector(&self.name, None);
-
-        // Clean up the VirtualTime registration for this network
         unregister_network_time_source(&self.name);
-
-        // Clean up topology registry for this network
         clear_topology_snapshots(&self.name);
+        clear_network_sockets(&self.name);
+        clear_network_address_mappings(&self.name);
+
+        // Thread-local cleanup
         clear_current_network_name();
 
         if self.clean_up_tmp_dirs {

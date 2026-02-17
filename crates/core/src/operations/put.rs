@@ -215,7 +215,10 @@ impl Operation for PutOp {
             Ok(None) => {
                 // Check if this is a response message - if so, the operation was likely
                 // cleaned up due to timeout and we should not create a new operation
-                if matches!(msg, PutMsg::Response { .. }) {
+                if matches!(
+                    msg,
+                    PutMsg::Response { .. } | PutMsg::ResponseStreaming { .. }
+                ) {
                     tracing::debug!(
                         tx = %tx,
                         phase = "load_or_init",
@@ -680,6 +683,22 @@ impl Operation for PutOp {
                                 stream_id = %stream_id,
                                 "PUT RequestStreaming skipped — stream already claimed (dedup)"
                             );
+                            // Push the operation state back since load_or_init popped it.
+                            // Without this, duplicate metadata messages (from embedded fragment #1)
+                            // permanently lose the operation state, preventing ResponseStreaming
+                            // from being matched to the operation.
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        id,
+                                        OpEnum::Put(PutOp {
+                                            id,
+                                            state: self.state,
+                                            upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OpNotPresent(id));
                         }
                         Err(e) => {
@@ -689,6 +708,19 @@ impl Operation for PutOp {
                                 error = %e,
                                 "Failed to claim stream from orphan registry"
                             );
+                            // Push the operation state back to prevent loss
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        id,
+                                        OpEnum::Put(PutOp {
+                                            id,
+                                            state: self.state,
+                                            upstream_addr,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
                     };

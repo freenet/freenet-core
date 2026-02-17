@@ -82,6 +82,7 @@ async fn query_connected_peers(
 /// so auto_connect_peers ensures they can form a full mesh rather than only
 /// connecting to the gateway.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -119,21 +120,32 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
     )
     .await?;
 
-    // Wait for put response
-    let resp = tokio::time::timeout(Duration::from_secs(60), client_api.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            assert_eq!(key, contract_key);
-            tracing::info!("Initial PUT successful");
-        }
-        Ok(Ok(other)) => {
-            bail!("Unexpected response while waiting for put: {:?}", other);
-        }
-        Ok(Err(e)) => {
-            bail!("Error receiving put response: {}", e);
-        }
-        Err(_) => {
+    // Wait for put response, draining any stale responses under CI load
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             bail!("Timeout waiting for put response");
+        }
+        match tokio::time::timeout(remaining, client_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Initial PUT successful");
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    "Skipping stale response while waiting for PutResponse: {:?}",
+                    other
+                );
+                continue;
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for put response");
+            }
         }
     }
 
@@ -196,33 +208,42 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
     // Perform GET to verify reconnection worked and peer can operate normally
     tracing::info!("Performing GET after reconnection");
     make_get(&mut client_api, contract_key, true, false).await?;
-    let get_response = tokio::time::timeout(Duration::from_secs(60), client_api.recv()).await;
-    match get_response {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-            contract: recv_contract,
-            state: recv_state,
-            ..
-        }))) => {
-            assert_eq!(
-                recv_contract.as_ref().expect("Contract should exist").key(),
-                contract_key
-            );
-            assert_eq!(recv_state, wrapped_state);
-            tracing::info!(
-                "Reconnection test successful - peer can perform operations after reconnecting"
-            );
-        }
-        Ok(Ok(other)) => {
-            bail!(
-                "Unexpected response while waiting for get after reconnection: {:?}",
-                other
-            );
-        }
-        Ok(Err(e)) => {
-            bail!("Error receiving get response after reconnection: {}", e);
-        }
-        Err(_) => {
+    // Drain stale responses until we get the GetResponse
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             bail!("Timeout waiting for get response after reconnection");
+        }
+        match tokio::time::timeout(remaining, client_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                contract: recv_contract,
+                state: recv_state,
+                ..
+            }))) => {
+                assert_eq!(
+                    recv_contract.as_ref().expect("Contract should exist").key(),
+                    contract_key
+                );
+                assert_eq!(recv_state, wrapped_state);
+                tracing::info!(
+                    "Reconnection test successful - peer can perform operations after reconnecting"
+                );
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    "Skipping stale response while waiting for GetResponse: {:?}",
+                    other
+                );
+                continue;
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving get response after reconnection: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for get response after reconnection");
+            }
         }
     }
 
@@ -237,6 +258,7 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
 
 /// Simplified test to verify basic gateway connectivity
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 60,
@@ -315,6 +337,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 ///
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer1", "peer2"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -598,62 +621,86 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // Peer1 sends UPDATE
     make_update(&mut client1, contract_key, updated_state.clone()).await?;
 
-    // Wait for UPDATE response on peer1
-    let update_response = tokio::time::timeout(Duration::from_secs(30), client1.recv()).await;
-    match update_response {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-            key, ..
-        }))) => {
-            assert_eq!(key, contract_key);
-            tracing::info!("✅ Peer1 received UpdateResponse");
+    // Wait for UPDATE response on peer1, draining any stale responses
+    // (e.g. late PutResponse from previous operation under CI load)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("Timeout waiting for UpdateResponse on peer1");
         }
-        Ok(Ok(other)) => bail!(
-            "Unexpected response waiting for UpdateResponse: {:?}",
-            other
-        ),
-        Ok(Err(e)) => bail!("Error receiving UpdateResponse: {}", e),
-        Err(_) => bail!("Timeout waiting for UpdateResponse"),
+        match tokio::time::timeout(remaining, client1.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("✅ Peer1 received UpdateResponse");
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    "Skipping stale response while waiting for UpdateResponse: {:?}",
+                    other
+                );
+                continue;
+            }
+            Ok(Err(e)) => bail!("Error receiving UpdateResponse: {}", e),
+            Err(_) => bail!("Timeout waiting for UpdateResponse on peer1"),
+        }
     }
 
-    // Wait for UPDATE notification on peer2 (subscribed via GET)
-    let notification = tokio::time::timeout(Duration::from_secs(30), client2.recv()).await;
-    match notification {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-            key,
-            update,
-        }))) => {
-            assert_eq!(key, contract_key);
-            match update {
-                UpdateData::State(state) => {
-                    let received_list: test_utils::TodoList =
-                        serde_json::from_slice(state.as_ref())
-                            .expect("deserialize update notification state");
-                    // Verify our update task is present in the received state
-                    let has_our_task = received_list
-                        .tasks
-                        .iter()
-                        .any(|t| t.title == "Proximity cache test");
-                    assert!(
-                        has_our_task,
-                        "Update notification state should contain our task. Got: {:?}",
-                        received_list.tasks
-                    );
-                    tracing::info!(
-                        "✅ Peer2 received UpdateNotification via proximity cache (issue #2294 regression test passed)"
-                    );
-                }
-                other => bail!("Unexpected update data type: {:?}", other),
-            }
+    // Wait for UPDATE notification on peer2 (subscribed via GET), draining stale responses
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "Timeout waiting for UpdateNotification on peer2 - \
+                 UPDATE may not have propagated via proximity cache (issue #2294)"
+            );
         }
-        Ok(Ok(other)) => bail!(
-            "Unexpected response waiting for UpdateNotification: {:?}",
-            other
-        ),
-        Ok(Err(e)) => bail!("Error receiving UpdateNotification: {}", e),
-        Err(_) => bail!(
-            "Timeout waiting for UpdateNotification on peer2 - \
-             UPDATE may not have propagated via proximity cache (issue #2294)"
-        ),
+        match tokio::time::timeout(remaining, client2.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                update,
+            }))) => {
+                assert_eq!(key, contract_key);
+                match update {
+                    UpdateData::State(state) => {
+                        let received_list: test_utils::TodoList =
+                            serde_json::from_slice(state.as_ref())
+                                .expect("deserialize update notification state");
+                        let has_our_task = received_list
+                            .tasks
+                            .iter()
+                            .any(|t| t.title == "Proximity cache test");
+                        assert!(
+                            has_our_task,
+                            "Update notification state should contain our task. Got: {:?}",
+                            received_list.tasks
+                        );
+                        tracing::info!(
+                            "✅ Peer2 received UpdateNotification via proximity cache (issue #2294 regression test passed)"
+                        );
+                    }
+                    other => bail!("Unexpected update data type: {:?}", other),
+                }
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    "Skipping stale response while waiting for UpdateNotification: {:?}",
+                    other
+                );
+                continue;
+            }
+            Ok(Err(e)) => bail!("Error receiving UpdateNotification: {}", e),
+            Err(_) => bail!(
+                "Timeout waiting for UpdateNotification on peer2 - \
+                 UPDATE may not have propagated via proximity cache (issue #2294)"
+            ),
+        }
     }
 
     // Clean disconnect
@@ -733,6 +780,7 @@ async fn perform_put_with_retries(
 /// The fix ensures handle_connect_peer updates the transport entry's pub_key
 /// when promoting transients.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 120,

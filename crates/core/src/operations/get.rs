@@ -748,7 +748,10 @@ impl Operation for GetOp {
             Ok(None) => {
                 // Check if this is a response message - if so, the operation was likely
                 // cleaned up due to timeout and we should not create a new operation
-                if matches!(msg, GetMsg::Response { .. }) {
+                if matches!(
+                    msg,
+                    GetMsg::Response { .. } | GetMsg::ResponseStreaming { .. }
+                ) {
                     tracing::debug!(
                         tx = %tx,
                         phase = "load_or_init",
@@ -2019,6 +2022,25 @@ impl Operation for GetOp {
                                 stream_id = %stream_id,
                                 "GET ResponseStreaming skipped — stream already claimed (dedup)"
                             );
+                            // Push the operation state back since load_or_init popped it.
+                            // Without this, duplicate metadata messages (from embedded fragment #1)
+                            // permanently lose the operation state, preventing subsequent
+                            // ResponseStreaming from being matched to the operation.
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        id,
+                                        OpEnum::Get(GetOp {
+                                            id,
+                                            state: self.state,
+                                            result: self.result,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                            local_fallback,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OpNotPresent(id));
                         }
                         Err(e) => {
@@ -2028,6 +2050,22 @@ impl Operation for GetOp {
                                 error = %e,
                                 "Failed to claim stream from orphan registry"
                             );
+                            // Push the operation state back to prevent loss
+                            if self.state.is_some() {
+                                let _ = op_manager
+                                    .push(
+                                        id,
+                                        OpEnum::Get(GetOp {
+                                            id,
+                                            state: self.state,
+                                            result: self.result,
+                                            stats,
+                                            upstream_addr: self.upstream_addr,
+                                            local_fallback,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
                     };

@@ -329,6 +329,52 @@ fn test_polling_does_not_spin() {
 }
 
 // =============================================================================
+// Nested Runtime Tests
+// =============================================================================
+
+/// Regression test for the nested-runtime panic that occurred with wasmtime.
+///
+/// When `execute_wasm_blocking` calls `handle.block_on(task_handle)` from within
+/// a tokio async context, tokio panics with "Cannot start a runtime from within
+/// a runtime." The fix is to wrap with `tokio::task::block_in_place()`.
+///
+/// This test verifies that `block_in_place(|| handle.block_on(...))` works
+/// correctly from an async context with a multi-thread runtime — the exact
+/// pattern used by wasmtime's `execute_wasm_blocking`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_block_in_place_from_async_context() {
+    let handle = tokio::runtime::Handle::current();
+    let task_handle = tokio::task::spawn_blocking(|| {
+        thread::sleep(Duration::from_millis(20));
+        42i64
+    });
+
+    // This is the exact pattern from execute_wasm_blocking.
+    // Without block_in_place, this would panic with "Cannot start a runtime
+    // from within a runtime."
+    let result = tokio::task::block_in_place(|| handle.block_on(task_handle));
+    assert_eq!(result.unwrap(), 42);
+}
+
+/// Verify that block_in_place + block_on works when the spawned task also
+/// interacts with the tokio runtime (e.g., for async I/O).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_block_in_place_with_async_task() {
+    let handle = tokio::runtime::Handle::current();
+    let task_handle = tokio::task::spawn_blocking(|| {
+        // Simulate what WASM execution does: pure computation
+        let mut sum = 0i64;
+        for i in 0..1000 {
+            sum += i;
+        }
+        sum
+    });
+
+    let result = tokio::task::block_in_place(|| handle.block_on(task_handle));
+    assert_eq!(result.unwrap(), 499500);
+}
+
+// =============================================================================
 // Orphaned Thread Tests
 // =============================================================================
 

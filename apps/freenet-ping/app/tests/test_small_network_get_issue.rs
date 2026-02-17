@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
@@ -102,7 +102,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -115,7 +115,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -128,7 +128,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

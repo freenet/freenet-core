@@ -1052,7 +1052,17 @@ deploy_gateways() {
                 release_binary=$(download_release_binary "$VERSION" "/tmp")
                 if [[ $? -ne 0 ]] || [[ -z "$release_binary" ]] || [[ ! -f "$release_binary" ]]; then
                     echo "  ⚠️  Failed to download release binary, falling back to local build"
-                    release_binary="$PROJECT_ROOT/target/release/freenet"
+                    # Check for custom target-dir in .cargo/config.toml (e.g. shared target directory)
+                    local cargo_config="$PROJECT_ROOT/.cargo/config.toml"
+                    local custom_target_dir=""
+                    if [[ -f "$cargo_config" ]]; then
+                        custom_target_dir=$(grep -oP 'target-dir\s*=\s*"\K[^"]+' "$cargo_config" 2>/dev/null || true)
+                    fi
+                    if [[ -n "$custom_target_dir" ]]; then
+                        release_binary="$custom_target_dir/release/freenet"
+                    else
+                        release_binary="$PROJECT_ROOT/target/release/freenet"
+                    fi
                 fi
 
                 if "$deploy_script" --binary "$release_binary"; then

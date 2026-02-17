@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_stdlib::client_api::WebApi;
 use futures::FutureExt;
 use tokio::{select, time::timeout};
@@ -73,7 +73,7 @@ async fn test_connection_timing() -> anyhow::Result<()> {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -84,7 +84,7 @@ async fn test_connection_timing() -> anyhow::Result<()> {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }

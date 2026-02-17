@@ -1,4 +1,4 @@
-//! Helper functions and types for dealing with HTTP gateway compatible contracts.
+//! Helper functions and types for dealing with HTTP client API compatible contracts.
 use std::{
     io::{Cursor, Read},
     path::Path,
