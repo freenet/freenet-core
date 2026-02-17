@@ -1595,8 +1595,14 @@ impl EventRegister {
         let mut event_log = match aof::LogFile::open(event_log_path.as_path()).await {
             Ok(file) => file,
             Err(err) => {
-                tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // fixme: propagate this to the main event loop
+                tracing::error!("Failed opening event log file {:?}: {err}", event_log_path);
+                eprintln!(
+                    "CRITICAL: Failed opening event log file {:?}: {err} - event logging disabled",
+                    event_log_path
+                );
+                // Drain the channel without logging rather than crashing the node
+                while log_recv.recv().await.is_some() {}
+                return;
             }
         };
 
