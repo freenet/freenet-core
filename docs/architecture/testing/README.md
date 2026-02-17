@@ -73,10 +73,7 @@ cargo test -p freenet
 cargo test -p freenet --test isolated_node_regression
 
 # SimNetwork simulation tests
-cargo test -p freenet --test simulation_integration
-
-# SimNetwork with deterministic scheduling (Turmoil always enabled)
-cargo test -p freenet --test simulation_integration -- --test-threads=1
+cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration
 
 # Real network tests (requires feature)
 cargo test -p freenet --test test_network_integration --features test-network
