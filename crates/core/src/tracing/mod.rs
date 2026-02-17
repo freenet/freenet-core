@@ -33,6 +33,7 @@ pub use event_aggregator::{
     AOFEventSource, EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent,
     WebSocketEventCollector,
 };
+pub use state_verifier::{StateVerifier, VerificationReport};
 
 use crate::node::OpManager;
 
@@ -45,6 +46,9 @@ pub mod event_aggregator;
 /// Telemetry reporting to central collector.
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
+
+/// Automatic state verification through telemetry linearization.
+pub mod state_verifier;
 
 /// Compute a full hash of contract state for convergence verification.
 /// Returns all 32 bytes of Blake3 hash as 64 hex characters.
@@ -817,6 +821,37 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a broadcast delivery summary event with the full breakdown of
+    /// why each potential target was or was not sent the broadcast (issue #3046).
+    pub fn broadcast_delivery_summary(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target_result: &crate::operations::update::BroadcastTargetResult,
+        skipped_summary_match: usize,
+        targets_sent: usize,
+        send_failed: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastDeliverySummary {
+                key,
+                proximity_found: target_result.proximity_found,
+                proximity_resolve_failed: target_result.proximity_resolve_failed,
+                interest_found: target_result.interest_found,
+                interest_resolve_failed: target_result.interest_resolve_failed,
+                skipped_self: target_result.skipped_self,
+                skipped_sender: target_result.skipped_sender,
+                skipped_summary_match,
+                targets_sent,
+                send_failed,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     /// Create a peer startup event.
     ///
     /// This should be called once when the node starts and is ready to participate in the network.
@@ -1560,8 +1595,14 @@ impl EventRegister {
         let mut event_log = match aof::LogFile::open(event_log_path.as_path()).await {
             Ok(file) => file,
             Err(err) => {
-                tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // fixme: propagate this to the main event loop
+                tracing::error!("Failed opening event log file {:?}: {err}", event_log_path);
+                eprintln!(
+                    "CRITICAL: Failed opening event log file {:?}: {err} - event logging disabled",
+                    event_log_path
+                );
+                // Drain the channel without logging rather than crashing the node
+                while log_recv.recv().await.is_some() {}
+                return;
             }
         };
 
@@ -2843,6 +2884,22 @@ pub(crate) enum UpdateEvent {
         /// Whether the local state actually changed after applying the update.
         changed: bool,
     },
+    /// Emitted after handle_broadcast_state_change() completes with a full
+    /// breakdown of why each potential peer was or was not sent the broadcast.
+    /// This enables diagnosing missed broadcast deliveries (issue #3046).
+    BroadcastDeliverySummary {
+        key: ContractKey,
+        proximity_found: usize,
+        proximity_resolve_failed: usize,
+        interest_found: usize,
+        interest_resolve_failed: usize,
+        skipped_self: usize,
+        skipped_sender: usize,
+        skipped_summary_match: usize,
+        targets_sent: usize,
+        send_failed: usize,
+        timestamp: u64,
+    },
 }
 
 impl UpdateEvent {
@@ -2854,7 +2911,8 @@ impl UpdateEvent {
             | UpdateEvent::BroadcastEmitted { key, .. }
             | UpdateEvent::BroadcastComplete { key, .. }
             | UpdateEvent::BroadcastReceived { key, .. }
-            | UpdateEvent::BroadcastApplied { key, .. } => *key,
+            | UpdateEvent::BroadcastApplied { key, .. }
+            | UpdateEvent::BroadcastDeliverySummary { key, .. } => *key,
         }
     }
 

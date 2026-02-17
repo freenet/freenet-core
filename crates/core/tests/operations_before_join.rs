@@ -5,7 +5,7 @@
 
 use freenet::{
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
     test_utils::{load_contract, make_get, make_put, make_subscribe},
 };
 use freenet_stdlib::{client_api::WebApi, prelude::*};
@@ -193,7 +193,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
     let (start_gateway_tx, start_gateway_rx) = tokio::sync::oneshot::channel::<()>();
 
     let peer_cfg = peer_config.build().await?;
-    let peer_ws_server = serve_gateway(peer_cfg.ws_api).await?;
+    let peer_ws_server = serve_client_api(peer_cfg.ws_api).await?;
     let peer_node = NodeConfig::new(peer_cfg.clone())
         .await?
         .build(peer_ws_server)
@@ -208,7 +208,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
 
         let node = NodeConfig::new(gw_config.clone())
             .await?
-            .build(serve_gateway(gw_config.ws_api).await?)
+            .build(serve_client_api(gw_config.ws_api).await?)
             .await?;
         node.run().await
     }

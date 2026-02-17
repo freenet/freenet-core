@@ -88,6 +88,9 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
+    // Re-export state verification for telemetry-based consistency analysis
+    pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
+
     // Re-export topology registry for subscription validation in tests
     pub use ring::topology_registry::{
         clear_all_topology_snapshots, clear_current_network_name, clear_topology_snapshots,
@@ -106,6 +109,9 @@ pub mod dev_tool {
         WakeupId,
     };
 
+    // Re-export fault injector for mid-simulation fault injection in Turmoil tests
+    pub use crate::node::{get_fault_injector, set_fault_injector, FaultInjectorState};
+
     // Re-export counter reset functions for deterministic simulation testing
     pub use crate::client_events::RequestId;
     pub use crate::contract::reset_event_id_counter;
@@ -113,53 +119,6 @@ pub mod dev_tool {
     pub use crate::test_utils::reset_global_node_index;
     pub use crate::transport::reset_nonce_counter;
     pub use crate::transport::StreamId;
-
-    /// Reset all global simulation state for deterministic testing.
-    ///
-    /// This function resets all atomic counters and global registries to their
-    /// initial state, ensuring that simulation runs with the same seed produce
-    /// identical results.
-    ///
-    /// Call this at the start of each simulation run, AFTER setting the RNG seed
-    /// with `GlobalRng::set_seed()`.
-    ///
-    /// # What gets reset:
-    /// - Request ID counter
-    /// - Client ID counter
-    /// - Event ID counter
-    /// - Channel ID counter
-    /// - Stream ID counter
-    /// - Nonce counter
-    /// - Global node index
-    /// - Socket registries
-    /// - Address network mappings
-    /// - Simulation time
-    /// - Topology snapshots
-    pub fn reset_all_simulation_state() {
-        // Reset RNG (caller should set seed after this)
-        crate::config::GlobalRng::clear_seed();
-
-        // Reset simulation time (caller should set time after this if needed)
-        crate::config::GlobalSimulationTime::clear_time();
-
-        // Reset all atomic counters
-        crate::client_events::RequestId::reset_counter();
-        crate::client_events::ClientId::reset_counter();
-        crate::contract::reset_event_id_counter();
-        crate::node::reset_channel_id_counter();
-        crate::transport::StreamId::reset_counter();
-        crate::transport::reset_nonce_counter();
-        crate::test_utils::reset_global_node_index();
-
-        // Reset global registries
-        crate::transport::in_memory_socket::clear_all_socket_registries();
-        crate::transport::in_memory_socket::clear_all_address_networks();
-        crate::transport::in_memory_socket::clear_all_network_time_sources();
-        crate::node::clear_all_fault_injectors();
-
-        // Clear topology snapshots from previous simulation runs
-        crate::ring::topology_registry::clear_all_topology_snapshots();
-    }
 }
 
 pub mod test_utils;

@@ -160,7 +160,6 @@ This is usually benign (duplicate message, already completed)
 □ Test sub-operation completion order (child before/after parent)
 □ Test streaming with payloads at threshold boundary
 □ Test race conditions (fast responses)
-□ Use --test-threads=1 for deterministic scheduling
 ```
 
 ## Common Patterns

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -126,8 +127,14 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
 #[serde(transparent)]
 pub struct StreamId(u32);
 
-/// Static counter for StreamId generation - must be at module level for reset access
-static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+const STREAM_ID_BLOCK: u32 = 100_000;
+
+thread_local! {
+    static STREAM_ID_COUNTER: Cell<u32> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new((idx as u32) * STREAM_ID_BLOCK)
+    };
+}
 
 impl StreamId {
     /// Marker bit that distinguishes operations-level streams from transport-level streams.
@@ -136,7 +143,11 @@ impl StreamId {
     const OPS_STREAM_BIT: u32 = 0x8000_0000;
 
     pub fn next() -> Self {
-        Self(STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release))
+        Self(STREAM_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
     /// Generate a new StreamId for operations-level streaming.
@@ -144,7 +155,11 @@ impl StreamId {
     /// and skip the legacy `InboundStream` decode path (which would fail because the bytes
     /// are a streaming payload, not a `NetMessage`).
     pub fn next_operations() -> Self {
-        let id = STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let id = STREAM_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
         Self(id | Self::OPS_STREAM_BIT)
     }
 
@@ -153,10 +168,11 @@ impl StreamId {
         self.0 & Self::OPS_STREAM_BIT != 0
     }
 
-    /// Reset the stream ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the stream ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        STREAM_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
     }
 }
 
@@ -265,6 +281,9 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
     }
 }
 
+/// Interval between keep-alive ping packets.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Maximum number of unanswered pings before considering the connection dead.
 ///
 /// With 5-second ping interval, 5 unanswered pings means 25 seconds of no response.
@@ -281,8 +300,6 @@ const MAX_UNANSWERED_PINGS: usize = 5;
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
         let socket = remote_conn.socket.clone();
@@ -902,23 +919,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // Re-read count after cleanup
                     let pending_ping_count = self.pending_pings.read().len();
 
-                    // Check for bidirectional liveness failure (too many unanswered pings).
-                    // This catches asymmetric failures where we receive packets from remote
-                    // (so last_received is updated) but our packets don't reach the remote
-                    // (so our pings never get ponged back).
+                    // Log unanswered pings for diagnostics but do NOT kill the connection.
+                    // The idle timeout (connection_idle_timeout, typically 120s) is the sole
+                    // connection liveness check. A separate bidirectional liveness check was
+                    // previously here but caused premature connection drops in Docker NAT
+                    // environments where small ping/pong UDP packets are lost while larger
+                    // data packets succeed, or where gateway connections become idle because
+                    // data routes through the P2P mesh instead.
                     if pending_ping_count > MAX_UNANSWERED_PINGS {
-                        tracing::warn!(
-                            target: "freenet_core::transport::keepalive_timeout",
+                        tracing::debug!(
+                            target: "freenet_core::transport::keepalive_health",
                             remote = ?self.remote_conn.remote_addr,
                             pending_pings = pending_ping_count,
                             max_unanswered = MAX_UNANSWERED_PINGS,
                             time_since_last_received_secs = elapsed.as_secs_f64(),
-                            "BIDIRECTIONAL LIVENESS FAILURE - {} pings unanswered (max {}), \
-                             connection appears asymmetric",
+                            "Many unanswered pings ({} > {}), relying on idle timeout for liveness",
                             pending_ping_count,
                             MAX_UNANSWERED_PINGS
                         );
-                        return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
                     let remaining_nanos = kill_connection_after_nanos.saturating_sub(elapsed_nanos);

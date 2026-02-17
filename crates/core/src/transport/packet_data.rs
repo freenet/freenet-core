@@ -1,6 +1,6 @@
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 
@@ -25,42 +25,56 @@ const TAG_SIZE: usize = 16;
 pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - PACKET_TYPE_SIZE - NONCE_SIZE - TAG_SIZE;
 const UDP_HEADER_SIZE: usize = 8;
 
-/// Counter-based nonce generation for AES-GCM.
-/// Uses 8 bytes from an atomic counter + 4 random bytes generated at startup.
-/// This is ~5.5x faster than random nonce generation while maintaining uniqueness.
-static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const NONCE_BLOCK: u64 = 1_000_000;
 
-/// Random prefix generated lazily to ensure nonce uniqueness across process restarts.
-/// Resettable for deterministic simulation testing.
-static NONCE_RANDOM_PREFIX: Mutex<Option<[u8; 4]>> = Mutex::new(None);
+thread_local! {
+    /// Counter-based nonce generation for AES-GCM.
+    /// Uses 8 bytes from a thread-local counter + 4 random bytes.
+    static NONCE_COUNTER: Cell<u64> = {
+        let idx = GlobalRng::thread_index();
+        Cell::new(idx * NONCE_BLOCK)
+    };
 
-/// Get or generate the nonce random prefix.
-fn get_nonce_prefix() -> [u8; 4] {
-    let mut guard = NONCE_RANDOM_PREFIX.lock().unwrap();
-    if let Some(prefix) = *guard {
-        prefix
-    } else {
-        let mut bytes = [0u8; 4];
-        GlobalRng::fill_bytes(&mut bytes);
-        *guard = Some(bytes);
-        bytes
-    }
+    /// Random prefix generated lazily per-thread to ensure nonce uniqueness.
+    static NONCE_RANDOM_PREFIX: RefCell<Option<[u8; 4]>> = const { RefCell::new(None) };
 }
 
-/// Reset the nonce counter and prefix to initial state.
-/// Used for deterministic simulation testing.
+/// Get or generate the nonce random prefix for this thread.
+fn get_nonce_prefix() -> [u8; 4] {
+    NONCE_RANDOM_PREFIX.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(prefix) = *borrow {
+            prefix
+        } else {
+            let mut bytes = [0u8; 4];
+            GlobalRng::fill_bytes(&mut bytes);
+            *borrow = Some(bytes);
+            bytes
+        }
+    })
+}
+
+/// Reset the nonce counter and prefix to initial state for this thread.
+/// Thread-local, so safe for parallel test execution.
 /// Call this AFTER GlobalRng::set_seed() so the prefix is regenerated
 /// deterministically on next use.
 pub fn reset_nonce_counter() {
-    NONCE_COUNTER.store(0, Ordering::SeqCst);
-    *NONCE_RANDOM_PREFIX.lock().unwrap() = None;
+    let idx = GlobalRng::thread_index();
+    NONCE_COUNTER.with(|c| c.set(idx * NONCE_BLOCK));
+    NONCE_RANDOM_PREFIX.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }
 
 /// Generate a unique 12-byte nonce using counter + random prefix.
 /// This is faster than random generation while ensuring uniqueness.
 #[inline]
 fn generate_nonce() -> [u8; NONCE_SIZE] {
-    let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let counter = NONCE_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
     let mut nonce = [0u8; NONCE_SIZE];
     // First 4 bytes: random prefix (ensures uniqueness across restarts)
     nonce[..4].copy_from_slice(&get_nonce_prefix());

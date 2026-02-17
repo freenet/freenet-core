@@ -22,10 +22,7 @@ pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;
 
 // Re-export fault injection types and functions for testing
-pub use in_memory::{
-    clear_all_fault_injectors, get_fault_injector, set_fault_injector, FaultInjectorState,
-    NetworkStats,
-};
+pub use in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState, NetworkStats};
 // Re-export event loop exit reason for graceful shutdown handling
 pub use p2p_protoc::EventLoopExitReason;
 
@@ -135,15 +132,22 @@ impl Clone for ConnectionError {
     }
 }
 
-use std::sync::atomic::AtomicU64;
+use std::cell::Cell;
 
-/// Static counter for channel ID generation
-static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CHANNEL_ID_BLOCK: u64 = 1_000_000;
 
-/// Reset the channel ID counter to initial state.
-/// Used for deterministic simulation testing.
+thread_local! {
+    static CHANNEL_ID_COUNTER: Cell<u64> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(idx * CHANNEL_ID_BLOCK)
+    };
+}
+
+/// Reset the channel ID counter to initial state for this thread.
+/// Thread-local, so safe for parallel test execution.
 pub fn reset_channel_id_counter() {
-    CHANNEL_ID_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    let idx = crate::config::GlobalRng::thread_index();
+    CHANNEL_ID_COUNTER.with(|c| c.set(idx * CHANNEL_ID_BLOCK));
 }
 
 /// Channel capacity for event loop notification and op execution channels.
@@ -151,9 +155,11 @@ const EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
 pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
-    use std::sync::atomic::Ordering;
-
-    let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let _channel_id = CHANNEL_ID_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
     let (notification_tx, notification_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
     let (op_execution_tx, op_execution_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
 

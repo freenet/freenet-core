@@ -201,7 +201,7 @@ impl Display for Ping {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

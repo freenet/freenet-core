@@ -162,6 +162,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Build
         env:
           # Use mold linker to avoid rust-lld crashes (see issue #2519)
@@ -184,31 +187,55 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
           # Default congestion control is FixedRate for CI stability.
           # To test BBR: set FREENET_CONGESTION_CONTROL=bbr and optionally FREENET_BBR_STARTUP_RATE
-        # Run all tests in parallel using all 16 cores
-        # Operations tests use dynamic port allocation with unique IPs (127.x.y.1) and are fully thread-safe
-        # Simulation tests excluded via feature flag (run separately below due to global state)
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb,wasmer-backend
-
-      - name: Test simulation (serial)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Simulation tests use global state (socket registries, RNG, counters)
-        # and must run serially to avoid race conditions.
-        # Includes: basic simulation, subscription topology validation
+          # Reduce gateway connection backoff for CI (default 30s is too aggressive
+          # for localhost tests under CI resource pressure). See issue #3078.
+          FREENET_BACKOFF_BASE_SECS: "5"
+        # Run all tests in parallel including simulation tests.
+        # Thread-local state and per-network registries provide test isolation.
+        # Skip determinism tests (run serially below) and blocked_peers tests
+        # (run serially below — they spin up 3 real nodes each and timeout
+        # under parallel resource contention).
+        # Exclude freenet-ping-types: --no-default-features disables its std
+        # feature, breaking test code that uses Ping::insert().
+        # nextest retries only failed tests (via .config/nextest.toml [profile.ci]),
+        # avoiding the 10-15 min penalty of re-running the entire workspace.
         run: |
-          cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmer-backend,simulation_tests,testing \
-            --test simulation_integration \
-            --test simulation_smoke \
-            -- --test-threads=1
+          cargo nextest run --workspace --exclude freenet-ping-types \
+            --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            --profile ci -E 'not test(determinism) & not test(blocked_peers)'
 
-      - name: Test wasmtime backend
+      - name: Test blocked-peers (serial)
+        if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Test the wasmtime backend to prevent regressions
-        # Runs wasmtime unit tests and basic integration tests
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmtime-backend --lib
+          FREENET_BACKOFF_BASE_SECS: "5"
+        # Blocked-peers tests each start 3 real nodes with 180s connection
+        # timeouts. Running them sequentially prevents resource contention.
+        run: |
+          cargo nextest run -p freenet-ping-app \
+            --features testing --profile ci \
+            -E 'test(blocked_peers)' -j 1
+
+      - name: Test ping-types
+        if: ${{ !cancelled() }}
+        # freenet-ping-types tests need the std feature (default).
+        # Run separately since the main step uses --no-default-features.
+        run: cargo nextest run -p freenet-ping-types --profile ci
+
+      - name: Test determinism (serial)
+        if: ${{ !cancelled() }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        # Determinism comparison tests compare exact event sequences across sequential runs.
+        # Shared atomic counters must not be advanced by concurrent tests between runs.
+        # The "determinism" filter matches: test_strict_determinism_*, test_turmoil_determinism_*, test_deterministic_replay_*
+        run: |
+          cargo nextest run -p freenet --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            --profile ci -E 'test(determinism)' -j 1
 
   six_peer_regression:
     name: six-peer-regression

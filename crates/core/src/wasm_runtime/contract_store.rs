@@ -77,24 +77,22 @@ impl ContractStore {
             let code_hash = *entry.value();
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            let ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract {
-                data,
-                params,
-                ..
-            })) = ContractContainer::try_from((&*key_path, params.clone().into_owned()))
+            // Load with version prefix stripping (fixes #2924)
+            // Files are stored with to_bytes_versioned() which adds a version prefix.
+            // Must use load_versioned_from_path() to strip it before compilation.
+            let (code, _ver) = ContractCode::load_versioned_from_path(&key_path)
                 .map_err(|err| {
                     tracing::debug!("contract not found: {err}");
                     err
                 })
-                .ok()?
-            else {
-                unimplemented!()
-            };
+                .ok()?;
+            let params = params.clone().into_owned();
             // add back the contract part to the mem store
-            let size = data.data().len() as i64;
-            self.contract_cache.insert(code_hash, data.clone(), size);
+            let size = code.data().len() as i64;
+            self.contract_cache
+                .insert(code_hash, Arc::new(code.clone()), size);
             Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                WrappedContract::new(data, params),
+                WrappedContract::new(Arc::new(code), params),
             )))
         })
     }
@@ -480,6 +478,105 @@ mod test {
                 "fetch_contract() failed for contract {i}"
             );
         }
+
+        Ok(())
+    }
+
+    /// Regression test for issue #2924: Versioned contract files must be
+    /// properly loaded without the version prefix before compilation.
+    ///
+    /// The bug:
+    /// - Contracts are stored with to_bytes_versioned() which adds a version prefix
+    /// - fetch_contract() was using ContractContainer::try_from which read raw bytes
+    /// - The prefix caused wasmer/wasmtime to fail auto-detection (no WASM magic number)
+    /// - Module::new tried to parse as WAT, failed with "input bytes aren't valid utf-8"
+    ///
+    /// The fix:
+    /// - Use ContractCode::load_versioned_from_path() which strips the prefix
+    /// - The WASM magic number is now at offset 0, so Module::new works correctly
+    #[tokio::test]
+    async fn test_versioned_contract_loading_issue_2924() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::wasm_runtime::engine::{Engine, WasmEngine};
+        use crate::wasm_runtime::runtime::RuntimeConfig;
+
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+
+        // Valid WASM binary (exports "memory" and "answer" function that returns 42)
+        // WAT equivalent:
+        // (module
+        //   (memory 1)
+        //   (export "memory" (memory 0))
+        //   (func (export "answer") (result i32)
+        //     i32.const 42
+        //   )
+        // )
+        const VALID_WASM: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
+            0x7f, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x13, 0x02, 0x06,
+            0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65,
+            0x72, 0x00, 0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+        ];
+
+        // Verify the WASM starts with magic number
+        assert_eq!(
+            &VALID_WASM[0..4],
+            &[0x00, 0x61, 0x73, 0x6d],
+            "Test WASM should start with magic number"
+        );
+
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(VALID_WASM.to_vec())),
+            [0, 1].as_ref().into(),
+        );
+        let key = *contract.key();
+        let params: Parameters = [0, 1].as_ref().into();
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone()));
+
+        // Store the contract (this adds version prefix to disk file)
+        store.store_contract(container)?;
+
+        // Drop the store to clear the cache, forcing fetch_contract to read from disk
+        drop(store);
+
+        // Create a new store and fetch the contract from disk
+        let db = create_test_db(contract_dir.path()).await;
+        let store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+        let fetched = store
+            .fetch_contract(&key, &params)
+            .expect("Contract should be fetchable after store");
+
+        // Extract the code bytes from the fetched contract
+        let ContractContainer::Wasm(ContractWasmAPIVersion::V1(fetched_contract)) = fetched else {
+            panic!("Expected WASM V1 contract");
+        };
+
+        // Verify the fetched code matches the original WASM (without version prefix)
+        let fetched_bytes = fetched_contract.code().data();
+        assert_eq!(
+            fetched_bytes, VALID_WASM,
+            "Fetched contract bytes should match original WASM without version prefix"
+        );
+
+        // Verify the WASM magic number is at the start (issue #2924 would fail here)
+        assert_eq!(
+            &fetched_bytes[0..4],
+            &[0x00, 0x61, 0x73, 0x6d],
+            "Fetched WASM should start with magic number (no version prefix)"
+        );
+
+        // Critical test: Verify the fetched contract can be compiled
+        // Before the fix, this would fail with "Error when converting wat: input bytes aren't valid utf-8"
+        let mut engine = Engine::new(&RuntimeConfig::default(), false)?;
+        let compile_result = engine.compile(fetched_bytes);
+        assert!(
+            compile_result.is_ok(),
+            "Contract should compile successfully without 'converting wat' error. Error: {:?}",
+            compile_result.err()
+        );
 
         Ok(())
     }

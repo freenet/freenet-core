@@ -24,6 +24,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 humantime = "2.2.0"
 
 [dev-dependencies]
+bincode = { workspace = true }
 freenet = { path = "../../../crates/core" }
 serial_test = { workspace = true }
 test-log = { workspace = true }

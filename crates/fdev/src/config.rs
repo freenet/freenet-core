@@ -57,6 +57,12 @@ pub enum SubCommand {
     NetworkMetricsServer(crate::network_metrics_server::ServerConfig),
     /// Get the contract ID without publishing
     GetContractId(crate::commands::GetContractIdConfig),
+    /// Verify network state consistency from telemetry event logs.
+    ///
+    /// Reads event log (AOF) files from one or more nodes, linearizes the
+    /// state transitions, and detects anomalies that indicate consistency
+    /// failures (missing broadcasts, unapplied updates, state divergence).
+    VerifyState(crate::verify_state::VerifyStateConfig),
 }
 
 impl SubCommand {

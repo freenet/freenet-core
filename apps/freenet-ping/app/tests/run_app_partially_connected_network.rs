@@ -21,7 +21,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -233,7 +233,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let gateway_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_service = serve_gateway(config.ws_api).await?;
+            let gateway_service = serve_client_api(config.ws_api).await?;
             let node = node.build(gateway_service).await?;
             node.run().await
         }
@@ -241,7 +241,9 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         gateway_futures.push(gateway_future);
     }
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give gateway time to start listener and bind ports before nodes connect.
+    // 20s matches other ping tests; 2s was too short on slow CI runners.
+    tokio::time::sleep(Duration::from_secs(20)).await;
 
     // Start regular nodes simultaneously — gateway admission control and explicit
     // rejection messages prevent the thundering herd problem (see #2887).
@@ -251,7 +253,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let regular_node_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_service = serve_gateway(config.ws_api).await?;
+            let gateway_service = serve_client_api(config.ws_api).await?;
             let node = node.build(gateway_service).await?;
             node.run().await
         }
@@ -259,7 +261,8 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         regular_node_futures.push(regular_node_future);
     }
 
-    let test = tokio::time::timeout(Duration::from_secs(300), async {
+    // 420s: 20s gateway startup + 5s port binding + 180s node connection + operations + buffer
+    let test = tokio::time::timeout(Duration::from_secs(420), async {
         // Small initial wait for nodes to start binding ports
         tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -287,10 +290,10 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             println!("Connected to regular node {i}");
         }
 
-        // Wait for nodes to connect to the network
+        // Wait for nodes to connect to the network (180s for 8-node network on slow CI)
         println!("Waiting for nodes to connect to the network...");
         for (i, client) in node_clients.iter_mut().enumerate() {
-            wait_for_node_connected(client, &format!("Node{i}"), 1, 120).await?;
+            wait_for_node_connected(client, &format!("Node{i}"), 1, 180).await?;
         }
         println!("All nodes connected to the network!");
 

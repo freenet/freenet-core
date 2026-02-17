@@ -3,33 +3,27 @@
 //! This module manages peer connection decisions: when to add connections, when to remove them,
 //! and whether to accept incoming connection requests.
 //!
-//! ## Core Concepts
+//! ## Connection Target Selection
 //!
-//! - **Request Density**: Tracks which ring locations receive outbound requests. Used to identify
-//!   "hot" areas of the ring where we should have more connections.
-//! - **Connection Evaluator**: Compares incoming connection candidates against recent candidates
-//!   in a time window. Only accepts if the candidate scores better than all others in the window.
-//! - **Resource Usage**: Tracks bandwidth consumption per peer to identify underperforming connections.
+//! All new connections target locations sampled from **Kleinberg's 1/d distribution** centered
+//! on the peer's own ring location. This produces ~59% short-distance connections with a long
+//! tail for routing reachability — proven optimal for O(log²N) greedy routing on a ring.
 //!
-//! ## Connection Lifecycle
+//! The sampling uses inverse CDF: `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1),
+//! producing samples uniform in log-distance space. See `small_world_rand::kleinberg_target`.
 //!
-//! ### Adding Connections (`adjust_topology`)
+//! When the peer's own location is unknown (during very early bootstrap), random locations
+//! are used as a fallback.
 //!
-//! The decision depends on current connection count:
+//! ## When to Add/Remove
 //!
-//! | Connections | Target Location Strategy |
-//! |-------------|-------------------------|
-//! | 0 to DENSITY_SELECTION_THRESHOLD-1 | Own location (if known), else random |
-//! | DENSITY_SELECTION_THRESHOLD+       | Density-based (target high-request areas) |
+//! - Below `min_connections` → add connections
+//! - At/above `min_connections`, resource usage < 50% → add connections
+//! - At/above `min_connections`, resource usage 50-90% → no change
+//! - At/above `min_connections`, resource usage > 90% → remove connections
+//! - Above `max_connections` → remove connections
 //!
-//! See `constants::DENSITY_SELECTION_THRESHOLD` (currently 5).
-//!
-//! Once at min_connections, additions are driven by resource usage:
-//! - Usage < 50% of limits → add connections (underutilized)
-//! - Usage 50-90% → no change
-//! - Usage > 90% → remove connections (overloaded)
-//!
-//! ### Accepting Incoming Connections (`evaluate_new_connection`)
+//! ## Accepting Incoming Connections (`evaluate_new_connection`)
 //!
 //! Used by `should_accept()` in connection_manager when a peer has between min and max connections.
 //! (Below min: always accept. At max: always reject.)
@@ -38,28 +32,14 @@
 //! 2. Compares against other candidates seen in a time window
 //! 3. Accepts only if this candidate scores higher than ALL others in the window
 //!
-//! The window duration depends on acquisition strategy:
-//! - **Fast** (default): 60-second window, more accepting
-//! - **Slow**: 5-minute window, more selective (used when over max_connections)
-//!
-//! ### Removing Connections
+//! ## Removing Connections
 //!
 //! When resource usage is high or over max_connections:
 //! 1. Calculate value-per-usage ratio for each peer: `request_count / bandwidth_used`
 //! 2. Remove the peer with the worst ratio (least useful for bandwidth consumed)
 //! 3. Fallback: if no peer qualifies, remove the most distant peer on the ring
-//!
-//! ## Important Notes
-//!
-//! - **Density tracking is about outbound requests**, not ring locality. The goal is to have
-//!   connections near locations we frequently query, not necessarily near our own location.
-//! - **Ring distance is NOT considered** when accepting connections between min and max.
-//!   This means we may accept distant peers if they score well on density.
-//! - **Early connections (0-4) target own location** when known, falling back to random.
-//!   This helps build local neighborhoods for small-world topology.
 
 use crate::{message::TransactionType, ring::Location};
-use anyhow::anyhow;
 use connection_evaluator::ConnectionEvaluator;
 use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
@@ -67,7 +47,7 @@ use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tokio::time::Instant;
-use tracing::{debug, error, event, info, span, warn, Level};
+use tracing::{debug, event, info, span, warn, Level};
 
 pub mod connection_evaluator;
 mod constants;
@@ -84,24 +64,15 @@ use crate::topology::rate::{Rate, RateProportion};
 use constants::*;
 use request_density_tracker::DensityMapError;
 
-/// The goal of `TopologyManager` is to select new connections such that the
-/// distribution of connections is as close as possible to the
-/// distribution of outbound requests.
+/// Manages peer connection topology: adding, removing, and evaluating connections.
 ///
-/// This is done by maintaining a `RequestDensityTracker` which tracks the
-/// distribution of requests in the network. The `TopologyManager` uses this
-/// tracker to create a `DensityMap` which is used to evaluate the density of
-/// requests at a given location.
+/// New connection targets are sampled from Kleinberg's 1/d distribution centered
+/// on the peer's own ring location (see [`small_world_rand::kleinberg_target`]).
 ///
-/// The `TopologyManager` uses the density map to select the best candidate
-/// location, which is assumed to be close to peer connections that are
-/// currently receiving a lot of requests. This should have the effect of
-/// "balancing" out requests over time.
-///
-/// The `TopologyManager` also uses a `ConnectionEvaluator` to evaluate whether
-/// a given connection is better than all other connections within a predefined
-/// time window. The goal of this is to select the best connections over time
-/// from incoming join requests.
+/// The manager uses a [`ConnectionEvaluator`] to evaluate whether an incoming
+/// connection candidate is better than all other candidates seen within a time
+/// window, and a [`RequestDensityTracker`] to score candidates by request density
+/// at their location.
 pub(crate) struct TopologyManager {
     limits: Limits,
     meter: Meter,
@@ -110,7 +81,7 @@ pub(crate) struct TopologyManager {
     fast_connection_evaluator: ConnectionEvaluator,
     request_density_tracker: RequestDensityTracker,
     pub(crate) outbound_request_counter: OutboundRequestCounter,
-    /// Must be updated when new neightbors are discovered.
+    /// Must be updated when new neighbors are discovered.
     cached_density_map: CachedDensityMap,
     connection_acquisition_strategy: ConnectionAcquisitionStrategy,
 }
@@ -340,8 +311,12 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
-    // A function that will determine if any peers should be added or removed based on
-    // the current resource usage, and either add or remove them
+    /// Determine whether to add or remove connections based on current connection
+    /// count and resource usage.
+    ///
+    /// When adding connections, targets are always sampled from Kleinberg's 1/d
+    /// distribution centered on own location (see `small_world_rand::kleinberg_target`).
+    /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
@@ -349,108 +324,14 @@ impl TopologyManager {
         at_time: Instant,
         current_connections: usize,
     ) -> TopologyAdjustment {
-        #[cfg(debug_assertions)]
-        {
-            thread_local! {
-                static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
-            }
-            if LAST_LOG
-                .with(|last_log| last_log.borrow().elapsed() > std::time::Duration::from_secs(10))
-            {
-                LAST_LOG.with(|last_log| {
-                    tracing::trace!(
-                        current_connections,
-                        filtered_neighbors = neighbor_locations.len(),
-                        "Adjusting topology"
-                    );
-                    *last_log.borrow_mut() = Instant::now();
-                });
-            }
-        }
-
+        // Below min_connections: add connections to reach the minimum.
         if current_connections < self.limits.min_connections {
-            let mut locations = Vec::new();
-            let below_threshold = self.limits.min_connections - current_connections;
-            if below_threshold > 0 {
-                // If we have no connections at all, bootstrap by targeting own location
-                if current_connections == 0 {
-                    match my_location {
-                        Some(location) => {
-                            // The first connect message should target the peer's own
-                            // location (if known), to reduce the danger of a peer failing to
-                            // cluster
-                            locations.push(*location);
-                        }
-                        None => {
-                            locations.push(Location::random());
-                        }
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        thread_local! {
-                            static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
-                        }
-                        if LAST_LOG.with(|last_log| {
-                            last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
-                        }) {
-                            LAST_LOG.with(|last_log| {
-                                tracing::trace!(
-                                    minimum_num_peers_hard_limit = self.limits.min_connections,
-                                    num_peers = current_connections,
-                                    to_add = below_threshold,
-                                    "Bootstrap: adding first connection at own location"
-                                );
-                                *last_log.borrow_mut() = Instant::now();
-                            });
-                        }
-                    }
-                }
-                // If we have 1-4 connections, target own location to build local neighborhood
-                else if current_connections < DENSITY_SELECTION_THRESHOLD {
-                    match my_location {
-                        Some(location) => {
-                            for _i in 0..below_threshold {
-                                locations.push(*location);
-                            }
-                        }
-                        None => {
-                            for _i in 0..below_threshold {
-                                locations.push(Location::random());
-                            }
-                        }
-                    }
-                }
-                // If we have 5+ connections, use density-based selection
-                else {
-                    return self
-                        .select_connections_to_add(neighbor_locations)
-                        .unwrap_or_else(|e| {
-                            debug!(
-                                error = ?e,
-                                fallback_count = below_threshold,
-                                "Density-based selection failed, falling back to random locations"
-                            );
-                            let mut fallback_locations = Vec::new();
-                            for _i in 0..below_threshold {
-                                fallback_locations.push(Location::random());
-                            }
-                            TopologyAdjustment::AddConnections(fallback_locations)
-                        });
-                }
-            }
+            let needed = self.limits.min_connections - current_connections;
+            let locations = Self::sample_targets(my_location, needed);
             return TopologyAdjustment::AddConnections(locations);
         }
 
-        // Skip resource-based removal in very small networks to avoid destabilizing them
-        // During startup or in small test networks, we need stability more than optimization
-        if current_connections < DENSITY_SELECTION_THRESHOLD {
-            debug!(
-                current_connections,
-                "Skipping resource-based topology adjustment for small network"
-            );
-            return TopologyAdjustment::NoChange;
-        }
-
+        // At/above min_connections: use resource usage to decide.
         let increase_usage_if_below: RateProportion =
             RateProportion::new(MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
         let decrease_usage_if_above: RateProportion =
@@ -458,61 +339,46 @@ impl TopologyManager {
 
         let (resource_type, usage_proportion) = self.calculate_usage_proportion(at_time);
 
-        // Detailed resource usage information
-        debug!(usage_proportion = ?usage_proportion, "Resource usage information");
-
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if current_connections > self.limits.max_connections {
                 debug!(
                     current_connections,
                     max_connections = self.limits.max_connections,
-                    "Number of connections above maximum, removing connections"
+                    "Above max connections, removing"
                 );
-
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
-
                 Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else if usage_proportion < increase_usage_if_below {
                 debug!(
                     resource_type = ?resource_type,
                     usage_proportion = ?usage_proportion,
-                    threshold = ?increase_usage_if_below,
-                    "Resource usage below threshold, adding connections"
+                    "Resource usage below threshold, adding connection"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                self.select_connections_to_add(neighbor_locations)
+                let locations = Self::sample_targets(my_location, 1);
+                Ok(TopologyAdjustment::AddConnections(locations))
             } else if usage_proportion > decrease_usage_if_above {
-                debug!(
-                    resource_type = ?resource_type,
-                    usage_proportion = ?usage_proportion,
-                    threshold = ?decrease_usage_if_above,
-                    "Resource usage above threshold, removing connections"
-                );
-                Ok(self.select_connections_to_remove(&resource_type, at_time))
+                if current_connections <= self.limits.min_connections {
+                    debug!(
+                        current_connections,
+                        min_connections = self.limits.min_connections,
+                        "Resource usage high but at min_connections — not removing"
+                    );
+                    Ok(TopologyAdjustment::NoChange)
+                } else {
+                    debug!(
+                        resource_type = ?resource_type,
+                        usage_proportion = ?usage_proportion,
+                        "Resource usage above threshold, removing connection"
+                    );
+                    Ok(self.select_connections_to_remove(&resource_type, at_time))
+                }
             } else {
-                debug!(
-                    resource_type = ?resource_type,
-                    usage_proportion = ?usage_proportion,
-                    "Resource usage within acceptable bounds"
-                );
                 Ok(TopologyAdjustment::NoChange)
             };
 
-        match &adjustment {
-            Ok(TopologyAdjustment::AddConnections(connections)) => {
-                debug!(connections = ?connections, "Added connections");
-            }
-            Ok(TopologyAdjustment::RemoveConnections(connections)) => {
-                debug!(connections = ?connections, "Removed connections");
-            }
-            Ok(TopologyAdjustment::NoChange) => {
-                debug!("No topology change required");
-            }
-            Err(e) => {
-                error!(error = ?e, "Couldn't adjust topology");
-            }
-        }
-
+        // Enforce max-connections cap: if we're still over after the main logic,
+        // use fallback removal (drop the most distant peer).
         if current_connections > self.limits.max_connections {
             let mut adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
             if matches!(adj, TopologyAdjustment::NoChange) {
@@ -528,7 +394,7 @@ impl TopologyManager {
                     warn!(
                         current_connections,
                         max_connections = self.limits.max_connections,
-                        "Over capacity but no removable peer found; leaving topology unchanged"
+                        "Over capacity but no removable peer found"
                     );
                 }
             }
@@ -536,6 +402,17 @@ impl TopologyManager {
         }
 
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
+    }
+
+    /// Sample `count` target locations using Kleinberg 1/d distribution.
+    /// Falls back to random locations if own location is unknown.
+    fn sample_targets(my_location: &Option<Location>, count: usize) -> Vec<Location> {
+        match my_location {
+            Some(loc) => (0..count)
+                .map(|_| small_world_rand::kleinberg_target(*loc))
+                .collect(),
+            None => (0..count).map(|_| Location::random()).collect(),
+        }
     }
 
     fn calculate_usage_proportion(&mut self, at_time: Instant) -> (ResourceType, RateProportion) {
@@ -554,48 +431,11 @@ impl TopologyManager {
         (*max_usage_rate.0, *max_usage_rate.1)
     }
 
-    /// modify the current connection acquisition strategy
     fn update_connection_acquisition_strategy(
         &mut self,
         new_strategy: ConnectionAcquisitionStrategy,
     ) {
         self.connection_acquisition_strategy = new_strategy;
-    }
-
-    fn select_connections_to_add(
-        &mut self,
-        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
-    ) -> anyhow::Result<TopologyAdjustment> {
-        if neighbor_locations.is_empty() {
-            tracing::warn!("select_connections_to_add: neighbor map empty, skipping adjustment");
-            return Ok(TopologyAdjustment::NoChange);
-        }
-
-        let function_span = span!(Level::INFO, "add_connections");
-        let _enter = function_span.enter();
-
-        debug!("Starting to compute density map");
-        let density_map = self
-            .request_density_tracker
-            .create_density_map(neighbor_locations)?;
-        debug!("Density map computed successfully");
-
-        debug!("Attempting to get max density location");
-        let max_density_location = match density_map.get_max_density() {
-            Ok(location) => {
-                debug!(location = %location, "Max density location found");
-                location
-            }
-            Err(e) => {
-                error!(error = ?e, "Failed to get max density location");
-                return Err(anyhow!(e));
-            }
-        };
-
-        info!(location = %max_density_location, "Adding new connection");
-        Ok(TopologyAdjustment::AddConnections(vec![
-            max_density_location,
-        ]))
     }
 
     fn select_connections_to_remove(
@@ -776,7 +616,7 @@ mod tests {
     fn random_location(this_peer_location: &Location) -> Location {
         use crate::config::GlobalRng;
         tracing::debug!("Generating random location");
-        let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.001));
+        let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.01));
         let location_f64 = if GlobalRng::random_bool(0.5) {
             this_peer_location.as_f64() - distance.as_f64()
         } else {
@@ -823,9 +663,11 @@ mod tests {
     #[test_log::test]
     fn test_remove_connections() {
         let mut resource_manager = setup_topology_manager(1000.0);
-        let peers = generate_random_peers(5);
+        // Need 6+ peers because the removal guard prevents dropping below min_connections (5).
+        // With 6 peers: current_connections=6 > min_connections=5, so removal is allowed.
+        let peers = generate_random_peers(6);
         // Total bw usage will be way higher than the limit of 1000
-        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600];
+        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600, 1300];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
@@ -834,7 +676,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        let requests_per_peer = vec![20, 19, 18, 9, 9, 15];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
         let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
         assert_eq!(worst_ix, 3);
@@ -894,10 +736,6 @@ mod tests {
         match adjustment {
             TopologyAdjustment::AddConnections(locations) => {
                 assert_eq!(locations.len(), 1);
-                // Location should be between peers[0] and peers[1] because they have the highest
-                // number of requests per hour for any adjacent peers
-                assert!(locations[0] >= peers[0].location().unwrap());
-                assert!(locations[0] <= peers[1].location().unwrap());
             }
             _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
         }
@@ -908,8 +746,7 @@ mod tests {
     fn test_no_adjustment() {
         let mut resource_manager = setup_topology_manager(1000.0);
         let peers = generate_random_peers(5);
-        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
-        // the TopologyManager to add a connection
+        // Total bw usage 750/1000 = 75%, within the 50-90% "no change" band
         let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
@@ -936,15 +773,22 @@ mod tests {
         }
     }
 
-    // Test with no peers
+    // Test that connections are never removed when at or below min_connections,
+    // even when resource usage is high. This prevents topology destabilization
+    // in small networks where every connection is critical.
     #[test_log::test]
-    fn test_no_peers() {
-        let mut resource_manager = setup_topology_manager(1000.0);
-        let peers = generate_random_peers(0);
-        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
-        // the TopologyManager to add a connection
-        let bw_usage_by_peer = vec![];
-        // Report usage from outside the ramp-up time window so it isn't ignored
+    fn test_no_removal_at_min_connections() {
+        // Use min_connections = 5 to test the inner guard in the removal branch.
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut resource_manager = TopologyManager::new(limits);
+        let peers = generate_random_peers(5);
+        // Very high bandwidth usage (way above the 90% threshold)
+        let bw_usage_by_peer = vec![2000, 2000, 2000, 2000, 2000];
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
             &mut resource_manager,
@@ -952,7 +796,7 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![];
+        let requests_per_peer = vec![5, 5, 5, 5, 5];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
         let mut neighbor_locations = BTreeMap::new();
@@ -960,24 +804,131 @@ mod tests {
             neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
-        let my_location = Location::random();
+        // At min_connections (5) with 5 connections:
+        // - current(5) >= min(5), enters resource evaluation
+        // - High usage triggers removal branch
+        // - Inner guard: current(5) <= min(5) → NoChange (not removal)
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            5, // exactly at min_connections
+        );
+        assert!(
+            !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "Should not remove connections when at min_connections, got {adjustment:?}"
+        );
+
+        // Below min_connections should add, not remove
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            3, // below min_connections
+        );
+        match adjustment {
+            TopologyAdjustment::AddConnections(_) => {}
+            _ => panic!("Expected AddConnections when below min, got {adjustment:?}"),
+        }
+
+        // With 6 connections and min=5: passes threshold, enters resource eval.
+        // Since current(6) > min(5), the inner guard allows removal.
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            6, // above min_connections
+        );
+        assert!(
+            matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "Should allow removal when above min_connections, got {adjustment:?}"
+        );
+    }
+
+    // Test with no peers: should add connections using Kleinberg targets
+    #[test_log::test]
+    fn test_no_peers() {
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let neighbor_locations = BTreeMap::new();
+        let my_location = Location::new(0.5);
 
         let adjustment = resource_manager.adjust_topology(
             &neighbor_locations,
             &Some(my_location),
-            report_time,
-            peers.len(),
+            Instant::now(),
+            0,
         );
 
         match adjustment {
             TopologyAdjustment::AddConnections(v) => {
                 assert!(!v.is_empty());
-                for location in v {
-                    assert_eq!(location, my_location);
+                // All locations should be valid ring values
+                for loc in &v {
+                    let val = loc.as_f64();
+                    assert!(
+                        (0.0..1.0).contains(&val),
+                        "Location {val} outside valid ring range"
+                    );
                 }
+                // Kleinberg sampling should produce distinct values
+                let as_set: std::collections::BTreeSet<Location> = v.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    v.len(),
+                    "Kleinberg targets should be distinct"
+                );
             }
             _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
         }
+    }
+
+    // Test that resource-based addition uses Kleinberg targets biased toward own location.
+    #[test_log::test]
+    fn test_resource_based_add_uses_kleinberg_targets() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let peers: Vec<PeerKeyLocation> = generate_random_peers(6);
+        // Low bandwidth to trigger "add connections" path
+        let bw_usage_by_peer = vec![5, 5, 5, 5, 5, 5];
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        let my_location = peers[0].location().unwrap();
+        let mut close_count = 0;
+        let trials = 20;
+        for _ in 0..trials {
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &Some(my_location),
+                Instant::now(),
+                peers.len(),
+            );
+
+            match adjustment {
+                TopologyAdjustment::AddConnections(locations) => {
+                    assert_eq!(locations.len(), 1);
+                    let dist_to_me = my_location.distance(locations[0]).as_f64();
+                    if dist_to_me < 0.3 {
+                        close_count += 1;
+                    }
+                }
+                _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            }
+        }
+        // Kleinberg 1/d should produce mostly close targets
+        assert!(
+            close_count > trials / 2,
+            "Expected most targets near my_location, got {close_count}/{trials} close"
+        );
     }
 
     fn setup_topology_manager(max_downstream_rate: f64) -> TopologyManager {
@@ -1097,10 +1048,10 @@ mod tests {
         );
     }
 
-    // Test that with 1 connection (below DENSITY_SELECTION_THRESHOLD), we target our own
-    // location to build a local neighborhood. This is critical for small-world topology.
+    // Test that below min_connections, Kleinberg targets are produced with short-distance bias.
     #[test_log::test]
-    fn test_early_connections_target_own_location() {
+    fn test_below_min_uses_kleinberg_targets() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1109,7 +1060,6 @@ mod tests {
         };
         let mut topology_manager = TopologyManager::new(limits);
 
-        // Simulate having 1 existing connection (below DENSITY_SELECTION_THRESHOLD of 5)
         let mut neighbor_locations = BTreeMap::new();
         let peer = PeerKeyLocation::random();
         neighbor_locations.insert(peer.location().unwrap(), vec![]);
@@ -1119,7 +1069,7 @@ mod tests {
             &neighbor_locations,
             &Some(my_location),
             Instant::now(),
-            1, // 1 current connection (below threshold of 5)
+            1,
         );
 
         match adjustment {
@@ -1127,14 +1077,108 @@ mod tests {
                 // Should request 24 more connections to reach min of 25
                 assert_eq!(locations.len(), 24);
 
-                // When below DENSITY_SELECTION_THRESHOLD, ALL locations should target
-                // our own location to build a local neighborhood
+                // All locations must be distinct (Kleinberg sampling produces unique values)
+                let as_set: std::collections::BTreeSet<Location> =
+                    locations.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    locations.len(),
+                    "All Kleinberg targets must be distinct"
+                );
+
+                // Majority should be short-distance (1/d bias)
+                let short_count = locations
+                    .iter()
+                    .filter(|loc| my_location.distance(**loc).as_f64() < 0.1)
+                    .count();
+                assert!(
+                    short_count > locations.len() / 3,
+                    "Expected short-distance bias, got {short_count}/{} close",
+                    locations.len()
+                );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
+
+    // Test that needing 1 more connection produces a single Kleinberg target.
+    #[test_log::test]
+    fn test_single_kleinberg_target() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for _ in 0..4 {
+            let peer = PeerKeyLocation::random();
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        let my_location = Location::new(0.25);
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            4,
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 1);
+                let val = locations[0].as_f64();
+                assert!(
+                    (0.0..1.0).contains(&val),
+                    "Target {val} outside valid ring range"
+                );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
+
+    // Test that Kleinberg targets wrap correctly near the ring boundary (1.0 wraps to 0.0).
+    #[test_log::test]
+    fn test_kleinberg_targets_wrap_near_boundary() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let peer = PeerKeyLocation::random();
+        neighbor_locations.insert(peer.location().unwrap(), vec![]);
+
+        let my_location = Location::new(0.9);
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            1,
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                // All locations must be valid (in [0, 1)) and distinct
                 for loc in &locations {
-                    assert_eq!(
-                        *loc, my_location,
-                        "Early connections (below threshold) should target own location"
+                    let v = loc.as_f64();
+                    assert!(
+                        (0.0..1.0).contains(&v),
+                        "Location {v} outside valid ring range [0, 1)"
                     );
                 }
+                let as_set: std::collections::BTreeSet<Location> =
+                    locations.iter().copied().collect();
+                assert_eq!(
+                    as_set.len(),
+                    locations.len(),
+                    "All Kleinberg targets must be distinct even when wrapping"
+                );
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
@@ -1142,7 +1186,7 @@ mod tests {
 
     // Test that when no location is known, we fall back to random locations
     #[test_log::test]
-    fn test_early_connections_use_random_when_no_location() {
+    fn test_no_location_falls_back_to_random() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1151,24 +1195,18 @@ mod tests {
         };
         let mut topology_manager = TopologyManager::new(limits);
 
-        // Simulate having 1 existing connection (below DENSITY_SELECTION_THRESHOLD of 5)
         let mut neighbor_locations = BTreeMap::new();
         let peer = PeerKeyLocation::random();
         neighbor_locations.insert(peer.location().unwrap(), vec![]);
 
-        // No known location - should fall back to random
-        let adjustment = topology_manager.adjust_topology(
-            &neighbor_locations,
-            &None, // Unknown location
-            Instant::now(),
-            1,
-        );
+        let adjustment =
+            topology_manager.adjust_topology(&neighbor_locations, &None, Instant::now(), 1);
 
         match adjustment {
             TopologyAdjustment::AddConnections(locations) => {
                 assert_eq!(locations.len(), 24);
 
-                // With random locations, we should get diverse values
+                // Random locations should produce diverse values
                 let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
                 assert!(
                     unique_locations.len() > 1,
