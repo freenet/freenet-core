@@ -82,6 +82,7 @@ async fn query_connected_peers(
 /// so auto_connect_peers ensures they can form a full mesh rather than only
 /// connecting to the gateway.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -257,6 +258,7 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
 
 /// Simplified test to verify basic gateway connectivity
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 60,
@@ -335,6 +337,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 ///
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer1", "peer2"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -777,6 +780,7 @@ async fn perform_put_with_retries(
 /// The fix ensures handle_connect_peer updates the transport entry's pub_key
 /// when promoting transients.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 120,

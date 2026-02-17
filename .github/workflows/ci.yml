@@ -162,6 +162,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Build
         env:
           # Use mold linker to avoid rust-lld crashes (see issue #2519)
@@ -194,15 +197,13 @@ jobs:
         # Exclude freenet-ping-app: its 3 blocked-peers tests each spin up 3 real
         # nodes (9 total). Running them in parallel with core tests causes CI
         # timeouts. They run sequentially in their own step below.
-        # Retry once on failure — real-network tests are timing-sensitive
-        # and occasionally fail under CI resource pressure.
+        # nextest retries only failed tests (via .config/nextest.toml [profile.ci]),
+        # avoiding the 10-15 min penalty of re-running the entire workspace.
         run: |
-          cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
+          cargo nextest run --workspace --exclude freenet-ping-app --exclude freenet-ping-types \
+            --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            -- --skip determinism \
-          || cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
-            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            -- --skip determinism
+            --profile ci -E 'not test(determinism)'
 
       - name: Test ping app (serial)
         if: ${{ !cancelled() }}
@@ -215,10 +216,8 @@ jobs:
         # Also includes freenet-ping-types (excluded from main step because
         # --no-default-features disables its std feature, breaking test code).
         run: |
-          cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
-            -- --test-threads=1 \
-          || cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
-            -- --test-threads=1
+          cargo nextest run -p freenet-ping-app -p freenet-ping-types \
+            --features testing --profile ci -j 1
 
       - name: Test determinism (serial)
         if: ${{ !cancelled() }}
@@ -228,7 +227,10 @@ jobs:
         # Determinism comparison tests compare exact event sequences across sequential runs.
         # Shared atomic counters must not be advanced by concurrent tests between runs.
         # The "determinism" filter matches: test_strict_determinism_*, test_turmoil_determinism_*, test_deterministic_replay_*
-        run: cargo test -p freenet --no-default-features --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing --test simulation_integration determinism -- --test-threads=1
+        run: |
+          cargo nextest run -p freenet --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            --profile ci -E 'test(determinism)' -j 1
 
   six_peer_regression:
     name: six-peer-regression
