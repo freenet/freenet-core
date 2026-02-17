@@ -290,7 +290,9 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         // Wait for nodes to connect to the network
         println!("Waiting for nodes to connect to the network...");
         for (i, client) in node_clients.iter_mut().enumerate() {
-            wait_for_node_connected(client, &format!("Node{i}"), 1, 120).await?;
+            // 180s: 8-node network under CI resource pressure needs more
+            // time to establish connections (see #3036).
+            wait_for_node_connected(client, &format!("Node{i}"), 1, 180).await?;
         }
         println!("All nodes connected to the network!");
 
