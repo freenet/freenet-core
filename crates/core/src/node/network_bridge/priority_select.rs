@@ -175,7 +175,28 @@ where
             }
         }
 
-        // Priority 3: Peer connection events
+        // Priority 3: Client transaction handler (implements Stream directly)
+        // Registering client transactions is a lightweight operation (HashMap insert),
+        // so it should be high priority to avoid starvation under sustained network load.
+        // See: https://github.com/freenet/freenet-core/issues/3074
+        if !this.client_transaction_closed {
+            match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
+                Poll::Ready(Some(result)) => {
+                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))))
+                }
+                Poll::Ready(None) => {
+                    this.client_transaction_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::ClientTransaction(Err(
+                            anyhow::anyhow!("channel closed"),
+                        )));
+                    }
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        // Priority 4: Peer connection events
         if !this.conn_events_closed {
             match Pin::new(&mut this.conn_events).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
@@ -191,7 +212,7 @@ where
             }
         }
 
-        // Priority 4: Connection bridge
+        // Priority 5: Connection bridge
         if !this.conn_bridge_closed {
             match Pin::new(&mut this.conn_bridge).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
@@ -208,7 +229,7 @@ where
             }
         }
 
-        // Priority 5: Handshake handler (implements Stream directly)
+        // Priority 6: Handshake handler (implements Stream directly)
         if !this.handshake_closed {
             match Pin::new(&mut this.handshake_handler).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
@@ -224,7 +245,7 @@ where
             }
         }
 
-        // Priority 6: Node controller
+        // Priority 7: Node controller
         if !this.node_controller_closed {
             match Pin::new(&mut this.node_controller).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
@@ -235,24 +256,6 @@ where
                     this.node_controller_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::NodeController(None));
-                    }
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        // Priority 7: Client transaction handler (implements Stream directly)
-        if !this.client_transaction_closed {
-            match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
-                Poll::Ready(Some(result)) => {
-                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))))
-                }
-                Poll::Ready(None) => {
-                    this.client_transaction_closed = true;
-                    if first_closed_channel.is_none() {
-                        first_closed_channel = Some(SelectResult::ClientTransaction(Err(
-                            anyhow::anyhow!("channel closed"),
-                        )));
                     }
                 }
                 Poll::Pending => {}
