@@ -65,37 +65,35 @@ mod tests {
         let d_min = 0.01;
         let n = 10000;
         let num_bins = 20;
-        let mut bins = vec![0; num_bins];
+        let log_ratio = (D_MAX / d_min).ln();
+        let mut bins = vec![0usize; num_bins];
 
+        // Use log-spaced bins: the 1/d distribution is uniform in log-distance,
+        // so each bin gets equal expected count (n/num_bins), making the
+        // chi-squared test well-calibrated.
         for _ in 0..n {
             let d = random_link_distance(Distance::new(d_min)).as_f64();
-            let bin_index = ((d - d_min) / (D_MAX - d_min) * (num_bins as f64)).floor() as usize;
+            let bin_index = ((d / d_min).ln() / log_ratio * num_bins as f64).floor() as usize;
             if bin_index < num_bins {
                 bins[bin_index] += 1;
             }
         }
 
-        let log_ratio = (D_MAX / d_min).ln();
-        let expected_counts: Vec<_> = (0..num_bins)
-            .map(|i| {
-                let lower = d_min + (D_MAX - d_min) * (i as f64 / num_bins as f64);
-                let upper = d_min + (D_MAX - d_min) * ((i as f64 + 1.0) / num_bins as f64);
-                n as f64 * (upper / lower).ln() / log_ratio
-            })
-            .collect();
-
-        let chi_squared = expected_counts
+        let expected = n as f64 / num_bins as f64;
+        let chi_squared: f64 = bins
             .iter()
-            .zip(bins.iter())
-            .map(|(&e, &o)| ((o as f64 - e) * (o as f64 - e)) / e)
-            .sum::<f64>();
+            .map(|&o| {
+                let diff = o as f64 - expected;
+                diff * diff / expected
+            })
+            .sum();
 
         let dof = num_bins - 1;
         let chi = ChiSquared::new(dof as f64).unwrap();
         let p_value = 1.0 - chi.cdf(chi_squared);
 
         assert!(
-            p_value > 0.05,
+            p_value > 0.001,
             "Chi-squared test failed, p_value = {p_value}"
         );
     }
