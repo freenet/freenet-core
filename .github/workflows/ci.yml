@@ -197,10 +197,10 @@ jobs:
         # Retry once on failure — real-network tests are timing-sensitive
         # and occasionally fail under CI resource pressure.
         run: |
-          cargo test --workspace --exclude freenet-ping-app --no-default-features \
+          cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
             -- --skip determinism \
-          || cargo test --workspace --exclude freenet-ping-app --no-default-features \
+          || cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
             -- --skip determinism
 
@@ -211,10 +211,12 @@ jobs:
           FREENET_BACKOFF_BASE_SECS: "5"
         # Ping blocked-peers tests each start 3 real nodes with 180s connection
         # timeouts. Running them sequentially prevents resource contention.
+        # Also includes freenet-ping-types (excluded from main step because
+        # --no-default-features disables its std feature, breaking test code).
         run: |
-          cargo test -p freenet-ping-app --features testing \
+          cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
             -- --test-threads=1 \
-          || cargo test -p freenet-ping-app --features testing \
+          || cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
             -- --test-threads=1
 
       - name: Test determinism (serial)
