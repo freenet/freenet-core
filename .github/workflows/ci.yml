@@ -184,6 +184,9 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
           # Default congestion control is FixedRate for CI stability.
           # To test BBR: set FREENET_CONGESTION_CONTROL=bbr and optionally FREENET_BBR_STARTUP_RATE
+          # Reduce gateway connection backoff for CI (default 30s is too aggressive
+          # for localhost tests under CI resource pressure). See issue #3078.
+          FREENET_BACKOFF_BASE_SECS: "5"
         # Run all tests in parallel including simulation tests.
         # Thread-local state and per-network registries provide test isolation.
         # Skip determinism comparison tests — they compare sequential runs and
