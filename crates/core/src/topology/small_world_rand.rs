@@ -3,9 +3,10 @@ use crate::ring::{Distance, Location};
 
 /// Minimum distance for Kleinberg sampling. On a ring with N peers uniformly
 /// distributed, the expected distance to the nearest peer is ~1/(2N). We use
-/// 0.001 which corresponds to a ~500 peer network — small enough to produce
-/// short connections in any realistic network.
-const D_MIN: f64 = 0.001;
+/// 0.01 which corresponds to a ~50 peer network. This produces ~59% of
+/// connections within distance 0.1 (good locality) while ensuring enough
+/// long-range connections for ring coverage in small networks.
+const D_MIN: f64 = 0.01;
 
 /// Maximum ring distance (half the ring).
 const D_MAX: f64 = 0.5;
@@ -123,8 +124,8 @@ mod tests {
                 short_count += 1;
             }
         }
-        // With 1/d distribution and d_min=0.001, d_max=0.5, the fraction
-        // below 0.1 should be ln(0.1/0.001)/ln(0.5/0.001) ≈ 74%.
+        // With 1/d distribution and d_min=0.01, d_max=0.5, the fraction
+        // below 0.1 should be ln(0.1/0.01)/ln(0.5/0.01) ≈ 59%.
         // Use a conservative threshold.
         let ratio = short_count as f64 / n as f64;
         assert!(
