@@ -205,6 +205,7 @@ jobs:
             -- --skip determinism
 
       - name: Test ping app (serial)
+        if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -220,6 +221,7 @@ jobs:
             -- --test-threads=1
 
       - name: Test determinism (serial)
+        if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold

@@ -885,6 +885,7 @@ mod tests {
     // Test that resource-based addition uses Kleinberg targets biased toward own location.
     #[test_log::test]
     fn test_resource_based_add_uses_kleinberg_targets() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
         let mut resource_manager = setup_topology_manager(1000.0);
         let peers: Vec<PeerKeyLocation> = generate_random_peers(6);
         // Low bandwidth to trigger "add connections" path
@@ -1050,6 +1051,7 @@ mod tests {
     // Test that below min_connections, Kleinberg targets are produced with short-distance bias.
     #[test_log::test]
     fn test_below_min_uses_kleinberg_targets() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
