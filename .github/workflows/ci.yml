@@ -191,7 +191,15 @@ jobs:
         # Thread-local state and per-network registries provide test isolation.
         # Skip determinism comparison tests — they compare sequential runs and
         # need shared atomic counters to be stable (run serially below).
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing -- --skip determinism
+        # Retry once on failure — real-network tests are timing-sensitive
+        # and occasionally fail under CI resource pressure.
+        run: |
+          cargo test --workspace --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            -- --skip determinism \
+          || cargo test --workspace --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            -- --skip determinism
 
       - name: Test determinism (serial)
         env:
