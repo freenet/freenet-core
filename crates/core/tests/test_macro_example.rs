@@ -10,7 +10,7 @@ use freenet::test_utils::TestContext;
 use freenet_macros::freenet_test;
 
 /// Simple test with just a gateway node
-#[freenet_test(nodes = ["gateway"])]
+#[freenet_test(health_check_readiness = true, nodes = ["gateway"])]
 async fn test_single_node(ctx: &mut TestContext) -> TestResult {
     // The macro has already set up:
     // - TestLogger with JSON format
@@ -33,6 +33,7 @@ async fn test_single_node(ctx: &mut TestContext) -> TestResult {
 
 /// Test with multiple nodes
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-1", "peer-2"],
     timeout_secs = 120,
     startup_wait_secs = 10
@@ -67,6 +68,7 @@ async fn test_multi_node(ctx: &mut TestContext) -> TestResult {
 
 /// Test that demonstrates event aggregation on failure
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-1"],
     aggregate_events = "on_failure"
 )]
@@ -91,6 +93,7 @@ async fn test_with_event_aggregation(ctx: &mut TestContext) -> TestResult {
 
 /// Test that always shows event aggregation
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     aggregate_events = "always"
 )]
@@ -103,6 +106,7 @@ async fn test_always_aggregate(ctx: &mut TestContext) -> TestResult {
 
 /// Test with custom tokio configuration
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 8,
@@ -130,6 +134,7 @@ async fn test_custom_tokio_config(ctx: &mut TestContext) -> TestResult {
 
 /// Test with single-threaded runtime
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     tokio_flavor = "current_thread",
     timeout_secs = 60,
@@ -147,6 +152,7 @@ async fn test_current_thread_runtime(ctx: &mut TestContext) -> TestResult {
 
 /// Test with multiple gateways
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
     timeout_secs = 120,
@@ -211,6 +217,7 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
 
 /// Test with auto_connect_peers enabled (now the default)
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-1", "peer-2"],
     timeout_secs = 120,
     startup_wait_secs = 30
@@ -239,6 +246,7 @@ async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
 
 /// Test with multiple gateways and auto_connect_peers (now the default)
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
     timeout_secs = 120,

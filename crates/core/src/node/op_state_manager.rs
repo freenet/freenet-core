@@ -267,6 +267,10 @@ pub(crate) struct OpManager {
     /// Notifies `initial_join_procedure` when gateway backoff is cleared,
     /// so it can wake from a long backoff sleep and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
+    /// Addresses blocked by local policy. Used by the connect protocol to reject
+    /// join requests from blocked peers at the routing level, allowing the uphill
+    /// hop mechanism to find alternate acceptors.
+    pub blocked_addresses: Option<Arc<HashSet<SocketAddr>>>,
 }
 
 impl Clone for OpManager {
@@ -291,6 +295,7 @@ impl Clone for OpManager {
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
+            blocked_addresses: self.blocked_addresses.clone(),
         }
     }
 }
@@ -402,6 +407,10 @@ impl OpManager {
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
+            blocked_addresses: config
+                .blocked_addresses
+                .as_ref()
+                .map(|a| Arc::new(a.clone())),
         })
     }
 

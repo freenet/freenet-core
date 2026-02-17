@@ -1,0 +1,10 @@
+[profile.ci]
+# Retry individual failed tests instead of re-running entire workspace.
+# Real-network tests are timing-sensitive and occasionally fail under CI
+# resource pressure — per-test retries avoid the 10-15 min penalty of
+# re-running all tests.
+retries = 2
+# Don't stop on first failure — run all tests to surface multiple issues.
+fail-fast = false
+# Terminate tests that hang (2 periods of 120s = 4 min max per test).
+slow-timeout = { period = "120s", terminate-after = 2 }

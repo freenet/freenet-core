@@ -275,7 +275,7 @@ pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<WaitingResolution>,
 ) {
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(10);
+    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(100);
     (
         ContractHandlerChannel {
             end: SenderHalve {
@@ -379,6 +379,11 @@ impl ContractHandlerChannel<SenderHalve> {
         self.session_adapter_tx = Some(session_tx);
     }
 
+    /// Timeout for registering a transaction with the event loop's client-result delivery system.
+    /// If the channel is full for this long, the event loop is not draining client transactions
+    /// (polled at Priority 7) and the operation should fail rather than block forever.
+    const WAIT_FOR_RES_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub async fn waiting_for_transaction_result(
         &self,
         transaction: impl Into<WaitingTransaction>,
@@ -387,45 +392,29 @@ impl ContractHandlerChannel<SenderHalve> {
     ) -> Result<(), ContractError> {
         let waiting_tx = transaction.into();
 
-        // Call legacy implementation first
-        self.end
-            .wait_for_res_tx
-            .send((client_id, waiting_tx))
-            .await
-            .map_err(|_| ContractError::NoEvHandlerResponse)?;
-
-        // Route to session actor if session adapter is installed
-        if let Some(session_tx) = &self.session_adapter_tx {
-            // Register all Transaction variants with the session actor
-            if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                let msg = SessionMessage::RegisterTransaction {
-                    tx,
-                    client_id,
-                    request_id,
-                };
-                if let Err(e) = session_tx.try_send(msg) {
-                    tracing::warn!(
-                        tx = %tx,
-                        client = %client_id,
-                        request_id = %request_id,
-                        error = %e,
-                        "Failed to notify session actor"
-                    );
-                } else {
-                    tracing::debug!(
-                        tx = %tx,
-                        client = %client_id,
-                        request_id = %request_id,
-                        "Session adapter registered transaction with session actor"
-                    );
-                }
+        match tokio::time::timeout(
+            Self::WAIT_FOR_RES_SEND_TIMEOUT,
+            self.end.wait_for_res_tx.send((client_id, waiting_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Err(_) => {
+                tracing::error!(
+                    client = %client_id,
+                    request_id = %request_id,
+                    channel_capacity = self.end.wait_for_res_tx.capacity(),
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out registering transaction for result delivery — \
+                     event loop is not draining client transactions (Priority 7 starvation)"
+                );
+                return Err(ContractError::NoEvHandlerResponse);
             }
-        } else {
-            tracing::warn!(
-                client = %client_id,
-                request_id = %request_id,
-                "Session adapter not installed - session actor will not track transaction"
-            );
+        }
+
+        if let WaitingTransaction::Transaction(tx) = waiting_tx {
+            self.notify_session_actor(tx, client_id, request_id);
         }
 
         Ok(())
@@ -438,46 +427,60 @@ impl ContractHandlerChannel<SenderHalve> {
         client_id: ClientId,
         request_id: RequestId,
     ) -> Result<(), ContractError> {
-        self.end
-            .wait_for_res_tx
-            .send((client_id, WaitingTransaction::Subscription { contract_key }))
-            .await
-            .map_err(|_| ContractError::NoEvHandlerResponse)?;
-
-        if let Some(session_tx) = &self.session_adapter_tx {
-            let msg = SessionMessage::RegisterTransaction {
-                tx,
-                client_id,
-                request_id,
-            };
-            if let Err(e) = session_tx.try_send(msg) {
-                tracing::warn!(
+        match tokio::time::timeout(
+            Self::WAIT_FOR_RES_SEND_TIMEOUT,
+            self.end
+                .wait_for_res_tx
+                .send((client_id, WaitingTransaction::Subscription { contract_key })),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Err(_) => {
+                tracing::error!(
                     tx = %tx,
                     client = %client_id,
                     request_id = %request_id,
                     contract = %contract_key,
-                    error = %e,
-                    "Failed to notify session actor"
+                    channel_capacity = self.end.wait_for_res_tx.capacity(),
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out registering subscription for result delivery — \
+                     event loop is not draining client transactions (Priority 7 starvation)"
                 );
-            } else {
-                tracing::debug!(
-                    tx = %tx,
-                    client = %client_id,
-                    request_id = %request_id,
-                    contract = %contract_key,
-                    "Session adapter registered subscription transaction with session actor"
-                );
+                return Err(ContractError::NoEvHandlerResponse);
             }
-        } else {
+        }
+
+        self.notify_session_actor(tx, client_id, request_id);
+
+        Ok(())
+    }
+
+    /// Notify the session actor about a transaction registration, if installed.
+    fn notify_session_actor(&self, tx: Transaction, client_id: ClientId, request_id: RequestId) {
+        let Some(session_tx) = &self.session_adapter_tx else {
             tracing::warn!(
                 client = %client_id,
                 request_id = %request_id,
-                contract = %contract_key,
-                "Session adapter not installed - subscription transaction not registered with session actor"
+                "Session adapter not installed — session actor will not track transaction"
+            );
+            return;
+        };
+        let msg = SessionMessage::RegisterTransaction {
+            tx,
+            client_id,
+            request_id,
+        };
+        if let Err(e) = session_tx.try_send(msg) {
+            tracing::warn!(
+                tx = %tx,
+                client = %client_id,
+                request_id = %request_id,
+                error = %e,
+                "Failed to notify session actor"
             );
         }
-
-        Ok(())
     }
 }
 
@@ -880,6 +883,43 @@ pub mod test {
         );
 
         Ok(())
+    }
+
+    /// Regression test for issue #3071: Verifies that `waiting_for_transaction_result`
+    /// times out instead of blocking indefinitely when the `wait_for_res_tx` channel
+    /// is full (the consumer at Priority 7 in the event loop is starved).
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_transaction_result_times_out_when_channel_full() {
+        use crate::client_events::RequestId;
+        use crate::message::Transaction;
+        use crate::operations::put::PutMsg;
+
+        let (send_halve, _rcv_halve, _wait_res) = contract_handler_channel();
+
+        // Fill the channel to capacity (100 items). We hold _wait_res so
+        // the receiver isn't dropped (which would give a different error).
+        for _ in 0..100 {
+            let tx = Transaction::new::<PutMsg>();
+            send_halve
+                .end
+                .wait_for_res_tx
+                .send((ClientId::FIRST, WaitingTransaction::Transaction(tx)))
+                .await
+                .expect("channel should accept items up to capacity");
+        }
+
+        // The 101st send should block, and with paused time we can
+        // advance past the timeout instantly.
+        let tx = Transaction::new::<PutMsg>();
+        let result = send_halve
+            .waiting_for_transaction_result(tx, ClientId::FIRST, RequestId::new())
+            .await;
+
+        assert!(
+            matches!(result, Err(super::ContractError::NoEvHandlerResponse)),
+            "Expected NoEvHandlerResponse timeout error, got {:?}",
+            result
+        );
     }
 }
 

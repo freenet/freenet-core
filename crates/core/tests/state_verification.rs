@@ -31,7 +31,6 @@ async fn test_verify_state_produces_report() {
 
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
-    GlobalRng::reset_thread_index_counter();
 
     let mut sim = SimNetwork::new("verify-state-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));
@@ -76,7 +75,6 @@ async fn test_verify_state_filter_methods() {
 
     GlobalRng::set_seed(SEED);
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
-    GlobalRng::reset_thread_index_counter();
 
     let mut sim = SimNetwork::new("verify-filter-test", 1, 3, 7, 3, 10, 2, SEED).await;
     sim.with_start_backoff(Duration::from_millis(50));
