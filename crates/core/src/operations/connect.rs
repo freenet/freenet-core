@@ -1784,13 +1784,19 @@ pub(crate) async fn join_ring_request(
     }
 
     let own = op_manager.ring.connection_manager.own_location();
-    // Use a random desired_location so the gateway routes to diverse ring peers
-    // instead of always forwarding to its single closest neighbor (which caused
-    // cascading failures at scale when all joiners converged on one acceptor).
-    // A random location also varies on each retry, preventing deterministic routing
-    // to the same unreachable peer. Ring-optimal connections are established later
-    // through connection_maintenance/adjust_topology once the peer has bootstrapped.
-    let desired_location = Location::random();
+    // Use the joiner's own location as the desired_location for the connect request.
+    //
+    // History: PR #2907 fixed a critical issue where using `gateway.location()` caused
+    // 99.7% of join requests to converge on a single acceptor. That PR intended to use
+    // the joiner's own location but implemented `Location::random()` instead, which
+    // broke simulation determinism for certain seeds (issues #3028, #3030).
+    //
+    // Using `own.location()` is correct because:
+    // - Each joiner has a unique location → requests spread across gateway neighbors
+    // - The gateway routes toward the joiner's ring neighborhood → better initial placement
+    // - Deterministic in simulation tests (same seed → same location → same topology)
+    // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
+    let desired_location = own.location().unwrap_or_else(Location::random);
     let ttl = op_manager
         .ring
         .max_hops_to_live

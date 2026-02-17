@@ -18,10 +18,10 @@ The simulation testing framework enables reproducible testing of the Freenet net
 
 ```bash
 # Run all simulation tests (Turmoil always enabled)
-cargo test -p freenet --features simulation_tests --test sim_network -- --test-threads=1
+cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration
 
 # Run with logging
-RUST_LOG=info cargo test -p freenet --features simulation_tests --test sim_network -- --nocapture --test-threads=1
+RUST_LOG=info cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --nocapture
 
 # Run fdev single-process simulation
 cargo run -p fdev -- test --gateways 2 --nodes 10 --events 100 --seed 0xDEADBEEF single-process
@@ -356,7 +356,7 @@ The `test_long_running_deterministic` test specifically targets time-dependent b
 ```bash
 # Run manually (requires nightly_tests feature)
 cargo test -p freenet --features "simulation_tests,testing,nightly_tests" --test simulation_integration \
-  test_long_running_deterministic -- --nocapture --test-threads=1
+  test_long_running_deterministic -- --nocapture
 ```
 
 **What it tests:**

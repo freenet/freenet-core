@@ -145,7 +145,6 @@ WHY: Breaks topology optimization, may cause resource exhaustion
 □ Test self-connection rejection
 □ Test location calculation determinism
 □ Test routing with visited peer filtering
-□ Use --test-threads=1 for determinism
 ```
 
 ## Documentation
