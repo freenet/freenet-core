@@ -1,6 +1,6 @@
 //! # Blocked Peers Tests
 //!
-//! Parameterized test framework for the "blocked peers" scenario
+//! Tests that contract updates propagate via gateway when direct peer connections are blocked.
 //! in Freenet, where direct peer-to-peer connections between certain nodes are intentionally
 //! blocked. The tests verify that contract state updates can propagate via gateway nodes
 //! when direct connections aren't available.
