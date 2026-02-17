@@ -58,6 +58,7 @@ impl Batch {
         self.batch.is_empty()
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn clear(&mut self) {
         self.batch.clear();
