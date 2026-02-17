@@ -191,34 +191,39 @@ jobs:
         # Thread-local state and per-network registries provide test isolation.
         # Skip determinism comparison tests — they compare sequential runs and
         # need shared atomic counters to be stable (run serially below).
-        # Exclude freenet-ping-app: its 3 blocked-peers tests each spin up 3 real
-        # nodes (9 total). Running them in parallel with core tests causes CI
-        # timeouts. They run sequentially in their own step below.
+        # Skip blocked-peers tests — they each spin up 3 real nodes and cause
+        # resource contention timeouts when run in parallel. Run serially below.
+        # Exclude freenet-ping-types: --no-default-features disables its std
+        # feature, breaking test code that uses Ping::insert().
         # Retry once on failure — real-network tests are timing-sensitive
         # and occasionally fail under CI resource pressure.
         run: |
-          cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
+          cargo test --workspace --exclude freenet-ping-types --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            -- --skip determinism \
-          || cargo test --workspace --exclude freenet-ping-app --exclude freenet-ping-types --no-default-features \
+            -- --skip determinism --skip blocked_peers \
+          || cargo test --workspace --exclude freenet-ping-types --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            -- --skip determinism
+            -- --skip determinism --skip blocked_peers
 
-      - name: Test ping app (serial)
+      - name: Test blocked-peers (serial)
         if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
           FREENET_BACKOFF_BASE_SECS: "5"
-        # Ping blocked-peers tests each start 3 real nodes with 180s connection
+        # Blocked-peers tests each start 3 real nodes with 180s connection
         # timeouts. Running them sequentially prevents resource contention.
-        # Also includes freenet-ping-types (excluded from main step because
-        # --no-default-features disables its std feature, breaking test code).
         run: |
-          cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
-            -- --test-threads=1 \
-          || cargo test -p freenet-ping-app -p freenet-ping-types --features testing \
-            -- --test-threads=1
+          cargo test -p freenet-ping-app --features testing \
+            --test run_app_blocked_peers -- --test-threads=1 \
+          || cargo test -p freenet-ping-app --features testing \
+            --test run_app_blocked_peers -- --test-threads=1
+
+      - name: Test ping-types
+        if: ${{ !cancelled() }}
+        # freenet-ping-types tests need the std feature (default).
+        # Run separately since the main step uses --no-default-features.
+        run: cargo test -p freenet-ping-types
 
       - name: Test determinism (serial)
         if: ${{ !cancelled() }}
