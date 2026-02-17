@@ -4097,15 +4097,21 @@ impl Drop for SimNetwork {
             clear_current_network_name, clear_topology_snapshots,
         };
         use crate::transport::in_memory_socket::{
-            clear_network_address_mappings, clear_network_sockets,
+            clear_network_address_mappings, remove_network_socket_registry,
+            set_packet_delivery_callback, set_queue_packet_callback,
         };
 
         // Per-network cleanup (safe for parallel tests)
         set_fault_injector(&self.name, None);
         unregister_network_time_source(&self.name);
         clear_topology_snapshots(&self.name);
-        clear_network_sockets(&self.name);
+        remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
+
+        // Clear global callbacks to prevent stale references between
+        // sequential simulation runs (e.g., determinism tests).
+        set_packet_delivery_callback(None);
+        set_queue_packet_callback(None);
 
         // Thread-local cleanup
         clear_current_network_name();

@@ -25,7 +25,8 @@ use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -627,6 +628,41 @@ fn create_runtime() -> tokio::runtime::Runtime {
 // STRICT Determinism Tests - Exact Event Equality
 // =============================================================================
 
+/// Compact fingerprint of a simulation trace for cross-run verification.
+///
+/// Provides a hash-based integrity check on top of field-by-field assertions.
+/// The fingerprint is logged so it can be compared across CI invocations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceFingerprint {
+    total_events: usize,
+    /// Hash of the full event sequence (order-sensitive).
+    sequence_hash: u64,
+    /// Hash of the per-type event counts (order-insensitive via BTreeMap).
+    counts_hash: u64,
+}
+
+impl TraceFingerprint {
+    fn from_events(events: &[String], event_counts: &HashMap<String, usize>) -> Self {
+        let mut seq_hasher = std::collections::hash_map::DefaultHasher::new();
+        for event in events {
+            event.hash(&mut seq_hasher);
+        }
+
+        let sorted_counts: BTreeMap<&String, &usize> = event_counts.iter().collect();
+        let mut counts_hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in &sorted_counts {
+            k.hash(&mut counts_hasher);
+            v.hash(&mut counts_hasher);
+        }
+
+        TraceFingerprint {
+            total_events: events.len(),
+            sequence_hash: seq_hasher.finish(),
+            counts_hash: counts_hasher.finish(),
+        }
+    }
+}
+
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
 ///
 /// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.
@@ -643,9 +679,9 @@ fn create_runtime() -> tokio::runtime::Runtime {
 ///
 /// **Scale:** Uses 2 gateways + 18 nodes to catch DashMap iteration non-determinism
 /// that only manifests at scale (e.g., in subscription/interest management).
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_strict_determinism_exact_event_equality() {
     const SEED: u64 = 0xDE7E_2A1E_1234;
 
@@ -798,18 +834,26 @@ fn test_strict_determinism_exact_event_equality() {
         assert_eq!(e2, e3, "Event sequence differs at index {}!", i);
     }
 
+    // Fingerprint verification: compact hash check for cross-run integrity
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 3 runs",
-        trace1.total_events
+        "STRICT DETERMINISM TEST PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 
 /// **STRICT** determinism test with MULTIPLE GATEWAYS.
 ///
 /// This test verifies that simulations with 2+ gateways remain deterministic.
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_strict_determinism_multi_gateway() {
     const SEED: u64 = 0xAB17_6A7E_1234;
 
@@ -892,9 +936,17 @@ fn test_strict_determinism_multi_gateway() {
         assert_eq!(e2, e3, "Event sequence differs at index {}!", i);
     }
 
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events (2 gateways)",
-        trace1.total_events
+        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events (2 gateways), fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 
@@ -958,9 +1010,18 @@ fn test_deterministic_replay_events() {
     assert_eq!(trace1.event_counts, trace2.event_counts);
     assert_eq!(trace1.total_events, trace2.total_events);
 
+    // Fingerprint verification (counts-only since this test doesn't track sequence)
+    let fp1 = TraceFingerprint::from_events(&[], &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&[], &trace2.event_counts);
+    assert_eq!(
+        fp1.counts_hash, fp2.counts_hash,
+        "Counts fingerprint mismatch between replay runs"
+    );
+
     tracing::info!(
-        "Deterministic replay test passed - {} events",
-        trace1.total_events
+        "Deterministic replay test passed - {} events, counts_hash={:#018x}",
+        trace1.total_events,
+        fp1.counts_hash
     );
 }
 
@@ -1086,9 +1147,9 @@ fn dense_network_replication() {
 // =============================================================================
 
 /// Verify that running the same simulation twice produces identical results.
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_turmoil_determinism_verification() {
     const SEED: u64 = 0xDE7E_2A11_0001;
 
@@ -1139,9 +1200,29 @@ fn test_turmoil_determinism_verification() {
         assert_eq!(e1, e2, "Event {} differs: {:?} vs {:?}", i, e1, e2);
     }
 
+    // Fingerprint verification
+    let counts1: HashMap<String, usize> = {
+        let mut m = HashMap::new();
+        for e in &events1 {
+            *m.entry(e.clone()).or_insert(0) += 1;
+        }
+        m
+    };
+    let counts2: HashMap<String, usize> = {
+        let mut m = HashMap::new();
+        for e in &events2 {
+            *m.entry(e.clone()).or_insert(0) += 1;
+        }
+        m
+    };
+    let fp1 = TraceFingerprint::from_events(&events1, &counts1);
+    let fp2 = TraceFingerprint::from_events(&events2, &counts2);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+
     tracing::info!(
-        "Determinism verified: {} identical events across runs",
-        events1.len()
+        "Determinism verified: {} identical events, fingerprint={:#018x}",
+        events1.len(),
+        fp1.sequence_hash
     );
 }
 
@@ -3718,9 +3799,17 @@ fn test_determinism_parallel_safe() {
     assert_eq!(trace1.event_sequence, trace2.event_sequence);
     assert_eq!(trace2.event_sequence, trace3.event_sequence);
 
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "PARALLEL-SAFE DETERMINISM PASSED: {} events matched across 3 runs",
-        trace1.total_events
+        "PARALLEL-SAFE DETERMINISM PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 

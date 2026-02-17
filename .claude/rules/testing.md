@@ -136,3 +136,45 @@ Common findings: `StateOscillation` (dominant), `StalePeer` during faults,
 `FinalDivergence = 0` (network self-heals).
 
 See: `crates/core/src/tracing/state_verifier.rs`
+
+## Determinism Tests
+
+Determinism tests run the same simulation multiple times with an identical seed
+and assert that every run produces the exact same event trace. They rely on
+nextest's per-process isolation to guarantee clean global state.
+
+### Rules
+
+```
+WHEN writing or modifying a determinism test:
+
+1. Each sequential run MUST use a unique network name
+   (e.g., "test-run1", "test-run2") so per-network cleanup works.
+
+2. Call setup_deterministic_state(seed) at the start of each run.
+
+3. SimNetwork::Drop handles per-network global state cleanup.
+   Do NOT call clear_all_* functions — they break concurrent tests.
+
+4. Use TraceFingerprint for hash-based cross-run verification
+   in addition to field-by-field assertions.
+
+5. nextest runs each test in its own process, so DashMap state
+   from other tests cannot leak into determinism comparisons.
+```
+
+### Running determinism tests
+
+```bash
+# With nextest (recommended — per-process isolation):
+cargo nextest run -p freenet --no-default-features \
+  --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+  -E 'test(determinism)'
+
+# With cargo test (legacy — requires single-threaded execution):
+cargo test -p freenet --features "simulation_tests,testing" \
+  --test simulation_integration -- --test-threads=1 determinism
+```
+
+See: `crates/core/tests/simulation_integration.rs` — `test_strict_determinism_*`,
+`test_turmoil_determinism_*`, `test_deterministic_replay_*`, `test_determinism_parallel_safe`
