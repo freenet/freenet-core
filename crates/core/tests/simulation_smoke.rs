@@ -63,7 +63,6 @@ async fn test_smoke_event_types_consistency() {
         const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
-        GlobalRng::reset_thread_index_counter();
 
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
         sim.with_start_backoff(Duration::from_millis(50));

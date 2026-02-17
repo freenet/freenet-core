@@ -36,7 +36,6 @@ async fn setup_streaming_network(
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
-    GlobalRng::reset_thread_index_counter();
 
     let mut sim = SimNetwork::new(
         name, gateways, nodes, 7,  // ring_max_htl
