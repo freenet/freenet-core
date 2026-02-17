@@ -156,16 +156,13 @@ impl LogFile {
                 Ok(Ok(serialized_data)) => {
                     batch_buf = serialized_data;
                     self.num_writes += batch_writes;
-                    self.batch.clear(); // Clear the batch for new data
                 }
                 Ok(Err(err)) => {
                     tracing::error!("Failed serializing event log batch: {err}");
-                    self.batch.clear();
                     return;
                 }
                 Err(err) => {
                     tracing::error!("Event log serialization task panicked: {err}");
-                    self.batch.clear();
                     return;
                 }
             }
