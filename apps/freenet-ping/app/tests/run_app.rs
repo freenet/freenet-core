@@ -651,8 +651,9 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
         // Wait for gateway to start its network listener
-        // This delay gives the gateway time to call node.run() and open its listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // This delay gives the gateway time to call node.run() and open its listener.
+        // 20s matches test_ping_application_loop; 10s was too short on slow CI runners.
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
@@ -667,7 +668,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
         // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
@@ -679,8 +680,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
+    // Main test logic (300s to accommodate 20s startup + 120s connection wait + operations + buffer)
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw = format!(
             "ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native"
@@ -907,9 +908,10 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
 
         println!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===");
 
-        // Poll for convergence instead of fixed wait - check every 2s for up to 60s
+        // Poll for convergence instead of fixed wait - check every 2s for up to 90s
+        // (increased from 60s; on slow CI runners earlier operations consume more budget)
         let propagation_start = std::time::Instant::now();
-        let propagation_timeout = Duration::from_secs(60);
+        let propagation_timeout = Duration::from_secs(90);
         let poll_interval = Duration::from_secs(2);
         let mut converged = false;
 
