@@ -71,7 +71,7 @@ flatbuffers = "25.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
-toml = "0.9"
+toml = "1.0"
 
 # CLI
 clap = "4"
@@ -133,7 +133,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 gag = "1"
 winapi = "0.3"
 wmi = "0.18.1"
-zip = { version = "7", default-features = false, features = ["deflate", "time"] }
+zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
 freenet-stdlib = "0.1.36"
