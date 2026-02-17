@@ -28,7 +28,7 @@ Is it a unit test?
   → Use mocks: MockNetworkBridge, MockRing
 
 Need deterministic results?
-  → Run with: cargo test -- --test-threads=1
+  → Use GlobalRng seeding (see src/config/mod.rs)
 ```
 
 ### WHEN modifying transport/
@@ -68,6 +68,5 @@ Each file is a state machine:
 
 ```bash
 cargo test -p freenet                           # All tests
-cargo test -p freenet -- --test-threads=1       # Deterministic
 cargo bench --bench transport_perf -- level0    # Quick benchmark
 ```

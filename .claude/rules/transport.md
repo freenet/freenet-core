@@ -196,7 +196,6 @@ USE: LockFreeStreamBuffer (OnceLock<Bytes> array)
 □ Test keep-alive and timeout
 □ Test congestion control at various RTTs
 □ Test streaming with packet loss
-□ Use --test-threads=1 for determinism
 ```
 
 ## Pitfalls to Avoid

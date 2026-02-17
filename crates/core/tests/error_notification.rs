@@ -42,6 +42,7 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 ///
 /// Fixes: #1858
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -104,6 +105,7 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
 /// This test verifies that when a PUT operation fails (e.g., invalid contract),
 /// the client receives an error response rather than hanging indefinitely.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -175,6 +177,7 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
 /// This test verifies that when an UPDATE operation fails (e.g., contract doesn't exist),
 /// the client receives an error response rather than hanging indefinitely.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -242,6 +245,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
 ///
 /// Fixes: #2490
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 180,
     startup_wait_secs = 30,

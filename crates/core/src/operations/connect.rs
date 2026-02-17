@@ -607,6 +607,19 @@ impl RelayContext for RelayEnv<'_> {
     fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool {
         let addr = joiner.socket_addr();
         let location = joiner.location();
+
+        // Check blocklist before capacity. If we block this peer, return false
+        // so the uphill hop mechanism can route to an alternate acceptor.
+        if let Some(blocked) = &self.op_manager.blocked_addresses {
+            if blocked.contains(&addr) {
+                tracing::info!(
+                    joiner_addr = %addr,
+                    "connect: rejecting join from blocked peer at routing level"
+                );
+                return false;
+            }
+        }
+
         self.op_manager
             .ring
             .connection_manager
@@ -1784,13 +1797,19 @@ pub(crate) async fn join_ring_request(
     }
 
     let own = op_manager.ring.connection_manager.own_location();
-    // Use a random desired_location so the gateway routes to diverse ring peers
-    // instead of always forwarding to its single closest neighbor (which caused
-    // cascading failures at scale when all joiners converged on one acceptor).
-    // A random location also varies on each retry, preventing deterministic routing
-    // to the same unreachable peer. Ring-optimal connections are established later
-    // through connection_maintenance/adjust_topology once the peer has bootstrapped.
-    let desired_location = Location::random();
+    // Use the joiner's own location as the desired_location for the connect request.
+    //
+    // History: PR #2907 fixed a critical issue where using `gateway.location()` caused
+    // 99.7% of join requests to converge on a single acceptor. That PR intended to use
+    // the joiner's own location but implemented `Location::random()` instead, which
+    // broke simulation determinism for certain seeds (issues #3028, #3030).
+    //
+    // Using `own.location()` is correct because:
+    // - Each joiner has a unique location → requests spread across gateway neighbors
+    // - The gateway routes toward the joiner's ring neighborhood → better initial placement
+    // - Deterministic in simulation tests (same seed → same location → same topology)
+    // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
+    let desired_location = own.location().unwrap_or_else(Location::random);
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -1890,7 +1909,7 @@ pub(crate) async fn initial_join_procedure(
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
                 // Design note: We track backoff per-gateway because join_ring_request uses
-                // a random desired_location each time. Backing off the gateway gives the
+                // the joiner's own desired_location each time. Backing off the gateway gives the
                 // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();

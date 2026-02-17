@@ -57,8 +57,7 @@ Test failed?
 
 ```
 Running simulation tests?
-  → Use: cargo test -p freenet -- --test-threads=1
-  → Why: Ensures deterministic scheduling
+  → Use: cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration
 
 Running all tests?
   → Use: cargo test -p freenet

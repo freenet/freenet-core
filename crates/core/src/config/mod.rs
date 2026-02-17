@@ -1685,18 +1685,11 @@ impl GlobalExecutor {
 use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
 
-/// Counter for deterministic thread indexing.
-/// Each thread gets a unique, deterministic index for RNG seeding.
 static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// Thread-local seeded RNG for deterministic operations.
-// Each thread gets its own RNG seeded from the seed + deterministic thread index.
 std::thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
-    // Deterministic thread index assigned at first RNG access
     static THREAD_INDEX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    // Thread-local seed for deterministic simulation testing.
-    // Each thread gets its own seed, ensuring parallel tests are fully isolated.
     static THREAD_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1772,36 +1765,22 @@ impl GlobalRng {
     ///
     /// This is purely thread-local — parallel tests on different threads are fully isolated.
     pub fn set_seed(seed: u64) {
-        // Set thread-local seed for test isolation. This prevents parallel tests from
-        // interfering with each other's RNG sequences.
-        // See: https://github.com/freenet/freenet-core/issues/2733
         THREAD_SEED.with(|s| s.set(Some(seed)));
-        // Clear thread-local RNG so it gets re-seeded with the new seed
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
+        // Pin thread index to 0 so the derived RNG seed is deterministic
+        // regardless of which OS thread runs this test (see #2733).
+        THREAD_INDEX.with(|idx| idx.set(Some(0)));
     }
 
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
-        // Clear thread-local seed
         THREAD_SEED.with(|s| s.set(None));
-        // Clear thread-local RNG
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-    }
-
-    /// Resets the thread index counter for deterministic simulation.
-    ///
-    /// **Warning:** This function should NOT be called in parallel test environments.
-    /// Resetting the global counter while other tests are running causes race conditions
-    /// that break determinism. See issue #2733 for details.
-    ///
-    /// This is only safe to call when you have exclusive control over all threads
-    /// using GlobalRng (e.g., single-threaded tests with `--test-threads=1`).
-    pub fn reset_thread_index_counter() {
-        THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        THREAD_INDEX.with(|idx| idx.set(None));
     }
 
     /// Returns the deterministic thread index for the current thread.
@@ -1879,20 +1858,8 @@ impl GlobalRng {
             THREAD_RNG.with(|rng_cell| {
                 let mut rng_ref = rng_cell.borrow_mut();
                 if rng_ref.is_none() {
-                    // Use deterministic thread index for reproducibility
-                    // Thread IDs are not stable across runs, so we use a counter
-                    let thread_index = THREAD_INDEX.with(|idx| {
-                        if let Some(i) = idx.get() {
-                            i
-                        } else {
-                            let new_idx = THREAD_INDEX_COUNTER
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            idx.set(Some(new_idx));
-                            new_idx
-                        }
-                    });
                     let thread_seed =
-                        seed.wrapping_add(thread_index.wrapping_mul(0x9E3779B97F4A7C15));
+                        seed.wrapping_add(Self::thread_index().wrapping_mul(0x9E3779B97F4A7C15));
                     *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
                 }
                 f(rng_ref.as_mut().unwrap())
@@ -2507,5 +2474,21 @@ mod tests {
         let config2: NetworkApiConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config2.congestion_control, "bbr");
         assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
+    }
+
+    #[test]
+    fn test_set_seed_pins_thread_index_to_zero() {
+        GlobalRng::clear_seed();
+
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        assert_eq!(GlobalRng::thread_index(), 0);
+
+        // Same seed produces same RNG output
+        let val1 = GlobalRng::random_u64();
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        let val2 = GlobalRng::random_u64();
+        assert_eq!(val1, val2);
+
+        GlobalRng::clear_seed();
     }
 }

@@ -162,6 +162,7 @@ async fn send_put_with_retry(
 
 /// Test PUT operation across two peers (gateway and peer)
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -267,6 +268,7 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -461,6 +463,7 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 /// Test that a second PUT to an already cached contract persists the merged state.
 /// This is a regression test for issue #1995.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -615,6 +618,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 // Re-enabled to verify if the flakiness (issue #1798, #2494) has been resolved.
 // The test expects multiple clients across different nodes to receive subscription updates.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
     startup_wait_secs = 40,
@@ -660,41 +664,83 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     let (stream3, _) = connect_async(&uri_b).await?;
     let mut client_api_node_b = WebApi::start(stream3);
 
-    // First client puts contract with initial state (without subscribing)
-    tracing::info!(
-        "Client 1: Starting PUT operation (elapsed: {:?})",
-        start_time.elapsed()
-    );
-    make_put(
-        &mut client_api1_node_a,
-        wrapped_state.clone(),
-        contract.clone(),
-        false, // subscribe=false - no automatic subscription
-    )
-    .await?;
+    // First client puts contract with initial state (without subscribing).
+    // Retry up to 3 times — under CI resource pressure, peer connections can
+    // drop during the first PUT attempt before the mesh is fully stable.
+    const PUT_MAX_ATTEMPTS: usize = 3;
+    let mut put_last_err: Option<anyhow::Error> = None;
+    for put_attempt in 1..=PUT_MAX_ATTEMPTS {
+        tracing::info!(
+            "Client 1: Starting PUT attempt {}/{} (elapsed: {:?})",
+            put_attempt,
+            PUT_MAX_ATTEMPTS,
+            start_time.elapsed()
+        );
+        if let Err(e) = make_put(
+            &mut client_api1_node_a,
+            wrapped_state.clone(),
+            contract.clone(),
+            false, // subscribe=false - no automatic subscription
+        )
+        .await
+        {
+            put_last_err = Some(e);
+            tracing::warn!(
+                "Client 1: PUT send failed on attempt {}, retrying...",
+                put_attempt
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
-    // Wait for put response
-    loop {
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                tracing::info!(
-                    "Client 1: PUT completed successfully (elapsed: {:?})",
-                    start_time.elapsed()
-                );
+        // Wait for put response, draining stale messages
+        let mut put_succeeded = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
                 break;
             }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for put response");
+            match tokio::time::timeout(remaining, client_api1_node_a.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                    tracing::info!(
+                        "Client 1: PUT completed successfully on attempt {} (elapsed: {:?})",
+                        put_attempt,
+                        start_time.elapsed()
+                    );
+                    put_succeeded = true;
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!("unexpected response while waiting for put: {:?}", other);
+                }
+                Ok(Err(e)) => {
+                    put_last_err = Some(anyhow::anyhow!("Error receiving put response: {}", e));
+                    break;
+                }
+                Err(_) => {
+                    put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
+                    break;
+                }
             }
         }
+
+        if put_succeeded {
+            put_last_err = None;
+            break;
+        }
+
+        tracing::warn!(
+            "Client 1: PUT attempt {} failed: {}; retrying after delay...",
+            put_attempt,
+            put_last_err.as_ref().unwrap()
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if let Some(e) = put_last_err {
+        bail!("PUT failed after {} attempts: {}", PUT_MAX_ATTEMPTS, e);
     }
 
     // Explicitly subscribe client 1 to the contract using make_subscribe
@@ -1184,6 +1230,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -1442,6 +1489,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
 // FIXME Update notification is not received
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -1908,6 +1956,7 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 /// The PUT response should arrive only after the subscription is established.
 /// No SubscribeResponse should leak to the client (subscription is a sub-operation).
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
     startup_wait_secs = 30,
@@ -2009,6 +2058,7 @@ async fn test_put_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 /// Tests that GET with blocking_subscribe=true completes successfully.
 /// The GET response should arrive and no SubscribeResponse should leak.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
     startup_wait_secs = 30,
@@ -2124,6 +2174,7 @@ async fn test_get_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "client-node"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -2313,6 +2364,7 @@ fn expected_three_hop_locations() -> [f64; 3] {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a", "peer-c"],
     gateways = ["gateway"],
     node_configs = {
@@ -2473,6 +2525,7 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-node"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -2543,6 +2596,7 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -2663,6 +2717,7 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 // - startup_wait_secs: 15s to allow nodes to fully start and establish connections
 // - tokio_worker_threads: 4 to provide adequate concurrency for multi-node test
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -2922,6 +2977,7 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 /// 2. Client immediately does Subscribe (before propagation to other peers)
 /// 3. Subscribe should succeed locally without network round-trip
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
     startup_wait_secs = 30,
@@ -3057,6 +3113,7 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 /// 2. Gateway has no peers to forward to
 /// 3. Gateway should immediately return NotFound to the client
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 5,
@@ -3175,6 +3232,7 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
 ///
 /// The fix compares old stored state with new stored state instead.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
     startup_wait_secs = 30,
@@ -3512,6 +3570,7 @@ enum DelegateCommandResponse {
 /// 5. The delegate issues an UpdateContractRequest with new state
 /// 6. A direct GET confirms the updated state
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 300,
     startup_wait_secs = 20,
@@ -3740,6 +3799,7 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// 4. The runtime fetches the state and sends GetContractResponse back to the delegate
 /// 5. The delegate wraps the result as an ApplicationMessage
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 300,
     startup_wait_secs = 20,

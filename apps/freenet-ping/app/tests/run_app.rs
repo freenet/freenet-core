@@ -651,8 +651,9 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Start client node 1 with delay to ensure gateway is running
     let node1 = async move {
         // Wait for gateway to start its network listener
-        // This delay gives the gateway time to call node.run() and open its listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // This delay gives the gateway time to call node.run() and open its listener.
+        // 20s matches test_ping_application_loop; 10s was too short on slow CI runners.
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
@@ -667,7 +668,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
         // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
@@ -679,8 +680,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
+    // Main test logic (300s to accommodate 20s startup + 120s connection wait + operations + buffer)
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw = format!(
             "ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native"
@@ -700,8 +701,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract
@@ -834,9 +835,41 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         println!("=== ALL SUBSCRIPTIONS COMPLETED ===");
         println!("All nodes are now subscribed and should receive all updates regardless of ring location");
 
-        // Brief delay for subscription system to activate
-        println!("Waiting 2 seconds for subscription system to stabilize...");
-        sleep(Duration::from_secs(2)).await;
+        // Verify subscription propagation before starting updates.
+        // SubscribeResponse only means the local node accepted the subscription.
+        // The subscription tree across the network may not be fully built yet.
+        // Send a probe update from the gateway and verify both peers receive
+        // the UpdateNotification, confirming end-to-end subscription propagation.
+        println!("Verifying subscription propagation with probe update...");
+        {
+            let mut probe = Ping::default();
+            probe.insert("probe".to_string());
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::State(State::from(
+                        serde_json::to_vec(&probe).unwrap(),
+                    )),
+                }))
+                .await?;
+            // Wait for gateway's own UpdateResponse (confirms update was accepted)
+            wait_for_update_response(&mut client_gw, &contract_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Gateway: probe update accepted");
+
+            // Wait for both peers to receive the UpdateNotification (60s each)
+            wait_for_update_notification(&mut client_node1, &contract_key, 60)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Node 1: received probe notification - subscription propagation confirmed");
+
+            wait_for_update_notification(&mut client_node2, &contract_key, 60)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("Node 2: received probe notification - subscription propagation confirmed");
+        }
+        println!("Subscription propagation verified! Starting update rounds...");
 
         // Step 5: All nodes send multiple updates to build history for eventual consistency testing
 
@@ -907,9 +940,10 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
 
         println!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===");
 
-        // Poll for convergence instead of fixed wait - check every 2s for up to 60s
+        // Poll for convergence instead of fixed wait - check every 2s for up to 90s
+        // (increased from 60s; on slow CI runners earlier operations consume more budget)
         let propagation_start = std::time::Instant::now();
-        let propagation_timeout = Duration::from_secs(60);
+        let propagation_timeout = Duration::from_secs(90);
         let poll_interval = Duration::from_secs(2);
         let mut converged = false;
 
@@ -1379,8 +1413,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic (240s timeout to accommodate 20s startup delay + 30s test + buffer for slow CI)
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
+    // Main test logic (360s: 20s startup + 180s connection wait + operations + buffer)
+    let test = tokio::time::timeout(Duration::from_secs(360), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -1397,8 +1431,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract

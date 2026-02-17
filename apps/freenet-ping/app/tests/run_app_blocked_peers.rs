@@ -1,6 +1,6 @@
 //! # Blocked Peers Tests
 //!
-//! This file implements a parameterized test framework for the "blocked peers" scenario
+//! Tests that contract updates propagate via gateway when direct peer connections are blocked.
 //! in Freenet, where direct peer-to-peer connections between certain nodes are intentionally
 //! blocked. The tests verify that contract state updates can propagate via gateway nodes
 //! when direct connections aren't available.
@@ -330,8 +330,9 @@ async fn run_blocked_peers_test_inner(
 
         // Wait for nodes to connect to the network before proceeding with operations
         tracing::info!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        // 180s for ring connection on slow CI runners (120s was insufficient)
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         tracing::info!("All nodes connected to the network!");
 
         // Compile/load contract code (same helper used by other app tests)
