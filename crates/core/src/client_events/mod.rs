@@ -1929,7 +1929,7 @@ pub(crate) mod test {
         }
 
         /// Wraps a generated request into an `OpenRequest`, attaching a notification
-        /// channel when the request is a Subscribe or Put-with-subscribe.
+        /// channel when the request is a Subscribe, Put-with-subscribe, or Get-with-subscribe.
         fn build_open_request(
             &mut self,
             request: Box<ClientRequest<'static>>,
@@ -1937,6 +1937,9 @@ pub(crate) mod test {
             let notification_channel = match request.as_ref() {
                 ClientRequest::ContractOp(ContractRequest::Subscribe { .. })
                 | ClientRequest::ContractOp(ContractRequest::Put {
+                    subscribe: true, ..
+                })
+                | ClientRequest::ContractOp(ContractRequest::Get {
                     subscribe: true, ..
                 }) => {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
