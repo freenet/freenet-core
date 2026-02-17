@@ -1797,18 +1797,9 @@ impl GlobalRng {
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-    }
-
-    /// Resets the thread index counter for deterministic simulation.
-    ///
-    /// **Warning:** This function should NOT be called in parallel test environments.
-    /// Resetting the global counter while other tests are running causes race conditions
-    /// that break determinism. See issue #2733 for details.
-    ///
-    /// This is only safe to call when you have exclusive control over all threads
-    /// using GlobalRng (e.g., single-threaded tests with `--test-threads=1`).
-    pub fn reset_thread_index_counter() {
-        THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Reset thread index so the thread picks up a fresh index from the
+        // global counter if it later re-enters seeded mode.
+        THREAD_INDEX.with(|idx| idx.set(None));
     }
 
     /// Returns the deterministic thread index for the current thread.
