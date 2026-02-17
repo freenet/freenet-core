@@ -5,10 +5,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc, LazyLock,
-    },
+    sync::{atomic::AtomicBool, Arc, LazyLock},
     time::Duration,
 };
 
@@ -128,7 +125,7 @@ impl Default for ConfigArgs {
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
-                ws_api_port: Some(default_http_gateway_port()),
+                ws_api_port: Some(default_ws_api_port()),
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
             },
@@ -546,10 +543,7 @@ impl ConfigArgs {
                         _ => addr,
                     }
                 },
-                port: self
-                    .ws_api
-                    .ws_api_port
-                    .unwrap_or(default_http_gateway_port()),
+                port: self.ws_api.ws_api_port.unwrap_or(default_ws_api_port()),
                 token_ttl_seconds: self
                     .ws_api
                     .token_ttl_seconds
@@ -1232,7 +1226,7 @@ pub struct WebsocketApiConfig {
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_http_gateway_port", rename = "ws-api-port")]
+    #[serde(default = "default_ws_api_port", rename = "ws-api-port")]
     pub port: u16,
 
     /// Token time-to-live in seconds
@@ -1273,7 +1267,7 @@ impl Default for WebsocketApiConfig {
     fn default() -> Self {
         Self {
             address: default_listening_address(),
-            port: default_http_gateway_port(),
+            port: default_ws_api_port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
         }
@@ -1291,7 +1285,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-const fn default_http_gateway_port() -> u16 {
+const fn default_ws_api_port() -> u16 {
     7509
 }
 
@@ -1688,27 +1682,14 @@ impl GlobalExecutor {
 // GlobalRng - Deterministic RNG abstraction for simulation testing
 // =============================================================================
 
-use parking_lot::Mutex;
 use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
 
-/// Global seed for deterministic simulation.
-/// Set this before any RNG operations to ensure reproducibility.
-/// Note: For test isolation, prefer using set_seed() which sets the thread-local seed.
-static SIMULATION_SEED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
-
-/// Counter for deterministic thread indexing.
-/// Each thread gets a unique, deterministic index for RNG seeding.
 static THREAD_INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// Thread-local seeded RNG for deterministic operations.
-// Each thread gets its own RNG seeded from the seed + deterministic thread index.
 std::thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SmallRng>> = const { std::cell::RefCell::new(None) };
-    // Deterministic thread index assigned at first RNG access
     static THREAD_INDEX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    // Thread-local seed for test isolation. When set, takes precedence over SIMULATION_SEED.
-    // This prevents parallel tests from interfering with each other's RNG sequences.
     static THREAD_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1774,58 +1755,52 @@ impl Drop for SeedGuard {
 }
 
 impl GlobalRng {
-    /// Sets the global seed for deterministic RNG.
+    /// Sets the thread-local seed for deterministic RNG.
     ///
     /// **Warning:** For test isolation, prefer `scoped_seed()` or `seed_guard()`
     /// which automatically clean up the seed state.
     ///
     /// Call this at test/simulation startup for reproducibility.
     /// Must call `clear_seed()` when done to avoid affecting other tests.
+    ///
+    /// This is purely thread-local — parallel tests on different threads are fully isolated.
     pub fn set_seed(seed: u64) {
-        // Set thread-local seed for test isolation. This prevents parallel tests from
-        // interfering with each other's RNG sequences.
-        // See: https://github.com/freenet/freenet-core/issues/2733
         THREAD_SEED.with(|s| s.set(Some(seed)));
-        // Also set global seed for code that spawns new threads (they'll inherit the seed)
-        *SIMULATION_SEED.lock() = Some(seed);
-        // Clear thread-local RNG so it gets re-seeded with the new seed
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        // NOTE: We intentionally do NOT reset THREAD_INDEX_COUNTER or clear THREAD_INDEX.
-        // Thread indices remain stable across set_seed() calls to ensure determinism.
+        // Pin thread index to 0 so the derived RNG seed is deterministic
+        // regardless of which OS thread runs this test (see #2733).
+        THREAD_INDEX.with(|idx| idx.set(Some(0)));
     }
 
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
-        // Clear thread-local seed
         THREAD_SEED.with(|s| s.set(None));
-        // Clear global seed
-        *SIMULATION_SEED.lock() = None;
-        // Clear thread-local RNG
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
-        // NOTE: We do NOT reset THREAD_INDEX_COUNTER here to avoid race conditions
-        // with parallel tests. Thread indices remain stable. See set_seed() for details.
+        THREAD_INDEX.with(|idx| idx.set(None));
     }
 
-    /// Resets the thread index counter for deterministic simulation.
+    /// Returns the deterministic thread index for the current thread.
     ///
-    /// **Warning:** This function should NOT be called in parallel test environments.
-    /// Resetting the global counter while other tests are running causes race conditions
-    /// that break determinism. See issue #2733 for details.
-    ///
-    /// This is only safe to call when you have exclusive control over all threads
-    /// using GlobalRng (e.g., single-threaded tests with `--test-threads=1`).
-    pub fn reset_thread_index_counter() {
-        THREAD_INDEX_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    /// Each thread gets a unique index from the global `THREAD_INDEX_COUNTER`.
+    /// This is used by thread-local ID counters to compute non-overlapping offset blocks.
+    pub fn thread_index() -> u64 {
+        THREAD_INDEX.with(|c| match c.get() {
+            Some(idx) => idx,
+            None => {
+                let idx = THREAD_INDEX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                c.set(Some(idx));
+                idx
+            }
+        })
     }
 
-    /// Returns true if a simulation seed is set (either thread-local or global).
+    /// Returns true if a simulation seed is set for the current thread.
     pub fn is_seeded() -> bool {
-        // Check thread-local seed first, then global
-        THREAD_SEED.with(|s| s.get()).is_some() || SIMULATION_SEED.lock().is_some()
+        THREAD_SEED.with(|s| s.get()).is_some()
     }
 
     /// Creates a RAII guard that sets the seed and clears it on drop.
@@ -1867,38 +1842,24 @@ impl GlobalRng {
         f()
     }
 
-    /// Executes a closure with access to the global RNG.
-    /// Uses seeded RNG if set (thread-local or global), otherwise system RNG.
+    /// Executes a closure with access to the RNG.
+    /// Uses seeded RNG if set via `set_seed()`, otherwise system RNG.
     #[inline]
     pub fn with_rng<F, R>(f: F) -> R
     where
         F: FnOnce(&mut dyn RngCore) -> R,
     {
-        // Check thread-local seed first for test isolation, then fall back to global seed.
-        // This prevents parallel tests from interfering with each other's RNG sequences.
-        let seed = THREAD_SEED
-            .with(|s| s.get())
-            .or_else(|| *SIMULATION_SEED.lock());
+        // Thread-local seed only — no global fallback. This ensures parallel tests
+        // on different threads are fully isolated.
+        let seed = THREAD_SEED.with(|s| s.get());
 
         if let Some(seed) = seed {
             // Simulation mode: use thread-local seeded RNG
             THREAD_RNG.with(|rng_cell| {
                 let mut rng_ref = rng_cell.borrow_mut();
                 if rng_ref.is_none() {
-                    // Use deterministic thread index for reproducibility
-                    // Thread IDs are not stable across runs, so we use a counter
-                    let thread_index = THREAD_INDEX.with(|idx| {
-                        if let Some(i) = idx.get() {
-                            i
-                        } else {
-                            let new_idx = THREAD_INDEX_COUNTER
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            idx.set(Some(new_idx));
-                            new_idx
-                        }
-                    });
                     let thread_seed =
-                        seed.wrapping_add(thread_index.wrapping_mul(0x9E3779B97F4A7C15));
+                        seed.wrapping_add(Self::thread_index().wrapping_mul(0x9E3779B97F4A7C15));
                     *rng_ref = Some(SmallRng::seed_from_u64(thread_seed));
                 }
                 f(rng_ref.as_mut().unwrap())
@@ -1968,14 +1929,11 @@ impl GlobalRng {
 // Global Simulation Time
 // =============================================================================
 
-/// Global simulation time base in milliseconds since Unix epoch.
-/// When set, ULID generation uses this instead of system time.
-/// Combined with GlobalRng seeding, this allows fully deterministic transaction IDs.
-static SIMULATION_TIME_MS: LazyLock<Mutex<Option<u64>>> = LazyLock::new(|| Mutex::new(None));
-
-/// Counter for deterministic time progression within a single millisecond.
-/// Increments with each ULID generation to ensure uniqueness.
-static SIMULATION_TIME_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Thread-local simulation time: allows parallel simulation tests without interference.
+std::thread_local! {
+    static SIMULATION_TIME_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static SIMULATION_TIME_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Global simulation time configuration for deterministic testing.
 ///
@@ -1999,18 +1957,18 @@ static SIMULATION_TIME_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct GlobalSimulationTime;
 
 impl GlobalSimulationTime {
-    /// Sets the global simulation time base in milliseconds since Unix epoch.
+    /// Sets the simulation time base in milliseconds since Unix epoch (thread-local).
     ///
-    /// All subsequent ULID generations will use this time (with auto-increment).
+    /// All subsequent ULID generations on this thread will use this time (with auto-increment).
     pub fn set_time_ms(time_ms: u64) {
-        *SIMULATION_TIME_MS.lock() = Some(time_ms);
-        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        SIMULATION_TIME_MS.with(|t| t.set(Some(time_ms)));
+        SIMULATION_TIME_COUNTER.with(|c| c.set(0));
     }
 
-    /// Clears the simulation time, reverting to system time.
+    /// Clears the simulation time, reverting to system time (thread-local).
     pub fn clear_time() {
-        *SIMULATION_TIME_MS.lock() = None;
-        SIMULATION_TIME_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        SIMULATION_TIME_MS.with(|t| t.set(None));
+        SIMULATION_TIME_COUNTER.with(|c| c.set(0));
     }
 
     /// Returns the current time in milliseconds for ULID generation.
@@ -2018,18 +1976,22 @@ impl GlobalSimulationTime {
     /// If simulation time is set, returns simulation time + counter increment.
     /// Otherwise, returns real system time.
     pub fn current_time_ms() -> u64 {
-        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
-            // Deterministic time: base + counter for uniqueness
-            let counter = SIMULATION_TIME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            base_time.saturating_add(counter)
-        } else {
-            // Production: use real system time
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_millis() as u64
-        }
+        SIMULATION_TIME_MS.with(|t| {
+            if let Some(base_time) = t.get() {
+                let counter = SIMULATION_TIME_COUNTER.with(|c| {
+                    let val = c.get();
+                    c.set(val + 1);
+                    val
+                });
+                base_time.saturating_add(counter)
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time before unix epoch")
+                    .as_millis() as u64
+            }
+        })
     }
 
     /// Returns the current time in milliseconds WITHOUT incrementing the counter.
@@ -2037,23 +1999,23 @@ impl GlobalSimulationTime {
     /// Use this for read-only time checks like elapsed time calculations.
     /// For ULID generation, use `current_time_ms()` which ensures uniqueness.
     pub fn read_time_ms() -> u64 {
-        if let Some(base_time) = *SIMULATION_TIME_MS.lock() {
-            // Return base time + current counter (without incrementing)
-            let counter = SIMULATION_TIME_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
-            base_time.saturating_add(counter)
-        } else {
-            // Production: use real system time
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_millis() as u64
-        }
+        SIMULATION_TIME_MS.with(|t| {
+            if let Some(base_time) = t.get() {
+                let counter = SIMULATION_TIME_COUNTER.with(|c| c.get());
+                base_time.saturating_add(counter)
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time before unix epoch")
+                    .as_millis() as u64
+            }
+        })
     }
 
-    /// Returns true if simulation time is set.
+    /// Returns true if simulation time is set (thread-local).
     pub fn is_simulation_time() -> bool {
-        SIMULATION_TIME_MS.lock().is_some()
+        SIMULATION_TIME_MS.with(|t| t.get().is_some())
     }
 
     /// Generates a deterministic ULID using GlobalRng and simulation time.
@@ -2103,17 +2065,12 @@ impl GlobalSimulationTime {
 // Global Test Metrics (for simulation testing)
 // =============================================================================
 
-/// Global counter for ResyncRequests received across all nodes.
-/// Used in simulation tests to verify correct summary caching behavior.
-static GLOBAL_RESYNC_REQUESTS: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for delta sends across all nodes.
-/// Incremented when a state change broadcast uses delta encoding.
-static GLOBAL_DELTA_SENDS: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for full state sends across all nodes.
-/// Incremented when a state change broadcast sends full state (not delta).
-static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
+// Thread-local test metrics: allows parallel simulation tests without interference.
+std::thread_local! {
+    static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Global test metrics for tracking events across the simulation network.
 ///
@@ -2137,44 +2094,44 @@ static GLOBAL_FULL_STATE_SENDS: AtomicU64 = AtomicU64::new(0);
 pub struct GlobalTestMetrics;
 
 impl GlobalTestMetrics {
-    /// Resets all test metrics to zero. Call at the start of each test.
+    /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
-        GLOBAL_RESYNC_REQUESTS.store(0, std::sync::atomic::Ordering::SeqCst);
-        GLOBAL_DELTA_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
-        GLOBAL_FULL_STATE_SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
+        GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
     /// Called from production code when handling ResyncRequest messages.
     pub fn record_resync_request() {
-        GLOBAL_RESYNC_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of ResyncRequests received since last reset.
     pub fn resync_requests() -> u64 {
-        GLOBAL_RESYNC_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
     }
 
     /// Records that a delta was sent in a state change broadcast.
     /// Called from p2p_protoc.rs when sent_delta = true.
     pub fn record_delta_send() {
-        GLOBAL_DELTA_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of delta sends since last reset.
     pub fn delta_sends() -> u64 {
-        GLOBAL_DELTA_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
     /// Records that full state was sent in a state change broadcast.
     /// Called from p2p_protoc.rs when sent_delta = false.
     pub fn record_full_state_send() {
-        GLOBAL_FULL_STATE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
-        GLOBAL_FULL_STATE_SENDS.load(std::sync::atomic::Ordering::SeqCst)
+        GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
     }
 }
 
@@ -2517,5 +2474,21 @@ mod tests {
         let config2: NetworkApiConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config2.congestion_control, "bbr");
         assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
+    }
+
+    #[test]
+    fn test_set_seed_pins_thread_index_to_zero() {
+        GlobalRng::clear_seed();
+
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        assert_eq!(GlobalRng::thread_index(), 0);
+
+        // Same seed produces same RNG output
+        let val1 = GlobalRng::random_u64();
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        let val2 = GlobalRng::random_u64();
+        assert_eq!(val1, val2);
+
+        GlobalRng::clear_seed();
     }
 }

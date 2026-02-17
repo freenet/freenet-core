@@ -10,8 +10,8 @@ use freenet_stdlib::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
+use std::cell::Cell;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
@@ -49,17 +49,29 @@ pub type HostResult = Result<HostResponse, ClientError>;
 #[repr(transparent)]
 pub struct RequestId(u64);
 
-static REQUEST_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+const COUNTER_BLOCK: u64 = 1_000_000;
+
+thread_local! {
+    static REQUEST_ID_COUNTER: Cell<u64> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(1 + idx * COUNTER_BLOCK)
+    };
+}
 
 impl RequestId {
     pub fn new() -> Self {
-        Self(REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
+        Self(REQUEST_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
-    /// Reset the request ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the request ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        REQUEST_ID_COUNTER.store(1, Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        REQUEST_ID_COUNTER.with(|c| c.set(1 + idx * COUNTER_BLOCK));
     }
 }
 
@@ -85,19 +97,29 @@ impl From<ClientId> for usize {
     }
 }
 
-static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+thread_local! {
+    static CLIENT_ID_COUNTER: Cell<usize> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        Cell::new(1 + (idx as usize) * (COUNTER_BLOCK as usize))
+    };
+}
 
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
 
     pub fn next() -> Self {
-        ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        ClientId(CLIENT_ID_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        }))
     }
 
-    /// Reset the client ID counter to initial state.
-    /// Used for deterministic simulation testing.
+    /// Reset the client ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
-        CLIENT_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = crate::config::GlobalRng::thread_index();
+        CLIENT_ID_COUNTER.with(|c| c.set(1 + (idx as usize) * (COUNTER_BLOCK as usize)));
     }
 }
 
@@ -1816,6 +1838,10 @@ pub(crate) mod test {
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
+        /// Keeps subscription notification receivers alive so the sender half
+        /// (passed as `notification_channel`) isn't immediately broken.
+        #[allow(dead_code)]
+        subscription_receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<HostResult>>,
     }
 
     impl<R> MemoryEventsGen<R>
@@ -1833,6 +1859,7 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
+                subscription_receivers: Vec::new(),
             }
         }
 
@@ -1883,6 +1910,7 @@ pub(crate) mod test {
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
+                subscription_receivers: Vec::new(),
             }
         }
     }
@@ -1896,8 +1924,39 @@ pub(crate) mod test {
             self.events_to_gen.extend(events)
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'_>> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'static>> {
             self.events_to_gen.remove(id)
+        }
+
+        /// Wraps a generated request into an `OpenRequest`, attaching a notification
+        /// channel when the request is a Subscribe, Put-with-subscribe, or Get-with-subscribe.
+        fn build_open_request(
+            &mut self,
+            request: Box<ClientRequest<'static>>,
+        ) -> OpenRequest<'static> {
+            let notification_channel = match request.as_ref() {
+                ClientRequest::ContractOp(ContractRequest::Subscribe { .. })
+                | ClientRequest::ContractOp(ContractRequest::Put {
+                    subscribe: true, ..
+                })
+                | ClientRequest::ContractOp(ContractRequest::Get {
+                    subscribe: true, ..
+                }) => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    self.subscription_receivers.push(rx);
+                    Some(tx)
+                }
+                _ => None,
+            };
+            OpenRequest {
+                client_id: ClientId::FIRST,
+                request_id: RequestId::new(),
+                request,
+                notification_channel,
+                token: None,
+                attested_contract: None,
+            }
+            .into_owned()
         }
     }
 
@@ -1911,32 +1970,16 @@ pub(crate) mod test {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
                         if self.rng.is_some() && pk == self.key {
-                            let res = OpenRequest {
-                                client_id: ClientId::FIRST,
-                                request_id: RequestId::new(),
-                                request: self
-                                    .generate_rand_event()
-                                    .await
-                                    .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
-                                    .into(),
-                                notification_channel: None,
-                                token: None,
-                                attested_contract: None,
-                            };
-                            return Ok(res.into_owned());
+                            let request = self
+                                .generate_rand_event()
+                                .await
+                                .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?;
+                            return Ok(self.build_open_request(request.into()));
                         } else if pk == self.key {
-                            let res = OpenRequest {
-                                client_id: ClientId::FIRST,
-                                request_id: RequestId::new(),
-                                request: self
-                                    .generate_deterministic_event(&ev_id)
-                                    .expect("event not found")
-                                    .into(),
-                                notification_channel: None,
-                                token: None,
-                                attested_contract: None,
-                            };
-                            return Ok(res.into_owned());
+                            let request = self
+                                .generate_deterministic_event(&ev_id)
+                                .expect("event not found");
+                            return Ok(self.build_open_request(request.into()));
                         }
                     } else {
                         // probably the process finished, wait for a bit and then kill the thread
@@ -2015,22 +2058,16 @@ pub(crate) mod test {
                             {
                                 tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
                                 if pub_key == self.id {
-                                    let res = OpenRequest {
-                                        client_id: ClientId::FIRST,
-                                        request_id: RequestId::new(),
-                                        request: self
-                                            .memory_event_generator
-                                            .generate_rand_event()
-                                            .await
-                                            .ok_or_else(|| {
-                                                ClientError::from(ErrorKind::Disconnect)
-                                            })?
-                                            .into(),
-                                        notification_channel: None,
-                                        token: None,
-                                        attested_contract: None,
-                                    };
-                                    return Ok(res.into_owned());
+                                    let request = self
+                                        .memory_event_generator
+                                        .generate_rand_event()
+                                        .await
+                                        .ok_or_else(|| {
+                                            ClientError::from(ErrorKind::Disconnect)
+                                        })?;
+                                    return Ok(self
+                                        .memory_event_generator
+                                        .build_open_request(request.into()));
                                 }
                             } else {
                                 continue;

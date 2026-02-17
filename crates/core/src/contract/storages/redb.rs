@@ -338,6 +338,54 @@ impl ReDb {
         }
     }
 
+    /// Store a contract's state synchronously.
+    ///
+    /// This is the same as `StateStorage::store` but without the async wrapper
+    /// and **without hosting metadata updates**. States written through this path
+    /// will not have `last_access_ms`, `access_type`, `state_size`, or `code_hash`
+    /// metadata tracked, meaning they won't be part of the hosting cache on restart.
+    ///
+    /// Used by V2 delegate host functions that need synchronous writes during
+    /// WASM `process()` execution. Hosting metadata integration is a follow-up.
+    pub fn store_state_sync(
+        &self,
+        key: &ContractKey,
+        state: WrappedState,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(STATE_TABLE)?;
+            tbl.insert(key.as_bytes(), state.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Atomically update a contract's state, failing if no prior state exists.
+    ///
+    /// Performs the existence check and write in a single write transaction to
+    /// eliminate the TOCTOU window that would exist with separate read + write.
+    /// Used by V2 delegate UPDATE host function.
+    ///
+    /// **Does not update hosting metadata** (same caveat as `store_state_sync`).
+    pub fn update_state_sync(
+        &self,
+        key: &ContractKey,
+        state: WrappedState,
+    ) -> Result<bool, redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(STATE_TABLE)?;
+            // Check existence within the same write transaction
+            let exists = tbl.get(key.as_bytes())?.is_some();
+            if !exists {
+                return Ok(false);
+            }
+            tbl.insert(key.as_bytes(), state.as_ref())?;
+        }
+        txn.commit()?;
+        Ok(true)
+    }
+
     /// Read a contract's state synchronously.
     ///
     /// This is the same as `StateStorage::get` but without the async wrapper.

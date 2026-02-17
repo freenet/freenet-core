@@ -606,6 +606,25 @@ impl WasmerEngine {
             Function::new_typed_async(store, |id_ptr: i64, id_len: i32| async move {
                 native_api::delegate_contracts::get_contract_state_len_impl(id_ptr, id_len)
             });
+        let put_state = Function::new_typed_async(
+            store,
+            |id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64| async move {
+                native_api::delegate_contracts::put_contract_state_impl(
+                    id_ptr, id_len, state_ptr, state_len,
+                )
+            },
+        );
+        let update_state = Function::new_typed_async(
+            store,
+            |id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64| async move {
+                native_api::delegate_contracts::update_contract_state_impl(
+                    id_ptr, id_len, state_ptr, state_len,
+                )
+            },
+        );
+        let subscribe = Function::new_typed_async(store, |id_ptr: i64, id_len: i32| async move {
+            native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
+        });
         imports.register_namespace(
             "freenet_delegate_contracts",
             [
@@ -616,6 +635,18 @@ impl WasmerEngine {
                 (
                     "__frnt__delegate__get_contract_state_len".to_owned(),
                     get_state_len.into(),
+                ),
+                (
+                    "__frnt__delegate__put_contract_state".to_owned(),
+                    put_state.into(),
+                ),
+                (
+                    "__frnt__delegate__update_contract_state".to_owned(),
+                    update_state.into(),
+                ),
+                (
+                    "__frnt__delegate__subscribe_contract".to_owned(),
+                    subscribe.into(),
                 ),
             ],
         );

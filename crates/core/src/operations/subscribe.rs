@@ -318,9 +318,18 @@ pub(crate) async fn request_subscribe(
         is_renewal,
     };
 
-    op_manager
-        .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-        .await?;
+    // Renewals use non-blocking send to fail fast under congestion rather
+    // than blocking 30 s and compounding it. Client subscribes use the
+    // blocking path for a definitive success/failure response.
+    if is_renewal {
+        op_manager
+            .notify_op_change_nonblocking(NetMessage::from(msg), OpEnum::Subscribe(op))
+            .await?;
+    } else {
+        op_manager
+            .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+            .await?;
+    }
 
     Ok(())
 }

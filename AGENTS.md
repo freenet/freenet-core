@@ -62,7 +62,6 @@ DO NOT delete or comment out the test.
 ```bash
 cargo build                    # Build
 cargo test -p freenet          # Test all
-cargo test -p freenet -- --test-threads=1  # Deterministic mode
 cargo fmt && cargo clippy --all-targets --all-features  # Lint
 ```
 

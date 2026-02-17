@@ -53,7 +53,60 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
-use crate::server::http_gateway::AttestedContractMap;
+use crate::server::client_api::AttestedContractMap;
+
+/// Checks if a WebSocket Origin header value refers to localhost.
+///
+/// Delimiter-aware: rejects origins like `http://localhost.evil.com` by requiring
+/// the hostname to be followed by `:`, `/`, or end-of-string.
+fn is_localhost_origin(origin: &str) -> bool {
+    let prefixes = [
+        "http://localhost:",
+        "http://localhost/",
+        "https://localhost:",
+        "https://localhost/",
+        "http://127.0.0.1:",
+        "http://127.0.0.1/",
+        "https://127.0.0.1:",
+        "https://127.0.0.1/",
+        "http://[::1]:",
+        "http://[::1]/",
+        "https://[::1]:",
+        "https://[::1]/",
+    ];
+    let exact = [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "https://[::1]",
+    ];
+    prefixes.iter().any(|p| origin.starts_with(p)) || exact.contains(&origin)
+}
+
+/// Checks if the WebSocket Origin header matches the request's Host header (same-origin check).
+///
+/// Extracts the host portion from the Origin URL (e.g. "nova.locut.us:7509" from
+/// "http://nova.locut.us:7509") and compares it against the Host header. This allows
+/// remote browsers to connect back to the same server while blocking cross-site attacks.
+fn is_same_origin(origin: &str, headers: &axum::http::HeaderMap) -> bool {
+    let Some(host_header) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    // Extract host from origin URL: "http://host:port" -> "host:port"
+    let origin_host = origin
+        .find("://")
+        .map(|i| &origin[i + 3..])
+        .unwrap_or(origin);
+    // Strip any trailing path from origin host
+    let origin_host = origin_host.split('/').next().unwrap_or(origin_host);
+
+    origin_host.eq_ignore_ascii_case(host_header)
+}
 
 /// Checks if an error represents a client-side disconnect rather than a server error.
 ///
@@ -84,6 +137,9 @@ fn is_client_disconnect_error(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Clone)]
+struct LocalhostOnly(bool);
+
+#[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
 impl std::ops::Deref for WebSocketRequest {
@@ -105,12 +161,13 @@ impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
         let attested_contracts = Arc::new(DashMap::new());
-        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts, true)
     }
 
     pub fn create_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
+        localhost_only: bool,
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
@@ -130,6 +187,7 @@ impl WebSocketProxy {
             .merge(v2_route)
             .layer(Extension(attested_contracts))
             .layer(Extension(ws_request))
+            .layer(Extension(LocalhostOnly(localhost_only)))
             .layer(axum::middleware::from_fn(connection_info));
 
         (
@@ -342,6 +400,41 @@ async fn connection_info(
         }
     };
 
+    // Check Origin header — browsers always send this on WS upgrade, CLI tools don't.
+    // This blocks cross-site WebSocket hijacking (evil.com connecting to our gateway)
+    // while allowing both localhost and legitimate remote access.
+    //
+    // When localhost_only: only allow localhost origins (127.0.0.1, [::1], localhost).
+    // When not localhost_only: allow any origin whose host matches the request's Host header
+    // (same-origin check), so remote browsers serving the UI can connect back.
+    // CLI tools (no Origin header) are always allowed.
+    let localhost_only = req
+        .extensions()
+        .get::<LocalhostOnly>()
+        .map_or(true, |l| l.0);
+    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin.to_str() {
+            let allowed = if localhost_only {
+                is_localhost_origin(origin_str)
+            } else {
+                is_same_origin(origin_str, req.headers())
+            };
+            if !allowed {
+                tracing::warn!(
+                    origin = origin_str,
+                    "Rejected WebSocket connection from disallowed origin"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "WebSocket connections from this origin are not allowed",
+                )
+                    .into_response();
+            }
+        } else {
+            return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
+        }
+    }
+
     tracing::debug!(
         ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
     );
@@ -515,33 +608,47 @@ async fn websocket_interface(
             }
         };
 
-        let client_req_task = async {
-            let next_msg = match client_stream
-                .next()
-                .await
-                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
-            {
-                Err(err) => {
-                    tracing::debug!(err = %err, "client channel error");
-                    return Err(Some(err.into()));
-                }
-                Ok(v) => v,
-            };
-            process_client_request(
-                client_id,
-                next_msg,
-                &request_sender,
-                &mut auth_token.as_mut().map(|t| t.0.clone()),
-                auth_token.as_mut().map(|t| t.1),
-                encoding_protoc,
-                api_version,
-            )
-            .await
-        };
-
+        // IMPORTANT: client_stream.next() is the only part inside the select future.
+        // process_client_request runs in the branch handler AFTER the select resolves,
+        // so it cannot be cancelled by other branches (listeners, responses, pings).
+        // Previously, process_client_request ran inside the select future and could be
+        // cancelled mid-execution if a subscription notification or host response arrived
+        // during an .await point (e.g., waiting_for_transaction_result). This left
+        // operations registered in the router but never started — a silent hang.
         tokio::select! { biased;
-            process_client_request = client_req_task => {
-                match process_client_request {
+            next_msg = client_stream.next() => {
+                let next_msg = match next_msg
+                    .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
+                {
+                    Err(err) => {
+                        tracing::debug!(err = %err, "client channel error");
+                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
+                        let _ = request_sender
+                            .send(ClientConnection::Request {
+                                client_id,
+                                req: Box::new(ClientRequest::Disconnect { cause: None }),
+                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+                                attested_contract: auth_token.as_ref().map(|t| t.1),
+                                api_version,
+                            })
+                            .await;
+                        let _ = server_sink.send(Message::Close(None)).await;
+                        return Ok(());
+                    }
+                    Ok(v) => v,
+                };
+                // Process the request outside the select — runs to completion
+                match process_client_request(
+                    client_id,
+                    next_msg,
+                    &request_sender,
+                    &mut auth_token.as_mut().map(|t| t.0.clone()),
+                    auth_token.as_mut().map(|t| t.1),
+                    encoding_protoc,
+                    api_version,
+                )
+                .await
+                {
                     Ok(Some(error)) => {
                         server_sink.send(error).await.inspect_err(|err| {
                             tracing::debug!(err = %err, "error sending message to client");
@@ -549,8 +656,7 @@ async fn websocket_interface(
                     }
                     Ok(None) => continue,
                     Err(None) => {
-                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
-                        // Notify node about client disconnect to trigger subscription cleanup
+                        tracing::debug!(%client_id, "Client channel closed during request processing");
                         let _ = request_sender
                             .send(ClientConnection::Request {
                                 client_id,
@@ -564,8 +670,7 @@ async fn websocket_interface(
                         return Ok(())
                     },
                     Err(Some(err)) => {
-                        tracing::debug!(%client_id, err = %err, "Client channel error, notifying node for subscription cleanup");
-                        // Notify node about client disconnect to trigger subscription cleanup even on error
+                        tracing::debug!(%client_id, err = %err, "Client request error, notifying node for subscription cleanup");
                         let _ = request_sender
                             .send(ClientConnection::Request {
                                 client_id,
@@ -694,6 +799,34 @@ async fn process_client_request(
             },
         }
     };
+
+    // Scope check: contract web apps (identified by attested_contract) cannot use NodeQueries.
+    // This prevents malicious contracts from exfiltrating peer topology data.
+    if attested_contract.is_some() {
+        if let ClientRequest::NodeQueries(_) = &req {
+            tracing::warn!(
+                %client_id,
+                contract = ?attested_contract,
+                "Blocked NodeQueries from contract web app"
+            );
+            let error: ClientError = ErrorKind::Unhandled {
+                cause: std::borrow::Cow::Borrowed(
+                    "NodeQueries is not available to contract web applications",
+                ),
+            }
+            .into();
+            let serialized = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))
+                        .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?
+                }
+            };
+            return Ok(Some(Message::Binary(serialized.into())));
+        }
+    }
 
     // Intercept explicit disconnect requests sent by the client as data messages
     if matches!(req, ClientRequest::Disconnect { .. }) {
@@ -1055,5 +1188,75 @@ mod tests {
         assert!(!is_client_disconnect_error(&anyhow::anyhow!(
             "permission denied"
         )));
+    }
+
+    #[test]
+    fn test_is_localhost_origin() {
+        // Valid localhost origins
+        assert!(is_localhost_origin("http://localhost"));
+        assert!(is_localhost_origin("https://localhost"));
+        assert!(is_localhost_origin("http://localhost:3000"));
+        assert!(is_localhost_origin("https://localhost:8080"));
+        assert!(is_localhost_origin("http://localhost/path"));
+
+        // Valid 127.0.0.1 origins
+        assert!(is_localhost_origin("http://127.0.0.1"));
+        assert!(is_localhost_origin("https://127.0.0.1"));
+        assert!(is_localhost_origin("http://127.0.0.1:50509"));
+        assert!(is_localhost_origin("http://127.0.0.1/path"));
+
+        // Valid IPv6 loopback origins
+        assert!(is_localhost_origin("http://[::1]"));
+        assert!(is_localhost_origin("https://[::1]"));
+        assert!(is_localhost_origin("http://[::1]:3000"));
+        assert!(is_localhost_origin("http://[::1]/path"));
+
+        // Reject external origins
+        assert!(!is_localhost_origin("http://evil.com"));
+        assert!(!is_localhost_origin("https://attacker.io:8080"));
+
+        // Reject hostname spoofing (delimiter-aware)
+        assert!(!is_localhost_origin("http://localhost.evil.com"));
+        assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
+
+        // Reject empty/garbage
+        assert!(!is_localhost_origin(""));
+        assert!(!is_localhost_origin("localhost"));
+    }
+
+    #[test]
+    fn test_is_same_origin() {
+        fn headers_with_host(host: &str) -> axum::http::HeaderMap {
+            let mut map = axum::http::HeaderMap::new();
+            map.insert(
+                axum::http::header::HOST,
+                axum::http::HeaderValue::from_str(host).unwrap(),
+            );
+            map
+        }
+
+        // Same origin — should be allowed
+        let h = headers_with_host("nova.locut.us:7509");
+        assert!(is_same_origin("http://nova.locut.us:7509", &h));
+        assert!(is_same_origin("http://nova.locut.us:7509/path", &h));
+
+        // Different host — cross-site attack
+        assert!(!is_same_origin("http://evil.com", &h));
+        assert!(!is_same_origin("http://evil.com:7509", &h));
+
+        // Same host, different port
+        assert!(!is_same_origin("http://nova.locut.us:8080", &h));
+
+        // Case-insensitive host comparison
+        assert!(is_same_origin("http://Nova.Locut.Us:7509", &h));
+
+        // No Host header — reject
+        let empty = axum::http::HeaderMap::new();
+        assert!(!is_same_origin("http://nova.locut.us:7509", &empty));
+
+        // Localhost same-origin
+        let h = headers_with_host("localhost:7509");
+        assert!(is_same_origin("http://localhost:7509", &h));
+        assert!(!is_same_origin("http://evil.com", &h));
     }
 }

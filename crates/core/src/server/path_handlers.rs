@@ -13,8 +13,8 @@ use crate::client_events::AuthToken;
 
 use super::{
     app_packaging::{WebApp, WebContractError},
+    client_api::HttpClientApiRequest,
     errors::WebSocketApiError,
-    http_gateway::HttpGatewayRequest,
     ApiVersion, ClientConnection, HostCallbackResult,
 };
 use tracing::{debug, instrument};
@@ -22,7 +22,7 @@ use tracing::{debug, instrument};
 #[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
-    request_sender: HttpGatewayRequest,
+    request_sender: HttpClientApiRequest,
     assigned_token: AuthToken,
     api_version: ApiVersion,
 ) -> Result<impl IntoResponse, WebSocketApiError> {

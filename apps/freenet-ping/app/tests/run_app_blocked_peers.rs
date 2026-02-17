@@ -1,6 +1,6 @@
 //! # Blocked Peers Tests
 //!
-//! This file implements a parameterized test framework for the "blocked peers" scenario
+//! Tests that contract updates propagate via gateway when direct peer connections are blocked.
 //! in Freenet, where direct peer-to-peer connections between certain nodes are intentionally
 //! blocked. The tests verify that contract state updates can propagate via gateway nodes
 //! when direct connections aren't available.
@@ -48,7 +48,11 @@ use common::{
     base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
     ping_states_equal, wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{
+    local_node::NodeConfig,
+    server::serve_client_api,
+    test_utils::{allocate_test_node_block, test_ip_for_node},
+};
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
@@ -154,12 +158,12 @@ async fn run_blocked_peers_test_inner(
         MAX_PORT_RETRY_ATTEMPTS
     );
 
-    // Network setup - use varied loopback IPs for unique ring locations
-    // This is essential because ring locations are derived from IP addresses.
-    // Without varied IPs, all nodes would have the same location, breaking routing.
-    let gw_ip = test_ip_for_node(0);
-    let node1_ip = test_ip_for_node(1);
-    let node2_ip = test_ip_for_node(2);
+    // Network setup - use globally unique loopback IPs to avoid conflicts with
+    // other tests running in parallel on CI. Each test allocates its own IP block.
+    let base_node_idx = allocate_test_node_block(3);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node1_ip = test_ip_for_node(base_node_idx + 1);
+    let node2_ip = test_ip_for_node(base_node_idx + 2);
 
     // Bind network sockets to varied IPs
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
@@ -257,7 +261,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -267,7 +271,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -277,7 +281,7 @@ async fn run_blocked_peers_test_inner(
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -326,8 +330,9 @@ async fn run_blocked_peers_test_inner(
 
         // Wait for nodes to connect to the network before proceeding with operations
         tracing::info!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        // 180s for ring connection on slow CI runners (120s was insufficient)
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         tracing::info!("All nodes connected to the network!");
 
         // Compile/load contract code (same helper used by other app tests)

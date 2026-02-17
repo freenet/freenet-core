@@ -1485,7 +1485,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     .map_err(|_| TransportError::ChannelClosed)?;
                 return Err(TransportError::ProtocolVersionMismatch {
                     expected: PCK_VERSION.to_string(),
-                    actual: PCK_VERSION, // We expected our version, they sent something else
+                    actual: format!("{:?}", protoc),
                 });
             }
 
@@ -2036,7 +2036,7 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     if let Some(expected) = err.split("expected version").nth(1) {
         TransportError::ProtocolVersionMismatch {
             expected: expected.trim().to_string(),
-            actual: PCK_VERSION,
+            actual: PCK_VERSION.to_string(),
         }
     } else {
         TransportError::ConnectionEstablishmentFailure { cause: err }

@@ -581,6 +581,9 @@ type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 pub(crate) enum NodeEvent {
     /// Drop the given peer connection by socket address.
     DropConnection(SocketAddr),
+    /// Drop all connections (ring + transient). Used after suspend/resume
+    /// to force fresh transport reconnection to gateways.
+    DropAllConnections,
     // Try connecting to the given peer.
     ConnectPeer {
         peer: PeerKeyLocation,
@@ -689,6 +692,9 @@ impl Display for NodeEvent {
         match self {
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
+            }
+            NodeEvent::DropAllConnections => {
+                write!(f, "DropAllConnections")
             }
             NodeEvent::ConnectPeer { peer, .. } => {
                 write!(f, "ConnectPeer (to {peer})")

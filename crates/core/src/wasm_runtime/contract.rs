@@ -52,43 +52,46 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.handle)?;
 
-        let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.handle, parameters)?;
-            param_buf.write(parameters)?;
-            param_buf.ptr()
-        };
-        let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.handle, state)?;
-            state_buf.write(state)?;
-            state_buf.ptr()
-        };
-        let related_buf_ptr = {
-            let serialized = bincode::serialize(related)?;
-            let mut related_buf = self.init_buf(&running.handle, &serialized)?;
-            related_buf.write(serialized)?;
-            related_buf.ptr()
-        };
+        let result = (|| -> RuntimeResult<ValidateResult> {
+            let linear_mem = self.linear_mem(&running.handle)?;
 
-        let result = self.engine.call_3i64_blocking(
-            &running.handle,
-            "validate_state",
-            param_buf_ptr as i64,
-            state_buf_ptr as i64,
-            related_buf_ptr as i64,
-        );
-        let result = classify_result(result);
+            let param_buf_ptr = {
+                let mut param_buf = self.init_buf(&running.handle, parameters)?;
+                param_buf.write(parameters)?;
+                param_buf.ptr()
+            };
+            let state_buf_ptr = {
+                let mut state_buf = self.init_buf(&running.handle, state)?;
+                state_buf.write(state)?;
+                state_buf.ptr()
+            };
+            let related_buf_ptr = {
+                let serialized = bincode::serialize(related)?;
+                let mut related_buf = self.init_buf(&running.handle, &serialized)?;
+                related_buf.write(serialized)?;
+                related_buf.ptr()
+            };
+
+            let result = self.engine.call_3i64_blocking(
+                &running.handle,
+                "validate_state",
+                param_buf_ptr as i64,
+                state_buf_ptr as i64,
+                related_buf_ptr as i64,
+            );
+            let result = classify_result(result)?;
+
+            let is_valid = unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_validate_state_res(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            };
+            Ok(is_valid)
+        })();
 
         self.drop_running_instance(&mut running);
-        let result = result?;
-
-        let is_valid = unsafe {
-            ContractInterfaceResult::from_raw(result, &linear_mem)
-                .unwrap_validate_state_res(linear_mem)
-                .map_err(Into::<ContractExecError>::into)?
-        };
-        Ok(is_valid)
+        result
     }
 
     fn update_state(
@@ -101,44 +104,46 @@ impl ContractRuntimeInterface for super::Runtime {
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.handle)?;
 
-        let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.handle, parameters)?;
-            param_buf.write(parameters)?;
-            param_buf.ptr()
-        };
-        let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.handle, state)?;
-            state_buf.write(state.clone())?;
-            state_buf.ptr()
-        };
-        let update_data_buf_ptr = {
-            let serialized = bincode::serialize(update_data)?;
-            let mut update_data_buf = self.init_buf(&running.handle, &serialized)?;
-            update_data_buf.write(serialized)?;
-            update_data_buf.ptr()
-        };
+        let result = (|| -> RuntimeResult<UpdateModification<'static>> {
+            let linear_mem = self.linear_mem(&running.handle)?;
 
-        let result = self.engine.call_3i64_blocking(
-            &running.handle,
-            "update_state",
-            param_buf_ptr as i64,
-            state_buf_ptr as i64,
-            update_data_buf_ptr as i64,
-        );
-        let result = classify_result(result);
+            let param_buf_ptr = {
+                let mut param_buf = self.init_buf(&running.handle, parameters)?;
+                param_buf.write(parameters)?;
+                param_buf.ptr()
+            };
+            let state_buf_ptr = {
+                let mut state_buf = self.init_buf(&running.handle, state)?;
+                state_buf.write(state.clone())?;
+                state_buf.ptr()
+            };
+            let update_data_buf_ptr = {
+                let serialized = bincode::serialize(update_data)?;
+                let mut update_data_buf = self.init_buf(&running.handle, &serialized)?;
+                update_data_buf.write(serialized)?;
+                update_data_buf.ptr()
+            };
+
+            let result = self.engine.call_3i64_blocking(
+                &running.handle,
+                "update_state",
+                param_buf_ptr as i64,
+                state_buf_ptr as i64,
+                update_data_buf_ptr as i64,
+            );
+            let result = classify_result(result)?;
+
+            let update_res = unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_update_state(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            };
+            Ok(update_res)
+        })();
 
         self.drop_running_instance(&mut running);
-        let result = result?;
-
-        let update_res = unsafe {
-            ContractInterfaceResult::from_raw(result, &linear_mem)
-                .unwrap_update_state(linear_mem)
-                .map_err(Into::<ContractExecError>::into)?
-        };
-
-        Ok(update_res)
+        result
     }
 
     fn summarize_state(
@@ -149,37 +154,39 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.handle)?;
 
-        let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.handle, parameters)?;
-            param_buf.write(parameters)?;
-            param_buf.ptr()
-        };
-        let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.handle, state)?;
-            state_buf.write(state.clone())?;
-            state_buf.ptr()
-        };
+        let result = (|| -> RuntimeResult<StateSummary<'static>> {
+            let linear_mem = self.linear_mem(&running.handle)?;
 
-        let result = self.engine.call_2i64_blocking(
-            &running.handle,
-            "summarize_state",
-            param_buf_ptr as i64,
-            state_buf_ptr as i64,
-        );
-        let result = classify_result(result);
+            let param_buf_ptr = {
+                let mut param_buf = self.init_buf(&running.handle, parameters)?;
+                param_buf.write(parameters)?;
+                param_buf.ptr()
+            };
+            let state_buf_ptr = {
+                let mut state_buf = self.init_buf(&running.handle, state)?;
+                state_buf.write(state.clone())?;
+                state_buf.ptr()
+            };
+
+            let result = self.engine.call_2i64_blocking(
+                &running.handle,
+                "summarize_state",
+                param_buf_ptr as i64,
+                state_buf_ptr as i64,
+            );
+            let result = classify_result(result)?;
+
+            let summary = unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_summarize_state(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            };
+            Ok(summary)
+        })();
 
         self.drop_running_instance(&mut running);
-        let result = result?;
-
-        let summary = unsafe {
-            ContractInterfaceResult::from_raw(result, &linear_mem)
-                .unwrap_summarize_state(linear_mem)
-                .map_err(Into::<ContractExecError>::into)?
-        };
-
-        Ok(summary)
+        result
     }
 
     fn get_state_delta<'a>(
@@ -191,43 +198,45 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&running.handle)?;
 
-        let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&running.handle, parameters)?;
-            param_buf.write(parameters)?;
-            param_buf.ptr()
-        };
-        let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&running.handle, state)?;
-            state_buf.write(state.clone())?;
-            state_buf.ptr()
-        };
-        let summary_buf_ptr = {
-            let mut summary_buf = self.init_buf(&running.handle, summary)?;
-            summary_buf.write(summary)?;
-            summary_buf.ptr()
-        };
+        let result = (|| -> RuntimeResult<StateDelta<'static>> {
+            let linear_mem = self.linear_mem(&running.handle)?;
 
-        let result = self.engine.call_3i64_blocking(
-            &running.handle,
-            "get_state_delta",
-            param_buf_ptr as i64,
-            state_buf_ptr as i64,
-            summary_buf_ptr as i64,
-        );
-        let result = classify_result(result);
+            let param_buf_ptr = {
+                let mut param_buf = self.init_buf(&running.handle, parameters)?;
+                param_buf.write(parameters)?;
+                param_buf.ptr()
+            };
+            let state_buf_ptr = {
+                let mut state_buf = self.init_buf(&running.handle, state)?;
+                state_buf.write(state.clone())?;
+                state_buf.ptr()
+            };
+            let summary_buf_ptr = {
+                let mut summary_buf = self.init_buf(&running.handle, summary)?;
+                summary_buf.write(summary)?;
+                summary_buf.ptr()
+            };
+
+            let result = self.engine.call_3i64_blocking(
+                &running.handle,
+                "get_state_delta",
+                param_buf_ptr as i64,
+                state_buf_ptr as i64,
+                summary_buf_ptr as i64,
+            );
+            let result = classify_result(result)?;
+
+            let delta = unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_get_state_delta(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            };
+            Ok(delta)
+        })();
 
         self.drop_running_instance(&mut running);
-        let result = result?;
-
-        let delta = unsafe {
-            ContractInterfaceResult::from_raw(result, &linear_mem)
-                .unwrap_get_state_delta(linear_mem)
-                .map_err(Into::<ContractExecError>::into)?
-        };
-
-        Ok(delta)
+        result
     }
 }
 

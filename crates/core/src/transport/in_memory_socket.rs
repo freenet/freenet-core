@@ -85,6 +85,12 @@ pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
 }
 
+/// Clears address-network mappings for a specific network.
+/// Retains mappings for other networks.
+pub fn clear_network_address_mappings(network_name: &str) {
+    ADDRESS_NETWORKS.retain(|_, v| v != network_name);
+}
+
 /// Clears all network time sources. Useful for test cleanup.
 pub fn clear_all_network_time_sources() {
     NETWORK_TIME_SOURCES.clear();
