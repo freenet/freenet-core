@@ -86,7 +86,7 @@ See [operations/README.md](operations/README.md) for detailed documentation.
 
 WASM-based contract execution:
 
-- **Executor** – Loads and runs WASM binaries (Wasmer or Wasmtime)
+- **Executor** – Loads and runs WASM binaries (Wasmtime)
 - **Handler** – Orchestrates contract operations
 - **StateStore** – Persistent storage (redb/sqlite backends)
 - **Runtime** – Host functions exposed to WASM (network, storage)

@@ -128,11 +128,11 @@ pub struct RuntimePool {
     shared_contract_modules: SharedModuleCache<ContractKey>,
     /// Shared compiled delegate module cache.
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
-    /// Shared backend engine (wasmer EngineInner via Arc) used by all executors.
+    /// Shared backend engine used by all executors.
     ///
-    /// All executors MUST share the same backend engine because wasmer Artifacts
-    /// store function pointers and signature indices that reference the compiling
-    /// Engine's internal data structures. Using a Module compiled by one Engine
+    /// All executors MUST share the same backend engine because compiled modules
+    /// store references to the compiling Engine's internal data structures. Using
+    /// a Module compiled by one Engine
     /// in a Store backed by a different Engine causes SIGSEGV.
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
@@ -181,8 +181,8 @@ impl RuntimePool {
 
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend
-        // engine because wasmer Artifacts store function pointers and signature
-        // indices tied to the compiling Engine's internal data structures.
+        // engine because compiled modules store references tied to the compiling
+        // Engine's internal data structures.
         let mut first_executor = Executor::from_config_with_shared_modules(
             config.clone(),
             shared_state_store.clone(),
