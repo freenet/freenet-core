@@ -869,8 +869,16 @@ impl ConnectionManager {
         self.pending_reservations.read().len()
     }
 
-    /// Remove pending reservations that have exceeded `PENDING_RESERVATION_TTL`.
-    /// Returns the number of stale entries removed.
+    /// Remove pending reservations that have exceeded `PENDING_RESERVATION_TTL`,
+    /// and clean up orphaned `location_for_peer` entries that have no corresponding
+    /// established connection or valid pending reservation.
+    ///
+    /// Orphaned entries arise when a CONNECT operation times out: `should_accept`
+    /// inserts into both `pending_reservations` and `location_for_peer`, but
+    /// abort handling may only clean the reservation, leaving a phantom location
+    /// entry that permanently blocks gateway retries (see #3088).
+    ///
+    /// Returns the number of stale entries removed (reservations + orphaned locations).
     pub(crate) fn cleanup_stale_reservations(&self) -> usize {
         let now = Instant::now();
         let mut pending = self.pending_reservations.write();
@@ -888,7 +896,41 @@ impl ConnectionManager {
                 true
             }
         });
-        before - pending.len()
+        let stale_reservations = before - pending.len();
+
+        // Also clean orphaned location_for_peer entries: addresses that appear in
+        // location_for_peer but have no established connection and no valid pending
+        // reservation. These phantoms cause has_connection_or_pending() to return
+        // true for peers that are not actually connected or connecting.
+        let conns = self.connections_by_location.read();
+        let mut locations = self.location_for_peer.write();
+        let before_locations = locations.len();
+        locations.retain(|addr, loc| {
+            // Keep if there's an established connection at this location for this address
+            if let Some(conn_list) = conns.get(loc) {
+                if conn_list
+                    .iter()
+                    .any(|c| c.location.socket_addr() == Some(*addr))
+                {
+                    return true;
+                }
+            }
+            // Keep if there's a valid (non-expired) pending reservation
+            if let Some((_loc, created)) = pending.get(addr) {
+                if now.duration_since(*created) <= PENDING_RESERVATION_TTL {
+                    return true;
+                }
+            }
+            tracing::warn!(
+                addr = %addr,
+                location = %loc,
+                "Removing orphaned location_for_peer entry (no connection or reservation)"
+            );
+            false
+        });
+        let orphaned_locations = before_locations - locations.len();
+
+        stale_reservations + orphaned_locations
     }
 
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
@@ -2032,5 +2074,116 @@ mod tests {
         }
         // Guard dropped, slot should be released
         assert_eq!(cm.connect_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    // ============ Phantom location_for_peer cleanup tests (#3088) ============
+
+    /// Regression test for #3088: When open > 0, should_accept inserts into both
+    /// pending_reservations and location_for_peer. If the CONNECT times out and only
+    /// the reservation is cleaned, a phantom location_for_peer entry remains, causing
+    /// has_connection_or_pending to permanently return true for that address.
+    #[test]
+    fn test_cleanup_removes_orphaned_location_for_peer() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let keypair = TransportKeypair::new();
+        let existing_addr = make_addr(8001);
+        let phantom_addr = make_addr(8002);
+        let phantom_loc = Location::new(0.5);
+
+        // Establish one real connection so open > 0
+        cm.add_connection(
+            Location::new(0.1),
+            existing_addr,
+            keypair.public().clone(),
+            false,
+        );
+        assert_eq!(cm.connection_count(), 1);
+
+        // should_accept with open > 0 calls record_pending_location,
+        // creating entries in both pending_reservations and location_for_peer
+        assert!(cm.should_accept(phantom_loc, phantom_addr));
+        assert!(cm.has_connection_or_pending(phantom_addr));
+
+        // Simulate what happens when a CONNECT times out: the pending reservation
+        // expires but location_for_peer is not cleaned (the bug)
+        age_reservation(&cm, phantom_addr, Duration::from_secs(120));
+
+        // Before the fix, has_connection_or_pending would still return true
+        // because location_for_peer still has the entry
+        assert!(
+            cm.location_for_peer.read().contains_key(&phantom_addr),
+            "phantom entry should exist in location_for_peer"
+        );
+
+        // cleanup_stale_reservations should now also clean the orphaned location
+        let removed = cm.cleanup_stale_reservations();
+        assert!(
+            removed >= 2,
+            "should remove stale reservation + orphaned location"
+        );
+
+        assert!(
+            !cm.location_for_peer.read().contains_key(&phantom_addr),
+            "phantom location_for_peer entry should be removed"
+        );
+        assert!(
+            !cm.has_connection_or_pending(phantom_addr),
+            "has_connection_or_pending should return false after cleanup"
+        );
+
+        // The established connection should be untouched
+        assert!(cm.has_connection_or_pending(existing_addr));
+        assert_eq!(cm.connection_count(), 1);
+    }
+
+    /// Verify that cleanup_stale_reservations does NOT remove location_for_peer
+    /// entries that have a corresponding established connection.
+    #[test]
+    fn test_cleanup_preserves_established_connection_locations() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let keypair = TransportKeypair::new();
+        let addr = make_addr(8001);
+        let loc = Location::new(0.3);
+
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        assert!(cm.location_for_peer.read().contains_key(&addr));
+
+        let removed = cm.cleanup_stale_reservations();
+        assert_eq!(removed, 0);
+        assert!(cm.location_for_peer.read().contains_key(&addr));
+        assert!(cm.has_connection_or_pending(addr));
+    }
+
+    /// Verify that prune_in_transit_connection clears the phantom entry directly,
+    /// as called from handle_aborted_op (Fix 2 of #3088).
+    #[test]
+    fn test_prune_in_transit_clears_phantom_location() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let keypair = TransportKeypair::new();
+        let existing_addr = make_addr(8001);
+        let phantom_addr = make_addr(8002);
+
+        // Establish one real connection so open > 0
+        cm.add_connection(
+            Location::new(0.1),
+            existing_addr,
+            keypair.public().clone(),
+            false,
+        );
+
+        // Accept a new peer (creates location_for_peer + pending_reservations entries)
+        assert!(cm.should_accept(Location::new(0.5), phantom_addr));
+        assert!(cm.has_connection_or_pending(phantom_addr));
+
+        // prune_in_transit_connection should clear the location_for_peer entry
+        cm.prune_in_transit_connection(phantom_addr);
+
+        assert!(
+            !cm.location_for_peer.read().contains_key(&phantom_addr),
+            "prune_in_transit_connection should remove the location_for_peer entry"
+        );
+        // Note: has_connection_or_pending may still return true due to the
+        // pending_reservations entry (TTL-based), but the location_for_peer
+        // phantom is gone, which is the key fix.
     }
 }
