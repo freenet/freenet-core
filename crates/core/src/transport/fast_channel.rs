@@ -108,6 +108,8 @@ pub struct FastSender<T> {
     inner: crossbeam::channel::Sender<T>,
     /// Notifies senders that space is available (for backpressure)
     send_notify: Arc<Notify>,
+    /// Notifies receivers that a message is available
+    recv_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped
     closed: Arc<AtomicBool>,
 }
@@ -117,6 +119,7 @@ impl<T> Clone for FastSender<T> {
         Self {
             inner: self.inner.clone(),
             send_notify: self.send_notify.clone(),
+            recv_notify: self.recv_notify.clone(),
             closed: self.closed.clone(),
         }
     }
@@ -131,7 +134,10 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self.inner.send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::SendError(msg)) => Err(SendError(msg)),
         }
     }
@@ -140,11 +146,11 @@ impl<T> FastSender<T> {
     ///
     /// For bounded channels, this yields if the channel is full,
     /// allowing other tasks to run while waiting for space.
-    pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
-        let mut msg = msg;
+    pub async fn send_async(&self, mut msg: T) -> Result<(), SendError<T>> {
         loop {
             match self.inner.try_send(msg) {
                 Ok(()) => {
+                    self.recv_notify.notify_one();
                     return Ok(());
                 }
                 Err(crossbeam::channel::TrySendError::Full(returned)) => {
@@ -166,7 +172,10 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         match self.inner.try_send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::TrySendError::Full(msg)) => Err(TrySendError::Full(msg)),
             Err(crossbeam::channel::TrySendError::Disconnected(msg)) => {
                 Err(TrySendError::Disconnected(msg))
@@ -193,6 +202,8 @@ pub struct FastReceiver<T> {
     inner: crossbeam::channel::Receiver<T>,
     /// Notifies senders that space is available
     send_notify: Arc<Notify>,
+    /// Notifies this receiver that a message is available
+    recv_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped (shared with senders for is_closed())
     closed: Arc<AtomicBool>,
     /// Counts recv_async poll iterations (test-only, for verifying no busy-loop)
@@ -209,15 +220,20 @@ impl<T> Drop for FastReceiver<T> {
     }
 }
 
+impl<T> Drop for FastSender<T> {
+    fn drop(&mut self) {
+        // Wake the receiver so it can detect sender disconnection
+        self.recv_notify.notify_one();
+    }
+}
+
 impl<T> FastReceiver<T> {
     /// Receives a message asynchronously.
     ///
     /// This is the primary receive method for async contexts.
-    /// Uses exponential backoff when the channel is empty.
+    /// Waits on a [`Notify`] signal from senders rather than polling,
+    /// so it adds zero CPU overhead while idle.
     pub async fn recv_async(&self) -> Result<T, RecvError> {
-        let mut backoff_us = 1u64;
-        const MAX_BACKOFF_US: u64 = 1000; // 1ms max
-
         loop {
             #[cfg(test)]
             self.poll_count.fetch_add(1, Ordering::Relaxed);
@@ -229,9 +245,8 @@ impl<T> FastReceiver<T> {
                     return Ok(msg);
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // Channel is empty - wait with exponential backoff
-                    tokio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
-                    backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
+                    // Wait until a sender signals that a message was enqueued
+                    self.recv_notify.notified().await;
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
                     return Err(RecvError);
@@ -293,17 +308,20 @@ impl<T> FastReceiver<T> {
 pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
     let (tx, rx) = crossbeam::channel::bounded(capacity);
     let send_notify = Arc::new(Notify::new());
+    let recv_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
 
     let sender = FastSender {
         inner: tx,
         send_notify: send_notify.clone(),
+        recv_notify: recv_notify.clone(),
         closed: closed.clone(),
     };
 
     let receiver = FastReceiver {
         inner: rx,
         send_notify,
+        recv_notify,
         closed,
         #[cfg(test)]
         poll_count: Arc::new(AtomicU64::new(0)),
@@ -417,34 +435,87 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_async_no_busy_loop() {
-        // Verify recv_async uses exponential backoff, not busy-looping.
-        // With 1s wait and 1ms max backoff, expect ~1000 iterations max.
-        // A busy-loop with yield_now() would do millions of iterations.
+        // Verify recv_async blocks on Notify rather than busy-looping.
+        // With Notify-based waking, we expect very few iterations:
+        // 1 try_recv (empty) → wait on notified → 1 try_recv (success) = 2 polls.
         let (tx, rx) = bounded::<i32>(10);
 
-        // Spawn sender that waits 1 second before sending
+        // Spawn sender that waits 100ms before sending
         let sender = GlobalExecutor::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             tx.send_async(42).await.unwrap();
         });
 
-        // Receive (will wait ~1s for the message)
+        // Receive (will wait ~100ms for the message)
         let result = rx.recv_async().await.unwrap();
         assert_eq!(result, 42);
 
         sender.await.unwrap();
 
-        // Check poll count - with exponential backoff (1μs -> 1ms max),
-        // 1 second of waiting should result in roughly:
-        // - First 10 iterations: 1+2+4+8+16+32+64+128+256+512 = ~1ms total
-        // - Remaining ~999ms at 1ms each = ~999 iterations
-        // Total: ~1009 iterations, let's say < 2000 to be safe
+        // With Notify-based waking, poll count should be exactly 2
+        // (one empty try_recv + one successful try_recv), but allow a
+        // small margin for spurious wakeups.
         let polls = rx.poll_count();
         assert!(
-            polls < 2000,
-            "Too many poll iterations ({polls}), likely busy-looping"
+            polls <= 5,
+            "Too many poll iterations ({polls}), Notify waking may not be working"
         );
-        // Also verify we actually polled (not zero)
         assert!(polls > 0, "Should have polled at least once");
+    }
+
+    #[tokio::test]
+    async fn test_sender_drop_wakes_blocked_receiver() {
+        // Verify that dropping all senders wakes a receiver blocked in recv_async,
+        // allowing it to detect disconnection and return RecvError.
+        let (tx, rx) = bounded::<i32>(10);
+
+        let receiver = GlobalExecutor::spawn(async move {
+            // No messages sent — receiver will block on notified().await
+            rx.recv_async().await
+        });
+
+        // Give receiver time to park on notified()
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(tx);
+
+        let result = receiver.await.unwrap();
+        assert!(
+            result.is_err(),
+            "Should return RecvError after all senders drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_concurrent_senders() {
+        // Verify no messages are lost when multiple cloned senders send concurrently.
+        let (tx, rx) = bounded::<i32>(100);
+        let n_senders = 5;
+        let msgs_per_sender = 200;
+
+        let handles: Vec<_> = (0..n_senders)
+            .map(|_| {
+                let tx = tx.clone();
+                GlobalExecutor::spawn(async move {
+                    for i in 0..msgs_per_sender {
+                        tx.send_async(i).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx); // drop original so channel closes when all clones finish
+
+        let receiver = GlobalExecutor::spawn(async move {
+            let mut count = 0;
+            while rx.recv_async().await.is_ok() {
+                count += 1;
+            }
+            count
+        });
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        let count = receiver.await.unwrap();
+        assert_eq!(count, n_senders * msgs_per_sender);
     }
 }
