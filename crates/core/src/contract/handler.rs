@@ -413,38 +413,8 @@ impl ContractHandlerChannel<SenderHalve> {
             }
         }
 
-        // Route to session actor if session adapter is installed
-        if let Some(session_tx) = &self.session_adapter_tx {
-            // Register all Transaction variants with the session actor
-            if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                let msg = SessionMessage::RegisterTransaction {
-                    tx,
-                    client_id,
-                    request_id,
-                };
-                if let Err(e) = session_tx.try_send(msg) {
-                    tracing::warn!(
-                        tx = %tx,
-                        client = %client_id,
-                        request_id = %request_id,
-                        error = %e,
-                        "Failed to notify session actor"
-                    );
-                } else {
-                    tracing::debug!(
-                        tx = %tx,
-                        client = %client_id,
-                        request_id = %request_id,
-                        "Session adapter registered transaction with session actor"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                client = %client_id,
-                request_id = %request_id,
-                "Session adapter not installed - session actor will not track transaction"
-            );
+        if let WaitingTransaction::Transaction(tx) = waiting_tx {
+            self.notify_session_actor(tx, client_id, request_id);
         }
 
         Ok(())
@@ -482,40 +452,35 @@ impl ContractHandlerChannel<SenderHalve> {
             }
         }
 
-        if let Some(session_tx) = &self.session_adapter_tx {
-            let msg = SessionMessage::RegisterTransaction {
-                tx,
-                client_id,
-                request_id,
-            };
-            if let Err(e) = session_tx.try_send(msg) {
-                tracing::warn!(
-                    tx = %tx,
-                    client = %client_id,
-                    request_id = %request_id,
-                    contract = %contract_key,
-                    error = %e,
-                    "Failed to notify session actor"
-                );
-            } else {
-                tracing::debug!(
-                    tx = %tx,
-                    client = %client_id,
-                    request_id = %request_id,
-                    contract = %contract_key,
-                    "Session adapter registered subscription transaction with session actor"
-                );
-            }
-        } else {
+        self.notify_session_actor(tx, client_id, request_id);
+
+        Ok(())
+    }
+
+    /// Notify the session actor about a transaction registration, if installed.
+    fn notify_session_actor(&self, tx: Transaction, client_id: ClientId, request_id: RequestId) {
+        let Some(session_tx) = &self.session_adapter_tx else {
             tracing::warn!(
                 client = %client_id,
                 request_id = %request_id,
-                contract = %contract_key,
-                "Session adapter not installed - subscription transaction not registered with session actor"
+                "Session adapter not installed — session actor will not track transaction"
+            );
+            return;
+        };
+        let msg = SessionMessage::RegisterTransaction {
+            tx,
+            client_id,
+            request_id,
+        };
+        if let Err(e) = session_tx.try_send(msg) {
+            tracing::warn!(
+                tx = %tx,
+                client = %client_id,
+                request_id = %request_id,
+                error = %e,
+                "Failed to notify session actor"
             );
         }
-
-        Ok(())
     }
 }
 
