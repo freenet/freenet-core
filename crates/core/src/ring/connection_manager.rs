@@ -82,7 +82,10 @@ pub(crate) struct ConnectionManager {
     /// Each entry records the advertised location and the time the reservation was created,
     /// allowing stale entries to be expired via `PENDING_RESERVATION_TTL`.
     pending_reservations: Arc<RwLock<BTreeMap<SocketAddr, (Location, Instant)>>>,
-    /// Mapping from socket address to location for established connections.
+    /// Mapping from socket address to location for established and in-progress connections.
+    /// Entries are added by `add_connection` (established) and `record_pending_location`
+    /// (speculative, during `should_accept`). Removed by `prune_connection` and
+    /// `cleanup_stale_reservations` (orphan sweep).
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<SocketAddr, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
@@ -880,55 +883,64 @@ impl ConnectionManager {
     ///
     /// Returns the number of stale entries removed (reservations + orphaned locations).
     pub(crate) fn cleanup_stale_reservations(&self) -> usize {
-        let now = Instant::now();
-        let mut pending = self.pending_reservations.write();
-        let before = pending.len();
-        pending.retain(|addr, (_loc, created)| {
-            let age = now.duration_since(*created);
-            if age > PENDING_RESERVATION_TTL {
+        // Phase 1: Clean expired pending reservations and snapshot surviving addresses.
+        // We release the pending_reservations lock before phase 2 to avoid deadlock:
+        // prune_connection acquires location_for_peer(W) → pending_reservations(W),
+        // so we must not hold pending_reservations while acquiring location_for_peer.
+        let (stale_reservations, valid_pending_addrs) = {
+            let now = Instant::now();
+            let mut pending = self.pending_reservations.write();
+            let before = pending.len();
+            pending.retain(|addr, (_loc, created)| {
+                let age = now.duration_since(*created);
+                if age > PENDING_RESERVATION_TTL {
+                    tracing::warn!(
+                        addr = %addr,
+                        age_secs = age.as_secs(),
+                        "Removing stale pending reservation"
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            let stale = before - pending.len();
+            let valid: Vec<SocketAddr> = pending.keys().copied().collect();
+            (stale, valid)
+        }; // pending_reservations lock released
+
+        // Phase 2: Clean orphaned location_for_peer entries — addresses with no
+        // established connection and no valid pending reservation. These phantoms
+        // cause has_connection_or_pending() to permanently return true (#3088).
+        //
+        // Lock ordering matches prune_connection: location_for_peer(W) first,
+        // then connections_by_location(R). No pending_reservations lock held.
+        let orphaned_locations = {
+            let mut locations = self.location_for_peer.write();
+            let conns = self.connections_by_location.read();
+            let before = locations.len();
+            locations.retain(|addr, loc| {
+                // Keep if there's an established connection at this location for this address
+                if conns.get(loc).is_some_and(|conn_list| {
+                    conn_list
+                        .iter()
+                        .any(|c| c.location.socket_addr() == Some(*addr))
+                }) {
+                    return true;
+                }
+                // Keep if there's a valid pending reservation (using phase 1 snapshot)
+                if valid_pending_addrs.contains(addr) {
+                    return true;
+                }
                 tracing::warn!(
                     addr = %addr,
-                    age_secs = age.as_secs(),
-                    "Removing stale pending reservation"
+                    location = %loc,
+                    "Removing orphaned location_for_peer entry (no connection or reservation)"
                 );
                 false
-            } else {
-                true
-            }
-        });
-        let stale_reservations = before - pending.len();
-
-        // Also clean orphaned location_for_peer entries: addresses that appear in
-        // location_for_peer but have no established connection and no valid pending
-        // reservation. These phantoms cause has_connection_or_pending() to return
-        // true for peers that are not actually connected or connecting.
-        let conns = self.connections_by_location.read();
-        let mut locations = self.location_for_peer.write();
-        let before_locations = locations.len();
-        locations.retain(|addr, loc| {
-            // Keep if there's an established connection at this location for this address
-            if let Some(conn_list) = conns.get(loc) {
-                if conn_list
-                    .iter()
-                    .any(|c| c.location.socket_addr() == Some(*addr))
-                {
-                    return true;
-                }
-            }
-            // Keep if there's a valid (non-expired) pending reservation
-            if let Some((_loc, created)) = pending.get(addr) {
-                if now.duration_since(*created) <= PENDING_RESERVATION_TTL {
-                    return true;
-                }
-            }
-            tracing::warn!(
-                addr = %addr,
-                location = %loc,
-                "Removing orphaned location_for_peer entry (no connection or reservation)"
-            );
-            false
-        });
-        let orphaned_locations = before_locations - locations.len();
+            });
+            before - locations.len()
+        };
 
         stale_reservations + orphaned_locations
     }
@@ -2117,9 +2129,9 @@ mod tests {
 
         // cleanup_stale_reservations should now also clean the orphaned location
         let removed = cm.cleanup_stale_reservations();
-        assert!(
-            removed >= 2,
-            "should remove stale reservation + orphaned location"
+        assert_eq!(
+            removed, 2,
+            "should remove exactly 1 stale reservation + 1 orphaned location"
         );
 
         assert!(
@@ -2182,8 +2194,11 @@ mod tests {
             !cm.location_for_peer.read().contains_key(&phantom_addr),
             "prune_in_transit_connection should remove the location_for_peer entry"
         );
-        // Note: has_connection_or_pending may still return true due to the
-        // pending_reservations entry (TTL-based), but the location_for_peer
-        // phantom is gone, which is the key fix.
+        // prune_connection(addr, false) also removes the pending_reservations entry,
+        // so has_connection_or_pending should now return false
+        assert!(
+            !cm.has_connection_or_pending(phantom_addr),
+            "has_connection_or_pending should return false after prune_in_transit_connection"
+        );
     }
 }
