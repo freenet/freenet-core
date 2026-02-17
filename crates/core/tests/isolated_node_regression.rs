@@ -27,6 +27,7 @@ use tracing::info;
 /// - GET operations retrieve from local cache without self-routing attempts (PR #1806)
 /// - Complete workflow functions properly without peer connections
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -142,6 +143,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
 /// 4. Client 2 sends identical GET request → Router tries to reuse removed TX
 /// 5. Bug: Client 2 never receives response
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -284,6 +286,7 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
 /// Tests the fix in PR #1844 where SubscribeResponse messages were not being
 /// delivered to WebSocket clients for local contracts.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -423,6 +426,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
 /// - UPDATE returns UpdateResponse without timeout (issue #1884)
 /// - GET operation retrieves updated state
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
