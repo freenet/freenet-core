@@ -8,3 +8,11 @@ retries = 2
 fail-fast = false
 # Terminate tests that hang (2 periods of 120s = 4 min max per test).
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+[profile.nightly]
+# Nightly tests run longer by design; no retries since failures need investigation.
+retries = 0
+fail-fast = false
+# Long-running simulation takes ~2.5 min wall clock (1h virtual @ 25x Turmoil
+# acceleration). Allow 10 min per period with 2 periods = 20 min hard cap.
+slow-timeout = { period = "600s", terminate-after = 2 }
