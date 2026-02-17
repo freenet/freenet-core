@@ -3626,9 +3626,22 @@ impl P2pConnManager {
                     op_manager.interest_manager.record_full_state_send();
                     crate::config::GlobalTestMetrics::record_full_state_send();
                 }
+
+                // Issue #3046: Refresh the peer's interest TTL on every successful
+                // broadcast send. Without this, interest entries for peers who only
+                // receive full-state broadcasts (no delta → no update_peer_summary
+                // call) expire after INTEREST_TTL (5 min), even though broadcasts
+                // are being successfully delivered. This caused ~49% of River room
+                // subscribers to miss updates.
+                op_manager
+                    .interest_manager
+                    .refresh_peer_interest(&key, &peer_key);
             }
 
             // PR #2763 FIX: Only update cached summary when we sent a delta.
+            // This is separate from the TTL refresh above — update_peer_summary
+            // sets the cached summary (used for delta computation), while
+            // refresh_peer_interest only extends the TTL.
             if sent_delta {
                 if let Some(summary) = &our_summary {
                     op_manager.interest_manager.update_peer_summary(
