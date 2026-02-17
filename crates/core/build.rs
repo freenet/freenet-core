@@ -9,6 +9,9 @@ fn main() {
         return;
     }
 
+    // Only regenerate if the schema file changes
+    println!("cargo:rerun-if-changed=../../schemas/flatbuffers/topology.fbs");
+
     let status = Command::new("flatc")
         .arg("--rust")
         .arg("-o")

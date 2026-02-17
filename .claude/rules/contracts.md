@@ -33,11 +33,17 @@ Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
 ```
 V1: Synchronous process() — delegates use request/response for contract access
-V2: Async host functions — delegates call ctx.get_contract_state() directly
+V2: Async host functions — delegates call contract methods directly:
+    - ctx.get_contract_state(id)       → read state (two-step: len + read)
+    - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
+    - ctx.update_contract_state(id, data) → conditional write (requires existing state)
+    - ctx.subscribe_contract(id)       → register interest (delivery is TODO)
     Backend-specific implementations:
     - Wasmer: Function::new_typed_async + Store::into_async()
     - Wasmtime: func_wrap_async (native async support)
     Selected when state_store_db is configured on Runtime
+    NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
+    hosting metadata. Network propagation is separate.
 ```
 
 ### WASM Call Modes

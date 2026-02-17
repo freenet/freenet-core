@@ -125,7 +125,18 @@ check_privileges() {
 if [[ -z "$BINARY_PATH" ]]; then
     # Try to find the git root
     if GIT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
-        BINARY_PATH="$GIT_ROOT/target/release/freenet"
+        # Check for custom target-dir in .cargo/config.toml (e.g. shared target directory)
+        CARGO_CONFIG="$GIT_ROOT/.cargo/config.toml"
+        CUSTOM_TARGET_DIR=""
+        if [[ -f "$CARGO_CONFIG" ]]; then
+            CUSTOM_TARGET_DIR=$(grep -oP 'target-dir\s*=\s*"\K[^"]+' "$CARGO_CONFIG" 2>/dev/null || true)
+        fi
+
+        if [[ -n "$CUSTOM_TARGET_DIR" ]]; then
+            BINARY_PATH="$CUSTOM_TARGET_DIR/release/freenet"
+        else
+            BINARY_PATH="$GIT_ROOT/target/release/freenet"
+        fi
     else
         echo "Error: Could not auto-detect binary path. Please specify with --binary"
         exit 1

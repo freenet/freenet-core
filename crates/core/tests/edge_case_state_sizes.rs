@@ -25,6 +25,7 @@ use tokio_tungstenite::connect_async;
 /// Verifies the lower bound of contract state size handling.
 /// Uses the smallest valid TodoList: {"tasks":[],"version":1}
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -80,6 +81,7 @@ async fn test_minimal_state_put_get(ctx: &mut TestContext) -> TestResult {
 ///
 /// Verifies handling of states near the practical size limit without exceeding it.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 90,
     startup_wait_secs = 10,
@@ -142,6 +144,7 @@ async fn test_large_state_put_get(ctx: &mut TestContext) -> TestResult {
 ///
 /// Verifies handling of zero-task todo lists (valid but empty contract state).
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -210,6 +213,7 @@ async fn test_empty_state_put_get(ctx: &mut TestContext) -> TestResult {
 /// This test is designed to verify the system doesn't crash or hang
 /// when confronted with oversized data.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 120,
     startup_wait_secs = 10,
@@ -286,6 +290,7 @@ async fn test_oversized_state_handling(ctx: &mut TestContext) -> TestResult {
 /// Related to: Bug #1734 - UPDATE operations that result in no state change
 /// should still return a proper response, not timeout.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 90,
     startup_wait_secs = 10,
@@ -360,6 +365,7 @@ async fn test_update_no_state_change(ctx: &mut TestContext) -> TestResult {
 /// Creates a state close to practical size limits (950KB) to verify
 /// edge case handling around the boundary without hitting system limits.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 90,
     startup_wait_secs = 10,

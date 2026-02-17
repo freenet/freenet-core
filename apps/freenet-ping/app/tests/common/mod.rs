@@ -5,7 +5,7 @@ use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
 };
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,

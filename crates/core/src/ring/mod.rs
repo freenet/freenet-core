@@ -1112,6 +1112,13 @@ impl Ring {
         #[cfg(test)]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(2);
 
+        // Faster tick when below min_connections, so initial mesh formation
+        // doesn't bottleneck on the 60-second steady-state interval.
+        #[cfg(not(test))]
+        const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(5);
+        #[cfg(test)]
+        const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(1);
+
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         /// Maximum number of concurrent connection acquisition attempts.
@@ -1138,7 +1145,14 @@ impl Ring {
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
         // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
         let mut last_boot_time = boot_time::Instant::now();
+        // In production (60s tick), 2x = 120s threshold is fine since real suspend
+        // causes minute+ jumps. In tests (2s tick), 2x = 4s is too tight — CI runners
+        // under load can have >4s scheduling delays between loop iterations, causing
+        // false positives that drop all connections mid-test. Use 30s minimum.
+        #[cfg(not(test))]
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
+        #[cfg(test)]
+        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
         let mut this_peer = None;
         loop {
@@ -1184,9 +1198,24 @@ impl Ring {
             if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
                 tracing::warn!(
                     boot_elapsed_secs = boot_elapsed.as_secs(),
-                    "Detected suspend/resume (boot-time jump) — clearing all backoff state"
+                    "Detected suspend/resume (boot-time jump) — dropping all connections and clearing state"
                 );
                 reset_all_backoff();
+                // Clear recently-failed addresses since they may be reachable again.
+                self.connection_manager.cleanup_all_failed_addrs();
+                // Drop all connections (including transient gateway connections).
+                // After suspend, transport sockets are dead but connection entries
+                // persist as zombies — keepalive tasks exit on socket error but
+                // don't trigger connection cleanup. The bootstrap loop then sends
+                // CONNECT messages into dead sockets that never reach the gateway.
+                notifier
+                    .notifications_sender
+                    .send(Either::Right(crate::message::NodeEvent::DropAllConnections))
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(?error, "Failed to send DropAllConnections");
+                        error
+                    })?;
                 zero_connections_since = None;
             }
 
@@ -1234,67 +1263,20 @@ impl Ring {
                 );
             }
 
-            // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
-            // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
-            let active_count = live_tx_tracker.active_connect_transaction_count();
-            if let Some(ideal_location) = pending_conn_adds.pop_first() {
-                // Check if this target is in backoff due to previous failures
+            // Drain pending connections, initiating multiple attempts per tick
+            // (up to MAX_CONCURRENT_CONNECTIONS) for faster mesh formation.
+            let mut active_count = live_tx_tracker.active_connect_transaction_count();
+            while let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
                     );
-                    // Intentionally do NOT re-queue here:
-                    // - Avoids repeatedly popping and checking the same location while it is
-                    //   under backoff, which would waste work in this tight maintenance loop.
-                    // - The topology manager will re-request connections to this location
-                    //   in the next cycle if we're still below min_connections.
-                } else if active_count < MAX_CONCURRENT_CONNECTIONS {
-                    tracing::debug!(
-                        active_connections = active_count,
-                        max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        target_location = %ideal_location,
-                        "Attempting to acquire new connection"
-                    );
-                    let tx = self
-                        .acquire_new(
-                            ideal_location,
-                            &skip_list,
-                            &notifier,
-                            &live_tx_tracker,
-                            &op_manager,
-                        )
-                        .await
-                        .map_err(|error| {
-                            tracing::error!(
-                                ?error,
-                                "FATAL: Connection maintenance task failed - shutting down"
-                            );
-                            error
-                        })?;
-                    if tx.is_none() {
-                        let conns = self.connection_manager.connection_count();
-                        tracing::warn!(
-                            connections = conns,
-                            target_location = %ideal_location,
-                            "acquire_new returned None - likely no peers to query through"
-                        );
-                        // Record failure for exponential backoff
-                        self.record_connection_failure(
-                            ideal_location,
-                            ConnectionFailureReason::RoutingFailed,
-                        );
-                    } else {
-                        tracing::info!(
-                            active_connections = active_count + 1,
-                            "Successfully initiated connection acquisition"
-                        );
-                        // Note: Backoff is only cleared when the connection actually completes
-                        // successfully in ConnectOp::handle_msg when acceptance.satisfied is true.
-                        // We don't clear it here at initiation because the connection could still
-                        // timeout or be rejected before completing.
-                    }
-                } else {
+                    // Intentionally not re-queued: adjust_topology will re-request
+                    // this location on the next cycle if still below min_connections.
+                    continue;
+                }
+                if active_count >= MAX_CONCURRENT_CONNECTIONS {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
@@ -1302,6 +1284,47 @@ impl Ring {
                         "At max concurrent connections, re-queuing location"
                     );
                     pending_conn_adds.insert(ideal_location);
+                    break;
+                }
+                tracing::debug!(
+                    active_connections = active_count,
+                    max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                    target_location = %ideal_location,
+                    "Attempting to acquire new connection"
+                );
+                let tx = self
+                    .acquire_new(
+                        ideal_location,
+                        &skip_list,
+                        &notifier,
+                        &live_tx_tracker,
+                        &op_manager,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(
+                            ?error,
+                            "FATAL: Connection maintenance task failed - shutting down"
+                        );
+                        error
+                    })?;
+                if tx.is_none() {
+                    let conns = self.connection_manager.connection_count();
+                    tracing::warn!(
+                        connections = conns,
+                        target_location = %ideal_location,
+                        "acquire_new returned None - likely no peers to query through"
+                    );
+                    self.record_connection_failure(
+                        ideal_location,
+                        ConnectionFailureReason::RoutingFailed,
+                    );
+                } else {
+                    active_count += 1;
+                    tracing::info!(
+                        active_connections = active_count,
+                        "Successfully initiated connection acquisition"
+                    );
                 }
             }
 
@@ -1426,11 +1449,28 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            crate::deterministic_select! {
-              _ = refresh_density_map.tick() => {
-                self.refresh_density_request_cache();
-              },
-              _ = check_interval.tick() => {},
+            let needs_fast_tick = current_connections < self.connection_manager.min_connections;
+
+            if needs_fast_tick {
+                // Uses sleep() instead of the check_interval so we don't need a
+                // second Interval object. We reset check_interval on transition
+                // back to steady-state to avoid an immediate burst tick.
+                crate::deterministic_select! {
+                  _ = refresh_density_map.tick() => {
+                    self.refresh_density_request_cache();
+                  },
+                  _ = tokio::time::sleep(FAST_CHECK_TICK_DURATION) => {},
+                }
+            } else {
+                // Reset the interval on transition from fast to normal tick so
+                // accumulated missed ticks don't cause an immediate burst.
+                check_interval.reset();
+                crate::deterministic_select! {
+                  _ = refresh_density_map.tick() => {
+                    self.refresh_density_request_cache();
+                  },
+                  _ = check_interval.tick() => {},
+                }
             }
         }
     }

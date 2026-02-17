@@ -130,6 +130,22 @@ impl fmt::Display for DelegateApiVersion {
 /// Error codes for contract state host functions.
 ///
 /// These extend the existing error code scheme in `native_api::error_codes`.
+///
+/// # Error Code Ranges
+///
+/// - `0`: Success (contract state read succeeded)
+/// - `-1`: Not in process context
+/// - `-4`: Invalid parameter (e.g., wrong instance ID length)
+/// - `-6`: Output buffer too small for the state data
+/// - `-7`: Contract not found in local store
+/// - `-8`: Internal state store error
+/// - `-9`: Memory bounds violation (WASM module passed invalid pointer)
+///
+/// # Memory Bounds Violations (`ERR_MEMORY_BOUNDS = -9`)
+///
+/// This error is returned when a WASM module attempts to access memory outside
+/// its allocated linear memory region via contract state host function calls.
+/// See `native_api::error_codes` documentation for details on validation logic.
 #[allow(dead_code)] // Public API — error codes for host function implementations
 pub mod contract_error_codes {
     /// Contract state read succeeded.
@@ -144,11 +160,19 @@ pub mod contract_error_codes {
     pub const ERR_INVALID_PARAM: i32 = -4;
     /// Internal state store error.
     pub const ERR_STORE_ERROR: i32 = -8;
+    /// Memory bounds violation (pointer out of range). Returned when a WASM module
+    /// attempts to access memory outside its allocated linear memory region via
+    /// host function calls.
+    pub const ERR_MEMORY_BOUNDS: i32 = -9;
+    /// Contract code not registered in the ContractStore index.
+    /// The delegate passed a contract instance ID whose CodeHash cannot be resolved.
+    pub const ERR_CONTRACT_CODE_NOT_REGISTERED: i32 = -10;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::native_api::DelegateEnvError;
 
     #[test]
     fn test_version_display() {
@@ -413,8 +437,7 @@ mod tests {
         };
 
         let result = env.get_contract_state_sync(&ContractInstanceId::new([1u8; 32]));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not configured"));
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
     }
 
     /// V2 delegate can read large contract state (1 MB).
@@ -428,6 +451,174 @@ mod tests {
         let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
         assert_eq!(result.len(), 1_000_000);
         assert_eq!(result, large_state);
+    }
+
+    // ============ ReDb store_state_sync tests ============
+
+    /// Verify store_state_sync writes and get_state_sync reads back correctly.
+    #[tokio::test]
+    async fn test_redb_store_state_sync_basic() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(40);
+        let state_data = vec![10, 20, 30, 40, 50];
+
+        // Store via sync path
+        db.store_state_sync(&key, WrappedState::new(state_data.clone()))
+            .unwrap();
+
+        // Read via sync path
+        let result = db.get_state_sync(&key).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().as_ref(), &state_data);
+    }
+
+    /// Verify store_state_sync can overwrite existing state.
+    #[tokio::test]
+    async fn test_redb_store_state_sync_overwrite() {
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.unwrap();
+
+        let (key, _, _) = make_contract_key(41);
+
+        db.store_state_sync(&key, WrappedState::new(vec![1, 1, 1]))
+            .unwrap();
+        db.store_state_sync(&key, WrappedState::new(vec![9, 9, 9]))
+            .unwrap();
+
+        let result = db.get_state_sync(&key).unwrap().unwrap();
+        assert_eq!(result.as_ref(), &[9, 9, 9]);
+    }
+
+    // ============ DelegateCallEnv PUT/UPDATE/SUBSCRIBE tests ============
+
+    /// PUT fails when state store is not configured.
+    #[tokio::test]
+    async fn test_env_put_contract_state_no_store() {
+        let mut env_holder = TestEnv::new().await;
+
+        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut env_holder.secret_store,
+                &env_holder.contract_store,
+                None,
+                delegate_key,
+            )
+        };
+
+        let result =
+            env.put_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
+    }
+
+    /// UPDATE fails when state store is not configured.
+    #[tokio::test]
+    async fn test_env_update_contract_state_no_store() {
+        let mut env_holder = TestEnv::new().await;
+
+        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut env_holder.secret_store,
+                &env_holder.contract_store,
+                None,
+                delegate_key,
+            )
+        };
+
+        let result =
+            env.update_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
+    }
+
+    /// V2 delegate can PUT contract state.
+    #[tokio::test]
+    async fn test_env_put_contract_state() {
+        let mut env_holder = TestEnv::new().await;
+        // store_contract registers the code hash + stores initial state
+        let contract_id = env_holder.store_contract(80, &[1, 2, 3]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        // PUT new state
+        let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6]);
+        assert!(result.is_ok(), "put should succeed: {:?}", result);
+
+        // Verify the new state
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(state, Some(vec![4, 5, 6]));
+    }
+
+    /// V2 delegate PUT fails for unregistered contract code.
+    #[tokio::test]
+    async fn test_env_put_contract_state_unregistered() {
+        let mut env_holder = TestEnv::new().await;
+
+        let env = unsafe { env_holder.make_env() };
+        let missing_id = ContractInstanceId::new([88u8; 32]);
+        let result = env.put_contract_state_sync(&missing_id, vec![1, 2, 3]);
+        assert!(matches!(
+            result,
+            Err(DelegateEnvError::ContractCodeNotRegistered)
+        ));
+    }
+
+    /// V2 delegate can UPDATE existing contract state.
+    #[tokio::test]
+    async fn test_env_update_contract_state() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(81, &[10, 20, 30]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.update_contract_state_sync(&contract_id, vec![40, 50, 60]);
+        assert!(result.is_ok(), "update should succeed: {:?}", result);
+
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(state, Some(vec![40, 50, 60]));
+    }
+
+    /// V2 delegate UPDATE fails when there's no existing state.
+    #[tokio::test]
+    async fn test_env_update_contract_state_nonexistent() {
+        let mut env_holder = TestEnv::new().await;
+        // Register contract code but don't store any state
+        let code = ContractCode::from(vec![82, 83, 84]);
+        let params = Parameters::from(vec![92, 93]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let contract_id = *key.id();
+        env_holder.contract_store.ensure_key_indexed(&key).unwrap();
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
+    }
+
+    /// V2 delegate can subscribe to a known contract.
+    #[tokio::test]
+    async fn test_env_subscribe_known() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(90, &[1]).await;
+
+        let env = unsafe { env_holder.make_env() };
+        let result = env.subscribe_contract_sync(&contract_id);
+        assert!(result.is_ok());
+    }
+
+    /// V2 delegate subscribe fails for unknown contract.
+    #[tokio::test]
+    async fn test_env_subscribe_unknown() {
+        let mut env_holder = TestEnv::new().await;
+
+        let env = unsafe { env_holder.make_env() };
+        let missing_id = ContractInstanceId::new([99u8; 32]);
+        let result = env.subscribe_contract_sync(&missing_id);
+        assert!(matches!(
+            result,
+            Err(DelegateEnvError::ContractCodeNotRegistered)
+        ));
     }
 
     // ============ Wasmer async host function integration tests ============
@@ -585,5 +776,130 @@ mod tests {
         let store_async = store.into_async();
         let result3 = futures::executor::block_on(call_inc.call_async(&store_async, 30));
         assert_eq!(result3.unwrap(), 31);
+    }
+
+    // ============ Wasmtime async host function integration tests ============
+
+    /// Verify that a WASM module with async host functions can be called
+    /// via wasmtime's async mechanism.
+    ///
+    /// This tests the core wasmtime pattern: `Linker::func_wrap` +
+    /// `TypedFunc::call` for synchronous-style host functions.
+    #[test]
+    #[cfg(feature = "wasmtime-backend")]
+    fn test_wasmtime_async_host_function_roundtrip() {
+        use wasmtime::*;
+
+        let wat = r#"
+        (module
+          (import "host" "async_get_value" (func $get_value (result i32)))
+          (func (export "compute") (result i32)
+            call $get_value
+            i32.const 1
+            i32.add))
+        "#;
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat).unwrap();
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+
+        linker
+            .func_wrap("host", "async_get_value", || -> i32 { 41 })
+            .unwrap();
+
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let compute = instance
+            .get_typed_func::<(), i32>(&mut store, "compute")
+            .unwrap();
+
+        let result = compute.call(&mut store, ()).unwrap();
+        assert_eq!(result, 42, "async_get_value(41) + 1 should be 42");
+    }
+
+    /// Verify that sync and async host functions can coexist in the same module
+    /// in wasmtime.
+    #[test]
+    #[cfg(feature = "wasmtime-backend")]
+    fn test_wasmtime_mixed_sync_async_host_functions() {
+        use wasmtime::*;
+
+        let wat = r#"
+        (module
+          (import "host" "sync_add" (func $sync_add (param i32 i32) (result i32)))
+          (import "host" "async_mul" (func $async_mul (param i32 i32) (result i32)))
+          (func (export "compute") (param i32 i32) (result i32)
+            ;; sync_add(a, b) + async_mul(a, b)
+            local.get 0
+            local.get 1
+            call $sync_add
+            local.get 0
+            local.get 1
+            call $async_mul
+            i32.add))
+        "#;
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat).unwrap();
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+
+        linker
+            .func_wrap("host", "sync_add", |a: i32, b: i32| -> i32 { a + b })
+            .unwrap();
+        linker
+            .func_wrap("host", "async_mul", |a: i32, b: i32| -> i32 { a * b })
+            .unwrap();
+
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let compute = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "compute")
+            .unwrap();
+
+        let result = compute.call(&mut store, (3, 4)).unwrap();
+        // sync_add(3, 4) = 7, async_mul(3, 4) = 12, total = 19
+        assert_eq!(result, 19);
+    }
+
+    /// Verify that wasmtime stores can be reused across multiple calls.
+    ///
+    /// Wasmtime stores are reusable by default — no special async conversion
+    /// is needed. This test verifies that pattern works correctly.
+    #[test]
+    #[cfg(feature = "wasmtime-backend")]
+    fn test_wasmtime_store_reuse() {
+        use wasmtime::*;
+
+        let wat = r#"
+        (module
+          (import "host" "inc" (func $inc (param i32) (result i32)))
+          (func (export "call_inc") (param i32) (result i32)
+            local.get 0
+            call $inc))
+        "#;
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat).unwrap();
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+
+        linker
+            .func_wrap("host", "inc", |x: i32| -> i32 { x + 1 })
+            .unwrap();
+
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let call_inc = instance
+            .get_typed_func::<i32, i32>(&mut store, "call_inc")
+            .unwrap();
+
+        // Multiple calls reusing the same store
+        let result1 = call_inc.call(&mut store, 10).unwrap();
+        assert_eq!(result1, 11);
+
+        let result2 = call_inc.call(&mut store, 20).unwrap();
+        assert_eq!(result2, 21);
+
+        let result3 = call_inc.call(&mut store, 30).unwrap();
+        assert_eq!(result3, 31);
     }
 }

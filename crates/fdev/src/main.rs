@@ -13,6 +13,7 @@ mod new_package;
 mod query;
 mod testing;
 mod util;
+mod verify_state;
 mod wasm_runtime;
 
 use crate::{
@@ -91,6 +92,9 @@ fn main() -> anyhow::Result<()> {
             }
             SubCommand::GetContractId(get_contract_id_config) => {
                 commands::get_contract_id(get_contract_id_config).await
+            }
+            SubCommand::VerifyState(verify_config) => {
+                verify_state::verify_state(verify_config).await
             }
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow

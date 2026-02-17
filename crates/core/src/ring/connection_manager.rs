@@ -259,7 +259,13 @@ impl ConnectionManager {
             }
         }
         let open = self.connection_count();
-        let reserved_before = self.pending_reservations.read().len();
+        let now = Instant::now();
+        let reserved_before = self
+            .pending_reservations
+            .read()
+            .iter()
+            .filter(|(_, (_, created))| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+            .count();
 
         tracing::debug!(
             addr = %addr,
@@ -886,8 +892,25 @@ impl ConnectionManager {
     }
 
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
-        self.location_for_peer.read().contains_key(&addr)
-            || self.pending_reservations.read().contains_key(&addr)
+        if self.location_for_peer.read().contains_key(&addr) {
+            return true;
+        }
+        let pending = self.pending_reservations.read();
+        if let Some((_loc, created)) = pending.get(&addr) {
+            return Instant::now().duration_since(*created) <= PENDING_RESERVATION_TTL;
+        }
+        false
+    }
+
+    pub(crate) fn inject_reservation(
+        &self,
+        addr: SocketAddr,
+        location: Location,
+        created: Instant,
+    ) {
+        self.pending_reservations
+            .write()
+            .insert(addr, (location, created));
     }
 
     pub(crate) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
@@ -1004,6 +1027,12 @@ impl ConnectionManager {
         before - map.len()
     }
 
+    /// Clear all recently-failed addresses. Used after suspend/resume when
+    /// previously-unreachable peers may be reachable again.
+    pub fn cleanup_all_failed_addrs(&self) {
+        self.recently_failed_addrs.write().clear();
+    }
+
     #[allow(dead_code)]
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = SocketAddr> {
         let read = self.location_for_peer.read();
@@ -1052,6 +1081,13 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn age_reservation(cm: &ConnectionManager, addr: SocketAddr, age: Duration) {
+        let mut pending = cm.pending_reservations.write();
+        if let Some(entry) = pending.get_mut(&addr) {
+            entry.1 = Instant::now() - age;
+        }
     }
 
     // ============ Basic ConnectionManager tests ============
@@ -1822,6 +1858,104 @@ mod tests {
         assert_eq!(cm.get_reserved_connections(), 1);
         assert!(!cm.has_connection_or_pending(addr1));
         assert!(cm.has_connection_or_pending(addr2));
+    }
+
+    #[test]
+    fn test_has_connection_or_pending_ignores_expired_reservation() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(8001);
+        let loc = Location::new(0.1);
+
+        // Create a reservation via should_accept
+        assert!(cm.should_accept(loc, addr));
+        assert!(cm.has_connection_or_pending(addr));
+
+        // Backdate the reservation to simulate expiration
+        {
+            let mut pending = cm.pending_reservations.write();
+            if let Some(entry) = pending.get_mut(&addr) {
+                entry.1 = Instant::now() - Duration::from_secs(120);
+            }
+        }
+
+        // Expired reservation should be invisible
+        assert!(
+            !cm.has_connection_or_pending(addr),
+            "has_connection_or_pending should ignore expired reservations"
+        );
+    }
+
+    #[test]
+    fn test_has_connection_or_pending_sees_fresh_reservation() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(8001);
+        let loc = Location::new(0.1);
+
+        assert!(cm.should_accept(loc, addr));
+        assert!(
+            cm.has_connection_or_pending(addr),
+            "has_connection_or_pending should see fresh reservations"
+        );
+    }
+
+    #[test]
+    fn test_has_connection_or_pending_always_sees_established() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let keypair = TransportKeypair::new();
+        let addr = make_addr(8001);
+        let loc = Location::new(0.1);
+
+        // Add an established connection
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        assert!(
+            cm.has_connection_or_pending(addr),
+            "has_connection_or_pending should always see established connections"
+        );
+    }
+
+    #[test]
+    fn test_has_connection_or_pending_ttl_boundary() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(8001);
+        assert!(cm.should_accept(Location::new(0.1), addr));
+
+        age_reservation(&cm, addr, PENDING_RESERVATION_TTL - Duration::from_secs(1));
+        assert!(cm.has_connection_or_pending(addr));
+
+        age_reservation(&cm, addr, PENDING_RESERVATION_TTL + Duration::from_secs(1));
+        assert!(!cm.has_connection_or_pending(addr));
+    }
+
+    #[test]
+    fn test_re_reservation_after_expiry() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(8001);
+        let loc = Location::new(0.1);
+
+        assert!(cm.should_accept(loc, addr));
+        assert!(cm.has_connection_or_pending(addr));
+
+        age_reservation(&cm, addr, Duration::from_secs(120));
+        assert!(!cm.has_connection_or_pending(addr));
+
+        assert!(cm.should_accept(loc, addr));
+        assert!(cm.has_connection_or_pending(addr));
+    }
+
+    #[test]
+    fn test_cleanup_frees_slots_for_new_connections() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 2, 3, false);
+        let addr1 = make_addr(8001);
+        let addr2 = make_addr(8002);
+        let addr3 = make_addr(8003);
+
+        assert!(cm.should_accept(Location::new(0.1), addr1));
+        assert!(cm.should_accept(Location::new(0.2), addr2));
+
+        age_reservation(&cm, addr1, Duration::from_secs(120));
+        assert_eq!(cm.cleanup_stale_reservations(), 1);
+
+        assert!(cm.should_accept(Location::new(0.3), addr3));
     }
 
     // ============ Admission control tests ============
