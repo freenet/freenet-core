@@ -191,15 +191,31 @@ jobs:
         # Thread-local state and per-network registries provide test isolation.
         # Skip determinism comparison tests — they compare sequential runs and
         # need shared atomic counters to be stable (run serially below).
+        # Exclude freenet-ping-app: its 3 blocked-peers tests each spin up 3 real
+        # nodes (9 total). Running them in parallel with core tests causes CI
+        # timeouts. They run sequentially in their own step below.
         # Retry once on failure — real-network tests are timing-sensitive
         # and occasionally fail under CI resource pressure.
         run: |
-          cargo test --workspace --no-default-features \
+          cargo test --workspace --exclude freenet-ping-app --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
             -- --skip determinism \
-          || cargo test --workspace --no-default-features \
+          || cargo test --workspace --exclude freenet-ping-app --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
             -- --skip determinism
+
+      - name: Test ping app (serial)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          FREENET_BACKOFF_BASE_SECS: "5"
+        # Ping blocked-peers tests each start 3 real nodes with 180s connection
+        # timeouts. Running them sequentially prevents resource contention.
+        run: |
+          cargo test -p freenet-ping-app --features testing \
+            -- --test-threads=1 \
+          || cargo test -p freenet-ping-app --features testing \
+            -- --test-threads=1
 
       - name: Test determinism (serial)
         env:
