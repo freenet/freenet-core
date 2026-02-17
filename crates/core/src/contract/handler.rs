@@ -275,7 +275,7 @@ pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<WaitingResolution>,
 ) {
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(10);
+    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(100);
     (
         ContractHandlerChannel {
             end: SenderHalve {
@@ -379,6 +379,11 @@ impl ContractHandlerChannel<SenderHalve> {
         self.session_adapter_tx = Some(session_tx);
     }
 
+    /// Timeout for registering a transaction with the event loop's client-result delivery system.
+    /// If the channel is full for this long, the event loop is not draining client transactions
+    /// (polled at Priority 7) and the operation should fail rather than block forever.
+    const WAIT_FOR_RES_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub async fn waiting_for_transaction_result(
         &self,
         transaction: impl Into<WaitingTransaction>,
@@ -387,12 +392,26 @@ impl ContractHandlerChannel<SenderHalve> {
     ) -> Result<(), ContractError> {
         let waiting_tx = transaction.into();
 
-        // Call legacy implementation first
-        self.end
-            .wait_for_res_tx
-            .send((client_id, waiting_tx))
-            .await
-            .map_err(|_| ContractError::NoEvHandlerResponse)?;
+        match tokio::time::timeout(
+            Self::WAIT_FOR_RES_SEND_TIMEOUT,
+            self.end.wait_for_res_tx.send((client_id, waiting_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Err(_) => {
+                tracing::error!(
+                    client = %client_id,
+                    request_id = %request_id,
+                    channel_capacity = self.end.wait_for_res_tx.capacity(),
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out registering transaction for result delivery — \
+                     event loop is not draining client transactions (Priority 7 starvation)"
+                );
+                return Err(ContractError::NoEvHandlerResponse);
+            }
+        }
 
         // Route to session actor if session adapter is installed
         if let Some(session_tx) = &self.session_adapter_tx {
@@ -438,11 +457,30 @@ impl ContractHandlerChannel<SenderHalve> {
         client_id: ClientId,
         request_id: RequestId,
     ) -> Result<(), ContractError> {
-        self.end
-            .wait_for_res_tx
-            .send((client_id, WaitingTransaction::Subscription { contract_key }))
-            .await
-            .map_err(|_| ContractError::NoEvHandlerResponse)?;
+        match tokio::time::timeout(
+            Self::WAIT_FOR_RES_SEND_TIMEOUT,
+            self.end
+                .wait_for_res_tx
+                .send((client_id, WaitingTransaction::Subscription { contract_key })),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Err(_) => {
+                tracing::error!(
+                    tx = %tx,
+                    client = %client_id,
+                    request_id = %request_id,
+                    contract = %contract_key,
+                    channel_capacity = self.end.wait_for_res_tx.capacity(),
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out registering subscription for result delivery — \
+                     event loop is not draining client transactions (Priority 7 starvation)"
+                );
+                return Err(ContractError::NoEvHandlerResponse);
+            }
+        }
 
         if let Some(session_tx) = &self.session_adapter_tx {
             let msg = SessionMessage::RegisterTransaction {
