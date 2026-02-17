@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
@@ -18,7 +18,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -99,10 +99,10 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
     let gateway_future = async {
         let config = config_gw.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        node_config.min_number_of_connections(2);
+        node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -112,10 +112,10 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
     let node1_future = async {
         let config = config_node1.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        node_config.min_number_of_connections(2);
+        node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -125,27 +125,19 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
     let node2_future = async {
         let config = config_node2.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        node_config.min_number_of_connections(2);
+        node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "node2"))
     .boxed_local();
 
-    let test = timeout(Duration::from_secs(180), async {
-        println!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        println!("✓ Nodes should be up and have basic connectivity");
-
-        // TODO: The connection maintenance task runs every 60 seconds by default,
-        // which is too slow for tests. This causes the first GET operation to take
-        // 11+ seconds as connections are established on-demand.
-        //
-        // Proper fix: Make connection acquisition more aggressive during startup,
-        // or make the maintenance interval configurable for tests.
+    let test = timeout(Duration::from_secs(300), async {
+        // Wait for nodes to start their WebSocket servers
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         let uri_gw =
             format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -165,6 +157,12 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         let (stream_node2, _) =
             connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
         let mut client_node2 = WebApi::start(stream_node2);
+
+        // Verify nodes have joined the ring before starting operations
+        println!("Waiting for nodes to join the ring...");
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        println!("✓ All nodes connected to the ring");
 
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         println!("Loading contract code from {}", path_to_code.display());

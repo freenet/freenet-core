@@ -59,9 +59,7 @@ use tracing::Instrument;
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 // Re-export types for dev_tool and testing
-pub use network_bridge::{
-    clear_all_fault_injectors, reset_channel_id_counter, EventLoopExitReason, NetworkStats,
-};
+pub use network_bridge::{reset_channel_id_counter, EventLoopExitReason, NetworkStats};
 
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
@@ -69,6 +67,11 @@ pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod message_processor;
 mod network_bridge;
+
+// Re-export fault injection types for test infrastructure.
+// No cfg gate: underlying items are unconditionally compiled and integration
+// tests compile the lib without cfg(test).
+pub use network_bridge::in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState};
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod proximity_cache;
@@ -747,6 +750,13 @@ where
     }
 }
 
+/// Returns the exponential backoff delay for the given retry attempt.
+///
+/// Starts at 5ms and doubles each attempt, capped at 1000ms.
+fn op_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
+}
+
 /// Pure network message processing for V1 messages (no client concerns)
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
@@ -765,7 +775,7 @@ where
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
 
-    const MAX_RETRIES: usize = 10usize;
+    const MAX_RETRIES: usize = 15usize;
     for i in 0..MAX_RETRIES {
         let tx = Some(*msg.id());
         tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
@@ -791,12 +801,21 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay = op_retry_backoff(i);
+                            tracing::debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
+                            tracing::debug!(
+                                tx = %msg.id(),
+                                tx_type = ?msg.id().transaction_type(),
+                                "Pure network: Operation already completed"
+                            );
                             return Ok(None);
                         }
                     }
@@ -842,8 +861,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay = op_retry_backoff(i);
+                            tracing::debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -884,8 +908,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay = op_retry_backoff(i);
+                            tracing::debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -915,8 +944,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay = op_retry_backoff(i);
+                            tracing::debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -946,8 +980,13 @@ where
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            let delay = op_retry_backoff(i);
+                            tracing::debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                attempt = i,
+                                "Pure network: Operation still running, backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         OpNotAvailable::Completed => {
@@ -965,12 +1004,15 @@ where
                 )
                 .await;
             }
+            // Non-transactional message types: process once and return immediately.
+            // These must NOT fall through to the post-loop "Dropping message" warning,
+            // which is only meant for operation retry exhaustion.
             NetMessageV1::ProximityCache { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!(
                         "Received ProximityCache message without source address (pure network)"
                     );
-                    break;
+                    return Ok(None);
                 };
                 tracing::debug!(
                     from = %source,
@@ -993,7 +1035,7 @@ where
                         %source,
                         "ProximityCache: could not resolve source addr to pub_key, skipping"
                     );
-                    break;
+                    return Ok(None);
                 };
                 if let Some(response) = op_manager
                     .proximity_cache
@@ -1006,12 +1048,12 @@ where
                         tracing::error!(%err, %source, "Failed to send ProximityCache response");
                     }
                 }
-                break;
+                return Ok(None);
             }
             NetMessageV1::InterestSync { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!("Received InterestSync message without source address");
-                    break;
+                    return Ok(None);
                 };
                 tracing::debug!(
                     from = %source,
@@ -1028,13 +1070,18 @@ where
                         tracing::error!(%err, %source, "Failed to send InterestSync response");
                     }
                 }
-                break;
+                return Ok(None);
             }
-            _ => break, // Exit the loop if no applicable message type is found
+            NetMessageV1::Aborted(_) => return Ok(None),
         }
     }
 
-    // If we reach here, no operation was processed
+    // If we reach here, retries were exhausted waiting for a concurrent operation to finish
+    tracing::warn!(
+        tx = %msg.id(),
+        tx_type = ?msg.id().transaction_type(),
+        "Dropping message after {MAX_RETRIES} retry attempts (operation busy)"
+    );
     Ok(None)
 }
 
@@ -1767,7 +1814,7 @@ pub async fn run_local_node(
         _ => {}
     }
 
-    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await?;
+    let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
 
     // TODO: use combinator instead
     // let mut all_clients =
@@ -1805,7 +1852,7 @@ pub async fn run_local_node(
                     .await
             }
             ClientRequest::DelegateOp(op) => {
-                // Use the attested_contract already resolved by WebSocket/HttpGateway
+                // Use the attested_contract already resolved by the WebSocket/HTTP client API
                 // instead of re-looking up from gw.attested_contracts (which could fail
                 // if the token expired between WebSocket connect and this request)
                 let op_name = match op {

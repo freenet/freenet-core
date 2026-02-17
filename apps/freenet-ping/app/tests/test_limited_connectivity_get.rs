@@ -41,7 +41,11 @@ use std::{
     time::Duration,
 };
 
-use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
+use freenet::{
+    local_node::NodeConfig,
+    server::serve_client_api,
+    test_utils::{allocate_test_node_block, test_ip_for_node},
+};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -52,7 +56,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    ws_config,
+    wait_for_node_connected, ws_config,
 };
 
 /// Test that GET requests for non-existent contracts terminate gracefully
@@ -65,9 +69,10 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
     println!("🔧 Testing GET for non-existent contract with limited connectivity");
     println!("   Network: Gateway + 1 peer (peer only connected to gateway)");
 
-    // Use unique IPs for each node
-    let gw_ip = test_ip_for_node(0);
-    let peer_ip = test_ip_for_node(1);
+    // Use globally unique IPs to avoid conflicts with parallel tests on CI
+    let base_node_idx = allocate_test_node_block(2);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let peer_ip = test_ip_for_node(base_node_idx + 1);
 
     // Create sockets for the network
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
@@ -122,7 +127,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -135,7 +140,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -143,9 +148,8 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
     .boxed_local();
 
     let test = timeout(Duration::from_secs(120), async {
-        println!("Waiting for nodes to start up...");
+        // Wait for nodes to start their WebSocket servers
         tokio::time::sleep(Duration::from_secs(10)).await;
-        println!("✓ Nodes should be up");
 
         // Connect to peer's WebSocket API
         let uri_peer = format!(
@@ -155,7 +159,10 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
             connect_async_with_config(&uri_peer, Some(ws_config()), false).await?;
         let mut client_peer = WebApi::start(stream_peer);
 
-        println!("✓ Connected to peer node");
+        // Verify peer has joined the ring before sending GET
+        println!("Waiting for peer to join the ring...");
+        wait_for_node_connected(&mut client_peer, "Peer", 1, 120).await?;
+        println!("✓ Peer connected to the ring");
 
         // Generate a random contract ID that definitely doesn't exist
         // Use a random hash to ensure it doesn't match any existing contract

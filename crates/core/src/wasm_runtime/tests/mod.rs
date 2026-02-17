@@ -1,14 +1,7 @@
-use std::{path::PathBuf, process::Command, sync::Arc};
+use std::{path::PathBuf, process::Command};
 
-use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
-};
-
-use crate::util::tests::get_temp_dir;
 use crate::util::workspace::get_workspace_target_dir;
 use tracing::info;
-
-use super::{ContractStore, DelegateStore, SecretsStore};
 
 mod cache;
 mod contract;
@@ -55,24 +48,32 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 pub(crate) struct TestSetup {
     #[allow(unused)]
     temp_dir: tempfile::TempDir,
-    contract_store: ContractStore,
-    delegate_store: DelegateStore,
-    secrets_store: SecretsStore,
-    contract_key: ContractKey,
+    contract_store: super::ContractStore,
+    delegate_store: super::DelegateStore,
+    secrets_store: super::SecretsStore,
+    contract_key: freenet_stdlib::prelude::ContractKey,
 }
 
 pub(crate) async fn setup_test_contract(
     name: &str,
 ) -> Result<TestSetup, Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, WrappedContract,
+    };
+
     use crate::contract::storages::Storage;
-    // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    use crate::util::tests::get_temp_dir;
     let temp_dir = get_temp_dir();
 
     let db = Storage::new(temp_dir.path()).await?;
     let mut contract_store =
-        ContractStore::new(temp_dir.path().join("contract"), 10_000, db.clone())?;
-    let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())?;
-    let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db)?;
+        super::ContractStore::new(temp_dir.path().join("contract"), 10_000, db.clone())?;
+    let delegate_store =
+        super::DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())?;
+    let secrets_store =
+        super::SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),

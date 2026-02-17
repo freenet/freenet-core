@@ -1053,14 +1053,22 @@ static RESERVED_PORTS: LazyLock<DashSet<u16>> = LazyLock::new(DashSet::new);
 static RESERVED_SOCKETS: LazyLock<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
     LazyLock::new(DashMap::new);
 
-/// Global counter for allocating unique node indices across all parallel tests.
-/// Each test allocates a contiguous block of indices for its nodes.
-static GLOBAL_NODE_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const NODE_INDEX_BLOCK: usize = 10_000;
 
-/// Reset the global node index counter to initial state.
-/// Used for deterministic simulation testing.
+thread_local! {
+    /// Thread-local counter for allocating unique node indices.
+    /// Each thread gets a non-overlapping block of 10K indices.
+    static GLOBAL_NODE_INDEX: std::cell::Cell<usize> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        std::cell::Cell::new((idx as usize) * NODE_INDEX_BLOCK)
+    };
+}
+
+/// Reset the global node index counter to initial state for this thread.
+/// Thread-local, so safe for parallel test execution.
 pub fn reset_global_node_index() {
-    GLOBAL_NODE_INDEX.store(0, std::sync::atomic::Ordering::SeqCst);
+    let idx = crate::config::GlobalRng::thread_index();
+    GLOBAL_NODE_INDEX.with(|c| c.set((idx as usize) * NODE_INDEX_BLOCK));
 }
 
 /// Allocate a block of unique global node indices for a test.
@@ -1068,7 +1076,11 @@ pub fn reset_global_node_index() {
 /// This ensures that parallel tests get non-overlapping IP address ranges.
 /// Returns the starting global index for this test's nodes.
 pub fn allocate_test_node_block(node_count: usize) -> usize {
-    GLOBAL_NODE_INDEX.fetch_add(node_count, std::sync::atomic::Ordering::SeqCst)
+    GLOBAL_NODE_INDEX.with(|c| {
+        let v = c.get();
+        c.set(v + node_count);
+        v
+    })
 }
 
 /// Generate a unique loopback IP address for test node at given index.
@@ -1165,6 +1177,17 @@ pub fn release_local_port(port: u16) {
     RESERVED_PORTS.remove(&port);
     // Dropping the sockets releases the port back to the OS
     RESERVED_SOCKETS.remove(&port);
+}
+
+/// Take the reserved TCP listener for a port without dropping it.
+///
+/// Returns the `TcpListener` that was held to reserve this port, removing
+/// it from tracking. The caller can convert it to a `tokio::net::TcpListener`
+/// via `TcpListener::from_std()`, avoiding a release-then-rebind race window
+/// where another process could claim the port. The UDP socket is dropped.
+pub fn take_reserved_tcp_listener(port: u16) -> Option<std::net::TcpListener> {
+    RESERVED_PORTS.remove(&port);
+    RESERVED_SOCKETS.remove(&port).map(|(_, (_udp, tcp))| tcp)
 }
 
 // Test context for integration tests

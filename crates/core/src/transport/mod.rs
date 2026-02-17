@@ -192,10 +192,7 @@ pub enum TransportError {
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
     #[error("Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core")]
-    ProtocolVersionMismatch {
-        expected: String,
-        actual: &'static str,
-    },
+    ProtocolVersionMismatch { expected: String, actual: String },
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]

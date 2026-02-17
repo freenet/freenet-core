@@ -21,6 +21,8 @@ We currently use these testing paradigms:
 | Simulation Testing | ✅ Mature | SimNetwork with VirtualTime + Turmoil |
 | Deterministic Time/RNG | ✅ Complete | `VirtualTime`, `GlobalRng` |
 | **Deterministic Scheduling** | ✅ **Complete** | **Turmoil (always enabled)** |
+| **Anomaly Detection** | ✅ **Complete** | **StateVerifier with 10 anomaly types** |
+| **Fault Tolerance Scenarios** | ✅ **Complete** | **Partition/heal, crash/recover, churn** |
 | Property-based Testing | ⚠️ Limited | LEDBAT only |
 | Fuzz Testing | ⚠️ Underused | Infrastructure exists |
 
@@ -54,6 +56,7 @@ Full determinism achieved. See [deterministic-simulation-roadmap.md](determinist
 | Testing contract operations in isolation | `#[freenet_test]` macro with single gateway |
 | Testing multi-node connectivity | `#[freenet_test]` macro with multiple nodes |
 | Testing fault tolerance (message loss, partitions) | SimNetwork with FaultConfig |
+| Testing fault recovery (partition heal, crash recover, churn) | Turmoil + global fault injector + anomaly detection |
 | Testing deterministic replay | SimNetwork with fixed seed |
 | Testing at scale (20+ peers) | `freenet-test-network` with TestNetwork |
 | Testing River app integration | `freenet-test-network` with riverctl |
@@ -70,10 +73,7 @@ cargo test -p freenet
 cargo test -p freenet --test isolated_node_regression
 
 # SimNetwork simulation tests
-cargo test -p freenet --test simulation_integration
-
-# SimNetwork with deterministic scheduling (Turmoil always enabled)
-cargo test -p freenet --test simulation_integration -- --test-threads=1
+cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration
 
 # Real network tests (requires feature)
 cargo test -p freenet --test test_network_integration --features test-network

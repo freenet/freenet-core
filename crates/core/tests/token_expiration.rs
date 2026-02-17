@@ -181,7 +181,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
     use freenet::{
         config::WebsocketApiConfig,
         dev_tool::{AuthToken, ClientId},
-        server::{serve_gateway_for_test, AttestedContract},
+        server::{serve_client_api_for_test, AttestedContract},
         test_utils,
     };
     use std::time::Duration;
@@ -194,13 +194,13 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         const CLEANUP_INTERVAL_SECS: u64 = 1;
 
         info!(
-            "Starting gateway with short token TTL ({} seconds) and cleanup interval ({} seconds)",
+            "Starting client API with short token TTL ({} seconds) and cleanup interval ({} seconds)",
             TOKEN_TTL_SECS, CLEANUP_INTERVAL_SECS
         );
 
         let ws_socket = TcpListener::bind("127.0.0.1:0")?;
         let ws_port = ws_socket.local_addr()?.port();
-        // Drop the socket to release the port before the gateway binds to it
+        // Drop the socket to release the port before the client API binds to it
         drop(ws_socket);
 
         let config = WebsocketApiConfig {
@@ -210,8 +210,8 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
             token_cleanup_interval_seconds: CLEANUP_INTERVAL_SECS,
         };
 
-        // Start the gateway server (which spawns the cleanup task)
-        let (gw, _ws_proxy) = serve_gateway_for_test(config).await?;
+        // Start the client API server (which spawns the cleanup task)
+        let (gw, _ws_proxy) = serve_client_api_for_test(config).await?;
 
         // Access the attested_contracts map via the test-only method
         let attested_contracts = gw.attested_contracts();

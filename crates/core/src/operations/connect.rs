@@ -250,6 +250,9 @@ pub(crate) struct RelayState {
     pub upstream_addr: SocketAddr,
     pub request: ConnectRequest,
     pub forwarded_to: Option<PeerKeyLocation>,
+    /// When the request was forwarded to `forwarded_to` peer.
+    /// Used for GC timeout logging and diagnostics.
+    pub forwarded_at: Option<Instant>,
     pub observed_sent: bool,
     pub accepted_locally: bool,
 }
@@ -372,6 +375,7 @@ impl RelayState {
         // forward_to_peer is called, so no need to mark it again here.
         let forward_snapshot = forward_req.clone();
         self.forwarded_to = Some(peer.clone());
+        self.forwarded_at = Some(Instant::now());
         self.request = forward_req;
         forward_attempts.insert(
             peer.clone(),
@@ -603,6 +607,19 @@ impl RelayContext for RelayEnv<'_> {
     fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool {
         let addr = joiner.socket_addr();
         let location = joiner.location();
+
+        // Check blocklist before capacity. If we block this peer, return false
+        // so the uphill hop mechanism can route to an alternate acceptor.
+        if let Some(blocked) = &self.op_manager.blocked_addresses {
+            if blocked.contains(&addr) {
+                tracing::info!(
+                    joiner_addr = %addr,
+                    "connect: rejecting join from blocked peer at routing level"
+                );
+                return false;
+            }
+        }
+
         self.op_manager
             .ring
             .connection_manager
@@ -874,6 +891,7 @@ impl ConnectOp {
             upstream_addr,
             request,
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         }));
@@ -1052,6 +1070,7 @@ impl ConnectOp {
                 upstream_addr,
                 request: request.clone(),
                 forwarded_to: None,
+                forwarded_at: None,
                 observed_sent: false,
                 accepted_locally: false,
             })));
@@ -1494,14 +1513,16 @@ impl Operation for ConnectOp {
                                 st.upstream_addr,
                             )
                         };
-                        if let Some(fwd) = forwarded {
-                            self.record_forward_outcome(&fwd, desired, true);
+                        if let Some(ref fwd) = forwarded {
+                            self.record_forward_outcome(fwd, desired, true);
                         }
 
-                        tracing::debug!(
+                        tracing::info!(
+                            tx = %self.id,
                             upstream_addr = %upstream_addr,
                             acceptor_pub_key = %payload.acceptor.pub_key(),
-                            "connect: forwarding response towards joiner"
+                            forwarded_from = ?forwarded,
+                            "connect: relay forwarding response towards joiner"
                         );
                         // Forward response toward the joiner via upstream using hop-by-hop routing
                         let forward_msg = ConnectMsg::Response {
@@ -1589,24 +1610,90 @@ impl Operation for ConnectOp {
                         }
                         self.state = Some(ConnectState::Completed);
                         Ok(store_operation_state(&mut self))
-                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_ref() {
-                        // Relay: forward rejection upstream toward the joiner
+                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                        // Relay: received rejection from uphill peer — try another before giving up
                         let upstream_addr = state.upstream_addr;
-                        tracing::debug!(
-                            tx = %self.id,
-                            upstream_addr = %upstream_addr,
-                            "connect: forwarding rejection upstream"
-                        );
-                        let reject_msg = ConnectMsg::Rejected {
-                            id: self.id,
-                            desired_location: *desired_location,
-                        };
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                            )
-                            .await?;
+                        let failed_peer = state.forwarded_to.clone();
+
+                        // Record failure in estimator so future routing avoids this peer.
+                        // This requires &mut self, so we must drop the state borrow first.
+                        if let Some(ref fwd) = failed_peer {
+                            self.record_forward_outcome(fwd, *desired_location, false);
+                        }
+
+                        // Re-borrow state to reset forwarded_to and retry with a new peer.
+                        // The previously-tried peer is in recency, so select_uphill_hop skips it.
+                        let env = RelayEnv::new(op_manager);
+                        let estimator = self.connect_forward_estimator.read().clone();
+                        let retry_actions =
+                            if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                                state.forwarded_to = None;
+                                state.forwarded_at = None;
+                                state.handle_request(
+                                    &env,
+                                    &self.recency,
+                                    &mut self.forward_attempts,
+                                    &estimator,
+                                )
+                            } else {
+                                unreachable!("state was Relaying at branch entry")
+                            };
+
+                        if let Some((peer, forward_req)) = retry_actions.forward {
+                            // Found a different uphill peer — forward to it
+                            self.recency.insert(peer.clone(), Instant::now());
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_peer = ?failed_peer,
+                                retry_peer = %peer.pub_key(),
+                                "connect: relay retrying with different uphill peer after rejection"
+                            );
+                            let forward_msg = ConnectMsg::Request {
+                                id: self.id,
+                                payload: forward_req,
+                            };
+                            if let Some(addr) = peer.socket_addr() {
+                                network_bridge
+                                    .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
+                                    .await?;
+                            }
+                        } else if let Some(response) = retry_actions.accept_response {
+                            // Relay decided to accept on retry — send response upstream
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_peer = ?failed_peer,
+                                acceptor = %response.acceptor.pub_key(),
+                                "connect: relay accepting locally after uphill rejection"
+                            );
+                            let response_msg = ConnectMsg::Response {
+                                id: self.id,
+                                payload: response,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                                )
+                                .await?;
+                        } else {
+                            // No more uphill peers and can't accept — forward rejection upstream
+                            tracing::info!(
+                                tx = %self.id,
+                                upstream_addr = %upstream_addr,
+                                failed_peer = ?failed_peer,
+                                "connect: relay forwarding rejection upstream (no retry peers available)"
+                            );
+                            let reject_msg = ConnectMsg::Rejected {
+                                id: self.id,
+                                desired_location: *desired_location,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(reject_msg)),
+                                )
+                                .await?;
+                        }
                         Ok(store_operation_state(&mut self))
                     } else {
                         tracing::warn!(
@@ -1710,13 +1797,19 @@ pub(crate) async fn join_ring_request(
     }
 
     let own = op_manager.ring.connection_manager.own_location();
-    // Use a random desired_location so the gateway routes to diverse ring peers
-    // instead of always forwarding to its single closest neighbor (which caused
-    // cascading failures at scale when all joiners converged on one acceptor).
-    // A random location also varies on each retry, preventing deterministic routing
-    // to the same unreachable peer. Ring-optimal connections are established later
-    // through connection_maintenance/adjust_topology once the peer has bootstrapped.
-    let desired_location = Location::random();
+    // Use the joiner's own location as the desired_location for the connect request.
+    //
+    // History: PR #2907 fixed a critical issue where using `gateway.location()` caused
+    // 99.7% of join requests to converge on a single acceptor. That PR intended to use
+    // the joiner's own location but implemented `Location::random()` instead, which
+    // broke simulation determinism for certain seeds (issues #3028, #3030).
+    //
+    // Using `own.location()` is correct because:
+    // - Each joiner has a unique location → requests spread across gateway neighbors
+    // - The gateway routes toward the joiner's ring neighborhood → better initial placement
+    // - Deterministic in simulation tests (same seed → same location → same topology)
+    // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
+    let desired_location = own.location().unwrap_or_else(Location::random);
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -1800,15 +1893,8 @@ pub(crate) async fn initial_join_procedure(
         loop {
             let open_conns = op_manager.ring.open_connections();
 
-            // When we have zero ring connections, try ALL gateways regardless of
-            // pending_reservations. This handles the case where a CONNECT operation
-            // reserved a gateway slot but the actual connection was routed to a
-            // blocked acceptor, leaving a stale reservation that prevents retries.
-            let unconnected_gateways: Vec<_> = if open_conns == 0 {
-                gateways.iter().collect()
-            } else {
-                op_manager.ring.is_not_connected(gateways.iter()).collect()
-            };
+            let unconnected_gateways: Vec<_> =
+                op_manager.ring.is_not_connected(gateways.iter()).collect();
 
             tracing::debug!(
                 "Connection status: open_connections = {}, unconnected_gateways = {}",
@@ -1823,7 +1909,7 @@ pub(crate) async fn initial_join_procedure(
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
                 // Design note: We track backoff per-gateway because join_ring_request uses
-                // a random desired_location each time. Backing off the gateway gives the
+                // the joiner's own desired_location each time. Backing off the gateway gives the
                 // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
@@ -1857,14 +1943,21 @@ pub(crate) async fn initial_join_procedure(
                 let eligible_count = eligible_gateways.len();
 
                 if eligible_count == 0 {
-                    // All gateways are in backoff - wait for the shortest one
+                    // All gateways are in backoff - wait for the shortest one,
+                    // but also wake up if connection_maintenance clears the backoff
+                    // (e.g. during isolation recovery or suspend detection).
                     if let Some(min_wait) = min_backoff {
                         tracing::info!(
                             wait_secs = min_wait.as_secs(),
                             total_gateways = unconnected_count,
                             "All gateways in backoff, waiting for shortest backoff to expire"
                         );
-                        tokio::time::sleep(min_wait).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(min_wait) => {},
+                            _ = op_manager.gateway_backoff_cleared.notified() => {
+                                tracing::info!("Gateway backoff cleared externally, retrying immediately");
+                            },
+                        }
                         continue;
                     }
                 }
@@ -2058,6 +2151,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2101,6 +2195,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2141,6 +2236,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2179,6 +2275,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2239,6 +2336,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2301,6 +2399,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2470,6 +2569,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2609,6 +2709,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2677,6 +2778,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2717,6 +2819,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2772,6 +2875,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2826,6 +2930,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -2871,6 +2976,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3064,6 +3170,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3095,6 +3202,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3125,6 +3233,7 @@ mod tests {
                 visited: VisitedPeers::default(),
             },
             forwarded_to: None,
+            forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -3140,5 +3249,111 @@ mod tests {
         assert!(!actions.rejected, "should not reject when uphill available");
         assert!(actions.forward.is_some(), "should forward uphill");
         assert!(actions.accept_response.is_none());
+        assert!(
+            state.forwarded_at.is_some(),
+            "forwarded_at should be set after forwarding"
+        );
+    }
+
+    #[test]
+    fn relay_retries_different_uphill_peer_after_rejection() {
+        // Simulate the retry sequence that process_message performs on Rejected:
+        // 1. Forward to peer_a (uphill)
+        // 2. Rejection arrives → reset forwarded_to, call handle_request again
+        // 3. Context provides peer_b → should forward to peer_b
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let peer_b = make_peer(7000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // Step 1: Initial forward to peer_a
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a.clone()));
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        assert!(actions.forward.is_some(), "should forward to peer_a");
+        assert_eq!(
+            state.forwarded_to.as_ref().unwrap().pub_key(),
+            peer_a.pub_key()
+        );
+
+        // Step 2: Simulate rejection — reset forwarded_to (as process_message does)
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+
+        // Step 3: Retry with peer_b available
+        let ctx_b = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(Some(peer_b.clone()));
+        let retry_actions =
+            state.handle_request(&ctx_b, &recency, &mut forward_attempts, &estimator);
+        assert!(
+            retry_actions.forward.is_some(),
+            "should forward to peer_b on retry"
+        );
+        let (fwd_peer, _) = retry_actions.forward.unwrap();
+        assert_eq!(fwd_peer.pub_key(), peer_b.pub_key());
+    }
+
+    #[test]
+    fn relay_rejects_when_no_uphill_peers_on_retry() {
+        // After rejection from uphill peer, if no more uphill peers available → rejected
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // Step 1: Initial forward to peer_a
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a));
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        assert!(actions.forward.is_some());
+
+        // Step 2: Reset forwarded_to (simulating rejection receipt)
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+
+        // Step 3: No uphill peers available on retry → should reject
+        let ctx_none = TestRelayContext::new(self_loc).accept(false);
+        let retry_actions =
+            state.handle_request(&ctx_none, &recency, &mut forward_attempts, &estimator);
+        assert!(
+            retry_actions.rejected,
+            "should reject when no uphill peers on retry"
+        );
+        assert!(retry_actions.forward.is_none());
+        assert!(retry_actions.accept_response.is_none());
     }
 }

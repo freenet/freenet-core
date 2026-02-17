@@ -47,9 +47,16 @@ impl PeerConnectionBackoff {
     const DEFAULT_MAX_ENTRIES: usize = 1024;
 
     /// Create a new backoff tracker with default settings.
+    ///
+    /// Respects `FREENET_BACKOFF_BASE_SECS` environment variable to override the
+    /// base interval (useful for CI/integration tests where 30s is too aggressive).
     pub fn new() -> Self {
-        let config =
-            ExponentialBackoff::new(Self::DEFAULT_BASE_INTERVAL, Self::DEFAULT_MAX_BACKOFF);
+        let base = std::env::var("FREENET_BACKOFF_BASE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Self::DEFAULT_BASE_INTERVAL);
+        let config = ExponentialBackoff::new(base, Self::DEFAULT_MAX_BACKOFF);
         Self {
             inner: TrackedBackoff::new(config, Self::DEFAULT_MAX_ENTRIES),
         }

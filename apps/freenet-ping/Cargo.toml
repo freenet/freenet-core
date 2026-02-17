@@ -9,6 +9,7 @@ freenet-ping-types = { path = "types", default-features = false }
 
 # Core dependencies
 anyhow = "1"
+bincode = "1"
 chrono = { version = "0.4", default-features = false }
 clap = "4"
 futures = "0.3"

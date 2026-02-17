@@ -58,6 +58,7 @@ impl Batch {
         self.batch.is_empty()
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn clear(&mut self) {
         self.batch.clear();
@@ -156,20 +157,24 @@ impl LogFile {
                 Ok(Ok(serialized_data)) => {
                     batch_buf = serialized_data;
                     self.num_writes += batch_writes;
-                    self.batch.clear(); // Clear the batch for new data
                 }
-                _ => {
-                    panic!("Failed serializing log");
+                Ok(Err(err)) => {
+                    tracing::error!("Failed serializing event log batch: {err}");
+                    return;
+                }
+                Err(err) => {
+                    tracing::error!("Event log serialization task panicked: {err}");
+                    return;
                 }
             }
         }
 
         if self.num_writes >= BATCH_SIZE {
-            {
-                let res = self.write_all(&batch_buf).await;
-                if res.is_err() {
-                    panic!("Failed writing to log file");
-                }
+            if let Err(err) = self.write_all(&batch_buf).await {
+                tracing::error!("Failed writing to event log file: {err}");
+                // Drop the batch rather than crashing the node
+                self.num_writes = 0;
+                return;
             }
             self.num_recs += self.num_writes;
             self.num_writes = 0;
@@ -178,8 +183,7 @@ impl LogFile {
         // Check the number of lines and truncate if needed
         if self.num_recs > self.max_log_records {
             if let Err(err) = self.truncate_records(REMOVE_RECS).await {
-                tracing::error!("Failed truncating log file: {:?}", err);
-                panic!("Failed truncating log file");
+                tracing::error!("Failed truncating event log file: {err}");
             }
         }
     }

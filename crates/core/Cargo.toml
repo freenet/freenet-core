@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.121"
+version = "0.1.131"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -25,6 +25,7 @@ aes-gcm = { workspace = true }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
+boot-time = { workspace = true }
 bs58 = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
@@ -168,7 +169,7 @@ required-features = ["bench", "bench_full"]
 chrono = { workspace = true }
 
 [features]
-default = ["redb", "trace", "websocket", "wasmer-backend"]
+default = ["redb", "trace", "websocket", "wasmtime-backend"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]

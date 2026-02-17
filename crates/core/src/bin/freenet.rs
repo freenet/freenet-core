@@ -8,7 +8,7 @@ use freenet::{
     config::{Config, ConfigArgs, GlobalExecutor},
     local_node::{Executor, NodeConfig, OperationMode},
     run_local_node, run_network_node,
-    server::serve_gateway,
+    server::serve_client_api,
 };
 use std::sync::Arc;
 
@@ -85,9 +85,9 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
-    let clients = serve_gateway(config.ws_api)
+    let clients = serve_client_api(config.ws_api)
         .await
-        .with_context(|| "failed to start HTTP/WebSocket gateway")?;
+        .with_context(|| "failed to start HTTP/WebSocket client API")?;
     tracing::info!("Initializing node configuration");
 
     let node_config = NodeConfig::new(config)

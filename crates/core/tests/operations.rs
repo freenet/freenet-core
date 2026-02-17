@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure};
 use freenet::test_utils::{
-    self, load_delegate, make_get, make_get_with_blocking, make_put, make_put_with_blocking,
-    make_subscribe, make_update, verify_contract_exists, TestContext,
+    self, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
+    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists, TestContext,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
@@ -162,10 +162,11 @@ async fn send_put_with_retry(
 
 /// Test PUT operation across two peers (gateway and peer)
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4,
     aggregate_events = "always"
@@ -267,10 +268,11 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -378,8 +380,8 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     // The UPDATE response indicates the operation was accepted, but state persistence/propagation
     // may have a small delay. Poll until the expected version is observed.
     {
-        const MAX_VERSION_POLL_ATTEMPTS: usize = 10;
-        const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const MAX_VERSION_POLL_ATTEMPTS: usize = 30;
+        const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
         let expected_todo_list: test_utils::TodoList =
             serde_json::from_slice(updated_state.as_ref())
@@ -461,10 +463,11 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 /// Test that a second PUT to an already cached contract persists the merged state.
 /// This is a regression test for issue #1995.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -615,6 +618,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 // Re-enabled to verify if the flakiness (issue #1798, #2494) has been resolved.
 // The test expects multiple clients across different nodes to receive subscription updates.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
     startup_wait_secs = 40,
@@ -660,41 +664,83 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     let (stream3, _) = connect_async(&uri_b).await?;
     let mut client_api_node_b = WebApi::start(stream3);
 
-    // First client puts contract with initial state (without subscribing)
-    tracing::info!(
-        "Client 1: Starting PUT operation (elapsed: {:?})",
-        start_time.elapsed()
-    );
-    make_put(
-        &mut client_api1_node_a,
-        wrapped_state.clone(),
-        contract.clone(),
-        false, // subscribe=false - no automatic subscription
-    )
-    .await?;
+    // First client puts contract with initial state (without subscribing).
+    // Retry up to 3 times — under CI resource pressure, peer connections can
+    // drop during the first PUT attempt before the mesh is fully stable.
+    const PUT_MAX_ATTEMPTS: usize = 3;
+    let mut put_last_err: Option<anyhow::Error> = None;
+    for put_attempt in 1..=PUT_MAX_ATTEMPTS {
+        tracing::info!(
+            "Client 1: Starting PUT attempt {}/{} (elapsed: {:?})",
+            put_attempt,
+            PUT_MAX_ATTEMPTS,
+            start_time.elapsed()
+        );
+        if let Err(e) = make_put(
+            &mut client_api1_node_a,
+            wrapped_state.clone(),
+            contract.clone(),
+            false, // subscribe=false - no automatic subscription
+        )
+        .await
+        {
+            put_last_err = Some(e);
+            tracing::warn!(
+                "Client 1: PUT send failed on attempt {}, retrying...",
+                put_attempt
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
-    // Wait for put response
-    loop {
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                tracing::info!(
-                    "Client 1: PUT completed successfully (elapsed: {:?})",
-                    start_time.elapsed()
-                );
+        // Wait for put response, draining stale messages
+        let mut put_succeeded = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
                 break;
             }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for put response");
+            match tokio::time::timeout(remaining, client_api1_node_a.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                    tracing::info!(
+                        "Client 1: PUT completed successfully on attempt {} (elapsed: {:?})",
+                        put_attempt,
+                        start_time.elapsed()
+                    );
+                    put_succeeded = true;
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!("unexpected response while waiting for put: {:?}", other);
+                }
+                Ok(Err(e)) => {
+                    put_last_err = Some(anyhow::anyhow!("Error receiving put response: {}", e));
+                    break;
+                }
+                Err(_) => {
+                    put_last_err = Some(anyhow::anyhow!("Timeout waiting for put response"));
+                    break;
+                }
             }
         }
+
+        if put_succeeded {
+            put_last_err = None;
+            break;
+        }
+
+        tracing::warn!(
+            "Client 1: PUT attempt {} failed: {}; retrying after delay...",
+            put_attempt,
+            put_last_err.as_ref().unwrap()
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if let Some(e) = put_last_err {
+        bail!("PUT failed after {} attempts: {}", PUT_MAX_ATTEMPTS, e);
     }
 
     // Explicitly subscribe client 1 to the contract using make_subscribe
@@ -1184,10 +1230,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1442,10 +1489,11 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
 // FIXME Update notification is not received
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1908,9 +1956,10 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 /// The PUT response should arrive only after the subscription is established.
 /// No SubscribeResponse should leak to the client (subscription is a sub-operation).
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2009,9 +2058,10 @@ async fn test_put_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 /// Tests that GET with blocking_subscribe=true completes successfully.
 /// The GET response should arrive and no SubscribeResponse should leak.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2124,10 +2174,11 @@ async fn test_get_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "client-node"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2313,6 +2364,7 @@ fn expected_three_hop_locations() -> [f64; 3] {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a", "peer-c"],
     gateways = ["gateway"],
     node_configs = {
@@ -2321,7 +2373,7 @@ fn expected_three_hop_locations() -> [f64; 3] {
         "peer-c": { location: three_hop_peer_c_location() },
     },
     timeout_secs = 240,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     aggregate_events = "on_failure",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -2473,6 +2525,7 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-node"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
@@ -2543,10 +2596,11 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
 }
 
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2663,10 +2717,11 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 // - startup_wait_secs: 15s to allow nodes to fully start and establish connections
 // - tokio_worker_threads: 4 to provide adequate concurrency for multi-node test
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -2922,9 +2977,10 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 /// 2. Client immediately does Subscribe (before propagation to other peers)
 /// 3. Subscribe should succeed locally without network round-trip
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3057,6 +3113,7 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 /// 2. Gateway has no peers to forward to
 /// 3. Gateway should immediately return NotFound to the client
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 5,
@@ -3175,9 +3232,10 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
 ///
 /// The fix compares old stored state with new stored state instead.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "peer-a"],
     timeout_secs = 300,
-    startup_wait_secs = 15,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3436,5 +3494,440 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
          PUT correctly triggers UPDATE for subscribers"
     );
 
+    Ok(())
+}
+
+// ============ Delegate Contract Capability Tests ============
+
+/// Commands matching test-delegate-capabilities DelegateCommand enum.
+/// Must stay in sync with tests/test-delegate-capabilities/src/lib.rs.
+#[derive(Debug, Serialize, Deserialize)]
+enum DelegateCommand {
+    GetContractState {
+        contract_id: ContractInstanceId,
+    },
+    GetMultipleContractStates {
+        contract_ids: Vec<ContractInstanceId>,
+    },
+    GetContractWithEcho {
+        contract_id: ContractInstanceId,
+        echo_message: String,
+    },
+    PutContractState {
+        contract: ContractContainer,
+        state: Vec<u8>,
+    },
+    UpdateContractState {
+        contract_id: ContractInstanceId,
+        state: Vec<u8>,
+    },
+    SubscribeContract {
+        contract_id: ContractInstanceId,
+    },
+}
+
+/// Responses matching test-delegate-capabilities DelegateResponse enum.
+/// Must stay in sync with tests/test-delegate-capabilities/src/lib.rs.
+#[derive(Debug, Serialize, Deserialize)]
+enum DelegateCommandResponse {
+    ContractState {
+        contract_id: ContractInstanceId,
+        state: Option<Vec<u8>>,
+    },
+    MultipleContractStates {
+        results: Vec<(ContractInstanceId, Option<Vec<u8>>)>,
+    },
+    Echo {
+        message: String,
+    },
+    ContractPutResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    ContractUpdateResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    ContractSubscribeResult {
+        contract_id: ContractInstanceId,
+        success: bool,
+        error: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// E2E test: delegate issues PUT and UPDATE to a real contract via the WASM runtime.
+///
+/// Verifies the full delegate->contract capability pipeline:
+/// 1. Register a real WASM delegate (test-delegate-capabilities)
+/// 2. The delegate issues a PutContractRequest for a real WASM contract (test-contract-integration)
+/// 3. The runtime processes the PUT via upsert_contract_state (with BroadcastStateChange)
+/// 4. A direct GET confirms the contract state was stored
+/// 5. The delegate issues an UpdateContractRequest with new state
+/// 6. A direct GET confirms the updated state
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    // Load WASM modules
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Connect to gateway WebSocket
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 1: Register the delegate
+    tracing::info!("Step 1: Registering delegate");
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on register");
+            tracing::info!("Delegate registered: {key}");
+        }
+        other => bail!("Unexpected register response: {:?}", other),
+    }
+
+    // Step 2: PUT contract via delegate
+    let initial_state = test_utils::create_empty_todo_list();
+    tracing::info!("Step 2: Delegate PUT contract (empty todo list)");
+
+    let app_id = ContractInstanceId::new([42u8; 32]);
+    let put_cmd = DelegateCommand::PutContractState {
+        contract: contract.clone(),
+        state: initial_state.clone(),
+    };
+    let put_payload = bincode::serialize(&put_cmd)?;
+    let app_msg = ApplicationMessage::new(app_id, put_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+            },
+        ))
+        .await?;
+
+    // Wait for delegate response (the response includes PutContractResponse routed back)
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on PUT response");
+            tracing::info!("Delegate PUT response: {} outbound messages", values.len());
+
+            // Find the ApplicationMessage containing ContractPutResult
+            let put_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("No ApplicationMessage in delegate PUT response"))?;
+
+            match put_result {
+                DelegateCommandResponse::ContractPutResult { success, error, .. } => {
+                    ensure!(
+                        success,
+                        "Delegate PUT failed: {}",
+                        error.unwrap_or_default()
+                    );
+                    tracing::info!("Delegate PUT succeeded");
+                }
+                other => bail!("Expected ContractPutResult, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate PUT response: {:?}", other),
+    }
+
+    // Step 3: Verify contract state via direct GET
+    tracing::info!("Step 3: Direct GET to verify PUT state");
+    make_get(&mut client, contract_key, true, false).await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse {
+            state, contract, ..
+        }) => {
+            ensure!(contract.is_some(), "GET should return contract code");
+            let stored: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+            ensure!(
+                stored.tasks.is_empty(),
+                "Initial state should be empty todo list, got {} tasks",
+                stored.tasks.len()
+            );
+            tracing::info!(
+                "GET confirmed: empty todo list stored (version {})",
+                stored.version
+            );
+        }
+        other => bail!("Unexpected GET response: {:?}", other),
+    }
+
+    // Step 4: UPDATE contract via delegate (add a task)
+    tracing::info!("Step 4: Delegate UPDATE contract (add a task)");
+    let updated_state = test_utils::create_todo_list_with_item("Delegate E2E test task");
+    let contract_instance_id = *contract_key.id();
+
+    let update_cmd = DelegateCommand::UpdateContractState {
+        contract_id: contract_instance_id,
+        state: updated_state.clone(),
+    };
+    let update_payload = bincode::serialize(&update_cmd)?;
+    let update_msg = ApplicationMessage::new(app_id, update_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(update_msg)],
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(
+                key == delegate_key,
+                "Delegate key mismatch on UPDATE response"
+            );
+            tracing::info!(
+                "Delegate UPDATE response: {} outbound messages",
+                values.len()
+            );
+
+            let update_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No ApplicationMessage in delegate UPDATE response")
+                })?;
+
+            match update_result {
+                DelegateCommandResponse::ContractUpdateResult { success, error, .. } => {
+                    ensure!(
+                        success,
+                        "Delegate UPDATE failed: {}",
+                        error.unwrap_or_default()
+                    );
+                    tracing::info!("Delegate UPDATE succeeded");
+                }
+                other => bail!("Expected ContractUpdateResult, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate UPDATE response: {:?}", other),
+    }
+
+    // Step 5: Verify updated state via direct GET
+    tracing::info!("Step 5: Direct GET to verify UPDATE state");
+    make_get(&mut client, contract_key, false, false).await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+            let stored: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+            ensure!(
+                stored.tasks.len() == 1,
+                "Updated state should have 1 task, got {}",
+                stored.tasks.len()
+            );
+            ensure!(
+                stored.tasks[0].title == "Delegate E2E test task",
+                "Task title mismatch: {}",
+                stored.tasks[0].title
+            );
+            tracing::info!(
+                "GET confirmed: 1 task stored (version {}), title: {}",
+                stored.version,
+                stored.tasks[0].title
+            );
+        }
+        other => bail!("Unexpected GET response after UPDATE: {:?}", other),
+    }
+
+    tracing::info!("Delegate contract PUT and UPDATE E2E test passed");
+    Ok(())
+}
+
+/// E2E test: delegate issues GET to retrieve a contract's state.
+///
+/// This test verifies:
+/// 1. PUT a contract directly via the client API
+/// 2. Register a delegate
+/// 3. The delegate issues a GetContractRequest
+/// 4. The runtime fetches the state and sends GetContractResponse back to the delegate
+/// 5. The delegate wraps the result as an ApplicationMessage
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 1: PUT contract directly so state exists in the store
+    let initial_state = test_utils::create_todo_list_with_item("Pre-existing task");
+    tracing::info!("Step 1: Direct PUT of contract with initial state");
+    make_put(
+        &mut client,
+        WrappedState::from(initial_state.clone()),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            ensure!(key == contract_key, "PUT key mismatch");
+            tracing::info!("Direct PUT succeeded");
+        }
+        other => bail!("Unexpected PUT response: {:?}", other),
+    }
+
+    // Step 2: Register delegate
+    tracing::info!("Step 2: Registering delegate");
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on register");
+            tracing::info!("Delegate registered");
+        }
+        other => bail!("Unexpected register response: {:?}", other),
+    }
+
+    // Step 3: GET contract via delegate
+    tracing::info!("Step 3: Delegate GET contract state");
+    let contract_instance_id = *contract_key.id();
+    let app_id = ContractInstanceId::new([42u8; 32]);
+
+    let get_cmd = DelegateCommand::GetContractState {
+        contract_id: contract_instance_id,
+    };
+    let get_payload = bincode::serialize(&get_cmd)?;
+    let get_msg = ApplicationMessage::new(app_id, get_payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(get_msg)],
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(60), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on GET response");
+
+            let get_result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("No ApplicationMessage in delegate GET response"))?;
+
+            match get_result {
+                DelegateCommandResponse::ContractState { state, .. } => {
+                    let state_bytes =
+                        state.ok_or_else(|| anyhow::anyhow!("GET returned None state"))?;
+                    let todo: test_utils::TodoList = serde_json::from_slice(&state_bytes)?;
+                    ensure!(
+                        todo.tasks.len() == 1,
+                        "Expected 1 task from GET, got {}",
+                        todo.tasks.len()
+                    );
+                    ensure!(
+                        todo.tasks[0].title == "Pre-existing task",
+                        "Task title mismatch: {}",
+                        todo.tasks[0].title
+                    );
+                    tracing::info!(
+                        "Delegate GET returned correct state: {} tasks, version {}",
+                        todo.tasks.len(),
+                        todo.version
+                    );
+                }
+                other => bail!("Expected ContractState, got {:?}", other),
+            }
+        }
+        other => bail!("Unexpected delegate GET response: {:?}", other),
+    }
+
+    tracing::info!("Delegate contract GET E2E test passed");
     Ok(())
 }

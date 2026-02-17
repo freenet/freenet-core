@@ -9,7 +9,7 @@
 
 use freenet::{
     local_node::NodeConfig,
-    server::serve_gateway,
+    server::serve_client_api,
     test_utils::{load_contract, make_get, make_subscribe, TestContext},
 };
 use freenet_macros::freenet_test;
@@ -42,6 +42,7 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 ///
 /// Fixes: #1858
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -104,6 +105,7 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
 /// This test verifies that when a PUT operation fails (e.g., invalid contract),
 /// the client receives an error response rather than hanging indefinitely.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -175,6 +177,7 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
 /// This test verifies that when an UPDATE operation fails (e.g., contract doesn't exist),
 /// the client receives an error response rather than hanging indefinitely.
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway"],
     timeout_secs = 60,
     startup_wait_secs = 10,
@@ -242,9 +245,10 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
 ///
 /// Fixes: #2490
 #[freenet_test(
+    health_check_readiness = true,
     nodes = ["gateway", "node-a"],
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -445,7 +449,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -457,7 +461,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await?)
+            .build(serve_client_api(config.ws_api).await?)
             .await?;
 
         // Run node until we receive shutdown signal

@@ -6,6 +6,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, Secr
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
+use super::engine::MAX_WASM_MEMORY_BYTES;
 use super::runtime::InstanceInfo;
 use super::secrets_store::SecretsStore;
 use crate::contract::storages::Storage;
@@ -38,7 +39,32 @@ thread_local! {
 pub(super) type InstanceId = i64;
 
 /// Error codes returned by host functions.
+///
 /// Negative values indicate errors, non-negative values are success/data.
+///
+/// # Error Code Ranges
+///
+/// - `0`: Success (or returned count/length)
+/// - `-1`: Not in process context (host function called outside delegate execution)
+/// - `-2`: Secret not found
+/// - `-3`: Storage operation failed
+/// - `-4`: Invalid parameter (e.g., negative length)
+/// - `-5`: Context too large (exceeds i32::MAX)
+/// - `-6`: Buffer too small (use length query functions first)
+/// - `-7`: Memory bounds violation (WASM module passed invalid pointer)
+///
+/// # Memory Bounds Violations (`ERR_MEMORY_BOUNDS = -7`)
+///
+/// This error is returned when a WASM module attempts to access memory outside
+/// its allocated linear memory region via host function calls. This can occur when:
+///
+/// - A negative offset is passed (would access before WASM memory)
+/// - Pointer arithmetic overflows (offset + size exceeds usize::MAX)
+/// - Access range exceeds the runtime's maximum memory limit (256 MiB by default)
+///
+/// The validation prevents potentially unsafe pointer arithmetic while allowing
+/// legitimate memory growth via the `memory.grow` instruction. The WASM engine's
+/// guard pages provide an additional layer of protection.
 pub mod error_codes {
     /// Operation succeeded (or returned count/length).
     pub const SUCCESS: i32 = 0;
@@ -54,6 +80,10 @@ pub mod error_codes {
     pub const ERR_CONTEXT_TOO_LARGE: i32 = -5;
     /// Buffer too small to hold the secret (use get_secret_len first).
     pub const ERR_BUFFER_TOO_SMALL: i32 = -6;
+    /// Memory bounds violation (pointer out of range). Returned when a WASM module
+    /// attempts to access memory outside its allocated linear memory region via
+    /// host function calls.
+    pub const ERR_MEMORY_BOUNDS: i32 = -7;
 }
 
 /// State available to a delegate during a single `process()` call.
@@ -86,6 +116,23 @@ pub(super) struct DelegateCallEnv {
 // executes WASM synchronously on the calling thread.
 unsafe impl Send for DelegateCallEnv {}
 unsafe impl Sync for DelegateCallEnv {}
+
+/// Typed errors from `DelegateCallEnv` contract operations.
+///
+/// Replaces string-based error matching so `_impl` host functions can map
+/// errors to the correct error code without fragile `contains()` checks.
+#[derive(Debug)]
+#[allow(dead_code)] // StorageError(String) is used for error logging via Debug
+pub(super) enum DelegateEnvError {
+    /// State store (ReDb) is not configured on this runtime.
+    StoreNotConfigured,
+    /// Contract code hash not found in the ContractStore index.
+    ContractCodeNotRegistered,
+    /// No existing state for this contract (required by UPDATE).
+    NoExistingState,
+    /// ReDb read/write error.
+    StorageError(String),
+}
 
 impl DelegateCallEnv {
     /// Create a new call environment.
@@ -139,6 +186,18 @@ impl DelegateCallEnv {
         unsafe { &*self.contract_store }
     }
 
+    /// Resolve a ContractInstanceId to a ContractKey using the contract index.
+    fn resolve_contract_key(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<ContractKey, DelegateEnvError> {
+        let code_hash = self
+            .contract_store()
+            .code_hash_from_id(instance_id)
+            .ok_or(DelegateEnvError::ContractCodeNotRegistered)?;
+        Ok(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
     /// Look up contract state by instance ID using the local ReDb store.
     ///
     /// Returns `Some(state_bytes)` if found, `None` if the contract is not stored locally.
@@ -150,27 +209,94 @@ impl DelegateCallEnv {
     pub(super) fn get_contract_state_sync(
         &self,
         instance_id: &ContractInstanceId,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, DelegateEnvError> {
         let Some(ref db) = self.state_store_db else {
-            return Err("state store not available (V2 contract access not configured)".into());
+            return Err(DelegateEnvError::StoreNotConfigured);
         };
 
-        // Step 1: Look up CodeHash from the contract index
+        // Look up CodeHash; return None (not error) if the instance is unknown
         let code_hash = match self.contract_store().code_hash_from_id(instance_id) {
             Some(ch) => ch,
             None => return Ok(None),
         };
 
-        // Step 2: Construct the full ContractKey
         let contract_key = ContractKey::from_id_and_code(*instance_id, code_hash);
 
-        // Step 3: Read state directly from ReDb via synchronous read transaction.
-        // No async wrapper, no futures::executor::block_on — just a plain read txn.
         match db.get_state_sync(&contract_key) {
             Ok(Some(wrapped_state)) => Ok(Some(wrapped_state.as_ref().to_vec())),
             Ok(None) => Ok(None),
-            Err(e) => Err(format!("state store read error: {e}")),
+            Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
         }
+    }
+
+    /// Store (PUT) contract state by instance ID.
+    ///
+    /// The contract's code hash must already be registered in the ContractStore
+    /// index (i.e., the contract code was previously stored). This writes the
+    /// state to ReDb synchronously.
+    ///
+    /// Returns `Ok(())` on success.
+    pub(super) fn put_contract_state_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+        state: Vec<u8>,
+    ) -> Result<(), DelegateEnvError> {
+        let Some(ref db) = self.state_store_db else {
+            return Err(DelegateEnvError::StoreNotConfigured);
+        };
+
+        let contract_key = self.resolve_contract_key(instance_id)?;
+
+        db.store_state_sync(
+            &contract_key,
+            freenet_stdlib::prelude::WrappedState::new(state),
+        )
+        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))
+    }
+
+    /// Update contract state by instance ID.
+    ///
+    /// Like PUT, but only succeeds if the contract already has stored state.
+    /// Returns an error if no prior state exists.
+    pub(super) fn update_contract_state_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+        state: Vec<u8>,
+    ) -> Result<(), DelegateEnvError> {
+        let Some(ref db) = self.state_store_db else {
+            return Err(DelegateEnvError::StoreNotConfigured);
+        };
+
+        let contract_key = self.resolve_contract_key(instance_id)?;
+
+        // Atomic check-and-write in a single ReDb write transaction.
+        match db.update_state_sync(
+            &contract_key,
+            freenet_stdlib::prelude::WrappedState::new(state),
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DelegateEnvError::NoExistingState),
+            Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
+        }
+    }
+
+    /// Register a subscription interest for a contract.
+    ///
+    /// Currently validates that the contract is known (code hash resolvable)
+    /// and returns success. Actual notification delivery is a follow-up.
+    // TODO(#2830): Implement actual subscription notification delivery
+    // Currently this is a no-op beyond validation — delegates will believe they
+    // are subscribed but will never receive notifications.
+    pub(super) fn subscribe_contract_sync(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<(), DelegateEnvError> {
+        // Validate the contract is known
+        let _contract_key = self.resolve_contract_key(instance_id)?;
+
+        // No-op for now — real subscription notification delivery is a follow-up.
+        // The fact that we resolved the key validates the contract is registered.
+        Ok(())
     }
 }
 
@@ -180,9 +306,64 @@ fn current_instance_id() -> InstanceId {
     CURRENT_DELEGATE_INSTANCE.with(|c| c.get())
 }
 
+/// Validates memory bounds and computes a pointer within WASM linear memory.
+///
+/// # Safety
+/// This function validates that the pointer arithmetic is safe. It checks for:
+/// - Negative offsets (which would access memory before WASM linear memory)
+/// - Overflow when adding offset + size
+/// - Access exceeding the maximum allowed WASM memory limit
+/// - Overflow when adding start_ptr + ptr
+///
+/// Note: WASM memory can grow dynamically via the `memory.grow` instruction between
+/// host function calls. The cached mem_size from instance creation may become stale,
+/// so we validate against the runtime's maximum memory limit (256 MiB by default)
+/// rather than the initial allocation. The WASM engine's guard pages provide additional
+/// protection against actual out-of-bounds access.
+///
+/// # Arguments
+/// * `ptr` - Offset from the start of WASM memory (provided by WASM module)
+/// * `start_ptr` - Base address of WASM linear memory (from InstanceInfo)
+/// * `size` - Size of the data to be accessed (in bytes)
+/// * `_mem_size` - Initial memory size (not used due to dynamic growth; kept for API compatibility)
+///
+/// # Returns
+/// * `Some(*mut T)` - Valid pointer within maximum memory limit
+/// * `None` - Pointer would be out of bounds or overflow
 #[inline(always)]
-fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
-    (start_ptr + ptr) as _
+fn validate_and_compute_ptr<T>(
+    ptr: i64,
+    start_ptr: i64,
+    size: usize,
+    _mem_size: usize,
+) -> Option<*mut T> {
+    // Check for negative offset (invalid - would access before WASM memory)
+    if ptr < 0 {
+        tracing::warn!("Memory bounds violation: negative offset {ptr}");
+        return None;
+    }
+
+    let ptr_usize = ptr as usize;
+
+    // Check for overflow when adding size to offset
+    let end_offset = ptr_usize.checked_add(size)?;
+
+    // Verify the entire access range is within the maximum allowed memory.
+    // Uses the same limit enforced by the engine's ResourceLimiter (256 MiB by default).
+    if end_offset > MAX_WASM_MEMORY_BYTES {
+        tracing::warn!(
+            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds max memory limit {MAX_WASM_MEMORY_BYTES}"
+        );
+        return None;
+    }
+
+    // Check for overflow when computing the host pointer
+    // start_ptr is the host address (i64), ptr is the WASM offset (i64)
+    let host_ptr = start_ptr.checked_add(ptr)?;
+
+    // Safe to return the computed pointer
+    // The WASM engine's guard pages will trap if the access is truly out of bounds
+    Some(host_ptr as *mut T)
 }
 
 pub(super) mod log {
@@ -196,7 +377,12 @@ pub(super) mod log {
             panic!("unset module id");
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(ptr) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in freenet_log::info");
+            return;
+        };
         let msg =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
@@ -213,7 +399,12 @@ pub(super) mod rand {
             panic!("unset module id");
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(ptr) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in freenet_rand::rand_bytes");
+            return;
+        };
         let slice = unsafe { &mut *std::ptr::slice_from_raw_parts_mut(ptr, len as usize) };
         let mut rng = rng();
         rng.fill_bytes(slice);
@@ -230,7 +421,15 @@ pub(super) mod time {
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let now = UtcOriginal::now();
-        let ptr = compute_ptr::<DateTime<UtcOriginal>>(ptr, info.start_ptr);
+        let Some(ptr) = validate_and_compute_ptr::<DateTime<UtcOriginal>>(
+            ptr,
+            info.start_ptr,
+            std::mem::size_of::<DateTime<UtcOriginal>>(),
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in freenet_time::utc_now");
+            return;
+        };
         unsafe {
             ptr.write(now);
         };
@@ -306,7 +505,11 @@ pub(super) mod delegate_context {
         if to_copy == 0 {
             return 0;
         }
-        let dst = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(dst) = validate_and_compute_ptr::<u8>(ptr, info.start_ptr, to_copy, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate context_read");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(env.context.as_ptr(), dst, to_copy);
         }
@@ -342,7 +545,12 @@ pub(super) mod delegate_context {
             env.context.clear();
             return error_codes::SUCCESS;
         }
-        let src = compute_ptr::<u8>(ptr, info.start_ptr);
+        let Some(src) =
+            validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate context_write");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let bytes = unsafe { std::slice::from_raw_parts(src, len as usize) };
         env.context = bytes.to_vec();
         error_codes::SUCCESS
@@ -394,7 +602,15 @@ pub(super) mod delegate_secrets {
         };
 
         // Read the secret key from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate get_secret_len");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -444,7 +660,15 @@ pub(super) mod delegate_secrets {
         };
 
         // Read the secret key from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate get_secret (key)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -466,7 +690,15 @@ pub(super) mod delegate_secrets {
                     return 0;
                 }
 
-                let dst = compute_ptr::<u8>(out_ptr, info.start_ptr);
+                let Some(dst) = validate_and_compute_ptr::<u8>(
+                    out_ptr,
+                    info.start_ptr,
+                    secret_len,
+                    info.mem_size,
+                ) else {
+                    tracing::error!("Memory bounds violation in delegate get_secret (output)");
+                    return error_codes::ERR_MEMORY_BOUNDS;
+                };
                 unsafe {
                     std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
                 }
@@ -506,11 +738,27 @@ pub(super) mod delegate_secrets {
         };
 
         // Read key and value from WASM memory
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate set_secret (key)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        let val_src = compute_ptr::<u8>(val_ptr, info.start_ptr);
+        let Some(val_src) = validate_and_compute_ptr::<u8>(
+            val_ptr,
+            info.start_ptr,
+            val_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate set_secret (value)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
 
         match env
@@ -551,7 +799,15 @@ pub(super) mod delegate_secrets {
             return error_codes::ERR_NOT_IN_PROCESS;
         };
 
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate has_secret");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -588,7 +844,15 @@ pub(super) mod delegate_secrets {
             return error_codes::ERR_NOT_IN_PROCESS;
         };
 
-        let key_src = compute_ptr::<u8>(key_ptr, info.start_ptr);
+        let Some(key_src) = validate_and_compute_ptr::<u8>(
+            key_ptr,
+            info.start_ptr,
+            key_len as usize,
+            info.mem_size,
+        ) else {
+            tracing::error!("Memory bounds violation in delegate remove_secret");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -662,7 +926,12 @@ pub(super) mod delegate_contracts {
         };
 
         // Read the contract instance ID from WASM memory
-        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let Some(id_src) =
+            validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate get_contract_state_len");
+            return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+        };
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -687,12 +956,56 @@ pub(super) mod delegate_contracts {
             Err(e) => {
                 tracing::error!(
                     contract = %contract_id,
-                    error = %e,
+                    error = ?e,
                     "V2 delegate: state store error"
                 );
-                contract_error_codes::ERR_STORE_ERROR as i64
+                delegate_env_error_to_code(&e)
             }
         }
+    }
+
+    /// Map a `DelegateEnvError` to the appropriate contract error code.
+    fn delegate_env_error_to_code(err: &DelegateEnvError) -> i64 {
+        match err {
+            DelegateEnvError::StoreNotConfigured => contract_error_codes::ERR_STORE_ERROR as i64,
+            DelegateEnvError::ContractCodeNotRegistered => {
+                contract_error_codes::ERR_CONTRACT_CODE_NOT_REGISTERED as i64
+            }
+            DelegateEnvError::NoExistingState => {
+                contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
+            }
+            DelegateEnvError::StorageError(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+        }
+    }
+
+    /// Read a 32-byte contract instance ID from WASM memory.
+    ///
+    /// Shared helper for all contract host functions. Validates the instance ID
+    /// pointer and length, returning the ContractInstanceId on success.
+    /// Only acquires and drops the MEM_ADDR guard to read WASM memory metadata.
+    fn read_instance_id(id_ptr: i64, id_len: i32) -> Result<ContractInstanceId, i64> {
+        let id = current_instance_id();
+        if id == -1 {
+            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
+        }
+        if id_len != 32 {
+            tracing::warn!("delegate contract host fn: expected 32-byte instance ID, got {id_len}");
+            return Err(contract_error_codes::ERR_INVALID_PARAM as i64);
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
+        };
+        let start_ptr = info.start_ptr;
+        let mem_size = info.mem_size;
+        drop(info);
+
+        let Some(id_src) = validate_and_compute_ptr::<u8>(id_ptr, start_ptr, 32, mem_size) else {
+            return Err(contract_error_codes::ERR_MEMORY_BOUNDS as i64);
+        };
+        let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
+            .try_into()
+            .unwrap();
+        Ok(ContractInstanceId::new(id_bytes))
     }
 
     /// Implementation of get_contract_state.
@@ -729,7 +1042,12 @@ pub(super) mod delegate_contracts {
         };
 
         // Read the contract instance ID from WASM memory
-        let id_src = compute_ptr::<u8>(id_ptr, info.start_ptr);
+        let Some(id_src) =
+            validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate get_contract_state (id)");
+            return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+        };
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -751,7 +1069,17 @@ pub(super) mod delegate_contracts {
                     return 0;
                 }
 
-                let dst = compute_ptr::<u8>(out_ptr, info.start_ptr);
+                let Some(dst) = validate_and_compute_ptr::<u8>(
+                    out_ptr,
+                    info.start_ptr,
+                    state_len,
+                    info.mem_size,
+                ) else {
+                    tracing::error!(
+                        "Memory bounds violation in delegate get_contract_state (output)"
+                    );
+                    return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+                };
                 unsafe {
                     std::ptr::copy_nonoverlapping(state_bytes.as_ptr(), dst, state_len);
                 }
@@ -773,10 +1101,186 @@ pub(super) mod delegate_contracts {
             Err(e) => {
                 tracing::error!(
                     contract = %contract_id,
-                    error = %e,
+                    error = ?e,
                     "V2 delegate: state store error"
                 );
-                contract_error_codes::ERR_STORE_ERROR as i64
+                delegate_env_error_to_code(&e)
+            }
+        }
+    }
+
+    /// Implementation of put_contract_state.
+    ///
+    /// Writes contract state to the local ReDb store. Requires the contract's
+    /// code hash to be registered in the ContractStore index.
+    ///
+    /// ## Returns
+    /// - `0`: success
+    /// - Negative error code on failure
+    pub(crate) fn put_contract_state_impl(
+        id_ptr: i64,
+        id_len: i32,
+        state_ptr: i64,
+        state_len: i64,
+    ) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        if state_len < 0 {
+            tracing::warn!("delegate put_contract_state: negative state_len={state_len}");
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read state bytes from WASM memory
+        let state_bytes = if state_len == 0 {
+            vec![]
+        } else {
+            let Some(src) = validate_and_compute_ptr::<u8>(
+                state_ptr,
+                info.start_ptr,
+                state_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!("Memory bounds violation in delegate put_contract_state (state)");
+                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+            };
+            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
+        };
+
+        match env.put_contract_state_sync(&contract_id, state_bytes) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: put_contract_state succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: put_contract_state failed"
+                );
+                delegate_env_error_to_code(e)
+            }
+        }
+    }
+
+    /// Implementation of update_contract_state.
+    ///
+    /// Like PUT, but only succeeds if the contract already has stored state.
+    ///
+    /// ## Returns
+    /// - `0`: success
+    /// - `ERR_CONTRACT_NOT_FOUND (-7)`: no existing state to update
+    /// - Negative error code on other failures
+    pub(crate) fn update_contract_state_impl(
+        id_ptr: i64,
+        id_len: i32,
+        state_ptr: i64,
+        state_len: i64,
+    ) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        if state_len < 0 {
+            tracing::warn!("delegate update_contract_state: negative state_len={state_len}");
+            return contract_error_codes::ERR_INVALID_PARAM as i64;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        // Read state bytes from WASM memory
+        let state_bytes = if state_len == 0 {
+            vec![]
+        } else {
+            let Some(src) = validate_and_compute_ptr::<u8>(
+                state_ptr,
+                info.start_ptr,
+                state_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!(
+                    "Memory bounds violation in delegate update_contract_state (state)"
+                );
+                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
+            };
+            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
+        };
+
+        match env.update_contract_state_sync(&contract_id, state_bytes) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: update_contract_state succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: update_contract_state failed"
+                );
+                delegate_env_error_to_code(e)
+            }
+        }
+    }
+
+    /// Implementation of subscribe_contract.
+    ///
+    /// Validates that the contract is known (code hash resolvable) and registers
+    /// subscription interest. Currently a no-op beyond validation; real notification
+    /// delivery is a follow-up.
+    ///
+    /// ## Returns
+    /// - `0`: success (contract is known, subscription registered)
+    /// - `ERR_CONTRACT_CODE_NOT_REGISTERED (-10)`: unknown contract
+    /// - Negative error code on other failures
+    pub(crate) fn subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64 {
+        let contract_id = match read_instance_id(id_ptr, id_len) {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
+
+        let id = current_instance_id();
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
+        };
+
+        match env.subscribe_contract_sync(&contract_id) {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    "V2 delegate: subscribe_contract succeeded"
+                );
+                contract_error_codes::SUCCESS as i64
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    contract = %contract_id,
+                    error = ?e,
+                    "V2 delegate: subscribe_contract failed"
+                );
+                delegate_env_error_to_code(e)
             }
         }
     }

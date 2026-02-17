@@ -76,12 +76,13 @@ impl RunningInstance {
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let handle = engine.create_instance(module, id, req_bytes)?;
 
-        // Record memory address for host function pointer arithmetic
-        let (ptr, _size) = engine.memory_info(&handle)?;
+        // Record memory address and size for host function pointer arithmetic
+        let (ptr, size) = engine.memory_info(&handle)?;
         native_api::MEM_ADDR.insert(
             id,
             InstanceInfo {
                 start_ptr: ptr as i64,
+                mem_size: size,
                 key,
             },
         );
@@ -110,6 +111,7 @@ impl Drop for RunningInstance {
 
 pub(crate) struct InstanceInfo {
     pub start_ptr: i64,
+    pub mem_size: usize,
     key: Key,
 }
 

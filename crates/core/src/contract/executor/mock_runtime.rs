@@ -1561,4 +1561,51 @@ mod test {
         assert_eq!(data, b"version 2 data");
         // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
     }
+
+    /// Verify that the corrupted-state recovery guard on the executor:
+    /// - Tracks contracts that have undergone recovery
+    /// - Prevents repeated recovery attempts (loop guard)
+    /// - Clears entries when manually removed (simulating successful update)
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_guard_prevents_infinite_loops() {
+        let executor = create_test_executor().await;
+        let contract = create_test_contract(b"guard_test_code");
+        let key = contract.key();
+
+        let guard = &executor.recovery_guard;
+
+        // Initially empty
+        assert!(!guard.lock().unwrap().contains(&key));
+
+        // Simulate recovery: insert the key, verify it's tracked
+        guard.lock().unwrap().insert(key);
+        assert!(guard.lock().unwrap().contains(&key));
+
+        // Simulate successful update: remove the key, verify it's cleared
+        guard.lock().unwrap().remove(&key);
+        assert!(!guard.lock().unwrap().contains(&key));
+    }
+
+    /// Verify that the recovery guard is shared across executors when
+    /// created from the same Arc (simulating pool behavior).
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_guard_shared_across_pool() {
+        let mut executor_a = create_test_executor().await;
+        let mut executor_b = create_test_executor().await;
+        let contract = create_test_contract(b"pool_guard_test");
+        let key = contract.key();
+
+        // Share a single guard across both executors
+        let shared_guard: super::super::CorruptedStateRecoveryGuard =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        executor_a.set_recovery_guard(shared_guard.clone());
+        executor_b.set_recovery_guard(shared_guard.clone());
+
+        // Recovery on executor_a marks the key; executor_b sees it
+        executor_a.recovery_guard.lock().unwrap().insert(key);
+        assert!(
+            executor_b.recovery_guard.lock().unwrap().contains(&key),
+            "Recovery guard should be visible across pool executors"
+        );
+    }
 }
