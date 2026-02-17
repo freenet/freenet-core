@@ -75,12 +75,12 @@ mod tests {
             }
         }
 
+        let log_ratio = (D_MAX / d_min).ln();
         let expected_counts: Vec<_> = (0..num_bins)
             .map(|i| {
                 let lower = d_min + (D_MAX - d_min) * (i as f64 / num_bins as f64);
                 let upper = d_min + (D_MAX - d_min) * ((i as f64 + 1.0) / num_bins as f64);
-                ((upper - lower) / (upper.powf(-1.0) - lower.powf(-1.0))).floor() * n as f64
-                    / num_bins as f64
+                n as f64 * (upper / lower).ln() / log_ratio
             })
             .collect();
 

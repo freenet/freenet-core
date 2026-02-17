@@ -896,9 +896,6 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![50, 50, 1, 1, 1, 1];
-        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
-
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
             neighbor_locations.insert(peer.location().unwrap(), vec![]);
