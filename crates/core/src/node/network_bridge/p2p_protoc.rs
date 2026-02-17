@@ -1042,10 +1042,17 @@ impl P2pConnManager {
                                 | ChannelCloseReason::OpExecution => {
                                     // All ClosedChannel events are critical - the transport is unable to establish
                                     // more connections, rendering this peer useless. Perform cleanup and shutdown.
+                                    let is_gateway = ctx.bridge.op_manager.ring.is_gateway();
+                                    let active_conns = ctx.connections.len();
+                                    // Write to stderr directly to ensure this survives process exit
+                                    // (tracing output may be buffered and lost during shutdown)
+                                    eprintln!(
+                                        "CRITICAL: Channel closed reason={reason:?} is_gateway={is_gateway} active_connections={active_conns} - shutting down"
+                                    );
                                     tracing::error!(
                                         reason = ?reason,
-                                        is_gateway = ctx.bridge.op_manager.ring.is_gateway(),
-                                        active_connections = ctx.connections.len(),
+                                        is_gateway,
+                                        active_connections = active_conns,
                                         phase = "shutdown",
                                         "Critical channel closed - performing cleanup and shutting down"
                                     );

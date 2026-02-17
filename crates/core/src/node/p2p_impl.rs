@@ -181,6 +181,7 @@ impl NodeP2P {
         let result = crate::deterministic_select! {
             r = f => {
                let Err(e) = r;
+               eprintln!("CRITICAL: Network event listener exited: {e}");
                tracing::error!("Network event listener exited: {}", e);
                Err(e)
             },
