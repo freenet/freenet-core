@@ -605,10 +605,6 @@ fn setup_deterministic_state(seed: u64) {
     // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();
 
-    // NOTE: reset_thread_index_counter() removed — set_seed() now resets
-    // THREAD_INDEX to 0 per-thread, which is safe for parallel tests.
-    // The old global counter reset was racy (see #2733).
-
     // Reset all thread-local ID counters for exact event sequence reproducibility.
     RequestId::reset_counter();
     freenet::dev_tool::ClientId::reset_counter();
