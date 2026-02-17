@@ -884,6 +884,43 @@ pub mod test {
 
         Ok(())
     }
+
+    /// Regression test for issue #3071: Verifies that `waiting_for_transaction_result`
+    /// times out instead of blocking indefinitely when the `wait_for_res_tx` channel
+    /// is full (the consumer at Priority 7 in the event loop is starved).
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_transaction_result_times_out_when_channel_full() {
+        use crate::client_events::RequestId;
+        use crate::message::Transaction;
+        use crate::operations::put::PutMsg;
+
+        let (send_halve, _rcv_halve, _wait_res) = contract_handler_channel();
+
+        // Fill the channel to capacity (100 items). We hold _wait_res so
+        // the receiver isn't dropped (which would give a different error).
+        for _ in 0..100 {
+            let tx = Transaction::new::<PutMsg>();
+            send_halve
+                .end
+                .wait_for_res_tx
+                .send((ClientId::FIRST, WaitingTransaction::Transaction(tx)))
+                .await
+                .expect("channel should accept items up to capacity");
+        }
+
+        // The 101st send should block, and with paused time we can
+        // advance past the timeout instantly.
+        let tx = Transaction::new::<PutMsg>();
+        let result = send_halve
+            .waiting_for_transaction_result(tx, ClientId::FIRST, RequestId::new())
+            .await;
+
+        assert!(
+            matches!(result, Err(super::ContractError::NoEvHandlerResponse)),
+            "Expected NoEvHandlerResponse timeout error, got {:?}",
+            result
+        );
+    }
 }
 
 pub(super) mod in_memory {
