@@ -1780,6 +1780,13 @@ impl GlobalRng {
         THREAD_RNG.with(|rng| {
             *rng.borrow_mut() = None;
         });
+        // Reset thread index to 0 so this thread's RNG seed and ID counters
+        // are deterministic regardless of which OS thread runs the test.
+        // Without this, thread_index varies by thread, making the effective
+        // RNG seed (test_seed + thread_index * constant) non-reproducible
+        // in parallel test execution. This replaces the old approach of
+        // resetting the global THREAD_INDEX_COUNTER (which was racy).
+        THREAD_INDEX.with(|idx| idx.set(Some(0)));
     }
 
     /// Clears the simulation seed, reverting to system RNG.
