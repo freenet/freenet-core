@@ -95,9 +95,6 @@ tracing-subscriber = "0.3"
 console-subscriber = "0.5.0"
 
 # WASM
-wasmer = "7.0.1"
-wasmer-compiler-singlepass = "7.0.1"
-wasmer-middlewares = "7.0.1"
 wasmtime = "41"
 
 # Testing/simulation
