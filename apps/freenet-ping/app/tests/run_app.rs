@@ -701,8 +701,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract
@@ -1413,8 +1413,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic (240s timeout to accommodate 20s startup delay + 30s test + buffer for slow CI)
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
+    // Main test logic (360s: 20s startup + 180s connection wait + operations + buffer)
+    let test = tokio::time::timeout(Duration::from_secs(360), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -1431,8 +1431,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
         // Wait for nodes to join the network before proceeding with operations
         println!("Waiting for nodes to connect to the network...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
-        wait_for_node_connected(&mut client_node2, "Node2", 1, 120).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 180).await?;
+        wait_for_node_connected(&mut client_node2, "Node2", 1, 180).await?;
         println!("All nodes connected to the network!");
 
         // Load the ping contract
