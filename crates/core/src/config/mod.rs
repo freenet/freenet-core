@@ -2475,4 +2475,20 @@ mod tests {
         assert_eq!(config2.congestion_control, "bbr");
         assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
     }
+
+    #[test]
+    fn test_set_seed_pins_thread_index_to_zero() {
+        GlobalRng::clear_seed();
+
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        assert_eq!(GlobalRng::thread_index(), 0);
+
+        // Same seed produces same RNG output
+        let val1 = GlobalRng::random_u64();
+        GlobalRng::set_seed(0xDEAD_BEEF);
+        let val2 = GlobalRng::random_u64();
+        assert_eq!(val1, val2);
+
+        GlobalRng::clear_seed();
+    }
 }
