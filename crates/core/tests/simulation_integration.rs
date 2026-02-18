@@ -2401,6 +2401,31 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n6_g2_s3("crdt-6n-2gw-s3", 0x2773_0006_1003, 2, 6)]
 #[case::n6_g2_s4("crdt-6n-2gw-s4", 0x2773_0006_1004, 2, 6)]
 #[case::n6_g2_s5("crdt-6n-2gw-s5", 0x2773_0006_1005, 2, 6)]
+#[case::n4_g1_s1("crdt-4n-1gw-s1", 0x2773_0004_0001, 1, 4)]
+#[case::n4_g1_s2("crdt-4n-1gw-s2", 0x2773_0004_0002, 1, 4)]
+#[case::n4_g1_s3("crdt-4n-1gw-s3", 0x2773_0004_0003, 1, 4)]
+#[case::n4_g1_s4("crdt-4n-1gw-s4", 0x2773_0004_0004, 1, 4)]
+#[case::n4_g1_s5("crdt-4n-1gw-s5", 0x2773_0004_0005, 1, 4)]
+#[case::n5_g1_s1("crdt-5n-1gw-s1", 0x2773_0005_0008, 1, 5)]
+#[case::n5_g1_s2("crdt-5n-1gw-s2", 0x2773_0005_0002, 1, 5)]
+#[case::n5_g1_s3("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5)]
+#[case::n5_g1_s4("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5)]
+#[case::n5_g1_s5("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5)]
+#[case::n6_g1_s1("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6)]
+#[case::n6_g1_s2("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6)]
+#[case::n6_g1_s3("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6)]
+#[case::n6_g1_s4("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6)]
+#[case::n6_g1_s5("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6)]
+#[case::n7_g1_s1("crdt-7n-1gw-s1", 0x2773_0007_0001, 1, 7)]
+#[case::n7_g1_s2("crdt-7n-1gw-s2", 0x2773_0007_0002, 1, 7)]
+#[case::n7_g1_s3("crdt-7n-1gw-s3", 0x2773_0007_0003, 1, 7)]
+#[case::n7_g1_s4("crdt-7n-1gw-s4", 0x2773_0007_0010, 1, 7)]
+#[case::n7_g1_s5("crdt-7n-1gw-s5", 0x2773_0007_0005, 1, 7)]
+#[case::n8_g1_s1("crdt-8n-1gw-s1", 0x2773_0008_0001, 1, 8)]
+#[case::n8_g1_s2("crdt-8n-1gw-s2", 0x2773_0008_0002, 1, 8)]
+#[case::n8_g1_s3("crdt-8n-1gw-s3", 0x2773_0008_0003, 1, 8)]
+#[case::n8_g1_s4("crdt-8n-1gw-s4", 0x2773_0008_0004, 1, 8)]
+#[case::n8_g1_s5("crdt-8n-1gw-s5", 0x2773_0008_0005, 1, 8)]
 fn test_crdt_convergence(
     #[case] name: &'static str,
     #[case] seed: u64,
@@ -2504,154 +2529,6 @@ fn test_crdt_convergence(
         convergence.converged.len(),
         resync_count
     );
-}
-
-// 16/25 single-gateway CRDT convergence tests pass after #3077 (thread-index fix)
-// and #3030 (own.location() routing). The remaining 9 fail due to real convergence
-// bugs where not all subscribers receive updates in certain seed/topology combos.
-// Tracked in #3070.
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s1() {
-    test_crdt_convergence("crdt-4n-1gw-s1", 0x2773_0004_0001, 1, 4);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n4_g1_s2() {
-    test_crdt_convergence("crdt-4n-1gw-s2", 0x2773_0004_0002, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s3() {
-    test_crdt_convergence("crdt-4n-1gw-s3", 0x2773_0004_0003, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s4() {
-    test_crdt_convergence("crdt-4n-1gw-s4", 0x2773_0004_0004, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s5() {
-    test_crdt_convergence("crdt-4n-1gw-s5", 0x2773_0004_0005, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n5_g1_s1() {
-    test_crdt_convergence("crdt-5n-1gw-s1", 0x2773_0005_0008, 1, 5);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n5_g1_s2() {
-    test_crdt_convergence("crdt-5n-1gw-s2", 0x2773_0005_0002, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s3() {
-    test_crdt_convergence("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s4() {
-    test_crdt_convergence("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s5() {
-    test_crdt_convergence("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s1() {
-    test_crdt_convergence("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s2() {
-    test_crdt_convergence("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s3() {
-    test_crdt_convergence("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s4() {
-    test_crdt_convergence("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n6_g1_s5() {
-    test_crdt_convergence("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n7_g1_s1() {
-    test_crdt_convergence("crdt-7n-1gw-s1", 0x2773_0007_0001, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s2() {
-    test_crdt_convergence("crdt-7n-1gw-s2", 0x2773_0007_0002, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s3() {
-    test_crdt_convergence("crdt-7n-1gw-s3", 0x2773_0007_0003, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s4() {
-    test_crdt_convergence("crdt-7n-1gw-s4", 0x2773_0007_0010, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s5() {
-    test_crdt_convergence("crdt-7n-1gw-s5", 0x2773_0007_0005, 1, 7);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s1() {
-    test_crdt_convergence("crdt-8n-1gw-s1", 0x2773_0008_0001, 1, 8);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n8_g1_s2() {
-    test_crdt_convergence("crdt-8n-1gw-s2", 0x2773_0008_0002, 1, 8);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s3() {
-    test_crdt_convergence("crdt-8n-1gw-s3", 0x2773_0008_0003, 1, 8);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s4() {
-    test_crdt_convergence("crdt-8n-1gw-s4", 0x2773_0008_0004, 1, 8);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n8_g1_s5() {
-    test_crdt_convergence("crdt-8n-1gw-s5", 0x2773_0008_0005, 1, 8);
 }
 
 /// Test: CRDT convergence with N nodes updating simultaneously.

@@ -263,7 +263,79 @@ where
     /// This ensures all nodes converge to the same state regardless of message
     /// delivery order, which is essential for simulation test correctness.
     ///
+    /// Apply a full state update using CRDT LWW-Register semantics.
+    ///
+    /// When a BroadcastTo message carries a full state (not a delta),
+    /// we must still use version-based comparison for CRDT contracts.
+    /// Without this, the hash-based comparison in the default path can
+    /// disagree with the version-based delta path, causing permanent
+    /// divergence between peers. See #3070.
+    ///
     /// Delta format: [from_version: u64][to_version: u64][new_data]
+    async fn apply_crdt_full_state(
+        &mut self,
+        key: &ContractKey,
+        current_state: &WrappedState,
+        incoming_state: &WrappedState,
+    ) -> Result<UpsertResult, ExecutorError> {
+        let (current_version, current_data) = crdt_encoding::decode_state(current_state.as_ref())
+            .ok_or_else(|| {
+            ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format (current)"))
+        })?;
+        let (incoming_version, incoming_data) =
+            crdt_encoding::decode_state(incoming_state.as_ref()).ok_or_else(|| {
+                ExecutorError::other(anyhow::anyhow!("Invalid CRDT state format (incoming)"))
+            })?;
+
+        tracing::debug!(
+            contract = %key,
+            current_version,
+            incoming_version,
+            "CRDT mode: applying full state with LWW semantics"
+        );
+
+        // LWW-Register merge: same logic as apply_crdt_delta
+        let should_update = if incoming_version > current_version {
+            true
+        } else if incoming_version == current_version {
+            // Tiebreaker: compare hashes of the data (not the full encoded state)
+            let incoming_hash = blake3::hash(incoming_data);
+            let current_hash = blake3::hash(current_data);
+            incoming_hash.as_bytes() > current_hash.as_bytes()
+        } else {
+            false
+        };
+
+        let result = if should_update {
+            self.state_store
+                .update(key, incoming_state.clone())
+                .await
+                .map_err(ExecutorError::other)?;
+            Ok(UpsertResult::Updated(incoming_state.clone()))
+        } else if incoming_version == current_version
+            && incoming_state.as_ref() == current_state.as_ref()
+        {
+            Ok(UpsertResult::NoChange)
+        } else {
+            // Current state wins — broadcast it so the sender learns
+            Ok(UpsertResult::CurrentWon(current_state.clone()))
+        };
+
+        // Emit BSC so the update propagates to subscribers at each hop.
+        // Without this, `return self.apply_crdt_full_state(...)` in
+        // upsert_contract_state bypasses the BSC emission after the match.
+        if let Ok(ref upsert_result) = result {
+            match upsert_result {
+                UpsertResult::Updated(state) | UpsertResult::CurrentWon(state) => {
+                    self.broadcast_state_change(*key, state).await;
+                }
+                UpsertResult::NoChange => {}
+            }
+        }
+
+        result
+    }
+
     async fn apply_crdt_delta(
         &mut self,
         key: &ContractKey,
@@ -319,7 +391,7 @@ where
             false
         };
 
-        if should_update {
+        let result = if should_update {
             let new_state_bytes = crdt_encoding::encode_state(to_version, new_data);
             let new_state = WrappedState::new(new_state_bytes);
 
@@ -338,7 +410,16 @@ where
             Ok(UpsertResult::Updated(new_state))
         } else {
             Ok(UpsertResult::NoChange)
+        };
+
+        // Emit BSC so the update propagates to subscribers at each hop.
+        // Without this, `return self.apply_crdt_delta(...)` in
+        // upsert_contract_state bypasses the BSC emission after the match.
+        if let Ok(UpsertResult::Updated(ref state)) = result {
+            self.broadcast_state_change(*key, state).await;
         }
+
+        result
     }
 }
 
@@ -412,22 +493,27 @@ where
                 // Check if there's already a state for this contract
                 match self.state_store.get(&key).await {
                     Ok(current_state) => {
-                        // Compare hashes - larger hash wins (deterministic CRDT merge)
+                        // CRDT contracts use version-based LWW merge for consistency
+                        // with the delta path. See #3070.
+                        if is_crdt_contract(key.id()) {
+                            return self
+                                .apply_crdt_full_state(&key, &current_state, &incoming_state)
+                                .await;
+                        }
+
+                        // Default: Compare hashes - larger hash wins (deterministic merge)
                         let incoming_hash = blake3::hash(incoming_state.as_ref());
                         let current_hash = blake3::hash(current_state.as_ref());
 
                         if incoming_hash.as_bytes() > current_hash.as_bytes() {
-                            // Incoming state wins - update
                             self.state_store
                                 .update(&key, incoming_state.clone())
                                 .await
                                 .map_err(ExecutorError::other)?;
                             Ok(UpsertResult::Updated(incoming_state))
                         } else if incoming_hash.as_bytes() == current_hash.as_bytes() {
-                            // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - return it so it can be propagated
                             Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
@@ -445,22 +531,27 @@ where
                 // Update case - must have existing state
                 match self.state_store.get(&key).await {
                     Ok(current_state) => {
-                        // Compare hashes - larger hash wins (deterministic CRDT merge)
+                        // CRDT contracts use version-based LWW merge for consistency
+                        // with the delta path. See #3070.
+                        if is_crdt_contract(key.id()) {
+                            return self
+                                .apply_crdt_full_state(&key, &current_state, &incoming_state)
+                                .await;
+                        }
+
+                        // Default: Compare hashes - larger hash wins (deterministic merge)
                         let incoming_hash = blake3::hash(incoming_state.as_ref());
                         let current_hash = blake3::hash(current_state.as_ref());
 
                         if incoming_hash.as_bytes() > current_hash.as_bytes() {
-                            // Incoming state wins - update
                             self.state_store
                                 .update(&key, incoming_state.clone())
                                 .await
                                 .map_err(ExecutorError::other)?;
                             Ok(UpsertResult::Updated(incoming_state))
                         } else if incoming_hash.as_bytes() == current_hash.as_bytes() {
-                            // Same state - no change
                             Ok(UpsertResult::NoChange)
                         } else {
-                            // Current state wins - return it so it can be propagated
                             Ok(UpsertResult::CurrentWon(current_state))
                         }
                     }
