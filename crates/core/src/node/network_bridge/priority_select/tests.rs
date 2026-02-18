@@ -2204,12 +2204,68 @@ async fn test_anti_starvation_force_poll_tier2_pending_falls_through() {
     );
     tokio::pin!(stream);
 
-    let events = drain_stream(&mut stream, p1_count + 10).await;
+    // Wrap the entire drain in a timeout to catch hangs caused by
+    // force-poll blocking when Tier-2 channels are Pending.
+    let events = timeout(Duration::from_secs(5), async {
+        drain_stream(&mut stream, p1_count + 10).await
+    })
+    .await
+    .expect("drain_stream should complete within 5s — force-poll must not block on Pending Tier-2");
 
     let total_notif = events.iter().filter(|&&e| e == "notification").count();
     assert_eq!(
         total_notif, p1_count,
         "All {} P1 messages should be received even when P7/P8 are always Pending",
+        p1_count
+    );
+}
+
+/// Test 5: Mixed scenario where P7 is closed but P8 is open-and-Pending.
+/// When force-poll fires, it should skip P7 (closed) and try P8 (Pending),
+/// then fall through to normal priority polling without blocking.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_mixed_p7_closed_p8_pending() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let p1_count = burst * 2;
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+
+    // P7: create channel and immediately close sender so stream yields None
+    let (client_tx, client_rx) = mpsc::channel::<(ClientId, WaitingTransaction)>(1);
+    drop(client_tx);
+
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    drop(notif_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx }, // Closed immediately
+        MockExecutorStream,                         // Always Pending
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = timeout(Duration::from_secs(5), async {
+        drain_stream(&mut stream, p1_count + 10).await
+    })
+    .await
+    .expect("drain_stream should complete — mixed closed/pending Tier-2 must not block");
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    assert_eq!(
+        total_notif, p1_count,
+        "All {} P1 messages should be received with P7 closed and P8 Pending",
         p1_count
     );
 }

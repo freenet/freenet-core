@@ -1183,6 +1183,18 @@ impl P2pConnManager {
                                         }
                                     }
 
+                                    // Clean up pending operation result callbacks
+                                    // Drop all waiting senders so callers see channel closure
+                                    let pending_count = state.pending_op_results.len();
+                                    if pending_count > 0 {
+                                        tracing::debug!(
+                                            pending_count,
+                                            phase = "cleanup",
+                                            "Draining pending_op_results"
+                                        );
+                                        state.pending_op_results.drain();
+                                    }
+
                                     tracing::info!(
                                         phase = "shutdown",
                                         "Cleanup complete - exiting event loop"
