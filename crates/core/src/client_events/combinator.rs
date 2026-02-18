@@ -230,7 +230,8 @@ async fn client_fn(
                         break;
                     }
                     Err(err) => {
-                        panic!("Error of kind: {err} not handled");
+                        tracing::error!("Unhandled client error: {err}");
+                        break;
                     }
                 }
             }

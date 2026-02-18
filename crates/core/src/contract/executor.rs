@@ -187,7 +187,7 @@ impl ExecutorError {
     pub fn unwrap_request(self) -> RequestError {
         match self.inner {
             Either::Left(err) => *err,
-            Either::Right(_) => panic!(),
+            Either::Right(_) => unreachable!("called unwrap_request on a non-request error"),
         }
     }
 }
