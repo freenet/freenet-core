@@ -1,13 +1,13 @@
 //! WASM engine abstraction layer.
 //!
-//! This module defines the [`WasmEngine`] trait that abstracts over different WASM
-//! runtimes (wasmer, wasmtime). All WASM-runtime-specific code lives behind this
-//! trait, keeping the rest of the codebase runtime-agnostic.
+//! This module defines the [`WasmEngine`] trait that abstracts over WASM
+//! runtimes. All WASM-runtime-specific code lives behind this trait, keeping
+//! the rest of the codebase runtime-agnostic.
 //!
 //! # Architecture
 //!
 //! - [`WasmEngine`] trait: defines lifecycle, compilation, memory, and execution operations
-//! - [`WasmerEngine`]: the current (and default) backend, wrapping wasmer 7.x
+//! - [`WasmtimeEngine`]: the wasmtime-based backend
 //! - [`InstanceHandle`]: opaque handle to a live WASM instance
 //! - [`WasmError`]: unified error type for all WASM operations
 //!
@@ -17,23 +17,16 @@
 //!
 //! - **Synchronous** (`call_3i64`, `call_3i64_async_imports`): Used for delegate
 //!   `process()` calls. Runs on the current thread. Wasmtime internally uses
-//!   `call_async()` via a `block_on_async` helper; wasmer calls directly.
+//!   `call_async()` via a `block_on_async` helper.
 //!   `call_3i64_async_imports` is the variant for V2 delegates with async host
-//!   function imports (wasmer needs `Store::into_async()` + `call_async()` for these).
+//!   function imports.
 //!
 //! - **Blocking with timeout** (`call_2i64_blocking`, `call_3i64_blocking`): Offloads
 //!   WASM to a blocking thread with timeout. Used for contract operations that may
 //!   take seconds.
 
-// Ensure exactly one backend is selected
-#[cfg(all(feature = "wasmer-backend", feature = "wasmtime-backend"))]
-compile_error!("Cannot enable both wasmer-backend and wasmtime-backend. Choose one.");
-
-#[cfg(not(any(feature = "wasmer-backend", feature = "wasmtime-backend")))]
-compile_error!("Must enable exactly one WASM backend: wasmer-backend or wasmtime-backend");
-
-#[cfg(feature = "wasmer-backend")]
-mod wasmer_engine;
+#[cfg(not(feature = "wasmtime-backend"))]
+compile_error!("The wasmtime-backend feature must be enabled.");
 
 #[cfg(feature = "wasmtime-backend")]
 mod wasmtime_engine;
@@ -45,8 +38,7 @@ use super::ContractError;
 /// 4096 pages = 256 MiB.
 ///
 /// This limit is enforced by the engine's ResourceLimiter and used by
-/// host function bounds validation. Both Wasmer and Wasmtime engines
-/// apply this limit.
+/// host function bounds validation.
 pub(crate) const DEFAULT_MAX_MEMORY_PAGES: u32 = 4096;
 
 /// WASM page size in bytes (64 KiB).
@@ -66,9 +58,7 @@ pub(crate) struct InstanceHandle {
 
 /// Unified error type for WASM engine operations.
 ///
-/// Replaces the 5 wasmer-specific error variants that were previously in
-/// `RuntimeInnerError`. Backend implementations map their native errors
-/// into these categories.
+/// Backend implementations map their native errors into these categories.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WasmError {
     /// Module compilation failed (syntax error, unsupported features).
@@ -181,14 +171,12 @@ pub(crate) trait WasmEngine: Send {
 
     // -- Async-imports WASM function calls --
     // Used for V2 delegates that have async host function imports.
-    // The wasmer backend uses Store::into_async() + call_async() + into_store().
     // This is still a blocking call from Rust's perspective.
 
     /// Call a WASM function `name(a, b, c) -> i64` using the async calling convention.
     ///
     /// Required when the module has async host function imports (e.g., V2 delegate
-    /// contract access functions registered via `Function::new_typed_async`).
-    /// Wasmer requires `call_async` + `StoreAsync` for modules with async imports.
+    /// contract access functions registered via `func_wrap_async`).
     fn call_3i64_async_imports(
         &mut self,
         handle: &InstanceHandle,
@@ -225,9 +213,6 @@ pub(crate) trait WasmEngine: Send {
 }
 
 // Backend selection via type alias — no generics leak outside wasm_runtime/
-#[cfg(feature = "wasmer-backend")]
-pub(crate) type Engine = wasmer_engine::WasmerEngine;
-
 #[cfg(feature = "wasmtime-backend")]
 pub(crate) type Engine = wasmtime_engine::WasmtimeEngine;
 
@@ -236,8 +221,5 @@ pub(crate) type Engine = wasmtime_engine::WasmtimeEngine;
 /// All executors in a pool MUST share the same backend engine because compiled
 /// modules store references to the compiling engine's internal data structures.
 /// Using a Module compiled by one Engine with a different Engine can cause errors.
-#[cfg(feature = "wasmer-backend")]
-pub(crate) type BackendEngine = wasmer::Engine;
-
 #[cfg(feature = "wasmtime-backend")]
 pub(crate) type BackendEngine = wasmtime::Engine;

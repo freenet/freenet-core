@@ -558,7 +558,7 @@ impl DelegateRuntimeInterface for Runtime {
             Ok(())
         })();
 
-        // Always clean up the wasmer Instance, even on error.
+        // Always clean up the WASM Instance, even on error.
         self.drop_running_instance(&mut running);
 
         process_result?;
@@ -589,7 +589,7 @@ impl DelegateRuntimeInterface for Runtime {
     }
 }
 
-#[cfg(all(test, any(feature = "wasmer-backend", feature = "wasmtime-backend")))]
+#[cfg(all(test, feature = "wasmtime-backend"))]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use freenet_stdlib::prelude::*;
