@@ -1229,7 +1229,10 @@ impl Ring {
             // when CONNECT operations fail to complete cleanly.
             let stale_removed = self.connection_manager.cleanup_stale_reservations();
             if stale_removed > 0 {
-                tracing::warn!(stale_removed, "Cleaned up stale pending reservations");
+                tracing::warn!(
+                    stale_removed,
+                    "Cleaned up stale reservations and orphaned location entries"
+                );
             }
 
             // Expire old NAT traversal failure entries

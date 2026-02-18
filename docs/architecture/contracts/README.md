@@ -4,44 +4,27 @@
 
 Freenet executes untrusted WASM contracts in a sandboxed environment. Contracts define shared state and update logic, while delegates provide private computation for users.
 
-## WASM Runtime Backends
+## WASM Runtime Backend
 
-Freenet supports two WASM runtime backends, selectable at compile time:
-
-### Wasmer (Default, Stable)
+Freenet uses Wasmtime as its WASM runtime backend, enabled via the `wasmtime-backend` feature (on by default).
 
 ```bash
-cargo build --features wasmer-backend  # default
-```
-
-**Compiler:** Singlepass (single-pass, fast compilation)
-
-**Characteristics:**
-- Stable, production-tested
-- Fast compilation for short-lived processes
-- **Memory issue:** Append-only `Vec<CodeMemory>` that never shrinks
-- Per-contract overhead: ~15.7 MB (10 MB code + 3.4 MB trap metadata + 2 MB address maps)
-- 92 contracts = 2.3 GB RSS plateau
-
-### Wasmtime (Experimental, Memory-Efficient)
-
-```bash
-cargo build --no-default-features --features wasmtime-backend,redb,trace
+cargo build  # wasmtime-backend is enabled by default
 ```
 
 **Compiler:** Cranelift (optimizing compiler)
 
 **Characteristics:**
-- **Memory-efficient:** Actually frees compiled code when modules drop
-- More compact code generation from Cranelift
-- Instance pooling for memory reuse
-- Expected: <200 MB for 20-30 contracts (vs 300-500 MB with wasmer)
+- **Memory-efficient:** Frees compiled code when modules are dropped
+- Compact code generation from Cranelift
+- On-demand instance allocation
+- Expected: <200 MB for 20-30 contracts
 
 ## Security Considerations
 
 ### Untrusted Code Execution
 
-Both backends are designed for executing untrusted WASM code:
+The backend is designed for executing untrusted WASM code:
 
 **WebAssembly Sandbox:**
 - Inaccessible call stack (prevents stack-smashing)
@@ -93,8 +76,7 @@ wasmtime_config.cranelift_opt_level(OptLevel::None);
 **Rationale:**
 - Optimization passes add complexity to the compiler
 - For untrusted code, simplicity > performance
-- Memory benefits come from pooling and compact code generation, not optimizations
-- Similar to wasmer's singlepass philosophy (fast compilation, minimal optimization)
+- Memory benefits come from compact code generation, not optimizations
 
 **Alternative considered:**
 - `OptLevel::SpeedAndSize` – more optimizations, slightly higher attack surface
@@ -103,44 +85,31 @@ wasmtime_config.cranelift_opt_level(OptLevel::None);
 
 **Future option: Winch**
 
-Wasmtime's baseline compiler "Winch" (analogous to wasmer's singlepass):
+Wasmtime's baseline compiler "Winch":
 - Single-pass, no optimizations
 - Even simpler than Cranelift with `OptLevel::None`
 - Could be added as a configuration option for maximum security
 
 ## Memory Management
 
-### Wasmtime Optimizations (#2941, #2942, #2928)
+### On-Demand Instance Allocation
 
-**Problem (Wasmer):**
-- ~15.7 MB per contract
-- 2.3 GB for 92 contracts
-- Memory never freed (append-only Vec)
+Uses wasmtime's default on-demand allocation — each instance gets its own
+mmap'd memory region, allocated at instantiation and freed on drop.
 
-**Solution (Wasmtime):**
+### Compact Code Generation (Cranelift)
 
-1. **Instance Pooling** (`PoolingAllocationStrategy`)
-   ```rust
-   pooling.total_core_instances(100);
-   pooling.max_memory_size(256 * 1024 * 1024); // 256 MiB
-   pooling.linear_memory_keep_resident(64 * 1024); // 64 KB
-   ```
-   - Pre-allocates pool of instances
-   - Reuses memory across instantiations
-   - Fast slot reuse with resident memory
+Generates efficient machine code with low per-contract footprint.
 
-2. **Compact Code Generation** (Cranelift)
-   - More efficient machine code than wasmer
-   - Reduces per-contract footprint
+### Proper Memory Cleanup
 
-3. **Proper Memory Cleanup**
-   - Compiled code is freed when modules drop
-   - Unlike wasmer's permanent `code_memory` growth
+Wasmtime frees compiled code when modules are dropped, so memory is
+properly reclaimed.
 
-**Expected Impact:**
+**Expected Footprint:**
 - User peers (20-30 contracts): <200 MB
 - Gateway (50-100 contracts): <500 MB
-- Memory is actually reclaimed when contracts are removed
+- Memory is reclaimed when contracts are removed
 
 ### Memory Tests
 
@@ -154,15 +123,14 @@ fn test_module_drop_frees_memory() {
         let module = Module::new(&engine, SIMPLE_WASM).unwrap();
         drop(module);
     }
-    // Wasmtime frees memory; wasmer would accumulate ~150-200 MB
+    // Wasmtime properly frees memory on drop
 }
 
 #[test]
 #[ignore] // Run manually to observe memory behavior
 fn test_memory_leak_comparison() {
     // Compile 100 modules, drop them, observe memory
-    // Wasmtime: memory returns to baseline
-    // Wasmer: memory stays high (~1.5 GB)
+    // Memory should return to baseline
 }
 ```
 
@@ -290,16 +258,13 @@ where F: FnOnce() -> WasmResult + Send + 'static
 
 ## Backend Selection
 
-### Compile-Time Feature Flags
+### Compile-Time Feature Flag
 
-**Exactly one backend must be enabled:**
+The `wasmtime-backend` feature must be enabled:
 
 ```rust
-#[cfg(all(feature = "wasmer-backend", feature = "wasmtime-backend"))]
-compile_error!("Cannot enable both wasmer-backend and wasmtime-backend");
-
-#[cfg(not(any(feature = "wasmer-backend", feature = "wasmtime-backend")))]
-compile_error!("Must enable exactly one WASM backend");
+#[cfg(not(feature = "wasmtime-backend"))]
+compile_error!("The wasmtime-backend feature must be enabled.");
 ```
 
 ### Type Aliases
@@ -307,10 +272,6 @@ compile_error!("Must enable exactly one WASM backend");
 Backend-agnostic code uses type aliases:
 
 ```rust
-// Selected at compile time:
-#[cfg(feature = "wasmer-backend")]
-pub(crate) type Engine = wasmer_engine::WasmerEngine;
-
 #[cfg(feature = "wasmtime-backend")]
 pub(crate) type Engine = wasmtime_engine::WasmtimeEngine;
 ```
@@ -357,7 +318,7 @@ pub(crate) trait WasmEngine: Send {
 ### Security
 
 1. **Add Winch compiler support**
-   - Wasmtime's baseline compiler (analogous to wasmer singlepass)
+   - Wasmtime's baseline compiler
    - Even simpler than Cranelift with `OptLevel::None`
    - Configuration option for maximum security
 
@@ -386,9 +347,8 @@ pub(crate) trait WasmEngine: Send {
    - Evict cached modules under pressure
    - Metrics for memory efficiency
 
-3. **Cross-backend memory benchmarks**
+3. **Memory benchmarks**
    - Automated memory profiling tests
-   - Compare wasmer vs wasmtime overhead
    - Regression detection
 
 ## References
@@ -404,8 +364,3 @@ pub(crate) trait WasmEngine: Send {
 
 **Production Use Cases:**
 - [Fastly's Cranelift Vetting](https://www.fastly.com/blog/how-we-vetted-cranelift-for-secure-sandboxing-in-compute-edge)
-
-**Related Issues:**
-- #2941 – Wasmer append-only Vec<CodeMemory>
-- #2942 – Per-contract memory overhead (~15.7 MB)
-- #2928 – 2.3 GB RSS for 92 contracts

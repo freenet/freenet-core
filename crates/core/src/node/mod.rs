@@ -1594,8 +1594,15 @@ async fn handle_aborted_op(
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
-                        // Record failure and apply backoff if we know the address
+                        // Clean up phantom location_for_peer entry left by should_accept's
+                        // record_pending_location (#3088). Without this, the gateway appears
+                        // permanently connected and initial_join_procedure never retries it.
                         if let Some(peer_addr) = gateway.peer_addr.as_known() {
+                            op_manager
+                                .ring
+                                .connection_manager
+                                .prune_in_transit_connection(*peer_addr);
+
                             let backoff_duration = {
                                 let mut backoff = op_manager.gateway_backoff.lock();
                                 backoff.record_failure(*peer_addr);
@@ -1616,7 +1623,14 @@ async fn handle_aborted_op(
                         connect::join_ring_request(&gateway, op_manager).await?;
                     }
                 }
-                Ok(Some(OpEnum::Connect(_))) => {
+                Ok(Some(OpEnum::Connect(op))) => {
+                    // Clean up phantom location_for_peer entry (#3088)
+                    if let Some(peer_addr) = op.get_next_hop_addr() {
+                        op_manager
+                            .ring
+                            .connection_manager
+                            .prune_in_transit_connection(peer_addr);
+                    }
                     if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                         tracing::warn!("Retrying joining the ring with an other gateway");
                         if let Some(gateway) = gateways.iter().shuffle().next() {
