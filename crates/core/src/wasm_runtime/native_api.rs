@@ -397,7 +397,10 @@ pub(super) mod rand {
 
     pub(crate) fn rand_bytes(id: i64, ptr: i64, len: u32) {
         if id == -1 {
-            tracing::error!("freenet_rand::rand_bytes called with unset module id");
+            tracing::error!(
+                "freenet_rand::rand_bytes called with unset module id; \
+                 output buffer NOT written — caller will read uninitialized memory"
+            );
             return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
@@ -419,7 +422,10 @@ pub(super) mod time {
 
     pub(crate) fn utc_now(id: i64, ptr: i64) {
         if id == -1 {
-            tracing::error!("freenet_time::utc_now called with unset module id");
+            tracing::error!(
+                "freenet_time::utc_now called with unset module id; \
+                 output buffer NOT written — caller will read uninitialized memory"
+            );
             return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
