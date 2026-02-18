@@ -272,6 +272,15 @@ jobs:
             .
             river-src
 
+      - name: Pin native-tls in river
+        working-directory: river-src
+        run: |
+          # native-tls 0.2.17 has a compilation bug (missing Tlsv13 match arm in openssl backend).
+          # River has no Cargo.lock, so cargo resolves to the broken latest version.
+          # Pin to 0.2.16 until the upstream fix is released.
+          cargo generate-lockfile
+          cargo update -p native-tls --precise 0.2.16
+
       - name: Pull Docker images for NAT simulation
         run: |
           # Pre-pull alpine image used by NAT router simulation
