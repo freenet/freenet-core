@@ -528,4 +528,189 @@ mod tests {
         let count = receiver.await.unwrap();
         assert_eq!(count, n_senders * msgs_per_sender);
     }
+
+    #[tokio::test]
+    async fn stress_high_concurrency_small_channel() {
+        // 50 senders, 1000 msgs each, tiny channel (capacity 5).
+        // Forces heavy backpressure contention on every send.
+        let (tx, rx) = bounded::<u64>(5);
+        let n_senders = 50;
+        let msgs_per_sender = 1000;
+
+        let handles: Vec<_> = (0..n_senders)
+            .map(|sender_id| {
+                let tx = tx.clone();
+                GlobalExecutor::spawn(async move {
+                    for i in 0..msgs_per_sender {
+                        tx.send_async(sender_id * msgs_per_sender + i)
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+
+        let receiver = GlobalExecutor::spawn(async move {
+            let mut count = 0u64;
+            while rx.recv_async().await.is_ok() {
+                count += 1;
+            }
+            count
+        });
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        let count = receiver.await.unwrap();
+        assert_eq!(count, n_senders * msgs_per_sender);
+    }
+
+    #[tokio::test]
+    async fn stress_rapid_sender_disconnect() {
+        // Create and drop senders rapidly while receiver is active.
+        // Each sender sends a few messages then disconnects.
+        let (tx, rx) = bounded::<u64>(100);
+        let total_expected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..100)
+            .map(|wave| {
+                let tx = tx.clone();
+                let total = total_expected.clone();
+                GlobalExecutor::spawn(async move {
+                    // Each sender lives briefly — send 10 messages then drop
+                    for i in 0..10 {
+                        tx.send_async(wave * 10 + i).await.unwrap();
+                        total.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // tx clone dropped here
+                })
+            })
+            .collect();
+        drop(tx); // drop original
+
+        let receiver = GlobalExecutor::spawn(async move {
+            let mut count = 0u64;
+            while rx.recv_async().await.is_ok() {
+                count += 1;
+            }
+            count
+        });
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        let count = receiver.await.unwrap();
+        let expected = total_expected.load(Ordering::Relaxed);
+        assert_eq!(count, expected);
+    }
+
+    #[tokio::test]
+    async fn stress_many_channels_parallel() {
+        // Simulate 200 independent channels (like 200 peer connections).
+        // Each has its own sender/receiver pair running concurrently.
+        let n_channels = 200;
+        let msgs_per_channel = 500;
+
+        let handles: Vec<_> = (0..n_channels)
+            .map(|_| {
+                GlobalExecutor::spawn(async move {
+                    let (tx, rx) = bounded::<u64>(50);
+
+                    let sender = GlobalExecutor::spawn(async move {
+                        for i in 0..msgs_per_channel {
+                            tx.send_async(i).await.unwrap();
+                        }
+                    });
+
+                    let receiver = GlobalExecutor::spawn(async move {
+                        let mut count = 0u64;
+                        while count < msgs_per_channel {
+                            rx.recv_async().await.unwrap();
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    sender.await.unwrap();
+                    let count = receiver.await.unwrap();
+                    assert_eq!(count, msgs_per_channel);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stress_backpressure_with_slow_receiver() {
+        // Capacity-1 channel: every send must wait for the receiver.
+        // Receiver adds artificial delay to create sustained backpressure.
+        let (tx, rx) = bounded::<u64>(1);
+        let n_msgs = 500;
+
+        let sender = GlobalExecutor::spawn(async move {
+            for i in 0..n_msgs {
+                tx.send_async(i).await.unwrap();
+            }
+        });
+
+        let receiver = GlobalExecutor::spawn(async move {
+            let mut count = 0u64;
+            for _ in 0..n_msgs {
+                let msg = rx.recv_async().await.unwrap();
+                assert_eq!(msg, count);
+                count += 1;
+                // Slow receiver: yield occasionally to stress backpressure wakeup
+                if count % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            count
+        });
+
+        sender.await.unwrap();
+        let count = receiver.await.unwrap();
+        assert_eq!(count, n_msgs);
+    }
+
+    #[tokio::test]
+    async fn stress_sender_drop_during_backpressure() {
+        // Fill channel, start multiple senders blocked on backpressure,
+        // then drop receiver — all senders should detect disconnection.
+        let (tx, rx) = bounded::<u64>(2);
+
+        // Fill the channel
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+
+        // Spawn senders that will block on backpressure
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let tx = tx.clone();
+                GlobalExecutor::spawn(async move {
+                    // This will block because channel is full
+                    let result = tx.send_async(100 + i).await;
+                    result
+                })
+            })
+            .collect();
+        drop(tx);
+
+        // Give senders time to park on backpressure
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drop receiver — senders should get SendError
+        drop(rx);
+
+        for h in handles {
+            let result = h.await.unwrap();
+            assert!(
+                result.is_err(),
+                "Sender should get error after receiver drops"
+            );
+        }
+    }
 }
