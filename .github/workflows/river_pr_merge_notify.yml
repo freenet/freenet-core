@@ -7,7 +7,7 @@ on:
 jobs:
   notify_river:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     if: github.event.pull_request.merged == true
     steps:
       - name: Install Rust
@@ -18,11 +18,27 @@ jobs:
       - name: Install riverctl
         run: cargo install riverctl
 
-      - name: Send message to River
+      - name: Send message to River (with exponential backoff)
         env:
           RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
         run: |
-          riverctl --node-url "${{ secrets.RIVER_GATEWAY_URL }}" \
-            message send \
-            "${{ secrets.RIVER_ROOM_ID }}" \
-            "PR #${{ github.event.pull_request.number }} merged: ${{ github.event.pull_request.title }} (by @${{ github.event.pull_request.user.login }}, merged by @${{ github.event.pull_request.merged_by.login }}) - ${{ github.event.pull_request.html_url }}"
+          MESSAGE="PR #${{ github.event.pull_request.number }} merged: ${{ github.event.pull_request.title }} (by @${{ github.event.pull_request.user.login }}, merged by @${{ github.event.pull_request.merged_by.login }}) - ${{ github.event.pull_request.html_url }}"
+          NODE_URL="${{ secrets.RIVER_GATEWAY_URL }}"
+          ROOM_ID="${{ secrets.RIVER_ROOM_ID }}"
+
+          max_attempts=7
+          delay=10
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Attempt $attempt/$max_attempts (delay: ${delay}s)..."
+            if riverctl --node-url "$NODE_URL" message send "$ROOM_ID" "$MESSAGE" 2>&1; then
+              echo "Message sent successfully on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "Failed, retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
+          exit 0

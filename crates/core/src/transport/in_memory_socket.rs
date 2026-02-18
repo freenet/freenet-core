@@ -354,6 +354,16 @@ pub fn clear_network_sockets(network_name: &str) {
     }
 }
 
+/// Removes the socket registry for a specific network entirely.
+///
+/// Unlike `clear_network_sockets` which clears socket contents but leaves
+/// the DashMap entry, this removes the entry itself. Called during
+/// `SimNetwork::Drop` to keep global state clean between sequential
+/// simulation runs (e.g., in determinism tests).
+pub fn remove_network_socket_registry(network_name: &str) {
+    SOCKET_REGISTRIES.remove(network_name);
+}
+
 /// Clears all socket registries (useful between test runs).
 pub fn clear_all_socket_registries() {
     SOCKET_REGISTRIES.clear();

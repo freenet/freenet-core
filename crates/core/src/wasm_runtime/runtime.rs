@@ -56,7 +56,7 @@ pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 
 /// A live WASM instance with RAII cleanup.
 ///
-/// On drop, removes the MEM_ADDR entry. The wasmer `Instance` is cleaned
+/// On drop, removes the MEM_ADDR entry. The WASM `Instance` is cleaned
 /// up by calling [`Runtime::drop_running_instance`] after the instance is
 /// no longer needed.
 pub(super) struct RunningInstance {
@@ -101,7 +101,7 @@ impl Drop for RunningInstance {
             tracing::debug!(
                 instance_id = self.id,
                 "RunningInstance dropped without engine cleanup — MEM_ADDR cleaned up, \
-                 but wasmer Instance will leak until engine is dropped"
+                 but WASM Instance will leak until engine is dropped"
             );
         }
         // Always clean up MEM_ADDR as a safety net (idempotent — engine may have already removed it)
@@ -175,7 +175,7 @@ impl Default for RuntimeConfig {
 }
 
 pub struct Runtime {
-    /// The WASM engine backend (wasmer, wasmtime, etc.)
+    /// The WASM engine backend (wasmtime).
     pub(super) engine: Engine,
 
     pub(super) secret_store: SecretsStore,
@@ -252,17 +252,16 @@ impl Runtime {
     /// with other runtimes.
     ///
     /// Used by `RuntimePool` to avoid duplicating compiled WASM modules across
-    /// pool executors. Each executor gets its own Store (wasmer runtime state:
+    /// pool executors. Each executor gets its own Store (runtime state:
     /// memories, globals, instances), but all share the same backend engine
-    /// (code_memory, signature registry, compiler) and module cache.
+    /// (compiler) and module cache.
     ///
     /// # Safety requirement
     ///
     /// All runtimes sharing a module cache MUST use the same backend engine.
-    /// Wasmer `Artifact`s store function pointers and signature indices that
-    /// reference the compiling Engine's internal data structures. Using a Module
-    /// compiled by one Engine in a Store backed by a different Engine causes
-    /// SIGSEGV.
+    /// Compiled modules store references to the compiling Engine's internal data
+    /// structures. Using a Module compiled by one Engine in a Store backed by a
+    /// different Engine causes SIGSEGV.
     pub(crate) fn build_with_shared_module_caches(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
@@ -287,7 +286,7 @@ impl Runtime {
 
     /// Explicitly clean up a running instance from the engine.
     ///
-    /// This removes the wasmer `Instance` from the engine's HashMap and
+    /// This removes the WASM `Instance` from the engine's HashMap and
     /// the MEM_ADDR entry. Should be called after the instance is no longer
     /// needed (after all WASM calls are complete).
     pub(super) fn drop_running_instance(&mut self, running: &mut RunningInstance) {
@@ -362,8 +361,8 @@ impl Runtime {
                     tracing::warn!(
                         evicted_contract = %evicted_key,
                         cache_capacity = cache.cap().get(),
-                        "Module cache eviction — wasmer code_memory will grow. \
-                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                        "Module cache eviction. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY"
                     );
                 }
                 module
@@ -410,8 +409,8 @@ impl Runtime {
                     tracing::warn!(
                         evicted_delegate = %evicted_key,
                         cache_capacity = cache.cap().get(),
-                        "Delegate cache eviction — wasmer code_memory will grow. \
-                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY (see #2941)"
+                        "Delegate cache eviction. \
+                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY"
                     );
                 }
                 module

@@ -983,6 +983,11 @@ impl Ring {
         self.hosting_manager.hosting_contract_keys()
     }
 
+    /// Get the cached state size in bytes for a hosted contract.
+    pub fn hosting_contract_size(&self, key: &ContractKey) -> u64 {
+        self.hosting_manager.hosting_contract_size(key)
+    }
+
     /// Get the number of contracts in the hosting cache.
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
@@ -1229,7 +1234,10 @@ impl Ring {
             // when CONNECT operations fail to complete cleanly.
             let stale_removed = self.connection_manager.cleanup_stale_reservations();
             if stale_removed > 0 {
-                tracing::warn!(stale_removed, "Cleaned up stale pending reservations");
+                tracing::warn!(
+                    stale_removed,
+                    "Cleaned up stale reservations and orphaned location entries"
+                );
             }
 
             // Expire old NAT traversal failure entries
