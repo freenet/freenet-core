@@ -4,26 +4,13 @@ fn main() {
     // Emit build metadata for startup logging
     emit_build_metadata();
 
-    // Skip flatbuffers generation for cross-compilation
-    if std::env::var("CARGO_BUILD_TARGET").is_ok() {
-        return;
-    }
-
-    // Only regenerate if the schema file changes
-    println!("cargo:rerun-if-changed=../../schemas/flatbuffers/topology.fbs");
-
-    let status = Command::new("flatc")
-        .arg("--rust")
-        .arg("-o")
-        .arg("src/generated")
-        .arg("../../schemas/flatbuffers/topology.fbs")
-        .status();
-    if let Err(err) = status {
-        println!("failed compiling flatbuffers schema: {err}");
-        println!("refer to https://github.com/google/flatbuffers to install the flatc compiler");
-    } else {
-        let _ = Command::new("cargo").arg("fmt").status();
-    }
+    // Flatbuffers codegen is intentionally NOT run automatically.
+    // The generated file (src/generated/topology_generated.rs) is checked in
+    // and only needs regeneration when schemas/flatbuffers/topology.fbs changes.
+    //
+    // To regenerate:
+    //   flatc --rust -o crates/core/src/generated ../../schemas/flatbuffers/topology.fbs
+    //   cargo fmt -p freenet
 }
 
 fn emit_build_metadata() {

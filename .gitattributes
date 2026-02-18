@@ -1,0 +1,2 @@
+# Mark auto-generated files so GitHub collapses them in PRs
+crates/core/src/generated/* linguist-generated=true
