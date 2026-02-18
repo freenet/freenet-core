@@ -690,9 +690,12 @@ impl P2pConnManager {
                 // receiver has been dropped (closed sender). This is a safety net for
                 // transactions that complete without emitting TransactionCompleted/TimedOut
                 // events, preventing unbounded HashMap growth.
-                if state.last_pending_op_cleanup.elapsed() > Duration::from_secs(60) {
+                const PENDING_OP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+                if state.last_pending_op_cleanup.elapsed() > PENDING_OP_CLEANUP_INTERVAL {
                     let before = state.pending_op_results.len();
-                    state.pending_op_results.retain(|_tx, sender| !sender.is_closed());
+                    state
+                        .pending_op_results
+                        .retain(|_tx, sender| !sender.is_closed());
                     let removed = before - state.pending_op_results.len();
                     if removed > 0 {
                         tracing::info!(
