@@ -12,20 +12,12 @@ paths:
 
 ```
 WasmEngine trait     → mod.rs             (backend-agnostic interface)
-WasmerEngine impl    → wasmer_engine.rs   (ONLY file that imports wasmer::)
 WasmtimeEngine impl  → wasmtime_engine.rs (ONLY file that imports wasmtime::)
 Engine type alias    → mod.rs             (selected by feature flag)
 ```
 
-**Backend Selection:** Choose WASM runtime at compile time via Cargo features:
-```
-default: wasmer-backend              # Wasmer 7.x (default, stable)
---features wasmtime-backend          # Wasmtime 27.x (experimental)
-```
+**Backend Selection:** The `wasmtime-backend` feature must be enabled (it is on by default).
 
-**Exactly one backend MUST be enabled.** Compile error if both or neither selected.
-
-**All `wasmer::` imports MUST stay in `engine/wasmer_engine.rs`.**
 **All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
@@ -38,9 +30,7 @@ V2: Async host functions — delegates call contract methods directly:
     - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
     - ctx.update_contract_state(id, data) → conditional write (requires existing state)
     - ctx.subscribe_contract(id)       → register interest (delivery is TODO)
-    Backend-specific implementations:
-    - Wasmer: Function::new_typed_async + Store::into_async()
-    - Wasmtime: func_wrap_async (native async support)
+    Backend implementation: func_wrap_async (wasmtime native async support)
     Selected when state_store_db is configured on Runtime
     NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
     hosting metadata. Network propagation is separate.
@@ -70,7 +60,7 @@ NEVER:
   - Execute untrusted code outside sandbox
   - Allow contracts to access filesystem directly
   - Allow contracts to make network calls directly
-  - Import wasmer:: or wasmtime:: outside their respective engine files
+  - Import wasmtime:: outside engine/wasmtime_engine.rs
 ```
 
 ### WHEN exposing host functions
@@ -81,7 +71,7 @@ Host functions (callable from WASM):
   - MUST handle panics gracefully
   - MUST NOT leak host memory to guest
   - SHOULD be idempotent where possible
-  - Registration: backend-specific in wasmer_engine.rs / wasmtime_engine.rs
+  - Registration: backend-specific in wasmtime_engine.rs
   - Logic implementations: keep in native_api.rs as pub(super) helpers
 
 Pattern:

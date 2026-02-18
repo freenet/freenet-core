@@ -51,13 +51,13 @@
 //! - Optimization passes add complexity (even though Cranelift's are security-hardened)
 //! - For untrusted code, we prioritize safety over performance
 //! - Memory benefits come from pooling and compact code generation, not optimizations
-//! - Similar philosophy to wasmer's singlepass compiler (fast, minimal optimization)
+//! - Fast, minimal optimization for maximum safety
 //!
 //! **Alternatives considered:**
 //! - `OptLevel::SpeedAndSize` – more optimizations, slightly higher complexity
 //!   - Still safe (Cranelift's optimizations are security-hardened)
 //!   - We chose `None` to minimize risk for untrusted contracts
-//! - Winch compiler – Wasmtime's baseline compiler (analogous to wasmer singlepass)
+//! - Winch compiler – Wasmtime's baseline compiler
 //!   - Even simpler than Cranelift with `OptLevel::None`
 //!   - Could be added as a future configuration option
 //!
@@ -82,35 +82,24 @@
 //!
 //! # Memory Management
 //!
-//! This backend addresses wasmer's memory issues (#2941, #2942, #2928).
-//!
-//! ## Problem (Wasmer)
-//!
-//! - ~15.7 MB per contract (10 MB code + 3.4 MB trap metadata + 2 MB address maps)
-//! - 2.3 GB RSS for 92 contracts
-//! - **Memory never freed** – append-only `Vec<CodeMemory>` that never shrinks
-//!
-//! ## Solution (Wasmtime)
-//!
-//! ### 1. On-Demand Instance Allocation
+//! ## On-Demand Instance Allocation
 //!
 //! Uses wasmtime's default on-demand allocation — each instance gets its own
 //! mmap'd memory region, allocated at instantiation and freed on drop.
-//! Memory is properly reclaimed (unlike wasmer's append-only approach).
 //!
-//! ### 2. Compact Code Generation (Cranelift)
+//! ## Compact Code Generation (Cranelift)
 //!
-//! Generates more efficient machine code than wasmer, reducing per-contract footprint.
+//! Generates efficient machine code with low per-contract footprint.
 //!
-//! ### 3. Proper Memory Cleanup
+//! ## Proper Memory Cleanup
 //!
-//! **Wasmtime actually frees compiled code when modules are dropped.**
-//! Unlike wasmer's permanent `code_memory` growth, wasmtime reclaims memory.
+//! Wasmtime frees compiled code when modules are dropped, so memory is
+//! properly reclaimed.
 //!
-//! ### Expected Impact
+//! ### Expected Footprint
 //!
-//! - User peers (20-30 contracts): <200 MB (vs 300-500 MB with wasmer)
-//! - Gateway (50-100 contracts): <500 MB (vs 1+ GB with wasmer)
+//! - User peers (20-30 contracts): <200 MB
+//! - Gateway (50-100 contracts): <500 MB
 //! - Memory is reclaimed when contracts are removed
 //!
 //! ### Memory Tests
@@ -248,7 +237,7 @@ impl WasmEngine for WasmtimeEngine {
         if host_mem {
             return Err(anyhow::anyhow!(
                 "host_mem=true is not supported in wasmtime backend. \
-                 Set host_mem=false or use wasmer-backend feature."
+                 Set host_mem=false."
             )
             .into());
         }
@@ -410,7 +399,6 @@ impl WasmEngine for WasmtimeEngine {
         c: i64,
     ) -> Result<i64, WasmError> {
         // Wasmtime's async host functions work seamlessly with call_async on the same Store.
-        // Unlike wasmer, we don't need to convert Store to StoreAsync — it's the same type.
         //
         // The async host functions (delegate_contracts) are registered via func_wrap_async,
         // so we use call_async here. The closures complete synchronously (ReDb reads) but
@@ -641,9 +629,9 @@ impl WasmtimeEngine {
         // gets its own mmap'd memory region, allocated at instantiation time
         // and freed when the instance is dropped.
         //
-        // Wasmtime advantages over wasmer:
-        // 1. Actually frees compiled code when modules are dropped
-        // 2. Cranelift generates more compact machine code
+        // Wasmtime memory management:
+        // 1. Frees compiled code when modules are dropped
+        // 2. Cranelift generates compact machine code
         // 3. On-demand allocation uses only as much memory as needed
         //
         // Note: Pooling allocation (InstanceAllocationStrategy::Pooling) was
@@ -1093,7 +1081,6 @@ mod tests {
         }
 
         // If we got here without OOM, wasmtime is properly freeing memory.
-        // With wasmer's append-only Vec, this would accumulate ~150-200 MB.
     }
 
     #[test]
@@ -1260,13 +1247,10 @@ mod tests {
         );
     }
 
-    /// Test that demonstrates the memory difference between wasmer and wasmtime.
+    /// Test that demonstrates wasmtime's memory cleanup behavior.
     ///
     /// This is a documentation test - run manually to observe memory behavior.
-    ///
-    /// Expected results:
-    /// - Wasmer: Memory grows with each compilation, never shrinks
-    /// - Wasmtime: Memory is freed when modules are dropped
+    /// Memory should be freed when modules are dropped.
     #[test]
     #[ignore] // Run manually with --ignored to observe memory behavior
     fn test_memory_leak_comparison() {
@@ -1287,7 +1271,6 @@ mod tests {
         }
 
         println!("All modules dropped. Check memory usage - it should have returned to baseline.");
-        println!("With wasmer, memory would still be high (~1.5 GB for 100 contracts).");
         println!("With wasmtime, memory should be near baseline.");
 
         // Sleep to allow manual memory inspection
@@ -1296,11 +1279,7 @@ mod tests {
 
     /// Rigorous memory test for Linux CI that verifies memory cleanup.
     ///
-    /// This test addresses issues #2941, #2942, #2928 where wasmer's append-only
-    /// Vec<CodeMemory> caused 2.3 GB RSS for 92 contracts (~15.7 MB per contract).
-    ///
-    /// The test verifies that wasmtime properly frees memory when modules are dropped,
-    /// unlike wasmer which accumulates memory indefinitely.
+    /// Verifies that wasmtime properly frees memory when modules are dropped.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_memory_freed_after_module_drop() {
@@ -1322,7 +1301,7 @@ mod tests {
         // Measure baseline RSS
         let baseline_rss = get_rss_bytes();
 
-        // Compile 50 modules (wasmer would accumulate ~785 MB for 50 × 15.7 MB)
+        // Compile 50 modules
         let mut modules = Vec::new();
         for _ in 0..50 {
             modules.push(Module::new(&engine, SIMPLE_WASM).unwrap());
@@ -1332,8 +1311,7 @@ mod tests {
         let peak_growth = peak_rss.saturating_sub(baseline_rss);
 
         // The reliable metric: how much RSS grew from compiling 50 modules.
-        // With wasmer this would be ~785 MB (50 × 15.7 MB per module).
-        // With wasmtime pooling it should be far less.
+        // Wasmtime should keep this well under 500 MB for 50 modules.
         //
         // NOTE: We intentionally check peak_growth (compilation overhead) rather
         // than post-drop RSS delta. RSS is process-wide, and concurrent test
@@ -1343,7 +1321,7 @@ mod tests {
         assert!(
             peak_growth < 500 * 1024 * 1024,
             "Excessive memory from compiling 50 modules: {} MB peak growth. \
-             Expected < 500 MB with wasmtime pooling (wasmer would use ~785 MB).",
+             Expected < 500 MB with wasmtime.",
             peak_growth / (1024 * 1024),
         );
 
