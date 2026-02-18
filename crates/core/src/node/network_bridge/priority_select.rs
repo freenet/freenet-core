@@ -158,8 +158,7 @@ where
 
         // Phase 1: Anti-starvation — force-poll Tier-2 (P7/P8) when the
         // high-priority streak has reached the burst limit.
-        let force_low_priority =
-            this.high_priority_streak >= PrioritySelectStream::<H, C, E>::MAX_HIGH_PRIORITY_BURST;
+        let force_low_priority = this.high_priority_streak >= Self::MAX_HIGH_PRIORITY_BURST;
 
         if force_low_priority {
             tracing::debug!(
@@ -213,8 +212,9 @@ where
                 this.high_priority_streak = 0;
             }
             // Otherwise, at least one channel is open but Pending. Keep
-            // streak >= MAX so the next Tier-1 item triggers another
-            // force-poll attempt (bounding the gap to MAX + 1).
+            // streak >= MAX so force-poll fires again on the very next
+            // poll_next call — whether that returns a Tier-1 item
+            // (incrementing streak past MAX) or re-enters Phase 1 directly.
         }
 
         // Phase 2: Normal priority polling (P1-P6, then P7-P8)
