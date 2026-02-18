@@ -288,9 +288,8 @@ impl HostingManager {
 
         if !expired.is_empty() {
             info!(
-                count = expired.len(),
-                "expire_stale_subscriptions: expired {} subscriptions",
-                expired.len()
+                expired_count = expired.len(),
+                "expire_stale_subscriptions: expired stale subscriptions"
             );
         }
 
@@ -421,7 +420,7 @@ impl HostingManager {
 
     /// Renew a downstream peer's subscription lease.
     /// Returns false if the peer is not currently tracked.
-    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    #[allow(dead_code)] // Only used in tests
     pub fn renew_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
             if peers.contains_key(peer) {
@@ -448,7 +447,6 @@ impl HostingManager {
     }
 
     /// Check whether any downstream peers are subscribed to this contract.
-    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.downstream_subscribers
             .get(contract)
@@ -486,11 +484,7 @@ impl HostingManager {
     /// Check if a contract has no local clients and no downstream subscribers,
     /// meaning we can safely unsubscribe upstream.
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
-        let has_clients = self
-            .client_subscriptions
-            .iter()
-            .any(|entry| *entry.key() == *contract.id());
-        if has_clients {
+        if self.has_client_subscriptions(contract.id()) {
             return false;
         }
         !self.has_downstream_subscribers(contract)

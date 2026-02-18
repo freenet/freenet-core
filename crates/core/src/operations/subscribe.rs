@@ -631,6 +631,54 @@ impl SubscribeOp {
     }
 }
 
+/// Register a downstream subscriber for a contract.
+///
+/// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
+/// avoids NAT timing window failures) or falls back to an address lookup. If a key
+/// is found, records the peer in both the downstream subscriber list and the interest
+/// manager so UPDATE broadcasts reach them immediately.
+fn register_downstream_subscriber(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    requester_addr: std::net::SocketAddr,
+    requester_pub_key: Option<&crate::transport::TransportPublicKey>,
+    source_addr: Option<std::net::SocketAddr>,
+    tx: &Transaction,
+    warn_suffix: &str,
+) {
+    let peer_key = requester_pub_key
+        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+        .or_else(|| {
+            op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(requester_addr)
+                .or_else(|| {
+                    source_addr
+                        .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
+                })
+                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
+        });
+
+    if let Some(peer_key) = peer_key {
+        op_manager
+            .ring
+            .add_downstream_subscriber(key, peer_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, false);
+    } else {
+        tracing::warn!(
+            tx = %tx,
+            contract = %key,
+            requester_addr = %requester_addr,
+            source_addr = ?source_addr,
+            "Subscribe: could not find peer to register interest{}",
+            warn_suffix
+        );
+    }
+}
+
 impl Operation for SubscribeOp {
     type Message = SubscribeMsg;
     type Result = SubscribeResult;
@@ -762,50 +810,18 @@ impl Operation for SubscribeOp {
                         // In the lease-based model (2026-01), we just confirm we have the contract.
                         // Updates propagate via proximity cache, not explicit tree.
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the subscribing peer in the interest manager so that
-                            // update broadcasts include them as a target immediately.
-                            // Use requester_pub_key (resolved at init time) when available,
-                            // falling back to addr lookup. The pub_key path avoids failures
-                            // during NAT traversal timing windows. (#2886)
-                            let peer_key = self
-                                .requester_pub_key
-                                .as_ref()
-                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-                                .or_else(|| {
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .get_peer_by_addr(requester_addr)
-                                        .or_else(|| {
-                                            source_addr.and_then(|sa| {
-                                                op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .get_peer_by_addr(sa)
-                                            })
-                                        })
-                                        .map(|pkl| {
-                                            crate::ring::interest::PeerKey::from(
-                                                pkl.pub_key.clone(),
-                                            )
-                                        })
-                                });
-                            if let Some(peer_key) = peer_key {
-                                op_manager
-                                    .ring
-                                    .add_downstream_subscriber(&key, peer_key.clone());
-                                op_manager
-                                    .interest_manager
-                                    .register_peer_interest(&key, peer_key, None, false);
-                            } else {
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester_addr = %requester_addr,
-                                    source_addr = ?source_addr,
-                                    "Subscribe: could not find peer to register interest"
-                                );
-                            }
+                            // Register the subscribing peer as a downstream subscriber.
+                            // Uses requester_pub_key (resolved at init time) to avoid
+                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            register_downstream_subscriber(
+                                op_manager,
+                                &key,
+                                requester_addr,
+                                self.requester_pub_key.as_ref(),
+                                source_addr,
+                                id,
+                                "",
+                            );
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
@@ -843,48 +859,18 @@ impl Operation for SubscribeOp {
                         // Contract arrived - respond to confirm subscription
                         // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the subscribing peer in the interest manager.
-                            // Use requester_pub_key (resolved at init time) when available,
-                            // falling back to addr lookup. (#2886)
-                            let peer_key = self
-                                .requester_pub_key
-                                .as_ref()
-                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-                                .or_else(|| {
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .get_peer_by_addr(requester_addr)
-                                        .or_else(|| {
-                                            source_addr.and_then(|sa| {
-                                                op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .get_peer_by_addr(sa)
-                                            })
-                                        })
-                                        .map(|pkl| {
-                                            crate::ring::interest::PeerKey::from(
-                                                pkl.pub_key.clone(),
-                                            )
-                                        })
-                                });
-                            if let Some(peer_key) = peer_key {
-                                op_manager
-                                    .ring
-                                    .add_downstream_subscriber(&key, peer_key.clone());
-                                op_manager
-                                    .interest_manager
-                                    .register_peer_interest(&key, peer_key, None, false);
-                            } else {
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester_addr = %requester_addr,
-                                    source_addr = ?source_addr,
-                                    "Subscribe: could not find peer to register interest (after contract wait)"
-                                );
-                            }
+                            // Register the subscribing peer as a downstream subscriber.
+                            // Uses requester_pub_key (resolved at init time) to avoid
+                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            register_downstream_subscriber(
+                                op_manager,
+                                &key,
+                                requester_addr,
+                                self.requester_pub_key.as_ref(),
+                                source_addr,
+                                id,
+                                " (after contract wait)",
+                            );
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -1028,7 +1014,6 @@ impl Operation for SubscribeOp {
                             // This ensures UPDATE broadcasts will reach us. Without this,
                             // if the contract was already cached (fetch_contract_if_missing returned early),
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
-                            // See: https://github.com/freenet/freenet-core/issues/XXX
                             super::announce_contract_cached(op_manager, key).await;
 
                             // Register the responding peer in our interest manager.

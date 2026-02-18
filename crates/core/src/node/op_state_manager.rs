@@ -672,7 +672,6 @@ impl OpManager {
             instance_id,
         });
 
-        // Push a temporary SubscribeOp so peek_next_hop_addr finds the target
         let op = OpEnum::Subscribe(crate::operations::subscribe::create_unsubscribe_op(
             instance_id,
             tx,
@@ -698,7 +697,8 @@ impl OpManager {
             }
         }
 
-        // Clean up local state
+        // Clean up local state regardless of send result. If delivery fails,
+        // the upstream peer will detect our absence when its downstream lease expires.
         self.ring.unsubscribe(contract);
         self.interest_manager
             .remove_peer_interest(contract, &peer_key);

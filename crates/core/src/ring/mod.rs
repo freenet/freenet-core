@@ -828,8 +828,7 @@ impl Ring {
             if !ds_expired.is_empty() {
                 tracing::debug!(
                     expired_count = ds_expired.len(),
-                    "Expired downstream subscribers for {} contracts",
-                    ds_expired.len()
+                    "Expired stale downstream subscribers"
                 );
             }
 
@@ -1007,8 +1006,7 @@ impl Ring {
                 tracing::info!(
                     attempted,
                     skipped_rate_limited = skipped,
-                    "Subscription renewal: attempted {} renewals",
-                    attempted
+                    "Subscription renewal cycle complete"
                 );
             }
         }
@@ -1438,7 +1436,7 @@ impl Ring {
             .add_downstream_subscriber(contract, peer)
     }
 
-    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    #[allow(dead_code)] // Only used in tests
     pub fn renew_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         self.hosting_manager
             .renew_downstream_subscriber(contract, peer)
@@ -1449,7 +1447,7 @@ impl Ring {
             .remove_downstream_subscriber(contract, peer)
     }
 
-    #[allow(dead_code)] // Used by upstream unsubscribe trigger (Task #3)
+    #[allow(dead_code)] // Only used in tests
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
     }
