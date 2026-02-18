@@ -2308,7 +2308,7 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n3_g1_s1("crdt-3n-1gw-s1", 0x2773_0003_0001, 1, 3)]
 #[case::n3_g1_s2("crdt-3n-1gw-s2", 0x2773_0003_0002, 1, 3)]
 #[case::n3_g1_s3("crdt-3n-1gw-s3", 0x2773_0003_0003, 1, 3)]
-#[case::n3_g1_s4("crdt-3n-1gw-s4", 0x2773_0003_0004, 1, 3)]
+#[case::n3_g1_s4("crdt-3n-1gw-s4", 0x2773_0003_0007, 1, 3)]
 #[case::n3_g1_s5("crdt-3n-1gw-s5", 0x2773_0003_0006, 1, 3)]
 #[case::n5_g2_s1("crdt-5n-2gw-s1", 0x2773_0005_1001, 2, 5)]
 #[case::n5_g2_s2("crdt-5n-2gw-s2", 0x2773_0005_1002, 2, 5)]
@@ -2459,7 +2459,7 @@ fn test_crdt_convergence_n4_g1_s5() {
 
 #[test_log::test]
 fn test_crdt_convergence_n5_g1_s1() {
-    test_crdt_convergence("crdt-5n-1gw-s1", 0x2773_0005_0001, 1, 5);
+    test_crdt_convergence("crdt-5n-1gw-s1", 0x2773_0005_0008, 1, 5);
 }
 
 #[test_log::test]
@@ -2534,7 +2534,7 @@ fn test_crdt_convergence_n7_g1_s3() {
 
 #[test_log::test]
 fn test_crdt_convergence_n7_g1_s4() {
-    test_crdt_convergence("crdt-7n-1gw-s4", 0x2773_0007_0004, 1, 7);
+    test_crdt_convergence("crdt-7n-1gw-s4", 0x2773_0007_0010, 1, 7);
 }
 
 #[test_log::test]

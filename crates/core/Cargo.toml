@@ -69,9 +69,6 @@ tokio-tungstenite = { workspace = true }
 tower-http = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
-wasmer = { features = ["sys", "experimental-async"], workspace = true, optional = true }
-wasmer-middlewares = { workspace = true, optional = true }
-wasmer-compiler-singlepass = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
 xz2 = { workspace = true }
 reqwest = { workspace = true }
@@ -186,8 +183,7 @@ nightly_tests = []
 # jemalloc heap profiling (unix only). Adds profiling support on top of the always-enabled jemalloc allocator.
 # Enable with MALLOC_CONF="prof:true,lg_prof_sample:19" and send SIGUSR1 to dump heap profiles.
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
-# WASM runtime backends (exactly one must be selected)
-wasmer-backend = ["dep:wasmer", "dep:wasmer-middlewares", "dep:wasmer-compiler-singlepass"]
+# WASM runtime backend
 wasmtime-backend = ["dep:wasmtime"]
 
 # ==============================================================================

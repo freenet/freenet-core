@@ -309,23 +309,11 @@ async fn serve_client_api_in_impl(
         config.token_cleanup_interval_seconds,
     );
 
-    // Whether to restrict WebSocket connections to localhost-only origins.
-    // Uses is_loopback() without is_unspecified() intentionally: when binding
-    // to 0.0.0.0 (network mode), remote browsers need to connect, so we use
-    // a same-origin check instead of a localhost-only allowlist.
-    // Note: client_api.rs has a separate `localhost` flag that also includes
-    // is_unspecified() — that controls the cookie Secure flag, which is a
-    // different concern (allowing HTTP cookies for home users without TLS).
-    let localhost_only = config.address.is_loopback();
-
     // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) =
         HttpClientApi::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
-    let (ws_proxy, ws_router) = WebSocketProxy::create_router_with_attested_contracts(
-        gw_router,
-        attested_contracts,
-        localhost_only,
-    );
+    let (ws_proxy, ws_router) =
+        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
     serve_with_listener(
         ws_socket,

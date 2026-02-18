@@ -488,7 +488,7 @@ mod test {
     /// The bug:
     /// - Contracts are stored with to_bytes_versioned() which adds a version prefix
     /// - fetch_contract() was using ContractContainer::try_from which read raw bytes
-    /// - The prefix caused wasmer/wasmtime to fail auto-detection (no WASM magic number)
+    /// - The prefix caused wasmtime to fail auto-detection (no WASM magic number)
     /// - Module::new tried to parse as WAT, failed with "input bytes aren't valid utf-8"
     ///
     /// The fix:
