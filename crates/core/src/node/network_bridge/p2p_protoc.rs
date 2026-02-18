@@ -2162,9 +2162,19 @@ impl P2pConnManager {
                 "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            if let Some(entry) = connection_manager.drop_transient(peer_addr) {
-                let loc = entry
-                    .location
+            let was_transient = connection_manager.drop_transient(peer_addr);
+
+            // Promote if: (a) was tracked as transient, OR (b) not already in ring.
+            // Case (b) handles expired transient TTL — transport preserved per 76058cf4
+            // but tracking entry gone. Without this, CONNECT succeeds but peer is never
+            // added to ring topology (#3113).
+            let needs_promotion =
+                was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
+            let transient_expired = was_transient.is_none() && needs_promotion;
+
+            if needs_promotion {
+                let loc = was_transient
+                    .and_then(|e| e.location)
                     .unwrap_or_else(|| Location::from_address(&peer_addr));
                 // Re-run admission + cap guard when promoting a transient connection.
                 let should_accept = connection_manager.should_accept(loc, peer_addr);
@@ -2173,6 +2183,7 @@ impl P2pConnManager {
                         tx = %tx,
                         %peer,
                         %loc,
+                        transient_expired,
                         "connect_peer: promotion rejected by admission logic"
                     );
                     callback
@@ -2197,6 +2208,7 @@ impl P2pConnManager {
                         current_connections = current,
                         max_connections = connection_manager.max_connections,
                         %loc,
+                        transient_expired,
                         "connect_peer: rejecting transient promotion to enforce cap"
                     );
                     callback
@@ -2218,7 +2230,12 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
-                tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
+                tracing::info!(
+                    tx = %tx,
+                    remote = %peer,
+                    transient_expired,
+                    "connect_peer: promoted to ring"
+                );
 
                 // tell the promoted peer about our subscriptions and cache
                 for (target, msg) in self
@@ -2946,14 +2963,15 @@ impl P2pConnManager {
                             // dispatch DropConnection — that tears down the
                             // underlying transport, killing any in-progress
                             // CONNECT handshake. If the CONNECT succeeds later,
-                            // add_connection() will promote it to a ring
-                            // connection normally (the transient entry is already
-                            // gone so the remove there is a no-op). If it never
-                            // succeeds, the transport idle timeout handles cleanup.
+                            // handle_connect_peer() will detect the missing
+                            // transient entry via is_in_ring() and still promote
+                            // the peer to ring topology (see #3113 fix). If it
+                            // never succeeds, the transport idle timeout handles
+                            // cleanup.
                             tracing::info!(
                                 %peer_addr,
                                 "Transient connection expired; removed tracking entry \
-                                 (transport connection preserved for in-progress CONNECT)"
+                                 (transport preserved, handle_connect_peer will promote via fallback)"
                             );
                         }
                     });
