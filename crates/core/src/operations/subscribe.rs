@@ -130,6 +130,7 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
+        stats: None,
     }
 }
 
@@ -150,6 +151,7 @@ pub(crate) fn start_op_with_id(
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
+        stats: None,
     }
 }
 
@@ -316,6 +318,10 @@ pub(crate) async fn request_subscribe(
         requester_addr: None, // We're the originator
         requester_pub_key: None,
         is_renewal,
+        stats: Some(SubscribeStats {
+            target_peer: target.clone(),
+            contract_location: Location::from(instance_id),
+        }),
     };
 
     // Renewals use non-blocking send to fail fast under congestion rather
@@ -375,6 +381,12 @@ async fn complete_local_subscription(
     Ok(())
 }
 
+/// Routing stats for subscribe operations, used to report failures to the router.
+struct SubscribeStats {
+    target_peer: crate::ring::PeerKeyLocation,
+    contract_location: Location,
+}
+
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
     state: Option<SubscribeState>,
@@ -389,6 +401,8 @@ pub(crate) struct SubscribeOp {
     /// Whether this is a renewal (requester already has the contract).
     /// Preserved across request/response to avoid sending state to renewals.
     is_renewal: bool,
+    /// Routing stats for failure reporting.
+    stats: Option<SubscribeStats>,
 }
 
 impl SubscribeOp {
@@ -407,7 +421,27 @@ impl SubscribeOp {
     }
 
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
-        OpOutcome::Irrelevant
+        // If finalized successfully, routing succeeded (but we don't have timing
+        // stats for subscribe, so report as Irrelevant for the success path).
+        if self.finalized() {
+            return OpOutcome::Irrelevant;
+        }
+        // Not completed — if we have stats, report as failure
+        if let Some(ref stats) = self.stats {
+            OpOutcome::ContractOpFailure {
+                target_peer: &stats.target_peer,
+                contract_location: stats.contract_location,
+            }
+        } else {
+            OpOutcome::Incomplete
+        }
+    }
+
+    /// Extract routing failure info for timeout reporting.
+    pub(crate) fn failure_routing_info(&self) -> Option<(crate::ring::PeerKeyLocation, Location)> {
+        self.stats
+            .as_ref()
+            .map(|s| (s.target_peer.clone(), s.contract_location))
     }
 
     pub(super) fn finalized(&self) -> bool {
@@ -588,6 +622,7 @@ impl Operation for SubscribeOp {
                         requester_addr: source_addr, // Store who sent us this request
                         requester_pub_key,
                         is_renewal,
+                        stats: None,
                     },
                     source_addr,
                 })
@@ -698,6 +733,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
+                                    stats: None,
                                 })),
                                 stream_data: None,
                             });
@@ -775,6 +811,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
+                                    stats: None,
                                 })),
                                 stream_data: None,
                             });
@@ -840,6 +877,7 @@ impl Operation for SubscribeOp {
                             requester_addr: self.requester_addr,
                             requester_pub_key: self.requester_pub_key,
                             is_renewal: self.is_renewal,
+                            stats: None,
                         })),
                         stream_data: None,
                     })
@@ -959,6 +997,7 @@ impl Operation for SubscribeOp {
                                         requester_addr: None,
                                         requester_pub_key: None,
                                         is_renewal: self.is_renewal,
+                                        stats: None,
                                     })),
                                     stream_data: None,
                                 })
@@ -1065,6 +1104,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
+                                            stats: None,
                                         })),
                                         stream_data: None,
                                     })
@@ -1113,6 +1153,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
+                                            stats: None,
                                         })),
                                         stream_data: None,
                                     })

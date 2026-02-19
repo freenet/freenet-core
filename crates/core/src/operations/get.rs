@@ -435,9 +435,35 @@ impl GetOp {
                 first_response_time: *response_end - *response_start,
                 payload_transfer_time: *transfer_end - *transfer_start,
             }
+        } else if self.result.is_none() {
+            // No result — if we have stats with a target peer, report as failure
+            if let Some(GetStats {
+                next_peer: Some(target_peer),
+                contract_location,
+                ..
+            }) = self.stats.as_deref()
+            {
+                OpOutcome::ContractOpFailure {
+                    target_peer,
+                    contract_location: *contract_location,
+                }
+            } else {
+                OpOutcome::Incomplete
+            }
         } else {
             OpOutcome::Incomplete
         }
+    }
+
+    /// Extract routing failure info for timeout reporting.
+    /// Returns `(target_peer, contract_location)` if stats are available.
+    pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
+        self.stats.as_deref().and_then(|stats| {
+            stats
+                .next_peer
+                .as_ref()
+                .map(|peer| (peer.clone(), stats.contract_location))
+        })
     }
 
     /// Handle aborted outbound connections by directly retrying with alternative peers.
@@ -3039,5 +3065,79 @@ mod tests {
             }
             other => panic!("Expected PrepareRequest state, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_failure_outcome_for_get() {
+        use crate::ring::{Location, PeerKeyLocation};
+        use std::time::Duration;
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // GetOp with stats but no result → should return ContractOpFailure
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: None,
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target_peer.clone()),
+                contract_location,
+                first_response_time: None,
+                transfer_time: None,
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            _ => panic!("Expected ContractOpFailure"),
+        }
+
+        // GetOp with no stats and no result → should return Incomplete
+        let op_no_stats = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: None,
+            stats: None,
+            upstream_addr: None,
+            local_fallback: None,
+        };
+        assert!(
+            matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
+            "GetOp with no stats should return Incomplete"
+        );
+
+        // GetOp with result + complete stats → should return ContractOpSuccess
+        let now = Instant::now();
+        let later = now + Duration::from_millis(50);
+        let op_success = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: Some(GetResult {
+                key: make_contract_key(1),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target_peer.clone()),
+                contract_location,
+                first_response_time: Some((now, Some(later))),
+                transfer_time: Some((now, Some(later))),
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+        assert!(
+            matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
+            "GetOp with result and complete stats should return ContractOpSuccess"
+        );
     }
 }

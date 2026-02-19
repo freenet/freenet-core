@@ -467,8 +467,10 @@ impl Router {
     }
 
     fn has_sufficient_historical_data(&self) -> bool {
-        let minimum_historical_data_for_global_prediction = 200;
-        self.response_start_time_estimator.len() >= minimum_historical_data_for_global_prediction
+        // Use failure_estimator which records both successes and failures,
+        // giving a complete picture of total routing events.
+        let minimum_historical_data_for_global_prediction = 50;
+        self.failure_estimator.len() >= minimum_historical_data_for_global_prediction
     }
 }
 
@@ -823,6 +825,136 @@ mod tests {
             *result.unwrap(),
             single_peer,
             "Should return the single candidate"
+        );
+    }
+
+    /// Feed router a mix of successes for peer A and failures for peer B at similar
+    /// distances. Verify select_peer prefers peer A.
+    #[test]
+    fn test_failure_avoidance() {
+        let peer_a = PeerKeyLocation::random();
+        let peer_b = PeerKeyLocation::random();
+
+        // Use a contract location equidistant from both peers
+        let contract_location = Location::random();
+
+        let mut events = Vec::new();
+
+        // 40 successes for peer A
+        for _ in 0..40 {
+            events.push(RouteEvent {
+                peer: peer_a.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            });
+        }
+
+        // 40 failures for peer B
+        for _ in 0..40 {
+            events.push(RouteEvent {
+                peer: peer_b.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        let router = Router::new(&events);
+
+        // With 80 total events in failure_estimator (>= 50 threshold),
+        // the router should use predictions and prefer peer A
+        let peers = vec![peer_a.clone(), peer_b.clone()];
+        let selected = router.select_peer(&peers, contract_location);
+        assert!(selected.is_some());
+        assert_eq!(
+            *selected.unwrap(),
+            peer_a,
+            "Router should prefer peer A (all successes) over peer B (all failures)"
+        );
+    }
+
+    /// Verify 49 events = distance-based, 50 events = prediction-based.
+    #[test]
+    fn test_threshold_at_50_events() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // 49 events: below threshold
+        let events_49: Vec<RouteEvent> = (0..49)
+            .map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            })
+            .collect();
+
+        let router_49 = Router::new(&events_49);
+        assert!(
+            !router_49.has_sufficient_historical_data(),
+            "49 events should be below threshold"
+        );
+
+        // 50 events: at threshold
+        let events_50: Vec<RouteEvent> = (0..50)
+            .map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            })
+            .collect();
+
+        let router_50 = Router::new(&events_50);
+        assert!(
+            router_50.has_sufficient_historical_data(),
+            "50 events should meet threshold"
+        );
+    }
+
+    /// 25 successes + 25 failures = 50 total. Router should activate predictions.
+    #[test]
+    fn test_failures_count_toward_threshold() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut events = Vec::new();
+
+        // 25 successes
+        for _ in 0..25 {
+            events.push(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            });
+        }
+
+        // 25 failures
+        for _ in 0..25 {
+            events.push(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        let router = Router::new(&events);
+        assert!(
+            router.has_sufficient_historical_data(),
+            "25 successes + 25 failures = 50 total should meet threshold"
         );
     }
 }

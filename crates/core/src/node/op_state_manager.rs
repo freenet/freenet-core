@@ -1109,14 +1109,33 @@ fn notify_subscription_timeout(
     });
 }
 
+/// Reports a routing failure for a timed-out operation to the router's isotonic model.
+fn report_timeout_failure(
+    ring: &crate::ring::Ring,
+    tx: &Transaction,
+    peer: crate::ring::PeerKeyLocation,
+    contract_location: crate::ring::Location,
+) {
+    ring.routing_finished(crate::router::RouteEvent {
+        peer,
+        contract_location,
+        outcome: crate::router::RouteOutcome::Failure,
+    });
+    tracing::info!(tx = %tx, "Reported operation timeout as routing failure");
+}
+
 /// Removes a subscribe operation from the ops map and notifies timeout if found.
 /// Returns `Some(())` if the operation was found and removed, `None` otherwise.
 fn remove_subscribe_and_notify_timeout(
     ops: &Ops,
     tx: &Transaction,
     ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
+    ring: &crate::ring::Ring,
 ) -> Option<()> {
     let (_, sub_op) = ops.subscribe.remove(tx)?;
+    if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
+        report_timeout_failure(ring, tx, peer, contract_location);
+    }
     if let Some(instance_id) = sub_op.instance_id() {
         notify_subscription_timeout(ch_outbound, instance_id);
     }
@@ -1227,9 +1246,18 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             }
                         }
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
-                        TransactionType::Get => ops.get.remove(&tx).is_none(),
+                        TransactionType::Get => {
+                            if let Some((_, get_op)) = ops.get.remove(&tx) {
+                                if let Some((peer, contract_location)) = get_op.failure_routing_info() {
+                                    report_timeout_failure(&ring, &tx, peer, contract_location);
+                                }
+                                false
+                            } else {
+                                true
+                            }
+                        }
                         TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_none()
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
@@ -1309,9 +1337,18 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             }
                         }
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
-                        TransactionType::Get => ops.get.remove(&tx).is_some(),
+                        TransactionType::Get => {
+                            if let Some((_, get_op)) = ops.get.remove(&tx) {
+                                if let Some((peer, contract_location)) = get_op.failure_routing_info() {
+                                    report_timeout_failure(&ring, &tx, peer, contract_location);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
                         TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_some()
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };

@@ -474,6 +474,7 @@ async fn test_subscription_validates_k_closest_usage() {
             requester_addr: None,
             requester_pub_key: None,
             is_renewal: false,
+            stats: None,
         };
 
         // State is simplified - skip list is now in the Request message, not state
@@ -573,6 +574,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -594,6 +596,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -617,6 +620,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -650,6 +654,7 @@ fn test_subscribe_op_failed_state_returns_error() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     // Verify to_host_result returns error
@@ -684,6 +689,7 @@ fn test_local_subscription_completion_state() {
         requester_addr: None, // Local subscription, no network requester
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     // Verify operation is in completed state
@@ -720,6 +726,7 @@ fn test_is_renewal_flag() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
+        stats: None,
     };
     assert!(renewal_op.is_renewal());
 
@@ -729,6 +736,7 @@ fn test_is_renewal_flag() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
     assert!(!client_op.is_renewal());
 }
@@ -747,6 +755,7 @@ fn test_op_enum_is_subscription_renewal() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
+        stats: None,
     });
     assert!(renewal.is_subscription_renewal());
 
@@ -756,6 +765,7 @@ fn test_op_enum_is_subscription_renewal() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     });
     assert!(!non_renewal.is_subscription_renewal());
 }

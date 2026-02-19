@@ -571,7 +571,7 @@ impl Ring {
                                 // protocol failure. Don't penalize with backoff — just
                                 // clear the pending mark so the contract is eligible on
                                 // the next cycle.
-                                tracing::debug!(
+                                tracing::warn!(
                                     %contract_key,
                                     "Subscription renewal skipped (channel full), will retry next cycle"
                                 );
