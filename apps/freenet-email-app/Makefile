@@ -35,9 +35,11 @@ build: \
 	publish-webapp
 
 generate-id-manager-key:
-	@if [ ! -f "$(FILE)" ]; then \
-		cd "$(IDENTITY_DELEGATE)" && cargo run -- --path "$(IDENTITY_DELEGATE)$(PATH_SEP)build"; \
-	fi
+ifeq ($(wildcard $(FILE)),)
+	cd "$(IDENTITY_DELEGATE)" && cargo run -- --path "$(IDENTITY_DELEGATE)$(PATH_SEP)build"
+else
+	@echo "file $(FILE) already exists. Skipping."
+endif
 
 build-inbox:
 	cd $(INBOX_DIR) && fdev build --features contract && \
