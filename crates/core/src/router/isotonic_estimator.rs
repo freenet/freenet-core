@@ -156,6 +156,15 @@ impl IsotonicEstimator {
     pub(crate) fn len(&self) -> usize {
         self.global_regression.len()
     }
+
+    /// Extract the global regression curve as `(x, y)` pairs, sorted by x.
+    pub(crate) fn curve_points(&self) -> Vec<(f64, f64)> {
+        self.global_regression
+            .get_points_sorted()
+            .into_iter()
+            .map(|p| (*p.x(), *p.y()))
+            .collect()
+    }
 }
 
 pub(crate) enum EstimatorType {

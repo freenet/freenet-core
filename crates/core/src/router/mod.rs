@@ -8,6 +8,84 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
+// ==================== Telemetry types ====================
+
+/// A snapshot of a single routing decision for telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct RoutingDecisionInfo {
+    pub target_location: f64,
+    pub strategy: RoutingStrategy,
+    pub candidates: Vec<RoutingCandidate>,
+    pub total_routing_events: usize,
+}
+
+/// Which strategy the router used for this decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum RoutingStrategy {
+    /// Not enough history; selected by distance only.
+    DistanceBased,
+    /// Used prediction model to rank candidates.
+    PredictionBased,
+    /// Had history but predictions failed for some candidates; fell back to distance for those.
+    PredictionFallback,
+}
+
+/// A single candidate considered during routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct RoutingCandidate {
+    pub distance: f64,
+    pub prediction: Option<RoutingPredictionInfo>,
+    pub selected: bool,
+}
+
+/// Prediction details for a routing candidate (subset of RoutingPrediction for telemetry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct RoutingPredictionInfo {
+    pub failure_probability: f64,
+    pub time_to_response_start: f64,
+    pub expected_total_time: f64,
+    pub transfer_speed_bps: f64,
+}
+
+impl From<RoutingPrediction> for RoutingPredictionInfo {
+    fn from(p: RoutingPrediction) -> Self {
+        Self {
+            failure_probability: p.failure_probability,
+            time_to_response_start: p.time_to_response_start,
+            expected_total_time: p.expected_total_time,
+            transfer_speed_bps: p.xfer_speed.bytes_per_second,
+        }
+    }
+}
+
+/// Periodic snapshot of the router model state for telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct RouterSnapshotInfo {
+    pub failure_events: usize,
+    pub success_events: usize,
+    pub transfer_rate_events: usize,
+    pub prediction_active: bool,
+    pub mean_transfer_size_bytes: f64,
+    pub consider_n_closest_peers: usize,
+    pub peers_with_failure_adjustments: usize,
+    pub peers_with_response_adjustments: usize,
+    /// PAV regression curve: Vec of (distance, failure_probability)
+    pub failure_curve: Vec<(f64, f64)>,
+    /// PAV regression curve: Vec of (distance, response_time_secs)
+    pub response_time_curve: Vec<(f64, f64)>,
+    /// PAV regression curve: Vec of (distance, bytes_per_sec)
+    pub transfer_rate_curve: Vec<(f64, f64)>,
+    /// Connect forward estimator curve, if available
+    pub connect_forward_curve: Option<Vec<(f64, f64)>>,
+    pub connect_forward_events: Option<usize>,
+    pub connect_forward_peer_adjustments: Option<usize>,
+}
+
 /// # Usage
 /// Important when using this type:
 /// Need to periodically rebuild the Router using `history` for better predictions.
@@ -108,7 +186,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            consider_n_closest_peers: 2,
+            consider_n_closest_peers: 5,
         }
     }
 
@@ -194,47 +272,9 @@ impl Router {
         target_location: Location,
         k: usize,
     ) -> Vec<&'a PeerKeyLocation> {
-        if k == 0 {
-            return Vec::new();
-        }
-
-        if !self.has_sufficient_historical_data() {
-            let mut peer_distances: Vec<_> = peers
-                .into_iter()
-                .filter_map(|peer| {
-                    peer.location().map(|loc| {
-                        let distance = target_location.distance(loc);
-                        (peer, distance)
-                    })
-                })
-                .collect();
-
-            GlobalRng::shuffle(&mut peer_distances);
-            peer_distances.sort_by_key(|&(_, distance)| distance);
-            peer_distances.truncate(k);
-            peer_distances.into_iter().map(|(peer, _)| peer).collect()
-        } else {
-            // Get closest peers and rank by predicted routing outcome time
-            let mut candidates: Vec<_> = self
-                .select_closest_peers(peers, &target_location)
-                .into_iter()
-                .filter_map(|peer| {
-                    self.predict_routing_outcome(peer, target_location)
-                        .ok()
-                        .map(|t| (peer, t.time_to_response_start))
-                })
-                .collect();
-
-            // Sort by predicted response time
-            candidates.sort_by(|&(_, time1), &(_, time2)| {
-                time1
-                    .partial_cmp(&time2)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            candidates.truncate(k);
-            candidates.into_iter().map(|(peer, _)| peer).collect()
-        }
+        let (selected, _decision) =
+            self.select_k_best_peers_with_telemetry(peers, target_location, k);
+        selected
     }
 
     fn predict_routing_outcome(
@@ -286,6 +326,146 @@ impl Router {
         })
     }
 
+    /// Like `select_k_best_peers` but also returns a `RoutingDecisionInfo` for telemetry.
+    pub fn select_k_best_peers_with_telemetry<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+    ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
+        let total_routing_events = self.response_start_time_estimator.len();
+
+        if k == 0 {
+            return (
+                Vec::new(),
+                RoutingDecisionInfo {
+                    target_location: target_location.as_f64(),
+                    strategy: RoutingStrategy::DistanceBased,
+                    candidates: Vec::new(),
+                    total_routing_events,
+                },
+            );
+        }
+
+        if !self.has_sufficient_historical_data() {
+            let mut peer_distances: Vec<_> = peers
+                .into_iter()
+                .filter_map(|peer| {
+                    peer.location().map(|loc| {
+                        let distance = target_location.distance(loc);
+                        (peer, distance)
+                    })
+                })
+                .collect();
+
+            GlobalRng::shuffle(&mut peer_distances);
+            peer_distances.sort_by_key(|&(_, distance)| distance);
+            peer_distances.truncate(k);
+
+            let candidates: Vec<RoutingCandidate> = peer_distances
+                .iter()
+                .map(|(_, dist)| RoutingCandidate {
+                    distance: dist.as_f64(),
+                    prediction: None,
+                    selected: true, // All are selected (list already truncated to k)
+                })
+                .collect();
+
+            let selected: Vec<&'a PeerKeyLocation> =
+                peer_distances.into_iter().map(|(peer, _)| peer).collect();
+
+            let decision = RoutingDecisionInfo {
+                target_location: target_location.as_f64(),
+                strategy: RoutingStrategy::DistanceBased,
+                candidates,
+                total_routing_events,
+            };
+            (selected, decision)
+        } else {
+            let closest = self.select_closest_peers(peers, &target_location);
+            let mut fallback_count = 0;
+
+            let mut scored: Vec<(&'a PeerKeyLocation, f64, Option<RoutingPrediction>)> = closest
+                .iter()
+                .map(|peer| {
+                    let distance = peer
+                        .location()
+                        .map(|loc| target_location.distance(loc).as_f64())
+                        .unwrap_or(0.5);
+                    match self.predict_routing_outcome(peer, target_location) {
+                        Ok(pred) => (*peer, distance, Some(pred)),
+                        Err(_) => {
+                            fallback_count += 1;
+                            (*peer, distance, None)
+                        }
+                    }
+                })
+                .collect();
+
+            // Sort: peers with predictions by expected_total_time, others at the end
+            scored.sort_by(|a, b| {
+                let time_a = a.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_b = b.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                time_a
+                    .partial_cmp(&time_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let strategy = if fallback_count == 0 {
+                RoutingStrategy::PredictionBased
+            } else {
+                // Some or all predictions failed; using distance as tiebreaker
+                RoutingStrategy::PredictionFallback
+            };
+
+            let candidates: Vec<RoutingCandidate> = scored
+                .iter()
+                .enumerate()
+                .map(|(i, (_, dist, pred))| RoutingCandidate {
+                    distance: *dist,
+                    prediction: pred.map(RoutingPredictionInfo::from),
+                    selected: i < k,
+                })
+                .collect();
+
+            scored.truncate(k);
+            let selected: Vec<&'a PeerKeyLocation> =
+                scored.into_iter().map(|(peer, _, _)| peer).collect();
+
+            let decision = RoutingDecisionInfo {
+                target_location: target_location.as_f64(),
+                strategy,
+                candidates,
+                total_routing_events,
+            };
+            (selected, decision)
+        }
+    }
+
+    /// Produce a snapshot of the router model state for telemetry.
+    pub fn snapshot(&self) -> RouterSnapshotInfo {
+        RouterSnapshotInfo {
+            failure_events: self.failure_estimator.len(),
+            success_events: self.response_start_time_estimator.len(),
+            transfer_rate_events: self.transfer_rate_estimator.len(),
+            prediction_active: self.has_sufficient_historical_data(),
+            mean_transfer_size_bytes: self.mean_transfer_size.compute(),
+            consider_n_closest_peers: self.consider_n_closest_peers,
+            peers_with_failure_adjustments: self.failure_estimator.peer_adjustments.len(),
+            peers_with_response_adjustments: self
+                .response_start_time_estimator
+                .peer_adjustments
+                .len(),
+            failure_curve: self.failure_estimator.curve_points(),
+            response_time_curve: self.response_start_time_estimator.curve_points(),
+            transfer_rate_curve: self.transfer_rate_estimator.curve_points(),
+            // Populated by Ring which has access to both Router and OpManager
+            connect_forward_curve: None,
+            connect_forward_events: None,
+            connect_forward_peer_adjustments: None,
+        }
+    }
+
     fn has_sufficient_historical_data(&self) -> bool {
         let minimum_historical_data_for_global_prediction = 200;
         self.response_start_time_estimator.len() >= minimum_historical_data_for_global_prediction
@@ -305,11 +485,11 @@ enum RoutingError {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-struct RoutingPrediction {
-    failure_probability: f64,
-    xfer_speed: TransferSpeed,
-    time_to_response_start: f64,
-    expected_total_time: f64,
+pub(crate) struct RoutingPrediction {
+    pub failure_probability: f64,
+    pub xfer_speed: TransferSpeed,
+    pub time_to_response_start: f64,
+    pub expected_total_time: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

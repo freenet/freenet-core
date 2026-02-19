@@ -249,6 +249,12 @@ impl Ring {
             TOPOLOGY_SNAPSHOT_INTERVAL,
         ));
 
+        // Spawn periodic router model snapshot telemetry (every 5 minutes)
+        GlobalExecutor::spawn(Self::emit_router_snapshot_telemetry(
+            ring.clone(),
+            Duration::from_secs(60 * 5),
+        ));
+
         Ok(ring)
     }
 
@@ -327,6 +333,45 @@ impl Ring {
             if !history.is_empty() {
                 let router_ref = &mut *router.write();
                 *router_ref = Router::new(&history);
+            }
+        }
+    }
+
+    /// Periodically emit a router model snapshot as an EventKind::RouterSnapshot event.
+    ///
+    /// This captures the isotonic regression curves and model state, including the
+    /// connect forward estimator if available via OpManager.
+    async fn emit_router_snapshot_telemetry(ring: Arc<Self>, interval_duration: Duration) {
+        let mut interval = tokio::time::interval(interval_duration);
+        // Skip the first immediate tick
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let mut snapshot = ring.router.read().snapshot();
+
+            // Try to include connect forward estimator data
+            if let Some(op_manager) = ring.upgrade_op_manager() {
+                let cfe = op_manager.connect_forward_estimator.read();
+                let (curve, events, adjustments) = cfe.snapshot();
+                snapshot.connect_forward_curve = Some(curve);
+                snapshot.connect_forward_events = Some(events);
+                snapshot.connect_forward_peer_adjustments = Some(adjustments);
+            }
+
+            tracing::info!(
+                failure_events = snapshot.failure_events,
+                success_events = snapshot.success_events,
+                prediction_active = snapshot.prediction_active,
+                consider_n_closest_peers = snapshot.consider_n_closest_peers,
+                "router_snapshot"
+            );
+
+            if let Some(event) = NetEventLog::router_snapshot(&ring, snapshot) {
+                ring.event_register
+                    .register_events(Either::Left(event))
+                    .await;
             }
         }
     }
@@ -829,8 +874,23 @@ impl Ring {
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
         let router = self.router.read();
-        self.connection_manager
-            .routing(Location::from(contract_key), None, skip_list, &router)
+        let target = Location::from(contract_key);
+        let (peer, decision) = self
+            .connection_manager
+            .routing_with_telemetry(target, None, skip_list, &router);
+
+        if let Some(decision) = &decision {
+            tracing::debug!(
+                target_location = %target.as_f64(),
+                strategy = ?decision.strategy,
+                num_candidates = decision.candidates.len(),
+                total_routing_events = decision.total_routing_events,
+                selected = peer.is_some(),
+                "routing_decision"
+            );
+        }
+
+        peer
     }
 
     /// Get k best peers for caching a contract, ranked by routing predictions.
@@ -879,11 +939,19 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        router
-            .select_k_best_peers(candidates.iter(), target_location, k)
-            .into_iter()
-            .cloned()
-            .collect()
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(candidates.iter(), target_location, k);
+
+        tracing::debug!(
+            target_location = %target_location.as_f64(),
+            strategy = ?decision.strategy,
+            num_candidates = decision.candidates.len(),
+            total_routing_events = decision.total_routing_events,
+            selected_count = selected.len(),
+            "routing_decision"
+        );
+
+        selected.into_iter().cloned().collect()
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {

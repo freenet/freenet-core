@@ -359,6 +359,15 @@ impl ConnectForwardEstimator {
             .ok()
             .map(|p| p.clamp(0.0, 1.0))
     }
+
+    /// Return the PAV curve points, event count, and peer adjustment count for telemetry.
+    pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, usize, usize) {
+        (
+            self.estimator.curve_points(),
+            self.estimator.len(),
+            self.estimator.peer_adjustments.len(),
+        )
+    }
 }
 impl RelayState {
     /// Helper to prepare and execute forwarding to a peer.

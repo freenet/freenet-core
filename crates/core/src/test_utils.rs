@@ -1587,6 +1587,8 @@ impl TestContext {
                     crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                     crate::tracing::EventKind::TransportSnapshot(..) => ("📊", "TransportSnapshot"),
                     crate::tracing::EventKind::InterestSync(..) => ("🔃", "InterestSync"),
+                    crate::tracing::EventKind::RoutingDecision(..) => ("🎯", "RoutingDecision"),
+                    crate::tracing::EventKind::RouterSnapshot(..) => ("📸", "RouterSnapshot"),
                 };
 
                 writeln!(
@@ -1632,6 +1634,8 @@ impl TestContext {
                 crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                 crate::tracing::EventKind::TransportSnapshot(..) => ("📊", "TransportSnapshot"),
                 crate::tracing::EventKind::InterestSync(..) => ("🔃", "InterestSync"),
+                crate::tracing::EventKind::RoutingDecision(..) => ("🎯", "RoutingDecision"),
+                crate::tracing::EventKind::RouterSnapshot(..) => ("📸", "RouterSnapshot"),
             };
 
             writeln!(
@@ -1698,6 +1702,8 @@ impl TestContext {
                             crate::tracing::EventKind::TransportSnapshot(..) => "TransportSnapshot",
                             crate::tracing::EventKind::InterestSync(..) => "InterestSync",
                             crate::tracing::EventKind::Ignored => "Ignored",
+                            crate::tracing::EventKind::RoutingDecision(..) => "RoutingDecision",
+                            crate::tracing::EventKind::RouterSnapshot(..) => "RouterSnapshot",
                         };
                         *by_type.entry(type_name.to_string()).or_default() += 1;
                     }
@@ -1756,6 +1762,12 @@ impl TestContext {
                                 ("📈", "TransportSnapshot")
                             }
                             crate::tracing::EventKind::InterestSync(..) => ("🔃", "InterestSync"),
+                            crate::tracing::EventKind::RoutingDecision(..) => {
+                                ("🎯", "RoutingDecision")
+                            }
+                            crate::tracing::EventKind::RouterSnapshot(..) => {
+                                ("📸", "RouterSnapshot")
+                            }
                             crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                         };
 

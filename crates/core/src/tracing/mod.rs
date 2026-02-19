@@ -1007,6 +1007,19 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a router snapshot event for periodic telemetry.
+    pub fn router_snapshot(
+        ring: &'a Ring,
+        snapshot: crate::router::RouterSnapshotInfo,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::RouterSnapshot(snapshot),
+        })
+    }
+
     pub fn from_outbound_msg(
         msg: &'a NetMessage,
         ring: &'a Ring,
@@ -2364,6 +2377,14 @@ pub enum EventKind {
     /// Tracks ResyncRequests and ResyncResponses which indicate delta application
     /// failures. Useful for monitoring the health of the delta sync protocol.
     InterestSync(InterestSyncEvent),
+    /// A routing decision snapshot: which peers were considered and why one was selected.
+    ///
+    /// Currently emitted via `tracing::debug!` at call sites (sync context prevents
+    /// async event registration). This variant is available for future async callers
+    /// that want to emit routing decisions through OTLP with sampling.
+    RoutingDecision(crate::router::RoutingDecisionInfo),
+    /// Periodic snapshot of the router model (isotonic regression curves, event counts).
+    RouterSnapshot(crate::router::RouterSnapshotInfo),
 }
 
 impl EventKind {
@@ -2380,6 +2401,8 @@ impl EventKind {
     const LIFECYCLE: u8 = 10;
     const TRANSPORT_SNAPSHOT: u8 = 11;
     const INTEREST_SYNC: u8 = 12;
+    const ROUTING_DECISION: u8 = 13;
+    const ROUTER_SNAPSHOT: u8 = 14;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -2396,6 +2419,8 @@ impl EventKind {
             EventKind::Lifecycle(_) => Self::LIFECYCLE,
             EventKind::TransportSnapshot(_) => Self::TRANSPORT_SNAPSHOT,
             EventKind::InterestSync(_) => Self::INTEREST_SYNC,
+            EventKind::RoutingDecision(_) => Self::ROUTING_DECISION,
+            EventKind::RouterSnapshot(_) => Self::ROUTER_SNAPSHOT,
         }
     }
 
@@ -2462,6 +2487,8 @@ impl EventKind {
             EventKind::Timeout { .. } => "Timeout",
             EventKind::TransportSnapshot(_) => "TransportSnapshot",
             EventKind::InterestSync(_) => "InterestSync",
+            EventKind::RoutingDecision(_) => "RoutingDecision",
+            EventKind::RouterSnapshot(_) => "RouterSnapshot",
         }
     }
 }

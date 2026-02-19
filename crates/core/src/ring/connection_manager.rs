@@ -1005,13 +1005,31 @@ impl ConnectionManager {
         skip_list: impl Contains<SocketAddr>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
+        let (peer, _decision) = self.routing_with_telemetry(target, requesting, skip_list, router);
+        peer
+    }
+
+    /// Route an op to the most optimal target, returning telemetry about the decision.
+    pub fn routing_with_telemetry(
+        &self,
+        target: Location,
+        requesting: Option<SocketAddr>,
+        skip_list: impl Contains<SocketAddr>,
+        router: &Router,
+    ) -> (
+        Option<PeerKeyLocation>,
+        Option<crate::router::RoutingDecisionInfo>,
+    ) {
         let candidates = self.routing_candidates(target, requesting, skip_list);
 
         if candidates.is_empty() {
-            return None;
+            return (None, None);
         }
 
-        router.select_peer(candidates.iter(), target).cloned()
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(candidates.iter(), target, 1);
+        let peer = selected.into_iter().next().cloned();
+        (peer, Some(decision))
     }
 
     /// Gather routing candidates after applying skip/transient filters.
