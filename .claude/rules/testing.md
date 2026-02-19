@@ -87,6 +87,21 @@ SimulationSocket::bind(addr).await
 ```
 See: `crates/core/src/transport/in_memory_socket.rs`
 
+## Choosing a Simulation Runner
+
+```
+Need mid-simulation fault injection (partitions, crashes, churn)?
+  → YES: Use Turmoil runner (.run() / run_simulation())
+  → NO: Continue...
+
+Scale > 50 nodes or virtual time > 5 minutes?
+  → YES: Use direct runner (.run_direct() / run_simulation_direct())
+  → NO: Either runner works; prefer direct for 100% determinism
+```
+
+- **Direct runner** (`run_simulation_direct`): Single `current_thread` + `start_paused(true)` tokio runtime. 100% deterministic. Scales to 500+ nodes. Used by fdev CLI and nightly tests.
+- **Turmoil runner** (`run_simulation`): Turmoil scheduler. ~99% deterministic. Supports mid-simulation fault injection via closures. Better for fault tolerance tests.
+
 ## Fault Injection in Turmoil Tests
 
 When testing fault tolerance scenarios with `run_simulation()`:
@@ -177,4 +192,5 @@ cargo test -p freenet --features "simulation_tests,testing" \
 ```
 
 See: `crates/core/tests/simulation_integration.rs` — `test_strict_determinism_*`,
-`test_turmoil_determinism_*`, `test_deterministic_replay_*`, `test_determinism_parallel_safe`
+`test_turmoil_determinism_*`, `test_deterministic_replay_*`, `test_determinism_parallel_safe`,
+`test_direct_runner_determinism` (direct runner, 3-run comparison with EventKey verification)

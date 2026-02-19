@@ -7,6 +7,7 @@ BASE_DIR="/root/.cache/freenet"
 NODE_DIR="${BASE_DIR}/node"
 
 freenet network \
+  --id "test-node-${HOSTNAME}" \
   --config-dir "$BASE_DIR" \
   --data-dir "$NODE_DIR" \
   --ws-api-port "${WS_API_PORT:-7509}"

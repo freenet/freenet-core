@@ -1,3 +1,17 @@
+//! # Lock Ordering
+//!
+//! To prevent deadlocks, all `RwLock`-protected fields in [`ConnectionManager`] **must** be
+//! acquired in the following order whenever multiple locks are held simultaneously:
+//!
+//! 1. `location_for_peer`
+//! 2. `connections_by_location`
+//! 3. `pending_reservations`
+//!
+//! Acquiring locks in any other order risks an ABBA deadlock. This ordering was established
+//! after a deadlock introduced in PR #3091 (fixed in PR #3095), where
+//! `cleanup_stale_reservations` acquired `pending_reservations` before `connections_by_location`,
+//! while `prune_connection` acquired them in the opposite order.
+
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};

@@ -3747,6 +3747,224 @@ impl SimNetwork {
             .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
     }
 
+    /// Run a simulation using a single `current_thread` tokio runtime with paused time.
+    ///
+    /// This avoids Turmoil's O(n²) link overhead and O(n³) per-tick cost, making it
+    /// feasible to simulate hundreds of nodes. Determinism is achieved via:
+    /// - `current_thread` runtime (single-threaded, no scheduling races)
+    /// - `start_paused(true)` (tokio auto-advances time deterministically)
+    /// - `GlobalRng::set_seed` (seeded randomness)
+    /// - `deterministic_select!` (ordered select branches)
+    /// - `SimulationSocket` with BTreeMap (deterministic address ordering)
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_simulation_direct<R>(
+        mut self,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+        event_wait: Duration,
+    ) -> anyhow::Result<()>
+    where
+        R: RandomEventGenerator + Send + 'static,
+    {
+        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::ring::topology_registry::set_current_network_name;
+
+        // Set up deterministic RNG and time for reproducible simulation
+        GlobalRng::set_seed(seed);
+
+        const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+        const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+        let epoch_offset = seed % RANGE_MS;
+        GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        set_current_network_name(&self.name);
+
+        // Single-threaded runtime with paused time for deterministic execution
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()?;
+
+        let total_peer_num = self.gateways.len() + self.nodes.len();
+
+        let result: anyhow::Result<()> = rt.block_on(async {
+            // Time driver: bridges tokio's paused time → VirtualTime
+            // When all tasks are idle, tokio auto-advances past the 1ms sleep,
+            // which wakes this driver, which advances VirtualTime, which wakes
+            // VirtualSleep futures in node tasks.
+            let vt = self.virtual_time.clone();
+            let time_driver = tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    vt.advance_to(start.elapsed().as_nanos() as u64);
+                }
+            });
+
+            // Spawn gateway nodes
+            let mut node_handles = Vec::new();
+
+            let gateways: Vec<_> = self.gateways.drain(..).collect();
+            for (node, config) in gateways {
+                let label = config.label.clone();
+                let receiver_ch = self.receiver_ch.clone();
+
+                let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+                let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                    receiver_ch,
+                    node.config.key_pair.public().clone(),
+                    seed,
+                );
+                user_events.rng_params(
+                    label.number(),
+                    total_peer_num,
+                    max_contract_num,
+                    iterations,
+                );
+
+                let span = tracing::info_span!("direct_gateway", %label);
+
+                self.labels
+                    .push((label, node.config.key_pair.public().clone()));
+
+                let handle = tokio::spawn(async move {
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                });
+                node_handles.push(handle);
+            }
+
+            // Spawn regular nodes with staggered start
+            let nodes: Vec<_> = self.nodes.drain(..).collect();
+            for (i, (node, label)) in nodes.into_iter().enumerate() {
+                let receiver_ch = self.receiver_ch.clone();
+
+                let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
+                let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                    receiver_ch,
+                    node.config.key_pair.public().clone(),
+                    seed,
+                );
+                user_events.rng_params(
+                    label.number(),
+                    total_peer_num,
+                    max_contract_num,
+                    iterations,
+                );
+
+                let span = tracing::info_span!("direct_node", %label);
+
+                self.labels
+                    .push((label, node.config.key_pair.public().clone()));
+
+                let backoff = self.start_backoff * (i as u32 + 1);
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(backoff).await;
+                    node.run_node_with_shared_storage(user_events, span, shared_storage)
+                        .await
+                });
+                node_handles.push(handle);
+            }
+
+            // Event driver: identical logic to run_fdev_test's client
+            let user_ev_controller = self
+                .user_ev_controller
+                .take()
+                .expect("user_ev_controller should be set");
+            let labels: Vec<_> = self.labels.clone();
+            let event_logs = self.event_listener.logs.clone();
+
+            // Give nodes time to start and establish connections
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Use a seeded RNG for deterministic peer selection
+            use rand::prelude::*;
+            use rand::SeedableRng;
+            let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
+
+            for event_id in 0..iterations as u32 {
+                if let Some((_, peer_key)) = labels.choose(&mut event_rng) {
+                    if user_ev_controller
+                        .send((event_id, peer_key.clone()))
+                        .is_err()
+                    {
+                        tracing::warn!(event_id, "Failed to send event signal - receivers dropped");
+                        break;
+                    }
+                }
+                tokio::time::sleep(event_wait).await;
+            }
+
+            // Wait for events to fully propagate
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Convergence check
+            let subscribed_count = {
+                use std::collections::HashSet;
+                let logs = event_logs.lock().await;
+                let mut subscribed_contracts: HashSet<String> = HashSet::new();
+                for log in logs.iter() {
+                    if let crate::tracing::EventKind::Subscribe(
+                        crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
+                    ) = &log.kind
+                    {
+                        subscribed_contracts.insert(format!("{:?}", key));
+                    }
+                }
+                subscribed_contracts.len()
+            };
+
+            if subscribed_count > 0 {
+                info!(
+                    "Found {} subscribed contracts, waiting for convergence...",
+                    subscribed_count
+                );
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+
+            // Shutdown: abort time driver, then check node tasks for errors/panics
+            time_driver.abort();
+
+            let mut first_error: Option<anyhow::Error> = None;
+            for handle in node_handles {
+                handle.abort();
+                match handle.await {
+                    // Node was aborted (normal shutdown) — ignore
+                    Err(e) if e.is_cancelled() => {}
+                    // Node panicked
+                    Err(e) => {
+                        let msg = format!("Node task panicked: {e}");
+                        tracing::error!("{}", msg);
+                        if first_error.is_none() {
+                            first_error = Some(anyhow::anyhow!("{}", msg));
+                        }
+                    }
+                    // Node returned an error before we aborted it
+                    Ok(Err(e)) => {
+                        tracing::error!("Node task failed: {e}");
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                    // Node completed successfully (unlikely — event loops run forever)
+                    Ok(Ok(())) => {}
+                }
+            }
+
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+
+            info!("Direct simulation completed successfully");
+            Ok(())
+        });
+
+        result
+    }
+
     // =========================================================================
     // Subscription Topology Validation
     // =========================================================================

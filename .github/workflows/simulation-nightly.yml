@@ -165,26 +165,26 @@ jobs:
             --no-capture \
             --profile nightly
 
-      # Large scale test (500 nodes) - disabled until scaling issues are resolved
-      # TODO: Re-enable once the 500-node configuration runs reliably
-      # - name: Large scale test (500 nodes)
-      #   run: |
-      #     echo "Running large scale simulation (500 nodes, 10000 events)"
-      #     target/release/fdev test \
-      #       --name "nightly-large-500" \
-      #       --seed 0x500BEEF \
-      #       --gateways 10 \
-      #       --nodes 490 \
-      #       --events 10000 \
-      #       --ring-max-htl 15 \
-      #       --max-connections 30 \
-      #       --min-connections 10 \
-      #       --latency-min 10 \
-      #       --latency-max 50 \
-      #       --min-success-rate 1.0 \
-      #       --print-summary \
-      #       --print-network-stats \
-      #       single-process
+      # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
+      - name: Large scale test (500 nodes)
+        timeout-minutes: 60
+        run: |
+          echo "Running large scale simulation (500 nodes, 10000 events)"
+          target/release/fdev test \
+            --name "nightly-large-500" \
+            --seed 0x500BEEF \
+            --gateways 10 \
+            --nodes 490 \
+            --events 10000 \
+            --ring-max-htl 15 \
+            --max-connections 30 \
+            --min-connections 10 \
+            --latency-min 10 \
+            --latency-max 50 \
+            --min-success-rate 1.0 \
+            --print-summary \
+            --print-network-stats \
+            single-process
 
       # Real-process soak test - disabled until the test runs properly
       # TODO: Re-enable once large_network test is stable
