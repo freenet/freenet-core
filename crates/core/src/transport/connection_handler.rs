@@ -118,7 +118,7 @@ pub async fn create_connection_handler<S: Socket>(
     (
         OutboundConnectionHandler<S>,
         InboundConnectionHandler<S>,
-        tokio::task::JoinHandle<Result<(), TransportError>>,
+        tokio::task::JoinHandle<TransportError>,
     ),
     TransportError,
 > {
@@ -224,7 +224,7 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
 type ListenerSetup<S> = (
     OutboundConnectionHandler<S>,
     mpsc::Receiver<PeerConnection<S>>,
-    tokio::task::JoinHandle<Result<(), TransportError>>,
+    tokio::task::JoinHandle<TransportError>,
 );
 
 #[allow(private_bounds)]
@@ -1056,7 +1056,7 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
 impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
-    async fn listen(mut self) -> Result<(), TransportError> {
+    async fn listen(mut self) -> TransportError {
         tracing::debug!(
             bind_addr = %self.this_addr,
             "Listening for packets"
@@ -1295,7 +1295,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 bind_addr = %self.this_addr,
                                 "Fatal UDP recv_from error, listen task exiting"
                             );
-                            return Err(e.into());
+                            return e.into();
                         }
                     }
                 },
@@ -1337,7 +1337,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     .await
                                     .is_err() {
                                     tracing::error!(peer_addr = %remote_addr, "Failed to notify new gateway connection");
-                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                    break 'outer TransportError::ConnectionClosed(self.this_addr);
                                 }
                                 sent_tracker.lock().report_sent_packet(
                                     SymmetricMessage::FIRST_PACKET_ID,
@@ -1430,7 +1430,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             "Connection handler channel closed — listen task exiting. \
                              This is expected during graceful shutdown."
                         );
-                        return Err(TransportError::ConnectionClosed(self.this_addr));
+                        return TransportError::ConnectionClosed(self.this_addr);
                     };
                     tracing::debug!(peer_addr = %remote_addr, "Received connection event");
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;

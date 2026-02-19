@@ -639,15 +639,7 @@ impl P2pConnManager {
                     // Without the listener, no UDP packets are read from the socket,
                     // connections will time out, and the node becomes unresponsive.
                     match listen_result {
-                        Ok(Ok(())) => {
-                            // Currently unreachable: all listen() exit paths return Err.
-                            // Kept as defensive code in case listen() is modified later.
-                            tracing::error!(
-                                "CRITICAL: UDP listen task exited cleanly — \
-                                 this should never happen during normal operation"
-                            );
-                        }
-                        Ok(Err(e)) => {
+                        Ok(e) => {
                             tracing::error!(
                                 error = %e,
                                 "CRITICAL: UDP listen task exited with transport error"
