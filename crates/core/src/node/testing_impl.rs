@@ -3788,7 +3788,7 @@ impl SimNetwork {
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
 
-        rt.block_on(async {
+        let result: anyhow::Result<()> = rt.block_on(async {
             // Time driver: bridges tokio's paused time → VirtualTime
             // When all tasks are idle, tokio auto-advances past the 1ms sleep,
             // which wakes this driver, which advances VirtualTime, which wakes
@@ -3925,16 +3925,44 @@ impl SimNetwork {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
 
-            // Shutdown: abort all node tasks and time driver
+            // Shutdown: abort time driver, then check node tasks for errors/panics
             time_driver.abort();
-            for handle in &node_handles {
+
+            let mut first_error: Option<anyhow::Error> = None;
+            for handle in node_handles {
                 handle.abort();
+                match handle.await {
+                    // Node was aborted (normal shutdown) — ignore
+                    Err(e) if e.is_cancelled() => {}
+                    // Node panicked
+                    Err(e) => {
+                        let msg = format!("Node task panicked: {e}");
+                        tracing::error!("{}", msg);
+                        if first_error.is_none() {
+                            first_error = Some(anyhow::anyhow!("{}", msg));
+                        }
+                    }
+                    // Node returned an error before we aborted it
+                    Ok(Err(e)) => {
+                        tracing::error!("Node task failed: {e}");
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                    // Node completed successfully (unlikely — event loops run forever)
+                    Ok(Ok(())) => {}
+                }
+            }
+
+            if let Some(e) = first_error {
+                return Err(e);
             }
 
             info!("Direct simulation completed successfully");
+            Ok(())
         });
 
-        Ok(())
+        result
     }
 
     // =========================================================================

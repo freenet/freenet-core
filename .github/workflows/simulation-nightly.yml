@@ -167,6 +167,7 @@ jobs:
 
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
       - name: Large scale test (500 nodes)
+        timeout-minutes: 60
         run: |
           echo "Running large scale simulation (500 nodes, 10000 events)"
           target/release/fdev test \

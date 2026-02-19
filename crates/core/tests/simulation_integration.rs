@@ -287,7 +287,11 @@ impl TestConfig {
     /// Run the simulation using the direct runner (single-threaded paused-time runtime).
     ///
     /// This avoids turmoil's O(n²) link overhead, making it suitable for large-scale
-    /// or long-running simulations. Same determinism guarantees as turmoil.
+    /// or long-running simulations.
+    ///
+    /// Note: Does not support mid-simulation fault injection (partitions, crashes).
+    /// Static latency jitter via `FaultConfig` is supported.
+    #[allow(dead_code)] // Used by nightly_tests-gated tests
     fn run_direct(self) -> TestResult {
         use freenet::simulation::FaultConfig;
 
