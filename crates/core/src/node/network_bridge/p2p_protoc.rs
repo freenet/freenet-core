@@ -652,15 +652,11 @@ impl P2pConnManager {
                             );
                         }
                         Err(join_err) => {
-                            if join_err.is_panic() {
-                                tracing::error!(
-                                    "CRITICAL: UDP listen task panicked: {join_err}"
-                                );
-                            } else {
-                                tracing::error!(
-                                    "CRITICAL: UDP listen task was cancelled: {join_err}"
-                                );
-                            }
+                            let cause = if join_err.is_panic() { "panicked" } else { "cancelled" };
+                            tracing::error!(
+                                cause,
+                                "CRITICAL: UDP listen task failed: {join_err}"
+                            );
                         }
                     }
                     return Err(anyhow!(
