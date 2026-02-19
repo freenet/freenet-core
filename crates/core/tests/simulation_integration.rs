@@ -283,6 +283,76 @@ impl TestConfig {
             logs_handle,
         }
     }
+
+    /// Run the simulation using the direct runner (single-threaded paused-time runtime).
+    ///
+    /// This avoids turmoil's O(n²) link overhead, making it suitable for large-scale
+    /// or long-running simulations. Same determinism guarantees as turmoil.
+    fn run_direct(self) -> TestResult {
+        use freenet::simulation::FaultConfig;
+
+        setup_deterministic_state(self.seed);
+        let rt = create_runtime();
+
+        let (sim, logs_handle) = rt.block_on(async {
+            let mut sim = SimNetwork::new(
+                self.name,
+                self.gateways,
+                self.nodes,
+                self.ring_max_htl,
+                self.rnd_if_htl_above,
+                self.max_connections,
+                self.min_connections,
+                self.seed,
+            )
+            .await;
+
+            // Apply latency jitter if configured
+            if let Some(ref latency) = self.latency_range {
+                let fault_config = FaultConfig::builder()
+                    .latency_range(latency.clone())
+                    .build();
+                sim.with_fault_injection(fault_config);
+                tracing::info!(
+                    "Latency jitter enabled: {:?} - {:?}",
+                    latency.start,
+                    latency.end
+                );
+            }
+
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        drop(rt);
+
+        let direct_result = sim.run_simulation_direct::<rand::rngs::SmallRng>(
+            self.seed,
+            self.max_contracts,
+            self.iterations,
+            self.event_wait,
+        );
+
+        // Map anyhow::Result to turmoil::Result for TestResult compatibility
+        let simulation_result: turmoil::Result = match direct_result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Box::new(std::io::Error::other(e.to_string()))),
+        };
+
+        let rt = create_runtime();
+        let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+        let event_count = rt.block_on(async { logs_handle.lock().await.len() });
+
+        TestResult {
+            seed: self.seed,
+            name: self.name,
+            simulation_result,
+            convergence,
+            event_count,
+            require_convergence: self.require_convergence,
+            logs_handle,
+        }
+    }
 }
 
 /// Result of running a simulation test.
@@ -3147,7 +3217,7 @@ fn test_subscription_broadcast_propagation() {
 /// - Events phase: 360 operations × 10s = 3600 seconds (1 hour)
 /// - Propagation: 10 seconds
 /// - Total: ~3610 seconds virtual time
-/// - Wall clock: ~2.5 min (25x acceleration with 8 turmoil hosts)
+/// - Wall clock: ~2.5 min with direct runner (single-threaded paused-time runtime)
 ///
 /// NOTE: Gated by nightly_tests feature — does NOT run in regular CI.
 #[test_log::test]
@@ -3162,7 +3232,7 @@ fn test_long_running_deterministic() {
     let start_time = std::time::Instant::now();
 
     TestConfig::long_running("long-running", SEED)
-        .run()
+        .run_direct()
         .assert_ok()
         .verify_operation_coverage()
         .check_convergence();
