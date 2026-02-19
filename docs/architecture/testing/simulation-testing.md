@@ -6,7 +6,9 @@ This document describes the deterministic simulation testing framework for Freen
 
 The simulation testing framework enables reproducible testing of the Freenet network by providing:
 
-1. **Deterministic scheduling** - Turmoil provides ~99% deterministic async execution
+1. **Deterministic scheduling** - Two runners available:
+   - **Direct runner** (`run_simulation_direct`) — single `current_thread` + `start_paused(true)` tokio runtime. 100% deterministic. Scales to 500+ nodes.
+   - **Turmoil runner** (`run_simulation`) — Turmoil's deterministic scheduler. ~99% deterministic. Better for mid-simulation fault injection via closures.
 2. **Seeded randomness** - All random decisions use `GlobalRng`
 3. **Controlled time** - `VirtualTime` advances only when explicitly stepped
 4. **Fault injection** - Configurable message loss, partitions, and latency
@@ -17,7 +19,7 @@ The simulation testing framework enables reproducible testing of the Freenet net
 ### Running Tests
 
 ```bash
-# Run all simulation tests (Turmoil always enabled)
+# Run all simulation tests
 cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration
 
 # Run with logging
@@ -113,16 +115,17 @@ SimNetwork
 
 ## Determinism Guarantees
 
-| Aspect | Mechanism |
-|--------|-----------|
-| Task scheduling | Turmoil - deterministic FIFO ordering |
-| RNG | `GlobalRng` - seeded, deterministic |
-| Time | `VirtualTime` - explicit advancement |
-| Network | `SimulationSocket` - in-memory |
-| Peer labels | Derived from master seed |
-| Fault injection | Seeded RNG for drop decisions |
+| Aspect | Direct Runner | Turmoil Runner |
+|--------|---------------|----------------|
+| Task scheduling | tokio `current_thread` + `start_paused(true)` — 100% deterministic | Turmoil FIFO — ~99% deterministic |
+| RNG | `GlobalRng` - seeded | `GlobalRng` - seeded |
+| Time | `VirtualTime` via time driver task | `VirtualTime` - explicit advancement |
+| Network | `SimulationSocket` - in-memory | `SimulationSocket` - in-memory |
+| Peer labels | Derived from master seed | Derived from master seed |
+| Fault injection | Static `FaultConfig` (no mid-sim changes) | `FaultConfig` + closure-based mid-sim injection |
+| Scale | 500+ nodes (single runtime) | ~50 nodes (O(n²) link overhead) |
 
-**Result:** Same seed produces identical execution (~99% determinism).
+**Result:** Same seed produces identical execution. Direct runner is fully deterministic; Turmoil is ~99%.
 
 ## Available APIs
 
@@ -195,10 +198,12 @@ if let Some(stats) = sim.get_network_stats() {
 }
 ```
 
-### Mid-Simulation Fault Injection (Turmoil Tests)
+### Mid-Simulation Fault Injection (Turmoil Runner Only)
 
 For Turmoil-based tests using `run_simulation()`, faults can be injected from the
-test closure via the global fault injector registry:
+test closure via the global fault injector registry. **Note:** The direct runner
+(`run_simulation_direct`) does not support mid-simulation fault injection — use
+static `FaultConfig` for latency jitter and message loss instead.
 
 ```rust
 let result = sim.run_simulation::<SmallRng, _, _>(
@@ -309,9 +314,10 @@ The simulation framework supports testing across different time scales:
 
 ### Time Acceleration
 
-Virtual time runs significantly faster than wall clock time due to Turmoil's scheduler:
-- **~20x acceleration** for long-duration idle tests (1 hour in ~3 minutes)
-- **~100-1000x acceleration** for event-driven tests with minimal idle time
+Virtual time runs significantly faster than wall clock time:
+- **Direct runner:** ~29x acceleration for long-duration tests (1 hour virtual in ~2 minutes wall clock). Scales better with node count since there's only one tokio runtime.
+- **Turmoil runner:** ~20x acceleration for long-duration idle tests. Degrades at scale due to O(n²) link iteration per tick.
+- **Both:** ~100-1000x acceleration for event-driven tests with minimal idle time.
 
 ### Long-Duration Test Configuration
 
@@ -319,7 +325,7 @@ For tests simulating extended periods, use the `long_running` configuration:
 
 ```rust
 TestConfig::long_running("my-long-test", SEED)
-    .run()
+    .run_direct()    // Uses the direct runner (single tokio runtime)
     .assert_ok()
     .verify_operation_coverage()
     .check_convergence();
@@ -331,8 +337,9 @@ This configuration:
 - 360 contract operations distributed across the duration
 - Tests for: connection timeout handling, state drift, timer edge cases
 
-Note: Turmoil steps through every virtual millisecond polling all hosts, so virtual
-time has a real cost. 3600s virtual ≈ 2.5 min wall clock with 8 hosts.
+The direct runner completes 3600s virtual time in ~2 minutes wall clock with 8 hosts.
+Use `.run_direct()` for long-duration and large-scale tests; use `.run()` (Turmoil)
+when mid-simulation fault injection via closures is needed.
 
 ## Nightly Test Suite
 
@@ -393,10 +400,12 @@ The following fault injection tests run in **regular CI** (not nightly) via `sim
 
 These run with every PR and don't need nightly scheduling.
 
-### Fault Tolerance Integration Tests (Turmoil)
+### Fault Tolerance Integration Tests (Turmoil Runner)
 
 These scenarios use Turmoil's deterministic scheduler with mid-simulation fault
 injection via the global fault injector registry. All include anomaly detection.
+They use the Turmoil runner because they require mid-simulation fault injection
+(partitions, crashes) from closures.
 
 | Test | Description | Results |
 |------|-------------|---------|
@@ -428,6 +437,20 @@ Currently only LEDBAT uses proptest. Expand to:
 | **Linearizability checker** | Jepsen/Knossos-style operation history verification | Medium |
 | **Clock skew simulation** | Per-node time offsets | Low |
 | **Invariant checking DSL** | Declarative system invariants | Low |
+
+## Choosing a Runner
+
+| Criterion | Direct Runner | Turmoil Runner |
+|-----------|:---:|:---:|
+| Large scale (50+ nodes) | **Preferred** | Slow (O(n²) links) |
+| Long duration (1hr+ virtual) | **Preferred** | Viable for small node counts |
+| Mid-simulation fault injection | Not supported | **Required** |
+| fdev CLI tests | **Default** | Not used |
+| Nightly tests | **Default** | Not used |
+| Determinism verification | **100%** | ~99% |
+| Fault tolerance tests (partition/crash/churn) | Not supported | **Required** |
+
+**Rule of thumb:** Use the direct runner unless you need mid-simulation fault injection from a closure.
 
 ## References
 
