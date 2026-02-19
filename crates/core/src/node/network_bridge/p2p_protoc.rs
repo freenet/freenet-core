@@ -533,17 +533,18 @@ impl P2pConnManager {
             message_processor,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<S>(
-            key_pair.clone(),
-            listening_ip,
-            listening_port,
-            is_gateway,
-            bandwidth_limit,
-            global_bandwidth,
-            ledbat_min_ssthresh,
-            Some(congestion_config.clone()),
-        )
-        .await?;
+        let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
+            create_connection_handler::<S>(
+                key_pair.clone(),
+                listening_ip,
+                listening_port,
+                is_gateway,
+                bandwidth_limit,
+                global_bandwidth,
+                ledbat_min_ssthresh,
+                Some(congestion_config.clone()),
+            )
+            .await?;
 
         tracing::info!(
             listening_port,
@@ -626,7 +627,56 @@ impl P2pConnManager {
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
-        while let Some(result) = select_stream.as_mut().next().await {
+        // Monitor both the event stream AND the UDP listen task.
+        // If the listen task exits for any reason, the transport layer is dead
+        // and we must propagate the error to trigger node shutdown.
+        loop {
+            let result = tokio::select! {
+                biased;
+
+                listen_result = &mut listen_task_handle => {
+                    // The UDP listener task has exited — this is fatal.
+                    // Without the listener, no UDP packets are read from the socket,
+                    // connections will time out, and the node becomes unresponsive.
+                    match listen_result {
+                        Ok(Ok(())) => {
+                            tracing::error!(
+                                "CRITICAL: UDP listen task exited cleanly — \
+                                 this should never happen during normal operation"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                error = %e,
+                                "CRITICAL: UDP listen task exited with transport error"
+                            );
+                        }
+                        Err(join_err) => {
+                            if join_err.is_panic() {
+                                tracing::error!(
+                                    "CRITICAL: UDP listen task panicked: {join_err}"
+                                );
+                            } else {
+                                tracing::error!(
+                                    "CRITICAL: UDP listen task was cancelled: {join_err}"
+                                );
+                            }
+                        }
+                    }
+                    return Err(anyhow!(
+                        "UDP listen task exited unexpectedly — \
+                         transport layer is dead, node must restart"
+                    ));
+                },
+
+                maybe_result = StreamExt::next(&mut select_stream) => {
+                    let Some(result) = maybe_result else {
+                        break;
+                    };
+                    result
+                },
+            };
+
             loop_iteration_count += 1;
 
             let event_type = match &result {

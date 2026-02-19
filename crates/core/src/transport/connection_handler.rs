@@ -114,7 +114,14 @@ pub async fn create_connection_handler<S: Socket>(
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     ledbat_min_ssthresh: Option<usize>,
     congestion_config: Option<CongestionControlConfig>,
-) -> Result<(OutboundConnectionHandler<S>, InboundConnectionHandler<S>), TransportError> {
+) -> Result<
+    (
+        OutboundConnectionHandler<S>,
+        InboundConnectionHandler<S>,
+        tokio::task::JoinHandle<Result<(), TransportError>>,
+    ),
+    TransportError,
+> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -132,7 +139,7 @@ pub async fn create_connection_handler<S: Socket>(
         is_gateway,
         "UDP socket bound successfully"
     );
-    let (och, new_connection_notifier) = OutboundConnectionHandler::config_listener(
+    let (och, new_connection_notifier, listen_handle) = OutboundConnectionHandler::config_listener(
         Arc::new(socket),
         keypair,
         is_gateway,
@@ -147,6 +154,7 @@ pub async fn create_connection_handler<S: Socket>(
         InboundConnectionHandler {
             new_connection_notifier,
         },
+        listen_handle,
     ))
 }
 
@@ -211,6 +219,14 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
     }
 }
 
+/// Return type for `config_listener`: the outbound handler, inbound connection receiver,
+/// and the JoinHandle for the UDP listen task (must be monitored for unexpected exits).
+type ListenerSetup<S> = (
+    OutboundConnectionHandler<S>,
+    mpsc::Receiver<PeerConnection<S>>,
+    tokio::task::JoinHandle<Result<(), TransportError>>,
+);
+
 #[allow(private_bounds)]
 impl<S: Socket> OutboundConnectionHandler<S> {
     #[allow(clippy::too_many_arguments)]
@@ -223,7 +239,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
         ledbat_min_ssthresh: Option<usize>,
         congestion_config: Option<CongestionControlConfig>,
-    ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
+    ) -> Result<ListenerSetup<S>, TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
@@ -254,7 +270,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        GlobalExecutor::spawn(RANDOM_U64.scope(
+        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
             {
                 // Use GlobalRng for deterministic simulation
                 let seed = GlobalRng::random_u64();
@@ -264,7 +280,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             transport.listen(),
         ));
 
-        Ok((connection_handler, new_connection_notifier))
+        Ok((connection_handler, new_connection_notifier, listen_handle))
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -274,7 +290,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(
+        let (handler, receiver, _listen_handle) = Self::config_listener(
             socket,
             keypair,
             is_gateway,
@@ -283,7 +299,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             None,
             None,
             None,
-        )
+        )?;
+        Ok((handler, receiver))
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -294,7 +311,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         is_gateway: bool,
         bandwidth_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(
+        let (handler, receiver, _listen_handle) = Self::config_listener(
             socket,
             keypair,
             is_gateway,
@@ -303,7 +320,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             None,
             None,
             None,
-        )
+        )?;
+        Ok((handler, receiver))
     }
 
     pub async fn connect(
@@ -443,7 +461,9 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        GlobalExecutor::spawn(RANDOM_U64.scope(
+        // Note: In test/bench code, the listen handle is intentionally dropped by callers
+        // since mock sockets manage their own lifetimes.
+        let _listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
             {
                 let seed = GlobalRng::random_u64();
                 let mut rng = StdRng::seed_from_u64(seed);
@@ -1252,9 +1272,27 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         Err(e) => {
+                            // Transient errors (e.g., ECONNREFUSED on Linux for ICMP port unreachable)
+                            // should not kill the listener. Only fatal errors should exit.
+                            let kind = e.kind();
+                            if matches!(kind, std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut)
+                            {
+                                tracing::warn!(
+                                    error = ?e,
+                                    error_kind = ?kind,
+                                    "Transient UDP recv_from error, continuing"
+                                );
+                                continue;
+                            }
                             tracing::error!(
                                 error = ?e,
-                                "Failed to receive UDP packet"
+                                error_kind = ?kind,
+                                bind_addr = %self.this_addr,
+                                "Fatal UDP recv_from error, listen task exiting"
                             );
                             return Err(e.into());
                         }
@@ -1383,8 +1421,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 // Handle new connection requests
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else {
-                        tracing::debug!(bind_addr = %self.this_addr, "Connection handler closed");
-                        return Ok(());
+                        tracing::error!(
+                            bind_addr = %self.this_addr,
+                            "Connection handler channel closed — listen task exiting. \
+                             This means all OutboundConnectionHandler senders were dropped."
+                        );
+                        return Err(TransportError::ConnectionClosed(self.this_addr));
                     };
                     tracing::debug!(peer_addr = %remote_addr, "Received connection event");
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
