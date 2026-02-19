@@ -3760,3 +3760,185 @@ fn test_determinism_across_threads() {
         events2
     );
 }
+
+// =============================================================================
+// Direct Runner Determinism Tests
+// =============================================================================
+
+/// **STRICT** determinism test for `run_simulation_direct`: verifies that
+/// same seed produces EXACTLY identical events across 3 runs.
+///
+/// Checks 4 levels of determinism (weakest → strongest):
+/// 1. Total event count
+/// 2. Per-type event counts
+/// 3. Event sequence (variant names in log order)
+/// 4. Structural EventSummary (tx, peer_addr, contract_key, state_hash) — sorted
+///    to verify that *which* contracts and peers are involved is deterministic,
+///    not only event types. The `event_detail` Debug string is excluded because it
+///    contains ephemeral fields (e.g., `this_peer_connection_count`).
+///
+/// Runs 3 times to catch flaky coincidences.
+#[test_log::test]
+fn test_direct_runner_determinism() {
+    const SEED: u64 = 0xD12E_C7DE_7000;
+
+    /// Structural fields of an event for deterministic comparison.
+    /// Excludes `event_detail` (Debug string with ephemeral internal state).
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct EventKey {
+        tx: freenet::dev_tool::Transaction,
+        peer_addr: std::net::SocketAddr,
+        event_kind_name: String,
+        contract_key: Option<String>,
+        state_hash: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<String>,
+        /// Sorted structural keys for deep content comparison
+        event_keys: Vec<EventKey>,
+        total_events: usize,
+    }
+
+    fn run_and_trace(name: &str, seed: u64) -> SimulationTrace {
+        setup_deterministic_state(seed);
+
+        let rt = create_runtime();
+
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                name, 2,  // gateways
+                4,  // nodes
+                10, // ring_max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                3,  // min_connections
+                seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        drop(rt);
+
+        sim.run_simulation_direct::<rand::rngs::SmallRng>(
+            seed,
+            10, // max_contract_num
+            30, // iterations
+            Duration::from_millis(200),
+        )
+        .expect("Direct simulation should succeed");
+
+        // Extract trace — need a runtime to lock the async mutex
+        let rt = create_runtime();
+        rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            let mut event_sequence: Vec<String> = Vec::new();
+
+            let mut event_keys: Vec<EventKey> = logs
+                .iter()
+                .map(|log| {
+                    let event_kind_name = log.kind.variant_name().to_string();
+                    let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+                    let state_hash = log.kind.state_hash().map(String::from);
+
+                    *event_counts.entry(event_kind_name.clone()).or_insert(0) += 1;
+                    event_sequence.push(event_kind_name.clone());
+
+                    EventKey {
+                        tx: log.tx,
+                        peer_addr: log.peer_id.addr,
+                        event_kind_name,
+                        contract_key,
+                        state_hash,
+                    }
+                })
+                .collect();
+            event_keys.sort();
+
+            SimulationTrace {
+                total_events: logs.len(),
+                event_counts,
+                event_sequence,
+                event_keys,
+            }
+        })
+    }
+
+    // Run 3 times with identical seed
+    let trace1 = run_and_trace("direct-det-run1", SEED);
+    let trace2 = run_and_trace("direct-det-run2", SEED);
+    let trace3 = run_and_trace("direct-det-run3", SEED);
+
+    // All runs must produce events
+    assert!(trace1.total_events > 0, "Run 1 should produce events");
+    assert!(trace2.total_events > 0, "Run 2 should produce events");
+    assert!(trace3.total_events > 0, "Run 3 should produce events");
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "DIRECT DETERMINISM FAILURE: Total event counts differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.total_events, trace3.total_events,
+        "DIRECT DETERMINISM FAILURE: Total event counts differ (run2 vs run3)!"
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "DIRECT DETERMINISM FAILURE: Event type counts differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.event_counts, trace3.event_counts,
+        "DIRECT DETERMINISM FAILURE: Event type counts differ (run2 vs run3)!"
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence (variant names in log order)
+    for (i, ((e1, e2), e3)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .zip(trace3.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "Event sequence differs at index {} (run1 vs run2)!",
+            i
+        );
+        assert_eq!(
+            e2, e3,
+            "Event sequence differs at index {} (run2 vs run3)!",
+            i
+        );
+    }
+
+    // STRICT ASSERTION 4: Structural event content (tx, peer, contract_key, state_hash)
+    assert_eq!(
+        trace1.event_keys, trace2.event_keys,
+        "DIRECT DETERMINISM FAILURE: Sorted event keys differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.event_keys, trace3.event_keys,
+        "DIRECT DETERMINISM FAILURE: Sorted event keys differ (run2 vs run3)!"
+    );
+
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
+    tracing::info!(
+        "DIRECT RUNNER DETERMINISM PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
+    );
+}
