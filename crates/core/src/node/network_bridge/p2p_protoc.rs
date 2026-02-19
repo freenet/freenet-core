@@ -640,6 +640,8 @@ impl P2pConnManager {
                     // connections will time out, and the node becomes unresponsive.
                     match listen_result {
                         Ok(Ok(())) => {
+                            // Currently unreachable: all listen() exit paths return Err.
+                            // Kept as defensive code in case listen() is modified later.
                             tracing::error!(
                                 "CRITICAL: UDP listen task exited cleanly — \
                                  this should never happen during normal operation"

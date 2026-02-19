@@ -1277,6 +1277,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             let kind = e.kind();
                             if matches!(kind, std::io::ErrorKind::ConnectionReset
                                 | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionAborted
                                 | std::io::ErrorKind::Interrupted
                                 | std::io::ErrorKind::WouldBlock
                                 | std::io::ErrorKind::TimedOut)
@@ -1421,10 +1422,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 // Handle new connection requests
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else {
-                        tracing::error!(
+                        // This fires both during graceful shutdown (event loop exits,
+                        // drops senders) and unexpected sender drops. Use warn! since
+                        // graceful shutdown is the common case.
+                        tracing::warn!(
                             bind_addr = %self.this_addr,
                             "Connection handler channel closed — listen task exiting. \
-                             This means all OutboundConnectionHandler senders were dropped."
+                             This is expected during graceful shutdown."
                         );
                         return Err(TransportError::ConnectionClosed(self.this_addr));
                     };
