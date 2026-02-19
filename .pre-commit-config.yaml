@@ -47,7 +47,7 @@ repos:
     hooks:
       - id: todo-must-fix
         name: Check for TODO-MUST-FIX markers
-        entry: bash -c 'if git diff --cached -- "*.rs" "*.ts" "*.js" "*.py" | grep -i "TODO-MUST-FIX"; then echo "❌ Found TODO-MUST-FIX in staged changes. Please fix before committing."; exit 1; fi'
+        entry: bash -c 'if git diff --cached -- "*.rs" "*.ts" "*.js" "*.py" | grep "^+" | grep -iv "^+++" | grep -i "TODO-MUST-FIX"; then echo "❌ Found TODO-MUST-FIX in staged changes. Please fix before committing."; exit 1; fi'
         language: system
         pass_filenames: false
         stages: [pre-commit]
