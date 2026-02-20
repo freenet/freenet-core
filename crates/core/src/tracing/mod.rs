@@ -2506,6 +2506,23 @@ impl EventKind {
         }
     }
 
+    /// Returns router snapshot summary data for `RouterSnapshot` events.
+    ///
+    /// Returns `(failure_events, success_events, prediction_active)`.
+    /// `failure_events` counts all events in the failure estimator (successes scored 0.0,
+    /// failures scored 1.0). `success_events` counts only timed GET successes.
+    /// `prediction_active` is true when `failure_events >= 50`.
+    pub fn router_snapshot_summary(&self) -> Option<(usize, usize, bool)> {
+        match self {
+            EventKind::RouterSnapshot(info) => Some((
+                info.failure_events,
+                info.success_events,
+                info.prediction_active,
+            )),
+            _ => None,
+        }
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
