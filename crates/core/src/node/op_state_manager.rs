@@ -1256,7 +1256,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 for tx in old_missing.drain(..) {
                     if let Some(tx) = ops.completed.remove(&tx) {
                         if cfg!(feature = "trace-ot") {
-                            event_register.notify_of_time_out(tx).await;
+                            let op_type = tx.transaction_type().description();
+                            event_register.notify_of_time_out(tx, op_type, None).await;
                         } else {
                             _ = tx;
                         }
@@ -1339,7 +1340,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if let Some(tx) = ops.completed.remove(&tx) {
                         tracing::debug!("Clean up timed out: {tx}");
                         if cfg!(feature = "trace-ot") {
-                            event_register.notify_of_time_out(tx).await;
+                            let op_type = tx.transaction_type().description();
+                            event_register.notify_of_time_out(tx, op_type, None).await;
                         } else {
                             _ = tx;
                         }
