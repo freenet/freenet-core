@@ -382,6 +382,8 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
     message_processor: Arc<MessageProcessor>,
+    /// Per-contract retry count for broadcasts that found no targets yet.
+    broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
 }
 
 impl P2pConnManager {
@@ -466,6 +468,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             message_processor,
+            broadcast_retries: HashMap::new(),
         })
     }
 
@@ -531,6 +534,7 @@ impl P2pConnManager {
             congestion_config,
             blocked_addresses,
             message_processor,
+            broadcast_retries,
         } = self;
 
         let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
@@ -614,6 +618,7 @@ impl P2pConnManager {
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             message_processor,
+            broadcast_retries,
         };
 
         // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)
@@ -3467,10 +3472,20 @@ impl P2pConnManager {
         }
     }
 
-    /// Handle BroadcastStateChange: notify interested network peers about state changes.
+    /// Maximum retry attempts when a broadcast finds no targets.
+    const MAX_BROADCAST_RETRIES: u8 = 3;
+
+    /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
+    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+    /// Notify interested network peers about a state change.
     ///
     /// Echo-back is prevented by summary comparison: we skip peers whose cached
     /// summary matches ours (they already have our state).
+    ///
+    /// When no targets are found (race between contract updates and subscription
+    /// establishment), the broadcast is retried with linear backoff up to
+    /// [`Self::MAX_BROADCAST_RETRIES`] times.
     async fn handle_broadcast_state_change(
         &mut self,
         op_manager: &Arc<OpManager>,
@@ -3500,30 +3515,67 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
-            tracing::warn!(
-                contract = %key,
-                self_addr = %self_addr,
-                "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
-            );
-            // Still emit delivery summary even when no targets, for diagnostics
-            let update_tx =
-                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-            if let Some(log) = NetEventLog::broadcast_delivery_summary(
-                &update_tx,
-                &op_manager.ring,
-                key,
-                &target_result,
-                0,
-                0,
-                0,
-            ) {
-                self.bridge
-                    .log_register
-                    .register_events(Either::Left(log))
-                    .await;
+            let retry_count = self.broadcast_retries.entry(key).or_insert(0);
+            if *retry_count < Self::MAX_BROADCAST_RETRIES {
+                *retry_count += 1;
+                let attempt = *retry_count;
+                tracing::info!(
+                    contract = %key,
+                    self_addr = %self_addr,
+                    attempt,
+                    max_retries = Self::MAX_BROADCAST_RETRIES,
+                    "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
+                );
+                // Schedule a delayed re-emission of BroadcastStateChange
+                let op_mgr = op_manager.clone();
+                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = op_mgr
+                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                            key,
+                            new_state,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            contract = %key,
+                            error = %e,
+                            "Failed to re-emit BroadcastStateChange for retry"
+                        );
+                    }
+                });
+            } else {
+                self.broadcast_retries.remove(&key);
+                tracing::warn!(
+                    contract = %key,
+                    self_addr = %self_addr,
+                    "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
+                    Self::MAX_BROADCAST_RETRIES
+                );
+                // Emit delivery summary for diagnostics
+                let update_tx =
+                    crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+                if let Some(log) = NetEventLog::broadcast_delivery_summary(
+                    &update_tx,
+                    &op_manager.ring,
+                    key,
+                    &target_result,
+                    0,
+                    0,
+                    0,
+                ) {
+                    self.bridge
+                        .log_register
+                        .register_events(Either::Left(log))
+                        .await;
+                }
             }
             return;
         }
+
+        // Targets found - clear any pending retry state for this contract
+        self.broadcast_retries.remove(&key);
 
         // Get our summary once for all targets
         let our_summary = op_manager
