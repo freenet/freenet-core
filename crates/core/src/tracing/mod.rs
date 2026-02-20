@@ -84,7 +84,12 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
         &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()>;
+    fn notify_of_time_out(
+        &mut self,
+        tx: Transaction,
+        op_type: &str,
+        target_peer: Option<String>,
+    ) -> BoxFuture<'_, ()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>>;
 }
@@ -117,10 +122,17 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(
+        &mut self,
+        tx: Transaction,
+        op_type: &str,
+        target_peer: Option<String>,
+    ) -> BoxFuture<'_, ()> {
+        let op_type = op_type.to_string();
         async move {
             for reg in &mut self.0 {
-                reg.notify_of_time_out(tx).await;
+                reg.notify_of_time_out(tx, &op_type, target_peer.clone())
+                    .await;
             }
         }
         .boxed()
@@ -181,10 +193,17 @@ impl NetEventRegister for DynamicRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(
+        &mut self,
+        tx: Transaction,
+        op_type: &str,
+        target_peer: Option<String>,
+    ) -> BoxFuture<'_, ()> {
+        let op_type = op_type.to_string();
         async move {
             for reg in &mut self.0 {
-                reg.notify_of_time_out(tx).await;
+                reg.notify_of_time_out(tx, &op_type, target_peer.clone())
+                    .await;
             }
         }
         .boxed()
@@ -1727,7 +1746,12 @@ impl NetEventRegister for EventRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(
+        &mut self,
+        tx: Transaction,
+        op_type: &str,
+        target_peer: Option<String>,
+    ) -> BoxFuture<'_, ()> {
         let log_msg = NetLogMessage {
             tx,
             datetime: Utc::now(),
@@ -1735,6 +1759,8 @@ impl NetEventRegister for EventRegister {
             kind: EventKind::Timeout {
                 id: tx,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                op_type: op_type.to_string(),
+                target_peer,
             },
         };
         let sender = self.log_sender.clone();
@@ -2312,7 +2338,12 @@ mod opentelemetry_tracer {
             Box::new(self.clone())
         }
 
-        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+        fn notify_of_time_out(
+            &mut self,
+            tx: Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> BoxFuture<'_, ()> {
             async move {
                 if cfg!(test) {
                     let _ = self.finished_tx_notifier.send(tx).await;
@@ -2366,6 +2397,10 @@ pub enum EventKind {
         /// The transaction that timed out.
         id: Transaction,
         timestamp: u64,
+        /// The operation type (e.g. "connect", "put", "get", "subscribe", "update").
+        op_type: String,
+        /// The target peer for the operation, if known from routing info.
+        target_peer: Option<String>,
     },
     /// Periodic transport layer metrics snapshot.
     ///
@@ -3882,7 +3917,12 @@ pub(super) mod test {
             Box::new(self.clone())
         }
 
-        fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
+        fn notify_of_time_out(
+            &mut self,
+            _: Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> BoxFuture<'_, ()> {
             async {}.boxed()
         }
 

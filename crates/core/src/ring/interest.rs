@@ -664,6 +664,8 @@ impl<T: TimeSource> InterestManager<T> {
         loop {
             interval.tick().await;
 
+            // Capture stats before sweep for the health snapshot
+            let stats = manager.stats();
             let expired = manager.sweep_expired_interests();
 
             if !expired.is_empty() {
@@ -671,7 +673,28 @@ impl<T: TimeSource> InterestManager<T> {
                     expired_count = expired.len(),
                     "Interest sweep: cleaned up expired peer interests"
                 );
+
+                // Emit per-entry expiration telemetry
+                for (contract, peer) in &expired {
+                    crate::tracing::telemetry::send_standalone_event(
+                        "interest_expired",
+                        serde_json::json!({
+                            "contract": contract.to_string(),
+                            "peer": peer.0.to_string(),
+                        }),
+                    );
+                }
             }
+
+            // Emit periodic health snapshot
+            crate::tracing::telemetry::send_standalone_event(
+                "subscription_health_snapshot",
+                serde_json::json!({
+                    "contracts_with_interests": stats.total_contracts,
+                    "total_interest_entries": stats.total_peer_interests,
+                    "expired_this_sweep": expired.len(),
+                }),
+            );
         }
     }
 

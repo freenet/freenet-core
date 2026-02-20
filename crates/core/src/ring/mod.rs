@@ -558,13 +558,14 @@ impl Ring {
                         )
                         .await;
 
-                        match &result {
+                        let (outcome, error_msg) = match &result {
                             Ok(()) => {
                                 tracing::info!(
                                     %contract_key,
                                     "Subscription renewal succeeded"
                                 );
                                 guard.complete(true);
+                                ("success", None)
                             }
                             Err(crate::operations::OpError::NotificationChannelError(_)) => {
                                 // Channel congestion is a local resource issue, not a
@@ -576,6 +577,7 @@ impl Ring {
                                     "Subscription renewal skipped (channel full), will retry next cycle"
                                 );
                                 guard.complete(true);
+                                ("dropped_channel_full", None)
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -583,9 +585,20 @@ impl Ring {
                                     error = %e,
                                     "Subscription renewal failed (will retry with backoff)"
                                 );
+                                let err_str = e.to_string();
                                 guard.complete(false);
+                                ("failed", Some(err_str))
                             }
-                        }
+                        };
+
+                        crate::tracing::telemetry::send_standalone_event(
+                            "subscription_renewal_outcome",
+                            serde_json::json!({
+                                "contract": contract_key.to_string(),
+                                "outcome": outcome,
+                                "error": error_msg,
+                            }),
+                        );
                     });
                 }
             }

@@ -20,6 +20,7 @@
 //! TODO(#2456): Enable HTTPS once TLS is configured on the collector server.
 //! Currently the server only accepts HTTP connections.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -37,6 +38,33 @@ use crate::router::RouteEvent;
 use crate::transport::TRANSPORT_METRICS;
 
 use super::{EventKind, NetEventLog, NetEventRegister, NetLogMessage};
+
+/// Global telemetry sender for standalone event emission from contexts
+/// that don't have access to a `NetEventRegister` (e.g., background tasks
+/// like subscription renewal and interest sweep).
+///
+/// Initialized when `TelemetryReporter::new()` creates the reporter.
+/// If telemetry is disabled, this remains unset and `send_standalone_event`
+/// silently drops events.
+static TELEMETRY_SENDER: OnceLock<mpsc::Sender<TelemetryCommand>> = OnceLock::new();
+
+/// Send a standalone telemetry event from any context.
+///
+/// This is a non-blocking, best-effort send. Events are dropped silently if:
+/// - Telemetry is not enabled (TELEMETRY_SENDER not initialized)
+/// - The telemetry channel is full
+pub fn send_standalone_event(event_type: &str, event_data: serde_json::Value) {
+    if let Some(sender) = TELEMETRY_SENDER.get() {
+        let event = TelemetryEvent {
+            timestamp: current_timestamp_ms(),
+            peer_id: String::new(),
+            transaction_id: String::new(),
+            event_type: event_type.to_string(),
+            event_data,
+        };
+        let _ = sender.try_send(TelemetryCommand::Event(event));
+    }
+}
 
 /// Maximum number of events to buffer before sending
 const MAX_BUFFER_SIZE: usize = 100;
@@ -122,6 +150,9 @@ impl TelemetryReporter {
         // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
 
+        // Store a clone in the global sender for standalone event emission
+        let _ = TELEMETRY_SENDER.set(sender.clone());
+
         // Initialize the transfer event channel for per-transfer telemetry
         let transfer_event_receiver = crate::transport::metrics::init_transfer_event_channel();
 
@@ -167,15 +198,25 @@ impl NetEventRegister for TelemetryReporter {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(
+        &mut self,
+        tx: Transaction,
+        op_type: &str,
+        target_peer: Option<String>,
+    ) -> BoxFuture<'_, ()> {
         let sender = self.sender.clone();
+        let op_type = op_type.to_string();
         async move {
             let event = TelemetryEvent {
                 timestamp: current_timestamp_ms(),
                 peer_id: String::new(),
                 transaction_id: tx.to_string(),
                 event_type: "timeout".to_string(),
-                event_data: serde_json::json!({"transaction": tx.to_string()}),
+                event_data: serde_json::json!({
+                    "transaction": tx.to_string(),
+                    "op_type": op_type,
+                    "target_peer": target_peer,
+                }),
             };
             let _ = sender.try_send(TelemetryCommand::Event(event));
         }
@@ -1294,11 +1335,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
         EventKind::Ignored => {
             serde_json::json!({"type": "ignored"})
         }
-        EventKind::Timeout { id, timestamp } => {
+        EventKind::Timeout {
+            id,
+            timestamp,
+            op_type,
+            target_peer,
+        } => {
             serde_json::json!({
                 "type": "timeout",
                 "id": id.to_string(),
                 "timestamp": timestamp,
+                "op_type": op_type,
+                "target_peer": target_peer,
             })
         }
         EventKind::Lifecycle(lifecycle_event) => {
@@ -1549,5 +1597,49 @@ mod tests {
         assert!(json["to_peer"].is_string());
         assert_eq!(json["state_size"], 1024);
         assert_eq!(json["timestamp"], 67890);
+    }
+
+    #[test]
+    fn test_event_kind_to_json_timeout_enriched() {
+        use crate::message::Transaction;
+
+        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
+        let event = EventKind::Timeout {
+            id: tx,
+            timestamp: 99999,
+            op_type: "get".to_string(),
+            target_peer: Some("peer-abc-123".to_string()),
+        };
+
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "timeout");
+        assert_eq!(json["timestamp"], 99999);
+        assert_eq!(json["op_type"], "get");
+        assert_eq!(json["target_peer"], "peer-abc-123");
+
+        // Test with no target peer
+        let event_no_peer = EventKind::Timeout {
+            id: tx,
+            timestamp: 88888,
+            op_type: "put".to_string(),
+            target_peer: None,
+        };
+        let json2 = event_kind_to_json(&event_no_peer);
+        assert_eq!(json2["op_type"], "put");
+        assert!(json2["target_peer"].is_null());
+    }
+
+    #[test]
+    fn test_send_standalone_event_no_panic_without_init() {
+        // When telemetry is not initialized, send_standalone_event should silently drop
+        send_standalone_event(
+            "subscription_renewal_outcome",
+            serde_json::json!({
+                "contract": "test-contract",
+                "outcome": "success",
+                "error": null,
+            }),
+        );
+        // No panic = success
     }
 }
