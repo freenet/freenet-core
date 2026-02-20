@@ -2713,8 +2713,8 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 /// If the NoChange bug is present, gateway would still have the old state
 /// because the UPDATE broadcast would be skipped.
 // Test configuration values:
-// - timeout_secs: 180s to account for slow CI environments and network propagation delays
-// - startup_wait_secs: 15s to allow nodes to fully start and establish connections
+// - timeout_secs: 300s to account for slow CI environments and network propagation delays
+// - startup_wait_secs: 30s timeout for health check (waits for WS + network join)
 // - tokio_worker_threads: 4 to provide adequate concurrency for multi-node test
 #[freenet_test(
     health_check_readiness = true,
@@ -2740,10 +2740,6 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 
     tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
-
-    // Additional wait for peer-to-gateway connection to stabilize after startup_wait_secs.
-    // This helps avoid race conditions in CI where connection establishment may take longer.
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
     let uri_peer_a = peer_a.ws_url();
