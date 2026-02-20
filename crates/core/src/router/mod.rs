@@ -297,13 +297,7 @@ impl Router {
             return Err(RoutingError::InsufficientDataError);
         }
 
-        let time_to_response_start_estimate = self
-            .response_start_time_estimator
-            .estimate_retrieval_time(peer, target_location)
-            .map_err(|source| RoutingError::EstimationError {
-                estimation: "start time",
-                source,
-            })?;
+        // Failure estimator is required — it has data from all outcome types
         let failure_estimate = self
             .failure_estimator
             .estimate_retrieval_time(peer, target_location)
@@ -311,28 +305,43 @@ impl Router {
                 estimation: "failure",
                 source,
             })?;
-        let transfer_rate_estimate = self
+
+        // Timing estimators are optional — they only get data from timed GET successes
+        // which are rare (~4% of operations). Use .ok() to gracefully degrade.
+        let time_estimate = self
+            .response_start_time_estimator
+            .estimate_retrieval_time(peer, target_location)
+            .ok();
+        let transfer_estimate = self
             .transfer_rate_estimator
             .estimate_retrieval_time(peer, target_location)
-            .map_err(|source| RoutingError::EstimationError {
-                estimation: "transfer rate",
-                source,
-            })?;
+            .ok();
 
-        // This is a fairly naive approach, assuming that the cost of a failure is a multiple
-        // of the cost of success.
         let failure_cost_multiplier = 3.0;
 
-        let expected_total_time = time_to_response_start_estimate
-            + (self.mean_transfer_size.compute() / transfer_rate_estimate)
-            + (time_to_response_start_estimate * failure_estimate * failure_cost_multiplier);
+        let (expected_total_time, time_to_response_start, xfer_speed) =
+            match (time_estimate, transfer_estimate) {
+                (Some(time), Some(rate)) => {
+                    // Full prediction with timing data
+                    let total = time
+                        + (self.mean_transfer_size.compute() / rate)
+                        + (time * failure_estimate * failure_cost_multiplier);
+                    (total, time, rate)
+                }
+                _ => {
+                    // Failure-only prediction: use failure probability as cost.
+                    // This still differentiates peers with different failure rates.
+                    let total = failure_estimate * failure_cost_multiplier;
+                    (total, 0.0, 0.0)
+                }
+            };
 
         Ok(RoutingPrediction {
             failure_probability: failure_estimate,
             xfer_speed: TransferSpeed {
-                bytes_per_second: transfer_rate_estimate,
+                bytes_per_second: xfer_speed,
             },
-            time_to_response_start: time_to_response_start_estimate,
+            time_to_response_start,
             expected_total_time,
         })
     }
@@ -344,7 +353,7 @@ impl Router {
         target_location: Location,
         k: usize,
     ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
-        let total_routing_events = self.response_start_time_estimator.len();
+        let total_routing_events = self.failure_estimator.len();
 
         if k == 0 {
             return (
@@ -982,17 +991,17 @@ mod tests {
         );
     }
 
-    /// When the failure_estimator has enough events but response_start_time_estimator
-    /// does not (all failures, no successes), predictions fail for all candidates.
-    /// The router should fall back to distance-based selection instead of returning empty.
+    /// When the failure_estimator has enough events but timing estimators do not
+    /// (all failures, no timed successes), the router should still use prediction-based
+    /// routing using failure probability alone — not fall back to distance-based.
     #[test]
-    fn test_fallback_when_all_predictions_fail() {
+    fn test_prediction_works_with_failure_only_data() {
         let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
         let contract_location = Location::random();
 
-        // 50 failures, 0 successes: failure_estimator has 50 events,
-        // but response_start_time_estimator has 0
-        let events: Vec<RouteEvent> = (0..50)
+        // 60 failures spread across peers: failure_estimator has data,
+        // but timing estimators have 0 events
+        let events: Vec<RouteEvent> = (0..60)
             .map(|i| RouteEvent {
                 peer: peers[i % peers.len()].clone(),
                 contract_location,
@@ -1001,33 +1010,27 @@ mod tests {
             .collect();
 
         let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+
+        // Predictions should succeed using failure probability alone
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        assert!(!selected.is_empty());
         assert!(
-            router.has_sufficient_routing_events(),
-            "50 failure events should meet threshold"
+            matches!(decision.strategy, RoutingStrategy::PredictionBased),
+            "Router should use predictions with failure-only data, got {:?}",
+            decision.strategy
         );
 
-        // select_peer should still return a result via distance-based fallback
-        let selected = router.select_peer(&peers, contract_location);
-        assert!(
-            selected.is_some(),
-            "Router should fall back to distance-based selection when predictions fail"
-        );
-
-        // The selected peer should be one of the closest to the contract
-        let selected_distance = selected
-            .unwrap()
-            .location()
-            .unwrap()
-            .distance(contract_location);
-        for peer in &peers {
-            if *peer != *selected.unwrap() {
-                // Not all peers need to be farther (router picks from top 2),
-                // but the selected should be among the closest
-                let _ = peer.location().unwrap().distance(contract_location);
-            }
+        // All candidates should have predictions (not None)
+        for candidate in &decision.candidates {
+            assert!(
+                candidate.prediction.is_some(),
+                "Each candidate should have a prediction from failure data"
+            );
         }
-        // Basic sanity: distance should be in valid range
-        assert!(selected_distance.as_f64() >= 0.0 && selected_distance.as_f64() <= 0.5);
     }
 
     /// Verify that `SuccessUntimed` feeds the failure_estimator (as 0.0 = success)
@@ -1112,5 +1115,128 @@ mod tests {
         // timing estimators: 0 (SuccessUntimed has no timing data, Failure has none either)
         assert_eq!(router.response_start_time_estimator.len(), 0);
         assert_eq!(router.transfer_rate_estimator.len(), 0);
+    }
+
+    /// With mixed untimed successes and failures (realistic post-#3137 scenario),
+    /// the router should use failure probability to prefer low-failure peers.
+    #[test]
+    fn test_failure_only_differentiates_peers() {
+        let good_peer = PeerKeyLocation::random();
+        let bad_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut events = Vec::new();
+
+        // Good peer: 30 untimed successes, 0 failures → 0% failure rate
+        for _ in 0..30 {
+            events.push(RouteEvent {
+                peer: good_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+
+        // Bad peer: 0 successes, 30 failures → 100% failure rate
+        for _ in 0..30 {
+            events.push(RouteEvent {
+                peer: bad_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+        // No timing data at all
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+
+        // Router should prefer the good peer via failure-probability prediction
+        let peers = vec![good_peer.clone(), bad_peer.clone()];
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionBased
+        ));
+        assert_eq!(
+            *selected[0], good_peer,
+            "Router should prefer the low-failure peer when using failure-only predictions"
+        );
+
+        // Verify the good peer has lower expected_total_time
+        let predictions: Vec<_> = decision
+            .candidates
+            .iter()
+            .filter_map(|c| c.prediction.as_ref())
+            .collect();
+        assert_eq!(predictions.len(), 2);
+        // The selected (first) candidate should have lower expected_total_time
+        let first = &decision.candidates[0];
+        let second = &decision.candidates[1];
+        assert!(
+            first.prediction.as_ref().unwrap().expected_total_time
+                <= second.prediction.as_ref().unwrap().expected_total_time,
+            "Selected peer should have lower expected_total_time"
+        );
+    }
+
+    /// With sparse timed success data (only a few GETs succeed), the router should
+    /// still produce predictions — using failure data for all peers and timing data
+    /// where available.
+    #[test]
+    fn test_sparse_timed_success_data() {
+        let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+        let contract_location = Location::random();
+
+        let mut events = Vec::new();
+
+        // 40 untimed successes across peers
+        for i in 0..40 {
+            events.push(RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+
+        // 10 failures
+        for i in 0..10 {
+            events.push(RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        // Only 3 timed successes (below MIN_POINTS_FOR_REGRESSION=5)
+        for peer in peers.iter().take(3) {
+            events.push(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            });
+        }
+
+        let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+        // Timing estimators have < 5 points
+        assert!(router.response_start_time_estimator.len() < 5);
+        assert!(router.transfer_rate_estimator.len() < 5);
+
+        // Router should still make predictions using failure data
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        assert!(!selected.is_empty());
+        assert!(
+            matches!(decision.strategy, RoutingStrategy::PredictionBased),
+            "Router should use failure-only predictions when timing data is sparse, got {:?}",
+            decision.strategy
+        );
     }
 }
