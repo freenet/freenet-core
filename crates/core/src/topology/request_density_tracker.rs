@@ -220,7 +220,6 @@ impl DensityMap {
     ///
     /// MIN_DISTANCE (0.001) prevents division-by-near-zero for candidates very close
     /// to `my_location`.
-    #[allow(dead_code)]
     pub fn get_max_density_weighted(
         &self,
         my_location: Location,

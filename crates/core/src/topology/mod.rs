@@ -5,12 +5,22 @@
 //!
 //! ## Connection Target Selection
 //!
-//! All new connections target locations sampled from **Kleinberg's 1/d distribution** centered
-//! on the peer's own ring location. This produces ~59% short-distance connections with a long
-//! tail for routing reachability — proven optimal for O(log²N) greedy routing on a ring.
+//! New connections use **hybrid targeting**: a mix of Kleinberg 1/d targets (for small-world
+//! routing reachability) and density-weighted targets (for connecting toward active contracts).
 //!
-//! The sampling uses inverse CDF: `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1),
-//! producing samples uniform in log-distance space. See `small_world_rand::kleinberg_target`.
+//! - **Kleinberg targets** (~50%): sampled from the 1/d distribution centered on the peer's
+//!   own location, producing ~59% short-distance connections with a long tail.
+//! - **Density-weighted targets** (~50%): biased toward ring locations with high request
+//!   density (where contracts exist), using stochastic score-proportional sampling.
+//!
+//! The density-weighted fraction is controlled by `DENSITY_TARGET_FRACTION`. When density
+//! data is unavailable (e.g., during early bootstrap with no requests yet), all targets
+//! automatically fall back to Kleinberg.
+//!
+//! This hybrid approach is critical for subscription tree formation: subscribe operations
+//! route toward contract locations and need connected peers along the path. Pure Kleinberg
+//! targeting (without density awareness) caused subscribe success rates to collapse from
+//! 92% to 24% (#3138).
 //!
 //! When the peer's own location is unknown (during very early bootstrap), random locations
 //! are used as a fallback.
@@ -39,6 +49,7 @@
 //! 2. Remove the peer with the worst ratio (least useful for bandwidth consumed)
 //! 3. Fallback: if no peer qualifies, remove the most distant peer on the ring
 
+use crate::config::GlobalRng;
 use crate::{message::TransactionType, ring::Location};
 use connection_evaluator::ConnectionEvaluator;
 use meter::Meter;
@@ -66,8 +77,9 @@ use request_density_tracker::DensityMapError;
 
 /// Manages peer connection topology: adding, removing, and evaluating connections.
 ///
-/// New connection targets are sampled from Kleinberg's 1/d distribution centered
-/// on the peer's own ring location (see [`small_world_rand::kleinberg_target`]).
+/// New connection targets use hybrid selection: a mix of Kleinberg 1/d targets
+/// (for small-world routing) and density-weighted targets (for connecting toward
+/// active contracts). See [`DENSITY_TARGET_FRACTION`] for the mixing ratio.
 ///
 /// The manager uses a [`ConnectionEvaluator`] to evaluate whether an incoming
 /// connection candidate is better than all other candidates seen within a time
@@ -314,8 +326,8 @@ impl TopologyManager {
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///
-    /// When adding connections, targets are always sampled from Kleinberg's 1/d
-    /// distribution centered on own location (see `small_world_rand::kleinberg_target`).
+    /// When adding connections, targets use hybrid selection: a mix of Kleinberg
+    /// 1/d and density-weighted targets. See `sample_targets` for details.
     /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
@@ -327,7 +339,7 @@ impl TopologyManager {
         // Below min_connections: add connections to reach the minimum.
         if current_connections < self.limits.min_connections {
             let needed = self.limits.min_connections - current_connections;
-            let locations = Self::sample_targets(my_location, needed);
+            let locations = self.sample_targets(my_location, needed);
             return TopologyAdjustment::AddConnections(locations);
         }
 
@@ -355,7 +367,7 @@ impl TopologyManager {
                     "Resource usage below threshold, adding connection"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                let locations = Self::sample_targets(my_location, 1);
+                let locations = self.sample_targets(my_location, 1);
                 Ok(TopologyAdjustment::AddConnections(locations))
             } else if usage_proportion > decrease_usage_if_above {
                 if current_connections <= self.limits.min_connections {
@@ -404,13 +416,32 @@ impl TopologyManager {
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
     }
 
-    /// Sample `count` target locations using Kleinberg 1/d distribution.
+    /// Sample `count` target locations using hybrid selection: a mix of
+    /// density-weighted targets and Kleinberg 1/d targets.
+    ///
+    /// Each target has `DENSITY_TARGET_FRACTION` probability of using
+    /// density-weighted selection (biased toward high-request-density locations).
+    /// If density data is unavailable or the density query fails, the target
+    /// falls back to Kleinberg automatically.
+    ///
     /// Falls back to random locations if own location is unknown.
-    fn sample_targets(my_location: &Option<Location>, count: usize) -> Vec<Location> {
+    fn sample_targets(&self, my_location: &Option<Location>, count: usize) -> Vec<Location> {
         match my_location {
-            Some(loc) => (0..count)
-                .map(|_| small_world_rand::kleinberg_target(*loc))
-                .collect(),
+            Some(loc) => {
+                let density_map = self.cached_density_map.get();
+                (0..count)
+                    .map(|_| {
+                        if let Some(dm) = density_map {
+                            if GlobalRng::random_bool(DENSITY_TARGET_FRACTION) {
+                                if let Ok(target) = dm.get_max_density_weighted(*loc) {
+                                    return target;
+                                }
+                            }
+                        }
+                        small_world_rand::kleinberg_target(*loc)
+                    })
+                    .collect()
+            }
             None => (0..count).map(|_| Location::random()).collect(),
         }
     }
@@ -1045,6 +1076,101 @@ mod tests {
         assert_eq!(
             topology_manager.limits.max_downstream_bandwidth,
             Rate::new_per_second(2000.0)
+        );
+    }
+
+    // Test that when density data is available, some targets are density-weighted
+    // (biased toward high-density locations) rather than pure Kleinberg.
+    #[test_log::test]
+    fn test_hybrid_targeting_uses_density_when_available() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
+        let mut topology_manager = setup_topology_manager(1000.0);
+        topology_manager.update_limits(Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 10,
+        });
+
+        // Create neighbors spread around the ring
+        let mut current_neighbors = BTreeMap::new();
+        for i in 0..10 {
+            current_neighbors.insert(Location::new(i as f64 / 10.0), vec![]);
+        }
+
+        // Cluster requests heavily around location 0.75 — this creates a density
+        // hotspot that density-weighted targeting should preferentially connect toward.
+        let my_location = Location::new(0.1);
+        let hotspot = Location::new(0.75);
+        for _ in 0..2000 {
+            topology_manager.record_request(
+                PeerKeyLocation::random(),
+                hotspot,
+                TransactionType::Subscribe,
+            );
+        }
+
+        topology_manager
+            .cached_density_map
+            .set(
+                &topology_manager.request_density_tracker,
+                &current_neighbors,
+            )
+            .unwrap();
+
+        // Sample many targets and count how many land near the density hotspot.
+        // The hotspot at 0.75 is at ring distance 0.35 from my_location (0.1).
+        // With pure Kleinberg centered at 0.1, only ~7.5% of targets land within
+        // 0.1 of 0.75. With 50% density targeting, this should jump to ~35-40%.
+        let mut near_hotspot = 0;
+        let trials = 500;
+        for _ in 0..trials {
+            let targets = topology_manager.sample_targets(&Some(my_location), 1);
+            if hotspot.distance(targets[0]).as_f64() < 0.1 {
+                near_hotspot += 1;
+            }
+        }
+
+        // Pure Kleinberg baseline: ~7.5% near hotspot (i.e., ~37 out of 500).
+        // With density targeting: should be well above that.
+        // Use 15% threshold (75 out of 500) — comfortably above Kleinberg's 7.5%.
+        assert!(
+            near_hotspot > trials * 15 / 100,
+            "Expected density-weighted targets toward hotspot at 0.75, \
+             but only {near_hotspot}/{trials} landed within 0.1 of it. \
+             Pure Kleinberg baseline would be ~{}, suggesting density targeting isn't working.",
+            trials * 75 / 1000
+        );
+    }
+
+    // Test that without density data, all targets are Kleinberg (no panic or error).
+    #[test_log::test]
+    fn test_hybrid_targeting_falls_back_without_density() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_1234);
+        let topology_manager = setup_topology_manager(1000.0);
+        let my_location = Location::new(0.5);
+
+        // No density data set — sample_targets should fall back to pure Kleinberg
+        let targets = topology_manager.sample_targets(&Some(my_location), 20);
+        assert_eq!(targets.len(), 20);
+
+        // All should be valid ring locations
+        for loc in &targets {
+            let val = loc.as_f64();
+            assert!(
+                (0.0..1.0).contains(&val),
+                "Location {val} outside valid ring range"
+            );
+        }
+
+        // Should still show Kleinberg's short-distance bias
+        let short_count = targets
+            .iter()
+            .filter(|loc| my_location.distance(**loc).as_f64() < 0.1)
+            .count();
+        assert!(
+            short_count > 5,
+            "Expected short-distance bias from Kleinberg fallback, got {short_count}/20 close"
         );
     }
 
