@@ -1915,3 +1915,680 @@ async fn test_closed_handshake_stream_no_spin() {
         other => panic!("Expected Notification(Some(_)), got {:?}", other),
     }
 }
+
+// =============================================================================
+// Anti-starvation tests (issue #3074)
+// =============================================================================
+
+/// Helper: create a dummy notification message
+fn dummy_notif_msg() -> Either<NetMessage, NodeEvent> {
+    Either::Left(NetMessage::V1(crate::message::NetMessageV1::Aborted(
+        crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+    )))
+}
+
+/// Helper: create a dummy client transaction tuple
+fn dummy_client_tx() -> (ClientId, WaitingTransaction) {
+    let client_id = crate::client_events::ClientId::next();
+    let waiting_tx = crate::contract::WaitingTransaction::Transaction(Transaction::new::<
+        crate::operations::put::PutMsg,
+    >());
+    (client_id, waiting_tx)
+}
+
+/// Helper: drain all ready messages from a PrioritySelectStream synchronously.
+/// Pre-fills channels then polls until Pending. Returns the event names in order.
+async fn drain_stream<H, C, E>(
+    stream: &mut Pin<&mut PrioritySelectStream<H, C, E>>,
+    max_items: usize,
+) -> Vec<&'static str>
+where
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
+    C: Stream<Item = (ClientId, WaitingTransaction)> + Unpin,
+    E: Stream<Item = Transaction> + Unpin,
+{
+    use futures::StreamExt;
+    let mut events = Vec::new();
+    for _ in 0..max_items {
+        match timeout(Duration::from_millis(50), stream.as_mut().next()).await {
+            Ok(Some(ref r)) => {
+                let name = match r {
+                    SelectResult::Notification(Some(_)) => "notification",
+                    SelectResult::OpExecution(Some(_)) => "op_execution",
+                    SelectResult::PeerConnection(Some(_)) => "peer_connection",
+                    SelectResult::ConnBridge(Some(_)) => "conn_bridge",
+                    SelectResult::Handshake(Some(_)) => "handshake",
+                    SelectResult::NodeController(Some(_)) => "node_controller",
+                    SelectResult::ClientTransaction(Ok(_)) => "client_transaction",
+                    SelectResult::ExecutorTransaction(Ok(_)) => "executor_transaction",
+                    // Channel closures — skip
+                    _ => continue,
+                };
+                events.push(name);
+            }
+            _ => break,
+        }
+    }
+    events
+}
+
+/// Test 1: P7 is serviced under sustained P1 load.
+/// Pre-fill 100 P1 (notification) messages and 10 P7 (client tx) messages.
+/// Verify P7 appears interleaved, not all at the end.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_p7_serviced_under_load() {
+    const P1_COUNT: usize = 100;
+    const P7_COUNT: usize = 10;
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(P7_COUNT + 10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    // Pre-fill channels
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..P7_COUNT {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    // Drop senders so channels close after draining
+    drop(notif_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, P1_COUNT + P7_COUNT + 20).await;
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    let total_client = events
+        .iter()
+        .filter(|&&e| e == "client_transaction")
+        .count();
+
+    assert_eq!(total_notif, P1_COUNT, "All P1 messages received");
+    assert_eq!(total_client, P7_COUNT, "All P7 messages received");
+
+    // The first P7 message must appear no later than burst + 1 (0-indexed position burst)
+    let first_p7_idx = events
+        .iter()
+        .position(|&e| e == "client_transaction")
+        .expect("P7 messages must exist");
+
+    assert!(
+        first_p7_idx <= burst,
+        "First P7 message at index {} but should be at most {} (MAX_HIGH_PRIORITY_BURST)",
+        first_p7_idx,
+        burst
+    );
+
+    // Verify P7 messages are NOT all clustered at the end
+    let last_p7_idx = events
+        .iter()
+        .rposition(|&e| e == "client_transaction")
+        .unwrap();
+    let last_notif_idx = events.iter().rposition(|&e| e == "notification").unwrap();
+
+    // At least one P7 message must appear before the last notification
+    assert!(
+        first_p7_idx < last_notif_idx,
+        "P7 messages should be interleaved with P1, not all at the end"
+    );
+
+    tracing::info!(
+        "Anti-starvation: first P7 at index {}, last P7 at {}, last P1 at {}",
+        first_p7_idx,
+        last_p7_idx,
+        last_notif_idx
+    );
+}
+
+/// Test 2: After exactly MAX_HIGH_PRIORITY_BURST P1 messages, P7 is serviced next.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_counter_reset_on_tier2() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let p1_count = burst + 1; // One more than burst limit
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    // Pre-fill: burst+1 P1 messages and 1 P7 message
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    client_tx.send(dummy_client_tx()).await.unwrap();
+
+    drop(notif_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, p1_count + 10).await;
+
+    // The P7 message must appear at exactly index `burst` (after `burst` P1 messages)
+    assert_eq!(
+        events.get(burst),
+        Some(&"client_transaction"),
+        "P7 should appear at index {} (right after {} consecutive P1 items), got events: {:?}",
+        burst,
+        burst,
+        &events[..std::cmp::min(events.len(), burst + 3)]
+    );
+}
+
+/// Test 3: Under burst limit, strict priority is preserved.
+/// With fewer than MAX_HIGH_PRIORITY_BURST P1 messages, all P1 come before any P7.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_preserves_priority_under_burst_limit() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let p1_count = 20; // Well under the burst limit
+    let p7_count = 5;
+    assert!(p1_count < burst, "Test requires P1 count < burst limit");
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(p7_count + 10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..p7_count {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    drop(notif_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, p1_count + p7_count + 10).await;
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    let total_client = events
+        .iter()
+        .filter(|&&e| e == "client_transaction")
+        .count();
+
+    assert_eq!(total_notif, p1_count);
+    assert_eq!(total_client, p7_count);
+
+    // All P1 must come before any P7
+    let last_notif = events.iter().rposition(|&e| e == "notification").unwrap();
+    let first_client = events
+        .iter()
+        .position(|&e| e == "client_transaction")
+        .unwrap();
+
+    assert!(
+        last_notif < first_client,
+        "Under burst limit, all P1 (last at {}) should precede all P7 (first at {})",
+        last_notif,
+        first_client
+    );
+}
+
+/// Test 4: When burst threshold is reached but P7/P8 are both Pending,
+/// P1-P6 resume normally without blocking.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_force_poll_tier2_pending_falls_through() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let p1_count = burst * 2; // Double the burst limit
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    drop(notif_tx);
+
+    // Use always-Pending mock streams for P7/P8
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientStream,   // Always Pending
+        MockExecutorStream, // Always Pending
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    // Wrap the entire drain in a timeout to catch hangs caused by
+    // force-poll blocking when Tier-2 channels are Pending.
+    let events = timeout(Duration::from_secs(5), async {
+        drain_stream(&mut stream, p1_count + 10).await
+    })
+    .await
+    .expect("drain_stream should complete within 5s — force-poll must not block on Pending Tier-2");
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    assert_eq!(
+        total_notif, p1_count,
+        "All {} P1 messages should be received even when P7/P8 are always Pending",
+        p1_count
+    );
+}
+
+/// Test 5: Mixed scenario where P7 is closed but P8 is open-and-Pending.
+/// When force-poll fires, it should skip P7 (closed) and try P8 (Pending),
+/// then fall through to normal priority polling without blocking.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_mixed_p7_closed_p8_pending() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let p1_count = burst * 2;
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+
+    // P7: create channel and immediately close sender so stream yields None
+    let (client_tx, client_rx) = mpsc::channel::<(ClientId, WaitingTransaction)>(1);
+    drop(client_tx);
+
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    drop(notif_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx }, // Closed immediately
+        MockExecutorStream,                         // Always Pending
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = timeout(Duration::from_secs(5), async {
+        drain_stream(&mut stream, p1_count + 10).await
+    })
+    .await
+    .expect("drain_stream should complete — mixed closed/pending Tier-2 must not block");
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    assert_eq!(
+        total_notif, p1_count,
+        "All {} P1 messages should be received with P7 closed and P8 Pending",
+        p1_count
+    );
+}
+
+// =============================================================================
+// High-load fairness stress test (issue #3074)
+// =============================================================================
+
+/// High-load deterministic fairness test: pre-fill many channels and verify
+/// that P7 (client transaction) messages are interleaved throughout, not starved.
+/// Uses multiple configurations to stress different scenarios.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_high_load_fairness() {
+    // Config 1: Heavy P1 load, moderate P7
+    test_high_load_fairness_config(500, 200, 150, 100, 200, 50).await;
+    // Config 2: Spread across all tier-1 channels
+    test_high_load_fairness_config(100, 100, 100, 100, 150, 30).await;
+    // Config 3: Heavy single tier-1 channel, many P7
+    test_high_load_fairness_config(800, 0, 0, 0, 300, 10).await;
+    // Config 4: Minimal tier-2 (edge case)
+    test_high_load_fairness_config(200, 200, 100, 100, 5, 2).await;
+}
+
+async fn test_high_load_fairness_config(
+    n_notif: usize,
+    n_op: usize,
+    n_bridge: usize,
+    n_node: usize,
+    n_client: usize,
+    n_executor: usize,
+) {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    let total_tier1 = n_notif + n_op + n_bridge + n_node;
+    let total_tier2 = n_client + n_executor;
+    let total = total_tier1 + total_tier2;
+
+    let tiers = run_prefilled_stream(n_notif, n_op, n_bridge, n_node, n_client, n_executor).await;
+
+    // Completeness
+    assert_eq!(
+        tiers.len(),
+        total,
+        "config=({n_notif},{n_op},{n_bridge},{n_node},{n_client},{n_executor}): expected {total} items, got {}",
+        tiers.len()
+    );
+
+    let recv_tier1 = tiers.iter().filter(|&&t| !t).count();
+    let recv_tier2 = tiers.iter().filter(|&&t| t).count();
+    assert_eq!(recv_tier1, total_tier1, "tier-1 count mismatch");
+    assert_eq!(recv_tier2, total_tier2, "tier-2 count mismatch");
+
+    if total_tier2 == 0 || total_tier1 == 0 {
+        return;
+    }
+
+    // Bounded latency: first tier-2 appears within burst+1
+    let first_t2 = tiers.iter().position(|&t| t).unwrap();
+    assert!(
+        first_t2 <= burst,
+        "config=({n_notif},{n_op},{n_bridge},{n_node},{n_client},{n_executor}): first tier-2 at index {first_t2}, limit {burst}"
+    );
+
+    // Max gap: no run of tier-1-only items exceeding burst while tier-2 items are pending
+    let mut max_run = 0usize;
+    let mut current_run = 0usize;
+    let mut tier2_remaining = total_tier2;
+    for &is_t2 in &tiers {
+        if is_t2 {
+            tier2_remaining -= 1;
+            current_run = 0;
+        } else if tier2_remaining > 0 {
+            current_run += 1;
+            max_run = max_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    assert!(
+        max_run <= burst,
+        "config=({n_notif},{n_op},{n_bridge},{n_node},{n_client},{n_executor}): max tier-1 run {max_run} exceeds burst {burst}"
+    );
+
+    tracing::info!(
+        "config=({},{},{},{},{},{}): fairness OK — {} events, max tier-1 run={}",
+        n_notif,
+        n_op,
+        n_bridge,
+        n_node,
+        n_client,
+        n_executor,
+        total,
+        max_run
+    );
+}
+
+// =============================================================================
+// Property-based tests (issue #3074)
+// =============================================================================
+
+/// Helper: create a PrioritySelectStream from pre-filled channels and drain it,
+/// returning the event tier sequence (true = tier2, false = tier1).
+async fn run_prefilled_stream(
+    n_notif: usize,
+    n_op: usize,
+    n_bridge: usize,
+    n_node: usize,
+    n_client: usize,
+    n_executor: usize,
+) -> Vec<bool> {
+    let total = n_notif + n_op + n_bridge + n_node + n_client + n_executor;
+    if total == 0 {
+        return vec![];
+    }
+
+    let (notif_tx, notif_rx) = mpsc::channel(n_notif.max(1));
+    let (op_tx, op_rx) = mpsc::channel(n_op.max(1));
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (bridge_tx, bridge_rx) = mpsc::channel(n_bridge.max(1));
+    let (node_tx, node_rx) = mpsc::channel(n_node.max(1));
+    let (client_tx, client_rx) = mpsc::channel(n_client.max(1));
+    let (executor_tx, executor_rx) = mpsc::channel(n_executor.max(1));
+
+    for _ in 0..n_notif {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..n_op {
+        let msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+            crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+        ));
+        let (cb, _) = mpsc::channel(1);
+        op_tx.send((cb, msg)).await.unwrap();
+    }
+    for _ in 0..n_bridge {
+        bridge_tx
+            .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
+                cause: None,
+            }))
+            .await
+            .unwrap();
+    }
+    for _ in 0..n_node {
+        node_tx
+            .send(NodeEvent::Disconnect { cause: None })
+            .await
+            .unwrap();
+    }
+    for _ in 0..n_client {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    for _ in 0..n_executor {
+        executor_tx
+            .send(Transaction::new::<crate::operations::put::PutMsg>())
+            .await
+            .unwrap();
+    }
+
+    drop(notif_tx);
+    drop(op_tx);
+    drop(bridge_tx);
+    drop(node_tx);
+    drop(client_tx);
+    drop(executor_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let mut tiers = Vec::with_capacity(total);
+    use futures::StreamExt;
+
+    for _ in 0..(total * 3) {
+        match timeout(Duration::from_millis(50), stream.as_mut().next()).await {
+            Ok(Some(ref r)) => {
+                let tier = match r {
+                    SelectResult::Notification(Some(_)) => Some(false),
+                    SelectResult::OpExecution(Some(_)) => Some(false),
+                    SelectResult::PeerConnection(Some(_)) => Some(false),
+                    SelectResult::ConnBridge(Some(_)) => Some(false),
+                    SelectResult::Handshake(Some(_)) => Some(false),
+                    SelectResult::NodeController(Some(_)) => Some(false),
+                    SelectResult::ClientTransaction(Ok(_)) => Some(true),
+                    SelectResult::ExecutorTransaction(Ok(_)) => Some(true),
+                    _ => None, // Channel closure
+                };
+                if let Some(t) = tier {
+                    tiers.push(t);
+                }
+            }
+            _ => break,
+        }
+    }
+    tiers
+}
+
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Max consecutive tier-1 run when tier-2 items are pending.
+    /// In a pre-filled scenario, all items are immediately available,
+    /// so the max run should be bounded by MAX_HIGH_PRIORITY_BURST.
+    fn max_tier1_run_while_tier2_pending(tiers: &[bool], total_tier2: usize) -> usize {
+        if total_tier2 == 0 {
+            return 0;
+        }
+        let mut max_run = 0;
+        let mut current_run = 0;
+        let mut tier2_remaining = total_tier2;
+
+        for &is_t2 in tiers {
+            if is_t2 {
+                tier2_remaining -= 1;
+                current_run = 0;
+            } else if tier2_remaining > 0 {
+                // Only count tier-1 runs while there are still tier-2 items pending
+                current_run += 1;
+                max_run = max_run.max(current_run);
+            } else {
+                current_run = 0;
+            }
+        }
+        max_run
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// Property: no starvation under any load distribution.
+        /// Generates random channel counts and verifies:
+        /// 1. Completeness: all messages received
+        /// 2. Bounded latency: first tier-2 appears within burst+1
+        /// 3. No indefinite gap: max tier-1 run ≤ MAX_HIGH_PRIORITY_BURST
+        #[test]
+        fn proptest_no_starvation_under_any_load(
+            n_notif in 0usize..200,
+            n_op in 0usize..200,
+            n_bridge in 0usize..200,
+            n_node in 0usize..200,
+            n_client in 0usize..100,
+            n_executor in 0usize..100,
+        ) {
+            let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+            let total_tier1 = n_notif + n_op + n_bridge + n_node;
+            let total_tier2 = n_client + n_executor;
+            let total = total_tier1 + total_tier2;
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let tiers = rt.block_on(run_prefilled_stream(
+                n_notif, n_op, n_bridge, n_node, n_client, n_executor,
+            ));
+
+            // Property 1: Completeness
+            prop_assert_eq!(tiers.len(), total,
+                "Expected {} total messages, got {}", total, tiers.len());
+
+            let recv_tier1 = tiers.iter().filter(|&&t| !t).count();
+            let recv_tier2 = tiers.iter().filter(|&&t| t).count();
+            prop_assert_eq!(recv_tier1, total_tier1);
+            prop_assert_eq!(recv_tier2, total_tier2);
+
+            if total_tier2 > 0 {
+                // Property 2: Bounded latency — first tier-2 within burst+1
+                let first_t2 = tiers.iter().position(|&t| t).unwrap();
+                prop_assert!(first_t2 <= burst,
+                    "First tier-2 at index {} exceeds burst limit {}", first_t2, burst);
+
+                // Property 3: No indefinite gap
+                let max_run = max_tier1_run_while_tier2_pending(&tiers, total_tier2);
+                prop_assert!(max_run <= burst,
+                    "Max tier-1 run {} exceeds burst limit {}", max_run, burst);
+            }
+        }
+
+        /// Property: priority preserved when total tier-1 count < burst limit.
+        #[test]
+        fn proptest_priority_preserved_under_burst_limit(
+            n_notif in 0usize..8,
+            n_op in 0usize..8,
+            n_bridge in 0usize..8,
+            n_node in 0usize..8,
+            n_client in 0usize..50,
+            n_executor in 0usize..50,
+        ) {
+            let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+            let total_tier1 = n_notif + n_op + n_bridge + n_node;
+            let total_tier2 = n_client + n_executor;
+
+            // Only test when tier-1 count is under burst limit and both tiers have items
+            prop_assume!(total_tier1 < burst && total_tier1 > 0 && total_tier2 > 0);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let tiers = rt.block_on(run_prefilled_stream(
+                n_notif, n_op, n_bridge, n_node, n_client, n_executor,
+            ));
+
+            prop_assert_eq!(tiers.len(), total_tier1 + total_tier2);
+
+            // Under burst limit: all tier-1 must precede all tier-2
+            let last_tier1 = tiers.iter().rposition(|&t| !t);
+            let first_tier2 = tiers.iter().position(|&t| t);
+
+            if let (Some(last_t1), Some(first_t2)) = (last_tier1, first_tier2) {
+                prop_assert!(last_t1 < first_t2,
+                    "Under burst limit: last tier-1 at {} should precede first tier-2 at {}",
+                    last_t1, first_t2);
+            }
+        }
+    }
+}

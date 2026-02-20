@@ -1042,6 +1042,32 @@ impl ContractExecutor for Executor<Runtime> {
                     return Err(merge_err);
                 };
 
+                // Before assuming local state is corrupted, validate it. If the local
+                // state is valid, the merge failure is legitimate (e.g., the incoming
+                // state is older and the contract's merge function correctly rejected
+                // it). Only trigger recovery when the local state itself fails
+                // validation. See issue #3109.
+                let local_valid = self
+                    .runtime
+                    .validate_state(&key, &params, &current_state, &related_contracts)
+                    .map(|r| r == ValidateResult::Valid)
+                    .unwrap_or(false);
+
+                if local_valid {
+                    tracing::info!(
+                        contract = %key,
+                        error = %merge_err,
+                        local_state_size = current_state.size(),
+                        incoming_state_size = valid_incoming.size(),
+                        event = "merge_rejected_valid_local",
+                        "Merge rejected incoming state but local state is valid - \
+                         not replacing (incoming state may be stale)"
+                    );
+                    return Err(merge_err);
+                }
+
+                // Local state failed validation — it's likely corrupted.
+
                 // Check and mark recovery in a single lock acquisition.
                 let already_recovered = {
                     let mut guard = self
@@ -1075,8 +1101,8 @@ impl ContractExecutor for Executor<Runtime> {
                     error = %merge_err,
                     incoming_state_size = valid_incoming.size(),
                     event = "corrupted_state_recovery",
-                    "Merge failed with validated incoming state - local state likely corrupted, \
-                     replacing with incoming state"
+                    "Merge failed with validated incoming state and local state is invalid - \
+                     replacing corrupted local state with incoming state"
                 );
 
                 recovery_performed = true;

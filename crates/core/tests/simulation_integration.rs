@@ -25,7 +25,8 @@ use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -276,6 +277,80 @@ impl TestConfig {
             seed: self.seed,
             name: self.name,
             simulation_result: result,
+            convergence,
+            event_count,
+            require_convergence: self.require_convergence,
+            logs_handle,
+        }
+    }
+
+    /// Run the simulation using the direct runner (single-threaded paused-time runtime).
+    ///
+    /// This avoids turmoil's O(n²) link overhead, making it suitable for large-scale
+    /// or long-running simulations.
+    ///
+    /// Note: Does not support mid-simulation fault injection (partitions, crashes).
+    /// Static latency jitter via `FaultConfig` is supported.
+    #[allow(dead_code)] // Used by nightly_tests-gated tests
+    fn run_direct(self) -> TestResult {
+        use freenet::simulation::FaultConfig;
+
+        setup_deterministic_state(self.seed);
+        let rt = create_runtime();
+
+        let (sim, logs_handle) = rt.block_on(async {
+            let mut sim = SimNetwork::new(
+                self.name,
+                self.gateways,
+                self.nodes,
+                self.ring_max_htl,
+                self.rnd_if_htl_above,
+                self.max_connections,
+                self.min_connections,
+                self.seed,
+            )
+            .await;
+
+            // Apply latency jitter if configured
+            if let Some(ref latency) = self.latency_range {
+                let fault_config = FaultConfig::builder()
+                    .latency_range(latency.clone())
+                    .build();
+                sim.with_fault_injection(fault_config);
+                tracing::info!(
+                    "Latency jitter enabled: {:?} - {:?}",
+                    latency.start,
+                    latency.end
+                );
+            }
+
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        drop(rt);
+
+        let direct_result = sim.run_simulation_direct::<rand::rngs::SmallRng>(
+            self.seed,
+            self.max_contracts,
+            self.iterations,
+            self.event_wait,
+        );
+
+        // Map anyhow::Result to turmoil::Result for TestResult compatibility
+        let simulation_result: turmoil::Result = match direct_result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Box::new(std::io::Error::other(e.to_string()))),
+        };
+
+        let rt = create_runtime();
+        let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+        let event_count = rt.block_on(async { logs_handle.lock().await.len() });
+
+        TestResult {
+            seed: self.seed,
+            name: self.name,
+            simulation_result,
             convergence,
             event_count,
             require_convergence: self.require_convergence,
@@ -627,6 +702,41 @@ fn create_runtime() -> tokio::runtime::Runtime {
 // STRICT Determinism Tests - Exact Event Equality
 // =============================================================================
 
+/// Compact fingerprint of a simulation trace for cross-run verification.
+///
+/// Provides a hash-based integrity check on top of field-by-field assertions.
+/// The fingerprint is logged so it can be compared across CI invocations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceFingerprint {
+    total_events: usize,
+    /// Hash of the full event sequence (order-sensitive).
+    sequence_hash: u64,
+    /// Hash of the per-type event counts (order-insensitive via BTreeMap).
+    counts_hash: u64,
+}
+
+impl TraceFingerprint {
+    fn from_events(events: &[String], event_counts: &HashMap<String, usize>) -> Self {
+        let mut seq_hasher = std::collections::hash_map::DefaultHasher::new();
+        for event in events {
+            event.hash(&mut seq_hasher);
+        }
+
+        let sorted_counts: BTreeMap<&String, &usize> = event_counts.iter().collect();
+        let mut counts_hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in &sorted_counts {
+            k.hash(&mut counts_hasher);
+            v.hash(&mut counts_hasher);
+        }
+
+        TraceFingerprint {
+            total_events: events.len(),
+            sequence_hash: seq_hasher.finish(),
+            counts_hash: counts_hasher.finish(),
+        }
+    }
+}
+
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
 ///
 /// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.
@@ -643,9 +753,9 @@ fn create_runtime() -> tokio::runtime::Runtime {
 ///
 /// **Scale:** Uses 2 gateways + 18 nodes to catch DashMap iteration non-determinism
 /// that only manifests at scale (e.g., in subscription/interest management).
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_strict_determinism_exact_event_equality() {
     const SEED: u64 = 0xDE7E_2A1E_1234;
 
@@ -798,18 +908,26 @@ fn test_strict_determinism_exact_event_equality() {
         assert_eq!(e2, e3, "Event sequence differs at index {}!", i);
     }
 
+    // Fingerprint verification: compact hash check for cross-run integrity
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "STRICT DETERMINISM TEST PASSED: {} events matched exactly across 3 runs",
-        trace1.total_events
+        "STRICT DETERMINISM TEST PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 
 /// **STRICT** determinism test with MULTIPLE GATEWAYS.
 ///
 /// This test verifies that simulations with 2+ gateways remain deterministic.
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_strict_determinism_multi_gateway() {
     const SEED: u64 = 0xAB17_6A7E_1234;
 
@@ -892,9 +1010,17 @@ fn test_strict_determinism_multi_gateway() {
         assert_eq!(e2, e3, "Event sequence differs at index {}!", i);
     }
 
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events (2 gateways)",
-        trace1.total_events
+        "MULTI-GATEWAY DETERMINISM TEST PASSED: {} events (2 gateways), fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 
@@ -958,9 +1084,18 @@ fn test_deterministic_replay_events() {
     assert_eq!(trace1.event_counts, trace2.event_counts);
     assert_eq!(trace1.total_events, trace2.total_events);
 
+    // Fingerprint verification (counts-only since this test doesn't track sequence)
+    let fp1 = TraceFingerprint::from_events(&[], &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&[], &trace2.event_counts);
+    assert_eq!(
+        fp1.counts_hash, fp2.counts_hash,
+        "Counts fingerprint mismatch between replay runs"
+    );
+
     tracing::info!(
-        "Deterministic replay test passed - {} events",
-        trace1.total_events
+        "Deterministic replay test passed - {} events, counts_hash={:#018x}",
+        trace1.total_events,
+        fp1.counts_hash
     );
 }
 
@@ -1086,9 +1221,9 @@ fn dense_network_replication() {
 // =============================================================================
 
 /// Verify that running the same simulation twice produces identical results.
-// FIXME(#3051): Passes in isolation but fails in full parallel suite due to DashMap state leak
+///
+/// Process isolation via nextest eliminates inter-test DashMap state leakage (#3051).
 #[test_log::test]
-#[ignore]
 fn test_turmoil_determinism_verification() {
     const SEED: u64 = 0xDE7E_2A11_0001;
 
@@ -1139,9 +1274,29 @@ fn test_turmoil_determinism_verification() {
         assert_eq!(e1, e2, "Event {} differs: {:?} vs {:?}", i, e1, e2);
     }
 
+    // Fingerprint verification
+    let counts1: HashMap<String, usize> = {
+        let mut m = HashMap::new();
+        for e in &events1 {
+            *m.entry(e.clone()).or_insert(0) += 1;
+        }
+        m
+    };
+    let counts2: HashMap<String, usize> = {
+        let mut m = HashMap::new();
+        for e in &events2 {
+            *m.entry(e.clone()).or_insert(0) += 1;
+        }
+        m
+    };
+    let fp1 = TraceFingerprint::from_events(&events1, &counts1);
+    let fp2 = TraceFingerprint::from_events(&events2, &counts2);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+
     tracing::info!(
-        "Determinism verified: {} identical events across runs",
-        events1.len()
+        "Determinism verified: {} identical events, fingerprint={:#018x}",
+        events1.len(),
+        fp1.sequence_hash
     );
 }
 
@@ -2320,6 +2475,31 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n6_g2_s3("crdt-6n-2gw-s3", 0x2773_0006_1003, 2, 6)]
 #[case::n6_g2_s4("crdt-6n-2gw-s4", 0x2773_0006_1004, 2, 6)]
 #[case::n6_g2_s5("crdt-6n-2gw-s5", 0x2773_0006_1005, 2, 6)]
+#[case::n4_g1_s1("crdt-4n-1gw-s1", 0x2773_0004_0001, 1, 4)]
+#[case::n4_g1_s2("crdt-4n-1gw-s2", 0x2773_0004_0002, 1, 4)]
+#[case::n4_g1_s3("crdt-4n-1gw-s3", 0x2773_0004_0003, 1, 4)]
+#[case::n4_g1_s4("crdt-4n-1gw-s4", 0x2773_0004_0004, 1, 4)]
+#[case::n4_g1_s5("crdt-4n-1gw-s5", 0x2773_0004_0005, 1, 4)]
+#[case::n5_g1_s1("crdt-5n-1gw-s1", 0x2773_0005_0008, 1, 5)]
+#[case::n5_g1_s2("crdt-5n-1gw-s2", 0x2773_0005_0002, 1, 5)]
+#[case::n5_g1_s3("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5)]
+#[case::n5_g1_s4("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5)]
+#[case::n5_g1_s5("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5)]
+#[case::n6_g1_s1("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6)]
+#[case::n6_g1_s2("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6)]
+#[case::n6_g1_s3("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6)]
+#[case::n6_g1_s4("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6)]
+#[case::n6_g1_s5("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6)]
+#[case::n7_g1_s1("crdt-7n-1gw-s1", 0x2773_0007_0001, 1, 7)]
+#[case::n7_g1_s2("crdt-7n-1gw-s2", 0x2773_0007_0002, 1, 7)]
+#[case::n7_g1_s3("crdt-7n-1gw-s3", 0x2773_0007_0003, 1, 7)]
+#[case::n7_g1_s4("crdt-7n-1gw-s4", 0x2773_0007_0010, 1, 7)]
+#[case::n7_g1_s5("crdt-7n-1gw-s5", 0x2773_0007_0005, 1, 7)]
+#[case::n8_g1_s1("crdt-8n-1gw-s1", 0x2773_0008_0001, 1, 8)]
+#[case::n8_g1_s2("crdt-8n-1gw-s2", 0x2773_0008_0002, 1, 8)]
+#[case::n8_g1_s3("crdt-8n-1gw-s3", 0x2773_0008_0003, 1, 8)]
+#[case::n8_g1_s4("crdt-8n-1gw-s4", 0x2773_0008_0004, 1, 8)]
+#[case::n8_g1_s5("crdt-8n-1gw-s5", 0x2773_0008_0005, 1, 8)]
 fn test_crdt_convergence(
     #[case] name: &'static str,
     #[case] seed: u64,
@@ -2423,154 +2603,6 @@ fn test_crdt_convergence(
         convergence.converged.len(),
         resync_count
     );
-}
-
-// 16/25 single-gateway CRDT convergence tests pass after #3077 (thread-index fix)
-// and #3030 (own.location() routing). The remaining 9 fail due to real convergence
-// bugs where not all subscribers receive updates in certain seed/topology combos.
-// Tracked in #3070.
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s1() {
-    test_crdt_convergence("crdt-4n-1gw-s1", 0x2773_0004_0001, 1, 4);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n4_g1_s2() {
-    test_crdt_convergence("crdt-4n-1gw-s2", 0x2773_0004_0002, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s3() {
-    test_crdt_convergence("crdt-4n-1gw-s3", 0x2773_0004_0003, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s4() {
-    test_crdt_convergence("crdt-4n-1gw-s4", 0x2773_0004_0004, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n4_g1_s5() {
-    test_crdt_convergence("crdt-4n-1gw-s5", 0x2773_0004_0005, 1, 4);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n5_g1_s1() {
-    test_crdt_convergence("crdt-5n-1gw-s1", 0x2773_0005_0008, 1, 5);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n5_g1_s2() {
-    test_crdt_convergence("crdt-5n-1gw-s2", 0x2773_0005_0002, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s3() {
-    test_crdt_convergence("crdt-5n-1gw-s3", 0x2773_0005_0003, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s4() {
-    test_crdt_convergence("crdt-5n-1gw-s4", 0x2773_0005_0004, 1, 5);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n5_g1_s5() {
-    test_crdt_convergence("crdt-5n-1gw-s5", 0x2773_0005_0005, 1, 5);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s1() {
-    test_crdt_convergence("crdt-6n-1gw-s1", 0x2773_0006_0001, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s2() {
-    test_crdt_convergence("crdt-6n-1gw-s2", 0x2773_0006_0002, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s3() {
-    test_crdt_convergence("crdt-6n-1gw-s3", 0x2773_0006_0003, 1, 6);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n6_g1_s4() {
-    test_crdt_convergence("crdt-6n-1gw-s4", 0x2773_0006_0004, 1, 6);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n6_g1_s5() {
-    test_crdt_convergence("crdt-6n-1gw-s5", 0x2773_0006_0005, 1, 6);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n7_g1_s1() {
-    test_crdt_convergence("crdt-7n-1gw-s1", 0x2773_0007_0001, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s2() {
-    test_crdt_convergence("crdt-7n-1gw-s2", 0x2773_0007_0002, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s3() {
-    test_crdt_convergence("crdt-7n-1gw-s3", 0x2773_0007_0003, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s4() {
-    test_crdt_convergence("crdt-7n-1gw-s4", 0x2773_0007_0010, 1, 7);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n7_g1_s5() {
-    test_crdt_convergence("crdt-7n-1gw-s5", 0x2773_0007_0005, 1, 7);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s1() {
-    test_crdt_convergence("crdt-8n-1gw-s1", 0x2773_0008_0001, 1, 8);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n8_g1_s2() {
-    test_crdt_convergence("crdt-8n-1gw-s2", 0x2773_0008_0002, 1, 8);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s3() {
-    test_crdt_convergence("crdt-8n-1gw-s3", 0x2773_0008_0003, 1, 8);
-}
-
-// FIXME(#3070): convergence failure — not all subscribers receive updates
-#[test_log::test]
-#[ignore]
-fn test_crdt_convergence_n8_g1_s4() {
-    test_crdt_convergence("crdt-8n-1gw-s4", 0x2773_0008_0004, 1, 8);
-}
-
-#[test_log::test]
-fn test_crdt_convergence_n8_g1_s5() {
-    test_crdt_convergence("crdt-8n-1gw-s5", 0x2773_0008_0005, 1, 8);
 }
 
 /// Test: CRDT convergence with N nodes updating simultaneously.
@@ -2680,11 +2712,7 @@ fn test_concurrent_updates_from_n_sources() {
 /// 2. Each node has a "stale" view of other nodes' summaries
 /// 3. ResyncRequest mechanism recovers divergent state
 ///
-/// Currently fails with 4 nodes - only 4 of 5 peers converge, 2 unique states remain.
-/// The 6-node variant (test_concurrent_updates_from_n_sources) passes.
-// TODO-MUST-FIX: Known-failing convergence with 4 nodes. #3085
 #[test_log::test]
-#[ignore]
 fn test_stale_summary_cache_multiple_branches() {
     const SEED: u64 = 0x57A1_E001_0001;
     const NETWORK_NAME: &str = "stale-summaries";
@@ -2887,9 +2915,7 @@ fn test_max_downstream_limit_reached() {
 /// Originally tested subscription tree topology (Issue #2787).
 /// Now tests that nodes subscribing one-by-one still achieve CRDT convergence
 /// when updates are issued after all have subscribed.
-// Known-failing: convergence failure with this seed/topology. Tracked in #3030.
 #[test_log::test]
-#[ignore]
 fn test_chain_topology_formation() {
     const SEED: u64 = 0xC4A1_0001_0001;
     const NETWORK_NAME: &str = "chain-topology";
@@ -3195,7 +3221,7 @@ fn test_subscription_broadcast_propagation() {
 /// - Events phase: 360 operations × 10s = 3600 seconds (1 hour)
 /// - Propagation: 10 seconds
 /// - Total: ~3610 seconds virtual time
-/// - Wall clock: ~2.5 min (25x acceleration with 8 turmoil hosts)
+/// - Wall clock: ~2.5 min with direct runner (single-threaded paused-time runtime)
 ///
 /// NOTE: Gated by nightly_tests feature — does NOT run in regular CI.
 #[test_log::test]
@@ -3210,7 +3236,7 @@ fn test_long_running_deterministic() {
     let start_time = std::time::Instant::now();
 
     TestConfig::long_running("long-running", SEED)
-        .run()
+        .run_direct()
         .assert_ok()
         .verify_operation_coverage()
         .check_convergence();
@@ -3718,9 +3744,17 @@ fn test_determinism_parallel_safe() {
     assert_eq!(trace1.event_sequence, trace2.event_sequence);
     assert_eq!(trace2.event_sequence, trace3.event_sequence);
 
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
     tracing::info!(
-        "PARALLEL-SAFE DETERMINISM PASSED: {} events matched across 3 runs",
-        trace1.total_events
+        "PARALLEL-SAFE DETERMINISM PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }
 
@@ -3798,5 +3832,187 @@ fn test_determinism_across_threads() {
         "CROSS-THREAD ISOLATION PASSED: thread1={} events, thread2={} events",
         events1,
         events2
+    );
+}
+
+// =============================================================================
+// Direct Runner Determinism Tests
+// =============================================================================
+
+/// **STRICT** determinism test for `run_simulation_direct`: verifies that
+/// same seed produces EXACTLY identical events across 3 runs.
+///
+/// Checks 4 levels of determinism (weakest → strongest):
+/// 1. Total event count
+/// 2. Per-type event counts
+/// 3. Event sequence (variant names in log order)
+/// 4. Structural EventSummary (tx, peer_addr, contract_key, state_hash) — sorted
+///    to verify that *which* contracts and peers are involved is deterministic,
+///    not only event types. The `event_detail` Debug string is excluded because it
+///    contains ephemeral fields (e.g., `this_peer_connection_count`).
+///
+/// Runs 3 times to catch flaky coincidences.
+#[test_log::test]
+fn test_direct_runner_determinism() {
+    const SEED: u64 = 0xD12E_C7DE_7000;
+
+    /// Structural fields of an event for deterministic comparison.
+    /// Excludes `event_detail` (Debug string with ephemeral internal state).
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct EventKey {
+        tx: freenet::dev_tool::Transaction,
+        peer_addr: std::net::SocketAddr,
+        event_kind_name: String,
+        contract_key: Option<String>,
+        state_hash: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct SimulationTrace {
+        event_counts: HashMap<String, usize>,
+        event_sequence: Vec<String>,
+        /// Sorted structural keys for deep content comparison
+        event_keys: Vec<EventKey>,
+        total_events: usize,
+    }
+
+    fn run_and_trace(name: &str, seed: u64) -> SimulationTrace {
+        setup_deterministic_state(seed);
+
+        let rt = create_runtime();
+
+        let (sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(
+                name, 2,  // gateways
+                4,  // nodes
+                10, // ring_max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                3,  // min_connections
+                seed,
+            )
+            .await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        drop(rt);
+
+        sim.run_simulation_direct::<rand::rngs::SmallRng>(
+            seed,
+            10, // max_contract_num
+            30, // iterations
+            Duration::from_millis(200),
+        )
+        .expect("Direct simulation should succeed");
+
+        // Extract trace — need a runtime to lock the async mutex
+        let rt = create_runtime();
+        rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            let mut event_sequence: Vec<String> = Vec::new();
+
+            let mut event_keys: Vec<EventKey> = logs
+                .iter()
+                .map(|log| {
+                    let event_kind_name = log.kind.variant_name().to_string();
+                    let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+                    let state_hash = log.kind.state_hash().map(String::from);
+
+                    *event_counts.entry(event_kind_name.clone()).or_insert(0) += 1;
+                    event_sequence.push(event_kind_name.clone());
+
+                    EventKey {
+                        tx: log.tx,
+                        peer_addr: log.peer_id.addr,
+                        event_kind_name,
+                        contract_key,
+                        state_hash,
+                    }
+                })
+                .collect();
+            event_keys.sort();
+
+            SimulationTrace {
+                total_events: logs.len(),
+                event_counts,
+                event_sequence,
+                event_keys,
+            }
+        })
+    }
+
+    // Run 3 times with identical seed
+    let trace1 = run_and_trace("direct-det-run1", SEED);
+    let trace2 = run_and_trace("direct-det-run2", SEED);
+    let trace3 = run_and_trace("direct-det-run3", SEED);
+
+    // All runs must produce events
+    assert!(trace1.total_events > 0, "Run 1 should produce events");
+    assert!(trace2.total_events > 0, "Run 2 should produce events");
+    assert!(trace3.total_events > 0, "Run 3 should produce events");
+
+    // STRICT ASSERTION 1: Exact same total event count
+    assert_eq!(
+        trace1.total_events, trace2.total_events,
+        "DIRECT DETERMINISM FAILURE: Total event counts differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.total_events, trace3.total_events,
+        "DIRECT DETERMINISM FAILURE: Total event counts differ (run2 vs run3)!"
+    );
+
+    // STRICT ASSERTION 2: Exact same event counts per type
+    assert_eq!(
+        trace1.event_counts, trace2.event_counts,
+        "DIRECT DETERMINISM FAILURE: Event type counts differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.event_counts, trace3.event_counts,
+        "DIRECT DETERMINISM FAILURE: Event type counts differ (run2 vs run3)!"
+    );
+
+    // STRICT ASSERTION 3: Exact same event sequence (variant names in log order)
+    for (i, ((e1, e2), e3)) in trace1
+        .event_sequence
+        .iter()
+        .zip(trace2.event_sequence.iter())
+        .zip(trace3.event_sequence.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            e1, e2,
+            "Event sequence differs at index {} (run1 vs run2)!",
+            i
+        );
+        assert_eq!(
+            e2, e3,
+            "Event sequence differs at index {} (run2 vs run3)!",
+            i
+        );
+    }
+
+    // STRICT ASSERTION 4: Structural event content (tx, peer, contract_key, state_hash)
+    assert_eq!(
+        trace1.event_keys, trace2.event_keys,
+        "DIRECT DETERMINISM FAILURE: Sorted event keys differ (run1 vs run2)!"
+    );
+    assert_eq!(
+        trace2.event_keys, trace3.event_keys,
+        "DIRECT DETERMINISM FAILURE: Sorted event keys differ (run2 vs run3)!"
+    );
+
+    // Fingerprint verification
+    let fp1 = TraceFingerprint::from_events(&trace1.event_sequence, &trace1.event_counts);
+    let fp2 = TraceFingerprint::from_events(&trace2.event_sequence, &trace2.event_counts);
+    let fp3 = TraceFingerprint::from_events(&trace3.event_sequence, &trace3.event_counts);
+    assert_eq!(fp1, fp2, "Fingerprint mismatch between run 1 and run 2");
+    assert_eq!(fp2, fp3, "Fingerprint mismatch between run 2 and run 3");
+
+    tracing::info!(
+        "DIRECT RUNNER DETERMINISM PASSED: {} events, fingerprint={:#018x}",
+        trace1.total_events,
+        fp1.sequence_hash
     );
 }

@@ -1627,7 +1627,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fdev"
-version = "0.3.105"
+version = "0.3.111"
 dependencies = [
  "anyhow",
  "axum",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.131"
+version = "0.1.137"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1949,9 +1949,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.36"
+version = "0.1.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca4a5c668ffa86ac32a2a81663604035c23030da4d82c198ef225cdae5ac2ff9"
+checksum = "30978c799400ba3b3df505192895e2ba6a5069fc6391d87d7db94626bafc1e88"
 dependencies = [
  "arbitrary",
  "bincode",

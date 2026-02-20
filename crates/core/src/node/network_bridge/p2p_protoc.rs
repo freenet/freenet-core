@@ -382,6 +382,8 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
     message_processor: Arc<MessageProcessor>,
+    /// Per-contract retry count for broadcasts that found no targets yet.
+    broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
 }
 
 impl P2pConnManager {
@@ -466,6 +468,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             message_processor,
+            broadcast_retries: HashMap::new(),
         })
     }
 
@@ -531,19 +534,21 @@ impl P2pConnManager {
             congestion_config,
             blocked_addresses,
             message_processor,
+            broadcast_retries,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<S>(
-            key_pair.clone(),
-            listening_ip,
-            listening_port,
-            is_gateway,
-            bandwidth_limit,
-            global_bandwidth,
-            ledbat_min_ssthresh,
-            Some(congestion_config.clone()),
-        )
-        .await?;
+        let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
+            create_connection_handler::<S>(
+                key_pair.clone(),
+                listening_ip,
+                listening_port,
+                is_gateway,
+                bandwidth_limit,
+                global_bandwidth,
+                ledbat_min_ssthresh,
+                Some(congestion_config.clone()),
+            )
+            .await?;
 
         tracing::info!(
             listening_port,
@@ -613,6 +618,7 @@ impl P2pConnManager {
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             message_processor,
+            broadcast_retries,
         };
 
         // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)
@@ -626,7 +632,46 @@ impl P2pConnManager {
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
-        while let Some(result) = select_stream.as_mut().next().await {
+        // Monitor both the event stream AND the UDP listen task.
+        // If the listen task exits for any reason, the transport layer is dead
+        // and we must propagate the error to trigger node shutdown.
+        loop {
+            let result = tokio::select! {
+                biased;
+
+                listen_result = &mut listen_task_handle => {
+                    // The UDP listener task has exited — this is fatal.
+                    // Without the listener, no UDP packets are read from the socket,
+                    // connections will time out, and the node becomes unresponsive.
+                    match listen_result {
+                        Ok(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "CRITICAL: UDP listen task exited with transport error"
+                            );
+                        }
+                        Err(join_err) => {
+                            let cause = if join_err.is_panic() { "panicked" } else { "cancelled" };
+                            tracing::error!(
+                                cause,
+                                "CRITICAL: UDP listen task failed: {join_err}"
+                            );
+                        }
+                    }
+                    return Err(anyhow!(
+                        "UDP listen task exited unexpectedly — \
+                         transport layer is dead, node must restart"
+                    ));
+                },
+
+                maybe_result = StreamExt::next(&mut select_stream) => {
+                    let Some(result) = maybe_result else {
+                        break;
+                    };
+                    result
+                },
+            };
+
             loop_iteration_count += 1;
 
             let event_type = match &result {
@@ -685,6 +730,27 @@ impl P2pConnManager {
                 loop_iteration_count = 0;
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
+
+                // Periodic cleanup of pending_op_results: remove entries where the
+                // receiver has been dropped (closed sender). This is a safety net for
+                // transactions that complete without emitting TransactionCompleted/TimedOut
+                // events, preventing unbounded HashMap growth.
+                const PENDING_OP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+                if state.last_pending_op_cleanup.elapsed() > PENDING_OP_CLEANUP_INTERVAL {
+                    let before = state.pending_op_results.len();
+                    state
+                        .pending_op_results
+                        .retain(|_tx, sender| !sender.is_closed());
+                    let removed = before - state.pending_op_results.len();
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            remaining = state.pending_op_results.len(),
+                            "Cleaned up closed pending_op_results senders"
+                        );
+                    }
+                    state.last_pending_op_cleanup = Instant::now();
+                }
             }
 
             match event {
@@ -1162,6 +1228,18 @@ impl P2pConnManager {
                                         }
                                     }
 
+                                    // Clean up pending operation result callbacks
+                                    // Drop all waiting senders so callers see channel closure
+                                    let pending_count = state.pending_op_results.len();
+                                    if pending_count > 0 {
+                                        tracing::debug!(
+                                            pending_count,
+                                            phase = "cleanup",
+                                            "Draining pending_op_results"
+                                        );
+                                        state.pending_op_results.drain();
+                                    }
+
                                     tracing::info!(
                                         phase = "shutdown",
                                         "Cleanup complete - exiting event loop"
@@ -1501,6 +1579,9 @@ impl P2pConnManager {
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
+                                                size_bytes: op_manager
+                                                    .ring
+                                                    .hosting_contract_size(&contract_key),
                                             },
                                         );
                                     }
@@ -1514,6 +1595,9 @@ impl P2pConnManager {
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
+                                                size_bytes: op_manager
+                                                    .ring
+                                                    .hosting_contract_size(contract_key),
                                             },
                                         );
                                     }
@@ -1613,10 +1697,16 @@ impl P2pConnManager {
                                         "Cleaned up client subscriptions for timed out transaction"
                                     );
                                 }
+                                // Clean up executor callback sender to prevent unbounded
+                                // HashMap growth (entries were inserted by handle_op_execution
+                                // but never removed — see #2941)
+                                state.pending_op_results.remove(&tx);
                             }
                             NodeEvent::TransactionCompleted(tx) => {
                                 // Clean up client subscription after successful completion
                                 state.tx_to_client.remove(&tx);
+                                // Clean up executor callback sender
+                                state.pending_op_results.remove(&tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -2117,9 +2207,19 @@ impl P2pConnManager {
                 "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            if let Some(entry) = connection_manager.drop_transient(peer_addr) {
-                let loc = entry
-                    .location
+            let was_transient = connection_manager.drop_transient(peer_addr);
+
+            // Promote if: (a) was tracked as transient, OR (b) not already in ring.
+            // Case (b) handles expired transient TTL — transport preserved per 76058cf4
+            // but tracking entry gone. Without this, CONNECT succeeds but peer is never
+            // added to ring topology (#3113).
+            let needs_promotion =
+                was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
+            let transient_expired = was_transient.is_none() && needs_promotion;
+
+            if needs_promotion {
+                let loc = was_transient
+                    .and_then(|e| e.location)
                     .unwrap_or_else(|| Location::from_address(&peer_addr));
                 // Re-run admission + cap guard when promoting a transient connection.
                 let should_accept = connection_manager.should_accept(loc, peer_addr);
@@ -2128,6 +2228,7 @@ impl P2pConnManager {
                         tx = %tx,
                         %peer,
                         %loc,
+                        transient_expired,
                         "connect_peer: promotion rejected by admission logic"
                     );
                     callback
@@ -2152,6 +2253,7 @@ impl P2pConnManager {
                         current_connections = current,
                         max_connections = connection_manager.max_connections,
                         %loc,
+                        transient_expired,
                         "connect_peer: rejecting transient promotion to enforce cap"
                     );
                     callback
@@ -2173,7 +2275,12 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
-                tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
+                tracing::info!(
+                    tx = %tx,
+                    remote = %peer,
+                    transient_expired,
+                    "connect_peer: promoted to ring"
+                );
 
                 // tell the promoted peer about our subscriptions and cache
                 for (target, msg) in self
@@ -2898,14 +3005,15 @@ impl P2pConnManager {
                             // dispatch DropConnection — that tears down the
                             // underlying transport, killing any in-progress
                             // CONNECT handshake. If the CONNECT succeeds later,
-                            // add_connection() will promote it to a ring
-                            // connection normally (the transient entry is already
-                            // gone so the remove there is a no-op). If it never
-                            // succeeds, the transport idle timeout handles cleanup.
+                            // handle_connect_peer() will detect the missing
+                            // transient entry via is_in_ring() and still promote
+                            // the peer to ring topology (see #3113 fix). If it
+                            // never succeeds, the transport idle timeout handles
+                            // cleanup.
                             tracing::info!(
                                 %peer_addr,
                                 "Transient connection expired; removed tracking entry \
-                                 (transport connection preserved for in-progress CONNECT)"
+                                 (transport preserved, handle_connect_peer will promote via fallback)"
                             );
                         }
                     });
@@ -3361,10 +3469,20 @@ impl P2pConnManager {
         }
     }
 
-    /// Handle BroadcastStateChange: notify interested network peers about state changes.
+    /// Maximum retry attempts when a broadcast finds no targets.
+    const MAX_BROADCAST_RETRIES: u8 = 3;
+
+    /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
+    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+    /// Notify interested network peers about a state change.
     ///
     /// Echo-back is prevented by summary comparison: we skip peers whose cached
     /// summary matches ours (they already have our state).
+    ///
+    /// When no targets are found (race between contract updates and subscription
+    /// establishment), the broadcast is retried with linear backoff up to
+    /// [`Self::MAX_BROADCAST_RETRIES`] times.
     async fn handle_broadcast_state_change(
         &mut self,
         op_manager: &Arc<OpManager>,
@@ -3394,30 +3512,67 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
-            tracing::warn!(
-                contract = %key,
-                self_addr = %self_addr,
-                "BROADCAST_NO_TARGETS: skipping broadcast - no targets found"
-            );
-            // Still emit delivery summary even when no targets, for diagnostics
-            let update_tx =
-                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-            if let Some(log) = NetEventLog::broadcast_delivery_summary(
-                &update_tx,
-                &op_manager.ring,
-                key,
-                &target_result,
-                0,
-                0,
-                0,
-            ) {
-                self.bridge
-                    .log_register
-                    .register_events(Either::Left(log))
-                    .await;
+            let retry_count = self.broadcast_retries.entry(key).or_insert(0);
+            if *retry_count < Self::MAX_BROADCAST_RETRIES {
+                *retry_count += 1;
+                let attempt = *retry_count;
+                tracing::info!(
+                    contract = %key,
+                    self_addr = %self_addr,
+                    attempt,
+                    max_retries = Self::MAX_BROADCAST_RETRIES,
+                    "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
+                );
+                // Schedule a delayed re-emission of BroadcastStateChange
+                let op_mgr = op_manager.clone();
+                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = op_mgr
+                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                            key,
+                            new_state,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            contract = %key,
+                            error = %e,
+                            "Failed to re-emit BroadcastStateChange for retry"
+                        );
+                    }
+                });
+            } else {
+                self.broadcast_retries.remove(&key);
+                tracing::warn!(
+                    contract = %key,
+                    self_addr = %self_addr,
+                    "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
+                    Self::MAX_BROADCAST_RETRIES
+                );
+                // Emit delivery summary for diagnostics
+                let update_tx =
+                    crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+                if let Some(log) = NetEventLog::broadcast_delivery_summary(
+                    &update_tx,
+                    &op_manager.ring,
+                    key,
+                    &target_result,
+                    0,
+                    0,
+                    0,
+                ) {
+                    self.bridge
+                        .log_register
+                        .register_events(Either::Left(log))
+                        .await;
+                }
             }
             return;
         }
+
+        // Targets found - clear any pending retry state for this contract
+        self.broadcast_retries.remove(&key);
 
         // Get our summary once for all targets
         let our_summary = op_manager
@@ -3686,12 +3841,15 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
 struct EventListenerState {
     expected_inbound: ExpectedInboundTracker,
     pending_from_executor: HashSet<Transaction>,
-    // FIXME: we are potentially leaving trash here when transacrions are completed
+    /// Maps transactions to the set of clients waiting for their results.
+    /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
+    /// Last time pending_op_results was scanned for closed senders.
+    last_pending_op_cleanup: Instant,
     /// Per-peer backoff tracking for failed connection attempts.
     /// Prevents rapid repeated connection attempts to the same peer.
     peer_backoff: PeerConnectionBackoff,
@@ -3708,6 +3866,7 @@ impl EventListenerState {
             client_waiting_transaction: Vec::new(),
             awaiting_connection: HashMap::new(),
             pending_op_results: HashMap::new(),
+            last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),

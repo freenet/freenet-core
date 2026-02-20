@@ -522,7 +522,13 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 TransferEvent::Failed { .. } => "transfer_failed".to_string(),
             }
         }
-        EventKind::Route(_) => "route".to_string(),
+        EventKind::Route(route_event) => {
+            use crate::router::RouteOutcome;
+            match &route_event.outcome {
+                RouteOutcome::Success { .. } => "route_success".to_string(),
+                RouteOutcome::Failure => "route_failure".to_string(),
+            }
+        }
         EventKind::Ignored => "ignored".to_string(),
         EventKind::Timeout { .. } => "timeout".to_string(),
         EventKind::Lifecycle(lifecycle_event) => {
@@ -544,6 +550,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 }
             }
         }
+        EventKind::RoutingDecision(_) => "routing_decision".to_string(),
+        EventKind::RouterSnapshot(_) => "router_snapshot".to_string(),
     }
 }
 
@@ -1247,10 +1255,36 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             }
         }
         EventKind::Route(route_event) => {
-            serde_json::json!({
-                "type": "route",
-                "event": format!("{:?}", route_event),
-            })
+            use crate::router::RouteOutcome;
+            let distance = route_event
+                .peer
+                .location()
+                .map(|l| route_event.contract_location.distance(l).as_f64());
+            match &route_event.outcome {
+                RouteOutcome::Success {
+                    time_to_response_start,
+                    payload_size,
+                    payload_transfer_time,
+                } => {
+                    serde_json::json!({
+                        "type": "route_success",
+                        "peer_location": route_event.peer.location().map(|l| l.as_f64()),
+                        "contract_location": route_event.contract_location.as_f64(),
+                        "distance": distance,
+                        "time_to_response_start_ms": time_to_response_start.as_millis() as u64,
+                        "payload_size": payload_size,
+                        "payload_transfer_time_ms": payload_transfer_time.as_millis() as u64,
+                    })
+                }
+                RouteOutcome::Failure => {
+                    serde_json::json!({
+                        "type": "route_failure",
+                        "peer_location": route_event.peer.location().map(|l| l.as_f64()),
+                        "contract_location": route_event.contract_location.as_f64(),
+                        "distance": distance,
+                    })
+                }
+            }
         }
         EventKind::Ignored => {
             serde_json::json!({"type": "ignored"})
@@ -1357,6 +1391,44 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     })
                 }
             }
+        }
+        EventKind::RoutingDecision(decision) => {
+            serde_json::json!({
+                "type": "routing_decision",
+                "target_location": decision.target_location,
+                "strategy": format!("{:?}", decision.strategy),
+                "num_candidates": decision.candidates.len(),
+                "total_routing_events": decision.total_routing_events,
+                "candidates": decision.candidates.iter().map(|c| {
+                    serde_json::json!({
+                        "distance": c.distance,
+                        "selected": c.selected,
+                        "failure_probability": c.prediction.as_ref().map(|p| p.failure_probability),
+                        "time_to_response_start": c.prediction.as_ref().map(|p| p.time_to_response_start),
+                        "expected_total_time": c.prediction.as_ref().map(|p| p.expected_total_time),
+                        "transfer_speed_bps": c.prediction.as_ref().map(|p| p.transfer_speed_bps),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }
+        EventKind::RouterSnapshot(snapshot) => {
+            serde_json::json!({
+                "type": "router_snapshot",
+                "failure_events": snapshot.failure_events,
+                "success_events": snapshot.success_events,
+                "transfer_rate_events": snapshot.transfer_rate_events,
+                "prediction_active": snapshot.prediction_active,
+                "mean_transfer_size_bytes": snapshot.mean_transfer_size_bytes,
+                "consider_n_closest_peers": snapshot.consider_n_closest_peers,
+                "peers_with_failure_adjustments": snapshot.peers_with_failure_adjustments,
+                "peers_with_response_adjustments": snapshot.peers_with_response_adjustments,
+                "failure_curve": snapshot.failure_curve,
+                "response_time_curve": snapshot.response_time_curve,
+                "transfer_rate_curve": snapshot.transfer_rate_curve,
+                "connect_forward_curve": snapshot.connect_forward_curve,
+                "connect_forward_events": snapshot.connect_forward_events,
+                "connect_forward_peer_adjustments": snapshot.connect_forward_peer_adjustments,
+            })
         }
     }
 }

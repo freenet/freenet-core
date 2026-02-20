@@ -190,20 +190,21 @@ jobs:
           # Reduce gateway connection backoff for CI (default 30s is too aggressive
           # for localhost tests under CI resource pressure). See issue #3078.
           FREENET_BACKOFF_BASE_SECS: "5"
-        # Run all tests in parallel including simulation tests.
-        # Thread-local state and per-network registries provide test isolation.
-        # Skip determinism tests (run serially below) and blocked_peers tests
-        # (run serially below — they spin up 3 real nodes each and timeout
-        # under parallel resource contention).
+        # Run all tests in parallel including simulation and determinism tests.
+        # nextest runs each test in its own process, providing full isolation
+        # for global state (DashMaps, callbacks, etc.). Determinism tests no
+        # longer need serialization — process isolation handles it (#3051).
         # Exclude freenet-ping-types: --no-default-features disables its std
         # feature, breaking test code that uses Ping::insert().
+        # Skip blocked_peers tests (run serially below — they spin up 3 real
+        # nodes each and timeout under parallel resource contention).
         # nextest retries only failed tests (via .config/nextest.toml [profile.ci]),
         # avoiding the 10-15 min penalty of re-running the entire workspace.
         run: |
           cargo nextest run --workspace --exclude freenet-ping-types \
             --no-default-features \
             --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            --profile ci -E 'not test(determinism) & not test(blocked_peers)'
+            --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
         if: ${{ !cancelled() }}
@@ -223,19 +224,6 @@ jobs:
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
-
-      - name: Test determinism (serial)
-        if: ${{ !cancelled() }}
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Determinism comparison tests compare exact event sequences across sequential runs.
-        # Shared atomic counters must not be advanced by concurrent tests between runs.
-        # The "determinism" filter matches: test_strict_determinism_*, test_turmoil_determinism_*, test_deterministic_replay_*
-        run: |
-          cargo nextest run -p freenet --no-default-features \
-            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
-            --profile ci -E 'test(determinism)' -j 1
 
   six_peer_regression:
     name: six-peer-regression

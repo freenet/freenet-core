@@ -374,7 +374,8 @@ pub(super) mod log {
     // functions like this in a structured way
     pub(crate) fn info(id: i64, ptr: i64, len: i32) {
         if id == -1 {
-            panic!("unset module id");
+            tracing::error!("freenet_log::info called with unset module id");
+            return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let Some(ptr) =
@@ -396,7 +397,11 @@ pub(super) mod rand {
 
     pub(crate) fn rand_bytes(id: i64, ptr: i64, len: u32) {
         if id == -1 {
-            panic!("unset module id");
+            tracing::error!(
+                "freenet_rand::rand_bytes called with unset module id; \
+                 output buffer NOT written — caller will read uninitialized memory"
+            );
+            return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let Some(ptr) =
@@ -417,7 +422,11 @@ pub(super) mod time {
 
     pub(crate) fn utc_now(id: i64, ptr: i64) {
         if id == -1 {
-            panic!("unset module id");
+            tracing::error!(
+                "freenet_time::utc_now called with unset module id; \
+                 output buffer NOT written — caller will read uninitialized memory"
+            );
+            return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let now = UtcOriginal::now();

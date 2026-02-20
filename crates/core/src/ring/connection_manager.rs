@@ -1,3 +1,17 @@
+//! # Lock Ordering
+//!
+//! To prevent deadlocks, all `RwLock`-protected fields in [`ConnectionManager`] **must** be
+//! acquired in the following order whenever multiple locks are held simultaneously:
+//!
+//! 1. `location_for_peer`
+//! 2. `connections_by_location`
+//! 3. `pending_reservations`
+//!
+//! Acquiring locks in any other order risks an ABBA deadlock. This ordering was established
+//! after a deadlock introduced in PR #3091 (fixed in PR #3095), where
+//! `cleanup_stale_reservations` acquired `pending_reservations` before `connections_by_location`,
+//! while `prune_connection` acquired them in the opposite order.
+
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};
@@ -691,11 +705,11 @@ impl ConnectionManager {
         pub_key: TransportPublicKey,
         was_reserved: bool,
     ) {
-        tracing::debug!(
+        tracing::info!(
             addr = %addr,
             peer_location = %loc,
             was_reserved = %was_reserved,
-            "Adding connection to topology"
+            "Adding connection to ring topology"
         );
         // Verify we're not adding a connection to ourselves (if we know our own address)
         debug_assert!(self.get_own_addr().map(|own| own != addr).unwrap_or(true));
@@ -812,10 +826,10 @@ impl ConnectionManager {
 
     fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
-        tracing::debug!(
+        tracing::info!(
             addr = %addr,
             connection_type,
-            "Pruning connection"
+            "Pruning connection from ring topology"
         );
 
         let mut locations_for_peer = self.location_for_peer.write();
@@ -836,13 +850,16 @@ impl ConnectionManager {
             return None;
         };
 
-        let conns = &mut *self.connections_by_location.write();
-        if let Some(conns) = conns.get_mut(&loc) {
-            if let Some(pos) = conns
+        let cbl = &mut *self.connections_by_location.write();
+        if let Some(bucket) = cbl.get_mut(&loc) {
+            if let Some(pos) = bucket
                 .iter()
                 .position(|c| c.location.socket_addr() == Some(addr))
             {
-                conns.swap_remove(pos);
+                bucket.swap_remove(pos);
+                if bucket.is_empty() {
+                    cbl.remove(&loc);
+                }
             }
         }
 
@@ -945,6 +962,15 @@ impl ConnectionManager {
         stale_reservations + orphaned_locations
     }
 
+    /// Check whether a peer address has an established connection in `connections_by_location`.
+    /// Unlike `has_connection_or_pending`, this checks only fully established ring connections.
+    pub fn is_in_ring(&self, addr: SocketAddr) -> bool {
+        let connections = self.connections_by_location.read();
+        connections
+            .values()
+            .any(|conns| conns.iter().any(|c| c.location.socket_addr() == Some(addr)))
+    }
+
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
         if self.location_for_peer.read().contains_key(&addr) {
             return true;
@@ -979,13 +1005,31 @@ impl ConnectionManager {
         skip_list: impl Contains<SocketAddr>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
+        let (peer, _decision) = self.routing_with_telemetry(target, requesting, skip_list, router);
+        peer
+    }
+
+    /// Route an op to the most optimal target, returning telemetry about the decision.
+    pub fn routing_with_telemetry(
+        &self,
+        target: Location,
+        requesting: Option<SocketAddr>,
+        skip_list: impl Contains<SocketAddr>,
+        router: &Router,
+    ) -> (
+        Option<PeerKeyLocation>,
+        Option<crate::router::RoutingDecisionInfo>,
+    ) {
         let candidates = self.routing_candidates(target, requesting, skip_list);
 
         if candidates.is_empty() {
-            return None;
+            return (None, None);
         }
 
-        router.select_peer(candidates.iter(), target).cloned()
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(candidates.iter(), target, 1);
+        let peer = selected.into_iter().next().cloned();
+        (peer, Some(decision))
     }
 
     /// Gather routing candidates after applying skip/transient filters.
@@ -2164,6 +2208,35 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(cm.location_for_peer.read().contains_key(&addr));
         assert!(cm.has_connection_or_pending(addr));
+    }
+
+    /// Verify that a peer can be promoted to ring after its transient entry expires.
+    /// This is the key scenario from #3113: transient TTL fires before CONNECT completes,
+    /// removing the tracking entry but preserving the transport. When CONNECT succeeds,
+    /// the peer must still be added to ring topology.
+    #[test]
+    fn test_expired_transient_promotion() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        // Step 1: Register transient connection (simulates inbound connection)
+        assert!(cm.try_register_transient(addr, Some(loc)));
+        assert!(cm.is_transient(addr));
+        assert!(!cm.is_in_ring(addr));
+
+        // Step 2: Drop transient (simulates TTL expiry)
+        let entry = cm.drop_transient(addr);
+        assert!(entry.is_some());
+        assert!(!cm.is_transient(addr));
+        assert!(!cm.is_in_ring(addr));
+
+        // Step 3: CONNECT succeeds — add_connection should work
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        assert!(cm.is_in_ring(addr));
+        assert_eq!(cm.connection_count(), 1);
     }
 
     /// Verify that prune_in_transit_connection clears the phantom entry directly,

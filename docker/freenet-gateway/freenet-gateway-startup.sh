@@ -15,6 +15,7 @@ echo "  Public Network Port: $PUBLIC_NETWORK_PORT"
 echo "  Network Port: $NETWORK_PORT"
 
 freenet network \
+    --id "test-gateway-${HOSTNAME}" \
     --skip-load-from-network \
     --is-gateway \
     --transport-keypair "$TRANSPORT_KEYPAIR" \

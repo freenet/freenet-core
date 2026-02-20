@@ -10,8 +10,9 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 |----------|----------|-----------|---------|-------------|-------|
 | **Unit Tests** | `src/**/*.rs` | Mocks | Mocks | Full | Single component |
 | **`#[freenet_test]` Macro** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-10 nodes |
-| **SimNetwork** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **Turmoil (~99%)** | 1-50 nodes |
-| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **SimNetwork + quiescence** | 1-500 nodes |
+| **SimNetwork (direct)** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **100% deterministic** | 1-500+ nodes |
+| **SimNetwork (turmoil)** | `tests/simulation_*.rs` | In-memory channels | MockStateStorage | **~99% deterministic** | 1-50 nodes |
+| **fdev test** | CLI tool | In-memory (single-process) | MockStateStorage | **Direct runner** | 1-500 nodes |
 | **freenet-test-network** | `tests/*.rs` | Real UDP (localhost) | SQLite | Non-deterministic | 2-40+ nodes |
 
 ---
@@ -73,7 +74,7 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 |-----------|---------------|-----|
 | **Speed** | Unit tests | No I/O, no network setup |
 | **Isolation** | Unit tests | Tests single component |
-| **Reproducibility** | SimNetwork + Turmoil | Full determinism (Turmoil always enabled) |
+| **Reproducibility** | SimNetwork (direct runner) | 100% determinism (single-threaded, paused time) |
 | **Realism** | test-network | Real processes, real UDP |
 | **Fault injection** | SimNetwork/fdev | Built-in FaultConfig |
 | **Scale** | test-network | Separate processes, real topology |
@@ -267,7 +268,7 @@ This section analyzes what testing paradigms we currently use versus industry be
 
 | Paradigm | What It Is | Value for Freenet | Effort | Priority |
 |----------|------------|-------------------|--------|----------|
-| ~~**Deterministic Simulation**~~ | ~~FoundationDB-style executor~~ | ✅ **IMPLEMENTED via Turmoil** | - | - |
+| ~~**Deterministic Simulation**~~ | ~~FoundationDB-style executor~~ | ✅ **IMPLEMENTED** — direct runner (100% deterministic, single-thread + paused time) and Turmoil runner (~99%) | - | - |
 | **Linearizability Checking** | Jepsen/Knossos-style consistency proofs | Prove correctness properties | High | Low |
 | **Model Checking** | TLA+ / formal specification | Verify protocol design before code | Medium | Low |
 | **Mutation Testing** | cargo-mutants | Find untested code paths | Low | High |
@@ -465,7 +466,7 @@ async fn deterministic_test(ctx: &mut TestContext) -> TestResult {
 }
 ```
 
-**Note:** Until this is implemented, use raw `#[tokio::test(start_paused = true)]` for simple tokio time control, or `SimNetwork` for full deterministic simulation with Turmoil.
+**Note:** Until this is implemented, use raw `#[tokio::test(start_paused = true)]` for simple tokio time control, or `SimNetwork` for full deterministic simulation (direct runner for scale/long-duration, Turmoil runner for mid-simulation fault injection).
 
 **Long-term improvement (high effort):** FoundationDB-style deterministic executor.
 
@@ -501,7 +502,7 @@ impl DeterministicRuntime {
 }
 ```
 
-**Reference:** [turmoil](https://github.com/tokio-rs/turmoil) - Tokio's deterministic network simulation
+**Reference:** [turmoil](https://github.com/tokio-rs/turmoil) - Tokio's deterministic network simulation (used for mid-simulation fault injection tests; the direct runner is preferred for scale and long-duration tests)
 
 #### Record/Replay (Future)
 

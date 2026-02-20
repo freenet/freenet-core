@@ -478,6 +478,15 @@ impl HostingManager {
         self.hosting_cache.read().iter().collect()
     }
 
+    /// Get the cached state size in bytes for a hosted contract.
+    pub fn hosting_contract_size(&self, key: &ContractKey) -> u64 {
+        self.hosting_cache
+            .read()
+            .get(key)
+            .map(|c| c.size_bytes)
+            .unwrap_or(0)
+    }
+
     /// Get the number of contracts in the hosting cache.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_cache.read().len()

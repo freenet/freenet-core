@@ -1124,20 +1124,32 @@ wait_for_binaries() {
     echo "  ⏳ Cross-compile workflow in progress..."
     echo "     Monitor at: https://github.com/freenet/freenet-core/actions/workflows/cross-compile.yml"
 
-    # Find the workflow run for this tag
-    local run_id
-    run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1)
+    # Find the workflow run for this tag — retry because it takes a few seconds
+    # for GitHub to start the workflow after the tag is pushed.
+    local run_id=""
+    local find_elapsed=0
+    local find_max=120  # 2 minutes to find the run
+    while [[ $find_elapsed -lt $find_max ]]; do
+        run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1)
+        if [[ -n "$run_id" ]]; then
+            break
+        fi
+        printf "  Waiting for workflow to appear... (%ds)\r" "$find_elapsed"
+        sleep 10
+        find_elapsed=$((find_elapsed + 10))
+    done
 
     if [[ -z "$run_id" ]]; then
-        echo "  ⚠️  Could not find cross-compile workflow run for v$VERSION"
-        echo "     Continuing without waiting (binaries may not be ready)"
-        return 0
+        echo "  ✗ Could not find cross-compile workflow run for v$VERSION after ${find_max}s"
+        echo "     Release binaries will NOT be available for auto-update."
+        echo "     Check: https://github.com/freenet/freenet-core/actions/workflows/cross-compile.yml"
+        return 1
     fi
 
     echo "  Workflow run ID: $run_id"
 
-    # Wait up to 15 minutes for workflow to complete
-    local max_wait=900
+    # Wait up to 20 minutes for workflow to complete
+    local max_wait=1200
     local elapsed=0
     local interval=30
 
@@ -1156,8 +1168,9 @@ wait_for_binaries() {
                 echo "  ✓ Release has $asset_count assets attached"
                 return 0
             else
-                echo "  ⚠️  Cross-compile workflow failed (conclusion: $conclusion)"
-                echo "     Binaries may not be available for download"
+                echo "  ✗ Cross-compile workflow failed (conclusion: $conclusion)"
+                echo "     Binaries will NOT be available for auto-update."
+                echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
                 return 1
             fi
         fi
@@ -1168,9 +1181,10 @@ wait_for_binaries() {
     done
 
     echo
-    echo "  ⚠️  Timeout waiting for cross-compile workflow"
-    echo "     Continuing anyway - users may encounter 404s until binaries are ready"
-    return 0
+    echo "  ✗ Timeout waiting for cross-compile workflow after ${max_wait}s"
+    echo "     Binaries may not be available for auto-update."
+    echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
+    return 1
 }
 
 announce_to_matrix() {
@@ -1311,6 +1325,8 @@ publish_crates
 create_github_release
 wait_for_binaries
 deploy_gateways
+# Announce AFTER binaries are confirmed available and gateways deployed,
+# so users can actually update when they see the announcement.
 announce_to_matrix
 announce_to_river
 

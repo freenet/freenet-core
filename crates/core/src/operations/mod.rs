@@ -378,12 +378,11 @@ pub(crate) enum OpOutcome<'a> {
         /// Transfer time of the payload.
         payload_transfer_time: Duration,
     },
-    // todo: handle failures stats when it does not complete successfully
-    // /// An op which involves a contract completed unsuccessfully.
-    // ContractOpFailure {
-    //     target_peer: Option<&'a PeerKeyLocation>,
-    //     contract_location: Location,
-    // },
+    /// An op which involves a contract completed unsuccessfully.
+    ContractOpFailure {
+        target_peer: &'a PeerKeyLocation,
+        contract_location: Location,
+    },
     /// In transit contract operation.
     Incomplete,
     /// This operation stats are not relevant for this peer.

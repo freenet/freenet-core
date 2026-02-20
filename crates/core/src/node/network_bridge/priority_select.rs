@@ -85,6 +85,11 @@ where
     handshake_closed: bool,
     client_transaction_closed: bool,
     executor_transaction_closed: bool,
+
+    /// Counts consecutive items returned from Tier-1 (P1-P6) channels.
+    /// When this reaches MAX_HIGH_PRIORITY_BURST, Tier-2 (P7-P8) channels
+    /// are force-polled first to prevent starvation.
+    high_priority_streak: u32,
 }
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
@@ -123,8 +128,14 @@ where
             handshake_closed: false,
             client_transaction_closed: false,
             executor_transaction_closed: false,
+            high_priority_streak: 0,
         }
     }
+
+    /// Maximum consecutive Tier-1 (P1-P6) items before force-polling Tier-2 (P7-P8).
+    /// Prevents starvation of client/executor transaction channels under sustained
+    /// high-priority traffic. See issue #3074.
+    pub(crate) const MAX_HIGH_PRIORITY_BURST: u32 = 32;
 }
 
 impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
@@ -141,14 +152,81 @@ where
         // Track if any channel closed (to report after checking all sources)
         let mut first_closed_channel: Option<SelectResult> = None;
 
+        // Track whether Tier-2 channels were already polled in Phase 1
+        // to avoid double-polling in Phase 2.
+        let mut tier2_polled_in_phase1 = false;
+
+        // Phase 1: Anti-starvation — force-poll Tier-2 (P7/P8) when the
+        // high-priority streak has reached the burst limit.
+        let force_low_priority = this.high_priority_streak >= Self::MAX_HIGH_PRIORITY_BURST;
+
+        if force_low_priority {
+            tracing::debug!(
+                streak = this.high_priority_streak,
+                "Anti-starvation: forcing poll of Tier-2 channels"
+            );
+            tier2_polled_in_phase1 = true;
+
+            // Force-poll P7: Client transaction handler
+            if !this.client_transaction_closed {
+                match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
+                    Poll::Ready(Some(result)) => {
+                        this.high_priority_streak = 0;
+                        return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
+                    }
+                    Poll::Ready(None) => {
+                        this.client_transaction_closed = true;
+                        if first_closed_channel.is_none() {
+                            first_closed_channel = Some(SelectResult::ClientTransaction(Err(
+                                anyhow::anyhow!("channel closed"),
+                            )));
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            // Force-poll P8: Executor transaction handler
+            if !this.executor_transaction_closed {
+                match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
+                    Poll::Ready(Some(tx)) => {
+                        this.high_priority_streak = 0;
+                        return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
+                    }
+                    Poll::Ready(None) => {
+                        this.executor_transaction_closed = true;
+                        if first_closed_channel.is_none() {
+                            first_closed_channel = Some(SelectResult::ExecutorTransaction(Err(
+                                anyhow::anyhow!("channel closed"),
+                            )));
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            // Neither P7 nor P8 yielded an item. Decide whether to reset streak:
+            if this.client_transaction_closed && this.executor_transaction_closed {
+                // Both channels are permanently closed — no more Tier-2 items
+                // possible. Reset streak so we stop force-polling.
+                this.high_priority_streak = 0;
+            }
+            // Otherwise, at least one channel is open but Pending. Keep
+            // streak >= MAX so force-poll fires again on the very next
+            // poll_next call — whether that returns a Tier-1 item
+            // (incrementing streak past MAX) or re-enters Phase 1 directly.
+        }
+
+        // Phase 2: Normal priority polling (P1-P6, then P7-P8)
+
         // Priority 1: Notification channel (highest priority)
         if !this.notification_closed {
             match Pin::new(&mut this.notification).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
-                    return Poll::Ready(Some(SelectResult::Notification(Some(msg))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::Notification(Some(msg))));
                 }
                 Poll::Ready(None) => {
-                    // Channel closed - record it and mark as closed to avoid re-polling
                     this.notification_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::Notification(None));
@@ -162,10 +240,10 @@ where
         if !this.op_execution_closed {
             match Pin::new(&mut this.op_execution).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
-                    return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))));
                 }
                 Poll::Ready(None) => {
-                    // Channel closed - record it and mark as closed to avoid re-polling
                     this.op_execution_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::OpExecution(None));
@@ -179,7 +257,8 @@ where
         if !this.conn_events_closed {
             match Pin::new(&mut this.conn_events).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
-                    return Poll::Ready(Some(SelectResult::PeerConnection(Some(event))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::PeerConnection(Some(event))));
                 }
                 Poll::Ready(None) => {
                     this.conn_events_closed = true;
@@ -195,10 +274,10 @@ where
         if !this.conn_bridge_closed {
             match Pin::new(&mut this.conn_bridge).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
-                    return Poll::Ready(Some(SelectResult::ConnBridge(Some(msg))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::ConnBridge(Some(msg))));
                 }
                 Poll::Ready(None) => {
-                    // Channel closed - record it and mark as closed to avoid re-polling
                     this.conn_bridge_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::ConnBridge(None));
@@ -212,7 +291,8 @@ where
         if !this.handshake_closed {
             match Pin::new(&mut this.handshake_handler).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
-                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))));
                 }
                 Poll::Ready(None) => {
                     this.handshake_closed = true;
@@ -228,10 +308,10 @@ where
         if !this.node_controller_closed {
             match Pin::new(&mut this.node_controller).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
-                    return Poll::Ready(Some(SelectResult::NodeController(Some(msg))))
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::NodeController(Some(msg))));
                 }
                 Poll::Ready(None) => {
-                    // Channel closed - record it and mark as closed to avoid re-polling
                     this.node_controller_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::NodeController(None));
@@ -241,11 +321,13 @@ where
             }
         }
 
-        // Priority 7: Client transaction handler (implements Stream directly)
-        if !this.client_transaction_closed {
+        // Priority 7: Client transaction handler
+        // Skip if already polled during Phase 1 force-poll
+        if !tier2_polled_in_phase1 && !this.client_transaction_closed {
             match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
                 Poll::Ready(Some(result)) => {
-                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))))
+                    this.high_priority_streak = 0;
+                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
                 }
                 Poll::Ready(None) => {
                     this.client_transaction_closed = true;
@@ -259,11 +341,13 @@ where
             }
         }
 
-        // Priority 8: Executor transaction handler (implements Stream directly)
-        if !this.executor_transaction_closed {
+        // Priority 8: Executor transaction handler
+        // Skip if already polled during Phase 1 force-poll
+        if !tier2_polled_in_phase1 && !this.executor_transaction_closed {
             match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
                 Poll::Ready(Some(tx)) => {
-                    return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))))
+                    this.high_priority_streak = 0;
+                    return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
                 }
                 Poll::Ready(None) => {
                     this.executor_transaction_closed = true;
