@@ -1037,11 +1037,14 @@ impl P2pConnManager {
                             }
                         }
                         ConnEvent::TransportClosed {
-                            remote_addr, error, ..
+                            remote_addr,
+                            error,
+                            connection_id,
                         } => {
                             tracing::debug!(
                                 peer_addr = %remote_addr,
                                 error = ?error,
+                                connection_id,
                                 phase = "disconnect",
                                 "Transport connection closed"
                             );
@@ -2003,7 +2006,8 @@ impl P2pConnManager {
                 );
                 match result {
                     Some(event) => {
-                        self.handle_handshake_action(event, state).await?;
+                        self.handle_handshake_action(event, state, handshake_commands)
+                            .await?;
                         Ok(EventResult::Continue)
                     }
                     None => {
@@ -2511,6 +2515,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
+        handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
         tracing::info!(?event, "handle_handshake_action: received handshake event");
         match event {
@@ -2561,8 +2566,15 @@ impl P2pConnManager {
                 let is_transient = transient;
 
                 // Pass peer directly - it may be None for transient connections
-                self.handle_successful_connection(peer, connection, state, None, is_transient)
-                    .await?;
+                self.handle_successful_connection(
+                    peer,
+                    connection,
+                    state,
+                    None,
+                    is_transient,
+                    handshake_commands,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundEstablished {
                 transaction,
@@ -2604,8 +2616,15 @@ impl P2pConnManager {
 
                 // For outbound connections, respect the transient flag from the handshake.
                 // Gateway connections should remain transient until CONNECT acceptance.
-                self.handle_successful_connection(Some(peer), connection, state, None, transient)
-                    .await?;
+                self.handle_successful_connection(
+                    Some(peer),
+                    connection,
+                    state,
+                    None,
+                    transient,
+                    handshake_commands,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
@@ -2769,6 +2788,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
         is_transient: bool,
+        handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
         // For transient connections, we may not know the peer's identity yet - use connection's remote_addr
@@ -2806,92 +2826,127 @@ impl P2pConnManager {
             if let Some(ref old_pub_key) = old.pub_key {
                 self.addr_by_pub_key.remove(old_pub_key);
             }
-            self.bridge
+
+            // Full cleanup: handle both transient and ring-promoted connections.
+            // If transient, drop_transient releases the budget slot.
+            // If ring-promoted, prune_connection cleans up topology, orphaned txs,
+            // subscriptions, and notifies the handshake driver.
+            let was_transient = self
+                .bridge
                 .op_manager
                 .ring
                 .connection_manager
-                .drop_transient(peer_addr);
+                .drop_transient(peer_addr)
+                .is_some();
+
+            if !was_transient {
+                // Old connection was ring-promoted — mirror TransportClosed cleanup
+                let old_peer = if let Some(ref pub_key) = old.pub_key {
+                    PeerKeyLocation::new(pub_key.clone(), peer_addr)
+                } else {
+                    PeerKeyLocation::new(
+                        (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
+                        peer_addr,
+                    )
+                };
+                let prune_result = self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .prune_connection(PeerId::new(peer_addr, old_peer.pub_key().clone()))
+                    .await;
+                self.bridge
+                    .handle_orphaned_transactions(
+                        prune_result.orphaned_transactions,
+                        &self.gateways,
+                    )
+                    .await;
+                self.bridge
+                    .op_manager
+                    .on_ring_connection_lost(old_peer.pub_key());
+                if let Err(error) = handshake_commands
+                    .send(HandshakeCommand::DropConnection {
+                        peer: old_peer.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        remote = %peer_addr,
+                        ?error,
+                        "Failed to notify handshake driver about replaced connection"
+                    );
+                }
+            }
 
             tracing::info!(
                 %peer_addr,
                 old_connection_id = old.connection_id,
+                was_transient,
                 "Replacing stale connection entry (peer reconnected with new identity)"
             );
         }
 
-        let mut newly_inserted = false;
-        if !self.connections.contains_key(&peer_addr) {
-            if is_transient {
-                let cm = &self.bridge.op_manager.ring.connection_manager;
-                let current = cm.transient_count();
-                if current >= cm.transient_budget() {
-                    tracing::warn!(
-                        remote = %peer_addr,
-                        budget = cm.transient_budget(),
-                        current,
-                        "Transient connection budget exhausted; dropping inbound connection before insert"
-                    );
-                    return Ok(());
-                }
+        if is_transient {
+            let cm = &self.bridge.op_manager.ring.connection_manager;
+            let current = cm.transient_count();
+            if current >= cm.transient_budget() {
+                tracing::warn!(
+                    remote = %peer_addr,
+                    budget = cm.transient_budget(),
+                    current,
+                    "Transient connection budget exhausted; dropping inbound connection before insert"
+                );
+                return Ok(());
             }
-            let conn_id = next_connection_id();
-            let (tx, rx) = mpsc::channel(10);
-            tracing::debug!(
-                self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
-                peer_id = ?peer_id,
-                %peer_addr,
-                connection_id = conn_id,
-                conn_map_size = self.connections.len(),
-                "[CONN_TRACK] INSERT: adding connection to HashMap"
-            );
-            self.connections.insert(
-                peer_addr,
-                ConnectionEntry {
-                    sender: tx,
-                    // For transient connections, we don't know the pub_key yet - it will be learned
-                    // when the peer sends its first message (e.g., ConnectRequest)
-                    pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
-                    connection_id: conn_id,
-                },
-            );
-            // Only add to reverse lookup if we know the pub_key
-            // For transient connections, this will be populated when identity is learned
-            if let Some(ref peer) = peer_id {
-                self.addr_by_pub_key
-                    .insert(peer.pub_key().clone(), peer_addr);
-            }
-            let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
-                anyhow::bail!("Connection event channel not initialized");
-            };
-
-            // Phase 4: Set orphan stream registry on connection for handling race conditions
-            // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-            let mut connection = connection;
-            connection.set_orphan_stream_registry(
-                self.bridge.op_manager.orphan_stream_registry().clone(),
-            );
-
-            // Use tokio::spawn directly instead of GlobalExecutor::spawn.
-            // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
-            // reliably poll tasks in certain test contexts (see issue #2709).
-            tokio::spawn(async move {
-                peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
-            });
-            // Yield to allow the spawned peer_connection_listener task to start.
-            // This is important because on some runtimes (especially in tests with boxed_local
-            // futures), spawned tasks may not be scheduled immediately, causing messages
-            // sent to the channel to pile up without being processed.
-            tokio::task::yield_now().await;
-            newly_inserted = true;
-        } else {
-            tracing::debug!(
-                self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
-                peer_id = ?peer_id,
-                %peer_addr,
-                conn_map_size = self.connections.len(),
-                "[CONN_TRACK] SKIP INSERT: connection already exists in HashMap"
-            );
         }
+        let conn_id = next_connection_id();
+        let (tx, rx) = mpsc::channel(10);
+        tracing::debug!(
+            self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
+            peer_id = ?peer_id,
+            %peer_addr,
+            connection_id = conn_id,
+            conn_map_size = self.connections.len(),
+            "[CONN_TRACK] INSERT: adding connection to HashMap"
+        );
+        self.connections.insert(
+            peer_addr,
+            ConnectionEntry {
+                sender: tx,
+                // For transient connections, we don't know the pub_key yet - it will be learned
+                // when the peer sends its first message (e.g., ConnectRequest)
+                pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
+                connection_id: conn_id,
+            },
+        );
+        // Only add to reverse lookup if we know the pub_key
+        // For transient connections, this will be populated when identity is learned
+        if let Some(ref peer) = peer_id {
+            self.addr_by_pub_key
+                .insert(peer.pub_key().clone(), peer_addr);
+        }
+        let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
+            anyhow::bail!("Connection event channel not initialized");
+        };
+
+        // Phase 4: Set orphan stream registry on connection for handling race conditions
+        // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+        let mut connection = connection;
+        connection
+            .set_orphan_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
+
+        // Use tokio::spawn directly instead of GlobalExecutor::spawn.
+        // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
+        // reliably poll tasks in certain test contexts (see issue #2709).
+        tokio::spawn(async move {
+            peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
+        });
+        // Yield to allow the spawned peer_connection_listener task to start.
+        // This is important because on some runtimes (especially in tests with boxed_local
+        // futures), spawned tasks may not be scheduled immediately, causing messages
+        // sent to the channel to pile up without being processed.
+        tokio::task::yield_now().await;
+        let newly_inserted = true;
 
         // Now safe to remove from awaiting_connection and notify callbacks.
         // self.connections already has the entry, so concurrent connect() calls
