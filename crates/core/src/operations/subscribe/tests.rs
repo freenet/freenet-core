@@ -819,10 +819,16 @@ fn test_subscribe_failure_outcome() {
             contract_location,
         }),
     };
-    assert!(
-        matches!(op_completed.outcome(), OpOutcome::Irrelevant),
-        "Completed subscribe should return Irrelevant"
-    );
+    match op_completed.outcome() {
+        OpOutcome::ContractOpSuccessUntimed {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        _ => panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats"),
+    }
 
     // Non-finalized op without stats → should return Incomplete
     let op_no_stats = SubscribeOp {

@@ -29,42 +29,49 @@ use crate::{
 };
 use either::Either;
 
+/// Routing stats for put operations, used to report success/failure to the router.
+struct PutStats {
+    target_peer: PeerKeyLocation,
+    contract_location: Location,
+}
+
 pub(crate) struct PutOp {
     pub id: Transaction,
     state: Option<PutState>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
     upstream_addr: Option<std::net::SocketAddr>,
+    /// Routing stats for reporting outcomes to the router.
+    stats: Option<PutStats>,
 }
 
 impl PutOp {
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
-        // todo: track in the future
-        // match &self.stats {
-        //     Some(PutStats {
-        //         contract_location,
-        //         payload_size,
-        //         // first_response_time: Some((response_start, Some(response_end))),
-        //         transfer_time: Some((transfer_start, Some(transfer_end))),
-        //         target: Some(target),
-        //         ..
-        //     }) => {
-        //         let payload_transfer_time: Duration = *transfer_end - *transfer_start;
-        //         // in puts both times are equivalent since when the transfer is initialized
-        //         // it already contains the payload
-        //         let first_response_time = payload_transfer_time;
-        //         OpOutcome::ContractOpSuccess {
-        //             target_peer: target,
-        //             contract_location: *contract_location,
-        //             payload_size: *payload_size,
-        //             payload_transfer_time,
-        //             first_response_time,
-        //         }
-        //     }
-        //     Some(_) => OpOutcome::Incomplete,
-        //     None => OpOutcome::Irrelevant,
-        // }
-        OpOutcome::Irrelevant
+        if self.finalized() {
+            if let Some(ref stats) = self.stats {
+                return OpOutcome::ContractOpSuccessUntimed {
+                    target_peer: &stats.target_peer,
+                    contract_location: stats.contract_location,
+                };
+            }
+            return OpOutcome::Irrelevant;
+        }
+        // Not completed — if we have stats, report as failure
+        if let Some(ref stats) = self.stats {
+            OpOutcome::ContractOpFailure {
+                target_peer: &stats.target_peer,
+                contract_location: stats.contract_location,
+            }
+        } else {
+            OpOutcome::Incomplete
+        }
+    }
+
+    /// Extract routing failure info for timeout reporting.
+    pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
+        self.stats
+            .as_ref()
+            .map(|s| (s.target_peer.clone(), s.contract_location))
     }
 
     pub(super) fn finalized(&self) -> bool {
@@ -240,6 +247,7 @@ impl Operation for PutOp {
                         state: None, // No state needed for forwarding nodes
                         id: tx,
                         upstream_addr: source_addr, // Remember who to send response to
+                        stats: None,
                     },
                     source_addr,
                 })
@@ -270,6 +278,7 @@ impl Operation for PutOp {
         Box::pin(async move {
             let id = self.id;
             let upstream_addr = self.upstream_addr;
+            let mut stats = self.stats;
             let is_originator = upstream_addr.is_none();
 
             // Look up sender's PeerKeyLocation from source address for telemetry
@@ -476,6 +485,10 @@ impl Operation for PutOp {
                             current_htl: htl,
                         });
 
+                        stats = Some(PutStats {
+                            target_peer: PeerKeyLocation::from(next_peer.clone()),
+                            contract_location: Location::from(&key),
+                        });
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(forward_msg)),
                             next_hop: Some(next_addr),
@@ -483,6 +496,7 @@ impl Operation for PutOp {
                                 id,
                                 state: new_state,
                                 upstream_addr,
+                                stats,
                             })),
                             stream_data,
                         })
@@ -530,6 +544,7 @@ impl Operation for PutOp {
                                     id,
                                     state: Some(PutState::Finished { key }),
                                     upstream_addr: None,
+                                    stats,
                                 })),
                                 stream_data: None,
                             })
@@ -623,6 +638,7 @@ impl Operation for PutOp {
                                 id,
                                 state: Some(PutState::Finished { key: *key }),
                                 upstream_addr: None,
+                                stats,
                             })),
                             stream_data: None,
                         })
@@ -695,6 +711,7 @@ impl Operation for PutOp {
                                             id,
                                             state: self.state,
                                             upstream_addr,
+                                            stats,
                                         }),
                                     )
                                     .await;
@@ -717,6 +734,7 @@ impl Operation for PutOp {
                                             id,
                                             state: self.state,
                                             upstream_addr,
+                                            stats,
                                         }),
                                     )
                                     .await;
@@ -941,6 +959,15 @@ impl Operation for PutOp {
                             current_htl: htl,
                         });
 
+                        stats = Some(PutStats {
+                            target_peer: PeerKeyLocation::from(
+                                next_peer_known
+                                    .as_ref()
+                                    .expect("piping_started implies next_peer_known")
+                                    .clone(),
+                            ),
+                            contract_location: Location::from(&key),
+                        });
                         // No return_msg or stream_data needed - piping handles forwarding
                         Ok(OperationResult {
                             return_msg: None,
@@ -949,6 +976,7 @@ impl Operation for PutOp {
                                 id,
                                 state: new_state,
                                 upstream_addr,
+                                stats,
                             })),
                             stream_data: None,
                         })
@@ -996,6 +1024,10 @@ impl Operation for PutOp {
                             current_htl: htl,
                         });
 
+                        stats = Some(PutStats {
+                            target_peer: PeerKeyLocation::from(next_peer.clone()),
+                            contract_location: Location::from(&key),
+                        });
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(forward_msg)),
                             next_hop: Some(next_addr),
@@ -1003,6 +1035,7 @@ impl Operation for PutOp {
                                 id,
                                 state: new_state,
                                 upstream_addr,
+                                stats,
                             })),
                             stream_data: None,
                         })
@@ -1046,6 +1079,7 @@ impl Operation for PutOp {
                                     id,
                                     state: Some(PutState::Finished { key }),
                                     upstream_addr: None,
+                                    stats,
                                 })),
                                 stream_data: None,
                             })
@@ -1139,6 +1173,7 @@ impl Operation for PutOp {
                                 id,
                                 state: Some(PutState::Finished { key: *key }),
                                 upstream_addr: None,
+                                stats,
                             })),
                             stream_data: None,
                         })
@@ -1236,6 +1271,7 @@ pub(crate) fn start_op(
         id,
         state,
         upstream_addr: None, // Local operation, no upstream peer
+        stats: None,
     }
 }
 
@@ -1266,6 +1302,7 @@ pub(crate) fn start_op_with_id(
         id,
         state,
         upstream_addr: None, // Local operation, no upstream peer
+        stats: None,
     }
 }
 
@@ -1372,6 +1409,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
             current_htl: htl,
         }),
         upstream_addr: None,
+        stats: None,
     };
 
     // Send through the operation processing pipeline
@@ -1593,6 +1631,7 @@ mod tests {
             id: Transaction::new::<PutMsg>(),
             state,
             upstream_addr: None,
+            stats: None,
         }
     }
 
@@ -1777,6 +1816,124 @@ mod tests {
             }
             other => panic!("Expected PrepareRequest state, got {:?}", other),
         }
+    }
+
+    // Tests for outcome() method
+    #[test]
+    fn put_op_outcome_success_untimed_when_finalized_with_stats() {
+        use crate::operations::OpOutcome;
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::Finished {
+                key: make_contract_key(1),
+            }),
+            upstream_addr: None,
+            stats: Some(PutStats {
+                target_peer: target_peer.clone(),
+                contract_location,
+            }),
+        };
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            _ => panic!("Expected ContractOpSuccessUntimed for finalized put with stats"),
+        }
+    }
+
+    #[test]
+    fn put_op_outcome_irrelevant_when_finalized_without_stats() {
+        use crate::operations::OpOutcome;
+
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::Finished {
+                key: make_contract_key(1),
+            }),
+            upstream_addr: None,
+            stats: None,
+        };
+        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    #[test]
+    fn put_op_outcome_failure_when_not_finalized_with_stats() {
+        use crate::operations::OpOutcome;
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::AwaitingResponse {
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop: None,
+                current_htl: 10,
+            }),
+            upstream_addr: None,
+            stats: Some(PutStats {
+                target_peer: target_peer.clone(),
+                contract_location,
+            }),
+        };
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            _ => panic!("Expected ContractOpFailure for non-finalized put with stats"),
+        }
+    }
+
+    #[test]
+    fn put_op_outcome_incomplete_when_not_finalized_without_stats() {
+        use crate::operations::OpOutcome;
+
+        let op = make_put_op(Some(PutState::AwaitingResponse {
+            subscribe: false,
+            blocking_subscribe: false,
+            next_hop: None,
+            current_htl: 10,
+        }));
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+    }
+
+    #[test]
+    fn put_op_failure_routing_info_with_stats() {
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: None,
+            upstream_addr: None,
+            stats: Some(PutStats {
+                target_peer: target_peer.clone(),
+                contract_location,
+            }),
+        };
+        let info = op.failure_routing_info().expect("should have routing info");
+        assert_eq!(info.0, target_peer);
+        assert_eq!(info.1, contract_location);
+    }
+
+    #[test]
+    fn put_op_failure_routing_info_without_stats() {
+        let op = make_put_op(None);
+        assert!(op.failure_routing_info().is_none());
     }
 
     #[test]

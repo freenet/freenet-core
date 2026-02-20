@@ -41,7 +41,43 @@ pub(crate) struct UpdateOp {
 
 impl UpdateOp {
     pub fn outcome(&self) -> OpOutcome<'_> {
-        OpOutcome::Irrelevant
+        if self.finalized() {
+            if let Some(UpdateStats {
+                target: Some(ref target),
+                contract_location: Some(loc),
+            }) = self.stats
+            {
+                return OpOutcome::ContractOpSuccessUntimed {
+                    target_peer: target,
+                    contract_location: loc,
+                };
+            }
+            return OpOutcome::Irrelevant;
+        }
+        // Not completed — if we have stats with target+location, report as failure
+        if let Some(UpdateStats {
+            target: Some(ref target),
+            contract_location: Some(loc),
+        }) = self.stats
+        {
+            OpOutcome::ContractOpFailure {
+                target_peer: target,
+                contract_location: loc,
+            }
+        } else {
+            OpOutcome::Incomplete
+        }
+    }
+
+    /// Extract routing failure info for timeout reporting.
+    pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
+        match &self.stats {
+            Some(UpdateStats {
+                target: Some(target),
+                contract_location: Some(loc),
+            }) => Some((target.clone(), *loc)),
+            _ => None,
+        }
     }
 
     pub fn finalized(&self) -> bool {
@@ -123,6 +159,7 @@ impl UpdateOp {
 
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
+    contract_location: Option<Location>,
 }
 
 struct UpdateExecution {
@@ -1379,7 +1416,10 @@ pub(crate) fn start_op(
     UpdateOp {
         id,
         state,
-        stats: Some(UpdateStats { target: None }),
+        stats: Some(UpdateStats {
+            target: None,
+            contract_location: Some(contract_location),
+        }),
         upstream_addr: None, // Local operation, no upstream peer
     }
 }
@@ -1403,7 +1443,10 @@ pub(crate) fn start_op_with_id(
     UpdateOp {
         id,
         state,
-        stats: Some(UpdateStats { target: None }),
+        stats: Some(UpdateStats {
+            target: None,
+            contract_location: Some(contract_location),
+        }),
         upstream_addr: None, // Local operation, no upstream peer
     }
 }
@@ -1624,6 +1667,7 @@ pub(crate) async fn request_update(
         state: Some(UpdateState::ReceivedRequest),
         stats: Some(UpdateStats {
             target: Some(target),
+            contract_location: Some(Location::from(&key)),
         }),
         upstream_addr: None, // We're the originator
     };
@@ -1895,4 +1939,137 @@ pub enum UpdateState {
         /// This is passed to update_contract which calls UpdateQuery to merge and persist.
         update_data: UpdateData<'static>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::test_utils::make_contract_key;
+    use crate::operations::OpOutcome;
+
+    fn make_update_op(state: Option<UpdateState>, stats: Option<UpdateStats>) -> UpdateOp {
+        UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state,
+            stats,
+            upstream_addr: None,
+        }
+    }
+
+    #[test]
+    fn update_op_outcome_success_untimed_when_finalized_with_full_stats() {
+        let target = PeerKeyLocation::random();
+        let loc = Location::random();
+        let op = make_update_op(
+            Some(UpdateState::Finished {
+                key: make_contract_key(1),
+                summary: StateSummary::from(vec![1u8]),
+            }),
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(loc),
+            }),
+        );
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer,
+                contract_location,
+            } => {
+                assert_eq!(*target_peer, target);
+                assert_eq!(contract_location, loc);
+            }
+            _ => panic!("Expected ContractOpSuccessUntimed for finalized update with full stats"),
+        }
+    }
+
+    #[test]
+    fn update_op_outcome_irrelevant_when_finalized_without_stats() {
+        let op = make_update_op(
+            Some(UpdateState::Finished {
+                key: make_contract_key(1),
+                summary: StateSummary::from(vec![1u8]),
+            }),
+            None,
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    #[test]
+    fn update_op_outcome_irrelevant_when_finalized_with_partial_stats() {
+        // target is None — should fall through to Irrelevant
+        let op = make_update_op(
+            Some(UpdateState::Finished {
+                key: make_contract_key(1),
+                summary: StateSummary::from(vec![1u8]),
+            }),
+            Some(UpdateStats {
+                target: None,
+                contract_location: Some(Location::random()),
+            }),
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    #[test]
+    fn update_op_outcome_failure_when_not_finalized_with_full_stats() {
+        let target = PeerKeyLocation::random();
+        let loc = Location::random();
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(loc),
+            }),
+        );
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location,
+            } => {
+                assert_eq!(*target_peer, target);
+                assert_eq!(contract_location, loc);
+            }
+            _ => panic!("Expected ContractOpFailure for non-finalized update with full stats"),
+        }
+    }
+
+    #[test]
+    fn update_op_outcome_incomplete_when_not_finalized_without_stats() {
+        let op = make_update_op(Some(UpdateState::ReceivedRequest), None);
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+    }
+
+    #[test]
+    fn update_op_failure_routing_info_with_full_stats() {
+        let target = PeerKeyLocation::random();
+        let loc = Location::random();
+        let op = make_update_op(
+            None,
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(loc),
+            }),
+        );
+        let info = op.failure_routing_info().expect("should have routing info");
+        assert_eq!(info.0, target);
+        assert_eq!(info.1, loc);
+    }
+
+    #[test]
+    fn update_op_failure_routing_info_without_stats() {
+        let op = make_update_op(None, None);
+        assert!(op.failure_routing_info().is_none());
+    }
+
+    #[test]
+    fn update_op_failure_routing_info_with_partial_stats() {
+        let op = make_update_op(
+            None,
+            Some(UpdateStats {
+                target: None,
+                contract_location: Some(Location::random()),
+            }),
+        );
+        assert!(op.failure_routing_info().is_none());
+    }
 }

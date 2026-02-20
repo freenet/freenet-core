@@ -50,7 +50,7 @@ use crate::transport::TransportPublicKey;
 use crate::util::time_source::TimeSource;
 
 /// TTL for peer interests. After this duration without refresh, entries are expired.
-pub const INTEREST_TTL: Duration = Duration::from_secs(300); // 5 minutes
+pub const INTEREST_TTL: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Interval for background sweep to clean up expired interests.
 pub const INTEREST_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute

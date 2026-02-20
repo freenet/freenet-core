@@ -526,6 +526,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
             use crate::router::RouteOutcome;
             match &route_event.outcome {
                 RouteOutcome::Success { .. } => "route_success".to_string(),
+                RouteOutcome::SuccessUntimed => "route_success_untimed".to_string(),
                 RouteOutcome::Failure => "route_failure".to_string(),
             }
         }
@@ -1276,9 +1277,13 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "payload_transfer_time_ms": payload_transfer_time.as_millis() as u64,
                     })
                 }
-                RouteOutcome::Failure => {
+                RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
+                    let type_str = match &route_event.outcome {
+                        RouteOutcome::SuccessUntimed => "route_success_untimed",
+                        _ => "route_failure",
+                    };
                     serde_json::json!({
-                        "type": "route_failure",
+                        "type": type_str,
                         "peer_location": route_event.peer.location().map(|l| l.as_f64()),
                         "contract_location": route_event.contract_location.as_f64(),
                         "distance": distance,

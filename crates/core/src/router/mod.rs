@@ -106,11 +106,7 @@ impl Router {
                 peer: re.peer.clone(),
                 contract_location: re.contract_location,
                 result: match re.outcome {
-                    RouteOutcome::Success {
-                        time_to_response_start: _,
-                        payload_size: _,
-                        payload_transfer_time: _,
-                    } => 0.0,
+                    RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => 0.0,
                     RouteOutcome::Failure => 1.0,
                 },
             })
@@ -224,11 +220,16 @@ impl Router {
 
                 self.transfer_rate_estimator.add_event(transfer_rate_event);
             }
-            RouteOutcome::Failure => {
+            RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
+                let result = if matches!(event.outcome, RouteOutcome::Failure) {
+                    1.0
+                } else {
+                    0.0
+                };
                 self.failure_estimator.add_event(IsotonicEvent {
                     peer: event.peer,
                     contract_location: event.contract_location,
-                    result: 1.0,
+                    result,
                 });
             }
         }
@@ -528,6 +529,9 @@ pub enum RouteOutcome {
         payload_size: usize,
         payload_transfer_time: Duration,
     },
+    /// Operation succeeded but has no timing data (subscribe, put, update).
+    /// Feeds only the failure_estimator (0.0 = success), not timing estimators.
+    SuccessUntimed,
     Failure,
 }
 
@@ -630,6 +634,9 @@ mod tests {
                 } => {
                     entry.0 += time_to_response_start.as_secs_f64();
                     entry.1 += *payload_size as f64 / payload_transfer_time.as_secs_f64();
+                }
+                RouteOutcome::SuccessUntimed => {
+                    // No timing data to accumulate
                 }
                 RouteOutcome::Failure => {
                     entry.2 += 1.0; // failure count
@@ -1021,5 +1028,89 @@ mod tests {
         }
         // Basic sanity: distance should be in valid range
         assert!(selected_distance.as_f64() >= 0.0 && selected_distance.as_f64() <= 0.5);
+    }
+
+    /// Verify that `SuccessUntimed` feeds the failure_estimator (as 0.0 = success)
+    /// but does NOT feed timing estimators (response_start_time, transfer_rate).
+    #[test]
+    fn test_success_untimed_feeds_failure_only() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Start with an empty router
+        let mut router = Router::new(&[]);
+        assert_eq!(router.failure_estimator.len(), 0);
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+
+        // Add a SuccessUntimed event
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::SuccessUntimed,
+        });
+
+        // failure_estimator should have 1 event (success = 0.0)
+        assert_eq!(
+            router.failure_estimator.len(),
+            1,
+            "SuccessUntimed should feed failure_estimator"
+        );
+        // timing estimators should remain empty
+        assert_eq!(
+            router.response_start_time_estimator.len(),
+            0,
+            "SuccessUntimed should NOT feed response_start_time_estimator"
+        );
+        assert_eq!(
+            router.transfer_rate_estimator.len(),
+            0,
+            "SuccessUntimed should NOT feed transfer_rate_estimator"
+        );
+
+        // Also verify it counts toward threshold: 49 SuccessUntimed + 1 more = 50
+        for _ in 0..49 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+        assert_eq!(router.failure_estimator.len(), 50);
+        assert!(
+            router.has_sufficient_routing_events(),
+            "50 SuccessUntimed events should meet the threshold"
+        );
+        // timing estimators still empty
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+    }
+
+    /// Verify Router::new() handles SuccessUntimed in history correctly.
+    #[test]
+    fn test_success_untimed_in_history() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let events: Vec<RouteEvent> = (0..30)
+            .map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            })
+            .chain((0..20).map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            }))
+            .collect();
+
+        let router = Router::new(&events);
+
+        // failure_estimator: 30 successes + 20 failures = 50
+        assert_eq!(router.failure_estimator.len(), 50);
+        // timing estimators: 0 (SuccessUntimed has no timing data, Failure has none either)
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
     }
 }

@@ -560,51 +560,49 @@ async fn report_result(
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
 
-            match op_res.outcome() {
+            let route_event = match op_res.outcome() {
                 OpOutcome::ContractOpSuccess {
                     target_peer,
                     contract_location,
                     first_response_time,
                     payload_size,
                     payload_transfer_time,
-                } => {
-                    let event = RouteEvent {
-                        peer: target_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::Success {
-                            time_to_response_start: first_response_time,
-                            payload_size,
-                            payload_transfer_time,
-                        },
-                    };
-                    if let Some(log_event) =
-                        NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
-                    {
-                        event_listener
-                            .register_events(Either::Left(log_event))
-                            .await;
-                    }
-                    op_manager.ring.routing_finished(event);
-                }
+                } => Some(RouteEvent {
+                    peer: target_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Success {
+                        time_to_response_start: first_response_time,
+                        payload_size,
+                        payload_transfer_time,
+                    },
+                }),
+                OpOutcome::ContractOpSuccessUntimed {
+                    target_peer,
+                    contract_location,
+                } => Some(RouteEvent {
+                    peer: target_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::SuccessUntimed,
+                }),
                 OpOutcome::ContractOpFailure {
                     target_peer,
                     contract_location,
-                } => {
-                    let event = RouteEvent {
-                        peer: target_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::Failure,
-                    };
-                    if let Some(log_event) =
-                        NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
-                    {
-                        event_listener
-                            .register_events(Either::Left(log_event))
-                            .await;
-                    }
-                    op_manager.ring.routing_finished(event);
+                } => Some(RouteEvent {
+                    peer: target_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Failure,
+                }),
+                OpOutcome::Incomplete | OpOutcome::Irrelevant => None,
+            };
+            if let Some(event) = route_event {
+                if let Some(log_event) =
+                    NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
+                {
+                    event_listener
+                        .register_events(Either::Left(log_event))
+                        .await;
                 }
-                OpOutcome::Incomplete | OpOutcome::Irrelevant => {}
+                op_manager.ring.routing_finished(event);
             }
             if let Some(mut cb) = executor_callback {
                 cb.response(op_res).await;

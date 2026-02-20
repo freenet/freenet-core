@@ -421,9 +421,14 @@ impl SubscribeOp {
     }
 
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
-        // If finalized successfully, routing succeeded (but we don't have timing
-        // stats for subscribe, so report as Irrelevant for the success path).
         if self.finalized() {
+            // Subscribe succeeded — report as untimed success if we have stats
+            if let Some(ref stats) = self.stats {
+                return OpOutcome::ContractOpSuccessUntimed {
+                    target_peer: &stats.target_peer,
+                    contract_location: stats.contract_location,
+                };
+            }
             return OpOutcome::Irrelevant;
         }
         // Not completed — if we have stats, report as failure

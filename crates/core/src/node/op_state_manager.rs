@@ -1116,6 +1116,32 @@ fn report_timeout_failure(
     );
 }
 
+/// Removes a put operation from the ops map and reports timeout failure if stats are available.
+/// Returns `true` if the operation was found and removed, `false` otherwise.
+fn remove_put_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring::Ring) -> bool {
+    if let Some((_, put_op)) = ops.put.remove(tx) {
+        if let Some((peer, contract_location)) = put_op.failure_routing_info() {
+            report_timeout_failure(ring, tx, peer, contract_location);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Removes an update operation from the ops map and reports timeout failure if stats are available.
+/// Returns `true` if the operation was found and removed, `false` otherwise.
+fn remove_update_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring::Ring) -> bool {
+    if let Some((_, update_op)) = ops.update.remove(tx) {
+        if let Some((peer, contract_location)) = update_op.failure_routing_info() {
+            report_timeout_failure(ring, tx, peer, contract_location);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Removes a subscribe operation from the ops map and notifies timeout if found.
 /// Returns `Some(())` if the operation was found and removed, `None` otherwise.
 fn remove_subscribe_and_notify_timeout(
@@ -1250,14 +1276,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
-                        // TODO(#3127): wire up PUT/UPDATE timeout failure reporting
-                        // once their outcome() methods track routing stats
-                        TransactionType::Put => ops.put.remove(&tx).is_none(),
+                        TransactionType::Put => !remove_put_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Get => !remove_get_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
                         }
-                        TransactionType::Update => ops.update.remove(&tx).is_none(),
+                        TransactionType::Update => !remove_update_and_report_failure(&ops, &tx, &ring),
                     };
                     if still_waiting {
                         delayed.push(tx);
@@ -1334,14 +1358,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
-                        // TODO(#3127): wire up PUT/UPDATE timeout failure reporting
-                        // once their outcome() methods track routing stats
-                        TransactionType::Put => ops.put.remove(&tx).is_some(),
+                        TransactionType::Put => remove_put_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Get => remove_get_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
                         }
-                        TransactionType::Update => ops.update.remove(&tx).is_some(),
+                        TransactionType::Update => remove_update_and_report_failure(&ops, &tx, &ring),
                     };
                     if removed {
                         tracing::info!(
