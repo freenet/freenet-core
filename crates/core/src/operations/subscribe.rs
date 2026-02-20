@@ -1016,9 +1016,9 @@ impl Operation for SubscribeOp {
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
                             super::announce_contract_cached(op_manager, key).await;
 
-                            // Register the responding peer in our interest manager.
-                            // The peer that fulfilled our subscription has the contract,
-                            // so we should include them in update broadcasts.
+                            // Register the responding peer as our upstream in the interest manager.
+                            // This peer fulfilled our subscription, so it's the target for
+                            // Unsubscribe messages when we no longer need updates.
                             if let Some(resp_addr) = source_addr {
                                 if let Some(pkl) = op_manager
                                     .ring
@@ -1029,7 +1029,7 @@ impl Operation for SubscribeOp {
                                         crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
                                     op_manager
                                         .interest_manager
-                                        .register_peer_interest(key, peer_key, None, false);
+                                        .register_peer_interest(key, peer_key, None, true);
                                 }
                             }
 

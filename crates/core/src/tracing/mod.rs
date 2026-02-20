@@ -1127,6 +1127,21 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
+            NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe {
+                id,
+                instance_id,
+            })) => {
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone());
+                EventKind::Subscribe(SubscribeEvent::UnsubscribeSent {
+                    id: *id,
+                    instance_id: *instance_id,
+                    from: own_loc.clone(),
+                    to,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             _ => EventKind::Ignored,
         };
         Either::Left(NetEventLog {
@@ -1380,6 +1395,16 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer, // We are the target
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
+                })
+            }
+            NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe { id, instance_id }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived {
+                    id: *id,
+                    instance_id: *instance_id,
+                    from: this_peer.clone(), // Sender resolved later; use own as placeholder
+                    at: this_peer,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             NetMessageV1::Connect(_)
@@ -2670,6 +2695,22 @@ impl EventKind {
         matches!(self, EventKind::Connect(_))
     }
 
+    /// Returns true if this event is an UnsubscribeReceived event.
+    pub fn is_unsubscribe_received(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived { .. })
+        )
+    }
+
+    /// Returns true if this event is an UnsubscribeSent event.
+    pub fn is_unsubscribe_sent(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeSent { .. })
+        )
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -3389,6 +3430,28 @@ pub(crate) enum SubscribeEvent {
     _Reserved9,
     #[doc(hidden)]
     _Reserved10,
+    /// An explicit Unsubscribe message was sent upstream for fast cleanup.
+    UnsubscribeSent {
+        id: Transaction,
+        /// Contract instance being unsubscribed from.
+        instance_id: ContractInstanceId,
+        /// The peer sending the unsubscribe.
+        from: PeerKeyLocation,
+        /// The upstream peer receiving the unsubscribe.
+        to: PeerKeyLocation,
+        timestamp: u64,
+    },
+    /// An explicit Unsubscribe message was received from a downstream peer.
+    UnsubscribeReceived {
+        id: Transaction,
+        /// Contract instance being unsubscribed from.
+        instance_id: ContractInstanceId,
+        /// The downstream peer that sent the unsubscribe.
+        from: PeerKeyLocation,
+        /// This peer (the upstream that received it).
+        at: PeerKeyLocation,
+        timestamp: u64,
+    },
 }
 
 impl SubscribeEvent {

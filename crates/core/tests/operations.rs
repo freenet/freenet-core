@@ -3888,3 +3888,194 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Delegate contract GET E2E test passed");
     Ok(())
 }
+
+/// Test that disconnecting a subscribed client triggers an upstream Unsubscribe message.
+///
+/// Scenario: node-b subscribes to a contract hosted on node-a. After verifying
+/// the subscription works (update propagates), client B disconnects. The test
+/// asserts that node-b sent an UnsubscribeSent event and the upstream peer
+/// logged an UnsubscribeReceived event in the aggregated event logs.
+#[freenet_test(
+    nodes = ["gateway", "node-a", "node-b"],
+    timeout_secs = 600,
+    startup_wait_secs = 40,
+    aggregate_events = "always",
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let node_a = ctx.node("node-a")?;
+    let node_b = ctx.node("node-b")?;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect clients
+    let uri_a = node_a.ws_url();
+    let (stream_a, _) = connect_async(&uri_a).await?;
+    let mut client_a = WebApi::start(stream_a);
+
+    let uri_b = node_b.ws_url();
+    let (stream_b, _) = connect_async(&uri_b).await?;
+    let mut client_b = WebApi::start(stream_b);
+
+    // Client A puts the contract
+    tracing::info!("Client A: PUT contract");
+    make_put(
+        &mut client_a,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+    loop {
+        match timeout(Duration::from_secs(120), client_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Client A: PUT complete");
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => bail!("Error waiting for PUT response: {}", e),
+            Err(_) => bail!("Timeout waiting for PUT response"),
+        }
+    }
+
+    // Client B gets the contract (so node-b caches it)
+    tracing::info!("Client B: GET contract");
+    make_get(&mut client_b, contract_key, true, false).await?;
+    loop {
+        match timeout(Duration::from_secs(60), client_b.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Client B: GET complete");
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => bail!("Error waiting for GET response: {}", e),
+            Err(_) => bail!("Timeout waiting for GET response"),
+        }
+    }
+
+    // Client B subscribes
+    tracing::info!("Client B: SUBSCRIBE");
+    make_subscribe(&mut client_b, contract_key).await?;
+    loop {
+        match timeout(Duration::from_secs(30), client_b.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }))) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed);
+                tracing::info!("Client B: subscribed");
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => bail!("Error waiting for SUBSCRIBE response: {}", e),
+            Err(_) => bail!("Timeout waiting for SUBSCRIBE response"),
+        }
+    }
+
+    // Send an update and verify client B receives it (subscription is active)
+    tracing::info!("Phase 1: Verify subscription works");
+    make_subscribe(&mut client_a, contract_key).await?;
+    loop {
+        match timeout(Duration::from_secs(30), client_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                subscribed,
+                ..
+            }))) => {
+                assert!(subscribed);
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => bail!("Error waiting for SUBSCRIBE response: {}", e),
+            Err(_) => bail!("Timeout waiting for SUBSCRIBE response"),
+        }
+    }
+
+    let todo = test_utils::TodoList {
+        tasks: vec![test_utils::Task {
+            id: 1,
+            title: "first update".into(),
+            description: "verify subscription".into(),
+            completed: false,
+            priority: 1,
+        }],
+        version: 1,
+    };
+    let state1 = WrappedState::from(serde_json::to_vec(&todo)?);
+    make_update(&mut client_a, contract_key, state1).await?;
+
+    let mut client_b_received = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(10), client_b.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Client B: received update notification");
+                client_b_received = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        client_b_received,
+        "Client B should receive update notification while subscribed"
+    );
+
+    // Phase 2: Disconnect client B — should trigger upstream Unsubscribe
+    tracing::info!("Phase 2: Disconnect client B");
+    client_b
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+
+    // Wait for the disconnect to propagate and unsubscribe to be sent upstream
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Check event logs for UnsubscribeSent and UnsubscribeReceived
+    let aggregator = ctx.aggregate_events().await?;
+    let events = aggregator.get_all_events().await?;
+
+    let unsubscribe_sent_count = events
+        .iter()
+        .filter(|e| e.kind.is_unsubscribe_sent())
+        .count();
+    let unsubscribe_received_count = events
+        .iter()
+        .filter(|e| e.kind.is_unsubscribe_received())
+        .count();
+
+    tracing::info!(
+        "Unsubscribe events: sent={}, received={}",
+        unsubscribe_sent_count,
+        unsubscribe_received_count
+    );
+
+    assert!(
+        unsubscribe_received_count > 0,
+        "Upstream node should have received the Unsubscribe message after client disconnect"
+    );
+
+    // Cleanup
+    client_a
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    Ok(())
+}

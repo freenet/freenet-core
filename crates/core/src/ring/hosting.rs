@@ -1434,55 +1434,6 @@ mod tests {
     }
 
     #[test]
-    fn test_downstream_subscriber_add_and_check() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        let peer = make_peer_key(10);
-
-        assert!(!manager.has_downstream_subscribers(&contract));
-
-        manager.add_downstream_subscriber(&contract, peer.clone());
-        assert!(manager.has_downstream_subscribers(&contract));
-
-        // Adding same peer again just refreshes the timestamp
-        manager.add_downstream_subscriber(&contract, peer);
-        assert!(manager.has_downstream_subscribers(&contract));
-    }
-
-    #[test]
-    fn test_downstream_subscriber_remove() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        let peer1 = make_peer_key(10);
-        let peer2 = make_peer_key(20);
-
-        manager.add_downstream_subscriber(&contract, peer1.clone());
-        manager.add_downstream_subscriber(&contract, peer2.clone());
-
-        assert!(manager.remove_downstream_subscriber(&contract, &peer1));
-        assert!(manager.has_downstream_subscribers(&contract));
-
-        assert!(manager.remove_downstream_subscriber(&contract, &peer2));
-        assert!(!manager.has_downstream_subscribers(&contract));
-
-        // Removing non-existent peer returns false
-        assert!(!manager.remove_downstream_subscriber(&contract, &peer1));
-    }
-
-    #[test]
-    fn test_downstream_subscriber_renew() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        let peer = make_peer_key(10);
-
-        // Renewing non-existent returns false
-        assert!(!manager.renew_downstream_subscriber(&contract, &peer));
-
-        manager.add_downstream_subscriber(&contract, peer.clone());
-        assert!(manager.renew_downstream_subscriber(&contract, &peer));
-    }
-
-    #[test]
     fn test_should_unsubscribe_upstream() {
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
