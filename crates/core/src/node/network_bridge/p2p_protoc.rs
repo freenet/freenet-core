@@ -2798,25 +2798,23 @@ impl P2pConnManager {
         // during the window when neither structure has the entry, causing the transport
         // layer to tear down the connection we just established.
         // See: handle_connect_peer checks self.connections first, then awaiting_connection.
-        // Check if we're replacing an existing connection (e.g., peer reconnected with
-        // new identity after suspend/resume). The old entry's sender gets dropped, which
-        // causes its peer_connection_listener to fire TransportClosed. The connection_id
-        // mechanism ensures that stale TransportClosed event won't remove the new entry.
-        let replacing_existing = self.connections.contains_key(&peer_addr);
-        if replacing_existing {
-            let old_entry = self.connections.remove(&peer_addr);
-            if let Some(old) = &old_entry {
-                if let Some(ref old_pub_key) = old.pub_key {
-                    self.addr_by_pub_key.remove(old_pub_key);
-                }
+        // If the peer already has a connection (e.g., reconnected with new identity after
+        // suspend/resume), replace it. Dropping the old sender causes its
+        // peer_connection_listener to fire TransportClosed; the connection_id mechanism
+        // ensures that stale event won't remove the new entry.
+        if let Some(old) = self.connections.remove(&peer_addr) {
+            if let Some(ref old_pub_key) = old.pub_key {
+                self.addr_by_pub_key.remove(old_pub_key);
             }
-            // Also clean up any stale ring/transient state for this address
-            let cm = &self.bridge.op_manager.ring.connection_manager;
-            cm.drop_transient(peer_addr);
+            self.bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .drop_transient(peer_addr);
 
             tracing::info!(
                 %peer_addr,
-                old_connection_id = ?old_entry.map(|e| e.connection_id),
+                old_connection_id = old.connection_id,
                 "Replacing stale connection entry (peer reconnected with new identity)"
             );
         }
@@ -3185,11 +3183,8 @@ impl P2pConnManager {
                     connection_id,
                     "peer_connection_listener reported transport closure"
                 );
-                // Ignore stale TransportClosed events from replaced connections.
-                // When a peer reconnects with a new identity, the old ConnectionEntry
-                // is replaced with a new one (new connection_id). The old
-                // peer_connection_listener's channel gets disconnected and it fires
-                // TransportClosed, but we must not remove the replacement entry.
+                // Ignore stale TransportClosed from replaced connections: the old
+                // listener's channel was dropped, but we must not remove the new entry.
                 if let Some(current) = self.connections.get(&remote_addr) {
                     if current.connection_id != connection_id {
                         tracing::info!(
@@ -4600,26 +4595,18 @@ mod tests {
         assert!(id3 > id2, "IDs must be monotonically increasing");
     }
 
-    /// Test that ConnectionEntry stores and exposes connection_id correctly,
-    /// and that the stale TransportClosed detection pattern works.
-    ///
-    /// This validates the fix for the bug where a peer reconnecting with a new
-    /// identity caused the gateway to:
-    /// 1. Skip inserting the new ConnectionEntry (old entry blocked the insert)
-    /// 2. Drop the new PeerConnection's inbound receiver
-    /// 3. Silently lose all packets from the reconnecting peer
-    ///
-    /// The fix replaces the old entry and uses connection_id to prevent the old
-    /// listener's TransportClosed from removing the replacement entry.
+    /// Validates the stale TransportClosed detection pattern: when a connection is
+    /// replaced (peer reconnected with new identity), a TransportClosed from the old
+    /// listener (mismatched connection_id) must not remove the replacement entry.
     #[test]
     fn test_stale_transport_closed_detection() {
         use std::collections::BTreeMap;
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "1.2.3.4:5678".parse().unwrap();
-
-        // Simulate: first connection inserted with id=10
         let mut connections: BTreeMap<SocketAddr, super::ConnectionEntry> = BTreeMap::new();
+
+        // Insert initial connection (id=10), then replace with new one (id=20)
         let (tx1, _rx1) = mpsc::channel(1);
         connections.insert(
             addr,
@@ -4629,8 +4616,6 @@ mod tests {
                 connection_id: 10,
             },
         );
-
-        // Simulate: connection replaced with id=20 (peer reconnected with new identity)
         let (tx2, _rx2) = mpsc::channel(1);
         connections.insert(
             addr,
@@ -4641,30 +4626,13 @@ mod tests {
             },
         );
 
-        // Simulate: stale TransportClosed arrives from old listener (connection_id=10)
-        let stale_connection_id = 10u64;
-        if let Some(current) = connections.get(&addr) {
-            // The current entry has connection_id=20, but the event has connection_id=10
-            // This means the event is from a replaced connection — should be ignored
-            assert_ne!(
-                current.connection_id, stale_connection_id,
-                "Stale TransportClosed should have different connection_id than current entry"
-            );
-        }
+        // Stale TransportClosed (id=10) should not match the current entry (id=20)
+        let current = connections.get(&addr).unwrap();
+        assert_ne!(current.connection_id, 10, "stale event must not match");
+        assert_eq!(current.connection_id, 20);
 
-        // The entry should still exist (stale event was ignored)
-        assert!(connections.contains_key(&addr));
-        assert_eq!(connections[&addr].connection_id, 20);
-
-        // Simulate: current TransportClosed arrives (connection_id=20)
-        let current_connection_id = 20u64;
-        if let Some(current) = connections.get(&addr) {
-            assert_eq!(
-                current.connection_id, current_connection_id,
-                "Current TransportClosed should match — this event should be processed"
-            );
-            // Only now do we remove the entry
-        }
+        // Current TransportClosed (id=20) should match and allow removal
+        assert_eq!(current.connection_id, 20, "current event must match");
         connections.remove(&addr);
         assert!(!connections.contains_key(&addr));
     }
