@@ -155,6 +155,7 @@ impl ProximityCacheManager {
                     self.neighbor_caches
                         .insert(from.clone(), added.iter().copied().collect());
                 }
+                crate::config::GlobalTestMetrics::record_neighbor_cache_update();
 
                 let neighbor_contracts: usize = self
                     .neighbor_caches
@@ -238,6 +239,7 @@ impl ProximityCacheManager {
 
                 self.neighbor_caches
                     .insert(from.clone(), contracts.into_iter().collect());
+                crate::config::GlobalTestMetrics::record_neighbor_cache_update();
 
                 info!(
                     peer = %from,

@@ -2043,6 +2043,11 @@ std::thread_local! {
     static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_NEIGHBOR_CACHE_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_ANTI_STARVATION_TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -2072,6 +2077,11 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
+        GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
+        GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
+        GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
+        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.set(0));
+        GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -2105,6 +2115,47 @@ impl GlobalTestMetrics {
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
+    }
+
+    pub fn record_pending_op_insert() {
+        GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn pending_op_inserts() -> u64 {
+        GLOBAL_PENDING_OP_INSERTS.with(|c| c.get())
+    }
+
+    pub fn record_pending_op_remove() {
+        GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn pending_op_removes() -> u64 {
+        GLOBAL_PENDING_OP_REMOVES.with(|c| c.get())
+    }
+
+    /// Track high-water mark for pending_op_results size.
+    pub fn record_pending_op_size(len: u64) {
+        GLOBAL_PENDING_OP_HWM.with(|c| c.set(c.get().max(len)));
+    }
+
+    pub fn pending_op_high_water_mark() -> u64 {
+        GLOBAL_PENDING_OP_HWM.with(|c| c.get())
+    }
+
+    pub fn record_neighbor_cache_update() {
+        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn neighbor_cache_updates() -> u64 {
+        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.get())
+    }
+
+    pub fn record_anti_starvation_trigger() {
+        GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn anti_starvation_triggers() -> u64 {
+        GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.get())
     }
 }
 

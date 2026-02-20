@@ -757,6 +757,12 @@ impl P2pConnManager {
                         .retain(|_tx, sender| !sender.is_closed());
                     let removed = before - state.pending_op_results.len();
                     if removed > 0 {
+                        for _ in 0..removed {
+                            crate::config::GlobalTestMetrics::record_pending_op_remove();
+                        }
+                        crate::config::GlobalTestMetrics::record_pending_op_size(
+                            state.pending_op_results.len() as u64,
+                        );
                         tracing::info!(
                             removed,
                             remaining = state.pending_op_results.len(),
@@ -1256,6 +1262,9 @@ impl P2pConnManager {
                                             phase = "cleanup",
                                             "Draining pending_op_results"
                                         );
+                                        for _ in 0..pending_count {
+                                            crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                        }
                                         state.pending_op_results.drain();
                                     }
 
@@ -1719,13 +1728,17 @@ impl P2pConnManager {
                                 // Clean up executor callback sender to prevent unbounded
                                 // HashMap growth (entries were inserted by handle_op_execution
                                 // but never removed — see #2941)
-                                state.pending_op_results.remove(&tx);
+                                if state.pending_op_results.remove(&tx).is_some() {
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
                             }
                             NodeEvent::TransactionCompleted(tx) => {
                                 // Clean up client subscription after successful completion
                                 state.tx_to_client.remove(&tx);
                                 // Clean up executor callback sender
-                                state.pending_op_results.remove(&tx);
+                                if state.pending_op_results.remove(&tx).is_some() {
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -3373,6 +3386,10 @@ impl P2pConnManager {
         match msg {
             Some((callback, msg)) => {
                 state.pending_op_results.insert(*msg.id(), callback);
+                crate::config::GlobalTestMetrics::record_pending_op_insert();
+                crate::config::GlobalTestMetrics::record_pending_op_size(
+                    state.pending_op_results.len() as u64,
+                );
                 EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
             }
             None => {
