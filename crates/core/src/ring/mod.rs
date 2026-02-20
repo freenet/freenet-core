@@ -414,11 +414,12 @@ impl Ring {
 
     /// Maximum renewal tasks spawned per tick.
     ///
-    /// At 30s intervals, this yields up to 20 renewals/minute. With 8-minute
-    /// subscription leases and 2-minute renewal windows, this handles up to
-    /// ~80 concurrent subscriptions before renewals can't keep up. The
-    /// mid-cycle channel capacity check (RENEWAL_STOP_CAPACITY_FRACTION)
-    /// provides backpressure if the network can't absorb this many.
+    /// At 30s intervals, this yields up to 20 renewals/minute. Since
+    /// `contracts_needing_renewal()` returns contracts expiring within the
+    /// 2-minute renewal window, this effectively handles ~40 concurrent
+    /// subscriptions before renewals can't keep up. The mid-cycle channel
+    /// capacity check (RENEWAL_STOP_CAPACITY_FRACTION) provides backpressure
+    /// if the network can't absorb this many.
     const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 10;
 
     /// Skip renewal cycle when channel remaining capacity falls below this
