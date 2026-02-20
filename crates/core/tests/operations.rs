@@ -4047,21 +4047,31 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     // Wait for the disconnect to propagate and unsubscribe to be sent upstream
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Check event logs for UnsubscribeSent and UnsubscribeReceived
+    // Check event logs for Unsubscribe events matching this contract
     let aggregator = ctx.aggregate_events().await?;
     let events = aggregator.get_all_events().await?;
+    let instance_id = *contract_key.id();
 
     let unsubscribe_sent_count = events
         .iter()
-        .filter(|e| e.kind.is_unsubscribe_sent())
+        .filter(|e| {
+            e.kind
+                .unsubscribe_sent_instance_id()
+                .is_some_and(|id| *id == instance_id)
+        })
         .count();
     let unsubscribe_received_count = events
         .iter()
-        .filter(|e| e.kind.is_unsubscribe_received())
+        .filter(|e| {
+            e.kind
+                .unsubscribe_received_instance_id()
+                .is_some_and(|id| *id == instance_id)
+        })
         .count();
 
     tracing::info!(
-        "Unsubscribe events: sent={}, received={}",
+        "Unsubscribe events for {}: sent={}, received={}",
+        instance_id,
         unsubscribe_sent_count,
         unsubscribe_received_count
     );

@@ -685,8 +685,6 @@ impl OpManager {
                     target = %target_addr,
                     "Sent Unsubscribe upstream"
                 );
-                // Mark as completed immediately since Unsubscribe is fire-and-forget
-                self.completed(tx);
             }
             Err(e) => {
                 tracing::warn!(
@@ -697,8 +695,7 @@ impl OpManager {
             }
         }
 
-        // Clean up local state regardless of send result. If delivery fails,
-        // the upstream peer will detect our absence when its downstream lease expires.
+        // Clean up local state regardless of send result.
         self.ring.unsubscribe(contract);
         self.interest_manager
             .remove_peer_interest(contract, &peer_key);

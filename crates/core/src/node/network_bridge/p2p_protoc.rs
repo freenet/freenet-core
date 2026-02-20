@@ -3387,11 +3387,16 @@ impl P2pConnManager {
                         next_hop = %next_hop_addr,
                         "handle_notification_msg: Found next hop in operation state, routing as OutboundMessage"
                     );
-                    // For UPDATE operations only: mark complete after routing because UPDATE
-                    // uses fire-and-forget semantics (client result already sent).
-                    // Other operations (GET, PUT, Subscribe, Connect) expect responses and
-                    // must remain in the state map until their response handling completes.
-                    if tx.transaction_type() == TransactionType::Update {
+                    // Fire-and-forget ops (Update, Unsubscribe) are completed after routing.
+                    // Other ops expect responses and stay in the state map.
+                    let is_fire_and_forget = tx.transaction_type() == TransactionType::Update
+                        || matches!(
+                            &msg,
+                            NetMessage::V1(NetMessageV1::Subscribe(
+                                crate::operations::subscribe::SubscribeMsg::Unsubscribe { .. }
+                            ))
+                        );
+                    if is_fire_and_forget {
                         self.bridge.op_manager.completed(tx);
                     }
                     return EventResult::Event(

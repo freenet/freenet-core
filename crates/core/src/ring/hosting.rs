@@ -434,16 +434,16 @@ impl HostingManager {
     /// Remove a downstream peer's subscription for a contract.
     /// Returns true if the peer was found and removed.
     pub fn remove_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        let mut removed = false;
         if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
-            let removed = peers.remove(peer).is_some();
-            if peers.is_empty() {
-                drop(peers);
-                self.downstream_subscribers.remove(contract);
-            }
-            removed
-        } else {
-            false
+            removed = peers.remove(peer).is_some();
         }
+        if removed {
+            // Remove the map entry if no peers remain
+            self.downstream_subscribers
+                .remove_if(contract, |_, peers| peers.is_empty());
+        }
+        removed
     }
 
     /// Check whether any downstream peers are subscribed to this contract.
@@ -785,6 +785,11 @@ impl HostingManager {
                 .map(|exp| *exp > renewal_threshold)
                 .unwrap_or(false)
             {
+                continue;
+            }
+            // Skip contracts with no local clients and no downstream subscribers —
+            // renewing would trigger an immediate unsubscribe, repeating every cycle.
+            if self.should_unsubscribe_upstream(&contract) {
                 continue;
             }
             // This hosted contract needs subscription renewal
@@ -1375,16 +1380,25 @@ mod tests {
         // This is the key test for the bug fix
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
 
         // Add to hosting cache (simulating GET operation)
         manager.record_contract_access(contract, 1000, AccessType::Get);
 
-        // Contract should need renewal even without active subscription
-        // (this is the bug fix - previously hosted contracts weren't included)
+        // No clients and no downstream — renewing would trigger an immediate
+        // unsubscribe, which would repeat on every renewal cycle
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Hosted contract with no interest should not be renewed"
+        );
+
+        // Add a client subscription — now it should need renewal
+        manager.add_client_subscription(contract.id(), client_id);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             needs_renewal.contains(&contract),
-            "Hosted contracts should need subscription renewal"
+            "Hosted contract with client subscription should need renewal"
         );
     }
 

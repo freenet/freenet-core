@@ -1402,7 +1402,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived {
                     id: *id,
                     instance_id: *instance_id,
-                    from: this_peer.clone(), // Sender resolved later; use own as placeholder
+                    from: this_peer.clone(), // Actual sender not available here
                     at: this_peer,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -2695,20 +2695,24 @@ impl EventKind {
         matches!(self, EventKind::Connect(_))
     }
 
-    /// Returns true if this event is an UnsubscribeReceived event.
-    pub fn is_unsubscribe_received(&self) -> bool {
-        matches!(
-            self,
-            EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived { .. })
-        )
+    /// Returns the contract instance id if this is an UnsubscribeReceived event.
+    pub fn unsubscribe_received_instance_id(&self) -> Option<&ContractInstanceId> {
+        match self {
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived { instance_id, .. }) => {
+                Some(instance_id)
+            }
+            _ => None,
+        }
     }
 
-    /// Returns true if this event is an UnsubscribeSent event.
-    pub fn is_unsubscribe_sent(&self) -> bool {
-        matches!(
-            self,
-            EventKind::Subscribe(SubscribeEvent::UnsubscribeSent { .. })
-        )
+    /// Returns the contract instance id if this is an UnsubscribeSent event.
+    pub fn unsubscribe_sent_instance_id(&self) -> Option<&ContractInstanceId> {
+        match self {
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeSent { instance_id, .. }) => {
+                Some(instance_id)
+            }
+            _ => None,
+        }
     }
 
     /// Returns the variant name of this event kind.
