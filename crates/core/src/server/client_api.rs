@@ -85,7 +85,17 @@ impl HttpClientApi {
         // (network mode) allow HTTP cookies — most home users lack TLS.
         let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
-        std::fs::create_dir_all(contract_web_path).unwrap();
+        std::fs::create_dir_all(&contract_web_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create contract web directory at {}: {}. \
+                 This may happen if {} was created by another user. \
+                 Try: sudo rm -rf {}",
+                contract_web_path.display(),
+                e,
+                std::env::temp_dir().join("freenet").display(),
+                std::env::temp_dir().join("freenet").display(),
+            )
+        });
 
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 

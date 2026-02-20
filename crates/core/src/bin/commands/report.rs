@@ -500,6 +500,10 @@ fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
 
 /// Read log file, filtering to entries from the last 30 minutes.
 /// Returns (filtered_content, original_file_size).
+///
+/// If the file contains no parseable timestamps (e.g., panic backtraces,
+/// stderr output), the entire file is included so that crash diagnostics
+/// are never silently discarded.
 fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
     let metadata = match fs::metadata(path) {
         Ok(m) => m,
@@ -516,7 +520,9 @@ fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
 
     let reader = BufReader::new(file);
     let mut filtered_lines = Vec::new();
+    let mut all_lines = Vec::new();
     let mut include_line = false;
+    let mut any_timestamp_found = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -531,38 +537,50 @@ fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
                 .map(|dt| dt.with_timezone(&Utc))
                 .or_else(|_| ts.parse::<DateTime<Utc>>())
             {
+                any_timestamp_found = true;
                 include_line = parsed >= cutoff;
             }
         }
 
+        // Truncate very long lines (e.g., delegates logging full state as byte arrays)
+        let line = if line.len() > MAX_LINE_LENGTH {
+            let truncate_at = line
+                .char_indices()
+                .take_while(|(i, _)| *i < MAX_LINE_LENGTH)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!(
+                "{}... [truncated, {} total bytes]",
+                &line[..truncate_at],
+                line.len()
+            )
+        } else {
+            line
+        };
+
+        // Track all lines in case we need to fall back to unfiltered content
+        all_lines.push(line.clone());
+
         // Include this line if we're within the time window
         // (lines without timestamps inherit the state from the previous timestamped line)
         if include_line {
-            // Truncate very long lines (e.g., delegates logging full state as byte arrays)
-            let line = if line.len() > MAX_LINE_LENGTH {
-                // Find a safe UTF-8 character boundary for truncation
-                let truncate_at = line
-                    .char_indices()
-                    .take_while(|(i, _)| *i < MAX_LINE_LENGTH)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                format!(
-                    "{}... [truncated, {} total bytes]",
-                    &line[..truncate_at],
-                    line.len()
-                )
-            } else {
-                line
-            };
             filtered_lines.push(line);
         }
     }
 
-    if filtered_lines.is_empty() {
+    // If no timestamps were found, include all lines — the file likely contains
+    // panic backtraces or other non-timestamped output that is critical for debugging.
+    let result_lines = if !any_timestamp_found && !all_lines.is_empty() {
+        all_lines
+    } else {
+        filtered_lines
+    };
+
+    if result_lines.is_empty() {
         (None, original_size)
     } else {
-        (Some(filtered_lines.join("\n")), original_size)
+        (Some(result_lines.join("\n")), original_size)
     }
 }
 
@@ -870,5 +888,62 @@ ws-api-port = 8080
             error_names.contains(&"freenet.error.2025-12-26-14.log"),
             "Should find error hourly format"
         );
+    }
+
+    #[test]
+    fn test_read_log_file_no_timestamps_includes_all_content() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("freenet.error.log");
+
+        // Simulate panic backtrace output (no timestamps)
+        let panic_content = "\
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: AddrInUse', src/main.rs:42
+stack backtrace:
+   0: std::panicking::begin_panic_handler
+   1: core::panicking::panic_fmt
+   2: core::result::unwrap_failed
+   3: freenet::main";
+        fs::write(&log_path, panic_content).unwrap();
+
+        let (content, original_size) = read_log_file(&log_path);
+
+        assert!(
+            content.is_some(),
+            "Files with no timestamps should still be included"
+        );
+        let content = content.unwrap();
+        assert!(
+            content.contains("panicked"),
+            "Panic message should be preserved"
+        );
+        assert!(
+            content.contains("stack backtrace"),
+            "Backtrace should be preserved"
+        );
+        assert_eq!(original_size, panic_content.len() as u64);
+    }
+
+    #[test]
+    fn test_read_log_file_old_timestamps_excluded() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("freenet.log");
+
+        // All timestamps are old (> 30 minutes ago) — should be filtered out
+        let old_content = "\
+2020-01-01T00:00:00.000000Z  INFO freenet: Old log entry 1
+2020-01-01T00:00:01.000000Z  INFO freenet: Old log entry 2";
+        fs::write(&log_path, old_content).unwrap();
+
+        let (content, original_size) = read_log_file(&log_path);
+
+        assert!(
+            content.is_none(),
+            "Old timestamped entries should be filtered out"
+        );
+        assert_eq!(original_size, old_content.len() as u64);
     }
 }
