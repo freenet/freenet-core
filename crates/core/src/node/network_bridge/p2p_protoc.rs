@@ -387,6 +387,10 @@ pub(in crate::node) struct P2pConnManager {
 }
 
 impl P2pConnManager {
+    pub(in crate::node) fn listening_port(&self) -> u16 {
+        self.listening_port
+    }
+
     pub async fn build(
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
@@ -2642,6 +2646,19 @@ impl P2pConnManager {
                         .record_failed_addr(peer_addr);
                 }
 
+                // Record failure for the connecting page diagnostics
+                let failure_reason = match &error {
+                    ConnectionError::TransportError(msg) => {
+                        crate::node::network_status::classify_transport_error(msg)
+                    }
+                    ConnectionError::Timeout => crate::node::network_status::FailureReason::Timeout,
+                    ConnectionError::IOError(msg) => {
+                        crate::node::network_status::FailureReason::Other(msg.clone())
+                    }
+                    other => crate::node::network_status::FailureReason::Other(other.to_string()),
+                };
+                crate::node::network_status::record_gateway_failure(peer_addr, failure_reason);
+
                 // Record failure for exponential backoff to prevent rapid retries
                 if !peer_addr.ip().is_unspecified() {
                     state.peer_backoff.record_failure(peer_addr);
@@ -2902,6 +2919,7 @@ impl P2pConnManager {
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
+            crate::node::network_status::record_connection_success();
             if promote_to_ring {
                 // Only prune reservation when promoting to ring - transient connections
                 // don't go through should_accept() so they have no reservation to prune

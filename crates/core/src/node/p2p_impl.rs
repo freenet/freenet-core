@@ -122,6 +122,9 @@ impl NodeP2P {
         // Record the start time for uptime tracking in shutdown event
         let start_time = tokio::time::Instant::now();
 
+        // Initialize network status tracking for the connecting page diagnostics
+        super::network_status::init(self.conn_manager.listening_port());
+
         // Emit peer startup event
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(
             &self.op_manager.ring,

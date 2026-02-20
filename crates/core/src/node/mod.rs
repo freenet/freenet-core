@@ -72,6 +72,7 @@ mod network_bridge;
 // No cfg gate: underlying items are unconditionally compiled and integration
 // tests compile the lib without cfg(test).
 pub use network_bridge::in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState};
+pub(crate) mod network_status;
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod proximity_cache;
