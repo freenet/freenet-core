@@ -586,17 +586,24 @@ async fn report_result(
                     }
                     op_manager.ring.routing_finished(event);
                 }
-                // todo: handle failures, need to track timeouts and other potential failures
-                // OpOutcome::ContractOpFailure {
-                //     target_peer: Some(target_peer),
-                //     contract_location,
-                // } => {
-                //     op_manager.ring.routing_finished(RouteEvent {
-                //         peer: *target_peer,
-                //         contract_location,
-                //         outcome: RouteOutcome::Failure,
-                //     });
-                // }
+                OpOutcome::ContractOpFailure {
+                    target_peer,
+                    contract_location,
+                } => {
+                    let event = RouteEvent {
+                        peer: target_peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::Failure,
+                    };
+                    if let Some(log_event) =
+                        NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
+                    {
+                        event_listener
+                            .register_events(Either::Left(log_event))
+                            .await;
+                    }
+                    op_manager.ring.routing_finished(event);
+                }
                 OpOutcome::Incomplete | OpOutcome::Irrelevant => {}
             }
             if let Some(mut cb) = executor_callback {

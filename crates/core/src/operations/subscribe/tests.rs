@@ -474,6 +474,7 @@ async fn test_subscription_validates_k_closest_usage() {
             requester_addr: None,
             requester_pub_key: None,
             is_renewal: false,
+            stats: None,
         };
 
         // State is simplified - skip list is now in the Request message, not state
@@ -573,6 +574,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -594,6 +596,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -617,6 +620,7 @@ fn test_subscribe_op_state_lifecycle() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     assert!(
@@ -650,6 +654,7 @@ fn test_subscribe_op_failed_state_returns_error() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     // Verify to_host_result returns error
@@ -684,6 +689,7 @@ fn test_local_subscription_completion_state() {
         requester_addr: None, // Local subscription, no network requester
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
 
     // Verify operation is in completed state
@@ -720,6 +726,7 @@ fn test_is_renewal_flag() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
+        stats: None,
     };
     assert!(renewal_op.is_renewal());
 
@@ -729,6 +736,7 @@ fn test_is_renewal_flag() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     };
     assert!(!client_op.is_renewal());
 }
@@ -747,6 +755,7 @@ fn test_op_enum_is_subscription_renewal() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
+        stats: None,
     });
     assert!(renewal.is_subscription_renewal());
 
@@ -756,6 +765,94 @@ fn test_op_enum_is_subscription_renewal() {
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     });
     assert!(!non_renewal.is_subscription_renewal());
+}
+
+/// Test that SubscribeOp::outcome() returns ContractOpFailure when the operation
+/// has stats but is not finalized (i.e., the subscription failed).
+#[test]
+fn test_subscribe_failure_outcome() {
+    use crate::operations::OpOutcome;
+    use crate::ring::{Location, PeerKeyLocation};
+
+    let tx = Transaction::new::<SubscribeMsg>();
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+
+    // Non-finalized op with stats → should return ContractOpFailure
+    let op_with_stats = SubscribeOp {
+        id: tx,
+        state: None, // Not completed = failed
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+
+    match op_with_stats.outcome() {
+        OpOutcome::ContractOpFailure {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        _ => panic!("Expected ContractOpFailure for non-finalized op with stats"),
+    }
+
+    // Completed op with stats → should return Irrelevant (success path)
+    let instance_id = ContractInstanceId::new([30u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([31u8; 32]));
+    let op_completed = SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+    assert!(
+        matches!(op_completed.outcome(), OpOutcome::Irrelevant),
+        "Completed subscribe should return Irrelevant"
+    );
+
+    // Non-finalized op without stats → should return Incomplete
+    let op_no_stats = SubscribeOp {
+        id: tx,
+        state: None,
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
+        "Non-finalized op without stats should return Incomplete"
+    );
+
+    // Test failure_routing_info()
+    let op_for_info = SubscribeOp {
+        id: tx,
+        state: None,
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+    let (peer, loc) = op_for_info
+        .failure_routing_info()
+        .expect("Should have routing info");
+    assert_eq!(peer, target_peer);
+    assert_eq!(loc, contract_location);
 }

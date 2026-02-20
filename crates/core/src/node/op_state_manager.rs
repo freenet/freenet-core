@@ -1109,18 +1109,55 @@ fn notify_subscription_timeout(
     });
 }
 
+/// Reports a routing failure for a timed-out operation to the router's isotonic model.
+fn report_timeout_failure(
+    ring: &crate::ring::Ring,
+    tx: &Transaction,
+    peer: crate::ring::PeerKeyLocation,
+    contract_location: crate::ring::Location,
+) {
+    ring.routing_finished(crate::router::RouteEvent {
+        peer: peer.clone(),
+        contract_location,
+        outcome: crate::router::RouteOutcome::Failure,
+    });
+    tracing::info!(
+        tx = %tx,
+        peer = ?peer.socket_addr(),
+        %contract_location,
+        "Reported operation timeout as routing failure"
+    );
+}
+
 /// Removes a subscribe operation from the ops map and notifies timeout if found.
 /// Returns `Some(())` if the operation was found and removed, `None` otherwise.
 fn remove_subscribe_and_notify_timeout(
     ops: &Ops,
     tx: &Transaction,
     ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
+    ring: &crate::ring::Ring,
 ) -> Option<()> {
     let (_, sub_op) = ops.subscribe.remove(tx)?;
+    if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
+        report_timeout_failure(ring, tx, peer, contract_location);
+    }
     if let Some(instance_id) = sub_op.instance_id() {
         notify_subscription_timeout(ch_outbound, instance_id);
     }
     Some(())
+}
+
+/// Removes a get operation from the ops map and reports timeout failure if stats are available.
+/// Returns `true` if the operation was found and removed, `false` otherwise.
+fn remove_get_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring::Ring) -> bool {
+    if let Some((_, get_op)) = ops.get.remove(tx) {
+        if let Some((peer, contract_location)) = get_op.failure_routing_info() {
+            report_timeout_failure(ring, tx, peer, contract_location);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out.
@@ -1226,10 +1263,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
+                        // TODO(#3127): wire up PUT/UPDATE timeout failure reporting
+                        // once their outcome() methods track routing stats
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
-                        TransactionType::Get => ops.get.remove(&tx).is_none(),
+                        TransactionType::Get => !remove_get_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_none()
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
@@ -1308,10 +1347,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
+                        // TODO(#3127): wire up PUT/UPDATE timeout failure reporting
+                        // once their outcome() methods track routing stats
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
-                        TransactionType::Get => ops.get.remove(&tx).is_some(),
+                        TransactionType::Get => remove_get_and_report_failure(&ops, &tx, &ring),
                         TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound).is_some()
+                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
                         }
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };

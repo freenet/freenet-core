@@ -33,6 +33,6 @@ impl Default for Mean {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub(super) struct TransferSpeed {
+pub(crate) struct TransferSpeed {
     pub bytes_per_second: f64,
 }
