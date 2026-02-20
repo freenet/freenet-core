@@ -738,7 +738,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
-                                    stats: None,
+                                    stats: self.stats,
                                 })),
                                 stream_data: None,
                             });
@@ -816,7 +816,7 @@ impl Operation for SubscribeOp {
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
-                                    stats: None,
+                                    stats: self.stats,
                                 })),
                                 stream_data: None,
                             });
@@ -1002,7 +1002,7 @@ impl Operation for SubscribeOp {
                                         requester_addr: None,
                                         requester_pub_key: None,
                                         is_renewal: self.is_renewal,
-                                        stats: None,
+                                        stats: self.stats,
                                     })),
                                     stream_data: None,
                                 })
@@ -1109,7 +1109,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
-                                            stats: None,
+                                            stats: self.stats,
                                         })),
                                         stream_data: None,
                                     })
@@ -1158,7 +1158,7 @@ impl Operation for SubscribeOp {
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
-                                            stats: None,
+                                            stats: self.stats,
                                         })),
                                         stream_data: None,
                                     })

@@ -1223,6 +1223,147 @@ mod tests {
         );
     }
 
+    // ============ Wiring completeness: end-to-end outcome → router chain tests ============
+
+    /// Simulate the full chain: subscribe outcome → RouteEvent → Router.
+    /// A completed subscribe with stats produces SuccessUntimed, which feeds
+    /// the failure_estimator (as 0.0 = success).
+    #[test]
+    fn test_subscribe_outcome_feeds_router() {
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Simulate what node/mod.rs:580-587 does when OpOutcome::ContractOpSuccessUntimed
+        // is returned from subscribe's outcome() (post-fix: stats are preserved)
+        let route_event = RouteEvent {
+            peer: target_peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::SuccessUntimed,
+        };
+
+        let mut router = Router::new(&[]);
+        assert_eq!(router.failure_estimator.len(), 0);
+        router.add_event(route_event);
+        assert_eq!(
+            router.failure_estimator.len(),
+            1,
+            "Router failure_estimator should record subscribe success (0.0)"
+        );
+        // Timing estimators should NOT be fed by untimed operations
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+    }
+
+    /// Create GetOp with result + partial timing, verify ContractOpSuccessUntimed
+    /// feeds router's failure_estimator.
+    #[test]
+    fn test_get_partial_timing_feeds_router() {
+        use crate::operations::OpOutcome;
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Simulate the OpOutcome from a GET with partial timing
+        let route_event = RouteEvent {
+            peer: target_peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::SuccessUntimed,
+        };
+
+        let mut router = Router::new(&[]);
+        assert_eq!(router.failure_estimator.len(), 0);
+        router.add_event(route_event);
+        assert_eq!(
+            router.failure_estimator.len(),
+            1,
+            "Router should record untimed GET success"
+        );
+        // Timing estimators should remain empty
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+    }
+
+    /// Verify ContractOpFailure increments failure_estimator with value 1.0,
+    /// and that after enough failures the router predicts higher failure probability.
+    #[test]
+    fn test_failure_outcome_feeds_failure_estimator_with_value_one() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut router = Router::new(&[]);
+
+        // Add a failure event
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::Failure,
+        });
+        assert_eq!(
+            router.failure_estimator.len(),
+            1,
+            "Failure should be recorded in failure_estimator"
+        );
+
+        // Add enough failures to cross threshold and check prediction
+        for _ in 0..59 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+        assert_eq!(router.failure_estimator.len(), 60);
+        assert!(router.has_sufficient_routing_events());
+
+        // Prediction should show high failure probability
+        let peers = vec![peer.clone()];
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        assert!(!selected.is_empty());
+        let pred = decision.candidates[0].prediction.as_ref().unwrap();
+        assert!(
+            pred.failure_probability > 0.5,
+            "After 60 failures, failure probability should be high, got {}",
+            pred.failure_probability
+        );
+    }
+
+    /// Verify existing Success path (with timing) still feeds all 3 estimators.
+    /// Regression guard for the new untimed branch.
+    #[test]
+    fn test_full_timing_success_still_works() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut router = Router::new(&[]);
+
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(50),
+                payload_size: 1000,
+                payload_transfer_time: Duration::from_millis(10),
+            },
+        });
+
+        assert_eq!(
+            router.failure_estimator.len(),
+            1,
+            "Success should feed failure_estimator (as 0.0)"
+        );
+        assert_eq!(
+            router.response_start_time_estimator.len(),
+            1,
+            "Timed success should feed response_start_time_estimator"
+        );
+        assert_eq!(
+            router.transfer_rate_estimator.len(),
+            1,
+            "Timed success should feed transfer_rate_estimator"
+        );
+    }
+
     /// When timing data accumulates beyond MIN_POINTS_FOR_REGRESSION, the router
     /// should transition from failure-only predictions (time=0, speed=0) to full
     /// predictions with real timing values.

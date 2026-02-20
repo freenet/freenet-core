@@ -450,6 +450,19 @@ impl GetOp {
             } else {
                 OpOutcome::Incomplete
             }
+        } else if let Some(GetStats {
+            next_peer: Some(target_peer),
+            contract_location,
+            ..
+        }) = self.stats.as_deref()
+        {
+            // Result present but timing incomplete (e.g. streaming completed without
+            // full handshake timing). Report as untimed success so the router still
+            // gets feedback instead of silently dropping the outcome.
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer,
+                contract_location: *contract_location,
+            }
         } else {
             OpOutcome::Incomplete
         }
@@ -3114,5 +3127,154 @@ mod tests {
             matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
             "GetOp with result and complete stats should return ContractOpSuccess"
         );
+    }
+
+    // ============ Partial timing outcome tests (validates GET partial timing fix) ============
+
+    /// Result + target_peer but incomplete timing → ContractOpSuccessUntimed.
+    /// Before the fix, this returned Incomplete, so the router never got feedback.
+    #[test]
+    fn test_get_outcome_success_untimed_partial_timing() {
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+        let now = Instant::now();
+
+        // Result present, target_peer set, first_response_time has start but no end
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::Finished {
+                key: make_contract_key(1),
+            }),
+            result: Some(GetResult {
+                key: make_contract_key(1),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target_peer.clone()),
+                contract_location,
+                first_response_time: Some((now, None)), // Started but not completed
+                transfer_time: Some((now, None)),       // Started but not completed
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+        }
+    }
+
+    /// Result + target_peer but no transfer_time at all → ContractOpSuccessUntimed.
+    #[test]
+    fn test_get_outcome_success_untimed_no_transfer_time() {
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::Finished {
+                key: make_contract_key(1),
+            }),
+            result: Some(GetResult {
+                key: make_contract_key(1),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target_peer.clone()),
+                contract_location,
+                first_response_time: None,
+                transfer_time: None,
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+        }
+    }
+
+    /// Result but no target_peer → Incomplete (can't attribute to a peer).
+    #[test]
+    fn test_get_outcome_incomplete_result_no_peer() {
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::Finished {
+                key: make_contract_key(1),
+            }),
+            result: Some(GetResult {
+                key: make_contract_key(1),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(GetStats {
+                next_peer: None,
+                contract_location: Location::random(),
+                first_response_time: None,
+                transfer_time: None,
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+
+        assert!(
+            matches!(op.outcome(), OpOutcome::Incomplete),
+            "Result with no target_peer should return Incomplete"
+        );
+    }
+
+    /// No result + partial timing → still ContractOpFailure (regression guard).
+    #[test]
+    fn test_get_outcome_failure_no_result_partial_timing() {
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+        let now = Instant::now();
+
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: None,
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target_peer.clone()),
+                contract_location,
+                first_response_time: Some((now, None)),
+                transfer_time: None,
+            })),
+            upstream_addr: None,
+            local_fallback: None,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpFailure, got {other:?}"),
+        }
     }
 }

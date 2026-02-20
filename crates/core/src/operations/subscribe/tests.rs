@@ -862,3 +862,106 @@ fn test_subscribe_failure_outcome() {
     assert_eq!(peer, target_peer);
     assert_eq!(loc, contract_location);
 }
+
+// ============ Outcome variant tests (following put.rs pattern) ============
+
+/// Completed subscribe with stats → ContractOpSuccessUntimed (validates stats wiring fix).
+#[test]
+fn test_subscribe_outcome_success_untimed_with_stats() {
+    use crate::operations::OpOutcome;
+    use crate::ring::{Location, PeerKeyLocation};
+
+    let instance_id = ContractInstanceId::new([40u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([41u8; 32]));
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+    match op.outcome() {
+        OpOutcome::ContractOpSuccessUntimed {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+    }
+}
+
+/// Completed subscribe without stats → Irrelevant (intermediate node, no originator stats).
+#[test]
+fn test_subscribe_outcome_irrelevant_without_stats() {
+    use crate::operations::OpOutcome;
+
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([43u8; 32]));
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+}
+
+/// Not completed + stats → ContractOpFailure (subscription failed, router should learn).
+#[test]
+fn test_subscribe_outcome_failure_with_stats() {
+    use crate::operations::OpOutcome;
+    use crate::ring::{Location, PeerKeyLocation};
+
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: None, // Not completed
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+    match op.outcome() {
+        OpOutcome::ContractOpFailure {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        other => panic!("Expected ContractOpFailure, got {other:?}"),
+    }
+}
+
+/// Not completed + no stats → Incomplete (in-transit, nothing to report).
+#[test]
+fn test_subscribe_outcome_incomplete_without_stats() {
+    use crate::operations::OpOutcome;
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: None,
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+}

@@ -366,6 +366,7 @@ try_from_op_enum!(
 );
 try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
 
+#[derive(Debug)]
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {

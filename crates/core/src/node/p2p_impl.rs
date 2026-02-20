@@ -43,6 +43,9 @@ pub(crate) struct NodeP2P {
     client_events_task: BoxFuture<'static, anyhow::Error>,
     contract_executor_task: BoxFuture<'static, anyhow::Error>,
     initial_join_task: Option<JoinHandle<()>>,
+    session_actor_task: JoinHandle<()>,
+    result_router_task: JoinHandle<()>,
+    op_mediator_task: JoinHandle<()>,
 }
 
 impl NodeP2P {
@@ -180,6 +183,38 @@ impl NodeP2P {
             self.node_controller,
         );
 
+        // Monitor spawned infrastructure tasks (session actor, result router, op mediator).
+        // If any of these panics or exits unexpectedly, the node runs degraded with no
+        // logs or detection. Combine into a single future that produces an error.
+        // Keep AbortHandles for cleanup since the JoinHandles are moved into the future.
+        let session_abort = self.session_actor_task.abort_handle();
+        let router_abort = self.result_router_task.abort_handle();
+        let mediator_abort = self.op_mediator_task.abort_handle();
+        let infra_monitor = {
+            let mut session_handle = self.session_actor_task;
+            let mut router_handle = self.result_router_task;
+            let mut mediator_handle = self.op_mediator_task;
+            async move {
+                fn join_result_to_error(
+                    name: &str,
+                    r: Result<(), tokio::task::JoinError>,
+                ) -> anyhow::Error {
+                    match r {
+                        Err(e) if e.is_panic() => anyhow::anyhow!("{name} panicked: {e}"),
+                        Err(e) => anyhow::anyhow!("{name} task failed: {e}"),
+                        Ok(()) => anyhow::anyhow!("{name} exited unexpectedly"),
+                    }
+                }
+                let e: anyhow::Error = tokio::select! {
+                    biased;
+                    r = &mut session_handle => join_result_to_error("Session actor", r),
+                    r = &mut router_handle => join_result_to_error("Result router", r),
+                    r = &mut mediator_handle => join_result_to_error("Op mediator", r),
+                };
+                e
+            }
+        };
+
         let join_task = self.initial_join_task.take();
         let result = crate::deterministic_select! {
             r = f => {
@@ -198,6 +233,11 @@ impl NodeP2P {
                 tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
             },
+            e = infra_monitor => {
+                eprintln!("CRITICAL: Infrastructure task exited: {e}");
+                tracing::error!("Infrastructure task exited: {:?}", e);
+                Err(e)
+            },
         };
 
         if let Some(handle) = join_task {
@@ -206,6 +246,9 @@ impl NodeP2P {
         if let Some(handle) = aggressive_conn_task {
             handle.abort();
         }
+        session_abort.abort();
+        router_abort.abort();
+        mediator_abort.abort();
 
         // Emit peer shutdown event
         let (graceful, reason) = match &result {
@@ -264,7 +307,7 @@ impl NodeP2P {
         // Spawn Session Actor
         use crate::client_events::session_actor::SessionActor;
         let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
-        GlobalExecutor::spawn(async move {
+        let session_actor_task = GlobalExecutor::spawn(async move {
             tracing::info!("Session actor starting");
             session_actor.run().await;
             tracing::warn!("Session actor stopped");
@@ -273,7 +316,7 @@ impl NodeP2P {
         // Spawn ResultRouter task
         use crate::client_events::result_router::ResultRouter;
         let router = ResultRouter::new(result_router_rx, session_tx.clone());
-        GlobalExecutor::spawn(async move {
+        let result_router_task = GlobalExecutor::spawn(async move {
             tracing::info!("Result router starting");
             router.run().await;
             tracing::warn!("Result router stopped");
@@ -300,7 +343,7 @@ impl NodeP2P {
             mediator_channels(op_manager.clone());
 
         // Spawn the mediator task that bridges between the pooled executors and the event loop
-        GlobalExecutor::spawn({
+        let op_mediator_task = GlobalExecutor::spawn({
             let mediator_task =
                 run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
             mediator_task.instrument(tracing::info_span!("op_request_mediator"))
@@ -384,8 +427,87 @@ impl NodeP2P {
                 client_events_task,
                 contract_executor_task,
                 initial_join_task: None,
+                session_actor_task,
+                result_router_task,
+                op_mediator_task,
             },
             shutdown_tx,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that a spawned task that panics is detected via JoinHandle.
+    #[tokio::test]
+    async fn test_join_handle_detects_panic() {
+        let handle: JoinHandle<()> = tokio::spawn(async {
+            panic!("intentional test panic");
+        });
+        let result = handle.await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.is_panic(),
+            "JoinError should indicate a panic, got: {err}"
+        );
+    }
+
+    /// Verify that a spawned task that returns cleanly produces Ok.
+    #[tokio::test]
+    async fn test_join_handle_detects_clean_exit() {
+        let handle: JoinHandle<()> = tokio::spawn(async {
+            // Clean return
+        });
+        let result = handle.await;
+        assert!(result.is_ok(), "Clean task exit should produce Ok");
+    }
+
+    /// Three tasks: 2 sleeping, 1 panics after short delay. Verify tokio::select!
+    /// triggers on the panicked task and returns a panic error.
+    #[tokio::test]
+    async fn test_select_catches_first_panicked_task() {
+        let mut h1: JoinHandle<()> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut h2: JoinHandle<()> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut h3: JoinHandle<()> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            panic!("task 3 panicked");
+        });
+
+        let result: anyhow::Result<()> = tokio::select! {
+            biased;
+            r = &mut h1 => match r {
+                Err(e) if e.is_panic() => Err(anyhow::anyhow!("task 1 panicked: {e}")),
+                Err(e) => Err(anyhow::anyhow!("task 1 failed: {e}")),
+                Ok(()) => Err(anyhow::anyhow!("task 1 exited")),
+            },
+            r = &mut h2 => match r {
+                Err(e) if e.is_panic() => Err(anyhow::anyhow!("task 2 panicked: {e}")),
+                Err(e) => Err(anyhow::anyhow!("task 2 failed: {e}")),
+                Ok(()) => Err(anyhow::anyhow!("task 2 exited")),
+            },
+            r = &mut h3 => match r {
+                Err(e) if e.is_panic() => Err(anyhow::anyhow!("task 3 panicked: {e}")),
+                Err(e) => Err(anyhow::anyhow!("task 3 failed: {e}")),
+                Ok(()) => Err(anyhow::anyhow!("task 3 exited")),
+            },
+        };
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("task 3 panicked"),
+            "Should catch the panicking task, got: {err_msg}"
+        );
+
+        // Clean up the sleeping tasks
+        h1.abort();
+        h2.abort();
     }
 }
