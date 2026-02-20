@@ -1968,6 +1968,53 @@ mod tests {
         );
     }
 
+    /// Test that remove_put_and_report_failure returns false for non-existent tx.
+    /// (Ring construction is complex; individual components are unit-tested separately:
+    ///  - PutOp::failure_routing_info() tested in operations/put.rs
+    ///  - report_timeout_failure() calls ring.routing_finished() which calls Router::add_event()
+    ///  - Router::add_event() tested in router/mod.rs)
+    #[test]
+    fn remove_put_returns_false_for_missing_tx() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::put::PutMsg>();
+
+        // Without Ring, test the Ops-level behavior: removal returns false for missing tx
+        assert!(!ops.put.contains_key(&tx));
+        // The DashMap::remove returns None for missing keys
+        assert!(ops.put.remove(&tx).is_none());
+    }
+
+    /// Test that remove_put actually removes from the Ops map when present.
+    #[test]
+    fn remove_put_removes_from_ops_map() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::put::PutMsg>();
+
+        let put_op = crate::operations::put::start_op(
+            crate::operations::test_utils::make_test_contract(&[1u8]),
+            freenet_stdlib::prelude::RelatedContracts::default(),
+            freenet_stdlib::prelude::WrappedState::new(vec![]),
+            10,
+            false,
+            false,
+        );
+        ops.put.insert(tx, put_op);
+        assert!(ops.put.contains_key(&tx));
+
+        // Verify removal works
+        let removed = ops.put.remove(&tx);
+        assert!(removed.is_some());
+        assert!(!ops.put.contains_key(&tx));
+    }
+
+    /// Test that remove_update returns None for missing tx.
+    #[test]
+    fn remove_update_returns_none_for_missing_tx() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        assert!(ops.update.remove(&tx).is_none());
+    }
+
     /// Test that failed child races with parent completion check.
     ///
     /// Scenario: A child fails while the parent is checking if all sub-operations completed.

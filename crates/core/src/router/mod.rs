@@ -1416,4 +1416,332 @@ mod tests {
             "Should have real transfer speed after transition"
         );
     }
+
+    /// Simulate realistic post-#3137 traffic: a mix of timed GET successes, untimed
+    /// PUT/SUBSCRIBE/UPDATE successes, and failures across multiple peers.
+    /// The router should activate prediction-based routing and prefer
+    /// low-failure, low-latency peers.
+    #[test]
+    fn test_realistic_mixed_traffic_routing() {
+        let contract_location = Location::random();
+        let close_peer = PeerKeyLocation::random();
+        let mid_peer = PeerKeyLocation::random();
+        let far_peer = PeerKeyLocation::random();
+
+        let mut events = Vec::new();
+
+        // close_peer: 10 timed GET successes + 15 untimed PUT/SUB successes, 2 failures
+        // → ~7% failure rate, good timing data
+        for _ in 0..10 {
+            events.push(RouteEvent {
+                peer: close_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(20),
+                    payload_size: 2000,
+                    payload_transfer_time: Duration::from_millis(5),
+                },
+            });
+        }
+        for _ in 0..15 {
+            events.push(RouteEvent {
+                peer: close_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+        for _ in 0..2 {
+            events.push(RouteEvent {
+                peer: close_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        // mid_peer: 3 timed GET successes + 10 untimed successes, 5 failures
+        // → ~28% failure rate, sparse timing data
+        for _ in 0..3 {
+            events.push(RouteEvent {
+                peer: mid_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 2000,
+                    payload_transfer_time: Duration::from_millis(15),
+                },
+            });
+        }
+        for _ in 0..10 {
+            events.push(RouteEvent {
+                peer: mid_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+        for _ in 0..5 {
+            events.push(RouteEvent {
+                peer: mid_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        // far_peer: 0 timed successes, 5 untimed successes, 15 failures
+        // → 75% failure rate, no timing data
+        for _ in 0..5 {
+            events.push(RouteEvent {
+                peer: far_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+        for _ in 0..15 {
+            events.push(RouteEvent {
+                peer: far_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        // Total: 27 + 18 + 20 = 65 events > 50 threshold
+        let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+
+        // failure_estimator should have all 65 events
+        assert_eq!(router.failure_estimator.len(), 65);
+        // timing estimators only have the timed GET successes: 10 + 3 = 13
+        assert_eq!(router.response_start_time_estimator.len(), 13);
+        assert_eq!(router.transfer_rate_estimator.len(), 13);
+
+        // Router should use prediction-based routing and prefer close_peer
+        let peers = vec![close_peer.clone(), mid_peer.clone(), far_peer.clone()];
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionBased
+        ));
+        assert_eq!(selected.len(), 3);
+
+        // close_peer should be ranked first (lowest failure + best timing)
+        assert_eq!(
+            *selected[0], close_peer,
+            "close_peer with ~7% failure and fast timing should be ranked first"
+        );
+        // far_peer should be ranked last (highest failure rate)
+        assert_eq!(
+            *selected[2], far_peer,
+            "far_peer with ~75% failure should be ranked last"
+        );
+    }
+
+    /// Test that adding events incrementally (as happens in practice) produces
+    /// the same routing decision as building from history.
+    #[test]
+    fn test_incremental_vs_batch_consistency() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let events: Vec<RouteEvent> = (0..30)
+            .map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            })
+            .chain((0..20).map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            }))
+            .chain((0..5).map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(40),
+                    payload_size: 1500,
+                    payload_transfer_time: Duration::from_millis(8),
+                },
+            }))
+            .collect();
+
+        // Batch: build from history
+        let batch_router = Router::new(&events);
+
+        // Incremental: add one by one
+        let mut incr_router = Router::new(&[]);
+        for event in &events {
+            incr_router.add_event(event.clone());
+        }
+
+        // Both should have identical estimator counts
+        assert_eq!(
+            batch_router.failure_estimator.len(),
+            incr_router.failure_estimator.len()
+        );
+        assert_eq!(
+            batch_router.response_start_time_estimator.len(),
+            incr_router.response_start_time_estimator.len()
+        );
+        assert_eq!(
+            batch_router.transfer_rate_estimator.len(),
+            incr_router.transfer_rate_estimator.len()
+        );
+    }
+
+    /// Verify that the router handles a scenario where only untimed operations
+    /// exist (no GETs ever succeeded with timing). This is realistic for a node
+    /// that primarily handles PUT/SUBSCRIBE/UPDATE traffic.
+    #[test]
+    fn test_untimed_only_network_peer_ranking() {
+        let reliable_peer = PeerKeyLocation::random();
+        let flaky_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut events = Vec::new();
+
+        // reliable_peer: 40 untimed successes, 0 failures
+        for _ in 0..40 {
+            events.push(RouteEvent {
+                peer: reliable_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+
+        // flaky_peer: 5 untimed successes, 15 failures → 75% failure
+        for _ in 0..5 {
+            events.push(RouteEvent {
+                peer: flaky_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+        for _ in 0..15 {
+            events.push(RouteEvent {
+                peer: flaky_peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+        // No timing data at all
+        assert_eq!(router.response_start_time_estimator.len(), 0);
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
+
+        // Router should still make predictions and prefer the reliable peer
+        let peers = vec![reliable_peer.clone(), flaky_peer.clone()];
+        let (selected, decision) =
+            router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
+
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionBased
+        ));
+        assert_eq!(
+            *selected[0], reliable_peer,
+            "Reliable peer should be preferred in untimed-only network"
+        );
+
+        // Predictions should use failure-only mode (time=0, speed=0)
+        for candidate in &decision.candidates {
+            let pred = candidate.prediction.as_ref().unwrap();
+            assert_eq!(pred.time_to_response_start, 0.0);
+            assert_eq!(pred.transfer_speed_bps, 0.0);
+        }
+    }
+
+    /// When the router receives SuccessUntimed events at one contract location
+    /// and Failure events at a different contract location through the same peer,
+    /// the failure estimator should track these as distinct (distance, result)
+    /// data points. This validates the isotonic model learns location-dependent
+    /// failure patterns using untimed success data from PUT/SUBSCRIBE/UPDATE.
+    #[test]
+    fn test_location_dependent_failure_patterns() {
+        let peer = PeerKeyLocation::random();
+        let near_contract = Location::new(0.01); // very close distance (close to 0)
+        let far_contract = Location::new(0.49); // maximum distance on the ring
+
+        let mut router = Router::new(&[]);
+
+        // Peer succeeds for nearby contracts (small distance)
+        for _ in 0..30 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: near_contract,
+                outcome: RouteOutcome::SuccessUntimed,
+            });
+        }
+
+        // Peer fails for distant contracts (large distance)
+        for _ in 0..25 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: far_contract,
+                outcome: RouteOutcome::Failure,
+            });
+        }
+
+        assert!(router.has_sufficient_routing_events());
+        assert_eq!(router.failure_estimator.len(), 55);
+
+        // The isotonic model should give different failure predictions
+        // for near vs far contracts through this peer
+        let peers = vec![peer.clone()];
+
+        let (_, near_decision) =
+            router.select_k_best_peers_with_telemetry(&peers, near_contract, 1);
+        let (_, far_decision) = router.select_k_best_peers_with_telemetry(&peers, far_contract, 1);
+
+        let near_pred = near_decision.candidates[0]
+            .prediction
+            .as_ref()
+            .expect("should have prediction for near contract");
+        let far_pred = far_decision.candidates[0]
+            .prediction
+            .as_ref()
+            .expect("should have prediction for far contract");
+
+        // Near contract should have lower failure probability than far contract
+        assert!(
+            near_pred.failure_probability <= far_pred.failure_probability,
+            "Near contract failure prob ({}) should be <= far contract failure prob ({})",
+            near_pred.failure_probability,
+            far_pred.failure_probability
+        );
+    }
+
+    /// Verify that a single peer's SuccessUntimed events correctly produce a 0.0
+    /// failure probability when it has never failed.
+    #[test]
+    fn test_zero_failure_probability_with_untimed_success() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let events: Vec<RouteEvent> = (0..60)
+            .map(|_| RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            })
+            .collect();
+
+        let router = Router::new(&events);
+        assert!(router.has_sufficient_routing_events());
+
+        let (_, decision) =
+            router.select_k_best_peers_with_telemetry(&[peer], contract_location, 1);
+
+        let pred = decision.candidates[0]
+            .prediction
+            .as_ref()
+            .expect("should have prediction");
+        assert!(
+            pred.failure_probability < 0.01,
+            "Peer with only successes should have near-zero failure probability, got {}",
+            pred.failure_probability
+        );
+    }
 }

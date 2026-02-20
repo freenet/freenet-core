@@ -1959,4 +1959,102 @@ mod tests {
             other => panic!("Expected PrepareRequest state, got {:?}", other),
         }
     }
+
+    /// Verify that start_op creates a PutOp with stats=None initially.
+    /// Stats should only be populated when a target peer is chosen during forwarding.
+    #[test]
+    fn start_op_creates_put_with_no_stats() {
+        let contract = make_test_contract(&[1u8]);
+        let op = start_op(
+            contract,
+            RelatedContracts::default(),
+            WrappedState::new(vec![]),
+            10,
+            false,
+            false,
+        );
+        assert!(
+            op.stats.is_none(),
+            "start_op should create PutOp with stats=None"
+        );
+        // Without stats, outcome should be Incomplete (not finalized, no stats)
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+    }
+
+    /// Simulate a put operation lifecycle: initially no stats, then stats are set
+    /// when forwarding, then state is Finished → outcome should be SuccessUntimed.
+    #[test]
+    fn put_op_stats_lifecycle_from_initial_to_finished() {
+        use crate::ring::{Location, PeerKeyLocation};
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Step 1: Initial state - no stats, PrepareRequest
+        let mut op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::PrepareRequest {
+                contract: make_test_contract(&[1u8]),
+                related_contracts: RelatedContracts::default(),
+                value: WrappedState::new(vec![]),
+                htl: 10,
+                subscribe: false,
+                blocking_subscribe: false,
+            }),
+            upstream_addr: None,
+            stats: None,
+        };
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+        assert!(op.failure_routing_info().is_none());
+
+        // Step 2: Stats are set when forwarding to next peer
+        op.stats = Some(PutStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        });
+        op.state = Some(PutState::AwaitingResponse {
+            subscribe: false,
+            blocking_subscribe: false,
+            next_hop: None,
+            current_htl: 9,
+        });
+        // Not finalized yet, but has stats → failure
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer: peer, ..
+            } => assert_eq!(*peer, target_peer),
+            _ => panic!("Expected ContractOpFailure for in-progress put with stats"),
+        }
+        assert!(op.failure_routing_info().is_some());
+
+        // Step 3: Operation finishes successfully
+        op.state = Some(PutState::Finished {
+            key: make_contract_key(1),
+        });
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer: peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(*peer, target_peer);
+                assert_eq!(loc, contract_location);
+            }
+            _ => panic!("Expected ContractOpSuccessUntimed for finished put with stats"),
+        }
+    }
+
+    /// Verify that a forwarding node (state=None, stats=None) returns Irrelevant
+    /// since it is finalized (state is None) but has no routing decision to report.
+    #[test]
+    fn put_op_forwarding_node_outcome_is_irrelevant() {
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            stats: None,
+        };
+        // state=None → finalized, stats=None → Irrelevant
+        assert!(op.finalized());
+        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
 }

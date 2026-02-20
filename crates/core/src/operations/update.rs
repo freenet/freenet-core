@@ -2072,4 +2072,118 @@ mod tests {
         );
         assert!(op.failure_routing_info().is_none());
     }
+
+    /// Verify that start_op creates an UpdateOp with contract_location populated
+    /// but target=None. The target is only set when the operation finds a peer
+    /// to forward to.
+    #[test]
+    fn start_op_creates_update_with_partial_stats() {
+        use crate::operations::test_utils::make_test_contract;
+        let contract = make_test_contract(&[1u8]);
+        let contract_key = contract.key();
+        let contract_location = Location::from(&contract_key);
+        let op = start_op(
+            contract_key,
+            UpdateData::State(WrappedState::new(vec![1u8]).into()),
+            RelatedContracts::default(),
+        );
+        // Stats should exist with contract_location but no target
+        let stats = op.stats.as_ref().expect("start_op should create stats");
+        assert!(
+            stats.target.is_none(),
+            "target should be None before forwarding"
+        );
+        assert_eq!(
+            stats.contract_location,
+            Some(contract_location),
+            "contract_location should be set from start_op"
+        );
+        // Outcome should be Incomplete since it has partial stats
+        // (finalized=false because state=PrepareRequest, stats has no target)
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+    }
+
+    /// Simulate the update operation lifecycle: partial stats → full stats → finished.
+    /// This mirrors what happens when an update operation finds a forwarding target.
+    #[test]
+    fn update_op_stats_lifecycle_from_partial_to_complete() {
+        let target = PeerKeyLocation::random();
+        let loc = Location::random();
+
+        // Step 1: Created with partial stats (no target yet)
+        let mut op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
+                target: None,
+                contract_location: Some(loc),
+            }),
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+        assert!(op.failure_routing_info().is_none());
+
+        // Step 2: Target found during forwarding
+        op.stats = Some(UpdateStats {
+            target: Some(target.clone()),
+            contract_location: Some(loc),
+        });
+        // Still not finalized → ContractOpFailure (has full stats but not done)
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location,
+            } => {
+                assert_eq!(*target_peer, target);
+                assert_eq!(contract_location, loc);
+            }
+            _ => panic!("Expected ContractOpFailure for in-progress update with stats"),
+        }
+        assert!(op.failure_routing_info().is_some());
+
+        // Step 3: Operation finishes
+        op.state = Some(UpdateState::Finished {
+            key: make_contract_key(1),
+            summary: StateSummary::from(vec![1u8]),
+        });
+        match op.outcome() {
+            OpOutcome::ContractOpSuccessUntimed {
+                target_peer,
+                contract_location,
+            } => {
+                assert_eq!(*target_peer, target);
+                assert_eq!(contract_location, loc);
+            }
+            _ => panic!("Expected ContractOpSuccessUntimed for finished update with stats"),
+        }
+    }
+
+    /// Verify that contract_location=None in UpdateStats causes Incomplete/Irrelevant
+    /// outcomes even when a target is set.
+    #[test]
+    fn update_op_outcome_with_target_but_no_contract_location() {
+        let target = PeerKeyLocation::random();
+
+        // Not finalized with target but no location → Incomplete
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: None,
+            }),
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+        assert!(op.failure_routing_info().is_none());
+
+        // Finalized with target but no location → Irrelevant
+        let op = make_update_op(
+            Some(UpdateState::Finished {
+                key: make_contract_key(1),
+                summary: StateSummary::from(vec![1u8]),
+            }),
+            Some(UpdateStats {
+                target: Some(target),
+                contract_location: None,
+            }),
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
 }

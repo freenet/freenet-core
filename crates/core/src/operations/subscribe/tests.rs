@@ -965,3 +965,93 @@ fn test_subscribe_outcome_incomplete_without_stats() {
     };
     assert!(matches!(op.outcome(), OpOutcome::Incomplete));
 }
+
+/// Simulate the subscribe operation lifecycle: stats are set when we find a
+/// forwarding peer, then state transitions to Completed → outcome should be
+/// SuccessUntimed.
+#[test]
+fn test_subscribe_stats_lifecycle() {
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([50u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([51u8; 32]));
+
+    // Step 1: Initial state with no stats — Incomplete
+    let mut op = SubscribeOp {
+        id: tx,
+        state: Some(SubscribeState::AwaitingResponse {
+            next_hop: None,
+            instance_id,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+
+    // Step 2: Stats set when forwarding to target
+    op.stats = Some(super::SubscribeStats {
+        target_peer: target_peer.clone(),
+        contract_location,
+    });
+    // Not finalized → ContractOpFailure
+    match op.outcome() {
+        OpOutcome::ContractOpFailure {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        _ => panic!("Expected ContractOpFailure for in-progress subscribe with stats"),
+    }
+
+    // Step 3: Operation completes
+    op.state = Some(SubscribeState::Completed { key: contract_key });
+    match op.outcome() {
+        OpOutcome::ContractOpSuccessUntimed {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        _ => panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats"),
+    }
+}
+
+/// Verify that renewal subscriptions also report outcomes correctly.
+/// Renewals follow the same routing path and should produce the same
+/// outcome as non-renewal subscriptions.
+#[test]
+fn test_subscribe_renewal_reports_outcome() {
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+    let instance_id = ContractInstanceId::new([60u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([61u8; 32]));
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: true, // This is a renewal
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+    // Renewal should still report success
+    match op.outcome() {
+        OpOutcome::ContractOpSuccessUntimed {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        _ => panic!("Expected ContractOpSuccessUntimed for renewal subscribe"),
+    }
+}
