@@ -187,9 +187,6 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A (peer-a) ws_port: {}", ws_api_port_peer_a);
     tracing::info!("Node B (gateway) ws_port: {}", ws_api_port_peer_b);
 
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Connect to node A's websocket API
     let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
@@ -292,9 +289,6 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     // Log data directories for debugging
     tracing::info!("Node A (peer-a) data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
-
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A websocket API
     let uri = peer_a.ws_url();
@@ -487,9 +481,6 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Connect to node A's websocket API
     let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
@@ -644,9 +635,6 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
     tracing::info!("Node B data dir: {:?}", node_b.temp_dir_path);
-
-    // Give extra time for peers to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect first client to node A's websocket API
     tracing::info!("Starting WebSocket connections after 40s startup wait");
@@ -1268,9 +1256,6 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Connect first client to node A's websocket API (for putting the contract)
     let uri_a = node_a.ws_url();
     let (stream1, _) = connect_async(&uri_a).await?;
@@ -1513,9 +1498,6 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
-
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect first client to node A's websocket API (for putting with auto-subscribe)
     let uri_a = node_a.ws_url();
@@ -1973,8 +1955,6 @@ async fn test_put_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
 
     let node_a = ctx.node("node-a")?;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     let uri_a = node_a.ws_url();
     let (stream1, _) = connect_async(&uri_a).await?;
     let mut client_api1 = WebApi::start(stream1);
@@ -2074,8 +2054,6 @@ async fn test_get_with_blocking_subscribe(ctx: &mut TestContext) -> TestResult {
     let wrapped_state = WrappedState::from(initial_state);
 
     let node_a = ctx.node("node-a")?;
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let uri_a = node_a.ws_url();
 
@@ -2201,9 +2179,6 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     // Log data directories for debugging
     tracing::info!("Client node data dir: {:?}", client_node.temp_dir_path);
     tracing::info!("Gateway node data dir: {:?}", gateway.temp_dir_path);
-
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to the client node's WebSocket API
     let uri = client_node.ws_url();
@@ -2547,9 +2522,6 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
     tracing::info!("Node data dir: {:?}", peer_node.temp_dir_path);
 
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Connect to gateway websocket API
     let uri_gw = gateway.ws_url();
     let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -2630,9 +2602,6 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
     // Log data directories for debugging
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
-
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to node A websocket API
     let uri = peer_a.ws_url();
@@ -2998,11 +2967,6 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
         ws_api_port
     );
 
-    // Give time for peer to connect to gateway (so remote peers exist).
-    // Use 5 seconds to match other CI-stable tests and avoid race conditions
-    // where connection establishment takes longer under CI load.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Connect to peer-a's websocket API
     let uri = peer_a.ws_url();
     let (stream, _) = connect_async(&uri).await?;
@@ -3250,9 +3214,6 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
 
     tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
-
-    // Wait for connection to stabilize
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
     let uri_peer_a = peer_a.ws_url();

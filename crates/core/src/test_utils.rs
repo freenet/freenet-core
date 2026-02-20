@@ -1221,11 +1221,17 @@ impl NodeInfo {
         )
     }
 
-    /// Wait for this node to become ready by polling its WebSocket API.
+    /// Wait for this node to become ready using a two-phase check.
     ///
-    /// This function attempts to connect to the node's WebSocket and verify it responds,
-    /// using exponential backoff polling. Returns as soon as the node is ready, rather than
-    /// waiting a fixed duration.
+    /// **Phase 1:** Verify the WebSocket API accepts connections and responds to a
+    /// diagnostics query. For gateways, this is sufficient (they are always "joined").
+    ///
+    /// **Phase 2 (non-gateway peers only):** Query `ConnectedPeers` and wait until at
+    /// least one connection exists, confirming the peer has completed its network join
+    /// handshake (which sets `peer_ready=true`).
+    ///
+    /// Uses exponential backoff polling. Returns as soon as the node is ready, rather
+    /// than waiting a fixed duration.
     ///
     /// # Arguments
     /// * `timeout` - Maximum time to wait for the node to become ready
