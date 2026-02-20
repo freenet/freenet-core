@@ -3,7 +3,7 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{atomic::AtomicU64, Arc, Weak};
 use std::time::Duration;
@@ -66,6 +66,12 @@ pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 // Note: For now internally we wrap some of the types internally with locks and/or use
 // multithreaded maps. In the future if performance requires it some of this can be moved
 // towards a more lock-free multithreading model if necessary.
+/// Backoff state for contract-directed CONNECT attempts.
+struct ContractConnectState {
+    current_backoff: Duration,
+    last_attempt: Instant,
+}
+
 pub(crate) struct Ring {
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
@@ -79,6 +85,8 @@ pub(crate) struct Ring {
     pub(crate) is_gateway: bool,
     /// Shared connection backoff tracker for all connection failure types.
     connection_backoff: Arc<parking_lot::Mutex<ConnectionBackoff>>,
+    /// Per-contract backoff for contract-directed CONNECT attempts.
+    contract_connect_backoff: Mutex<HashMap<ContractKey, ContractConnectState>>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -198,6 +206,7 @@ impl Ring {
             op_manager: RwLock::new(None),
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
+            contract_connect_backoff: Mutex::new(HashMap::new()),
         };
 
         if let Some(loc) = config.location {
@@ -255,6 +264,16 @@ impl Ring {
             Duration::from_secs(60 * 5),
         ));
 
+        // Spawn periodic contract-directed CONNECT task.
+        // When a peer is a "subscription root" (closest to contract among neighbors),
+        // it sends CONNECTs toward the contract's ring location to merge disconnected
+        // subscription subtrees.
+        const CONTRACT_CONNECT_INTERVAL: Duration = Duration::from_secs(30);
+        GlobalExecutor::spawn(Self::contract_directed_connects(
+            ring.clone(),
+            CONTRACT_CONNECT_INTERVAL,
+        ));
+
         Ok(ring)
     }
 
@@ -303,6 +322,203 @@ impl Ring {
     /// when the node has had zero ring connections for an extended period.
     pub fn reset_all_connection_backoff(&self) {
         self.connection_backoff.lock().clear();
+    }
+
+    // ==================== Contract-Directed CONNECT ====================
+
+    /// Initial backoff before retrying a contract-directed CONNECT.
+    const INITIAL_CONTRACT_CONNECT_BACKOFF: Duration = Duration::from_secs(30);
+    /// Maximum backoff cap for contract-directed CONNECTs (24 hours).
+    const MAX_CONTRACT_CONNECT_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
+    /// Maximum contract-directed CONNECTs per cycle.
+    const MAX_CONTRACT_CONNECTS_PER_CYCLE: usize = 2;
+
+    /// Returns true if this peer is the closest to the contract among its connected neighbors
+    /// (i.e., it's a subscription root for this contract).
+    fn is_subscription_root(&self, contract_key: &ContractKey) -> bool {
+        if !self.is_hosting_contract(contract_key) {
+            return false;
+        }
+        let contract_location = Location::from(contract_key);
+        let my_location = match self.connection_manager.own_location().location() {
+            Some(loc) => loc,
+            None => return false,
+        };
+        let my_distance = my_location.distance(contract_location);
+
+        let connections = self.connection_manager.get_connections_by_location();
+        for (_loc, conns) in connections.iter() {
+            for conn in conns {
+                if let Some(peer_loc) = conn.location.location() {
+                    if peer_loc.distance(contract_location) < my_distance {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Check if a contract-directed CONNECT is currently in backoff.
+    fn is_in_contract_connect_backoff(&self, contract_key: &ContractKey) -> bool {
+        let backoff = self.contract_connect_backoff.lock();
+        if let Some(state) = backoff.get(contract_key) {
+            state.last_attempt.elapsed() < state.current_backoff
+        } else {
+            false
+        }
+    }
+
+    /// Record a contract-directed CONNECT attempt. Doubles the backoff (up to cap).
+    fn record_contract_connect_attempt(&self, contract_key: &ContractKey) {
+        let mut backoff = self.contract_connect_backoff.lock();
+        let state = backoff
+            .entry(*contract_key)
+            .or_insert_with(|| ContractConnectState {
+                current_backoff: Self::INITIAL_CONTRACT_CONNECT_BACKOFF,
+                last_attempt: Instant::now(),
+            });
+        state.last_attempt = Instant::now();
+        state.current_backoff = (state.current_backoff * 2).min(Self::MAX_CONTRACT_CONNECT_BACKOFF);
+    }
+
+    /// Periodic task: when this peer is a subscription root for a contract,
+    /// initiate a CONNECT toward the contract's ring location to merge
+    /// disconnected subscription subtrees.
+    async fn contract_directed_connects(ring: Arc<Self>, interval: Duration) {
+        // Random initial delay to prevent thundering herd.
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=60u64));
+        tokio::time::sleep(initial_delay).await;
+
+        let mut tick_interval = tokio::time::interval(interval);
+        tick_interval.tick().await; // skip first immediate tick
+
+        loop {
+            tick_interval.tick().await;
+
+            // Skip if we have too few connections to be meaningful.
+            let conn_count = ring.connection_manager.connection_count();
+            if conn_count < 2 {
+                continue;
+            }
+
+            let contracts = ring.hosting_contract_keys();
+            if contracts.is_empty() {
+                continue;
+            }
+
+            let Some(op_manager) = ring.upgrade_op_manager() else {
+                continue;
+            };
+
+            let mut connects_this_cycle = 0;
+
+            for contract_key in &contracts {
+                if connects_this_cycle >= Self::MAX_CONTRACT_CONNECTS_PER_CYCLE {
+                    break;
+                }
+
+                if !ring.is_subscription_root(contract_key) {
+                    // No longer root — a closer connection now exists.
+                    // If we had backoff state, we previously sent a CONNECT as root.
+                    // Now that a closer peer is connected, expire the subscription
+                    // so it re-routes through the closer peer on the next renewal cycle.
+                    let had_backoff = ring
+                        .contract_connect_backoff
+                        .lock()
+                        .remove(contract_key)
+                        .is_some();
+                    if had_backoff {
+                        ring.force_subscription_renewal(contract_key);
+                        tracing::info!(
+                            contract = %contract_key,
+                            "No longer subscription root after contract-directed CONNECT; \
+                             expired subscription to re-route through closer peer"
+                        );
+                    }
+                    continue;
+                }
+
+                let contract_location = Location::from(contract_key);
+                let my_location = ring.connection_manager.own_location().location();
+                let my_distance = my_location.map(|l| l.distance(contract_location).as_f64());
+
+                if ring.is_in_contract_connect_backoff(contract_key) {
+                    continue;
+                }
+
+                // Emit telemetry for the root detection.
+                crate::tracing::telemetry::send_standalone_event(
+                    "subscription_root_detected",
+                    serde_json::json!({
+                        "contract": contract_key.to_string(),
+                        "contract_location": contract_location.as_f64(),
+                        "neighbor_count": conn_count,
+                        "my_distance": my_distance,
+                    }),
+                );
+
+                ring.record_contract_connect_attempt(contract_key);
+
+                let backoff_secs = {
+                    let b = ring.contract_connect_backoff.lock();
+                    b.get(contract_key)
+                        .map(|s| s.current_backoff.as_secs())
+                        .unwrap_or(0)
+                };
+
+                tracing::info!(
+                    contract = %contract_key,
+                    %contract_location,
+                    backoff_secs,
+                    "Initiating contract-directed CONNECT as subscription root"
+                );
+
+                crate::tracing::telemetry::send_standalone_event(
+                    "contract_directed_connect",
+                    serde_json::json!({
+                        "contract": contract_key.to_string(),
+                        "contract_location": contract_location.as_f64(),
+                        "my_distance": my_distance,
+                        "backoff_secs": backoff_secs,
+                    }),
+                );
+
+                let skip_list = HashSet::new();
+                match ring
+                    .acquire_new(
+                        contract_location,
+                        &skip_list,
+                        &op_manager.to_event_listener,
+                        &ring.live_tx_tracker,
+                        &op_manager,
+                    )
+                    .await
+                {
+                    Ok(Some(tx)) => {
+                        tracing::debug!(
+                            %tx,
+                            contract = %contract_key,
+                            "Contract-directed CONNECT initiated"
+                        );
+                        connects_this_cycle += 1;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            contract = %contract_key,
+                            "Contract-directed CONNECT: no routing target found"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            contract = %contract_key,
+                            error = %e,
+                            "Contract-directed CONNECT failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Register events with the event system.
@@ -1017,6 +1233,12 @@ impl Ring {
     /// Get all contracts with active subscriptions.
     pub fn get_subscribed_contracts(&self) -> Vec<ContractKey> {
         self.hosting_manager.get_subscribed_contracts()
+    }
+
+    /// Force-expire a contract's subscription so it gets renewed through the
+    /// current best route on the next recovery cycle.
+    fn force_subscription_renewal(&self, contract: &ContractKey) {
+        self.hosting_manager.force_subscription_renewal(contract);
     }
 
     /// Expire stale subscriptions and return the contracts that were expired.

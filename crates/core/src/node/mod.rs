@@ -781,6 +781,28 @@ where
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
 
+    // Reject new non-CONNECT operations when nearly isolated (0-1 connections).
+    // Prevents poorly-connected peers (e.g., symmetric NAT with only a gateway
+    // connection) from becoming false subscription roots by caching contracts
+    // they shouldn't be responsible for.
+    //
+    // Fixed threshold of 2: a peer with only a gateway connection (1) rejects
+    // relayed work; once it has 2+ connections the gate opens. This avoids
+    // scaling issues where min_connections/2 exceeds small-network capacity.
+    const MIN_RELAY_CONNECTIONS: usize = 2;
+    if !matches!(msg, NetMessageV1::Connect(_)) {
+        let conn_count = op_manager.ring.connection_manager.connection_count();
+        if conn_count < MIN_RELAY_CONNECTIONS && !op_manager.has_operation(msg.id()) {
+            tracing::debug!(
+                conn_count,
+                min_relay = MIN_RELAY_CONNECTIONS,
+                tx = %msg.id(),
+                "Rejecting incoming operation: below minimum relay connections"
+            );
+            return Ok(None);
+        }
+    }
+
     const MAX_RETRIES: usize = 15usize;
     for i in 0..MAX_RETRIES {
         let tx = Some(*msg.id());

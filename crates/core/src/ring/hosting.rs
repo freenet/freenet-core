@@ -253,6 +253,18 @@ impl HostingManager {
     /// Expire stale subscriptions and return the contracts that were expired.
     ///
     /// Should be called periodically by a background task.
+    /// Force-expire a contract's subscription so it gets renewed through the
+    /// current best route on the next recovery cycle. Used when a new closer
+    /// connection has been established (not just initiated).
+    pub fn force_subscription_renewal(&self, contract: &ContractKey) {
+        if self.active_subscriptions.remove(contract).is_some() {
+            tracing::info!(
+                %contract,
+                "force_subscription_renewal: expired subscription to trigger re-route"
+            );
+        }
+    }
+
     pub fn expire_stale_subscriptions(&self) -> Vec<ContractKey> {
         let now = Instant::now();
         let mut expired = Vec::new();
