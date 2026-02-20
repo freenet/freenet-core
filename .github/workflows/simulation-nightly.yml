@@ -165,6 +165,22 @@ jobs:
             --no-capture \
             --profile nightly
 
+      # Churn resilience test - tests network behavior under node crashes/restarts
+      - name: Churn resilience test (20 nodes, 10% crash rate)
+        run: |
+          echo "Running churn resilience simulation (500 events, 10% crash rate)"
+          target/release/fdev test \
+            --name "nightly-churn-20" \
+            --seed 0xC102FEED \
+            --gateways 2 --nodes 18 --events 500 \
+            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
+            --latency-min 10 --latency-max 50 \
+            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
+            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
+            --min-success-rate 0.80 \
+            --print-summary --print-network-stats \
+            single-process
+
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
       - name: Large scale test (500 nodes)
         timeout-minutes: 60

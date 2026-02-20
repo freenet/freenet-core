@@ -76,7 +76,7 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{
-            check_convergence_from_logs, run_turmoil_simulation, ContractDistribution,
+            check_convergence_from_logs, run_turmoil_simulation, ChurnConfig, ContractDistribution,
             ControlledEventChain, ControlledSimulationResult, ConvergedContract, ConvergenceResult,
             DivergedContract, EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats,
             OperationSummary, PeerMessage, PeerStatus, PutOperationStats, RunningNode,
