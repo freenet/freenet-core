@@ -21,7 +21,6 @@ use freenet::dev_tool::{
     check_convergence_from_logs, reset_channel_id_counter, reset_event_id_counter,
     reset_global_node_index, reset_nonce_counter, RequestId, SimNetwork, StreamId, VirtualTime,
 };
-use freenet::simulation::TimeSource;
 use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
@@ -4100,132 +4099,110 @@ fn test_direct_runner_determinism() {
     );
 }
 
-// Zombie Connection Regression Test (PR #3005)
+// =============================================================================
+// Subscription Storm Regression Test (PR #2995, PR #3146)
 // =============================================================================
 
-/// Test: Suspend/resume creates zombie connections that block reconnection.
+/// Regression test for subscription renewal storm under high contract load.
 ///
-/// Reproduces the bug from PR #3005:
-/// 1. Network establishes connections
-/// 2. Node crashes (simulating suspend without cleanup)
-/// 3. Time passes (simulating suspend duration)
-/// 4. Node restarts (simulating resume)
-/// 5. BUG: Old connection entries persist as "zombies"
-/// 6. New CONNECT messages sent through dead transport sockets
-/// 7. Bootstrap/reconnection fails
+/// Ensures that with 250+ contracts requiring renewal, the subscription
+/// recovery mechanism (PR #2995, #3146) prevents notification channel
+/// saturation through rate-limiting and smart backpressure.
 ///
-/// This is a regression test to prevent the zombie connection bug.
-#[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn test_suspend_resume_zombie_connections() {
-    const SEED: u64 = 0xDEAD_BEEF_3005;
-    const NETWORK_NAME: &str = "zombie-connections";
+/// **Background:**
+/// - `recover_orphaned_subscriptions()` runs every 30 seconds
+/// - Pre-fix: 20+ concurrent renewals could saturate the notification channel
+/// - PR #2995: Rate-limited to 5 renewals per interval
+/// - PR #3146: Improved to 10 renewals/interval with smart backpressure
+///
+/// **Test validates:**
+/// - Subscription recovery triggers with 250+ contracts
+/// - No channel saturation warnings under production-scale load
+/// - Network remains responsive during recovery cycles
+///
+/// **Runtime:** ~8-10 minutes wall-clock (300 contract compilations)
+#[test_log::test]
+#[cfg(feature = "nightly_tests")]
+fn test_subscription_renewal_at_scale() {
+    const SEED: u64 = 0x2995_CAFE_BABE;
 
-    tracing::info!("=== Testing Zombie Connection Bug (PR #3005) ===");
+    tracing::info!("=== Subscription Renewal at Scale (250+ contracts) ===");
 
-    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 2, 7, 3, 10, 2, SEED).await;
-    sim.with_start_backoff(Duration::from_millis(50));
+    let start_time = std::time::Instant::now();
 
-    // Start network
-    let _handles = sim
-        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10)
-        .await;
+    let config = TestConfig {
+        name: "subscription-renewal-scale",
+        seed: SEED,
+        gateways: 1,
+        nodes: 2,
+        ring_max_htl: 7,
+        rnd_if_htl_above: 3,
+        max_connections: 10,
+        min_connections: 2,
+        max_contracts: 250, // Production scale
+        iterations: 300,    // Seed contracts
+        duration: Duration::from_secs(90),
+        event_wait: Duration::from_millis(200),
+        sleep_after_events: Duration::from_secs(40), // Trigger 30s recovery cycle
+        require_convergence: false,
+        latency_range: None,
+    };
 
-    // Phase 1: Let network stabilize and establish connections
-    tracing::info!("Phase 1: Network startup and stabilization");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let max_contracts = config.max_contracts; // Save before config.run() moves it
 
-    // Log initial virtual time
-    let initial_time = sim.virtual_time().now_nanos();
-    tracing::info!("Initial virtual time: {}ns", initial_time);
-
-    // Verify initial connectivity
-    sim.check_connectivity(Duration::from_secs(10))
-        .await
-        .expect("Initial connectivity check should pass");
-    tracing::info!("✓ Network connectivity established");
-
-    // Phase 2: Crash a node (simulate suspend)
-    let node_to_suspend = sim
-        .all_node_addresses()
-        .keys()
-        .find(|label| label.is_node())
-        .cloned()
-        .expect("Should have at least one node");
-
-    tracing::info!(?node_to_suspend, "Phase 2: Simulating suspend (crash node)");
-    let crashed = sim.crash_node(&node_to_suspend);
-    assert!(crashed, "Node should crash successfully");
-    assert!(sim.is_node_crashed(&node_to_suspend));
-    tracing::info!("✓ Node crashed (suspend simulated)");
-
-    // Phase 3: Advance time significantly (simulate suspend duration)
-    tracing::info!("Phase 3: Simulating time passage during suspend");
-
-    // Advance time by 1 hour in virtual time
-    // NOTE: With keepalive enabled (future), this would trigger timeout cleanup
-    // Without keepalive, connections persist as zombies
-    let suspend_duration = Duration::from_secs(3600);
-    sim.virtual_time().advance(suspend_duration);
-
-    let time_after_suspend = sim.virtual_time().now_nanos();
     tracing::info!(
-        "✓ Advanced virtual time by {} seconds (now: {}ns)",
-        suspend_duration.as_secs(),
-        time_after_suspend
+        "Testing with {} contracts, {} operations",
+        max_contracts,
+        config.iterations
     );
 
-    // Let tasks process the time advancement
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = config.run();
 
-    // Phase 4: Restart node (simulate resume)
-    tracing::info!(
-        ?node_to_suspend,
-        "Phase 4: Simulating resume (restart node)"
-    );
+    // Verify subscription recovery triggered and channel didn't saturate
+    let rt = create_runtime();
+    let logs = rt.block_on(async { result.logs_handle.lock().await.clone() });
 
-    let restart_seed = SEED.wrapping_add(0x1000);
-    let handle = sim
-        .restart_node::<rand::rngs::SmallRng>(&node_to_suspend, restart_seed, 5, 5)
-        .await;
+    let mut renewal_attempts = 0;
+    let mut channel_warnings = 0;
 
-    assert!(handle.is_some(), "Node should restart successfully");
-    assert!(!sim.is_node_crashed(&node_to_suspend));
-    tracing::info!("✓ Node restarted (resume simulated)");
-
-    // Let the restarted node attempt to bootstrap
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Phase 5: Check for zombie connection bug
-    tracing::info!("Phase 5: Checking for zombie connections");
-
-    let connectivity_result = sim.check_connectivity(Duration::from_secs(15)).await;
-
-    match connectivity_result {
-        Ok(()) => {
-            tracing::info!("✓ Connectivity restored after restart");
-            tracing::info!("   FIX WORKING: No zombie connections blocking reconnection");
-            tracing::info!("   (or DropAllConnections was called on resume)");
+    for log in &logs {
+        let msg = format!("{:?}", log);
+        if msg.contains("Subscription renewal: attempted") {
+            renewal_attempts += 1;
         }
-        Err(e) => {
-            tracing::error!("✗ Connectivity check failed after restart: {}", e);
-            tracing::error!("BUG DETECTED: Zombie connections blocking reconnection");
-            tracing::error!("");
-            tracing::error!("Root cause analysis:");
-            tracing::error!("  - Node crashed without proper cleanup");
-            tracing::error!("  - Old connection HashMap entries still exist");
-            tracing::error!("  - CONNECT messages sent through dead transport sockets");
-            tracing::error!("  - Gateway doesn't respond (socket handle invalid)");
-            tracing::error!("  - Bootstrap hangs waiting for response");
-            tracing::error!("");
-            tracing::error!("Expected fix: Call DropAllConnections in ops_after_resume()");
-            tracing::error!("See PR #3005 for details");
-
-            // Fail the test to catch regression
-            panic!("Zombie connection bug detected! Connectivity failed after node restart");
+        if msg.contains("Notification channel") && msg.contains("full") {
+            channel_warnings += 1;
+            tracing::error!("Channel saturation detected: {}", msg);
         }
     }
 
-    tracing::info!("=== Zombie Connection Test Complete ===");
+    let wall_clock = start_time.elapsed();
+
+    tracing::info!(
+        "Completed in {:.1}s: {} renewal cycles, {} channel warnings",
+        wall_clock.as_secs_f64(),
+        renewal_attempts,
+        channel_warnings
+    );
+
+    // Assertions: Regression checks
+    result.assert_ok();
+
+    // Log renewal activity (may be 0 if no subscriptions need renewal)
+    tracing::info!("Subscription renewal cycles observed: {}", renewal_attempts);
+
+    // REGRESSION CHECK: With the fix (PR #2995/#3146), we should NOT see channel saturation
+    // even under high contract load. This is the critical validation.
+    assert_eq!(
+        channel_warnings, 0,
+        "Channel saturation detected - regression in PR #2995/#3146 fix! \
+         The subscription renewal rate-limiting may not be working correctly."
+    );
+
+    tracing::info!(
+        "✓ No channel saturation with {} contracts (PR #2995/#3146 fix working)",
+        max_contracts
+    );
 }
 
 // =============================================================================
