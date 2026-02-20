@@ -412,9 +412,14 @@ impl Ring {
         }
     }
 
-    /// Maximum renewal tasks spawned per tick. Keep small to avoid saturating
-    /// the notification channel; exponential backoff handles the remainder.
-    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 5;
+    /// Maximum renewal tasks spawned per tick.
+    ///
+    /// At 30s intervals, this yields up to 20 renewals/minute. With 8-minute
+    /// subscription leases and 2-minute renewal windows, this handles up to
+    /// ~80 concurrent subscriptions before renewals can't keep up. The
+    /// mid-cycle channel capacity check (RENEWAL_STOP_CAPACITY_FRACTION)
+    /// provides backpressure if the network can't absorb this many.
+    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 10;
 
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
@@ -488,29 +493,39 @@ impl Ring {
                 continue;
             };
 
-            // Backpressure: skip this cycle if the notification channel is
-            // already congested. Renewals will be retried next tick.
+            // Backpressure: reduce batch size when the notification channel is
+            // congested, but never skip entirely. Renewals are critical-path —
+            // skipping a full cycle when the channel is busy lets subscriptions
+            // expire, which causes cascading failures as the subscription tree
+            // thins out and remaining renewals take longer paths.
             let sender = op_manager.to_event_listener.notifications_sender();
             let channel_remaining = sender.capacity();
             let channel_max = sender.max_capacity();
-            if channel_remaining < channel_max / Self::RENEWAL_DEFER_CAPACITY_FRACTION {
-                tracing::warn!(
-                    channel_remaining,
-                    channel_max,
-                    contracts = contracts_needing_renewal.len(),
-                    "Notification channel >50% full, deferring subscription renewals"
-                );
-                continue;
-            }
+            let batch_limit =
+                if channel_remaining < channel_max / Self::RENEWAL_DEFER_CAPACITY_FRACTION {
+                    // Channel >50% full: allow a reduced batch (quarter of normal)
+                    // so critical renewals still get through. Always attempt at least 1.
+                    let reduced = (Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL / 4).max(1);
+                    tracing::warn!(
+                        channel_remaining,
+                        channel_max,
+                        batch_limit = reduced,
+                        contracts = contracts_needing_renewal.len(),
+                        "Notification channel >50% full, reducing renewal batch size"
+                    );
+                    reduced
+                } else {
+                    Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL
+                };
 
             let mut attempted = 0;
             let mut skipped = 0;
 
             for contract in contracts_needing_renewal {
                 // Limit concurrent renewal attempts to avoid overwhelming the network
-                if attempted >= Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL {
+                if attempted >= batch_limit {
                     tracing::debug!(
-                        limit = Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
+                        limit = batch_limit,
                         "Reached max renewal attempts for this interval, remaining will be tried next cycle"
                     );
                     break;

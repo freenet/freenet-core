@@ -60,10 +60,15 @@ pub const SUBSCRIPTION_LEASE_DURATION: Duration =
     Duration::from_secs(SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * LEASE_RENEWAL_MULTIPLIER as u64); // 8 minutes
 
 /// Initial backoff duration for subscription retries.
-const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(30);
+const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(15);
 
 /// Maximum backoff duration for subscription retries.
-const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(600); // 10 minutes
+///
+/// MUST be shorter than SUBSCRIPTION_LEASE_DURATION (8 min), otherwise a
+/// contract in max-backoff will have its subscription expire before the next
+/// retry attempt, causing permanent subscription loss until the next
+/// recovery cycle picks it up.
+const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(120); // 2 minutes
 
 /// Maximum number of tracked subscription backoff entries.
 const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
@@ -1279,5 +1284,46 @@ mod tests {
             needs_renewal.contains(&contract),
             "Hosted contracts should need subscription renewal"
         );
+    }
+
+    /// Validates that backoff constants are internally consistent.
+    ///
+    /// MAX_SUBSCRIPTION_BACKOFF must be shorter than SUBSCRIPTION_LEASE_DURATION,
+    /// otherwise a contract at maximum backoff will have its subscription expire
+    /// before the next retry — causing permanent subscription loss that only
+    /// recovers when the orphan recovery sweep picks it up (up to 30s later).
+    ///
+    /// This test would have caught the original bug where MAX_SUBSCRIPTION_BACKOFF
+    /// was 600s (10 min) but SUBSCRIPTION_LEASE_DURATION was only 480s (8 min).
+    #[test]
+    fn test_backoff_shorter_than_lease() {
+        assert!(
+            MAX_SUBSCRIPTION_BACKOFF < SUBSCRIPTION_LEASE_DURATION,
+            "MAX_SUBSCRIPTION_BACKOFF ({:?}) must be shorter than \
+             SUBSCRIPTION_LEASE_DURATION ({:?}), otherwise subscriptions \
+             expire before retry",
+            MAX_SUBSCRIPTION_BACKOFF,
+            SUBSCRIPTION_LEASE_DURATION
+        );
+    }
+
+    /// Validates that the full backoff sequence never exceeds the lease duration.
+    /// Even after many consecutive failures, no single backoff delay should be
+    /// long enough to let the subscription expire.
+    #[test]
+    fn test_backoff_sequence_within_lease() {
+        let backoff =
+            ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
+        // Check delays for up to 10 consecutive failures
+        for failures in 1..=10 {
+            let delay = backoff.delay_for_failures(failures);
+            assert!(
+                delay < SUBSCRIPTION_LEASE_DURATION,
+                "Backoff delay after {} failures ({:?}) exceeds lease ({:?})",
+                failures,
+                delay,
+                SUBSCRIPTION_LEASE_DURATION
+            );
+        }
     }
 }
