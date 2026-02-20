@@ -21,6 +21,7 @@ use freenet::dev_tool::{
     check_convergence_from_logs, reset_channel_id_counter, reset_event_id_counter,
     reset_global_node_index, reset_nonce_counter, RequestId, SimNetwork, StreamId, VirtualTime,
 };
+use freenet::simulation::TimeSource;
 use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
@@ -4015,4 +4016,133 @@ fn test_direct_runner_determinism() {
         trace1.total_events,
         fp1.sequence_hash
     );
+}
+
+// =============================================================================
+// Zombie Connection Regression Test (PR #3005)
+// =============================================================================
+
+/// Test: Suspend/resume creates zombie connections that block reconnection.
+///
+/// Reproduces the bug from PR #3005:
+/// 1. Network establishes connections
+/// 2. Node crashes (simulating suspend without cleanup)
+/// 3. Time passes (simulating suspend duration)
+/// 4. Node restarts (simulating resume)
+/// 5. BUG: Old connection entries persist as "zombies"
+/// 6. New CONNECT messages sent through dead transport sockets
+/// 7. Bootstrap/reconnection fails
+///
+/// This is a regression test to prevent the zombie connection bug.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_suspend_resume_zombie_connections() {
+    const SEED: u64 = 0xDEAD_BEEF_3005;
+    const NETWORK_NAME: &str = "zombie-connections";
+
+    tracing::info!("=== Testing Zombie Connection Bug (PR #3005) ===");
+
+    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 2, 7, 3, 10, 2, SEED).await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start network
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10)
+        .await;
+
+    // Phase 1: Let network stabilize and establish connections
+    tracing::info!("Phase 1: Network startup and stabilization");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Log initial virtual time
+    let initial_time = sim.virtual_time().now_nanos();
+    tracing::info!("Initial virtual time: {}ns", initial_time);
+
+    // Verify initial connectivity
+    sim.check_connectivity(Duration::from_secs(10))
+        .await
+        .expect("Initial connectivity check should pass");
+    tracing::info!("✓ Network connectivity established");
+
+    // Phase 2: Crash a node (simulate suspend)
+    let node_to_suspend = sim
+        .all_node_addresses()
+        .keys()
+        .find(|label| label.is_node())
+        .cloned()
+        .expect("Should have at least one node");
+
+    tracing::info!(?node_to_suspend, "Phase 2: Simulating suspend (crash node)");
+    let crashed = sim.crash_node(&node_to_suspend);
+    assert!(crashed, "Node should crash successfully");
+    assert!(sim.is_node_crashed(&node_to_suspend));
+    tracing::info!("✓ Node crashed (suspend simulated)");
+
+    // Phase 3: Advance time significantly (simulate suspend duration)
+    tracing::info!("Phase 3: Simulating time passage during suspend");
+
+    // Advance time by 1 hour in virtual time
+    // NOTE: With keepalive enabled (future), this would trigger timeout cleanup
+    // Without keepalive, connections persist as zombies
+    let suspend_duration = Duration::from_secs(3600);
+    sim.virtual_time().advance(suspend_duration);
+
+    let time_after_suspend = sim.virtual_time().now_nanos();
+    tracing::info!(
+        "✓ Advanced virtual time by {} seconds (now: {}ns)",
+        suspend_duration.as_secs(),
+        time_after_suspend
+    );
+
+    // Let tasks process the time advancement
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Phase 4: Restart node (simulate resume)
+    tracing::info!(
+        ?node_to_suspend,
+        "Phase 4: Simulating resume (restart node)"
+    );
+
+    let restart_seed = SEED.wrapping_add(0x1000);
+    let handle = sim
+        .restart_node::<rand::rngs::SmallRng>(&node_to_suspend, restart_seed, 5, 5)
+        .await;
+
+    assert!(handle.is_some(), "Node should restart successfully");
+    assert!(!sim.is_node_crashed(&node_to_suspend));
+    tracing::info!("✓ Node restarted (resume simulated)");
+
+    // Let the restarted node attempt to bootstrap
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Phase 5: Check for zombie connection bug
+    tracing::info!("Phase 5: Checking for zombie connections");
+
+    let connectivity_result = sim.check_connectivity(Duration::from_secs(15)).await;
+
+    match connectivity_result {
+        Ok(()) => {
+            tracing::info!("✓ Connectivity restored after restart");
+            tracing::info!("   FIX WORKING: No zombie connections blocking reconnection");
+            tracing::info!("   (or DropAllConnections was called on resume)");
+        }
+        Err(e) => {
+            tracing::error!("✗ Connectivity check failed after restart: {}", e);
+            tracing::error!("BUG DETECTED: Zombie connections blocking reconnection");
+            tracing::error!("");
+            tracing::error!("Root cause analysis:");
+            tracing::error!("  - Node crashed without proper cleanup");
+            tracing::error!("  - Old connection HashMap entries still exist");
+            tracing::error!("  - CONNECT messages sent through dead transport sockets");
+            tracing::error!("  - Gateway doesn't respond (socket handle invalid)");
+            tracing::error!("  - Bootstrap hangs waiting for response");
+            tracing::error!("");
+            tracing::error!("Expected fix: Call DropAllConnections in ops_after_resume()");
+            tracing::error!("See PR #3005 for details");
+
+            // Fail the test to catch regression
+            panic!("Zombie connection bug detected! Connectivity failed after node restart");
+        }
+    }
+
+    tracing::info!("=== Zombie Connection Test Complete ===");
 }
