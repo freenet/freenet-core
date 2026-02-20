@@ -81,12 +81,13 @@ impl UpdateCommand {
     async fn download_and_install(&self, release: &Release) -> Result<()> {
         let target = get_target_triple();
         let extension = get_archive_extension();
-        let asset_name = format!("freenet-{}.{}", target, extension);
+        let freenet_asset_name = format!("freenet-{}.{}", target, extension);
+        let fdev_asset_name = format!("fdev-{}.{}", target, extension);
 
-        let asset = release
+        let freenet_asset = release
             .assets
             .iter()
-            .find(|a| a.name == asset_name)
+            .find(|a| a.name == freenet_asset_name)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No binary available for your platform ({}). Available assets: {}",
@@ -99,6 +100,8 @@ impl UpdateCommand {
                         .join(", ")
                 )
             })?;
+
+        let fdev_asset = release.assets.iter().find(|a| a.name == fdev_asset_name);
 
         // Try to get checksums
         let checksums = if let Some(checksums_asset) =
@@ -123,39 +126,64 @@ impl UpdateCommand {
             None
         };
 
-        // Download to temp file
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-        let archive_path = temp_dir.path().join(&asset_name);
 
-        download_file(&asset.browser_download_url, &archive_path, self.quiet).await?;
+        // Download and install freenet
+        let freenet_archive_path = temp_dir.path().join(&freenet_asset_name);
+        download_file(
+            &freenet_asset.browser_download_url,
+            &freenet_archive_path,
+            self.quiet,
+        )
+        .await?;
 
-        // Verify checksum if available
         if let Some(ref checksums) = checksums {
-            if let Some(expected_hash) = checksums.get(&asset_name) {
+            if let Some(expected_hash) = checksums.get(&freenet_asset_name) {
                 if !self.quiet {
-                    println!("Verifying checksum...");
+                    println!("Verifying freenet checksum...");
                 }
-                verify_checksum(&archive_path, expected_hash)?;
+                verify_checksum(&freenet_archive_path, expected_hash)?;
             } else if !self.quiet {
                 eprintln!(
                     "Warning: Checksum not found for {}. Continuing without verification.",
-                    asset_name
+                    freenet_asset_name
                 );
             }
         }
 
-        // Extract archive
-        let extracted_binary = extract_binary(&archive_path, temp_dir.path())?;
+        // Use a subdirectory per archive to avoid filename collisions
+        let freenet_extract_dir = temp_dir.path().join("freenet");
+        fs::create_dir_all(&freenet_extract_dir)?;
+        let extracted_freenet =
+            extract_binary(&freenet_archive_path, &freenet_extract_dir, "freenet")?;
 
-        // Replace current binary
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
-        replace_binary(&extracted_binary, &current_exe)?;
+        replace_binary(&extracted_freenet, &current_exe)?;
 
         if !self.quiet {
             println!(
-                "Successfully updated to version {}",
+                "Successfully updated freenet to version {}",
                 release.tag_name.trim_start_matches('v')
             );
+        }
+
+        // Download and install fdev alongside freenet.
+        // All fdev failures are non-fatal — a failed fdev update must never
+        // prevent the service file update or service restart that follows.
+        if let Some(fdev_asset) = fdev_asset {
+            if !self.quiet {
+                println!("Downloading fdev...");
+            }
+            self.try_update_fdev(
+                fdev_asset,
+                &fdev_asset_name,
+                &checksums,
+                temp_dir.path(),
+                &current_exe,
+            )
+            .await;
+        } else if !self.quiet {
+            eprintln!("Warning: fdev not found in release assets. Skipping fdev update.");
         }
 
         // Check if service file needs updating (for users who installed before v0.1.75)
@@ -210,6 +238,92 @@ impl UpdateCommand {
         }
 
         Ok(())
+    }
+
+    /// Try to update fdev, printing warnings on failure. Never returns an error —
+    /// fdev update failures must not prevent the caller from continuing with
+    /// service file updates and service restarts.
+    async fn try_update_fdev(
+        &self,
+        asset: &Asset,
+        asset_name: &str,
+        checksums: &Option<Checksums>,
+        temp_dir: &Path,
+        freenet_exe: &Path,
+    ) {
+        let archive_path = temp_dir.join(asset_name);
+        if let Err(e) = download_file(&asset.browser_download_url, &archive_path, self.quiet).await
+        {
+            if !self.quiet {
+                eprintln!(
+                    "Warning: Failed to download fdev: {}. Skipping fdev update.",
+                    e
+                );
+            }
+            return;
+        }
+
+        if let Some(ref checksums) = checksums {
+            if let Some(expected_hash) = checksums.get(asset_name) {
+                if !self.quiet {
+                    println!("Verifying fdev checksum...");
+                }
+                if let Err(e) = verify_checksum(&archive_path, expected_hash) {
+                    if !self.quiet {
+                        eprintln!(
+                            "Warning: fdev checksum verification failed: {}. Skipping fdev update.",
+                            e
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        let extract_dir = temp_dir.join("fdev");
+        if let Err(e) = fs::create_dir_all(&extract_dir) {
+            if !self.quiet {
+                eprintln!(
+                    "Warning: Failed to create fdev extract directory: {}. Skipping fdev update.",
+                    e
+                );
+            }
+            return;
+        }
+
+        let extracted_fdev = match extract_binary(&archive_path, &extract_dir, "fdev") {
+            Ok(path) => path,
+            Err(e) => {
+                if !self.quiet {
+                    eprintln!(
+                        "Warning: Failed to extract fdev: {}. Skipping fdev update.",
+                        e
+                    );
+                }
+                return;
+            }
+        };
+
+        // Install fdev next to the freenet binary
+        let Some(install_dir) = freenet_exe.parent() else {
+            if !self.quiet {
+                eprintln!("Warning: Cannot determine install directory. Skipping fdev update.");
+            }
+            return;
+        };
+
+        #[cfg(target_os = "windows")]
+        let fdev_dest = install_dir.join("fdev.exe");
+        #[cfg(not(target_os = "windows"))]
+        let fdev_dest = install_dir.join("fdev");
+
+        if let Err(e) = replace_binary(&extracted_fdev, &fdev_dest) {
+            if !self.quiet {
+                eprintln!("Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh", e);
+            }
+        } else if !self.quiet {
+            println!("Successfully updated fdev.");
+        }
     }
 }
 
@@ -404,7 +518,7 @@ async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+fn extract_binary(archive_path: &Path, dest_dir: &Path, name: &str) -> Result<PathBuf> {
     // Extract with path traversal protection
     let dest_dir_canonical = dest_dir
         .canonicalize()
@@ -424,13 +538,13 @@ fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 
     // Binary name differs on Windows
     #[cfg(target_os = "windows")]
-    let binary_name = "freenet.exe";
+    let binary_name = format!("{name}.exe");
     #[cfg(not(target_os = "windows"))]
-    let binary_name = "freenet";
+    let binary_name = name.to_string();
 
-    let binary_path = dest_dir.join(binary_name);
+    let binary_path = dest_dir.join(&binary_name);
     if !binary_path.exists() {
-        anyhow::bail!("Binary not found in archive");
+        anyhow::bail!("{name} binary not found in archive");
     }
 
     // Verify the binary is executable and works
@@ -747,12 +861,11 @@ fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> 
     Ok(())
 }
 
-fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
-    // On Unix, we can't directly replace a running binary, but we can rename it
-    let backup_path = current_exe.with_extension("old");
-    let parent_dir = current_exe
+fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
+    let backup_path = dest.with_extension("old");
+    let parent_dir = dest
         .parent()
-        .context("Current executable has no parent directory")?;
+        .context("Destination path has no parent directory")?;
 
     // Remove old backup if it exists
     if backup_path.exists() {
@@ -761,7 +874,8 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
 
     // First, copy new binary to a temp location in the same directory
     // This ensures the rename will be atomic (same filesystem)
-    let temp_new = parent_dir.join(".freenet.new.tmp");
+    let file_stem = dest.file_name().unwrap_or_default().to_string_lossy();
+    let temp_new = parent_dir.join(format!(".{file_stem}.new.tmp"));
     fs::copy(new_binary, &temp_new).context("Failed to copy new binary to target directory")?;
 
     // Set executable permissions on temp file
@@ -773,21 +887,24 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         fs::set_permissions(&temp_new, perms)?;
     }
 
-    // Rename current to backup (atomic on Unix)
-    fs::rename(current_exe, &backup_path)
-        .context("Failed to backup current binary. You may need to run with sudo.")?;
+    if dest.exists() {
+        // Rename current to backup (atomic on Unix)
+        fs::rename(dest, &backup_path)
+            .context("Failed to backup current binary. You may need to run with sudo.")?;
+    }
 
-    // Rename temp to current (atomic on Unix)
-    if let Err(e) = fs::rename(&temp_new, current_exe) {
+    // Rename temp to dest (atomic on Unix)
+    if let Err(e) = fs::rename(&temp_new, dest) {
         // Try to restore backup
-        if let Err(restore_err) = fs::rename(&backup_path, current_exe) {
-            // Critical: rollback failed, system may be in broken state
-            eprintln!(
-                "CRITICAL: Failed to restore backup after update failure. \
-                 Original binary may be at: {}",
-                backup_path.display()
-            );
-            eprintln!("Restore error: {}", restore_err);
+        if backup_path.exists() {
+            if let Err(restore_err) = fs::rename(&backup_path, dest) {
+                eprintln!(
+                    "CRITICAL: Failed to restore backup after update failure. \
+                     Original binary may be at: {}",
+                    backup_path.display()
+                );
+                eprintln!("Restore error: {}", restore_err);
+            }
         }
         // Clean up temp file
         let _ = fs::remove_file(&temp_new);
@@ -795,13 +912,15 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     }
 
     // Remove backup on success
-    if let Err(e) = fs::remove_file(&backup_path) {
-        // Non-fatal: warn but don't fail
-        eprintln!(
-            "Warning: Failed to remove backup file {}: {}",
-            backup_path.display(),
-            e
-        );
+    if backup_path.exists() {
+        if let Err(e) = fs::remove_file(&backup_path) {
+            // Non-fatal: warn but don't fail
+            eprintln!(
+                "Warning: Failed to remove backup file {}: {}",
+                backup_path.display(),
+                e
+            );
+        }
     }
 
     Ok(())
