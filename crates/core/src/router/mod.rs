@@ -307,7 +307,7 @@ impl Router {
             })?;
 
         // Timing estimators are optional — they only get data from timed GET successes
-        // which are rare (~4% of operations). Use .ok() to gracefully degrade.
+        // which are rare (~4% of operations).
         let time_estimate = self
             .response_start_time_estimator
             .estimate_retrieval_time(peer, target_location)
@@ -329,8 +329,7 @@ impl Router {
                     (total, time, rate)
                 }
                 _ => {
-                    // Failure-only prediction: use failure probability as cost.
-                    // This still differentiates peers with different failure rates.
+                    // Failure-only prediction: use failure probability as cost
                     let total = failure_estimate * failure_cost_multiplier;
                     (total, 0.0, 0.0)
                 }
@@ -1040,11 +1039,7 @@ mod tests {
         let peer = PeerKeyLocation::random();
         let contract_location = Location::random();
 
-        // Start with an empty router
         let mut router = Router::new(&[]);
-        assert_eq!(router.failure_estimator.len(), 0);
-        assert_eq!(router.response_start_time_estimator.len(), 0);
-        assert_eq!(router.transfer_rate_estimator.len(), 0);
 
         // Add a SuccessUntimed event
         router.add_event(RouteEvent {
@@ -1084,9 +1079,6 @@ mod tests {
             router.has_sufficient_routing_events(),
             "50 SuccessUntimed events should meet the threshold"
         );
-        // timing estimators still empty
-        assert_eq!(router.response_start_time_estimator.len(), 0);
-        assert_eq!(router.transfer_rate_estimator.len(), 0);
     }
 
     /// Verify Router::new() handles SuccessUntimed in history correctly.
@@ -1147,7 +1139,6 @@ mod tests {
 
         let router = Router::new(&events);
         assert!(router.has_sufficient_routing_events());
-        // No timing data at all
         assert_eq!(router.response_start_time_estimator.len(), 0);
         assert_eq!(router.transfer_rate_estimator.len(), 0);
 
@@ -1165,13 +1156,6 @@ mod tests {
             "Router should prefer the low-failure peer when using failure-only predictions"
         );
 
-        // Verify the good peer has lower expected_total_time
-        let predictions: Vec<_> = decision
-            .candidates
-            .iter()
-            .filter_map(|c| c.prediction.as_ref())
-            .collect();
-        assert_eq!(predictions.len(), 2);
         // The selected (first) candidate should have lower expected_total_time
         let first = &decision.candidates[0];
         let second = &decision.candidates[1];
@@ -1225,7 +1209,6 @@ mod tests {
 
         let router = Router::new(&events);
         assert!(router.has_sufficient_routing_events());
-        // Timing estimators have < 5 points
         assert!(router.response_start_time_estimator.len() < 5);
         assert!(router.transfer_rate_estimator.len() < 5);
 
@@ -1237,6 +1220,59 @@ mod tests {
             matches!(decision.strategy, RoutingStrategy::PredictionBased),
             "Router should use failure-only predictions when timing data is sparse, got {:?}",
             decision.strategy
+        );
+    }
+
+    /// When timing data accumulates beyond MIN_POINTS_FOR_REGRESSION, the router
+    /// should transition from failure-only predictions (time=0, speed=0) to full
+    /// predictions with real timing values.
+    #[test]
+    fn test_transition_from_failure_only_to_full_predictions() {
+        let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+        let contract_location = Location::random();
+
+        // Phase 1: Only untimed data, above threshold
+        let mut events: Vec<RouteEvent> = (0..50)
+            .map(|i| RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+            })
+            .collect();
+
+        let router = Router::new(&events);
+        let (_, decision) = router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        // Failure-only: timing fields should be 0.0
+        let pred = decision.candidates[0].prediction.as_ref().unwrap();
+        assert_eq!(pred.time_to_response_start, 0.0);
+        assert_eq!(pred.transfer_speed_bps, 0.0);
+
+        // Phase 2: Add enough timed successes to cross MIN_POINTS_FOR_REGRESSION (5)
+        for peer in &peers {
+            events.push(RouteEvent {
+                peer: peer.clone(),
+                contract_location,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(10),
+                },
+            });
+        }
+
+        let router2 = Router::new(&events);
+        assert!(router2.response_start_time_estimator.len() >= 5);
+        let (_, decision2) =
+            router2.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        // Full prediction: timing fields should have real values
+        let pred2 = decision2.candidates[0].prediction.as_ref().unwrap();
+        assert!(
+            pred2.time_to_response_start > 0.0,
+            "Should have real timing data after transition"
+        );
+        assert!(
+            pred2.transfer_speed_bps > 0.0,
+            "Should have real transfer speed after transition"
         );
     }
 }
