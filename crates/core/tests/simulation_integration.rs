@@ -4589,7 +4589,7 @@ fn test_subscription_renewal_at_scale() {
         min_connections: 2,
         max_contracts: 250, // Production scale
         iterations: 300,    // Seed contracts
-        duration: Duration::from_secs(90),
+        duration: Duration::from_secs(120), // 60s events + 40s sleep + margin
         event_wait: Duration::from_millis(200),
         sleep_after_events: Duration::from_secs(40), // Trigger 30s recovery cycle
         require_convergence: false,
