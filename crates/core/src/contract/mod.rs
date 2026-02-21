@@ -19,7 +19,10 @@ pub(crate) use executor::{
 pub use executor::mock_runtime::{clear_crdt_contracts, is_crdt_contract, register_crdt_contract};
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel,
-    in_memory::{MemoryContractHandler, SimulationContractHandler, SimulationHandlerBuilder},
+    in_memory::{
+        MemoryContractHandler, MockWasmContractHandler, MockWasmHandlerBuilder,
+        SimulationContractHandler, SimulationHandlerBuilder,
+    },
     ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, NetworkContractHandler, SenderHalve, SessionMessage, StoreResponse,
     WaitingResolution, WaitingTransaction,

@@ -1,8 +1,9 @@
 use super::engine::{WasmEngine, WasmError};
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
-    ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
-    UpdateData, UpdateModification, ValidateResult, WrappedState,
+    CodeHash, ContractContainer, ContractInstanceId, ContractInterfaceResult, ContractKey,
+    Parameters, RelatedContracts, StateDelta, StateSummary, UpdateData, UpdateModification,
+    ValidateResult, WrappedState,
 };
 
 pub(crate) trait ContractRuntimeInterface {
@@ -40,6 +41,34 @@ pub(crate) trait ContractRuntimeInterface {
         state: &WrappedState,
         delta_to: &StateSummary<'_>,
     ) -> RuntimeResult<StateDelta<'static>>;
+}
+
+/// Abstracts contract code storage needed by the production ContractExecutor.
+///
+/// Implemented by `Runtime` (delegates to `ContractStore`) and `MockWasmRuntime`
+/// (delegates to `InMemoryContractStore`), allowing the production executor logic
+/// to work with either backend.
+pub(crate) trait ContractStoreBridge {
+    fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash>;
+
+    fn fetch_contract_code(
+        &self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+    ) -> Option<ContractContainer>;
+
+    fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error>;
+
+    fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
+
+    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
+}
+
+/// Combined trait: WASM execution + contract storage. Implemented by `Runtime`
+/// (production) and `MockWasmRuntime` (simulation).
+pub(crate) trait ContractRuntimeBridge:
+    ContractRuntimeInterface + ContractStoreBridge + Send + 'static
+{
 }
 
 impl ContractRuntimeInterface for super::Runtime {

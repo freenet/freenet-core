@@ -115,6 +115,36 @@ impl InMemoryContractStore {
         inner.instance_to_code.len()
     }
 
+    /// Remove a contract by key.
+    pub fn remove_contract(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.instance_to_code.remove(key.id());
+        // Only remove code if no other instances reference it
+        let code_hash = *key.code_hash();
+        let still_referenced = inner
+            .instance_to_code
+            .values()
+            .any(|(hash, _)| *hash == code_hash);
+        if !still_referenced {
+            inner.code_by_hash.remove(&code_hash);
+        }
+        Ok(())
+    }
+
+    /// Ensure a contract key is indexed (instance_id -> code_hash mapping exists).
+    pub fn ensure_key_indexed(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.instance_to_code.contains_key(key.id()) {
+            let code_hash = *key.code_hash();
+            // We don't have params here, so use empty. The code hash is the important part
+            // for lookup_key reconstruction.
+            inner
+                .instance_to_code
+                .insert(*key.id(), (code_hash, Parameters::from(Vec::<u8>::new())));
+        }
+        Ok(())
+    }
+
     /// Clear all stored contracts (for testing).
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();

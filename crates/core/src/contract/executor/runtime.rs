@@ -641,13 +641,26 @@ enum ComputedStateUpdate {
     MissingRelated(Vec<RelatedContract>),
 }
 
-impl ContractExecutor for Executor<Runtime> {
-    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
-        let code_hash = self.runtime.contract_store.code_hash_from_id(instance_id)?;
+// ============================================================================
+// Bridged methods - shared production logic for Runtime and MockWasmRuntime
+// ============================================================================
+
+#[allow(private_bounds)]
+impl<R, S> Executor<R, S>
+where
+    R: crate::wasm_runtime::ContractRuntimeBridge,
+    S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
+    <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
+{
+    pub(super) fn bridged_lookup_key(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Option<ContractKey> {
+        let code_hash = self.runtime.code_hash_from_id(instance_id)?;
         Some(ContractKey::from_id_and_code(*instance_id, code_hash))
     }
 
-    async fn fetch_contract(
+    pub(super) async fn bridged_fetch_contract(
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
@@ -674,7 +687,8 @@ impl ContractExecutor for Executor<Runtime> {
         }
     }
 
-    async fn upsert_contract_state(
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn bridged_upsert_contract_state(
         &mut self,
         key: ContractKey,
         update: Either<WrappedState, StateDelta<'static>>,
@@ -682,15 +696,8 @@ impl ContractExecutor for Executor<Runtime> {
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
         // CRITICAL: When a ContractContainer is provided, use its key instead of the passed-in key.
-        // The container's key is authoritative and includes the code hash, which is needed for
-        // proper contract store lookups. The passed-in key may have code=None (e.g., from GET
-        // responses where only the ContractInstanceId was preserved in the message).
-        // See issue #2306 and related debugging.
         let key = if let Some(ref container) = code {
             let container_key = container.key();
-            // Validate that the instance IDs match - if they don't, something is seriously wrong
-            // (corrupted message, bug, or malicious peer). The code hashes may differ (that's
-            // expected - the container has the authoritative one), but instance IDs must match.
             if key.id() != container_key.id() {
                 tracing::error!(
                     passed_key = %key,
@@ -741,8 +748,6 @@ impl ContractExecutor for Executor<Runtime> {
                     queue_size,
                     "Operation queued during contract initialization"
                 );
-                // Return NoChange to indicate the operation didn't fail but also didn't complete
-                // The caller should retry later once initialization is complete
                 return Ok(UpsertResult::NoChange);
             }
         }
@@ -759,14 +764,11 @@ impl ContractExecutor for Executor<Runtime> {
         let params = if let Some(code) = &code {
             code.params()
         } else {
-            // Contract not provided, need to get params from state_store
             self.state_store
                 .get_params(&key)
                 .await
                 .map_err(ExecutorError::other)?
                 .ok_or_else(|| {
-                    // This error occurs when an UPDATE arrives for a contract whose
-                    // parameters haven't been stored yet (race condition)
                     tracing::warn!(
                         contract = %key,
                         is_delta = matches!(update, Either::Right(_)),
@@ -780,65 +782,43 @@ impl ContractExecutor for Executor<Runtime> {
         };
 
         // Track if we stored a new contract
-        let (remove_if_fail, contract_was_provided) = if self
-            .runtime
-            .contract_store
-            .fetch_contract(&key, &params)
-            .is_none()
-        {
-            if let Some(ref contract_code) = code {
-                tracing::debug!(
-                    contract = %key,
-                    phase = "store_contract",
-                    "Storing new contract"
-                );
+        let (remove_if_fail, contract_was_provided) =
+            if self.runtime.fetch_contract_code(&key, &params).is_none() {
+                if let Some(ref contract_code) = code {
+                    tracing::debug!(
+                        contract = %key,
+                        phase = "store_contract",
+                        "Storing new contract"
+                    );
 
-                self.runtime
-                    .contract_store
-                    .store_contract(contract_code.clone())
-                    .map_err(ExecutorError::other)?;
-                (true, true)
+                    self.runtime
+                        .store_contract(contract_code.clone())
+                        .map_err(ExecutorError::other)?;
+                    (true, true)
+                } else {
+                    tracing::error!(
+                        contract = %key,
+                        key_code_hash = ?key.code_hash(),
+                        code_provided = code.is_some(),
+                        is_delta = matches!(update, Either::Right(_)),
+                        phase = "missing_contract_error",
+                        "Contract not in store and no code provided"
+                    );
+                    return Err(ExecutorError::request(StdContractError::MissingContract {
+                        key: key.into(),
+                    }));
+                }
             } else {
-                // Bug #2306: This should never happen for PUT operations because they
-                // always provide the contract code. If we hit this path during a PUT,
-                // it indicates the contract code was lost somewhere in the flow.
-                tracing::error!(
-                    contract = %key,
-                    key_code_hash = ?key.code_hash(),
-                    code_provided = code.is_some(),
-                    is_delta = matches!(update, Either::Right(_)),
-                    phase = "missing_contract_error",
-                    "Contract not in store and no code provided - this is a bug if this is a PUT operation"
-                );
-                return Err(ExecutorError::request(StdContractError::MissingContract {
-                    key: key.into(),
-                }));
-            }
-        } else {
-            // fetch_contract succeeded - the contract code is already cached.
-            // However, we still need to ensure the key_to_code_part mapping exists
-            // for THIS specific ContractInstanceId. This is critical for contracts
-            // that reuse the same WASM code with different parameters (e.g., different
-            // River rooms). Without this, lookup_key() fails for the new instance_id.
-            // See issue #2380.
-            //
-            // We only index when code was provided in this request (code.is_some()).
-            // When code is None, this is a state-only update to an existing contract
-            // that should already be indexed.
-            if code.is_some() {
-                self.runtime
-                    .contract_store
-                    .ensure_key_indexed(&key)
-                    .map_err(ExecutorError::other)?;
-            }
-            (false, code.is_some())
-        };
+                if code.is_some() {
+                    self.runtime
+                        .ensure_key_indexed(&key)
+                        .map_err(ExecutorError::other)?;
+                }
+                (false, code.is_some())
+            };
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
-        // Save the incoming full state (if any) for potential corrupted-state recovery.
-        // When the stored state is corrupted, WASM merge fails. If we have a validated
-        // incoming full state, we can replace the corrupted state with it.
         let incoming_full_state = match &update {
             Either::Left(state) => Some(state.clone()),
             Either::Right(_) => None,
@@ -860,7 +840,7 @@ impl ContractExecutor for Executor<Runtime> {
                     .validate_state(&key, &params, &incoming_state, &related_contracts)
                     .map_err(|err| {
                         if remove_if_fail {
-                            let _ = self.runtime.contract_store.remove_contract(&key);
+                            let _ = self.runtime.remove_contract(&key);
                         }
                         ExecutorError::execution(err, None)
                     })?;
@@ -872,7 +852,6 @@ impl ContractExecutor for Executor<Runtime> {
                             "Incoming state is valid"
                         );
 
-                        // If the contract is new, we store the incoming state as the initial state avoiding the update
                         if is_new_contract {
                             tracing::debug!(
                                 contract = %key,
@@ -885,7 +864,6 @@ impl ContractExecutor for Executor<Runtime> {
                                 .await
                                 .map_err(ExecutorError::other)?;
 
-                            // Contract initialization complete - mark as ready and get queued ops
                             if let Some(completion_info) =
                                 self.init_tracker.complete_initialization(&key)
                             {
@@ -907,7 +885,6 @@ impl ContractExecutor for Executor<Runtime> {
                                     );
                                 }
 
-                                // Log details about queued operations
                                 for op in &completion_info.queued_ops {
                                     let queue_time = op.queued_at.elapsed();
                                     tracing::info!(
@@ -918,45 +895,14 @@ impl ContractExecutor for Executor<Runtime> {
                                         "Queued operation ready for retry after initialization"
                                     );
                                 }
-                                // The queued operations will be handled when the sender retries them
-                                // Now that initialization is complete, they will succeed
                             }
 
-                            // Notify network peers of new contract state (automatic propagation)
-                            // For new contracts (PUT), we don't exclude any sender since this is locally initiated
-                            if let Some(op_manager) = &self.op_manager {
-                                tracing::info!(
-                                    contract = %key,
-                                    state_size = incoming_state.size(),
-                                    "NEW CONTRACT: Emitting BroadcastStateChange"
-                                );
-                                if let Err(err) = op_manager
-                                    .notify_node_event(
-                                        crate::message::NodeEvent::BroadcastStateChange {
-                                            key,
-                                            new_state: incoming_state.clone(),
-                                        },
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        contract = %key,
-                                        error = %err,
-                                        "Failed to broadcast new contract state to network peers"
-                                    );
-                                }
-                            } else {
-                                tracing::warn!(
-                                    contract = %key,
-                                    "NEW CONTRACT: No op_manager - cannot broadcast state change"
-                                );
-                            }
-
+                            self.broadcast_state_change(key, incoming_state.clone())
+                                .await;
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
                     ValidateResult::Invalid => {
-                        // Validation failed - clear any queued operations
                         if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
@@ -967,7 +913,6 @@ impl ContractExecutor for Executor<Runtime> {
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
                     }
                     ValidateResult::RequestRelated(mut related) => {
-                        // Clear any queued operations since we're missing related contracts
                         if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
@@ -1025,7 +970,6 @@ impl ContractExecutor for Executor<Runtime> {
             Ok(Either::Left(s)) => s,
             Ok(Either::Right(mut r)) => {
                 let Some(c) = r.pop() else {
-                    // this branch should be unreachable since attempt_state_update should only
                     return Err(ExecutorError::internal_error());
                 };
                 return Err(ExecutorError::request(StdContractError::MissingRelated {
@@ -1033,20 +977,10 @@ impl ContractExecutor for Executor<Runtime> {
                 }));
             }
             Err(merge_err) => {
-                // Merge failed. If we have a validated full incoming state, try to recover
-                // by replacing the (likely corrupted) local state. The incoming state was
-                // already validated at entry to this function.
                 let Some(ref valid_incoming) = incoming_full_state else {
-                    // Delta update failed and we don't have a full state to recover with.
-                    // Propagate the error (the caller may send a ResyncRequest).
                     return Err(merge_err);
                 };
 
-                // Before assuming local state is corrupted, validate it. If the local
-                // state is valid, the merge failure is legitimate (e.g., the incoming
-                // state is older and the contract's merge function correctly rejected
-                // it). Only trigger recovery when the local state itself fails
-                // validation. See issue #3109.
                 let local_valid = self
                     .runtime
                     .validate_state(&key, &params, &current_state, &related_contracts)
@@ -1066,9 +1000,6 @@ impl ContractExecutor for Executor<Runtime> {
                     return Err(merge_err);
                 }
 
-                // Local state failed validation — it's likely corrupted.
-
-                // Check and mark recovery in a single lock acquisition.
                 let already_recovered = {
                     let mut guard = self
                         .recovery_guard
@@ -1077,16 +1008,12 @@ impl ContractExecutor for Executor<Runtime> {
                     if guard.contains(&key) {
                         true
                     } else {
-                        // Mark recovery attempted BEFORE replacing, so if the commit
-                        // triggers another update that also fails, we won't loop.
                         guard.insert(key);
                         false
                     }
                 };
 
                 if already_recovered {
-                    // Recovery was already attempted for this contract. The replacement
-                    // state also failed, so the contract is effectively broken.
                     tracing::error!(
                         contract = %key,
                         error = %merge_err,
@@ -1110,9 +1037,6 @@ impl ContractExecutor for Executor<Runtime> {
             }
         };
 
-        // Clear the recovery guard for this contract on a successful merge
-        // (NOT on the same call that performed recovery — the guard must persist
-        // so a subsequent failure is detected as a broken contract).
         if incoming_full_state.is_some() && !recovery_performed {
             self.recovery_guard
                 .lock()
@@ -1137,7 +1061,7 @@ impl ContractExecutor for Executor<Runtime> {
         }
     }
 
-    fn register_contract_notifier(
+    pub(super) fn bridged_register_contract_notifier(
         &mut self,
         instance_id: ContractInstanceId,
         cli_id: ClientId,
@@ -1148,8 +1072,6 @@ impl ContractExecutor for Executor<Runtime> {
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                // Client is already subscribed with a different channel - update to the new channel
-                // This can happen when a client reconnects
                 tracing::info!(
                     contract = %instance_id,
                     client = %cli_id,
@@ -1177,6 +1099,444 @@ impl ContractExecutor for Executor<Runtime> {
         Ok(())
     }
 
+    pub(super) fn bridged_notify_subscription_error(
+        &self,
+        key: ContractInstanceId,
+        reason: String,
+    ) {
+        if let Some(channels) = self.update_notifications.get(&key) {
+            send_subscription_error_to_clients(channels, key, reason);
+        }
+    }
+
+    pub(super) async fn bridged_summarize_contract_state(
+        &mut self,
+        key: ContractKey,
+    ) -> Result<StateSummary<'static>, ExecutorError> {
+        let (state, _) = self.bridged_fetch_contract(key, false).await?;
+
+        let state = state.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract state not found".into(),
+            })
+        })?;
+
+        let params = self
+            .state_store
+            .get_params(&key)
+            .await
+            .map_err(ExecutorError::other)?
+            .ok_or_else(|| {
+                ExecutorError::request(StdContractError::Get {
+                    key,
+                    cause: "contract parameters not found".into(),
+                })
+            })?;
+
+        self.runtime
+            .summarize_state(&key, &params, &state)
+            .map_err(|e| ExecutorError::execution(e, None))
+    }
+
+    pub(super) async fn bridged_get_contract_state_delta(
+        &mut self,
+        key: ContractKey,
+        their_summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ExecutorError> {
+        let (state, _) = self.bridged_fetch_contract(key, false).await?;
+
+        let state = state.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract state not found".into(),
+            })
+        })?;
+
+        let params = self
+            .state_store
+            .get_params(&key)
+            .await
+            .map_err(ExecutorError::other)?
+            .ok_or_else(|| {
+                ExecutorError::request(StdContractError::Get {
+                    key,
+                    cause: "contract parameters not found".into(),
+                })
+            })?;
+
+        self.runtime
+            .get_state_delta(&key, &params, &state, &their_summary)
+            .map_err(|e| ExecutorError::execution(e, None))
+    }
+
+    // --- Helper methods ---
+
+    async fn perform_contract_get(
+        &mut self,
+        return_contract_code: bool,
+        key: ContractKey,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        tracing::debug!(
+            contract = %key,
+            return_code = return_contract_code,
+            "Getting contract"
+        );
+        let mut got_contract: Option<ContractContainer> = None;
+
+        if return_contract_code {
+            if let Some(contract) = self.get_contract_locally(&key).await? {
+                got_contract = Some(contract);
+            }
+        }
+
+        let state_result = self.state_store.get(&key).await;
+        tracing::debug!(
+            contract = %key,
+            state_found = state_result.is_ok(),
+            has_contract = got_contract.is_some(),
+            "Contract get result"
+        );
+        match state_result {
+            Ok(state) => Ok((Some(state), got_contract)),
+            Err(StateStoreError::MissingContract(_)) => {
+                tracing::warn!(contract = %key, "Contract state not found in store");
+                Ok((None, got_contract))
+            }
+            Err(err) => {
+                tracing::error!(contract = %key, error = %err, "Failed to get contract state");
+                Err(ExecutorError::request(RequestError::from(
+                    StdContractError::Get {
+                        key,
+                        cause: format!("{err}").into(),
+                    },
+                )))
+            }
+        }
+    }
+
+    async fn get_contract_locally(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<ContractContainer>, ExecutorError> {
+        let Some(parameters) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            tracing::debug!(
+                contract = %key,
+                "Contract parameters not in state_store, cannot fetch contract"
+            );
+            return Ok(None);
+        };
+
+        let Some(contract) = self.runtime.fetch_contract_code(key, &parameters) else {
+            return Ok(None);
+        };
+        Ok(Some(contract))
+    }
+
+    async fn attempt_state_update(
+        &mut self,
+        parameters: &Parameters<'_>,
+        current_state: &WrappedState,
+        key: &ContractKey,
+        updates: &[UpdateData<'_>],
+    ) -> Result<Either<WrappedState, Vec<RelatedContract>>, ExecutorError> {
+        let update_modification =
+            match self
+                .runtime
+                .update_state(key, parameters, current_state, updates)
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    return Err(ExecutorError::execution(
+                        err,
+                        Some(InnerOpError::Upsert(*key)),
+                    ))
+                }
+            };
+        let UpdateModification {
+            new_state, related, ..
+        } = update_modification;
+        let Some(new_state) = new_state else {
+            if related.is_empty() {
+                return Ok(Either::Left(current_state.clone()));
+            } else {
+                return Ok(Either::Right(related));
+            }
+        };
+        let new_state = WrappedState::new(new_state.into_bytes());
+
+        if new_state.as_ref() == current_state.as_ref() {
+            tracing::debug!(
+                contract = %key,
+                phase = "update_skipped",
+                "No changes in state, avoiding update"
+            );
+            return Ok(Either::Left(current_state.clone()));
+        }
+
+        Ok(Either::Left(new_state))
+    }
+
+    async fn commit_state_update(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) -> Result<(), ExecutorError> {
+        self.state_store
+            .update(key, new_state.clone())
+            .await
+            .map_err(ExecutorError::other)?;
+
+        tracing::info!(
+            contract = %key,
+            new_size_bytes = new_state.as_ref().len(),
+            phase = "update_complete",
+            "Contract state updated"
+        );
+
+        if let Err(err) = self
+            .send_update_notification(key, parameters, new_state)
+            .await
+        {
+            tracing::error!(
+                contract = %key,
+                error = %err,
+                phase = "notification_failed",
+                "Failed to send update notification"
+            );
+        }
+
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key: *key,
+                    new_state: new_state.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
+        match result {
+            ValidateResult::Valid => unreachable!("called validation_error on Valid result"),
+            ValidateResult::Invalid => {
+                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "invalid outcome state".into(),
+                })
+            }
+            ValidateResult::RequestRelated(_) => {
+                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                })
+            }
+        }
+    }
+
+    async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(err) = op_manager
+                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key,
+                    new_state,
+                })
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast state change to network peers"
+                );
+            }
+        }
+    }
+
+    async fn send_update_notification(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) -> Result<(), ExecutorError> {
+        tracing::debug!(contract = %key, "notify of contract update");
+        let key = *key;
+        let instance_id = *key.id();
+
+        if let (Some(shared_notifications), Some(shared_summaries)) = (
+            self.shared_notifications.as_ref(),
+            self.shared_summaries.as_ref(),
+        ) {
+            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> = {
+                let notifications = shared_notifications.read().unwrap();
+                match notifications.get(&instance_id) {
+                    Some(notifiers) => notifiers.clone(),
+                    None => return Ok(()),
+                }
+            };
+
+            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> = {
+                let summaries = shared_summaries.read().unwrap();
+                summaries.get(&instance_id).cloned().unwrap_or_default()
+            };
+
+            let mut failures = Vec::with_capacity(32);
+
+            for (peer_key, notifier) in &notifiers_snapshot {
+                let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
+
+                let update = match peer_summary {
+                    Some(summary) => self
+                        .runtime
+                        .get_state_delta(&key, params, new_state, summary)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                        })?
+                        .to_owned()
+                        .into(),
+                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                };
+
+                if let Err(err) =
+                    notifier.send(Ok(
+                        ContractResponse::UpdateNotification { key, update }.into()
+                    ))
+                {
+                    failures.push(*peer_key);
+                    tracing::error!(
+                        client = %peer_key,
+                        contract = %key,
+                        error = %err,
+                        phase = "notification_send_failed_shared",
+                        "Failed to send update notification to client (shared storage)"
+                    );
+                } else {
+                    tracing::debug!(
+                        client = %peer_key,
+                        contract = %key,
+                        phase = "notification_sent_shared",
+                        "Sent update notification to client (shared storage)"
+                    );
+                }
+            }
+
+            if !failures.is_empty() {
+                let mut notifications = shared_notifications.write().unwrap();
+                if let Some(notifiers) = notifications.get_mut(&instance_id) {
+                    notifiers.retain(|(c, _)| !failures.contains(c));
+                }
+                drop(notifications);
+
+                let mut summaries = shared_summaries.write().unwrap();
+                if let Some(contract_summaries) = summaries.get_mut(&instance_id) {
+                    for failed_client in &failures {
+                        contract_summaries.remove(failed_client);
+                    }
+                }
+            }
+        } else if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
+                let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
+                let mut failures = Vec::with_capacity(32);
+
+                for (peer_key, notifier) in notifiers.iter() {
+                    let peer_summary = summaries.get_mut(peer_key).unwrap();
+                    let update = match peer_summary {
+                        Some(summary) => self
+                            .runtime
+                            .get_state_delta(&key, params, new_state, &*summary)
+                            .map_err(|err| {
+                                tracing::error!("{err}");
+                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                            })?
+                            .to_owned()
+                            .into(),
+                        None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                    };
+
+                    if let Err(err) =
+                        notifier.send(Ok(
+                            ContractResponse::UpdateNotification { key, update }.into()
+                        ))
+                    {
+                        failures.push(*peer_key);
+                        tracing::error!(
+                            client = %peer_key,
+                            contract = %key,
+                            error = %err,
+                            phase = "notification_send_failed",
+                            "Failed to send update notification to client"
+                        );
+                    } else {
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_sent",
+                            "Sent update notification to client"
+                        );
+                    }
+                }
+
+                if !failures.is_empty() {
+                    notifiers.retain(|(c, _)| !failures.contains(c));
+                }
+            }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// ContractExecutor for Executor<Runtime> - delegates to bridged methods
+// ============================================================================
+
+impl ContractExecutor for Executor<Runtime> {
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
+        self.bridged_lookup_key(instance_id)
+    }
+
+    async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        return_contract_code: bool,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        self.bridged_fetch_contract(key, return_contract_code).await
+    }
+
+    async fn upsert_contract_state(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertResult, ExecutorError> {
+        self.bridged_upsert_contract_state(key, update, related_contracts, code)
+            .await
+    }
+
+    fn register_contract_notifier(
+        &mut self,
+        instance_id: ContractInstanceId,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        self.bridged_register_contract_notifier(instance_id, cli_id, notification_ch, summary)
+    }
+
     async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
@@ -1190,42 +1550,14 @@ impl ContractExecutor for Executor<Runtime> {
     }
 
     fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        if let Some(channels) = self.update_notifications.get(&key) {
-            send_subscription_error_to_clients(channels, key, reason);
-        }
+        self.bridged_notify_subscription_error(key, reason)
     }
 
     async fn summarize_contract_state(
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
-        // Fetch the state and contract code
-        let (state, _) = self.fetch_contract(key, false).await?;
-
-        let state = state.ok_or_else(|| {
-            ExecutorError::request(StdContractError::Get {
-                key,
-                cause: "contract state not found".into(),
-            })
-        })?;
-
-        // Get parameters for the contract
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
-
-        // Call the contract's summarize_state method
-        self.runtime
-            .summarize_state(&key, &params, &state)
-            .map_err(|e| ExecutorError::execution(e, None))
+        self.bridged_summarize_contract_state(key).await
     }
 
     async fn get_contract_state_delta(
@@ -1233,38 +1565,9 @@ impl ContractExecutor for Executor<Runtime> {
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
-        // Fetch the state and contract code
-        let (state, _) = self.fetch_contract(key, false).await?;
-
-        let state = state.ok_or_else(|| {
-            ExecutorError::request(StdContractError::Get {
-                key,
-                cause: "contract state not found".into(),
-            })
-        })?;
-
-        // Get parameters for the contract
-        let params = self
-            .state_store
-            .get_params(&key)
+        self.bridged_get_contract_state_delta(key, their_summary)
             .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
-
-        // Call the contract's get_state_delta method
-        self.runtime
-            .get_state_delta(&key, &params, &state, &their_summary)
-            .map_err(|e| ExecutorError::execution(e, None))
     }
-}
-
-impl Executor<Runtime> {
-    // Private implementation methods
 }
 
 impl Executor<Runtime> {
@@ -1973,129 +2276,6 @@ impl Executor<Runtime> {
         }
     }
 
-    /// Computes the updated state by running the contract's update_state function.
-    ///
-    /// This is a pure computation — it does NOT persist, notify, or broadcast.
-    /// Callers must validate the result and then call `commit_state_update()`
-    /// to persist and propagate the change.
-    async fn attempt_state_update(
-        &mut self,
-        parameters: &Parameters<'_>,
-        current_state: &WrappedState,
-        key: &ContractKey,
-        updates: &[UpdateData<'_>],
-    ) -> Result<Either<WrappedState, Vec<RelatedContract>>, ExecutorError> {
-        let update_modification =
-            match self
-                .runtime
-                .update_state(key, parameters, current_state, updates)
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    return Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Upsert(*key)),
-                    ))
-                }
-            };
-        let UpdateModification {
-            new_state, related, ..
-        } = update_modification;
-        let Some(new_state) = new_state else {
-            if related.is_empty() {
-                // no updates were made, just return old state
-                return Ok(Either::Left(current_state.clone()));
-            } else {
-                return Ok(Either::Right(related));
-            }
-        };
-        let new_state = WrappedState::new(new_state.into_bytes());
-
-        if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!(
-                contract = %key,
-                phase = "update_skipped",
-                "No changes in state, avoiding update"
-            );
-            return Ok(Either::Left(current_state.clone()));
-        }
-
-        Ok(Either::Left(new_state))
-    }
-
-    /// Persists, notifies subscribers, and broadcasts a validated state update.
-    ///
-    /// Must only be called AFTER `validate_state()` confirms the state is valid.
-    async fn commit_state_update(
-        &mut self,
-        key: &ContractKey,
-        parameters: &Parameters<'_>,
-        new_state: &WrappedState,
-    ) -> Result<(), ExecutorError> {
-        self.state_store
-            .update(key, new_state.clone())
-            .await
-            .map_err(ExecutorError::other)?;
-
-        tracing::info!(
-            contract = %key,
-            new_size_bytes = new_state.as_ref().len(),
-            phase = "update_complete",
-            "Contract state updated"
-        );
-
-        if let Err(err) = self
-            .send_update_notification(key, parameters, new_state)
-            .await
-        {
-            tracing::error!(
-                contract = %key,
-                error = %err,
-                phase = "notification_failed",
-                "Failed to send update notification"
-            );
-        }
-
-        // Notify network peers of state change (automatic propagation)
-        // Echo-back prevention is handled by summary comparison in p2p_protoc
-        if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key: *key,
-                    new_state: new_state.clone(),
-                })
-                .await
-            {
-                tracing::warn!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Converts a non-Valid `ValidateResult` into an appropriate `ExecutorError`.
-    fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
-        match result {
-            ValidateResult::Valid => unreachable!("called validation_error on Valid result"),
-            ValidateResult::Invalid => {
-                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
-                    key,
-                    cause: "invalid outcome state".into(),
-                })
-            }
-            ValidateResult::RequestRelated(_) => {
-                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
-                    key,
-                    cause: "missing related contracts for validation".into(),
-                })
-            }
-        }
-    }
-
     /// Given a contract and a series of delta updates, it will try to perform an update
     /// to the contract state and return the new state. If it fails to update the state,
     /// it will return an error.
@@ -2206,49 +2386,6 @@ impl Executor<Runtime> {
                 .await?;
         }
         Ok(new_state)
-    }
-
-    async fn perform_contract_get(
-        &mut self,
-        return_contract_code: bool,
-        key: ContractKey,
-    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        tracing::debug!(
-            contract = %key,
-            return_code = return_contract_code,
-            "Getting contract"
-        );
-        let mut got_contract: Option<ContractContainer> = None;
-
-        if return_contract_code {
-            if let Some(contract) = self.get_contract_locally(&key).await? {
-                got_contract = Some(contract);
-            }
-        }
-
-        let state_result = self.state_store.get(&key).await;
-        tracing::debug!(
-            contract = %key,
-            state_found = state_result.is_ok(),
-            has_contract = got_contract.is_some(),
-            "Contract get result"
-        );
-        match state_result {
-            Ok(state) => Ok((Some(state), got_contract)),
-            Err(StateStoreError::MissingContract(_)) => {
-                tracing::warn!(contract = %key, "Contract state not found in store");
-                Ok((None, got_contract))
-            }
-            Err(err) => {
-                tracing::error!(contract = %key, error = %err, "Failed to get contract state");
-                Err(ExecutorError::request(RequestError::from(
-                    StdContractError::Get {
-                        key,
-                        cause: format!("{err}").into(),
-                    },
-                )))
-            }
-        }
     }
 
     async fn get_local_contract(
@@ -2412,223 +2549,6 @@ impl Executor<Runtime> {
             }));
         }
         Ok(())
-    }
-
-    /// Broadcasts a state change to network peers via the op_manager.
-    ///
-    /// This is fire-and-forget: failures are logged but do not propagate errors,
-    /// since peers will eventually sync via their next subscription renewal.
-    async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
-        if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key,
-                    new_state,
-                })
-                .await
-            {
-                tracing::warn!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers"
-                );
-            }
-        }
-    }
-
-    /// Delivers update notifications to LOCAL client subscriptions via websocket channels.
-    ///
-    /// # Architecture: Local vs Network Subscriptions
-    ///
-    /// Freenet uses two distinct subscription delivery mechanisms:
-    ///
-    /// 1. **Local subscriptions** (handled here): Clients connected to this node's websocket
-    ///    API register via `register_contract_notifier()`. Updates are delivered directly
-    ///    through executor notification channels stored in `self.update_notifications`.
-    ///    This path is triggered by `LocalSubscribeComplete` events (see `message.rs`).
-    ///
-    /// 2. **Network subscriptions** (handled in `operations/update.rs`): Remote peers
-    ///    subscribe via `ring.seeding_manager.subscribers`. Updates propagate through
-    ///    the network via `get_broadcast_targets_update()` which filters network peers
-    ///    to receive UPDATE messages.
-    ///
-    /// This separation allows local clients to receive updates immediately without
-    /// network round-trips, while network subscriptions follow the peer-to-peer protocol.
-    ///
-    /// See also:
-    /// - `operations/subscribe.rs::complete_local_subscription()` - triggers LocalSubscribeComplete
-    /// - `operations/update.rs::get_broadcast_targets_update()` - network subscription routing
-    async fn send_update_notification(
-        &mut self,
-        key: &ContractKey,
-        params: &Parameters<'_>,
-        new_state: &WrappedState,
-    ) -> Result<(), ExecutorError> {
-        tracing::debug!(contract = %key, "notify of contract update");
-        let key = *key;
-        let instance_id = *key.id();
-
-        // Check if we're using shared storage (pool mode) or per-executor storage (standalone mode)
-        if let (Some(shared_notifications), Some(shared_summaries)) = (
-            self.shared_notifications.as_ref(),
-            self.shared_summaries.as_ref(),
-        ) {
-            // Use shared pool-level storage for notifications
-            // This ensures subscriptions registered while this executor was checked out are notified
-            //
-            // CRITICAL: We use the snapshot pattern to avoid holding locks during WASM execution.
-            // Locks are only held briefly during clone, never during get_state_delta.
-
-            // Step 1: Clone notifiers and summaries under minimal lock scope (fast)
-            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> = {
-                let notifications = shared_notifications.read().unwrap();
-                match notifications.get(&instance_id) {
-                    Some(notifiers) => notifiers.clone(),
-                    None => return Ok(()), // No subscribers for this contract
-                }
-            };
-
-            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> = {
-                let summaries = shared_summaries.read().unwrap();
-                summaries.get(&instance_id).cloned().unwrap_or_default()
-            };
-            // Locks released here - snapshot complete
-
-            // Step 2: Process notifications WITHOUT holding any locks
-            // get_state_delta() calls WASM which can be slow
-            let mut failures = Vec::with_capacity(32);
-
-            for (peer_key, notifier) in &notifiers_snapshot {
-                let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
-
-                let update = match peer_summary {
-                    Some(summary) => self
-                        .runtime
-                        .get_state_delta(&key, params, new_state, summary)
-                        .map_err(|err| {
-                            tracing::error!("{err}");
-                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                        })?
-                        .to_owned()
-                        .into(),
-                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
-                };
-
-                if let Err(err) =
-                    notifier.send(Ok(
-                        ContractResponse::UpdateNotification { key, update }.into()
-                    ))
-                {
-                    failures.push(*peer_key);
-                    tracing::error!(
-                        client = %peer_key,
-                        contract = %key,
-                        error = %err,
-                        phase = "notification_send_failed_shared",
-                        "Failed to send update notification to client (shared storage)"
-                    );
-                } else {
-                    tracing::debug!(
-                        client = %peer_key,
-                        contract = %key,
-                        phase = "notification_sent_shared",
-                        "Sent update notification to client (shared storage)"
-                    );
-                }
-            }
-
-            // Step 3: Clean up failed notifiers under separate brief lock acquisition
-            if !failures.is_empty() {
-                let mut notifications = shared_notifications.write().unwrap();
-                if let Some(notifiers) = notifications.get_mut(&instance_id) {
-                    notifiers.retain(|(c, _)| !failures.contains(c));
-                }
-                drop(notifications);
-
-                // Also clean up orphaned summaries for failed clients
-                let mut summaries = shared_summaries.write().unwrap();
-                if let Some(contract_summaries) = summaries.get_mut(&instance_id) {
-                    for failed_client in &failures {
-                        contract_summaries.remove(failed_client);
-                    }
-                }
-            }
-        } else {
-            // Fallback to per-executor storage (standalone mode, tests, etc.)
-            if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
-                let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
-                let mut failures = Vec::with_capacity(32);
-
-                for (peer_key, notifier) in notifiers.iter() {
-                    let peer_summary = summaries.get_mut(peer_key).unwrap();
-                    let update = match peer_summary {
-                        Some(summary) => self
-                            .runtime
-                            .get_state_delta(&key, params, new_state, &*summary)
-                            .map_err(|err| {
-                                tracing::error!("{err}");
-                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                            })?
-                            .to_owned()
-                            .into(),
-                        None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
-                    };
-
-                    if let Err(err) =
-                        notifier.send(Ok(
-                            ContractResponse::UpdateNotification { key, update }.into()
-                        ))
-                    {
-                        failures.push(*peer_key);
-                        tracing::error!(
-                            client = %peer_key,
-                            contract = %key,
-                            error = %err,
-                            phase = "notification_send_failed",
-                            "Failed to send update notification to client"
-                        );
-                    } else {
-                        tracing::debug!(
-                            client = %peer_key,
-                            contract = %key,
-                            phase = "notification_sent",
-                            "Sent update notification to client"
-                        );
-                    }
-                }
-
-                if !failures.is_empty() {
-                    notifiers.retain(|(c, _)| !failures.contains(c));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_contract_locally(
-        &self,
-        key: &ContractKey,
-    ) -> Result<Option<ContractContainer>, ExecutorError> {
-        let Some(parameters) = self
-            .state_store
-            .get_params(key)
-            .await
-            .map_err(ExecutorError::other)?
-        else {
-            // Parameters not in state_store yet
-            // This can happen when a contract was just stored but state hasn't been stored yet
-            // In this case, we can't fetch the contract because fetch_contract requires params
-            tracing::debug!(
-                contract = %key,
-                "Contract parameters not in state_store, cannot fetch contract"
-            );
-            return Ok(None);
-        };
-
-        let Some(contract) = self.runtime.contract_store.fetch_contract(key, &parameters) else {
-            return Ok(None);
-        };
-        Ok(Some(contract))
     }
 }
 

@@ -761,6 +761,9 @@ pub struct SimNetwork {
     /// where simulation tests used inline messages for all payloads.
     pub streaming_threshold: Option<usize>,
     connection_managers: HashMap<NodeLabel, ConnectionManager>,
+    /// When true, use `MockWasmRuntime` (production `ContractExecutor` code path)
+    /// instead of `MockRuntime` (simplified hash-based merge).
+    pub use_mock_wasm: bool,
 }
 
 impl SimNetwork {
@@ -818,6 +821,7 @@ impl SimNetwork {
             all_gateway_configs: Vec::new(),
             streaming_threshold: None,
             connection_managers: HashMap::new(),
+            use_mock_wasm: false,
         };
         net.config_gateways(
             gateways
@@ -3786,6 +3790,7 @@ impl SimNetwork {
             .build()?;
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
+        let use_mock_wasm = self.use_mock_wasm;
 
         let result: anyhow::Result<()> = rt.block_on(async {
             // Time driver: bridges tokio's paused time → VirtualTime
@@ -3828,10 +3833,17 @@ impl SimNetwork {
                 self.labels
                     .push((label, node.config.key_pair.public().clone()));
 
-                let handle = tokio::spawn(async move {
-                    node.run_node_with_shared_storage(user_events, span, shared_storage)
-                        .await
-                });
+                let handle = if use_mock_wasm {
+                    tokio::spawn(async move {
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                            .await
+                    })
+                } else {
+                    tokio::spawn(async move {
+                        node.run_node_with_shared_storage(user_events, span, shared_storage)
+                            .await
+                    })
+                };
                 node_handles.push(handle);
             }
 
@@ -3860,11 +3872,19 @@ impl SimNetwork {
                     .push((label, node.config.key_pair.public().clone()));
 
                 let backoff = self.start_backoff * (i as u32 + 1);
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep(backoff).await;
-                    node.run_node_with_shared_storage(user_events, span, shared_storage)
-                        .await
-                });
+                let handle = if use_mock_wasm {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(backoff).await;
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                            .await
+                    })
+                } else {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(backoff).await;
+                        node.run_node_with_shared_storage(user_events, span, shared_storage)
+                            .await
+                    })
+                };
                 node_handles.push(handle);
             }
 

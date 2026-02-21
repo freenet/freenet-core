@@ -60,6 +60,8 @@ struct TestConfig {
     latency_range: Option<std::ops::Range<Duration>>,
     /// Optional message loss rate for fault injection (0.0 to 1.0)
     message_loss_rate: f64,
+    /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime
+    use_mock_wasm: bool,
 }
 
 impl TestConfig {
@@ -82,6 +84,7 @@ impl TestConfig {
             require_convergence: true,
             latency_range: None,
             message_loss_rate: 0.0,
+            use_mock_wasm: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl TestConfig {
             require_convergence: true,
             latency_range: None,
             message_loss_rate: 0.0,
+            use_mock_wasm: false,
         }
     }
 
@@ -126,6 +130,7 @@ impl TestConfig {
             require_convergence: true,
             latency_range: None,
             message_loss_rate: 0.0,
+            use_mock_wasm: false,
         }
     }
 
@@ -168,6 +173,7 @@ impl TestConfig {
             // Realistic latency jitter (10-50ms) to uncover timing issues
             latency_range: Some(Duration::from_millis(10)..Duration::from_millis(50)),
             message_loss_rate: 0.0,
+            use_mock_wasm: false,
         }
     }
 
@@ -235,6 +241,12 @@ impl TestConfig {
     /// Add message loss fault injection (0.0 to 1.0).
     fn with_message_loss(mut self, rate: f64) -> Self {
         self.message_loss_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime.
+    fn with_mock_wasm(mut self) -> Self {
+        self.use_mock_wasm = true;
         self
     }
 
@@ -327,6 +339,7 @@ impl TestConfig {
         setup_deterministic_state(self.seed);
         let rt = create_runtime();
 
+        let use_mock_wasm = self.use_mock_wasm;
         let (sim, logs_handle) = rt.block_on(async {
             let mut sim = SimNetwork::new(
                 self.name,
@@ -339,6 +352,7 @@ impl TestConfig {
                 self.seed,
             )
             .await;
+            sim.use_mock_wasm = use_mock_wasm;
 
             // Apply fault injection if configured (latency and/or message loss)
             let has_latency = self.latency_range.is_some();
@@ -1229,6 +1243,21 @@ fn ci_medium_simulation() {
         .assert_ok()
         .verify_operation_coverage()
         .check_convergence()
+        .verify_state_report();
+}
+
+// =============================================================================
+// MockWasmRuntime Tests
+// =============================================================================
+
+/// Simulation using MockWasmRuntime — exercises the production ContractExecutor code path
+/// (init_tracker, validation, notification pipeline, corrupted state recovery) without WASM.
+#[test_log::test]
+fn mock_wasm_runtime_simulation() {
+    TestConfig::small("mock-wasm-sim", 0xA0C1_1A5E_0001)
+        .with_mock_wasm()
+        .run_direct()
+        .assert_ok()
         .verify_state_report();
 }
 

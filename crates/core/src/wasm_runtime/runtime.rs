@@ -432,3 +432,34 @@ impl Runtime {
         Ok((running, api_version))
     }
 }
+
+impl super::contract::ContractStoreBridge for Runtime {
+    fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash> {
+        self.contract_store.code_hash_from_id(id)
+    }
+
+    fn fetch_contract_code(
+        &self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+    ) -> Option<ContractContainer> {
+        self.contract_store.fetch_contract(key, params)
+    }
+
+    fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error> {
+        self.contract_store.store_contract(contract)?;
+        Ok(())
+    }
+
+    fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        self.contract_store.remove_contract(key)?;
+        Ok(())
+    }
+
+    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        self.contract_store.ensure_key_indexed(key)?;
+        Ok(())
+    }
+}
+
+impl super::contract::ContractRuntimeBridge for Runtime {}
