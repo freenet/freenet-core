@@ -341,6 +341,14 @@ pub(crate) enum NetMessageV1 {
     InterestSync {
         message: InterestMessage,
     },
+    /// Peer readiness advertisement: indicates whether the sender is ready
+    /// to accept non-CONNECT operations. Peers behind symmetric NAT with
+    /// only a gateway connection broadcast `ready: false` (implicitly, by
+    /// not yet sending this message) and `ready: true` once they have
+    /// enough ring connections (`min_ready_connections`).
+    ReadyState {
+        ready: bool,
+    },
 }
 
 /// Messages for the proximity cache protocol.
@@ -557,6 +565,7 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
             // Version 1.1.0 for delta-based interest sync
             NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
+            NetMessageV1::ReadyState { .. } => semver::Version::new(1, 0, 0),
         }
     }
 }
@@ -780,6 +789,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(tx) => tx,
             NetMessageV1::ProximityCache { .. } => Transaction::NULL,
             NetMessageV1::InterestSync { .. } => Transaction::NULL,
+            NetMessageV1::ReadyState { .. } => Transaction::NULL,
         }
     }
 
@@ -793,6 +803,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::ProximityCache { .. } => None,
             NetMessageV1::InterestSync { .. } => None,
+            NetMessageV1::ReadyState { .. } => None,
         }
     }
 }
@@ -814,6 +825,9 @@ impl Display for NetMessage {
                 }
                 InterestSync { message } => {
                     write!(f, "InterestSync {{ {message:?} }}")?;
+                }
+                ReadyState { ready } => {
+                    write!(f, "ReadyState {{ ready: {ready} }}")?;
                 }
             },
         };

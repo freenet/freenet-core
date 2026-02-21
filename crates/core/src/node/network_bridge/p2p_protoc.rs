@@ -1198,6 +1198,10 @@ impl P2pConnManager {
                                             )
                                             .await;
 
+                                        if prune_result.became_unready {
+                                            ctx.handle_broadcast_ready_state(false).await;
+                                        }
+
                                         if let Some(ref pub_key) = pub_key_opt {
                                             ctx.bridge.op_manager.on_ring_connection_lost(pub_key);
                                         }
@@ -1929,6 +1933,11 @@ impl P2pConnManager {
             .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
             .await;
 
+        // Broadcast unready if we dropped below the readiness threshold
+        if prune_result.became_unready {
+            self.handle_broadcast_ready_state(false).await;
+        }
+
         // Forget this peer's subscriptions and cached contract state
         self.bridge
             .op_manager
@@ -2303,7 +2312,8 @@ impl P2pConnManager {
                         .ok();
                     return Ok(());
                 }
-                self.bridge
+                let just_became_ready = self
+                    .bridge
                     .op_manager
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
@@ -2328,6 +2338,11 @@ impl P2pConnManager {
                             "Failed to send interest/cache data on transient promotion"
                         );
                     }
+                }
+
+                // Broadcast readiness if we just crossed the threshold
+                if just_became_ready {
+                    self.handle_broadcast_ready_state(true).await;
                 }
             }
 
@@ -2803,6 +2818,7 @@ impl P2pConnManager {
         is_transient: bool,
         handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
+        let mut broadcast_ready: Option<bool> = None;
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
         // For transient connections, we may not know the peer's identity yet - use connection's remote_addr
         let peer_addr = peer_id
@@ -2874,6 +2890,10 @@ impl P2pConnManager {
                         &self.gateways,
                     )
                     .await;
+                if prune_result.became_unready {
+                    // Deferred: broadcast after connection_manager borrow ends
+                    broadcast_ready = Some(false);
+                }
                 self.bridge
                     .op_manager
                     .on_ring_connection_lost(old_peer.pub_key());
@@ -3061,7 +3081,8 @@ impl P2pConnManager {
                     return Ok(());
                 }
                 tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
-                self.bridge
+                let just_became_ready = self
+                    .bridge
                     .op_manager
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
@@ -3080,6 +3101,11 @@ impl P2pConnManager {
                             "Failed to send interest/cache data to new peer"
                         );
                     }
+                }
+
+                // Broadcast readiness if we just crossed the threshold (deferred)
+                if just_became_ready {
+                    broadcast_ready = Some(true);
                 }
 
                 // Note: In the simplified 2026-01 architecture, subscriptions are lease-based
@@ -3144,6 +3170,10 @@ impl P2pConnManager {
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.
             connection_manager.drop_transient(peer_addr);
+        }
+        // Deferred broadcast: connection_manager borrow is now dropped
+        if let Some(ready) = broadcast_ready {
+            self.handle_broadcast_ready_state(ready).await;
         }
         Ok(())
     }
@@ -3294,6 +3324,10 @@ impl P2pConnManager {
                             &self.gateways,
                         )
                         .await;
+
+                    if prune_result.became_unready {
+                        self.handle_broadcast_ready_state(false).await;
+                    }
 
                     // forget this peer's subscriptions and cached contract state
                     self.bridge
@@ -3610,6 +3644,28 @@ impl P2pConnManager {
                 error = %e,
                 "Failed to send interest message to peer"
             );
+        }
+    }
+
+    /// Broadcast ReadyState to all connected ring peers.
+    async fn handle_broadcast_ready_state(&mut self, ready: bool) {
+        let msg =
+            crate::message::NetMessage::V1(crate::message::NetMessageV1::ReadyState { ready });
+
+        tracing::info!(
+            ready,
+            peer_count = self.connections.len(),
+            "Broadcasting ReadyState to connected peers"
+        );
+
+        for peer_addr in self.connections.keys() {
+            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
+                tracing::warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    "Failed to send ReadyState to peer"
+                );
+            }
         }
     }
 

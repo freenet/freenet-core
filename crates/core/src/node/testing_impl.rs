@@ -1426,6 +1426,8 @@ impl SimNetwork {
                 .min_number_of_connections(self.min_connections)
                 .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
+            // Disable readiness gating in SimNetwork by default
+            config.relay_ready_connections = Some(0);
             self.event_listener
                 .add_node(label.clone(), config.key_pair.public().clone());
             configs.push((
@@ -1525,6 +1527,8 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);
+            // Disable readiness gating in SimNetwork by default
+            config.relay_ready_connections = Some(0);
 
             // Track address for crash/restart operations
             self.node_addresses.insert(label.clone(), addr);

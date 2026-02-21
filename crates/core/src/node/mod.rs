@@ -176,6 +176,10 @@ pub struct NodeConfig {
     pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
     pub(crate) transient_budget: usize,
     pub(crate) transient_ttl: Duration,
+    /// Minimum ring connections before this peer advertises readiness
+    /// to accept non-CONNECT operations. `None` or `Some(0)` disables the gate.
+    /// Default: `Some(2)` in production.
+    pub(crate) relay_ready_connections: Option<usize>,
 }
 
 impl NodeConfig {
@@ -293,6 +297,7 @@ impl NodeConfig {
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
+            relay_ready_connections: Some(2),
         })
     }
 
@@ -391,6 +396,11 @@ impl NodeConfig {
 
     pub fn min_number_of_connections(&mut self, num: usize) -> &mut Self {
         self.min_number_conn = Some(num);
+        self
+    }
+
+    pub fn relay_ready_connections(&mut self, num: Option<usize>) -> &mut Self {
+        self.relay_ready_connections = num;
         self
     }
 
@@ -1076,6 +1086,26 @@ where
                         tracing::error!(%err, %source, "Failed to send InterestSync response");
                     }
                 }
+                return Ok(None);
+            }
+            NetMessageV1::ReadyState { ready } => {
+                let Some(source) = source_addr else {
+                    tracing::warn!("Received ReadyState message without source address");
+                    return Ok(None);
+                };
+                if ready {
+                    op_manager.ring.connection_manager.mark_peer_ready(source);
+                } else {
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .mark_peer_not_ready(source);
+                }
+                tracing::debug!(
+                    from = %source,
+                    ready,
+                    "Processed ReadyState from peer"
+                );
                 return Ok(None);
             }
             NetMessageV1::Aborted(_) => return Ok(None),

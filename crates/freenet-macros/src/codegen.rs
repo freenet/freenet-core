@@ -492,6 +492,7 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
                 .expect("ws port should have been reserved");
             let built_config = #config_var.build().await?;
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
+            node_config.relay_ready_connections(Some(0));
             #connection_tuning
             let (#node_var, #flush_handle_var) = node_config
                 .build_with_flush_handle(freenet::server::serve_client_api_with_listener(built_config.ws_api, ws_listener).await?)

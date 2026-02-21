@@ -12,7 +12,7 @@
 //! `cleanup_stale_reservations` acquired `pending_reservations` before `connections_by_location`,
 //! while `prune_connection` acquired them in the opposite order.
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::net::SocketAddr;
@@ -126,6 +126,11 @@ pub(crate) struct ConnectionManager {
     /// Addresses that recently failed NAT traversal. Pre-populated into the
     /// CONNECT `visited` bloom filter so routing nodes skip these peers.
     recently_failed_addrs: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
+    /// Peers that have advertised readiness to accept non-CONNECT operations.
+    ready_peers: Arc<DashSet<SocketAddr>>,
+    /// Minimum connections before this peer advertises readiness.
+    /// 0 means readiness gating is disabled (all peers treated as ready).
+    pub min_ready_connections: usize,
 }
 
 impl ConnectionManager {
@@ -175,6 +180,8 @@ impl ConnectionManager {
             AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
         };
 
+        let min_ready_connections = config.relay_ready_connections.unwrap_or(0);
+
         Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
@@ -189,6 +196,7 @@ impl ConnectionManager {
             config.is_gateway,
             config.transient_budget,
             config.transient_ttl,
+            min_ready_connections,
         )
     }
 
@@ -203,6 +211,7 @@ impl ConnectionManager {
         is_gateway: bool,
         transient_budget: usize,
         transient_ttl: Duration,
+        min_ready_connections: usize,
     ) -> Self {
         let topology_manager = Arc::new(RwLock::new(TopologyManager::new(Limits {
             max_upstream_bandwidth,
@@ -234,6 +243,8 @@ impl ConnectionManager {
                 usize::MAX
             },
             recently_failed_addrs: Arc::new(RwLock::new(BTreeMap::new())),
+            ready_peers: Arc::new(DashSet::new()),
+            min_ready_connections,
         }
     }
 
@@ -867,6 +878,9 @@ impl ConnectionManager {
             self.pending_reservations.write().remove(&addr);
         }
 
+        // Clean up readiness state for the pruned peer
+        self.ready_peers.remove(&addr);
+
         Some(loc)
     }
 
@@ -1057,6 +1071,10 @@ impl ConnectionManager {
                 if self.is_transient(addr) {
                     return None;
                 }
+                // Skip peers that haven't advertised readiness
+                if !self.is_peer_ready(addr) {
+                    return None;
+                }
                 if let Some(requester) = requesting {
                     if requester == addr {
                         return None;
@@ -1136,6 +1154,29 @@ impl ConnectionManager {
         let read = self.location_for_peer.read();
         read.keys().copied().collect::<Vec<_>>().into_iter()
     }
+
+    // ==================== Peer Readiness ====================
+
+    /// Mark a peer as ready to accept non-CONNECT operations.
+    pub fn mark_peer_ready(&self, addr: SocketAddr) {
+        self.ready_peers.insert(addr);
+    }
+
+    /// Mark a peer as not ready (e.g., dropped below threshold).
+    pub fn mark_peer_not_ready(&self, addr: SocketAddr) {
+        self.ready_peers.remove(&addr);
+    }
+
+    /// Check if a peer has advertised readiness.
+    /// When `min_ready_connections == 0`, all peers are treated as ready.
+    pub fn is_peer_ready(&self, addr: SocketAddr) -> bool {
+        self.min_ready_connections == 0 || self.ready_peers.contains(&addr)
+    }
+
+    /// Check if *this* node has crossed the readiness threshold.
+    pub fn is_self_ready(&self) -> bool {
+        self.min_ready_connections == 0 || self.connection_count() >= self.min_ready_connections
+    }
 }
 
 #[cfg(test)]
@@ -1174,6 +1215,7 @@ mod tests {
             is_gateway,
             10,
             Duration::from_secs(60),
+            0, // readiness gating disabled in tests
         )
     }
 
@@ -1236,6 +1278,7 @@ mod tests {
             false,
             10,
             Duration::from_secs(60),
+            0,
         );
 
         assert_eq!(cm.get_own_addr(), Some(addr));
@@ -1263,6 +1306,7 @@ mod tests {
             false,
             10,
             Duration::from_secs(60),
+            0,
         );
 
         let other_addr: SocketAddr = "127.0.0.2:8001".parse().unwrap();
@@ -1415,6 +1459,7 @@ mod tests {
             false,
             2, // transient_budget = 2
             Duration::from_secs(60),
+            0,
         );
 
         // First two should succeed
@@ -1796,6 +1841,7 @@ mod tests {
             false,
             10,
             Duration::from_secs(60),
+            0,
         );
 
         assert_eq!(cm.get_own_addr(), Some(ipv6_addr));
