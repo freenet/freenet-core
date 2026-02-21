@@ -552,8 +552,10 @@ impl StreamRegistry {
             .or_insert_with(|| StreamHandle::new(stream_id, total_bytes))
             .clone();
 
-        // Notify listeners about the new stream (ignore send errors)
-        let _ = self.new_stream_tx.send(stream_id).await;
+        // Notify listeners about the new stream; receiver may not be listening
+        if let Err(e) = self.new_stream_tx.send(stream_id).await {
+            tracing::debug!(%stream_id, error = %e, "no listener for new stream notification");
+        }
 
         handle
     }

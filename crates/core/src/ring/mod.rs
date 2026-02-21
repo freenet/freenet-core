@@ -1205,7 +1205,7 @@ impl Ring {
     fn refresh_density_request_cache(&self) {
         let cbl = self.connection_manager.get_connections_by_location();
         let topology_manager = &mut self.connection_manager.topology_manager.write();
-        let _ = topology_manager.refresh_cache(&cbl);
+        let _refreshed = topology_manager.refresh_cache(&cbl);
     }
 
     /// Returns a filtered iterator for peers that are not connected to this node already.

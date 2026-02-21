@@ -1574,7 +1574,8 @@ impl EventFlushHandle {
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+            // Best-effort flush: timeout or channel error is acceptable
+            let _flush_result = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
         }
     }
 }
@@ -1659,7 +1660,8 @@ impl EventRegister {
                         EventLogCommand::Flush(reply) => {
                             // Flush any remaining events in the batch
                             Self::flush_batch(&mut event_log).await;
-                            // Signal completion
+                            // Signal completion; receiver may have timed out
+                            #[allow(clippy::let_underscore_must_use)]
                             let _ = reply.send(());
                         }
                     }
@@ -1736,7 +1738,10 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                let _ = self.log_sender.send(EventLogCommand::Log(log_msg)).await;
+                if let Err(e) = self.log_sender.send(EventLogCommand::Log(log_msg)).await {
+                    tracing::debug!(error = %e, "event log channel closed");
+                    break;
+                }
             }
         }
         .boxed()
@@ -1765,7 +1770,9 @@ impl NetEventRegister for EventRegister {
         };
         let sender = self.log_sender.clone();
         async move {
-            let _ = sender.send(EventLogCommand::Log(log_msg)).await;
+            if let Err(e) = sender.send(EventLogCommand::Log(log_msg)).await {
+                tracing::debug!(error = %e, "event log channel closed during timeout notification");
+            }
         }
         .boxed()
     }
@@ -2080,7 +2087,9 @@ async fn received_from_metrics_server(
     use tokio_tungstenite::tungstenite::Message;
     match msg {
         Ok(Message::Ping(ping)) => {
-            let _ = ws_stream.send(Message::Pong(ping)).await;
+            if let Err(e) = ws_stream.send(Message::Pong(ping)).await {
+                tracing::debug!(error = %e, "failed to send pong to metrics server");
+            }
         }
         Ok(Message::Close(_)) => {
             if let Err(error) = ws_stream.send(Message::Close(None)).await {

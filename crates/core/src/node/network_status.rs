@@ -46,6 +46,8 @@ pub fn init(listening_port: u16) {
         listening_port,
         started_at: Instant::now(),
     };
+    // OnceLock::set returns Err if already initialized; this is expected on repeated calls
+    #[allow(clippy::let_underscore_must_use)]
     let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
 }
 

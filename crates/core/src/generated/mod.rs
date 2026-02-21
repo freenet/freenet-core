@@ -1,6 +1,8 @@
 #![allow(unused_imports, dead_code, clippy::all)]
 
+// Generated FlatBuffers code — exempt from project-wide restriction lints.
 #[cfg(feature = "trace")]
+#[allow(clippy::undocumented_unsafe_blocks, clippy::let_underscore_must_use)]
 pub(crate) mod topology_generated;
 use freenet_stdlib::prelude::ContractKey;
 pub use topology_generated::*;

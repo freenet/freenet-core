@@ -1005,17 +1005,19 @@ where
             let (tx, rx) = std::sync::mpsc::channel();
             let thread_handle = std::thread::spawn(move || {
                 let result = f();
+                // Receiver may have timed out; send failure is non-fatal
+                #[allow(clippy::let_underscore_must_use)]
                 let _ = tx.send(result);
             });
 
             loop {
                 match rx.try_recv() {
                     Ok((Ok(value), store)) => {
-                        let _ = thread_handle.join();
+                        let _join = thread_handle.join();
                         return BlockingResult::Ok(value, store);
                     }
                     Ok((Err(err), store)) => {
-                        let _ = thread_handle.join();
+                        let _join = thread_handle.join();
                         return BlockingResult::WasmError(err, store);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}

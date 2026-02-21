@@ -154,7 +154,7 @@ async fn test_borrow_blocks_when_pool_exhausted() {
     // Try to acquire another permit - should block
     let sem_clone = semaphore.clone();
     let acquire_future = async move {
-        let _ = sem_clone.acquire().await.unwrap();
+        let _permit = sem_clone.acquire().await.unwrap();
     };
 
     let result = timeout(Duration::from_millis(50), acquire_future).await;
@@ -299,7 +299,7 @@ async fn test_pool_exhaustion_with_timeout() {
     // Try to acquire a third - should timeout
     let sem_clone = semaphore.clone();
     let borrow_result = timeout(Duration::from_millis(100), async move {
-        let _ = sem_clone.acquire().await.unwrap();
+        let _permit = sem_clone.acquire().await.unwrap();
     })
     .await;
 
@@ -321,7 +321,7 @@ async fn test_pool_recovers_after_exhaustion() {
     // Spawn task that will wait for permit
     let sem_clone = semaphore.clone();
     let waiter = GlobalExecutor::spawn(async move {
-        let _ = sem_clone.acquire().await.unwrap();
+        let _permit = sem_clone.acquire().await.unwrap();
     });
 
     // Add permit back after delay

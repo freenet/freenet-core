@@ -856,7 +856,9 @@ where
                     .validate_state(&key, &params, &incoming_state, &related_contracts)
                     .map_err(|err| {
                         if remove_if_fail {
-                            let _ = self.runtime.remove_contract(&key);
+                            if let Err(e) = self.runtime.remove_contract(&key) {
+                                tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
+                            }
                         }
                         ExecutorError::execution(err, None)
                     })?;
@@ -1738,10 +1740,9 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                let _ =
-                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
-                        tracing::error!("Failed to set cleanup on exit: {error}");
-                    });
+                if let Err(error) = crate::util::set_cleanup_on_exit(config.paths().clone()) {
+                    tracing::error!("Failed to set cleanup on exit: {error}");
+                }
                 Ok(())
             },
             OperationMode::Local,
@@ -2548,10 +2549,10 @@ impl Executor<Runtime> {
                 StdContractError::MissingRelated { key: *id }.into(),
             ));
         };
-        let state: &[u8] = unsafe {
-            // Safety: this is fine since this will never scape this scope
-            std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
-        };
+        // SAFETY: `contract` is alive for the remainder of this function,
+        // and `state` does not escape this scope, so the reborrowed slice
+        // remains valid for its entire use.
+        let state: &[u8] = unsafe { std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref()) };
         Ok(State::from(state))
     }
 
@@ -2621,7 +2622,9 @@ impl Executor<Runtime> {
                     &related_contracts,
                 )
                 .map_err(|err| {
-                    let _ = self.runtime.contract_store.remove_contract(&trying_key);
+                    if let Err(e) = self.runtime.contract_store.remove_contract(&trying_key) {
+                        tracing::warn!(contract = %trying_key, error = %e, "failed to remove contract after validation failure");
+                    }
                     ExecutorError::execution(err, None)
                 })?;
 

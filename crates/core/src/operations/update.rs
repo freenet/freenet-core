@@ -201,7 +201,9 @@ impl Operation for UpdateOp {
                 // was an existing operation, other peer messaged back
             }
             Ok(Some(op)) => {
-                let _ = op_manager.push(tx, op).await;
+                if let Err(e) = op_manager.push(tx, op).await {
+                    tracing::warn!(tx = %tx, error = %e, "failed to push mismatched op back");
+                }
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
@@ -581,7 +583,7 @@ impl Operation for UpdateOp {
                                     event = "resync_request_sent",
                                     "Sending ResyncRequest to peer after delta failure"
                                 );
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .notify_node_event(
                                         crate::message::NodeEvent::SendInterestMessage {
                                             target: sender_addr,
@@ -591,7 +593,10 @@ impl Operation for UpdateOp {
                                                 },
                                         },
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to send ResyncRequest");
+                                }
                             }
                             return Err(err);
                         }
@@ -689,7 +694,7 @@ impl Operation for UpdateOp {
                             // Without this, duplicate metadata messages (from embedded fragment #1)
                             // permanently lose the operation state.
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         *id,
                                         OpEnum::Update(UpdateOp {
@@ -699,7 +704,10 @@ impl Operation for UpdateOp {
                                             upstream_addr: self.upstream_addr,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push UPDATE op state back after dedup");
+                                }
                             }
                             return Err(OpError::OpNotPresent(*id));
                         }
@@ -712,7 +720,7 @@ impl Operation for UpdateOp {
                             );
                             // Push the operation state back to prevent loss
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         *id,
                                         OpEnum::Update(UpdateOp {
@@ -722,7 +730,10 @@ impl Operation for UpdateOp {
                                             upstream_addr: self.upstream_addr,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push UPDATE op state back after orphan claim failure");
+                                }
                             }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
@@ -891,7 +902,7 @@ impl Operation for UpdateOp {
                             // Without this, duplicate metadata messages (from embedded fragment #1)
                             // permanently lose the operation state.
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         *id,
                                         OpEnum::Update(UpdateOp {
@@ -901,7 +912,10 @@ impl Operation for UpdateOp {
                                             upstream_addr: self.upstream_addr,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push UPDATE broadcast op state back after dedup");
+                                }
                             }
                             return Err(OpError::OpNotPresent(*id));
                         }
@@ -914,7 +928,7 @@ impl Operation for UpdateOp {
                             );
                             // Push the operation state back to prevent loss
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         *id,
                                         OpEnum::Update(UpdateOp {
@@ -924,7 +938,10 @@ impl Operation for UpdateOp {
                                             upstream_addr: self.upstream_addr,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push UPDATE broadcast op state back after orphan claim failure");
+                                }
                             }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
@@ -1243,12 +1260,22 @@ fn build_op_result(
         stats,
         upstream_addr,
     });
-    let state = output_op.map(OpEnum::Update);
-    Ok(OperationResult {
-        return_msg: return_msg.map(NetMessage::from),
-        next_hop,
-        state,
-        stream_data,
+    let op_state = output_op.map(OpEnum::Update);
+    let return_msg = return_msg.map(NetMessage::from);
+    Ok(match (return_msg, op_state) {
+        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
+            msg,
+            next_hop,
+            state,
+            stream_data,
+        },
+        (Some(msg), None) => OperationResult::SendAndComplete {
+            msg,
+            next_hop,
+            stream_data,
+        },
+        (None, Some(state)) => OperationResult::ContinueOp(state),
+        (None, None) => OperationResult::Completed,
     })
 }
 

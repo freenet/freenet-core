@@ -388,7 +388,8 @@ pub fn emit_transfer_started(
             tx_id: None, // Transaction ID not available at transport layer
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
-        // Use try_send to avoid blocking the transport layer
+        // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
+        #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
 }
@@ -429,7 +430,8 @@ pub fn emit_transfer_completed(
             direction,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
-        // Use try_send to avoid blocking the transport layer
+        // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
+        #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
 }
@@ -455,7 +457,8 @@ pub fn emit_transfer_failed(
             direction,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
-        // Use try_send to avoid blocking the transport layer
+        // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
+        #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
 }

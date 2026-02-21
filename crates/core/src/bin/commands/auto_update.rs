@@ -201,9 +201,9 @@ fn get_last_check_time() -> Option<SystemTime> {
 /// Record that we just checked for updates.
 fn record_check_time() {
     if let Some(dir) = state_dir() {
-        let _ = fs::create_dir_all(&dir);
+        let _mkdir = fs::create_dir_all(&dir);
         let marker = dir.join("last_update_check");
-        let _ = fs::write(&marker, "");
+        let _write = fs::write(&marker, "");
     }
 }
 
@@ -219,10 +219,10 @@ fn get_current_backoff() -> Duration {
 /// Increase the backoff interval (double it, up to MAX_BACKOFF).
 fn increase_backoff() {
     if let Some(dir) = state_dir() {
-        let _ = fs::create_dir_all(&dir);
+        let _mkdir = fs::create_dir_all(&dir);
         let current = get_current_backoff();
         let new_backoff = std::cmp::min(current * 2, MAX_BACKOFF);
-        let _ = fs::write(
+        let _write = fs::write(
             dir.join("update_backoff_secs"),
             new_backoff.as_secs().to_string(),
         );
@@ -232,7 +232,7 @@ fn increase_backoff() {
 /// Reset backoff to initial value (called when update is found).
 pub fn reset_backoff() {
     if let Some(dir) = state_dir() {
-        let _ = fs::remove_file(dir.join("update_backoff_secs"));
+        let _rm = fs::remove_file(dir.join("update_backoff_secs"));
     }
 }
 
@@ -258,16 +258,16 @@ fn get_update_failure_count() -> u32 {
 #[allow(dead_code)] // Will be wired up to update command in follow-up
 pub fn record_update_failure() {
     if let Some(dir) = state_dir() {
-        let _ = fs::create_dir_all(&dir);
+        let _mkdir = fs::create_dir_all(&dir);
         let count = get_update_failure_count() + 1;
-        let _ = fs::write(dir.join("update_failures"), count.to_string());
+        let _write = fs::write(dir.join("update_failures"), count.to_string());
     }
 }
 
 /// Clear the update failure count (called on successful update check).
 pub fn clear_update_failures() {
     if let Some(dir) = state_dir() {
-        let _ = fs::remove_file(dir.join("update_failures"));
+        let _rm = fs::remove_file(dir.join("update_failures"));
     }
 }
 

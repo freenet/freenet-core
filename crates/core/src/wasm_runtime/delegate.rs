@@ -100,8 +100,10 @@ impl Runtime {
         api_version: DelegateApiVersion,
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
         // Set up the delegate call environment with context, secret store, and
-        // contract store access. SAFETY: self.secret_store and self.contract_store
-        // are valid for the duration of the process_func.call() / call_async() below.
+        // contract store access.
+        // SAFETY: `self.secret_store` and `self.contract_store` are valid for the
+        // duration of the WASM `process()` call below, and the `DelegateEnvGuard`
+        // ensures the env is removed from `DELEGATE_ENV` before this function returns.
         let env = unsafe {
             DelegateCallEnv::new(
                 context,
@@ -203,6 +205,9 @@ impl Runtime {
         };
 
         let linear_mem = self.linear_mem(handle)?;
+        // SAFETY: `res` is the return value from the WASM `process` call and
+        // `linear_mem` points to the instance's live linear memory, so `from_raw`
+        // reads a valid, in-bounds result descriptor.
         let outbound = unsafe {
             DelegateInterfaceResult::from_raw(res, &linear_mem)
                 .unwrap(linear_mem)
@@ -664,14 +669,15 @@ mod test {
                 &vec![].into(),
             ))))
         };
-        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = runtime
-            .secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
 
         Ok((delegate, runtime, temp_dir))
     }
@@ -1873,14 +1879,15 @@ mod test {
                 &vec![].into(),
             ))))
         };
-        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = runtime
-            .secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
 
         // Verify API version detection: V1 delegate should be V1
         let (mut running, api_version) =
@@ -2008,14 +2015,15 @@ mod test {
                 &vec![].into(),
             ))))
         };
-        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = runtime
-            .secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
 
         // Verify the module is detected as V2
         let (mut running, api_version) =
@@ -2095,14 +2103,15 @@ mod test {
                 &vec![].into(),
             ))))
         };
-        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = runtime
-            .secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
 
         // Ask for a contract that doesn't exist
         let app_id = ContractInstanceId::new([1u8; 32]);
@@ -2192,14 +2201,15 @@ mod test {
                 &vec![].into(),
             ))))
         };
-        let _ = runtime.delegate_store.store_delegate(delegate.clone());
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = runtime
-            .secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
 
         Ok((delegate, runtime, contract_instance_id, temp_dir))
     }

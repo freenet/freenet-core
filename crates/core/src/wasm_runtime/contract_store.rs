@@ -153,7 +153,7 @@ impl ContractStore {
             .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
         // Wait for cache to process the insert. Even if TinyLFU rejects it,
         // the disk fallback above ensures the contract can still be fetched.
-        let _ = self.contract_cache.wait();
+        let _cache_result = self.contract_cache.wait();
 
         Ok(())
     }

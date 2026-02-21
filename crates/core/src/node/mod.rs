@@ -868,10 +868,12 @@ where
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
-                        let _ = op_execution_callback
+                        if let Err(err) = op_execution_callback
                             .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
                             .await
-                            .inspect_err(|err| tracing::error!(%err, %tx_id, "Failed to send message to executor"));
+                        {
+                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
+                        }
                     }
                 }
 
@@ -915,10 +917,12 @@ where
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
-                        let _ = op_execution_callback
+                        if let Err(err) = op_execution_callback
                             .send(NetMessage::V1(NetMessageV1::Get((*op).clone())))
                             .await
-                            .inspect_err(|err| tracing::error!(%err, %tx_id, "Failed to send message to executor"));
+                        {
+                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
+                        }
                     }
                 }
 
@@ -1644,10 +1648,13 @@ pub async fn subscribe_with_id(
         use crate::client_events::RequestId;
         // Generate a default RequestId for internal subscription operations
         let request_id = RequestId::new();
-        let _ = op_manager
+        if let Err(e) = op_manager
             .ch_outbound
             .waiting_for_subscription_result(id, instance_id, client_id, request_id)
-            .await;
+            .await
+        {
+            tracing::warn!(tx = %id, error = %e, "failed to register subscription result waiter");
+        }
     }
     // Initialize a subscribe op.
     match subscribe::request_subscribe(&op_manager, op).await {

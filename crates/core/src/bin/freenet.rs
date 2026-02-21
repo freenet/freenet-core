@@ -170,6 +170,10 @@ async fn run_network_node_with_signals(
                     Ok(c_path) => {
                         // prof.dump mallctl expects a *const c_char (pointer to filename)
                         let ptr: *const libc::c_char = c_path.as_ptr();
+                        // SAFETY: `ptr` points to a valid null-terminated C string
+                        // (`c_path` is alive for the duration of the call), and
+                        // "prof.dump" is a valid jemalloc mallctl key that accepts
+                        // a `*const c_char` pointer to a filename.
                         let result = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", ptr) };
                         match result {
                             Ok(()) => tracing::info!(%path, "Heap profile dumped"),
@@ -201,6 +205,8 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
+                        // Oneshot send; receiver is guaranteed to exist here
+                        #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
                     }

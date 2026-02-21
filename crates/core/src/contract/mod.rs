@@ -741,18 +741,20 @@ where
                 summary,
                 subscriber_listener,
             } => {
-                let _ = contract_handler
-                    .executor()
-                    .register_contract_notifier(key, client_id, subscriber_listener, summary)
-                    .inspect_err(|err| {
-                        tracing::warn!(
-                            contract = %key,
-                            client = %client_id,
-                            error = %err,
-                            phase = "registration_failed",
-                            "Error registering subscriber listener"
-                        );
-                    });
+                if let Err(err) = contract_handler.executor().register_contract_notifier(
+                    key,
+                    client_id,
+                    subscriber_listener,
+                    summary,
+                ) {
+                    tracing::warn!(
+                        contract = %key,
+                        client = %client_id,
+                        error = %err,
+                        phase = "registration_failed",
+                        "Error registering subscriber listener"
+                    );
+                }
 
                 // FIXME: if there is an error send actually an error back
                 // If the caller disconnected, just log and continue.
@@ -793,9 +795,12 @@ where
                     network_subscriptions: vec![], // Contract handler only tracks application subscriptions
                     connected_peers: connections,
                 };
-                let _ = callback
+                if let Err(e) = callback
                     .send(crate::message::QueryResult::NetworkDebug(network_debug))
-                    .await;
+                    .await
+                {
+                    tracing::debug!(error = %e, "failed to send network debug info via callback");
+                }
 
                 // If the caller disconnected, just log and continue.
                 if let Err(error) = contract_handler

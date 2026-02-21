@@ -226,7 +226,9 @@ async fn client_fn(
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
                         tracing::debug!("disconnected client");
-                        let _ = tx_host.send(Err(err)).await;
+                        if let Err(e) = tx_host.send(Err(err)).await {
+                            tracing::debug!(error = %e, "failed to notify host of client disconnect");
+                        }
                         break;
                     }
                     Err(err) => {

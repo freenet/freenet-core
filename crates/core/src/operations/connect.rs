@@ -1762,21 +1762,32 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     // Hop-by-hop routing: messages are sent directly via network_bridge.send() with
     // explicit target addresses. No next_hop is embedded in the result.
-    OperationResult {
-        return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
-        next_hop: None,
-        state: state_clone.map(|state| {
-            OpEnum::Connect(Box::new(ConnectOp {
-                id: op.id,
-                state: Some(state),
-                first_hop: op.first_hop.clone(),
-                desired_location: op.desired_location,
-                recency: op.recency.clone(),
-                forward_attempts: op.forward_attempts.clone(),
-                connect_forward_estimator: op.connect_forward_estimator.clone(),
-            }))
-        }),
-        stream_data: None,
+    let return_msg = msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m)));
+    let state = state_clone.map(|state| {
+        OpEnum::Connect(Box::new(ConnectOp {
+            id: op.id,
+            state: Some(state),
+            first_hop: op.first_hop.clone(),
+            desired_location: op.desired_location,
+            recency: op.recency.clone(),
+            forward_attempts: op.forward_attempts.clone(),
+            connect_forward_estimator: op.connect_forward_estimator.clone(),
+        }))
+    });
+    match (return_msg, state) {
+        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
+            msg,
+            next_hop: None,
+            state,
+            stream_data: None,
+        },
+        (Some(msg), None) => OperationResult::SendAndComplete {
+            msg,
+            next_hop: None,
+            stream_data: None,
+        },
+        (None, Some(state)) => OperationResult::ContinueOp(state),
+        (None, None) => OperationResult::Completed,
     }
 }
 

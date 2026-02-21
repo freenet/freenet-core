@@ -62,6 +62,8 @@ pub fn send_standalone_event(event_type: &str, event_data: serde_json::Value) {
             event_type: event_type.to_string(),
             event_data,
         };
+        // Fire-and-forget: channel full means telemetry event is dropped
+        #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(TelemetryCommand::Event(event));
     }
 }
@@ -151,6 +153,8 @@ impl TelemetryReporter {
         let (sender, receiver) = mpsc::channel(1000);
 
         // Store a clone in the global sender for standalone event emission
+        // OnceLock::set returns Err if already initialized; expected on repeated calls
+        #[allow(clippy::let_underscore_must_use)]
         let _ = TELEMETRY_SENDER.set(sender.clone());
 
         // Initialize the transfer event channel for per-transfer telemetry
@@ -169,7 +173,8 @@ impl TelemetryReporter {
     }
 
     async fn send_event(&self, event: TelemetryEvent) {
-        // Non-blocking send - drop if channel is full
+        // Fire-and-forget: non-blocking send, drop if channel is full
+        #[allow(clippy::let_underscore_must_use)]
         let _ = self.sender.try_send(TelemetryCommand::Event(event));
     }
 }
@@ -218,6 +223,8 @@ impl NetEventRegister for TelemetryReporter {
                     "target_peer": target_peer,
                 }),
             };
+            // Fire-and-forget: channel full means telemetry event is dropped
+            #[allow(clippy::let_underscore_must_use)]
             let _ = sender.try_send(TelemetryCommand::Event(event));
         }
         .boxed()

@@ -216,7 +216,9 @@ impl Operation for PutOp {
                     phase = "load_or_init",
                     "Found operation with wrong type, pushing back"
                 );
-                let _ = op_manager.push(tx, op).await;
+                if let Err(e) = op_manager.push(tx, op).await {
+                    tracing::warn!(tx = %tx, error = %e, "failed to push mismatched op back");
+                }
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
@@ -489,15 +491,15 @@ impl Operation for PutOp {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
                             contract_location: Location::from(&key),
                         });
-                        Ok(OperationResult {
-                            return_msg: Some(NetMessage::from(forward_msg)),
+                        Ok(OperationResult::SendAndContinue {
+                            msg: NetMessage::from(forward_msg),
                             next_hop: Some(next_addr),
-                            state: Some(OpEnum::Put(PutOp {
+                            state: OpEnum::Put(PutOp {
                                 id,
                                 state: new_state,
                                 upstream_addr,
                                 stats,
-                            })),
+                            }),
                             stream_data,
                         })
                     } else {
@@ -537,17 +539,12 @@ impl Operation for PutOp {
                                 .await;
                             }
 
-                            Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Put(PutOp {
-                                    id,
-                                    state: Some(PutState::Finished { key }),
-                                    upstream_addr: None,
-                                    stats,
-                                })),
-                                stream_data: None,
-                            })
+                            Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                                id,
+                                state: Some(PutState::Finished { key }),
+                                upstream_addr: None,
+                                stats,
+                            })))
                         } else {
                             // Non-originator target peer - emit put_success for convergence checking
                             // Without this event, the target peer's stored state won't be tracked,
@@ -571,10 +568,9 @@ impl Operation for PutOp {
                             let upstream =
                                 upstream_addr.expect("non-originator must have upstream");
 
-                            Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(response)),
+                            Ok(OperationResult::SendAndComplete {
+                                msg: NetMessage::from(response),
                                 next_hop: Some(upstream),
-                                state: None, // Operation complete for this node
                                 stream_data: None,
                             })
                         }
@@ -631,17 +627,12 @@ impl Operation for PutOp {
                                 .await;
                         }
 
-                        Ok(OperationResult {
-                            return_msg: None,
-                            next_hop: None,
-                            state: Some(OpEnum::Put(PutOp {
-                                id,
-                                state: Some(PutState::Finished { key: *key }),
-                                upstream_addr: None,
-                                stats,
-                            })),
-                            stream_data: None,
-                        })
+                        Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                            id,
+                            state: Some(PutState::Finished { key: *key }),
+                            upstream_addr: None,
+                            stats,
+                        })))
                     } else {
                         // Forward response to our upstream
                         let upstream = upstream_addr.expect("non-originator must have upstream");
@@ -656,10 +647,9 @@ impl Operation for PutOp {
 
                         let response = PutMsg::Response { id, key: *key };
 
-                        Ok(OperationResult {
-                            return_msg: Some(NetMessage::from(response)),
+                        Ok(OperationResult::SendAndComplete {
+                            msg: NetMessage::from(response),
                             next_hop: Some(upstream),
-                            state: None, // Operation complete for this node
                             stream_data: None,
                         })
                     }
@@ -704,7 +694,7 @@ impl Operation for PutOp {
                             // permanently lose the operation state, preventing ResponseStreaming
                             // from being matched to the operation.
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Put(PutOp {
@@ -714,7 +704,10 @@ impl Operation for PutOp {
                                             stats,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push PUT op state back after dedup");
+                                }
                             }
                             return Err(OpError::OpNotPresent(id));
                         }
@@ -727,7 +720,7 @@ impl Operation for PutOp {
                             );
                             // Push the operation state back to prevent loss
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Put(PutOp {
@@ -737,7 +730,10 @@ impl Operation for PutOp {
                                             stats,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push PUT op state back after orphan claim failure");
+                                }
                             }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
@@ -968,18 +964,13 @@ impl Operation for PutOp {
                             ),
                             contract_location: Location::from(&key),
                         });
-                        // No return_msg or stream_data needed - piping handles forwarding
-                        Ok(OperationResult {
-                            return_msg: None,
-                            next_hop: None, // Piping already sent to next_addr
-                            state: Some(OpEnum::Put(PutOp {
-                                id,
-                                state: new_state,
-                                upstream_addr,
-                                stats,
-                            })),
-                            stream_data: None,
-                        })
+                        // No msg or stream_data needed - piping handles forwarding
+                        Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                            id,
+                            state: new_state,
+                            upstream_addr,
+                            stats,
+                        })))
                     } else if let Some(next_peer) = next_peer_known {
                         // Next hop exists but piping didn't start (streaming not appropriate for size)
                         // Forward as non-streaming message
@@ -1028,15 +1019,15 @@ impl Operation for PutOp {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
                             contract_location: Location::from(&key),
                         });
-                        Ok(OperationResult {
-                            return_msg: Some(NetMessage::from(forward_msg)),
+                        Ok(OperationResult::SendAndContinue {
+                            msg: NetMessage::from(forward_msg),
                             next_hop: Some(next_addr),
-                            state: Some(OpEnum::Put(PutOp {
+                            state: OpEnum::Put(PutOp {
                                 id,
                                 state: new_state,
                                 upstream_addr,
                                 stats,
-                            })),
+                            }),
                             stream_data: None,
                         })
                     } else {
@@ -1072,17 +1063,12 @@ impl Operation for PutOp {
                                 .await;
                             }
 
-                            Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Put(PutOp {
-                                    id,
-                                    state: Some(PutState::Finished { key }),
-                                    upstream_addr: None,
-                                    stats,
-                                })),
-                                stream_data: None,
-                            })
+                            Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                                id,
+                                state: Some(PutState::Finished { key }),
+                                upstream_addr: None,
+                                stats,
+                            })))
                         } else {
                             // Send ResponseStreaming back to upstream
                             let own_location = op_manager.ring.connection_manager.own_location();
@@ -1106,10 +1092,9 @@ impl Operation for PutOp {
                                 continue_forwarding: false,
                             };
 
-                            Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(response)),
+                            Ok(OperationResult::SendAndComplete {
+                                msg: NetMessage::from(response),
                                 next_hop: Some(upstream),
-                                state: None,
                                 stream_data: None,
                             })
                         }
@@ -1166,17 +1151,12 @@ impl Operation for PutOp {
                             "Streaming PUT operation complete (originator)"
                         );
 
-                        Ok(OperationResult {
-                            return_msg: None,
-                            next_hop: None,
-                            state: Some(OpEnum::Put(PutOp {
-                                id,
-                                state: Some(PutState::Finished { key: *key }),
-                                upstream_addr: None,
-                                stats,
-                            })),
-                            stream_data: None,
-                        })
+                        Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                            id,
+                            state: Some(PutState::Finished { key: *key }),
+                            upstream_addr: None,
+                            stats,
+                        })))
                     } else {
                         // Forward response to upstream
                         let upstream = upstream_addr.expect("non-originator must have upstream");
@@ -1193,10 +1173,9 @@ impl Operation for PutOp {
                         // (streaming is only needed for large payloads, responses are small)
                         let response = PutMsg::Response { id, key: *key };
 
-                        Ok(OperationResult {
-                            return_msg: Some(NetMessage::from(response)),
+                        Ok(OperationResult::SendAndComplete {
+                            msg: NetMessage::from(response),
                             next_hop: Some(upstream),
-                            state: None, // Operation complete for this node
                             stream_data: None,
                         })
                     }

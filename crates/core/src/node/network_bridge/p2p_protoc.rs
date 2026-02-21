@@ -58,6 +58,8 @@ fn get_rss_bytes() -> Option<u64> {
     {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
         let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is a POSIX-defined, signal-safe
+        // call that reads a system constant and has no preconditions.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size > 0 {
             Some(rss_pages * page_size as u64)
@@ -1250,9 +1252,9 @@ impl P2pConnManager {
                                             phase = "cleanup",
                                             "Notifying awaiting connection of shutdown"
                                         );
-                                        // Best effort notification - ignore errors since we're shutting down anyway
-                                        // The callback sender will handle cleanup on their side
+                                        // Best effort notification during shutdown - receiver may already be dropped
                                         for mut callback in callbacks.drain(..) {
+                                            #[allow(clippy::let_underscore_must_use)]
                                             let _ = callback.send_result(Err(())).await;
                                         }
                                     }
@@ -2835,6 +2837,8 @@ impl P2pConnManager {
             );
             if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                 for mut cb in callbacks {
+                    // Best effort - caller will handle the connection failure
+                    #[allow(clippy::let_underscore_must_use)]
                     let _ = cb.send_result(Err(())).await;
                 }
             }
@@ -4673,7 +4677,7 @@ mod tests {
             }
 
             // Signal that we're about to enter select! and then immediately timeout
-            let _ = ready_tx.send(());
+            drop(ready_tx.send(()));
 
             // Immediate timeout to simulate error - messages sent after this starts are lost
             tokio::select! {
@@ -4692,15 +4696,15 @@ mod tests {
         });
 
         // Wait for listener to be ready, then immediately send messages
-        let _ = ready_rx.await;
+        let _ready = ready_rx.await;
 
         // Send messages - these arrive while select! is running with a very short timeout
         // Some or all will be lost because we return without draining
         for i in 0..5 {
-            let _ = tx.send(format!("msg{}", i)).await;
+            let _sent = tx.send(format!("msg{}", i)).await;
         }
 
-        let _ = timeout(Duration::from_millis(100), listener).await;
+        let _listener_result = timeout(Duration::from_millis(100), listener).await;
 
         // Without the drain fix, messages are lost
         let count = processed.load(Ordering::SeqCst);

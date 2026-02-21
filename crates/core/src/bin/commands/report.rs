@@ -685,8 +685,8 @@ async fn query_node_diagnostics(port: u16) -> Result<String> {
         .await
         .context("Failed to receive diagnostics response")?;
 
-    // Close connection gracefully
-    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+    // Close connection gracefully; ignore errors since we're done
+    let _disconnect = client.send(ClientRequest::Disconnect { cause: None }).await;
 
     match response {
         HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {

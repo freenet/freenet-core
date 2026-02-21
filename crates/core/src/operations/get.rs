@@ -781,7 +781,9 @@ impl Operation for GetOp {
                 // was an existing operation, other peer messaged back
             }
             Ok(Some(op)) => {
-                let _ = op_manager.push(tx, op).await;
+                if let Err(e) = op_manager.push(tx, op).await {
+                    tracing::warn!(tx = %tx, error = %e, "failed to push mismatched op back");
+                }
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
@@ -2066,7 +2068,7 @@ impl Operation for GetOp {
                             // permanently lose the operation state, preventing subsequent
                             // ResponseStreaming from being matched to the operation.
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Get(GetOp {
@@ -2078,7 +2080,10 @@ impl Operation for GetOp {
                                             local_fallback,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push GET op state back after dedup");
+                                }
                             }
                             return Err(OpError::OpNotPresent(id));
                         }
@@ -2091,7 +2096,7 @@ impl Operation for GetOp {
                             );
                             // Push the operation state back to prevent loss
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Get(GetOp {
@@ -2103,7 +2108,10 @@ impl Operation for GetOp {
                                             local_fallback,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push GET op state back after orphan claim failure");
+                                }
                             }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
@@ -2246,14 +2254,17 @@ impl Operation for GetOp {
 
                         if !already_hosting {
                             // Use put_query to cache the contract
-                            let _ = op_manager
+                            if let Err(e) = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
                                     state: state.clone(),
                                     related_contracts: RelatedContracts::default(),
                                     contract: contract_to_cache,
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
+                            }
                         }
 
                         // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
@@ -2399,11 +2410,22 @@ fn build_op_result(
         upstream_addr,
         local_fallback: None, // Forwarding operations don't have local fallback
     });
-    Ok(OperationResult {
-        return_msg: msg.map(NetMessage::from),
-        next_hop,
-        state: output_op.map(OpEnum::Get),
-        stream_data,
+    let return_msg = msg.map(NetMessage::from);
+    let op_state = output_op.map(OpEnum::Get);
+    Ok(match (return_msg, op_state) {
+        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
+            msg,
+            next_hop,
+            state,
+            stream_data,
+        },
+        (Some(msg), None) => OperationResult::SendAndComplete {
+            msg,
+            next_hop,
+            stream_data,
+        },
+        (None, Some(state)) => OperationResult::ContinueOp(state),
+        (None, None) => OperationResult::Completed,
     })
 }
 
