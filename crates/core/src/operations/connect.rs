@@ -2157,6 +2157,38 @@ mod tests {
     }
 
     #[test]
+    fn expired_forward_attempts_record_failures_in_estimator() {
+        let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+        let mut op = ConnectOp::new_joiner(
+            Transaction::new::<ConnectMsg>(),
+            Location::new(0.1),
+            1,
+            None,
+            None,
+            estimator.clone(),
+        );
+        let peer = make_peer(2000);
+        op.forward_attempts.insert(
+            peer.clone(),
+            ForwardAttempt {
+                peer: peer.clone(),
+                desired: Location::new(0.2),
+                sent_at: Instant::now() - FORWARD_ATTEMPT_TIMEOUT - Duration::from_secs(1),
+            },
+        );
+
+        let (_, events_before, _) = estimator.read().snapshot();
+        op.expire_forward_attempts(Instant::now());
+        let (_, events_after, _) = estimator.read().snapshot();
+
+        assert!(op.forward_attempts.is_empty());
+        assert!(
+            events_after > events_before,
+            "estimator should have recorded failure; before={events_before}, after={events_after}"
+        );
+    }
+
+    #[test]
     fn relay_accepts_when_policy_allows() {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
