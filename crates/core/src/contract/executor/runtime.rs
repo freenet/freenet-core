@@ -1450,51 +1450,51 @@ where
                 }
             }
         } else if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
-                let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
-                let mut failures = Vec::with_capacity(32);
+            let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
+            let mut failures = Vec::with_capacity(32);
 
-                for (peer_key, notifier) in notifiers.iter() {
-                    let peer_summary = summaries.get_mut(peer_key).unwrap();
-                    let update = match peer_summary {
-                        Some(summary) => self
-                            .runtime
-                            .get_state_delta(&key, params, new_state, &*summary)
-                            .map_err(|err| {
-                                tracing::error!("{err}");
-                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                            })?
-                            .to_owned()
-                            .into(),
-                        None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
-                    };
+            for (peer_key, notifier) in notifiers.iter() {
+                let peer_summary = summaries.get_mut(peer_key).unwrap();
+                let update = match peer_summary {
+                    Some(summary) => self
+                        .runtime
+                        .get_state_delta(&key, params, new_state, &*summary)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                        })?
+                        .to_owned()
+                        .into(),
+                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                };
 
-                    if let Err(err) =
-                        notifier.send(Ok(
-                            ContractResponse::UpdateNotification { key, update }.into()
-                        ))
-                    {
-                        failures.push(*peer_key);
-                        tracing::error!(
-                            client = %peer_key,
-                            contract = %key,
-                            error = %err,
-                            phase = "notification_send_failed",
-                            "Failed to send update notification to client"
-                        );
-                    } else {
-                        tracing::debug!(
-                            client = %peer_key,
-                            contract = %key,
-                            phase = "notification_sent",
-                            "Sent update notification to client"
-                        );
-                    }
-                }
-
-                if !failures.is_empty() {
-                    notifiers.retain(|(c, _)| !failures.contains(c));
+                if let Err(err) =
+                    notifier.send(Ok(
+                        ContractResponse::UpdateNotification { key, update }.into()
+                    ))
+                {
+                    failures.push(*peer_key);
+                    tracing::error!(
+                        client = %peer_key,
+                        contract = %key,
+                        error = %err,
+                        phase = "notification_send_failed",
+                        "Failed to send update notification to client"
+                    );
+                } else {
+                    tracing::debug!(
+                        client = %peer_key,
+                        contract = %key,
+                        phase = "notification_sent",
+                        "Sent update notification to client"
+                    );
                 }
             }
+
+            if !failures.is_empty() {
+                notifiers.retain(|(c, _)| !failures.contains(c));
+            }
+        }
         Ok(())
     }
 }
