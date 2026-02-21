@@ -298,7 +298,7 @@ impl NodeConfig {
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
-            relay_ready_connections: Some(2),
+            relay_ready_connections: Some(3),
         })
     }
 
