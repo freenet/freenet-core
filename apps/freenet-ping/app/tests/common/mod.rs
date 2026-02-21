@@ -332,6 +332,16 @@ pub fn ws_config() -> WebSocketConfig {
         .max_frame_size(Some(16 * 1024 * 1024)) // 16MB frames
 }
 
+/// Creates a NodeConfig with test-appropriate defaults.
+/// Disables relay readiness gating (which requires a minimum number of ring connections
+/// before a node will route non-CONNECT operations). Small test topologies can never
+/// reach the production threshold, so this must be disabled.
+pub async fn test_node_config(config: freenet::config::Config) -> Result<NodeConfig> {
+    let mut nc = NodeConfig::new(config).await?;
+    nc.relay_ready_connections(Some(0));
+    Ok(nc)
+}
+
 pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;

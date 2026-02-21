@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
+use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
@@ -18,7 +18,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    test_node_config, wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -98,7 +98,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
 
     let gateway_future = async {
         let config = config_gw.build().await?;
-        let mut node_config = NodeConfig::new(config.clone()).await?;
+        let mut node_config = test_node_config(config.clone()).await?;
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
@@ -111,7 +111,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
 
     let node1_future = async {
         let config = config_node1.build().await?;
-        let mut node_config = NodeConfig::new(config.clone()).await?;
+        let mut node_config = test_node_config(config.clone()).await?;
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config
@@ -124,7 +124,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
 
     let node2_future = async {
         let config = config_node2.build().await?;
-        let mut node_config = NodeConfig::new(config.clone()).await?;
+        let mut node_config = test_node_config(config.clone()).await?;
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(10);
         let node = node_config

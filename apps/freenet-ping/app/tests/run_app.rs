@@ -3,7 +3,7 @@ mod common;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_client_api};
+use freenet::server::serve_client_api;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{
@@ -19,8 +19,8 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
-    gw_config_from_path_with_rng, test_ip_for_node, wait_for_node_connected, APP_TAG, PACKAGE_DIR,
-    PATH_TO_CONTRACT,
+    gw_config_from_path_with_rng, test_ip_for_node, test_node_config, wait_for_node_connected,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -262,7 +262,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
     // Start gateway node
     let gateway_node = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -273,7 +273,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
     // Start client node
     let client_node = async move {
         let config = config_node.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -640,7 +640,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     // Start gateway node first
     let gateway_node = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -657,7 +657,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -672,7 +672,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -1375,7 +1375,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     // Start gateway node first
     let gateway_node = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -1390,7 +1390,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
         tracing::info!("Node1 starting after gateway delay");
 
         let config = config_node1.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -1405,7 +1405,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
         tracing::info!("Node2 starting after gateway delay");
 
         let config = config_node2.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;

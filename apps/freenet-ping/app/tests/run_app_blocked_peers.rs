@@ -18,10 +18,9 @@ use std::{
 use anyhow::anyhow;
 use common::{
     base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
-    wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    test_node_config, wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet::{
-    local_node::NodeConfig,
     server::serve_client_api,
     test_utils::{allocate_test_node_block, test_ip_for_node},
 };
@@ -180,7 +179,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
     // Start nodes
     let gateway_node = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -190,7 +189,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
 
     let node1 = async {
         let config = config_node1.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;
@@ -200,7 +199,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
 
     let node2 = async {
         let config = config_node2.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;

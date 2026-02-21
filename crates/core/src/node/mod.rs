@@ -178,7 +178,7 @@ pub struct NodeConfig {
     pub(crate) transient_ttl: Duration,
     /// Minimum ring connections before this peer advertises readiness
     /// to accept non-CONNECT operations. `None` or `Some(0)` disables the gate.
-    /// Default: `Some(2)` in production.
+    /// Default: `Some(3)` in production.
     #[serde(default)]
     pub(crate) relay_ready_connections: Option<usize>,
 }
