@@ -2320,4 +2320,143 @@ mod tests {
             "has_connection_or_pending should return false after prune_in_transit_connection"
         );
     }
+
+    // ============ Readiness gating tests ============
+
+    fn make_connection_manager_with_readiness(
+        own_addr: Option<SocketAddr>,
+        min_conn: usize,
+        max_conn: usize,
+        is_gateway: bool,
+        min_ready_connections: usize,
+    ) -> ConnectionManager {
+        let keypair = TransportKeypair::new();
+        let own_location = if let Some(addr) = own_addr {
+            AtomicU64::new(u64::from_le_bytes(
+                Location::from_address(&addr).as_f64().to_le_bytes(),
+            ))
+        } else {
+            AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
+        };
+
+        ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            min_conn,
+            max_conn,
+            7,
+            (keypair.public().clone(), own_addr, own_location),
+            is_gateway,
+            10,
+            Duration::from_secs(60),
+            min_ready_connections,
+        )
+    }
+
+    #[test]
+    fn test_is_peer_ready_with_gating_disabled() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 0);
+        // With min_ready_connections=0, all peers are considered ready
+        let peer_addr = make_addr(9000);
+        assert!(cm.is_peer_ready(peer_addr));
+    }
+
+    #[test]
+    fn test_is_peer_ready_with_gating_enabled() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
+        let peer_addr = make_addr(9000);
+
+        // Unknown peer is not ready
+        assert!(!cm.is_peer_ready(peer_addr));
+
+        // Mark peer ready
+        cm.mark_peer_ready(peer_addr);
+        assert!(cm.is_peer_ready(peer_addr));
+
+        // Mark peer not ready
+        cm.mark_peer_not_ready(peer_addr);
+        assert!(!cm.is_peer_ready(peer_addr));
+    }
+
+    #[test]
+    fn test_is_self_ready_threshold() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
+
+        // With 0 connections, not ready
+        assert!(!cm.is_self_ready());
+        assert_eq!(cm.connection_count(), 0);
+
+        // Add 1 connection — still not ready
+        let peer1 = TransportKeypair::new();
+        let addr1 = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+        assert!(!cm.is_self_ready());
+
+        // Add 2nd connection — now ready
+        let peer2 = TransportKeypair::new();
+        let addr2 = make_addr(9002);
+        cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
+        assert!(cm.is_self_ready());
+    }
+
+    #[test]
+    fn test_is_self_ready_disabled() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 0);
+        // With min_ready_connections=0, always ready
+        assert!(cm.is_self_ready());
+    }
+
+    #[test]
+    fn test_routing_candidates_filters_unready_peers() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager_with_readiness(Some(own_addr), 1, 10, false, 2);
+
+        // Add two peers
+        let peer1 = TransportKeypair::new();
+        let addr1 = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+
+        let peer2 = TransportKeypair::new();
+        let addr2 = make_addr(9002);
+        cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
+
+        // Neither peer is ready — routing_candidates should return empty
+        let target = Location::new(0.5);
+        let skip = HashSet::<SocketAddr>::new();
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        assert!(
+            candidates.is_empty(),
+            "no peers are ready, should get no candidates"
+        );
+
+        // Mark peer1 ready — only peer1 should appear
+        cm.mark_peer_ready(addr1);
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].socket_addr(), Some(addr1));
+
+        // Mark peer2 ready — both should appear
+        cm.mark_peer_ready(addr2);
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn test_prune_connection_cleans_up_ready_peers() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager_with_readiness(Some(own_addr), 1, 10, false, 2);
+
+        let peer1 = TransportKeypair::new();
+        let addr1 = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+        cm.mark_peer_ready(addr1);
+        assert!(cm.is_peer_ready(addr1));
+
+        // Prune the connection — should clean up ready state
+        cm.prune_alive_connection(addr1);
+        assert!(
+            !cm.is_peer_ready(addr1),
+            "ready state should be cleaned up after prune"
+        );
+    }
 }

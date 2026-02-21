@@ -565,7 +565,7 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
             // Version 1.1.0 for delta-based interest sync
             NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
-            NetMessageV1::ReadyState { .. } => semver::Version::new(1, 0, 0),
+            NetMessageV1::ReadyState { .. } => semver::Version::new(1, 2, 0),
         }
     }
 }

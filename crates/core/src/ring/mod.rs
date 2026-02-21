@@ -1183,6 +1183,10 @@ impl Ring {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
                         continue;
                     }
+                    // Skip peers that haven't advertised readiness
+                    if !self.connection_manager.is_peer_ready(addr) {
+                        continue;
+                    }
                 }
                 candidates.push(conn.location.clone());
             }
