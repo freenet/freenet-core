@@ -143,6 +143,8 @@ impl Drop for SubscriptionRecoveryGuard {
 pub struct PruneConnectionResult {
     /// Orphaned transactions that need to be retried or failed.
     pub orphaned_transactions: Vec<Transaction>,
+    /// True if this prune caused us to drop below the readiness threshold.
+    pub became_unready: bool,
 }
 
 impl Ring {
@@ -1054,7 +1056,11 @@ impl Ring {
             .record_request(recipient, target, request_type);
     }
 
-    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
+    /// Add a connection to the ring topology.
+    ///
+    /// Returns `true` if this connection caused us to cross the readiness threshold
+    /// (i.e., we just became ready to accept non-CONNECT operations).
+    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) -> bool {
         tracing::info!(
             peer = %peer,
             peer_location = %loc,
@@ -1062,6 +1068,9 @@ impl Ring {
             was_reserved = %was_reserved,
             "Adding connection to peer"
         );
+        let min_ready = self.connection_manager.min_ready_connections;
+        let was_ready = min_ready == 0 || self.connection_manager.connection_count() >= min_ready;
+
         let addr = peer.addr;
         let pub_key = peer.pub_key.clone();
         self.connection_manager
@@ -1071,7 +1080,11 @@ impl Ring {
                 .register_events(Either::Left(event))
                 .await;
         }
-        self.refresh_density_request_cache()
+        self.refresh_density_request_cache();
+
+        let is_ready = self.connection_manager.is_self_ready();
+        // Return true only if we just crossed the threshold
+        !was_ready && is_ready
     }
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
@@ -1168,6 +1181,10 @@ impl Ring {
             for conn in sorted_conns {
                 if let Some(addr) = conn.location.socket_addr() {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
+                        continue;
+                    }
+                    // Skip peers that haven't advertised readiness
+                    if !self.connection_manager.is_peer_ready(addr) {
                         continue;
                     }
                 }
@@ -1394,6 +1411,9 @@ impl Ring {
             );
         }
 
+        let min_ready = self.connection_manager.min_ready_connections;
+        let was_ready = self.connection_manager.is_self_ready();
+
         // Capture connection duration before pruning
         let connection_duration_ms = self
             .connection_manager
@@ -1403,6 +1423,7 @@ impl Ring {
         let Some(_loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
             return PruneConnectionResult {
                 orphaned_transactions,
+                became_unready: false,
             };
         };
 
@@ -1419,8 +1440,12 @@ impl Ring {
                 .await;
         }
 
+        let is_ready = self.connection_manager.is_self_ready();
+        let became_unready = min_ready > 0 && was_ready && !is_ready;
+
         PruneConnectionResult {
             orphaned_transactions,
+            became_unready,
         }
     }
 

@@ -1028,6 +1028,16 @@ impl OpManager {
             ));
         }
 
+        // If we're already ready, tell the new peer immediately
+        if self.ring.connection_manager.is_self_ready()
+            && self.ring.connection_manager.min_ready_connections > 0
+        {
+            messages.push((
+                peer_addr,
+                NetMessage::V1(NetMessageV1::ReadyState { ready: true }),
+            ));
+        }
+
         messages
     }
 
