@@ -1,6 +1,6 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
+    now_nanos, ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     OpRequestSender, RequestError, Response, StateStoreError, SLOW_INIT_THRESHOLD,
     STALE_INIT_THRESHOLD,
 };
@@ -714,9 +714,10 @@ where
         };
 
         // Opportunistically clean up any stale initializations to prevent resource leaks
+        let now = now_nanos();
         let stale = self
             .init_tracker
-            .cleanup_stale_initializations(STALE_INIT_THRESHOLD);
+            .cleanup_stale_initializations(STALE_INIT_THRESHOLD, now);
         for info in stale {
             tracing::warn!(
                 contract = %info.key,
@@ -732,6 +733,7 @@ where
             code.is_some(),
             update.clone(),
             related_contracts.clone(),
+            now,
         ) {
             InitCheckResult::NotInitializing => {
                 // Continue with normal processing below
@@ -844,7 +846,7 @@ where
                 contract = %key,
                 "Starting contract initialization - queueing subsequent operations"
             );
-            self.init_tracker.start_initialization(key);
+            self.init_tracker.start_initialization(key, now_nanos());
         }
 
         let mut updates = match update {
@@ -878,8 +880,10 @@ where
                                 .await
                                 .map_err(ExecutorError::other)?;
 
-                            if let Some(completion_info) =
-                                self.init_tracker.complete_initialization(&key)
+                            let completion_now = now_nanos();
+                            if let Some(completion_info) = self
+                                .init_tracker
+                                .complete_initialization(&key, completion_now)
                             {
                                 let init_duration = completion_info.init_duration;
                                 if init_duration > SLOW_INIT_THRESHOLD {
@@ -899,15 +903,89 @@ where
                                     );
                                 }
 
-                                for op in &completion_info.queued_ops {
-                                    let queue_time = op.queued_at.elapsed();
+                                // Replay queued operations that arrived during initialization.
+                                // These were UPDATE operations that couldn't proceed while the
+                                // contract was being initialized. Now that initialization is
+                                // complete, we apply them in order to the stored state.
+                                let mut current = incoming_state.clone();
+                                for op in completion_info.queued_ops {
+                                    let queue_time = ContractInitTracker::queue_wait_duration(
+                                        &op,
+                                        completion_now,
+                                    );
                                     tracing::info!(
                                         contract = %key,
                                         queue_time_ms = queue_time.as_millis(),
                                         is_delta = matches!(op.update, Either::Right(_)),
                                         has_related = op.related_contracts.states().next().is_some(),
-                                        "Queued operation ready for retry after initialization"
+                                        "Replaying queued operation after initialization"
                                     );
+
+                                    let replay_updates = match op.update {
+                                        Either::Left(state) => {
+                                            vec![UpdateData::State(state.into())]
+                                        }
+                                        Either::Right(delta) => {
+                                            vec![UpdateData::Delta(delta)]
+                                        }
+                                    };
+
+                                    match self
+                                        .attempt_state_update(
+                                            &params,
+                                            &current,
+                                            &key,
+                                            &replay_updates,
+                                        )
+                                        .await
+                                    {
+                                        Ok(Either::Left(new_state)) => {
+                                            // Validate before accepting
+                                            let valid = self
+                                                .runtime
+                                                .validate_state(
+                                                    &key,
+                                                    &params,
+                                                    &new_state,
+                                                    &op.related_contracts,
+                                                )
+                                                .map(|r| r == ValidateResult::Valid)
+                                                .unwrap_or(false);
+
+                                            if valid && new_state.as_ref() != current.as_ref() {
+                                                if let Err(e) = self
+                                                    .commit_state_update(&key, &params, &new_state)
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        contract = %key,
+                                                        error = %e,
+                                                        "Failed to commit replayed queued operation"
+                                                    );
+                                                } else {
+                                                    current = new_state;
+                                                }
+                                            } else if !valid {
+                                                tracing::warn!(
+                                                    contract = %key,
+                                                    "Queued operation produced invalid state, skipping"
+                                                );
+                                            }
+                                        }
+                                        Ok(Either::Right(_missing)) => {
+                                            tracing::warn!(
+                                                contract = %key,
+                                                "Queued operation needs related contracts, skipping"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                contract = %key,
+                                                error = %e,
+                                                "Failed to replay queued operation, skipping"
+                                            );
+                                        }
+                                    }
                                 }
                             }
 

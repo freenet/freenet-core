@@ -3,10 +3,28 @@
 //! When a new contract is being stored (PUT), we need to validate its state before accepting
 //! any UPDATE operations. This module provides a state machine to track which contracts are
 //! currently being initialized and queue any operations that arrive during that window.
+//!
+//! # Determinism
+//!
+//! This module never calls `Instant::now()` or any wall-clock function internally.
+//! All time values are passed in as `u64` nanoseconds by the caller, which obtains
+//! them from the appropriate `TimeSource` (or `tokio::time::Instant` under turmoil).
+//! This makes the tracker fully deterministic for simulation testing (DST).
 
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
+
+/// Returns the current time as nanoseconds elapsed since `tokio::time::Instant`'s epoch.
+///
+/// This uses `tokio::time::Instant` (NOT `std::time::Instant`) which is deterministic
+/// under both turmoil and `start_paused = true` tokio runtimes. All callers of
+/// `ContractInitTracker` methods should use this function to obtain time values.
+pub(crate) fn now_nanos() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    Instant::now().duration_since(*epoch).as_nanos() as u64
+}
 
 /// Initialization taking longer than this logs a warning
 pub(crate) const SLOW_INIT_THRESHOLD: Duration = Duration::from_secs(1);
@@ -34,8 +52,8 @@ pub(crate) enum InitCheckResult {
 pub(crate) struct QueuedOperation {
     pub update: Either<WrappedState, StateDelta<'static>>,
     pub related_contracts: RelatedContracts<'static>,
-    /// When this operation was queued
-    pub queued_at: Instant,
+    /// When this operation was queued, as nanoseconds from the caller's time source
+    pub queued_at_nanos: u64,
 }
 
 /// Information about completed initialization
@@ -58,7 +76,11 @@ pub(crate) struct StaleInitInfo {
     pub dropped_ops: usize,
 }
 
-/// Tracks the initialization state of contracts
+/// Tracks the initialization state of contracts.
+///
+/// All time-dependent operations accept a `now_nanos` parameter from the caller
+/// rather than reading the clock internally, ensuring deterministic behavior
+/// in simulation tests.
 #[derive(Debug)]
 pub(crate) struct ContractInitTracker {
     states: HashMap<ContractKey, InitState>,
@@ -67,7 +89,8 @@ pub(crate) struct ContractInitTracker {
 #[derive(Debug)]
 struct InitState {
     queued_ops: Vec<QueuedOperation>,
-    started_at: Instant,
+    /// When initialization started, as nanoseconds from the caller's time source
+    started_at_nanos: u64,
 }
 
 impl Default for ContractInitTracker {
@@ -88,12 +111,15 @@ impl ContractInitTracker {
     /// - If not initializing, returns `NotInitializing` and the caller should proceed normally.
     /// - If initializing and this is an UPDATE (no code), queues the operation and returns `Queued`.
     /// - If initializing and this is a PUT (has code), returns `PutDuringInit` error.
+    ///
+    /// `now_nanos` is the current time from the caller's time source.
     pub fn check_and_maybe_queue(
         &mut self,
         key: &ContractKey,
         has_code: bool,
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
+        now_nanos: u64,
     ) -> InitCheckResult {
         let Some(state) = self.states.get_mut(key) else {
             return InitCheckResult::NotInitializing;
@@ -108,7 +134,7 @@ impl ContractInitTracker {
         state.queued_ops.push(QueuedOperation {
             update,
             related_contracts,
-            queued_at: Instant::now(),
+            queued_at_nanos: now_nanos,
         });
 
         InitCheckResult::Queued {
@@ -125,12 +151,13 @@ impl ContractInitTracker {
     /// Mark a contract as starting initialization.
     ///
     /// This should be called when a new contract is being stored for the first time.
-    pub fn start_initialization(&mut self, key: ContractKey) {
+    /// `now_nanos` is the current time from the caller's time source.
+    pub fn start_initialization(&mut self, key: ContractKey, now_nanos: u64) {
         self.states.insert(
             key,
             InitState {
                 queued_ops: Vec::new(),
-                started_at: Instant::now(),
+                started_at_nanos: now_nanos,
             },
         );
     }
@@ -138,10 +165,18 @@ impl ContractInitTracker {
     /// Mark initialization as complete and return any queued operations.
     ///
     /// Returns `None` if the contract wasn't being initialized.
-    pub fn complete_initialization(&mut self, key: &ContractKey) -> Option<InitCompletionInfo> {
-        self.states.remove(key).map(|state| InitCompletionInfo {
-            queued_ops: state.queued_ops,
-            init_duration: state.started_at.elapsed(),
+    /// `now_nanos` is the current time from the caller's time source.
+    pub fn complete_initialization(
+        &mut self,
+        key: &ContractKey,
+        now_nanos: u64,
+    ) -> Option<InitCompletionInfo> {
+        self.states.remove(key).map(|state| {
+            let elapsed_nanos = now_nanos.saturating_sub(state.started_at_nanos);
+            InitCompletionInfo {
+                queued_ops: state.queued_ops,
+                init_duration: Duration::from_nanos(elapsed_nanos),
+            }
         })
     }
 
@@ -166,15 +201,25 @@ impl ContractInitTracker {
     /// Returns information about each stale initialization that was cleaned up.
     /// This should be called periodically to prevent resource leaks from
     /// initializations that never complete (e.g., due to bugs or crashes).
-    pub fn cleanup_stale_initializations(&mut self, max_age: Duration) -> Vec<StaleInitInfo> {
-        let now = Instant::now();
+    ///
+    /// `now_nanos` is the current time from the caller's time source.
+    pub fn cleanup_stale_initializations(
+        &mut self,
+        max_age: Duration,
+        now_nanos: u64,
+    ) -> Vec<StaleInitInfo> {
+        let max_age_nanos = max_age.as_nanos() as u64;
         let stale_keys: Vec<_> = self
             .states
             .iter()
             .filter_map(|(key, state)| {
-                let age = now.duration_since(state.started_at);
-                if age > max_age {
-                    Some((*key, age, state.queued_ops.len()))
+                let age_nanos = now_nanos.saturating_sub(state.started_at_nanos);
+                if age_nanos > max_age_nanos {
+                    Some((
+                        *key,
+                        Duration::from_nanos(age_nanos),
+                        state.queued_ops.len(),
+                    ))
                 } else {
                     None
                 }
@@ -198,6 +243,13 @@ impl ContractInitTracker {
     #[allow(dead_code)] // Useful for monitoring
     pub fn initializing_count(&self) -> usize {
         self.states.len()
+    }
+
+    /// Compute how long a queued operation has been waiting.
+    ///
+    /// `now_nanos` is the current time from the caller's time source.
+    pub fn queue_wait_duration(op: &QueuedOperation, now_nanos: u64) -> Duration {
+        Duration::from_nanos(now_nanos.saturating_sub(op.queued_at_nanos))
     }
 }
 
@@ -226,6 +278,7 @@ mod tests {
             false,
             Either::Left(state),
             RelatedContracts::default(),
+            1_000_000,
         );
 
         assert!(matches!(result, InitCheckResult::NotInitializing));
@@ -236,7 +289,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         let state = make_test_state(&[1, 2, 3]);
         let result = tracker.check_and_maybe_queue(
@@ -244,6 +297,7 @@ mod tests {
             true, // has_code = true means this is a PUT
             Either::Left(state),
             RelatedContracts::default(),
+            2_000_000,
         );
 
         assert!(matches!(result, InitCheckResult::PutDuringInit));
@@ -254,7 +308,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         let state = make_test_state(&[1, 2, 3]);
         let result = tracker.check_and_maybe_queue(
@@ -262,6 +316,7 @@ mod tests {
             false, // has_code = false means this is an UPDATE
             Either::Left(state),
             RelatedContracts::default(),
+            2_000_000,
         );
 
         assert!(matches!(result, InitCheckResult::Queued { queue_size: 1 }));
@@ -273,15 +328,17 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         for i in 0..3 {
             let state = make_test_state(&[i]);
+            let now = 2_000_000 + (i as u64) * 1_000_000;
             let result = tracker.check_and_maybe_queue(
                 &key,
                 false,
                 Either::Left(state),
                 RelatedContracts::default(),
+                now,
             );
             assert!(matches!(
                 result,
@@ -297,7 +354,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         // Queue some operations
         for i in 0..2 {
@@ -307,12 +364,14 @@ mod tests {
                 false,
                 Either::Left(state),
                 RelatedContracts::default(),
+                2_000_000 + (i as u64) * 1_000_000,
             );
         }
 
-        let completion = tracker.complete_initialization(&key).unwrap();
+        let completion = tracker.complete_initialization(&key, 10_000_000).unwrap();
 
         assert_eq!(completion.queued_ops.len(), 2);
+        assert_eq!(completion.init_duration, Duration::from_nanos(9_000_000));
         assert!(!tracker.is_initializing(&key));
     }
 
@@ -321,7 +380,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         // Queue some operations
         for i in 0..3 {
@@ -331,6 +390,7 @@ mod tests {
                 false,
                 Either::Left(state),
                 RelatedContracts::default(),
+                2_000_000 + (i as u64) * 1_000_000,
             );
         }
 
@@ -345,7 +405,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        assert!(tracker.complete_initialization(&key).is_none());
+        assert!(tracker.complete_initialization(&key, 1_000_000).is_none());
     }
 
     #[test]
@@ -363,10 +423,10 @@ mod tests {
 
         assert!(!tracker.is_initializing(&key));
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
         assert!(tracker.is_initializing(&key));
 
-        tracker.complete_initialization(&key);
+        tracker.complete_initialization(&key, 2_000_000);
         assert!(!tracker.is_initializing(&key));
     }
 
@@ -375,7 +435,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        tracker.start_initialization(key, 1_000_000);
 
         let delta = StateDelta::from(vec![10, 20, 30]);
         let result = tracker.check_and_maybe_queue(
@@ -383,11 +443,12 @@ mod tests {
             false,
             Either::Right(delta),
             RelatedContracts::default(),
+            2_000_000,
         );
 
         assert!(matches!(result, InitCheckResult::Queued { queue_size: 1 }));
 
-        let completion = tracker.complete_initialization(&key).unwrap();
+        let completion = tracker.complete_initialization(&key, 3_000_000).unwrap();
         assert!(matches!(completion.queued_ops[0].update, Either::Right(_)));
     }
 
@@ -396,7 +457,8 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        // Start initialization at t=0
+        tracker.start_initialization(key, 0);
 
         // Queue an operation
         let state = make_test_state(&[1, 2, 3]);
@@ -405,10 +467,11 @@ mod tests {
             false,
             Either::Left(state),
             RelatedContracts::default(),
+            1_000_000,
         );
 
-        // With zero duration threshold, everything is stale
-        let stale = tracker.cleanup_stale_initializations(Duration::ZERO);
+        // At t=31s, with 30s threshold, everything started at t=0 is stale
+        let stale = tracker.cleanup_stale_initializations(Duration::from_secs(30), 31_000_000_000);
 
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].key, key);
@@ -421,10 +484,13 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key);
+        // Start initialization at t=100s
+        let start_nanos = 100_000_000_000;
+        tracker.start_initialization(key, start_nanos);
 
-        // With very long threshold, nothing is stale
-        let stale = tracker.cleanup_stale_initializations(Duration::from_secs(3600));
+        // At t=101s, with 3600s threshold, nothing is stale
+        let stale = tracker
+            .cleanup_stale_initializations(Duration::from_secs(3600), start_nanos + 1_000_000_000);
 
         assert!(stale.is_empty());
         assert!(tracker.is_initializing(&key));
@@ -438,14 +504,14 @@ mod tests {
         let key2 = make_contract_key_with_code(&[2]);
         let key3 = make_contract_key_with_code(&[3]);
 
-        tracker.start_initialization(key1);
-        tracker.start_initialization(key2);
-        tracker.start_initialization(key3);
+        tracker.start_initialization(key1, 0);
+        tracker.start_initialization(key2, 1_000_000);
+        tracker.start_initialization(key3, 2_000_000);
 
         assert_eq!(tracker.initializing_count(), 3);
 
-        // Clean up all with zero threshold
-        let stale = tracker.cleanup_stale_initializations(Duration::ZERO);
+        // Clean up all with zero threshold at a later time
+        let stale = tracker.cleanup_stale_initializations(Duration::ZERO, 10_000_000);
 
         assert_eq!(stale.len(), 3);
         assert_eq!(tracker.initializing_count(), 0);
@@ -460,14 +526,136 @@ mod tests {
         let key1 = make_contract_key_with_code(&[1]);
         let key2 = make_contract_key_with_code(&[2]);
 
-        tracker.start_initialization(key1);
+        tracker.start_initialization(key1, 1_000_000);
         assert_eq!(tracker.initializing_count(), 1);
 
-        tracker.start_initialization(key2);
+        tracker.start_initialization(key2, 2_000_000);
         assert_eq!(tracker.initializing_count(), 2);
 
-        tracker.complete_initialization(&key1);
+        tracker.complete_initialization(&key1, 3_000_000);
         assert_eq!(tracker.initializing_count(), 1);
+    }
+
+    /// Verify that queue_wait_duration computes correctly from nanos values
+    #[test]
+    fn test_queue_wait_duration() {
+        let op = QueuedOperation {
+            update: Either::Left(make_test_state(&[1])),
+            related_contracts: RelatedContracts::default(),
+            queued_at_nanos: 5_000_000_000, // 5 seconds
+        };
+
+        let wait = ContractInitTracker::queue_wait_duration(&op, 8_000_000_000); // 8 seconds
+        assert_eq!(wait, Duration::from_secs(3));
+    }
+
+    /// Verify that init_duration is correctly computed as the difference between
+    /// start and completion times
+    #[test]
+    fn test_init_duration_deterministic() {
+        let mut tracker = ContractInitTracker::new();
+        let key = make_test_key();
+
+        let start = 1_000_000_000; // 1 second
+        let end = 1_500_000_000; // 1.5 seconds
+        tracker.start_initialization(key, start);
+        let info = tracker.complete_initialization(&key, end).unwrap();
+
+        assert_eq!(info.init_duration, Duration::from_millis(500));
+    }
+
+    /// Verify that the same sequence of operations always produces the same result
+    /// regardless of when it's called (no wall-clock dependency).
+    #[test]
+    fn test_fully_deterministic_sequence() {
+        // Run the same sequence twice with identical time values
+        let run = || {
+            let mut tracker = ContractInitTracker::new();
+            let key = make_test_key();
+
+            tracker.start_initialization(key, 100);
+
+            let state = make_test_state(&[42]);
+            tracker.check_and_maybe_queue(
+                &key,
+                false,
+                Either::Left(state),
+                RelatedContracts::default(),
+                200,
+            );
+
+            let stale = tracker.cleanup_stale_initializations(Duration::from_secs(1), 300);
+            assert!(stale.is_empty(), "should not be stale yet");
+
+            let completion = tracker.complete_initialization(&key, 400).unwrap();
+            (completion.init_duration, completion.queued_ops.len())
+        };
+
+        let (dur1, ops1) = run();
+        let (dur2, ops2) = run();
+        assert_eq!(dur1, dur2);
+        assert_eq!(ops1, ops2);
+        assert_eq!(dur1, Duration::from_nanos(300));
+    }
+
+    /// Behavioral test: init_tracker produces identical results when given identical
+    /// time inputs, regardless of which thread or when the test runs.
+    /// This is the core guarantee that makes the tracker DST-compatible.
+    #[test]
+    fn test_deterministic_stale_cleanup_with_explicit_time() {
+        // Two runs with identical time values must produce identical results
+        let run = |start: u64, queue_time: u64, cleanup_time: u64, max_age_secs: u64| {
+            let mut tracker = ContractInitTracker::new();
+            let key = make_test_key();
+
+            tracker.start_initialization(key, start);
+
+            let state = make_test_state(&[99]);
+            tracker.check_and_maybe_queue(
+                &key,
+                false,
+                Either::Left(state),
+                RelatedContracts::default(),
+                queue_time,
+            );
+
+            let stale = tracker
+                .cleanup_stale_initializations(Duration::from_secs(max_age_secs), cleanup_time);
+            (stale.len(), tracker.is_initializing(&key))
+        };
+
+        // With cleanup at t=5s and max_age=10s, init at t=0 is NOT stale
+        let (stale1, init1) = run(0, 1_000_000_000, 5_000_000_000, 10);
+        let (stale2, init2) = run(0, 1_000_000_000, 5_000_000_000, 10);
+        assert_eq!((stale1, init1), (0, true));
+        assert_eq!((stale1, init1), (stale2, init2));
+
+        // With cleanup at t=15s and max_age=10s, init at t=0 IS stale
+        let (stale3, init3) = run(0, 1_000_000_000, 15_000_000_000, 10);
+        let (stale4, init4) = run(0, 1_000_000_000, 15_000_000_000, 10);
+        assert_eq!((stale3, init3), (1, false));
+        assert_eq!((stale3, init3), (stale4, init4));
+    }
+
+    /// Behavioral test: queue_wait_duration is a pure function of the input nanos values
+    #[test]
+    fn test_queue_wait_duration_is_pure() {
+        let make_op = |queued_at: u64| QueuedOperation {
+            update: Either::Left(make_test_state(&[1])),
+            related_contracts: RelatedContracts::default(),
+            queued_at_nanos: queued_at,
+        };
+
+        // Same inputs always produce same output
+        let op = make_op(1_000_000_000);
+        let d1 = ContractInitTracker::queue_wait_duration(&op, 3_000_000_000);
+        let d2 = ContractInitTracker::queue_wait_duration(&op, 3_000_000_000);
+        assert_eq!(d1, d2);
+        assert_eq!(d1, Duration::from_secs(2));
+
+        // Saturating subtraction: if now < queued_at, duration is zero (no panic)
+        let d3 = ContractInitTracker::queue_wait_duration(&op, 500_000_000);
+        assert_eq!(d3, Duration::ZERO);
     }
 
     fn make_contract_key_with_code(code_bytes: &[u8]) -> ContractKey {
