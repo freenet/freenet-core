@@ -839,12 +839,19 @@ pub(crate) struct ConnectOp {
 impl ConnectOp {
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         self.forward_attempts.remove(peer);
+        if !success {
+            tracing::debug!(
+                peer = %peer.pub_key,
+                desired = %desired,
+                "connect forward failed, recording failure in estimator"
+            );
+        }
         self.connect_forward_estimator
             .write()
             .record(peer, desired, success);
     }
 
-    fn expire_forward_attempts(&mut self, now: Instant) {
+    pub(crate) fn expire_forward_attempts(&mut self, now: Instant) {
         let mut expired = Vec::new();
         for (peer, attempt) in self.forward_attempts.iter() {
             if now.duration_since(attempt.sent_at) >= FORWARD_ATTEMPT_TIMEOUT {
@@ -2147,6 +2154,38 @@ mod tests {
         );
         op.expire_forward_attempts(Instant::now());
         assert!(op.forward_attempts.is_empty());
+    }
+
+    #[test]
+    fn expired_forward_attempts_record_failures_in_estimator() {
+        let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+        let mut op = ConnectOp::new_joiner(
+            Transaction::new::<ConnectMsg>(),
+            Location::new(0.1),
+            1,
+            None,
+            None,
+            estimator.clone(),
+        );
+        let peer = make_peer(2000);
+        op.forward_attempts.insert(
+            peer.clone(),
+            ForwardAttempt {
+                peer: peer.clone(),
+                desired: Location::new(0.2),
+                sent_at: Instant::now() - FORWARD_ATTEMPT_TIMEOUT - Duration::from_secs(1),
+            },
+        );
+
+        let (_, events_before, _) = estimator.read().snapshot();
+        op.expire_forward_attempts(Instant::now());
+        let (_, events_after, _) = estimator.read().snapshot();
+
+        assert!(op.forward_attempts.is_empty());
+        assert!(
+            events_after > events_before,
+            "estimator should have recorded failure; before={events_before}, after={events_after}"
+        );
     }
 
     #[test]
