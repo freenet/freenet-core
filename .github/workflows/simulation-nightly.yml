@@ -149,18 +149,18 @@ jobs:
             --print-network-stats \
             single-process
 
-      # Long-duration simulation test (1 hour virtual time, ~2.5 min wall clock)
+      # Nightly-gated simulation tests (long-running, high-scale regression tests)
       # Uses Turmoil deterministic scheduler for reproducible results
-      # Uncovers time-dependent bugs that only manifest after extended operation
+      # Includes:
+      #   - test_long_running_deterministic: 1 hour virtual time
+      #   - test_subscription_renewal_at_scale: 250 contracts regression test
       # NOTE: Gated by nightly_tests feature — does NOT run in regular CI
-      - name: Long-running simulation (1 hour virtual time)
+      - name: Nightly simulation tests (long-running + high-scale)
         run: |
-          echo "Running long-running deterministic simulation test (3600s virtual time)"
-          echo "This tests for time-dependent bugs (connection timeouts, state drift, etc.)"
+          echo "Running all nightly simulation tests (gated by nightly_tests feature)"
           cargo nextest run -p freenet \
             --features "simulation_tests,testing,nightly_tests" \
             --test simulation_integration \
-            -E 'test(test_long_running_deterministic)' \
             --test-threads 1 \
             --no-capture \
             --profile nightly
