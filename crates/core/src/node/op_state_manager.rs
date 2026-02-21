@@ -1275,7 +1275,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                     let still_waiting = match tx.transaction_type() {
                         TransactionType::Connect => {
-                            if let Some((_, op)) = ops.connect.remove(&tx) {
+                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
+                                // Record forward failures before dropping the op so the
+                                // estimator learns about timed-out forwarding targets.
+                                op.expire_forward_attempts(tokio::time::Instant::now());
                                 // Log uphill routes that timed out with no response
                                 log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations
@@ -1358,7 +1361,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                     let removed = match tx.transaction_type() {
                         TransactionType::Connect => {
-                            if let Some((_, op)) = ops.connect.remove(&tx) {
+                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
+                                // Record forward failures before dropping the op so the
+                                // estimator learns about timed-out forwarding targets.
+                                op.expire_forward_attempts(tokio::time::Instant::now());
                                 // Log uphill routes that timed out with no response
                                 log_connect_uphill_timeout(&tx, &op);
                                 // Notify backoff tracker of timeout for joiner operations

@@ -839,12 +839,19 @@ pub(crate) struct ConnectOp {
 impl ConnectOp {
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         self.forward_attempts.remove(peer);
+        if !success {
+            tracing::debug!(
+                peer = %peer.pub_key,
+                desired = %desired,
+                "connect forward failed, recording failure in estimator"
+            );
+        }
         self.connect_forward_estimator
             .write()
             .record(peer, desired, success);
     }
 
-    fn expire_forward_attempts(&mut self, now: Instant) {
+    pub(crate) fn expire_forward_attempts(&mut self, now: Instant) {
         let mut expired = Vec::new();
         for (peer, attempt) in self.forward_attempts.iter() {
             if now.duration_since(attempt.sent_at) >= FORWARD_ATTEMPT_TIMEOUT {
