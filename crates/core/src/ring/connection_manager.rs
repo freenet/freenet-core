@@ -1034,7 +1034,7 @@ impl ConnectionManager {
         Option<PeerKeyLocation>,
         Option<crate::router::RoutingDecisionInfo>,
     ) {
-        let candidates = self.routing_candidates(target, requesting, skip_list);
+        let candidates = self.routing_candidates(target, requesting, skip_list, true);
 
         if candidates.is_empty() {
             return (None, None);
@@ -1047,11 +1047,14 @@ impl ConnectionManager {
     }
 
     /// Gather routing candidates after applying skip/transient filters.
+    /// When `check_readiness` is true, peers that haven't advertised readiness are filtered out.
+    /// CONNECT operations pass `false` to allow routing to not-yet-ready peers.
     pub fn routing_candidates(
         &self,
         target: Location,
         requesting: Option<SocketAddr>,
         skip_list: impl Contains<SocketAddr>,
+        check_readiness: bool,
     ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
@@ -1071,8 +1074,8 @@ impl ConnectionManager {
                 if self.is_transient(addr) {
                     return None;
                 }
-                // Skip peers that haven't advertised readiness
-                if !self.is_peer_ready(addr) {
+                // Skip peers that haven't advertised readiness (unless bypassed for CONNECT)
+                if check_readiness && !self.is_peer_ready(addr) {
                     return None;
                 }
                 if let Some(requester) = requesting {
@@ -1788,7 +1791,7 @@ mod tests {
         // Get routing candidates with requester specified
         let empty_set: HashSet<SocketAddr> = HashSet::new();
         let target = Location::new(0.5);
-        let candidates = cm.routing_candidates(target, Some(requester_addr), &empty_set);
+        let candidates = cm.routing_candidates(target, Some(requester_addr), &empty_set, true);
 
         // Should have 2 candidates (excluding requester)
         assert_eq!(
@@ -2423,7 +2426,7 @@ mod tests {
         // Neither peer is ready — routing_candidates should return empty
         let target = Location::new(0.5);
         let skip = HashSet::<SocketAddr>::new();
-        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
         assert!(
             candidates.is_empty(),
             "no peers are ready, should get no candidates"
@@ -2431,13 +2434,13 @@ mod tests {
 
         // Mark peer1 ready — only peer1 should appear
         cm.mark_peer_ready(addr1);
-        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].socket_addr(), Some(addr1));
 
         // Mark peer2 ready — both should appear
         cm.mark_peer_ready(addr2);
-        let candidates = cm.routing_candidates(target, Some(own_addr), &skip);
+        let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
         assert_eq!(candidates.len(), 2);
     }
 

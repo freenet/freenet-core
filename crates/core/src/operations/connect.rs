@@ -655,6 +655,7 @@ impl RelayContext for RelayEnv<'_> {
             desired_location,
             None,
             skip,
+            false, // CONNECT bypasses readiness filter to allow routing to not-yet-ready peers
         );
 
         // Calculate our own distance to the target for greedy routing check
@@ -749,6 +750,7 @@ impl RelayContext for RelayEnv<'_> {
             desired_location,
             None,
             skip,
+            false, // CONNECT bypasses readiness filter to allow routing to not-yet-ready peers
         );
 
         let now = Instant::now();
