@@ -775,22 +775,6 @@ impl OpManager {
         Ok(op)
     }
 
-    /// Non-destructive check for whether we already know about a transaction.
-    /// Used by the relay gate to distinguish "new incoming request" from
-    /// "response to our own operation".
-    pub fn has_operation(&self, id: &Transaction) -> bool {
-        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
-            return true;
-        }
-        match id.transaction_type() {
-            TransactionType::Connect => self.ops.connect.contains_key(id),
-            TransactionType::Put => self.ops.put.contains_key(id),
-            TransactionType::Get => self.ops.get.contains_key(id),
-            TransactionType::Subscribe => self.ops.subscribe.contains_key(id),
-            TransactionType::Update => self.ops.update.contains_key(id),
-        }
-    }
-
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);

@@ -166,6 +166,7 @@ where
                 "Anti-starvation: forcing poll of Tier-2 channels"
             );
             tier2_polled_in_phase1 = true;
+            crate::config::GlobalTestMetrics::record_anti_starvation_trigger();
 
             // Force-poll P7: Client transaction handler
             if !this.client_transaction_closed {

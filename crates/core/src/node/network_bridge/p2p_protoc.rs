@@ -343,6 +343,16 @@ struct ConnectionEntry {
     /// The peer's public key, learned from the first message.
     /// None for transient connections before identity is established.
     pub_key: Option<TransportPublicKey>,
+    /// Unique ID for this connection entry. Used to distinguish stale
+    /// TransportClosed events from replaced connections (e.g., after identity change).
+    connection_id: u64,
+}
+
+/// Monotonically increasing counter for generating unique connection IDs.
+static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(in crate::node) struct P2pConnManager {
@@ -747,6 +757,12 @@ impl P2pConnManager {
                         .retain(|_tx, sender| !sender.is_closed());
                     let removed = before - state.pending_op_results.len();
                     if removed > 0 {
+                        for _ in 0..removed {
+                            crate::config::GlobalTestMetrics::record_pending_op_remove();
+                        }
+                        crate::config::GlobalTestMetrics::record_pending_op_size(
+                            state.pending_op_results.len() as u64,
+                        );
                         tracing::info!(
                             removed,
                             remaining = state.pending_op_results.len(),
@@ -1026,10 +1042,15 @@ impl P2pConnManager {
                                 }
                             }
                         }
-                        ConnEvent::TransportClosed { remote_addr, error } => {
+                        ConnEvent::TransportClosed {
+                            remote_addr,
+                            error,
+                            connection_id,
+                        } => {
                             tracing::debug!(
                                 peer_addr = %remote_addr,
                                 error = ?error,
+                                connection_id,
                                 phase = "disconnect",
                                 "Transport connection closed"
                             );
@@ -1241,6 +1262,9 @@ impl P2pConnManager {
                                             phase = "cleanup",
                                             "Draining pending_op_results"
                                         );
+                                        for _ in 0..pending_count {
+                                            crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                        }
                                         state.pending_op_results.drain();
                                     }
 
@@ -1704,13 +1728,17 @@ impl P2pConnManager {
                                 // Clean up executor callback sender to prevent unbounded
                                 // HashMap growth (entries were inserted by handle_op_execution
                                 // but never removed — see #2941)
-                                state.pending_op_results.remove(&tx);
+                                if state.pending_op_results.remove(&tx).is_some() {
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
                             }
                             NodeEvent::TransactionCompleted(tx) => {
                                 // Clean up client subscription after successful completion
                                 state.tx_to_client.remove(&tx);
                                 // Clean up executor callback sender
-                                state.pending_op_results.remove(&tx);
+                                if state.pending_op_results.remove(&tx).is_some() {
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -1991,7 +2019,8 @@ impl P2pConnManager {
                 );
                 match result {
                     Some(event) => {
-                        self.handle_handshake_action(event, state).await?;
+                        self.handle_handshake_action(event, state, handshake_commands)
+                            .await?;
                         Ok(EventResult::Continue)
                     }
                     None => {
@@ -2499,6 +2528,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
+        handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
         tracing::info!(?event, "handle_handshake_action: received handshake event");
         match event {
@@ -2549,8 +2579,15 @@ impl P2pConnManager {
                 let is_transient = transient;
 
                 // Pass peer directly - it may be None for transient connections
-                self.handle_successful_connection(peer, connection, state, None, is_transient)
-                    .await?;
+                self.handle_successful_connection(
+                    peer,
+                    connection,
+                    state,
+                    None,
+                    is_transient,
+                    handshake_commands,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundEstablished {
                 transaction,
@@ -2592,8 +2629,15 @@ impl P2pConnManager {
 
                 // For outbound connections, respect the transient flag from the handshake.
                 // Gateway connections should remain transient until CONNECT acceptance.
-                self.handle_successful_connection(Some(peer), connection, state, None, transient)
-                    .await?;
+                self.handle_successful_connection(
+                    Some(peer),
+                    connection,
+                    state,
+                    None,
+                    transient,
+                    handshake_commands,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
@@ -2757,6 +2801,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
         is_transient: bool,
+        handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
         // For transient connections, we may not know the peer's identity yet - use connection's remote_addr
@@ -2786,76 +2831,135 @@ impl P2pConnManager {
         // during the window when neither structure has the entry, causing the transport
         // layer to tear down the connection we just established.
         // See: handle_connect_peer checks self.connections first, then awaiting_connection.
-        let mut newly_inserted = false;
-        if !self.connections.contains_key(&peer_addr) {
-            if is_transient {
-                let cm = &self.bridge.op_manager.ring.connection_manager;
-                let current = cm.transient_count();
-                if current >= cm.transient_budget() {
+        // If the peer already has a connection (e.g., reconnected with new identity after
+        // suspend/resume), replace it. Dropping the old sender causes its
+        // peer_connection_listener to fire TransportClosed; the connection_id mechanism
+        // ensures that stale event won't remove the new entry.
+        if let Some(old) = self.connections.remove(&peer_addr) {
+            if let Some(ref old_pub_key) = old.pub_key {
+                self.addr_by_pub_key.remove(old_pub_key);
+            }
+
+            // Full cleanup: handle both transient and ring-promoted connections.
+            // If transient, drop_transient releases the budget slot.
+            // If ring-promoted, prune_connection cleans up topology, orphaned txs,
+            // subscriptions, and notifies the handshake driver.
+            let was_transient = self
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .drop_transient(peer_addr)
+                .is_some();
+
+            if !was_transient {
+                // Old connection was ring-promoted — mirror TransportClosed cleanup
+                let old_peer = if let Some(ref pub_key) = old.pub_key {
+                    PeerKeyLocation::new(pub_key.clone(), peer_addr)
+                } else {
+                    PeerKeyLocation::new(
+                        (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
+                        peer_addr,
+                    )
+                };
+                let prune_result = self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .prune_connection(PeerId::new(peer_addr, old_peer.pub_key().clone()))
+                    .await;
+                self.bridge
+                    .handle_orphaned_transactions(
+                        prune_result.orphaned_transactions,
+                        &self.gateways,
+                    )
+                    .await;
+                self.bridge
+                    .op_manager
+                    .on_ring_connection_lost(old_peer.pub_key());
+                if let Err(error) = handshake_commands
+                    .send(HandshakeCommand::DropConnection {
+                        peer: old_peer.clone(),
+                    })
+                    .await
+                {
                     tracing::warn!(
                         remote = %peer_addr,
-                        budget = cm.transient_budget(),
-                        current,
-                        "Transient connection budget exhausted; dropping inbound connection before insert"
+                        ?error,
+                        "Failed to notify handshake driver about replaced connection"
                     );
-                    return Ok(());
                 }
             }
-            let (tx, rx) = mpsc::channel(10);
-            tracing::debug!(
-                self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
-                peer_id = ?peer_id,
-                %peer_addr,
-                conn_map_size = self.connections.len(),
-                "[CONN_TRACK] INSERT: adding connection to HashMap"
-            );
-            self.connections.insert(
-                peer_addr,
-                ConnectionEntry {
-                    sender: tx,
-                    // For transient connections, we don't know the pub_key yet - it will be learned
-                    // when the peer sends its first message (e.g., ConnectRequest)
-                    pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
-                },
-            );
-            // Only add to reverse lookup if we know the pub_key
-            // For transient connections, this will be populated when identity is learned
-            if let Some(ref peer) = peer_id {
-                self.addr_by_pub_key
-                    .insert(peer.pub_key().clone(), peer_addr);
-            }
-            let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
-                anyhow::bail!("Connection event channel not initialized");
-            };
 
-            // Phase 4: Set orphan stream registry on connection for handling race conditions
-            // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-            let mut connection = connection;
-            connection.set_orphan_stream_registry(
-                self.bridge.op_manager.orphan_stream_registry().clone(),
-            );
-
-            // Use tokio::spawn directly instead of GlobalExecutor::spawn.
-            // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
-            // reliably poll tasks in certain test contexts (see issue #2709).
-            tokio::spawn(async move {
-                peer_connection_listener(rx, connection, peer_addr, conn_events).await;
-            });
-            // Yield to allow the spawned peer_connection_listener task to start.
-            // This is important because on some runtimes (especially in tests with boxed_local
-            // futures), spawned tasks may not be scheduled immediately, causing messages
-            // sent to the channel to pile up without being processed.
-            tokio::task::yield_now().await;
-            newly_inserted = true;
-        } else {
-            tracing::debug!(
-                self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
-                peer_id = ?peer_id,
+            tracing::info!(
                 %peer_addr,
-                conn_map_size = self.connections.len(),
-                "[CONN_TRACK] SKIP INSERT: connection already exists in HashMap"
+                old_connection_id = old.connection_id,
+                was_transient,
+                "Replacing stale connection entry (peer reconnected with new identity)"
             );
         }
+
+        if is_transient {
+            let cm = &self.bridge.op_manager.ring.connection_manager;
+            let current = cm.transient_count();
+            if current >= cm.transient_budget() {
+                tracing::warn!(
+                    remote = %peer_addr,
+                    budget = cm.transient_budget(),
+                    current,
+                    "Transient connection budget exhausted; dropping inbound connection before insert"
+                );
+                return Ok(());
+            }
+        }
+        let conn_id = next_connection_id();
+        let (tx, rx) = mpsc::channel(10);
+        tracing::debug!(
+            self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
+            peer_id = ?peer_id,
+            %peer_addr,
+            connection_id = conn_id,
+            conn_map_size = self.connections.len(),
+            "[CONN_TRACK] INSERT: adding connection to HashMap"
+        );
+        self.connections.insert(
+            peer_addr,
+            ConnectionEntry {
+                sender: tx,
+                // For transient connections, we don't know the pub_key yet - it will be learned
+                // when the peer sends its first message (e.g., ConnectRequest)
+                pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
+                connection_id: conn_id,
+            },
+        );
+        // Only add to reverse lookup if we know the pub_key
+        // For transient connections, this will be populated when identity is learned
+        if let Some(ref peer) = peer_id {
+            self.addr_by_pub_key
+                .insert(peer.pub_key().clone(), peer_addr);
+        }
+        let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
+            anyhow::bail!("Connection event channel not initialized");
+        };
+
+        // Phase 4: Set orphan stream registry on connection for handling race conditions
+        // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+        let mut connection = connection;
+        connection
+            .set_orphan_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
+
+        // Use tokio::spawn directly instead of GlobalExecutor::spawn.
+        // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
+        // reliably poll tasks in certain test contexts (see issue #2709).
+        tokio::spawn(async move {
+            peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
+        });
+        // Yield to allow the spawned peer_connection_listener task to start.
+        // This is important because on some runtimes (especially in tests with boxed_local
+        // futures), spawned tasks may not be scheduled immediately, causing messages
+        // sent to the channel to pile up without being processed.
+        tokio::task::yield_now().await;
+        let newly_inserted = true;
 
         // Now safe to remove from awaiting_connection and notify callbacks.
         // self.connections already has the entry, so concurrent connect() calls
@@ -3136,12 +3240,30 @@ impl P2pConnManager {
                     ConnEvent::InboundMessage(inbound).into(),
                 ))
             }
-            Some(ConnEvent::TransportClosed { remote_addr, error }) => {
+            Some(ConnEvent::TransportClosed {
+                remote_addr,
+                error,
+                connection_id,
+            }) => {
                 tracing::debug!(
                     remote = %remote_addr,
                     ?error,
+                    connection_id,
                     "peer_connection_listener reported transport closure"
                 );
+                // Ignore stale TransportClosed from replaced connections: the old
+                // listener's channel was dropped, but we must not remove the new entry.
+                if let Some(current) = self.connections.get(&remote_addr) {
+                    if current.connection_id != connection_id {
+                        tracing::info!(
+                            remote = %remote_addr,
+                            stale_id = connection_id,
+                            current_id = current.connection_id,
+                            "Ignoring stale TransportClosed from replaced connection"
+                        );
+                        return Ok(EventResult::Continue);
+                    }
+                }
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
                     // Construct PeerKeyLocation for prune_connection and DropConnection
@@ -3264,6 +3386,10 @@ impl P2pConnManager {
         match msg {
             Some((callback, msg)) => {
                 state.pending_op_results.insert(*msg.id(), callback);
+                crate::config::GlobalTestMetrics::record_pending_op_insert();
+                crate::config::GlobalTestMetrics::record_pending_op_size(
+                    state.pending_op_results.len() as u64,
+                );
                 EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
             }
             None => {
@@ -3913,6 +4039,9 @@ pub(super) enum ConnEvent {
     TransportClosed {
         remote_addr: SocketAddr,
         error: TransportError,
+        /// ID of the connection entry that spawned the listener reporting this closure.
+        /// Used to ignore stale events from replaced connections.
+        connection_id: u64,
     },
     /// Send raw stream data to a peer via the transport's stream mechanism.
     /// Used by operations-level streaming to send large payloads as stream fragments.
@@ -4080,9 +4209,14 @@ async fn notify_transport_closed(
     sender: &Sender<ConnEvent>,
     remote_addr: SocketAddr,
     error: TransportError,
+    connection_id: u64,
 ) {
     if sender
-        .send(ConnEvent::TransportClosed { remote_addr, error })
+        .send(ConnEvent::TransportClosed {
+            remote_addr,
+            error,
+            connection_id,
+        })
         .await
         .is_err()
     {
@@ -4143,6 +4277,7 @@ async fn peer_connection_listener(
     mut conn: Box<dyn PeerConnectionApi>,
     peer_addr: SocketAddr,
     conn_events: Sender<ConnEvent>,
+    connection_id: u64,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -4176,7 +4311,8 @@ async fn peer_connection_listener(
                         // Drain any messages that arrived after our try_recv() but before
                         // handle_peer_channel_message returned an error
                         drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
-                        notify_transport_closed(&conn_events, remote_addr, error).await;
+                        notify_transport_closed(&conn_events, remote_addr, error, connection_id)
+                            .await;
                         return;
                     }
                 }
@@ -4191,6 +4327,7 @@ async fn peer_connection_listener(
                         &conn_events,
                         remote_addr,
                         TransportError::ConnectionClosed(remote_addr),
+                        connection_id,
                     )
                     .await;
                     return;
@@ -4212,7 +4349,7 @@ async fn peer_connection_listener(
                             );
                             // Drain any messages that arrived while we were processing this one
                             drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
-                            notify_transport_closed(&conn_events, remote_addr, error).await;
+                            notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
                             return;
                         }
                     }
@@ -4226,6 +4363,7 @@ async fn peer_connection_listener(
                             &conn_events,
                             remote_addr,
                             TransportError::ConnectionClosed(remote_addr),
+                            connection_id,
                         )
                         .await;
                         return;
@@ -4273,7 +4411,7 @@ async fn peer_connection_listener(
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
-                            notify_transport_closed(&conn_events, remote_addr, transport_error).await;
+                            notify_transport_closed(&conn_events, remote_addr, transport_error, connection_id).await;
                             return;
                         }
                     },
@@ -4287,7 +4425,7 @@ async fn peer_connection_listener(
                         // Messages may have been queued to the channel while we were
                         // waiting in select!, and they would be lost without this drain.
                         drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
-                        notify_transport_closed(&conn_events, remote_addr, error).await;
+                        notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
                         return;
                     }
                 }
@@ -4517,5 +4655,57 @@ mod tests {
              This test validates the bug exists when drain is missing.",
             count
         );
+    }
+
+    /// Test that connection_id generation produces unique, monotonically increasing IDs.
+    #[test]
+    fn test_connection_id_uniqueness() {
+        let id1 = super::next_connection_id();
+        let id2 = super::next_connection_id();
+        let id3 = super::next_connection_id();
+        assert!(id2 > id1, "IDs must be monotonically increasing");
+        assert!(id3 > id2, "IDs must be monotonically increasing");
+    }
+
+    /// Validates the stale TransportClosed detection pattern: when a connection is
+    /// replaced (peer reconnected with new identity), a TransportClosed from the old
+    /// listener (mismatched connection_id) must not remove the replacement entry.
+    #[test]
+    fn test_stale_transport_closed_detection() {
+        use std::collections::BTreeMap;
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let mut connections: BTreeMap<SocketAddr, super::ConnectionEntry> = BTreeMap::new();
+
+        // Insert initial connection (id=10), then replace with new one (id=20)
+        let (tx1, _rx1) = mpsc::channel(1);
+        connections.insert(
+            addr,
+            super::ConnectionEntry {
+                sender: tx1,
+                pub_key: None,
+                connection_id: 10,
+            },
+        );
+        let (tx2, _rx2) = mpsc::channel(1);
+        connections.insert(
+            addr,
+            super::ConnectionEntry {
+                sender: tx2,
+                pub_key: None,
+                connection_id: 20,
+            },
+        );
+
+        // Stale TransportClosed (id=10) should not match the current entry (id=20)
+        let current = connections.get(&addr).unwrap();
+        assert_ne!(current.connection_id, 10, "stale event must not match");
+        assert_eq!(current.connection_id, 20);
+
+        // Current TransportClosed (id=20) should match and allow removal
+        assert_eq!(current.connection_id, 20, "current event must match");
+        connections.remove(&addr);
+        assert!(!connections.contains_key(&addr));
     }
 }
