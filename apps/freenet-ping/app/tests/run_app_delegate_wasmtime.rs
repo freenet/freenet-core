@@ -3,7 +3,7 @@ mod common;
 use std::{net::TcpListener, time::Duration};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_client_api};
+use freenet::server::serve_client_api;
 use freenet_stdlib::{
     client_api::{ClientRequest, HostResponse},
     prelude::*,
@@ -15,7 +15,7 @@ use tokio::select;
 
 use common::{
     allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
-    test_ip_for_node,
+    test_ip_for_node, test_node_config,
 };
 
 /// Message types matching test-delegate-integration's InboundAppMessage
@@ -79,7 +79,7 @@ async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
     // Start gateway node
     let gateway_node = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
+        let node = test_node_config(config.clone())
             .await?
             .build(serve_client_api(config.ws_api).await?)
             .await?;

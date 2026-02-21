@@ -8,7 +8,7 @@
 mod common;
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_client_api, test_utils::test_ip_for_node};
+use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -25,7 +25,7 @@ use tokio::{select, time::timeout};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    test_node_config, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
@@ -175,7 +175,7 @@ async fn setup_50_node_network(
         let config = gateway_configs.remove(0);
         let gateway_future = async {
             let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
+            let node = test_node_config(config.clone())
                 .await?
                 .build(serve_client_api(config.ws_api).await?)
                 .await?;
@@ -205,7 +205,7 @@ async fn setup_50_node_network(
             let config = node_configs.remove(0);
             let regular_node_future = async {
                 let config = config.build().await?;
-                let node = NodeConfig::new(config.clone())
+                let node = test_node_config(config.clone())
                     .await?
                     .build(serve_client_api(config.ws_api).await?)
                     .await?;

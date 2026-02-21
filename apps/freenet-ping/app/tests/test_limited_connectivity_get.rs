@@ -42,7 +42,6 @@ use std::{
 };
 
 use freenet::{
-    local_node::NodeConfig,
     server::serve_client_api,
     test_utils::{allocate_test_node_block, test_ip_for_node},
 };
@@ -56,7 +55,7 @@ use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    wait_for_node_connected, ws_config,
+    test_node_config, wait_for_node_connected, ws_config,
 };
 
 /// Test that GET requests for non-existent contracts terminate gracefully
@@ -123,7 +122,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
 
     let gateway_future = async {
         let config = config_gw.build().await?;
-        let mut node_config = NodeConfig::new(config.clone()).await?;
+        let mut node_config = test_node_config(config.clone()).await?;
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config
@@ -136,7 +135,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> anyhow::Result<
 
     let peer_future = async {
         let config = config_peer.build().await?;
-        let mut node_config = NodeConfig::new(config.clone()).await?;
+        let mut node_config = test_node_config(config.clone()).await?;
         node_config.min_number_of_connections(1);
         node_config.max_number_of_connections(5);
         let node = node_config

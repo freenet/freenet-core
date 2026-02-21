@@ -178,7 +178,7 @@ pub struct NodeConfig {
     pub(crate) transient_ttl: Duration,
     /// Minimum ring connections before this peer advertises readiness
     /// to accept non-CONNECT operations. `None` or `Some(0)` disables the gate.
-    /// Default: `Some(2)` in production.
+    /// Default: `Some(3)` in production.
     #[serde(default)]
     pub(crate) relay_ready_connections: Option<usize>,
 }
@@ -298,7 +298,7 @@ impl NodeConfig {
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
-            relay_ready_connections: Some(2),
+            relay_ready_connections: Some(3),
         })
     }
 
