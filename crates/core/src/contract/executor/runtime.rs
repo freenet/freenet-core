@@ -796,6 +796,9 @@ where
                         .map_err(ExecutorError::other)?;
                     (true, true)
                 } else {
+                    // Bug #2306: This should never happen for PUT operations because they
+                    // always provide the contract code. If we hit this path during a PUT,
+                    // it indicates the contract code was lost somewhere in the flow.
                     tracing::error!(
                         contract = %key,
                         key_code_hash = ?key.code_hash(),
@@ -809,6 +812,14 @@ where
                     }));
                 }
             } else {
+                // Contract already in store. ensure_key_indexed handles the case of contracts
+                // that reuse the same WASM code with different parameters (e.g., different
+                // River rooms). Without this, lookup_key() fails for the new instance_id.
+                // See issue #2380.
+                //
+                // We only index when code was provided in this request (code.is_some()).
+                // When code is None, this is a state-only update to an existing contract
+                // that should already be indexed.
                 if code.is_some() {
                     self.runtime
                         .ensure_key_indexed(&key)
@@ -819,6 +830,9 @@ where
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
+        // Save the incoming full state (if any) for potential corrupted-state recovery.
+        // When the stored state is corrupted, WASM merge fails. If we have a validated
+        // incoming full state, we can replace the corrupted state with it.
         let incoming_full_state = match &update {
             Either::Left(state) => Some(state.clone()),
             Either::Right(_) => None,
@@ -977,16 +991,27 @@ where
                 }));
             }
             Err(merge_err) => {
+                // Merge failed. If we have a validated full incoming state, try to recover
+                // by replacing the (likely corrupted) local state. The incoming state was
+                // already validated at entry to this function.
                 let Some(ref valid_incoming) = incoming_full_state else {
+                    // Delta update failed and we don't have a full state to recover with.
+                    // Propagate the error (the caller may send a ResyncRequest).
                     return Err(merge_err);
                 };
 
+                // Before assuming local state is corrupted, validate it. If the local
+                // state is valid, the merge failure is legitimate (e.g., the incoming
+                // state is older and the contract's merge function correctly rejected
+                // it). Only trigger recovery when the local state itself fails
+                // validation. See issue #3109.
                 let local_valid = self
                     .runtime
                     .validate_state(&key, &params, &current_state, &related_contracts)
                     .map(|r| r == ValidateResult::Valid)
                     .unwrap_or(false);
 
+                // Local state is valid — the merge failure is legitimate, not corruption.
                 if local_valid {
                     tracing::info!(
                         contract = %key,
@@ -1000,6 +1025,9 @@ where
                     return Err(merge_err);
                 }
 
+                // Local state failed validation — it's likely corrupted.
+
+                // Check and mark recovery in a single lock acquisition.
                 let already_recovered = {
                     let mut guard = self
                         .recovery_guard
@@ -1037,6 +1065,9 @@ where
             }
         };
 
+        // Clear the recovery guard for this contract on a successful merge
+        // (NOT on the same call that performed recovery — the guard must persist
+        // so a subsequent failure is detected as a broken contract).
         if incoming_full_state.is_some() && !recovery_performed {
             self.recovery_guard
                 .lock()
