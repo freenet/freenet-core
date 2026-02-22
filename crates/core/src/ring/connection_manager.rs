@@ -1012,6 +1012,9 @@ impl ConnectionManager {
     }
 
     /// Route an op to the most optimal target.
+    /// Note: this applies readiness gating (`check_readiness=true`). For CONNECT
+    /// operations that need to bypass readiness, use `routing_candidates` directly.
+    #[cfg(test)]
     pub fn routing(
         &self,
         target: Location,
