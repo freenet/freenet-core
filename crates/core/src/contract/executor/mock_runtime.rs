@@ -124,6 +124,26 @@ mod crdt_encoding {
 /// threads (file watchers, compaction), this runtime keeps everything in memory
 /// for deterministic simulation testing.
 ///
+/// ## ⚠ Prefer `MockWasmRuntime` for new tests
+///
+/// `MockRuntime` has its own `ContractExecutor` implementation (~350 lines) with
+/// hash-based merge semantics that **do not share code** with the production
+/// `Runtime`. This means changes to production behavior (init tracking, WASM
+/// validation, subscriber notifications, corrupted state recovery) are **not
+/// exercised** by tests using `MockRuntime`.
+///
+/// `MockWasmRuntime` delegates to the same `bridged_*` methods used by the
+/// production `Runtime`, giving much higher fidelity. Use it for new simulation
+/// tests via `SimNetwork::with_mock_wasm()` or `use_mock_wasm: true`.
+///
+/// `MockRuntime` is retained for:
+/// - CRDT emulation mode tests (version-based LWW merge)
+/// - Tests that specifically need hash-based deterministic merge semantics
+/// - Backward compatibility with existing test infrastructure
+///
+/// See issue #3141 (CI & Testing Redesign) and conformance tests in
+/// `pool_tests/conformance_tests.rs`.
+///
 /// ## CRDT Emulation Mode
 ///
 /// Contracts can be registered for CRDT emulation using `register_crdt_contract()`.
