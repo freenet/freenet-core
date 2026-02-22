@@ -42,12 +42,12 @@ async fn expect_peer_not_joined(client: &mut WebApi, op_name: &str) -> anyhow::R
     };
 
     assert!(
-        error_msg.contains("PEER_NOT_JOINED"),
-        "{}: expected PEER_NOT_JOINED, got: {}",
+        error_msg.contains("PeerNotJoined"),
+        "{}: expected PeerNotJoined, got: {}",
         op_name,
         error_msg
     );
-    info!("{}: got PEER_NOT_JOINED as expected", op_name);
+    info!("{}: got PeerNotJoined as expected", op_name);
     Ok(())
 }
 
@@ -267,9 +267,9 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
                 }
                 Ok(Err(e)) => {
                     let err_str = format!("{:?}", e);
-                    if err_str.contains("PEER_NOT_JOINED") {
+                    if err_str.contains("PeerNotJoined") {
                         info!(
-                            "Still PEER_NOT_JOINED after {:?}, retrying...",
+                            "Still PeerNotJoined after {:?}, retrying...",
                             join_start.elapsed()
                         );
                         continue;
