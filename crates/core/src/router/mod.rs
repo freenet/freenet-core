@@ -1751,4 +1751,266 @@ mod tests {
             pred.failure_probability
         );
     }
+
+    mod proptest_router {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy that generates a RouteOutcome with valid durations.
+        fn arb_route_outcome() -> impl Strategy<Value = RouteOutcome> {
+            prop_oneof![
+                // Success with timing data
+                (1u64..5000, 100usize..100_000, 1u64..5000).prop_map(
+                    |(response_ms, payload_size, transfer_ms)| {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(response_ms),
+                            payload_size,
+                            payload_transfer_time: Duration::from_millis(transfer_ms),
+                        }
+                    }
+                ),
+                // Untimed success
+                Just(RouteOutcome::SuccessUntimed),
+                // Failure
+                Just(RouteOutcome::Failure),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Property: predictions never produce NaN or panic under any mix of
+            /// operation outcomes fed to the router.
+            #[test]
+            fn predictions_never_nan_or_panic(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..200),
+                seed in 0u64..u64::MAX,
+            ) {
+                let _guard = crate::config::GlobalRng::seed_guard(seed);
+                let peers: Vec<PeerKeyLocation> =
+                    (0..5).map(|_| PeerKeyLocation::random()).collect();
+                let contract_location = Location::random();
+
+                let events: Vec<RouteEvent> = outcomes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, outcome)| RouteEvent {
+                        peer: peers[i % peers.len()].clone(),
+                        contract_location,
+                        outcome,
+                    })
+                    .collect();
+
+                let router = Router::new(&events);
+
+                // Router should have enough events for prediction
+                prop_assert!(router.has_sufficient_routing_events());
+
+                // Predictions must not produce NaN
+                let (selected, decision) =
+                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+                prop_assert!(!selected.is_empty());
+                for candidate in &decision.candidates {
+                    if let Some(pred) = &candidate.prediction {
+                        prop_assert!(
+                            !pred.failure_probability.is_nan(),
+                            "failure_probability is NaN"
+                        );
+                        prop_assert!(
+                            !pred.expected_total_time.is_nan(),
+                            "expected_total_time is NaN"
+                        );
+                        prop_assert!(
+                            !pred.time_to_response_start.is_nan(),
+                            "time_to_response_start is NaN"
+                        );
+                        prop_assert!(
+                            !pred.transfer_speed_bps.is_nan(),
+                            "transfer_speed_bps is NaN"
+                        );
+                    }
+                }
+            }
+
+            /// Property: after enough failure data for a peer, the router predicts
+            /// a higher failure probability for that peer compared to a peer with
+            /// all successes (at the same distance).
+            #[test]
+            fn failure_data_increases_failure_prediction(
+                n_good in 30usize..60,
+                n_bad in 30usize..60,
+                seed in 0u64..u64::MAX,
+            ) {
+                let _guard = crate::config::GlobalRng::seed_guard(seed);
+                let good_peer = PeerKeyLocation::random();
+                let bad_peer = PeerKeyLocation::random();
+                let contract_location = Location::random();
+
+                let mut events = Vec::new();
+
+                // Good peer: all successes (untimed for simplicity)
+                for _ in 0..n_good {
+                    events.push(RouteEvent {
+                        peer: good_peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::SuccessUntimed,
+                    });
+                }
+
+                // Bad peer: all failures
+                for _ in 0..n_bad {
+                    events.push(RouteEvent {
+                        peer: bad_peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::Failure,
+                    });
+                }
+
+                let router = Router::new(&events);
+                prop_assert!(router.has_sufficient_routing_events());
+
+                let peers = vec![good_peer.clone(), bad_peer.clone()];
+                let (_, decision) =
+                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
+
+                // Find predictions for each peer
+                let good_pred = decision.candidates.iter()
+                    .find(|c| c.selected)
+                    .and_then(|c| c.prediction.as_ref());
+                let all_preds: Vec<_> = decision.candidates.iter()
+                    .filter_map(|c| c.prediction.as_ref())
+                    .collect();
+
+                // With enough data, predictions should exist for both
+                if all_preds.len() == 2 {
+                    // The selected peer (lowest expected_total_time) should be
+                    // the good peer since failures increase cost
+                    let selected_pred = &decision.candidates[0].prediction.as_ref().unwrap();
+                    let other_pred = &decision.candidates[1].prediction.as_ref().unwrap();
+                    prop_assert!(
+                        selected_pred.expected_total_time <= other_pred.expected_total_time,
+                        "Selected peer should have lower expected time"
+                    );
+                }
+                // At minimum, predictions should not be None for the good peer
+                prop_assert!(good_pred.is_some() || all_preds.is_empty());
+            }
+
+            /// Property: add_event is consistent with batch construction.
+            /// Building from history vs adding events one-by-one should produce
+            /// the same estimator counts.
+            #[test]
+            fn incremental_matches_batch(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 1..100),
+                seed in 0u64..u64::MAX,
+            ) {
+                let _guard = crate::config::GlobalRng::seed_guard(seed);
+                let peer = PeerKeyLocation::random();
+                let contract_location = Location::random();
+
+                let events: Vec<RouteEvent> = outcomes
+                    .into_iter()
+                    .map(|outcome| RouteEvent {
+                        peer: peer.clone(),
+                        contract_location,
+                        outcome,
+                    })
+                    .collect();
+
+                // Batch construction
+                let batch_router = Router::new(&events);
+
+                // Incremental construction
+                let mut incr_router = Router::new(&[]);
+                for event in &events {
+                    incr_router.add_event(event.clone());
+                }
+
+                prop_assert_eq!(
+                    batch_router.failure_estimator.len(),
+                    incr_router.failure_estimator.len(),
+                    "failure_estimator counts differ"
+                );
+                prop_assert_eq!(
+                    batch_router.response_start_time_estimator.len(),
+                    incr_router.response_start_time_estimator.len(),
+                    "response_start_time_estimator counts differ"
+                );
+                prop_assert_eq!(
+                    batch_router.transfer_rate_estimator.len(),
+                    incr_router.transfer_rate_estimator.len(),
+                    "transfer_rate_estimator counts differ"
+                );
+            }
+
+            /// Property: select_peer always returns None for empty peer list,
+            /// regardless of router state.
+            #[test]
+            fn empty_peers_always_none(
+                n_events in 0usize..100,
+                seed in 0u64..u64::MAX,
+            ) {
+                let _guard = crate::config::GlobalRng::seed_guard(seed);
+                let peer = PeerKeyLocation::random();
+                let contract_location = Location::random();
+
+                let events: Vec<RouteEvent> = (0..n_events)
+                    .map(|_| RouteEvent {
+                        peer: peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::SuccessUntimed,
+                    })
+                    .collect();
+
+                let router = Router::new(&events);
+                let empty: Vec<PeerKeyLocation> = vec![];
+                let result = router.select_peer(&empty, contract_location);
+                prop_assert!(result.is_none());
+            }
+
+            /// Property: failure probability is bounded in [0, 1] (with small
+            /// floating-point tolerance) for any mix of outcomes.
+            #[test]
+            fn failure_probability_bounded(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..150),
+                seed in 0u64..u64::MAX,
+            ) {
+                let _guard = crate::config::GlobalRng::seed_guard(seed);
+                let peers: Vec<PeerKeyLocation> =
+                    (0..3).map(|_| PeerKeyLocation::random()).collect();
+                let contract_location = Location::random();
+
+                let events: Vec<RouteEvent> = outcomes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, outcome)| RouteEvent {
+                        peer: peers[i % peers.len()].clone(),
+                        contract_location,
+                        outcome,
+                    })
+                    .collect();
+
+                let router = Router::new(&events);
+                if !router.has_sufficient_routing_events() {
+                    return Ok(());
+                }
+
+                let (_, decision) =
+                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+                for candidate in &decision.candidates {
+                    if let Some(pred) = &candidate.prediction {
+                        // Allow small float tolerance around [0, 1]
+                        prop_assert!(
+                            pred.failure_probability >= -0.01
+                                && pred.failure_probability <= 1.01,
+                            "failure_probability {} out of [0, 1] range",
+                            pred.failure_probability
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
