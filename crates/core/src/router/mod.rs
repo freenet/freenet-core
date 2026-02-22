@@ -1421,6 +1421,7 @@ mod tests {
     /// low-failure, low-latency peers.
     #[test]
     fn test_realistic_mixed_traffic_routing() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let contract_location = Location::random();
         let close_peer = PeerKeyLocation::random();
         let mid_peer = PeerKeyLocation::random();
