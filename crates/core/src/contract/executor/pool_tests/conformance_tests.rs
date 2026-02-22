@@ -153,6 +153,13 @@ async fn conformance_fetch_returns_same_state() {
         "Both runtimes must return the same state after PUT"
     );
 
+    // Verify the fetched state is exactly what we stored
+    assert_eq!(
+        mock_state.as_ref().map(|s| s.as_ref()),
+        Some(state.as_ref()),
+        "Fetched state must equal the originally stored state"
+    );
+
     assert!(
         mock_code.is_some(),
         "MockRuntime must return contract code when requested"
@@ -252,15 +259,23 @@ async fn conformance_summarize_succeeds_on_both() {
         .await
         .expect("MockWasmRuntime summarize must succeed");
 
-    // Both should produce non-empty summaries (format may differ)
-    assert!(
-        !mock_summary.as_ref().is_empty(),
-        "MockRuntime summary must be non-empty"
+    // Both use blake3 hashing for summarization, so summaries must be identical.
+    assert_eq!(
+        mock_summary.as_ref(),
+        wasm_summary.as_ref(),
+        "Summaries must match: both runtimes use blake3 hashing"
     );
-    assert!(
-        !wasm_summary.as_ref().is_empty(),
-        "MockWasmRuntime summary must be non-empty"
+
+    // Verify it's a valid blake3 hash (32 bytes)
+    assert_eq!(
+        mock_summary.as_ref().len(),
+        32,
+        "Summary must be a 32-byte blake3 hash"
     );
+
+    // Verify it matches the expected blake3 hash of the input state
+    let expected = blake3::hash(state.as_ref());
+    assert_eq!(mock_summary.as_ref(), expected.as_bytes());
 }
 
 // =========================================================================
@@ -276,6 +291,15 @@ async fn conformance_update_full_state_both_succeed() {
     let key = contract.key();
     let initial_state = WrappedState::new(vec![1, 2, 3]);
     let updated_state = WrappedState::new(vec![4, 5, 6]);
+
+    // MockRuntime uses blake3 hash comparison (larger hash wins), so we need
+    // the updated state's hash to be larger to guarantee both runtimes return Updated.
+    assert!(
+        blake3::hash(updated_state.as_ref()).as_bytes()
+            > blake3::hash(initial_state.as_ref()).as_bytes(),
+        "Test data assumption violated: updated_state must have a larger blake3 hash \
+         than initial_state for MockRuntime to return Updated. Change the test values."
+    );
 
     // PUT initial state on both
     mock.upsert_contract_state(
@@ -317,24 +341,30 @@ async fn conformance_update_full_state_both_succeed() {
         .await
         .expect("MockWasmRuntime UPDATE should not error");
 
-    // Both must succeed (not error). The specific result variant may differ
-    // because MockRuntime uses hash-based merge while MockWasmRuntime uses
-    // the production validate→update pipeline, but neither should error.
-    let mock_is_ok = matches!(
-        mock_result,
-        crate::contract::UpsertResult::Updated(_)
-            | crate::contract::UpsertResult::NoChange
-            | crate::contract::UpsertResult::CurrentWon(_)
-    );
-    let wasm_is_ok = matches!(
-        wasm_result,
-        crate::contract::UpsertResult::Updated(_)
-            | crate::contract::UpsertResult::NoChange
-            | crate::contract::UpsertResult::CurrentWon(_)
-    );
+    // Both should return Updated since the state bytes differ.
+    // MockRuntime uses hash-based merge (larger blake3 hash wins), and
+    // MockWasmRuntime uses the production validate→update pipeline.
+    // In both cases, a different state should be accepted.
+    let mock_state = match mock_result {
+        crate::contract::UpsertResult::Updated(s) => s,
+        other => panic!("MockRuntime: expected Updated, got {other:?}"),
+    };
+    let wasm_state = match wasm_result {
+        crate::contract::UpsertResult::Updated(s) => s,
+        other => panic!("MockWasmRuntime: expected Updated, got {other:?}"),
+    };
 
-    assert!(mock_is_ok, "MockRuntime UPDATE must not error");
-    assert!(wasm_is_ok, "MockWasmRuntime UPDATE must not error");
+    // Both runtimes should have stored the updated state
+    assert_eq!(
+        mock_state.as_ref(),
+        updated_state.as_ref(),
+        "MockRuntime must store the updated state"
+    );
+    assert_eq!(
+        wasm_state.as_ref(),
+        updated_state.as_ref(),
+        "MockWasmRuntime must store the updated state"
+    );
 }
 
 // =========================================================================
@@ -373,7 +403,11 @@ async fn drift_detector_register_notifier_divergence() {
     .await
     .unwrap();
 
-    // Register a notifier on both
+    // Register a notifier on both.
+    // Note: _rx1/_rx2 are kept alive (not dropped) so the sender channels remain
+    // valid. This test verifies registration tracking, not notification delivery.
+    // Notification delivery is covered by the wasm_conformance_tests which test
+    // the ContractRuntimeInterface directly.
     let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
     let client_id = crate::client_events::ClientId::next();

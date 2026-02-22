@@ -27,10 +27,6 @@
 //! compile the test contract. The feature gate is on the `mod` declaration in
 //! `pool_tests/mod.rs`.
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Arc;
-
 use freenet_stdlib::prelude::*;
 
 use crate::contract::executor::mock_wasm_runtime::MockWasmRuntime;
@@ -39,7 +35,7 @@ use crate::wasm_runtime::{
     SecretsStore,
 };
 
-const MOCK_ALIGNED_CONTRACT: &str = "test_contract_mock_aligned";
+const MOCK_ALIGNED_CONTRACT: &str = "test-contract-mock-aligned";
 
 struct WasmTestSetup {
     runtime: Runtime,
@@ -49,8 +45,16 @@ struct WasmTestSetup {
 }
 
 /// Compile the mock-aligned test contract to WASM and build a production Runtime.
+///
+/// Uses the shared `test_utils::load_contract` helper which properly checks the
+/// cargo build exit status and streams compiler output.
 async fn setup_wasm_runtime() -> Result<WasmTestSetup, Box<dyn std::error::Error>> {
-    let wasm_bytes = compile_test_contract(MOCK_ALIGNED_CONTRACT)?;
+    let contract = tokio::task::spawn_blocking(|| {
+        crate::test_utils::load_contract(MOCK_ALIGNED_CONTRACT, Parameters::from(vec![]))
+    })
+    .await??;
+
+    let contract_key = contract.key();
 
     let temp_dir = crate::util::tests::get_temp_dir();
     let db = crate::contract::storages::Storage::new(temp_dir.path()).await?;
@@ -59,12 +63,7 @@ async fn setup_wasm_runtime() -> Result<WasmTestSetup, Box<dyn std::error::Error
     let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())?;
     let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db)?;
 
-    let contract_bytes =
-        WrappedContract::new(Arc::new(ContractCode::from(wasm_bytes)), vec![].into());
-    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
-    let contract_key = contract.key();
     contract_store.store_contract(contract)?;
-
     let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)?;
 
     Ok(WasmTestSetup {
@@ -72,35 +71,6 @@ async fn setup_wasm_runtime() -> Result<WasmTestSetup, Box<dyn std::error::Error
         contract_key,
         _temp_dir: temp_dir,
     })
-}
-
-/// Compile a test contract crate to `wasm32-unknown-unknown`.
-fn compile_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let module_path = {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = manifest_dir
-            .ancestors()
-            .nth(2)
-            .expect("workspace root not found");
-        workspace_root.join("tests").join(name.replace('_', "-"))
-    };
-
-    let target = crate::util::workspace::get_workspace_target_dir();
-    const WASM_TARGET: &str = "wasm32-unknown-unknown";
-
-    let mut child = Command::new("cargo")
-        .args(["build", "--target", WASM_TARGET])
-        .current_dir(&module_path)
-        .env("CARGO_TARGET_DIR", &target)
-        .spawn()?;
-    child.wait()?;
-
-    let output_file = target
-        .join(WASM_TARGET)
-        .join("debug")
-        .join(name)
-        .with_extension("wasm");
-    Ok(std::fs::read(output_file)?)
 }
 
 /// Create a MockWasmRuntime (no WASM engine needed).
@@ -361,10 +331,21 @@ async fn wasm_conformance_round_trip() -> Result<(), Box<dyn std::error::Error>>
         &[UpdateData::Delta(mock_delta)],
     )?;
 
+    let wasm_state = wasm_updated.unwrap_valid();
+    let mock_state = mock_updated.unwrap_valid();
+
     assert_eq!(
-        wasm_updated.unwrap_valid().as_ref(),
-        mock_updated.unwrap_valid().as_ref(),
+        wasm_state.as_ref(),
+        mock_state.as_ref(),
         "Round-trip must produce same state"
+    );
+
+    // Semantic check: applying the delta to any base state must recover the
+    // original value, since get_state_delta returns the full state as the delta.
+    assert_eq!(
+        wasm_state.as_ref(),
+        state.as_ref(),
+        "Round-trip delta application must recover the original state"
     );
     Ok(())
 }
