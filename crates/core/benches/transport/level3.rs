@@ -31,7 +31,7 @@ pub fn bench_max_send_rate(c: &mut Criterion) {
             async move {
                 let buf = [0u8; 1400];
                 for _ in 0..10_000 {
-                    let _ = socket.send(&buf).await;
+                    let _sent = socket.send(&buf).await;
                 }
             }
         });

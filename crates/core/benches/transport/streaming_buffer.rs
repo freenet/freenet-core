@@ -261,7 +261,7 @@ pub fn bench_duplicate_insert(c: &mut Criterion) {
         b.iter(|| {
             // Try to insert duplicates
             for i in 1..=10 {
-                let _ = black_box(buffer.insert(i, frag.clone()));
+                let _inserted = black_box(buffer.insert(i, frag.clone()));
             }
         });
     });

@@ -2337,7 +2337,7 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'a, ()> {
             async {
                 for log_msg in NetLogMessage::to_log_message(logs) {
-                    let _ = self.log_sender.send(log_msg).await;
+                    let _sent = self.log_sender.send(log_msg).await;
                 }
             }
             .boxed()
@@ -2355,7 +2355,7 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'_, ()> {
             async move {
                 if cfg!(test) {
-                    let _ = self.finished_tx_notifier.send(tx).await;
+                    let _sent = self.finished_tx_notifier.send(tx).await;
                 }
             }
             .boxed()
