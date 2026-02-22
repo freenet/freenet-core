@@ -1997,10 +1997,26 @@ impl Ring {
                 self_addr = ?self.connection_manager.get_own_addr(),
                 "Looking for peer to route through"
             );
-            if let Some(target) =
-                self.connection_manager
-                    .routing(ideal_location, None, skip_list, &router)
-            {
+            // CONNECT operations bypass readiness gating — peers need to route
+            // through ANY ring connection to acquire new connections, even if those
+            // connections haven't advertised readiness yet. Without this, peers get
+            // stuck below the readiness threshold: they can't initiate CONNECTs
+            // because routing() filters out all their "not ready" connections,
+            // but they can't become ready without more connections.
+            let candidates = self.connection_manager.routing_candidates(
+                ideal_location,
+                None,
+                skip_list,
+                false, // bypass readiness — this is a CONNECT for connection acquisition
+            );
+            let selected = if !candidates.is_empty() {
+                let (selected, _) =
+                    router.select_k_best_peers_with_telemetry(candidates.iter(), ideal_location, 1);
+                selected.into_iter().next().cloned()
+            } else {
+                None
+            };
+            if let Some(target) = selected {
                 tracing::debug!(
                     query_target = %target,
                     target_location = %ideal_location,
@@ -2012,7 +2028,7 @@ impl Ring {
                     current_connections,
                     is_gateway,
                     target_location = %ideal_location,
-                    "acquire_new: routing() returned None - cannot find peer to query"
+                    "acquire_new: no routing candidates found - cannot find peer to query"
                 );
                 return Ok(None);
             }
