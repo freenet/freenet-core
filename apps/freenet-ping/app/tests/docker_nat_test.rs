@@ -97,7 +97,9 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
             blocking_subscribe: false,
         }))
         .await?;
-    wait_for_put_response(&mut gw_client, &contract_key).await?;
+    wait_for_put_response(&mut gw_client, &contract_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to deploy contract: {}", e))?;
     tracing::info!("Contract deployed: {contract_key}");
 
     // --- Subscribe from peer ---
