@@ -2523,6 +2523,43 @@ impl EventKind {
         }
     }
 
+    /// Returns whether this is a route outcome event, and if so, whether it succeeded.
+    ///
+    /// Returns `Some(true)` for `RouteOutcome::Success` or `SuccessUntimed`,
+    /// `Some(false)` for `RouteOutcome::Failure`, `None` for non-Route events.
+    pub fn route_outcome_is_success(&self) -> Option<bool> {
+        match self {
+            EventKind::Route(re) => {
+                Some(!matches!(re.outcome, crate::router::RouteOutcome::Failure))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns whether this is a subscribe outcome event (success or not-found).
+    ///
+    /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
+    /// `None` for all other events (including subscribe requests/responses).
+    pub fn subscribe_outcome(&self) -> Option<bool> {
+        match self {
+            EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. }) => Some(true),
+            EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. }) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this event is an update broadcast received by a peer.
+    ///
+    /// Matches `UpdateEvent::BroadcastReceived` — the moment a peer receives
+    /// an update broadcast (before application). Used to verify that subscription
+    /// interest is maintained across lease cycles.
+    pub fn is_update_broadcast_received(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Update(UpdateEvent::BroadcastReceived { .. })
+        )
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {

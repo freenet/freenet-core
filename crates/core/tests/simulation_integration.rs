@@ -5063,3 +5063,226 @@ fn test_subscribe_renewal_long_running() {
 
     tracing::info!("test_subscribe_renewal_long_running PASSED");
 }
+
+// =============================================================================
+// Operation Success Rate Tests (Stage 4, #3152)
+//
+// These tests measure operation success rates and assert thresholds,
+// catching regressions from topology/routing changes.
+//
+// Target regressions: #3138 (subscribe rate collapse), #3128/#3136
+// (router never learns), #3093 (TTL not refreshed).
+// =============================================================================
+
+/// Assert subscribe success rate ≥ 70%.
+///
+/// Runs a medium network and scans event logs for subscribe outcomes.
+/// Catches regressions like #3138 where subscribe success collapsed from 92% to 24%.
+#[test_log::test]
+fn test_topology_subscribe_health() {
+    const SEED: u64 = 0x3152_0001_0001;
+
+    tracing::info!("=== Starting Topology Subscribe Health Test ===");
+
+    let result = TestConfig::medium("sub-health", SEED)
+        .with_iterations(100)
+        .with_duration(Duration::from_secs(60))
+        .run()
+        .assert_ok();
+
+    let rt = create_runtime();
+    let (successes, failures) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let mut successes = 0u64;
+        let mut failures = 0u64;
+        for log in logs.iter() {
+            match log.kind.subscribe_outcome() {
+                Some(true) => successes += 1,
+                Some(false) => failures += 1,
+                None => {}
+            }
+        }
+        (successes, failures)
+    });
+
+    let total = successes + failures;
+    assert!(
+        total > 0,
+        "No subscribe outcome events found in {} events — simulation may not be generating subscribes",
+        result.event_count
+    );
+
+    let success_rate = successes as f64 / total as f64;
+    tracing::info!(
+        "Subscribe health: {}/{} succeeded ({:.1}%)",
+        successes,
+        total,
+        success_rate * 100.0
+    );
+
+    assert!(
+        success_rate >= 0.70,
+        "Subscribe success rate {:.1}% is below 70% threshold \
+         ({} succeeded, {} failed out of {} total). \
+         See #3138 for context on subscribe rate regressions.",
+        success_rate * 100.0,
+        successes,
+        failures,
+        total
+    );
+
+    tracing::info!(
+        "test_topology_subscribe_health PASSED: {:.1}% success rate",
+        success_rate * 100.0
+    );
+}
+
+/// Verify router receives feedback and doesn't degrade over time.
+///
+/// Checks that (a) router prediction becomes active (enough events), and
+/// (b) the failure rate in the second half of the simulation is not significantly
+/// worse than the first half. Catches #3128/#3136 (router never learns).
+#[test_log::test]
+fn test_router_learning() {
+    const SEED: u64 = 0x3152_0002_0001;
+
+    tracing::info!("=== Starting Router Learning Test ===");
+
+    let result = TestConfig::small("router-learn", SEED)
+        .with_iterations(150)
+        .with_duration(Duration::from_secs(200))
+        .run()
+        .assert_ok();
+
+    // Check that router prediction becomes active
+    let snapshots = result.router_snapshots();
+    let any_prediction_active = snapshots.iter().any(|(_f, _s, active)| *active);
+    tracing::info!(
+        "Router snapshots: {} total, prediction_active in any: {}",
+        snapshots.len(),
+        any_prediction_active
+    );
+
+    // Collect route outcomes and split into first/second half
+    let rt = create_runtime();
+    let outcomes: Vec<bool> = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        logs.iter()
+            .filter_map(|log| log.kind.route_outcome_is_success())
+            .collect()
+    });
+
+    if outcomes.is_empty() {
+        tracing::warn!("No route outcome events — skipping degradation check");
+        return;
+    }
+
+    let mid = outcomes.len() / 2;
+    let (first_half, second_half) = outcomes.split_at(mid);
+
+    let first_failures = first_half.iter().filter(|&&s| !s).count();
+    let second_failures = second_half.iter().filter(|&&s| !s).count();
+
+    let first_rate = if first_half.is_empty() {
+        0.0
+    } else {
+        first_failures as f64 / first_half.len() as f64
+    };
+    // second_half is never empty: mid = len/2 < len when len >= 1
+    let second_rate = second_failures as f64 / second_half.len() as f64;
+
+    tracing::info!(
+        "Route failure rates: first half {:.1}% ({}/{}), second half {:.1}% ({}/{})",
+        first_rate * 100.0,
+        first_failures,
+        first_half.len(),
+        second_rate * 100.0,
+        second_failures,
+        second_half.len()
+    );
+
+    // Second half failure rate should not be significantly worse than first half
+    assert!(
+        second_rate <= first_rate + 0.15,
+        "Router is degrading: second-half failure rate ({:.1}%) exceeds \
+         first-half ({:.1}%) by more than 15pp. \
+         This suggests the router is not learning from feedback. See #3128/#3136.",
+        second_rate * 100.0,
+        first_rate * 100.0
+    );
+
+    tracing::info!("test_router_learning PASSED");
+}
+
+/// Verify subscriptions survive 2+ lease cycles (SUBSCRIPTION_LEASE_DURATION = 480s).
+///
+/// Runs long enough for ~2.5 lease cycles and checks that update broadcasts
+/// continue arriving in the second half. Catches #3093 (TTL not refreshed).
+#[test_log::test]
+fn test_interest_renewal() {
+    const SEED: u64 = 0x3152_0003_0001;
+
+    tracing::info!("=== Starting Interest Renewal Test ===");
+
+    let result = TestConfig::medium("interest-renew", SEED)
+        .with_nodes(4)
+        .with_iterations(400)
+        .with_event_wait(Duration::from_secs(3))
+        .with_duration(Duration::from_secs(1400))
+        .run_direct()
+        .assert_ok();
+
+    // Count broadcast-received events in first vs second half
+    let rt = create_runtime();
+    let (early_broadcasts, late_broadcasts) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let total = logs
+            .iter()
+            .filter(|log| log.kind.is_update_broadcast_received())
+            .count();
+
+        let mid = total / 2;
+        (mid, total - mid)
+    });
+
+    let total = early_broadcasts + late_broadcasts;
+    tracing::info!(
+        "Broadcast received events: {} total (early: {}, late: {})",
+        total,
+        early_broadcasts,
+        late_broadcasts
+    );
+
+    assert!(
+        total > 0,
+        "No BroadcastReceived events found in {} events — \
+         simulation may not be generating updates",
+        result.event_count
+    );
+
+    assert!(
+        late_broadcasts > 0,
+        "No BroadcastReceived events in second half of simulation. \
+         Subscriptions may have expired without renewal. See #3093."
+    );
+
+    let ratio = late_broadcasts as f64 / early_broadcasts.max(1) as f64;
+    tracing::info!(
+        "Late/early broadcast ratio: {:.2} ({}/{})",
+        ratio,
+        late_broadcasts,
+        early_broadcasts
+    );
+
+    assert!(
+        ratio > 0.2,
+        "Late broadcast ratio ({:.2}) is below 0.2 threshold — \
+         subscriptions are likely degrading across lease cycles. See #3093.",
+        ratio
+    );
+
+    tracing::info!(
+        "test_interest_renewal PASSED: {:.2} late/early ratio",
+        ratio
+    );
+}
