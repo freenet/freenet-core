@@ -261,8 +261,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        # Run all test files gated on simulation_tests feature:
+        # simulation_integration, simulation_smoke, streaming_e2e, state_verification
         run: |
-          cargo nextest run -p freenet --test simulation_integration \
+          cargo nextest run -p freenet --locked \
+            --test simulation_integration \
+            --test simulation_smoke \
+            --test streaming_e2e \
+            --test state_verification \
             --features simulation_tests,testing --profile ci
 
   nat_validation:
