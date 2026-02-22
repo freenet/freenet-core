@@ -5111,8 +5111,10 @@ fn test_topology_subscribe_health() {
 
     let total = successes + failures;
     assert!(
-        total > 0,
-        "No subscribe outcome events found in {} events — simulation may not be generating subscribes",
+        total >= 5,
+        "Only {} subscribe outcome events in {} total events — \
+         too few for meaningful success rate measurement",
+        total,
         result.event_count
     );
 
