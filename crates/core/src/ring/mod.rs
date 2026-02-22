@@ -573,9 +573,8 @@ impl Ring {
             }
 
             let num_peers = peer_addrs.len();
-            let spread_delay = INTEREST_HEARTBEAT_INTERVAL
-                .checked_div(num_peers as u32)
-                .unwrap_or(Duration::from_secs(1));
+            // num_peers >= 1 guaranteed by the is_empty() check above
+            let spread_delay = INTEREST_HEARTBEAT_INTERVAL / num_peers as u32;
 
             tracing::debug!(
                 num_peers,
@@ -584,6 +583,7 @@ impl Ring {
             );
 
             let sender = op_manager.to_event_listener.notifications_sender();
+            let mut peers_sent = 0usize;
             for (i, peer_addr) in peer_addrs.into_iter().enumerate() {
                 let message = crate::message::InterestMessage::Interests {
                     hashes: hashes.clone(),
@@ -604,6 +604,7 @@ impl Ring {
                     );
                     break;
                 }
+                peers_sent += 1;
 
                 // Spread sends evenly across the interval (skip delay after last)
                 if i + 1 < num_peers {
@@ -614,7 +615,7 @@ impl Ring {
             crate::tracing::telemetry::send_standalone_event(
                 "interest_heartbeat_cycle",
                 serde_json::json!({
-                    "peers_sent": num_peers,
+                    "peers_sent": peers_sent,
                     "interest_hashes": hashes.len(),
                 }),
             );
