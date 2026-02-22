@@ -75,11 +75,12 @@ impl PutOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.state.is_none() || matches!(self.state, Some(PutState::Finished { .. }))
+        self.state.is_none() || matches!(self.state, Some(PutState::Finished(_)))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(PutState::Finished { key }) = &self.state {
+        if let Some(PutState::Finished(data)) = &self.state {
+            let key = &data.key;
             Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::PutResponse { key: *key },
             ))
@@ -95,7 +96,7 @@ impl PutOp {
     /// an outbound message to a downstream peer.
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(PutState::AwaitingResponse { next_hop, .. }) => *next_hop,
+            Some(PutState::AwaitingResponse(data)) => data.next_hop,
             _ => None,
         }
     }
@@ -104,7 +105,7 @@ impl PutOp {
     /// Returns None if the operation is not in AwaitingResponse state.
     pub(crate) fn get_current_htl(&self) -> Option<usize> {
         match &self.state {
-            Some(PutState::AwaitingResponse { current_htl, .. }) => Some(*current_htl),
+            Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
             _ => None,
         }
     }
@@ -121,11 +122,9 @@ impl PutOp {
 
         // Extract key and current_htl from state if available
         let (key, current_htl) = match &self.state {
-            Some(PutState::PrepareRequest { contract, htl, .. }) => {
-                (Some(contract.key()), Some(*htl))
-            }
-            Some(PutState::AwaitingResponse { current_htl, .. }) => (None, Some(*current_htl)),
-            Some(PutState::Finished { key }) => (Some(*key), None),
+            Some(PutState::PrepareRequest(data)) => (Some(data.contract.key()), Some(data.htl)),
+            Some(PutState::AwaitingResponse(data)) => (None, Some(data.current_htl)),
+            Some(PutState::Finished(data)) => (Some(data.key), None),
             None => (None, None),
         };
 
@@ -173,7 +172,7 @@ impl PutOp {
 
 impl IsOperationCompleted for PutOp {
     fn is_completed(&self) -> bool {
-        matches!(self.state, Some(put::PutState::Finished { .. }))
+        matches!(self.state, Some(put::PutState::Finished(_)))
     }
 }
 
@@ -293,17 +292,13 @@ impl Operation for PutOp {
 
             // Extract subscribe flags from state (only relevant for originator)
             let subscribe = match &self.state {
-                Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
-                Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
+                Some(PutState::PrepareRequest(data)) => data.subscribe,
+                Some(PutState::AwaitingResponse(data)) => data.subscribe,
                 _ => false,
             };
             let blocking_subscribe = match &self.state {
-                Some(PutState::PrepareRequest {
-                    blocking_subscribe, ..
-                }) => *blocking_subscribe,
-                Some(PutState::AwaitingResponse {
-                    blocking_subscribe, ..
-                }) => *blocking_subscribe,
+                Some(PutState::PrepareRequest(data)) => data.blocking_subscribe,
+                Some(PutState::AwaitingResponse(data)) => data.blocking_subscribe,
                 _ => false,
             };
 
@@ -480,12 +475,12 @@ impl Operation for PutOp {
 
                         // Transition to AwaitingResponse, preserving subscribe flags for originator
                         // Store next_hop so handle_notification_msg can route the message
-                        let new_state = Some(PutState::AwaitingResponse {
+                        let new_state = Some(PutState::AwaitingResponse(AwaitingResponseData {
                             subscribe,
                             blocking_subscribe,
                             next_hop: Some(next_addr),
                             current_htl: htl,
-                        });
+                        }));
 
                         stats = Some(PutStats {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
@@ -541,7 +536,7 @@ impl Operation for PutOp {
 
                             Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
                                 id,
-                                state: Some(PutState::Finished { key }),
+                                state: Some(PutState::Finished(FinishedData { key })),
                                 upstream_addr: None,
                                 stats,
                             })))
@@ -600,9 +595,7 @@ impl Operation for PutOp {
                         // Emit put_success telemetry
                         // Calculate hop_count from current_htl in state
                         let current_htl = match &self.state {
-                            Some(PutState::AwaitingResponse { current_htl, .. }) => {
-                                Some(*current_htl)
-                            }
+                            Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
                             _ => None,
                         };
                         let hop_count = current_htl
@@ -629,7 +622,7 @@ impl Operation for PutOp {
 
                         Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
                             id,
-                            state: Some(PutState::Finished { key: *key }),
+                            state: Some(PutState::Finished(FinishedData { key: *key })),
                             upstream_addr: None,
                             stats,
                         })))
@@ -948,12 +941,12 @@ impl Operation for PutOp {
                         // Forwarding nodes always use non-blocking subscriptions:
                         // blocking_subscribe is a client-side preference that only
                         // applies to the originator node.
-                        let new_state = Some(PutState::AwaitingResponse {
+                        let new_state = Some(PutState::AwaitingResponse(AwaitingResponseData {
                             subscribe: *msg_subscribe,
                             blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
-                        });
+                        }));
 
                         stats = Some(PutStats {
                             target_peer: PeerKeyLocation::from(
@@ -1008,12 +1001,12 @@ impl Operation for PutOp {
                         // Forwarding nodes always use non-blocking subscriptions:
                         // blocking_subscribe is a client-side preference that only
                         // applies to the originator node.
-                        let new_state = Some(PutState::AwaitingResponse {
+                        let new_state = Some(PutState::AwaitingResponse(AwaitingResponseData {
                             subscribe: *msg_subscribe,
                             blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
-                        });
+                        }));
 
                         stats = Some(PutStats {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
@@ -1065,7 +1058,7 @@ impl Operation for PutOp {
 
                             Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
                                 id,
-                                state: Some(PutState::Finished { key }),
+                                state: Some(PutState::Finished(FinishedData { key })),
                                 upstream_addr: None,
                                 stats,
                             })))
@@ -1118,7 +1111,7 @@ impl Operation for PutOp {
 
                     // Extract current HTL for telemetry
                     let current_htl = match &self.state {
-                        Some(PutState::AwaitingResponse { current_htl, .. }) => Some(*current_htl),
+                        Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
                         _ => None,
                     };
 
@@ -1153,7 +1146,7 @@ impl Operation for PutOp {
 
                         Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
                             id,
-                            state: Some(PutState::Finished { key: *key }),
+                            state: Some(PutState::Finished(FinishedData { key: *key })),
                             upstream_addr: None,
                             stats,
                         })))
@@ -1237,14 +1230,14 @@ pub(crate) fn start_op(
     tracing::debug!(contract_location = %contract_location, contract = %key, phase = "request", "Requesting put");
 
     let id = Transaction::new::<PutMsg>();
-    let state = Some(PutState::PrepareRequest {
+    let state = Some(PutState::PrepareRequest(PrepareRequestData {
         contract,
         related_contracts,
         value,
         htl,
         subscribe,
         blocking_subscribe,
-    });
+    }));
 
     PutOp {
         id,
@@ -1268,14 +1261,14 @@ pub(crate) fn start_op_with_id(
     let contract_location = Location::from(&key);
     tracing::debug!(contract_location = %contract_location, contract = %key, tx = %id, phase = "request", "Requesting put with existing transaction ID");
 
-    let state = Some(PutState::PrepareRequest {
+    let state = Some(PutState::PrepareRequest(PrepareRequestData {
         contract,
         related_contracts,
         value,
         htl,
         subscribe,
         blocking_subscribe,
-    });
+    }));
 
     PutOp {
         id,
@@ -1285,13 +1278,87 @@ pub(crate) fn start_op_with_id(
     }
 }
 
-/// State machine for PUT operations.
-///
-/// State transitions:
-/// - Originator: PrepareRequest → AwaitingResponse → Finished
-/// - Forwarder: (receives Request) → AwaitingResponse → (receives Response) → done
-/// - Final node: (receives Request) → stores contract → sends Response → done
-///
+// State machine for PUT operations.
+//
+// State transitions:
+// - Originator: PrepareRequest → AwaitingResponse → Finished
+// - Forwarder: (receives Request) → AwaitingResponse → (receives Response) → done
+// - Final node: (receives Request) → stores contract → sends Response → done
+//
+// ── Type-state data structs ──────────────────────────────────────────────
+//
+// Each state in the PUT state machine is a named struct with typed
+// transition methods.  This gives compile-time guarantees:
+//
+//   PrepareRequest ── into_awaiting_response() ──► AwaitingResponse
+//   AwaitingResponse ── into_finished()         ──► Finished
+//
+// Invalid transitions (e.g. Finished → PrepareRequest) are unrepresentable
+// because the target type simply has no such method.
+
+/// Data for the PrepareRequest state: originator preparing initial PUT request.
+#[derive(Debug, Clone)]
+pub struct PrepareRequestData {
+    pub contract: ContractContainer,
+    pub related_contracts: RelatedContracts<'static>,
+    pub value: WrappedState,
+    pub htl: usize,
+    /// If true, start a subscription after PUT completes
+    pub subscribe: bool,
+    /// If true, the PUT response waits for the subscription to complete
+    pub blocking_subscribe: bool,
+}
+
+impl PrepareRequestData {
+    /// Transition to AwaitingResponse after sending the PUT request.
+    ///
+    /// Encodes valid transition: PrepareRequest → AwaitingResponse.
+    /// The subscribe/blocking_subscribe flags are carried forward.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern
+    pub fn into_awaiting_response(
+        self,
+        next_hop: Option<std::net::SocketAddr>,
+    ) -> AwaitingResponseData {
+        AwaitingResponseData {
+            subscribe: self.subscribe,
+            blocking_subscribe: self.blocking_subscribe,
+            next_hop,
+            current_htl: self.htl,
+        }
+    }
+}
+
+/// Data for the AwaitingResponse state: waiting for downstream node's response.
+#[derive(Debug, Clone)]
+pub struct AwaitingResponseData {
+    /// If true, start a subscription after PUT completes (originator only)
+    pub subscribe: bool,
+    /// If true, the PUT response waits for the subscription to complete
+    pub blocking_subscribe: bool,
+    /// Next hop address for routing the outbound message
+    pub next_hop: Option<std::net::SocketAddr>,
+    /// Current HTL (remaining hops) for hop_count calculation.
+    pub current_htl: usize,
+}
+
+impl AwaitingResponseData {
+    /// Transition to Finished on successful PUT response.
+    ///
+    /// Encodes valid transition: AwaitingResponse → Finished.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern
+    pub fn into_finished(self, key: ContractKey) -> FinishedData {
+        FinishedData { key }
+    }
+}
+
+/// Data for the Finished state: PUT operation completed successfully.
+#[derive(Debug, Clone, Copy)]
+pub struct FinishedData {
+    pub key: ContractKey,
+}
+
+// ── State enum (wraps the typed structs) ─────────────────────────────────
+
 /// Streaming flow (when enabled and payload > threshold):
 /// State machine for PUT operations.
 /// - Originator: PrepareRequest → AwaitingResponse → Finished
@@ -1299,29 +1366,11 @@ pub(crate) fn start_op_with_id(
 #[derive(Debug, Clone)]
 pub enum PutState {
     /// Local originator preparing to send initial request.
-    PrepareRequest {
-        contract: ContractContainer,
-        related_contracts: RelatedContracts<'static>,
-        value: WrappedState,
-        htl: usize,
-        /// If true, start a subscription after PUT completes
-        subscribe: bool,
-        /// If true, the PUT response waits for the subscription to complete
-        blocking_subscribe: bool,
-    },
+    PrepareRequest(PrepareRequestData),
     /// Waiting for response from downstream node.
-    AwaitingResponse {
-        /// If true, start a subscription after PUT completes (originator only)
-        subscribe: bool,
-        /// If true, the PUT response waits for the subscription to complete
-        blocking_subscribe: bool,
-        /// Next hop address for routing the outbound message
-        next_hop: Option<std::net::SocketAddr>,
-        /// Current HTL (remaining hops) for hop_count calculation.
-        current_htl: usize,
-    },
+    AwaitingResponse(AwaitingResponseData),
     /// Operation completed successfully.
-    Finished { key: ContractKey },
+    Finished(FinishedData),
 }
 
 /// Request to insert/update a value into a contract.
@@ -1329,21 +1378,14 @@ pub enum PutState {
 pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result<(), OpError> {
     let (id, contract, value, related_contracts, htl, subscribe, blocking_subscribe) =
         match &put_op.state {
-            Some(PutState::PrepareRequest {
-                contract,
-                value,
-                related_contracts,
-                htl,
-                subscribe,
-                blocking_subscribe,
-            }) => (
+            Some(PutState::PrepareRequest(data)) => (
                 put_op.id,
-                contract.clone(),
-                value.clone(),
-                related_contracts.clone(),
-                *htl,
-                *subscribe,
-                *blocking_subscribe,
+                data.contract.clone(),
+                data.value.clone(),
+                data.related_contracts.clone(),
+                data.htl,
+                data.subscribe,
+                data.blocking_subscribe,
             ),
             _ => {
                 tracing::error!(
@@ -1381,12 +1423,12 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
     // next_hop is None initially - we process locally first then determine routing
     let new_op = PutOp {
         id,
-        state: Some(PutState::AwaitingResponse {
+        state: Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe,
             blocking_subscribe,
             next_hop: None,
             current_htl: htl,
-        }),
+        })),
         upstream_addr: None,
         stats: None,
     };
@@ -1626,9 +1668,9 @@ mod tests {
 
     #[test]
     fn put_op_finalized_when_state_is_finished() {
-        let op = make_put_op(Some(PutState::Finished {
+        let op = make_put_op(Some(PutState::Finished(FinishedData {
             key: make_contract_key(1),
-        }));
+        })));
         assert!(
             op.finalized(),
             "PutOp should be finalized when state is Finished"
@@ -1637,12 +1679,12 @@ mod tests {
 
     #[test]
     fn put_op_not_finalized_when_awaiting_response() {
-        let op = make_put_op(Some(PutState::AwaitingResponse {
+        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe: false,
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
-        }));
+        })));
         assert!(
             !op.finalized(),
             "PutOp should not be finalized in AwaitingResponse state"
@@ -1653,7 +1695,7 @@ mod tests {
     #[test]
     fn put_op_to_host_result_success_when_finished() {
         let key = make_contract_key(1);
-        let op = make_put_op(Some(PutState::Finished { key }));
+        let op = make_put_op(Some(PutState::Finished(FinishedData { key })));
         let result = op.to_host_result();
         assert!(
             result.is_ok(),
@@ -1672,12 +1714,12 @@ mod tests {
 
     #[test]
     fn put_op_to_host_result_error_when_not_finished() {
-        let op = make_put_op(Some(PutState::AwaitingResponse {
+        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe: false,
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
-        }));
+        })));
         let result = op.to_host_result();
         assert!(
             result.is_err(),
@@ -1698,9 +1740,9 @@ mod tests {
     // Tests for is_completed() trait method
     #[test]
     fn put_op_is_completed_when_finished() {
-        let op = make_put_op(Some(PutState::Finished {
+        let op = make_put_op(Some(PutState::Finished(FinishedData {
             key: make_contract_key(1),
-        }));
+        })));
         assert!(
             op.is_completed(),
             "is_completed should return true for Finished state"
@@ -1709,12 +1751,12 @@ mod tests {
 
     #[test]
     fn put_op_is_not_completed_when_in_progress() {
-        let op = make_put_op(Some(PutState::AwaitingResponse {
+        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe: false,
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
-        }));
+        })));
         assert!(
             !op.is_completed(),
             "is_completed should return false for AwaitingResponse state"
@@ -1759,9 +1801,8 @@ mod tests {
             true, // blocking_subscribe
         );
         match op.state {
-            Some(PutState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(PutState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     blocking_subscribe,
                     "blocking_subscribe should be true in PrepareRequest"
@@ -1785,9 +1826,8 @@ mod tests {
             tx,
         );
         match op.state {
-            Some(PutState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(PutState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     blocking_subscribe,
                     "blocking_subscribe should be true in PrepareRequest via start_op_with_id"
@@ -1807,9 +1847,9 @@ mod tests {
         let contract_location = Location::random();
         let op = PutOp {
             id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::Finished {
+            state: Some(PutState::Finished(FinishedData {
                 key: make_contract_key(1),
-            }),
+            })),
             upstream_addr: None,
             stats: Some(PutStats {
                 target_peer: target_peer.clone(),
@@ -1834,9 +1874,9 @@ mod tests {
 
         let op = PutOp {
             id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::Finished {
+            state: Some(PutState::Finished(FinishedData {
                 key: make_contract_key(1),
-            }),
+            })),
             upstream_addr: None,
             stats: None,
         };
@@ -1852,12 +1892,12 @@ mod tests {
         let contract_location = Location::random();
         let op = PutOp {
             id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::AwaitingResponse {
+            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
                 subscribe: false,
                 blocking_subscribe: false,
                 next_hop: None,
                 current_htl: 10,
-            }),
+            })),
             upstream_addr: None,
             stats: Some(PutStats {
                 target_peer: target_peer.clone(),
@@ -1880,12 +1920,12 @@ mod tests {
     fn put_op_outcome_incomplete_when_not_finalized_without_stats() {
         use crate::operations::OpOutcome;
 
-        let op = make_put_op(Some(PutState::AwaitingResponse {
+        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe: false,
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
-        }));
+        })));
         assert!(matches!(op.outcome(), OpOutcome::Incomplete));
     }
 
@@ -1927,9 +1967,8 @@ mod tests {
             false, // blocking_subscribe
         );
         match op.state {
-            Some(PutState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(PutState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     !blocking_subscribe,
                     "blocking_subscribe should be false by default"
@@ -1972,14 +2011,14 @@ mod tests {
         // Step 1: Initial state - no stats, PrepareRequest
         let mut op = PutOp {
             id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::PrepareRequest {
+            state: Some(PutState::PrepareRequest(PrepareRequestData {
                 contract: make_test_contract(&[1u8]),
                 related_contracts: RelatedContracts::default(),
                 value: WrappedState::new(vec![]),
                 htl: 10,
                 subscribe: false,
                 blocking_subscribe: false,
-            }),
+            })),
             upstream_addr: None,
             stats: None,
         };
@@ -1991,12 +2030,12 @@ mod tests {
             target_peer: target_peer.clone(),
             contract_location,
         });
-        op.state = Some(PutState::AwaitingResponse {
+        op.state = Some(PutState::AwaitingResponse(AwaitingResponseData {
             subscribe: false,
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 9,
-        });
+        }));
         // Not finalized yet, but has stats → failure
         match op.outcome() {
             OpOutcome::ContractOpFailure {
@@ -2007,9 +2046,9 @@ mod tests {
         assert!(op.failure_routing_info().is_some());
 
         // Step 3: Operation finishes successfully
-        op.state = Some(PutState::Finished {
+        op.state = Some(PutState::Finished(FinishedData {
             key: make_contract_key(1),
-        });
+        }));
         match op.outcome() {
             OpOutcome::ContractOpSuccessUntimed {
                 target_peer: peer,

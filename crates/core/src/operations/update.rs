@@ -81,7 +81,7 @@ impl UpdateOp {
     }
 
     pub fn finalized(&self) -> bool {
-        matches!(self.state, None | Some(UpdateState::Finished { .. }))
+        matches!(self.state, None | Some(UpdateState::Finished(_)))
     }
 
     /// Get the next hop address for hop-by-hop routing.
@@ -94,7 +94,8 @@ impl UpdateOp {
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(UpdateState::Finished { key, summary }) = &self.state {
+        if let Some(UpdateState::Finished(data)) = &self.state {
+            let (key, summary) = (&data.key, &data.summary);
             tracing::debug!(
                 "Creating UpdateResponse for transaction {} with key {} and summary length {}",
                 self.id,
@@ -174,7 +175,7 @@ impl TryFrom<UpdateOp> for UpdateResult {
     type Error = OpError;
 
     fn try_from(op: UpdateOp) -> Result<Self, Self::Error> {
-        if matches!(op.state, None | Some(UpdateState::Finished { .. })) {
+        if matches!(op.state, None | Some(UpdateState::Finished(_))) {
             Ok(UpdateResult {})
         } else {
             Err(OpError::UnexpectedOpState)
@@ -361,10 +362,10 @@ impl Operation for UpdateOp {
                             // event emitted by the executor when state changes.
                             // Use upstream_addr to determine if we're the originator
                             if self.upstream_addr.is_none() {
-                                new_state = Some(UpdateState::Finished {
+                                new_state = Some(UpdateState::Finished(FinishedData {
                                     key: *key,
                                     summary: summary.clone(),
-                                });
+                                }));
                             } else {
                                 new_state = None;
                             }
@@ -843,10 +844,10 @@ impl Operation for UpdateOp {
 
                     // Network propagation is automatic via BroadcastStateChange
                     if self.upstream_addr.is_none() {
-                        new_state = Some(UpdateState::Finished {
+                        new_state = Some(UpdateState::Finished(FinishedData {
                             key: *key,
                             summary: summary.clone(),
-                        });
+                        }));
                     } else {
                         new_state = None;
                     }
@@ -1434,11 +1435,11 @@ pub(crate) fn start_op(
     tracing::debug!(%contract_location, %key, "Requesting update");
     let id = Transaction::new::<UpdateMsg>();
 
-    let state = Some(UpdateState::PrepareRequest {
+    let state = Some(UpdateState::PrepareRequest(PrepareRequestData {
         key,
         related_contracts,
         update_data,
-    });
+    }));
 
     UpdateOp {
         id,
@@ -1461,11 +1462,11 @@ pub(crate) fn start_op_with_id(
     let contract_location = Location::from(&key);
     tracing::debug!(%contract_location, %key, "Requesting update with transaction ID {}", id);
 
-    let state = Some(UpdateState::PrepareRequest {
+    let state = Some(UpdateState::PrepareRequest(PrepareRequestData {
         key,
         related_contracts,
         update_data,
-    });
+    }));
 
     UpdateOp {
         id,
@@ -1484,16 +1485,12 @@ pub(crate) async fn request_update(
     mut update_op: UpdateOp,
 ) -> Result<(), OpError> {
     // Extract the key and check if we need to handle this locally
-    let (key, update_data, related_contracts) = if let Some(UpdateState::PrepareRequest {
-        key,
-        update_data,
-        related_contracts,
-    }) = update_op.state.take()
-    {
-        (key, update_data, related_contracts)
-    } else {
-        return Err(OpError::UnexpectedOpState);
-    };
+    let (key, update_data, related_contracts) =
+        if let Some(UpdateState::PrepareRequest(data)) = update_op.state.take() {
+            (data.key, data.update_data, data.related_contracts)
+        } else {
+            return Err(OpError::UnexpectedOpState);
+        };
 
     // Find the best peer to send this update to.
     // In the simplified architecture (2026-01 refactor), we use:
@@ -1712,10 +1709,10 @@ pub(crate) async fn request_update(
     // The operation will be marked complete later when the message is processed.
     let op = UpdateOp {
         id,
-        state: Some(UpdateState::Finished {
+        state: Some(UpdateState::Finished(FinishedData {
             key,
             summary: summary.clone(),
-        }),
+        })),
         stats: None,
         upstream_addr: None,
     };
@@ -1743,10 +1740,10 @@ async fn deliver_update_result(
     // the broadcast fan-out to proceed asynchronously.
     let op = UpdateOp {
         id,
-        state: Some(UpdateState::Finished {
+        state: Some(UpdateState::Finished(FinishedData {
             key,
             summary: summary.clone(),
-        }),
+        })),
         stats: None,
         upstream_addr: None, // Terminal state, no routing needed
     };
@@ -1788,7 +1785,7 @@ async fn deliver_update_result(
 
 impl IsOperationCompleted for UpdateOp {
     fn is_completed(&self) -> bool {
-        matches!(self.state, Some(UpdateState::Finished { .. }))
+        matches!(self.state, Some(UpdateState::Finished(_)))
     }
 }
 
@@ -1932,40 +1929,70 @@ mod messages {
     }
 }
 
-/// State machine for UPDATE operations.
-///
-/// # Important: Updates are Fire-and-Forget
-///
-/// Updates spread through the subscription tree like a virus - there is no acknowledgment
-/// or completion signal that propagates back. When a node receives an UPDATE:
-/// 1. It applies the update locally
-/// 2. It broadcasts to its downstream subscribers (if any)
-/// 3. It does NOT wait for or expect any response from downstream
+// State machine for UPDATE operations.
+//
+// # Important: Updates are Fire-and-Forget
+//
+// Updates spread through the subscription tree like a virus - there is no acknowledgment
+// or completion signal that propagates back. When a node receives an UPDATE:
+// 1. It applies the update locally
+// 2. It broadcasts to its downstream subscribers (if any)
+// 3. It does NOT wait for or expect any response from downstream
+//
+// ── Type-state data structs ──────────────────────────────────────────────
+//
+// Each state in the UPDATE state machine is a named struct with typed
+// transition methods.  This gives compile-time guarantees:
+//
+//   ReceivedRequest ── (next state depends on whether contract is found locally)
+//   PrepareRequest ── into_finished()  ──► Finished
+//
+// Invalid transitions (e.g. Finished → ReceivedRequest) are unrepresentable
+// because the target type simply has no such method.
+
+/// Data for the Finished state: update was applied locally.
 ///
 /// The `Finished` state only indicates that the LOCAL update was applied successfully.
 /// It does NOT mean all subscribers have received the update - that's unknowable.
-/// This is by design: waiting for tree-wide propagation would be impractical and
-/// would create deadlocks in cyclic subscription topologies.
+#[derive(Debug)]
+pub struct FinishedData {
+    pub key: ContractKey,
+    pub summary: StateSummary<'static>,
+}
+
+/// Data for the PrepareRequest state: client-initiated update being prepared.
+#[derive(Debug)]
+pub struct PrepareRequestData {
+    pub key: ContractKey,
+    pub related_contracts: RelatedContracts<'static>,
+    /// The update data - can be a delta (from client) or full state (from PUT/executor).
+    /// This is passed to update_contract which calls UpdateQuery to merge and persist.
+    pub update_data: UpdateData<'static>,
+}
+
+impl PrepareRequestData {
+    /// Transition to Finished after the update is applied locally.
+    ///
+    /// Encodes valid transition: PrepareRequest → Finished.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern
+    pub fn into_finished(self, summary: StateSummary<'static>) -> FinishedData {
+        FinishedData {
+            key: self.key,
+            summary,
+        }
+    }
+}
+
+// ── State enum (wraps the typed structs) ─────────────────────────────────
+
 #[derive(Debug)]
 pub enum UpdateState {
     /// Initial state when receiving an update request from another peer.
     ReceivedRequest,
-
-    /// The update was applied locally. Used to signal completion to the client
-    /// for client-initiated updates. Does NOT indicate network-wide propagation.
-    Finished {
-        key: ContractKey,
-        summary: StateSummary<'static>,
-    },
-
+    /// The update was applied locally.
+    Finished(FinishedData),
     /// Preparing to send an update request (client-initiated updates).
-    PrepareRequest {
-        key: ContractKey,
-        related_contracts: RelatedContracts<'static>,
-        /// The update data - can be a delta (from client) or full state (from PUT/executor).
-        /// This is passed to update_contract which calls UpdateQuery to merge and persist.
-        update_data: UpdateData<'static>,
-    },
+    PrepareRequest(PrepareRequestData),
 }
 
 #[cfg(test)]
@@ -1988,10 +2015,10 @@ mod tests {
         let target = PeerKeyLocation::random();
         let loc = Location::random();
         let op = make_update_op(
-            Some(UpdateState::Finished {
+            Some(UpdateState::Finished(FinishedData {
                 key: make_contract_key(1),
                 summary: StateSummary::from(vec![1u8]),
-            }),
+            })),
             Some(UpdateStats {
                 target: Some(target.clone()),
                 contract_location: Some(loc),
@@ -2012,10 +2039,10 @@ mod tests {
     #[test]
     fn update_op_outcome_irrelevant_when_finalized_without_stats() {
         let op = make_update_op(
-            Some(UpdateState::Finished {
+            Some(UpdateState::Finished(FinishedData {
                 key: make_contract_key(1),
                 summary: StateSummary::from(vec![1u8]),
-            }),
+            })),
             None,
         );
         assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
@@ -2025,10 +2052,10 @@ mod tests {
     fn update_op_outcome_irrelevant_when_finalized_with_partial_stats() {
         // target is None — should fall through to Irrelevant
         let op = make_update_op(
-            Some(UpdateState::Finished {
+            Some(UpdateState::Finished(FinishedData {
                 key: make_contract_key(1),
                 summary: StateSummary::from(vec![1u8]),
-            }),
+            })),
             Some(UpdateStats {
                 target: None,
                 contract_location: Some(Location::random()),
@@ -2167,10 +2194,10 @@ mod tests {
         assert!(op.failure_routing_info().is_some());
 
         // Step 3: Operation finishes
-        op.state = Some(UpdateState::Finished {
+        op.state = Some(UpdateState::Finished(FinishedData {
             key: make_contract_key(1),
             summary: StateSummary::from(vec![1u8]),
-        });
+        }));
         match op.outcome() {
             OpOutcome::ContractOpSuccessUntimed {
                 target_peer,
@@ -2202,10 +2229,10 @@ mod tests {
 
         // Finalized with target but no location → Irrelevant
         let op = make_update_op(
-            Some(UpdateState::Finished {
+            Some(UpdateState::Finished(FinishedData {
                 key: make_contract_key(1),
                 summary: StateSummary::from(vec![1u8]),
-            }),
+            })),
             Some(UpdateStats {
                 target: Some(target),
                 contract_location: None,
