@@ -10,12 +10,17 @@ mod common;
 
 use anyhow::Result;
 use common::{
-    connect_ws_with_retry, deploy_contract, get_contract_state, subscribe_to_contract,
-    update_contract_state,
+    connect_ws_with_retry, get_contract_state, load_contract, subscribe_to_contract,
+    update_contract_state, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
+use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest},
+    prelude::*,
+};
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 /// Test contract operations (PUT -> SUBSCRIBE -> UPDATE -> GET) across a
 /// Docker NAT network with 1 gateway and 3 peers.
@@ -58,10 +63,41 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
     let mut gw_client = connect_ws_with_retry(&gw_url, "gateway", 30).await?;
     let mut peer_client = connect_ws_with_retry(&peer_url, "peer0", 30).await?;
 
-    // --- Deploy contract from gateway (PUT + subscribe) ---
-    let options = PingContractOptions::default();
-    let initial_state = Ping::default();
-    let contract_key = deploy_contract(&mut gw_client, initial_state, &options, true).await?;
+    // --- Load and deploy contract from gateway (PUT + subscribe) ---
+    let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
+
+    // Compile contract WASM from source, get code hash for proper options
+    let temp_options = PingContractOptions {
+        frequency: Duration::from_secs(5),
+        ttl: Duration::from_secs(30),
+        tag: APP_TAG.to_string(),
+        code_key: String::new(),
+    };
+    let temp_params = Parameters::from(serde_json::to_vec(&temp_options)?);
+    let container = load_contract(&path_to_code, temp_params)?;
+    let code_hash = CodeHash::from_code(container.data());
+
+    let options = PingContractOptions {
+        frequency: Duration::from_secs(5),
+        ttl: Duration::from_secs(30),
+        tag: APP_TAG.to_string(),
+        code_key: code_hash.to_string(),
+    };
+    let params = Parameters::from(serde_json::to_vec(&options)?);
+    let container = load_contract(&path_to_code, params)?;
+    let contract_key = container.key();
+
+    let initial_state = WrappedState::new(serde_json::to_vec(&Ping::default())?);
+    gw_client
+        .send(ClientRequest::ContractOp(ContractRequest::Put {
+            contract: container,
+            state: initial_state,
+            related_contracts: RelatedContracts::new(),
+            subscribe: true,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    wait_for_put_response(&mut gw_client, &contract_key).await?;
     tracing::info!("Contract deployed: {contract_key}");
 
     // --- Subscribe from peer ---
@@ -72,7 +108,6 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // --- Update state from gateway ---
-    // Ping::insert() adds a timestamped entry under the given peer name.
     let mut update = Ping::default();
     update.insert("nat-test-node".to_string());
     update_contract_state(&mut gw_client, contract_key, update).await?;
