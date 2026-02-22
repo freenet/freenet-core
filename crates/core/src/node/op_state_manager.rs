@@ -303,6 +303,7 @@ impl OpManager {
         event_register: ER,
         connection_manager: ConnectionManager,
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+        task_monitor: &super::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -310,6 +311,7 @@ impl OpManager {
             event_register.clone(),
             config.is_gateway,
             connection_manager,
+            task_monitor,
         )?;
         let ops = Arc::new(Ops::default());
 
@@ -328,21 +330,24 @@ impl OpManager {
             Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        GlobalExecutor::spawn(
-            garbage_cleanup_task(
-                rx,
-                ops.clone(),
-                ring.live_tx_tracker.clone(),
-                notification_channel.clone(),
-                event_register,
-                sub_op_tracker.clone(),
-                result_router_tx.clone(),
-                request_router.clone(),
-                ring.clone(),
-                ch_outbound.clone(),
-                contract_waiters.clone(),
-            )
-            .instrument(garbage_span),
+        task_monitor.register(
+            "garbage_cleanup",
+            GlobalExecutor::spawn(
+                garbage_cleanup_task(
+                    rx,
+                    ops.clone(),
+                    ring.live_tx_tracker.clone(),
+                    notification_channel.clone(),
+                    event_register,
+                    sub_op_tracker.clone(),
+                    result_router_tx.clone(),
+                    request_router.clone(),
+                    ring.clone(),
+                    ch_outbound.clone(),
+                    contract_waiters.clone(),
+                )
+                .instrument(garbage_span),
+            ),
         );
 
         // Gateways are ready immediately (peer_id set from config)

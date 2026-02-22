@@ -772,11 +772,11 @@ macro_rules! deterministic_select {
         ];
 
         let output = {
-            let mut fut1 = $fut1;
-            let mut fut2 = $fut2;
-            let mut fut3 = $fut3;
-            let mut fut4 = $fut4;
-            let mut fut5 = $fut5;
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
+            let fut4 = $fut4;
+            let fut5 = $fut5;
             tokio::pin!(fut1);
             tokio::pin!(fut2);
             tokio::pin!(fut3);
