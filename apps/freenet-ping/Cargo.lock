@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.138"
+version = "0.1.144"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1302,6 +1302,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sha2",
+ "socket2 0.5.10",
  "stretto",
  "tar",
  "tempfile",
