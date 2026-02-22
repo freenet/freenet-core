@@ -333,6 +333,7 @@ impl<ER> Builder<ER> {
     ///
     /// Same as `run_node_with_shared_storage` but uses `MockWasmContractHandler` instead of
     /// `SimulationContractHandler`.
+    #[allow(dead_code)]
     pub async fn run_node_with_mock_wasm<UsrEv>(
         self,
         user_events: UsrEv,

@@ -1258,8 +1258,6 @@ mod tests {
     /// feeds router's failure_estimator.
     #[test]
     fn test_get_partial_timing_feeds_router() {
-        use crate::operations::OpOutcome;
-
         let target_peer = PeerKeyLocation::random();
         let contract_location = Location::random();
 

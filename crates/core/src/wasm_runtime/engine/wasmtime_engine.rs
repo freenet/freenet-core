@@ -213,6 +213,27 @@ impl ResourceLimiter for HostState {
         const MAX_TABLE_ELEMENTS: usize = 10_000;
         Ok(desired <= MAX_TABLE_ELEMENTS)
     }
+
+    /// Disable wasmtime's per-Store instance limit.
+    ///
+    /// Wasmtime's `Store` has a monotonic instance counter (only incremented in
+    /// `Store::check_new_instance`, never decremented) with a default limit of 10,000.
+    /// Since freenet properly cleans up instances (drops them from the HashMap and frees
+    /// their memory), we hit this artificial limit during long-running gateway sessions
+    /// where the 5-minute interest heartbeat calls `summarize_state()` for every contract,
+    /// each creating a WASM instance. With hundreds of contracts the store exhausts
+    /// within ~100 minutes.
+    fn instances(&self) -> usize {
+        usize::MAX
+    }
+
+    fn tables(&self) -> usize {
+        usize::MAX
+    }
+
+    fn memories(&self) -> usize {
+        usize::MAX
+    }
 }
 
 impl WasmEngine for WasmtimeEngine {
@@ -1063,6 +1084,26 @@ mod tests {
 
         let result = Module::new(&engine, SIMPLE_WASM);
         assert!(result.is_ok(), "Failed to compile simple WASM module");
+    }
+
+    /// Regression test for Report 2RDXTD: wasmtime's per-Store instance counter is
+    /// monotonic (never decremented) with a default limit of 10,000. Our ResourceLimiter
+    /// override sets instances() to usize::MAX so long-running gateways don't exhaust.
+    /// This test creates and drops >10,000 instances on a single Store to verify.
+    #[test]
+    fn test_instance_limit_override_allows_many_instances() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create and drop 10,001 instances on the same store — exceeds wasmtime's
+        // default 10,000 limit. Without our ResourceLimiter override this would fail.
+        for i in 0..10_001 {
+            let handle = engine
+                .create_instance(&module, i, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
     }
 
     #[test]
