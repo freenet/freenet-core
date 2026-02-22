@@ -26,7 +26,7 @@ use std::time::Duration;
 /// 3. Subscriptions work across NAT
 /// 4. State updates are received by subscribing peers
 #[ignore] // Only runs when FREENET_TEST_DOCKER_NAT=1
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")] // Docker backend uses block_in_place()
 async fn test_contract_operations_via_docker_nat() -> Result<()> {
     // Require Docker NAT env var — fail loudly if someone removes #[ignore]
     // and runs this without Docker.
