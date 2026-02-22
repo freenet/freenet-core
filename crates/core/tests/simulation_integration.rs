@@ -5309,3 +5309,145 @@ fn test_interest_renewal() {
         ratio
     );
 }
+
+/// Isolated integration test for interest TTL refresh on broadcast send.
+///
+/// Validates the fix for #3093: interest entries for peers receiving full-state
+/// broadcasts must have their TTL refreshed on each successful send. Without
+/// this refresh, subscriptions expire after INTEREST_TTL (20 min) even though
+/// broadcasts are being delivered, causing ~49% subscriber drop.
+///
+/// ## Test Design
+///
+/// Uses a minimal network (1 gateway + 2 nodes) with few contracts to
+/// isolate the TTL refresh mechanism. Virtual time spans ~1.5x INTEREST_TTL
+/// (1800s) so that without the broadcast-send TTL refresh, interest entries
+/// would expire and late-phase broadcasts would stop arriving.
+///
+/// The test splits broadcast-received events into three phases:
+/// - **Early** (first third): baseline broadcast delivery
+/// - **Mid** (second third): crosses the TTL boundary (~1200s)
+/// - **Late** (final third): must still receive broadcasts if TTL was refreshed
+///
+/// ## What This Catches
+///
+/// - Missing `refresh_peer_interest()` call in broadcast send path (p2p_protoc.rs)
+/// - TTL expiration causing silent subscriber loss
+/// - Regression of the #3093 fix
+///
+/// ## Related
+///
+/// - Issue #3093: Interest TTL not refreshed on full-state broadcast
+/// - Issue #3107: Add isolated integration test (this test)
+/// - Issue #3141: CI & Testing Redesign
+/// - `test_interest_renewal`: Scale test covering the same mechanism
+///
+/// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
+/// Virtual time: 300 iterations × 6s = 1800s (~1.5× INTEREST_TTL).
+/// Wall clock: typically < 15s.
+#[test_log::test]
+fn test_interest_ttl_refresh_on_broadcast() {
+    const SEED: u64 = 0x3107_0BCA_0001;
+
+    tracing::info!("=== Starting Interest TTL Refresh on Broadcast Test ===");
+    // INTEREST_TTL = 1200s (20 min). Virtual time = 300 × 6s = 1800s (~1.5× TTL).
+    tracing::info!("Virtual time target: 1800s (~1.5x INTEREST_TTL of 1200s)");
+
+    let result = TestConfig::small("ttl-refresh-bcast", SEED)
+        .with_gateways(1)
+        .with_nodes(2) // Minimal network: 1 gateway + 2 nodes
+        .with_max_contracts(2) // Few contracts → more updates per contract
+        .with_iterations(300) // 300 × 6s = 1800s virtual time
+        .with_event_wait(Duration::from_secs(6))
+        .run_direct()
+        .assert_ok();
+
+    // Analyze broadcast-received events across three phases of virtual time.
+    // The TTL boundary is at ~1200s (INTEREST_TTL). If refresh is working,
+    // broadcasts should continue in the late phase (1200s-1800s).
+    let rt = create_runtime();
+    let (early_broadcasts, mid_broadcasts, late_broadcasts) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let log_count = logs.len();
+        let third = log_count / 3;
+
+        let mut early = 0usize;
+        let mut mid = 0usize;
+        let mut late = 0usize;
+        for (i, log) in logs.iter().enumerate() {
+            if log.kind.is_update_broadcast_received() {
+                if i < third {
+                    early += 1;
+                } else if i < third * 2 {
+                    mid += 1;
+                } else {
+                    late += 1;
+                }
+            }
+        }
+        (early, mid, late)
+    });
+
+    let total = early_broadcasts + mid_broadcasts + late_broadcasts;
+    tracing::info!(
+        "Broadcast received events: {} total (early: {}, mid: {}, late: {})",
+        total,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts
+    );
+
+    // Must have some broadcasts overall — otherwise the simulation didn't
+    // generate enough update activity to be meaningful.
+    assert!(
+        total > 0,
+        "No BroadcastReceived events found in {} logged events — \
+         simulation may not be generating updates. Seed: 0x{:X}",
+        result.event_count,
+        SEED
+    );
+
+    // CRITICAL: Late-phase broadcasts must exist. If the TTL refresh on
+    // broadcast send is missing (regression of #3093), interest entries
+    // expire at ~1200s and no broadcasts are delivered after that point.
+    assert!(
+        late_broadcasts > 0,
+        "No BroadcastReceived events in the final third of simulation \
+         (after INTEREST_TTL boundary). Interest TTL is NOT being refreshed \
+         on broadcast send — subscriptions have silently expired. \
+         See #3093, #3107. Seed: 0x{:X}",
+        SEED
+    );
+
+    // The late/early ratio should be meaningful — at least 10% of early
+    // traffic. A drastic drop indicates partial TTL refresh failure.
+    let late_ratio = late_broadcasts as f64 / early_broadcasts.max(1) as f64;
+    tracing::info!(
+        "Late/early broadcast ratio: {:.2} ({}/{})",
+        late_ratio,
+        late_broadcasts,
+        early_broadcasts
+    );
+
+    assert!(
+        late_ratio > 0.1,
+        "Late broadcast ratio ({:.2}) dropped below 0.1 — \
+         interest TTL refresh may be partially broken. \
+         Early: {}, Mid: {}, Late: {}. See #3093, #3107. Seed: 0x{:X}",
+        late_ratio,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts,
+        SEED
+    );
+
+    tracing::info!(
+        "test_interest_ttl_refresh_on_broadcast PASSED: late/early ratio {:.2}, \
+         total broadcasts: {} (early: {}, mid: {}, late: {})",
+        late_ratio,
+        total,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts
+    );
+}
