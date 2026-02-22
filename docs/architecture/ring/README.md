@@ -282,7 +282,7 @@ flowchart LR
 **Features:**
 - Hash-based contract discovery
 - Delta sent only if < 50% of full state
-- TTL-based interest expiry (5 minutes)
+- TTL-based interest expiry (20 min) with periodic heartbeat refresh (5 min)
 
 **Code reference:** `crates/core/src/ring/interest.rs`
 

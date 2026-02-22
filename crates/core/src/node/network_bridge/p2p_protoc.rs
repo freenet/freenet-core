@@ -3981,7 +3981,7 @@ impl P2pConnManager {
                 // Issue #3046: Refresh the peer's interest TTL on every successful
                 // broadcast send. Without this, interest entries for peers who only
                 // receive full-state broadcasts (no delta → no update_peer_summary
-                // call) expire after INTEREST_TTL (5 min), even though broadcasts
+                // call) expire after INTEREST_TTL, even though broadcasts
                 // are being successfully delivered. This caused ~49% of River room
                 // subscribers to miss updates.
                 op_manager

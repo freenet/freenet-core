@@ -1727,23 +1727,26 @@ mod tests {
         let current_contracts = manager.get_contracts_for_peer(&peer);
         assert_eq!(current_contracts.len(), 2);
 
-        // Step 2: Find matching contracts from incoming hashes
-        let incoming_contracts: HashSet<ContractKey> = incoming_hashes
-            .iter()
-            .flat_map(|h| manager.lookup_by_hash(*h))
-            .filter(|c| manager.has_local_interest(c))
-            .collect();
-
-        // Step 3: Remove entries not in incoming set
+        // Step 2: Remove entries whose hash is NOT in incoming set
+        // (mirrors the handler's hash-domain comparison, not resolved keys)
         for contract in &current_contracts {
-            if !incoming_contracts.contains(contract) {
+            let h = contract_hash(contract);
+            if !incoming_hashes.contains(&h) {
                 manager.remove_peer_interest(contract, &peer);
             }
         }
 
-        // Step 4: Register/refresh entries in incoming set
-        for contract in &incoming_contracts {
-            manager.register_peer_interest(contract, peer.clone(), None, false);
+        // Step 3: Find matching contracts and register/refresh
+        let matching =
+            manager.get_matching_contracts(&incoming_hashes.iter().copied().collect::<Vec<_>>());
+        for contract in &matching {
+            if manager.get_peer_interest(contract, &peer).is_some() {
+                // Existing entry: refresh TTL (preserves cached summary)
+                manager.refresh_peer_interest(contract, &peer);
+            } else {
+                // New entry
+                manager.register_peer_interest(contract, peer.clone(), None, false);
+            }
         }
 
         // Verify: contract1 removed, contract2 refreshed, contract3 added
@@ -1766,5 +1769,65 @@ mod tests {
             !interest2.is_expired_at(time.now()),
             "contract2 interest should not be expired after refresh"
         );
+    }
+
+    #[test]
+    fn test_refresh_preserves_summary() {
+        // Verify that refresh_peer_interest preserves the cached summary,
+        // unlike register_peer_interest which overwrites it.
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let summary = StateSummary::from(vec![1, 2, 3]);
+
+        // Register with a summary
+        manager.register_peer_interest(&contract, peer.clone(), Some(summary.clone()), false);
+
+        // Advance time
+        time.advance_time(Duration::from_secs(60));
+
+        // Refresh TTL (should preserve summary)
+        manager.refresh_peer_interest(&contract, &peer);
+
+        // Verify summary is still there
+        let cached = manager.get_peer_summary(&contract, &peer);
+        assert!(
+            cached.is_some(),
+            "summary should be preserved after refresh"
+        );
+        assert_eq!(cached.unwrap().as_ref(), summary.as_ref());
+
+        // Verify TTL was reset
+        let interest = manager.get_peer_interest(&contract, &peer).unwrap();
+        assert!(
+            !interest.is_expired_at(time.now()),
+            "interest should not be expired after refresh"
+        );
+    }
+
+    #[test]
+    fn test_register_peer_interest_resets_ttl() {
+        // Verify that register_peer_interest resets TTL for existing entries.
+        // The heartbeat relies on this for new-entry registration.
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        // Register interest
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+        // Advance time to nearly expired
+        time.advance_time(INTEREST_TTL - Duration::from_secs(10));
+
+        // Re-register (as heartbeat would for a new entry)
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+        // Advance time past original registration but not past re-registration
+        time.advance_time(Duration::from_secs(20));
+
+        // Should not be expired
+        let expired = manager.sweep_expired_interests();
+        assert!(expired.is_empty(), "re-registration should have reset TTL");
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
     }
 }

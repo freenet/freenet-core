@@ -1217,6 +1217,10 @@ async fn handle_interest_sync_message(
                     hashes.iter().copied().collect();
                 let current_contracts = op_manager.interest_manager.get_contracts_for_peer(pk);
 
+                // Hash collisions (FNV-1a u32) can cause a stale entry to
+                // survive if its hash collides with a live one. This is the
+                // safe direction — false negatives on removal, not false
+                // positives — and extremely rare in practice.
                 let mut removed = 0usize;
                 for contract in &current_contracts {
                     let h = contract_hash(contract);
@@ -1247,12 +1251,26 @@ async fn handle_interest_sync_message(
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
 
                 if let Some(ref pk) = peer_key {
-                    op_manager.interest_manager.register_peer_interest(
-                        &contract,
-                        pk.clone(),
-                        None, // We'll get their summary in their Summaries response
-                        false,
-                    );
+                    // Refresh TTL for existing entries (preserves cached summary).
+                    // Only register new interest if this is a genuinely new entry;
+                    // otherwise register_peer_interest would overwrite the cached
+                    // summary with None, defeating delta optimization.
+                    if op_manager
+                        .interest_manager
+                        .get_peer_interest(&contract, pk)
+                        .is_some()
+                    {
+                        op_manager
+                            .interest_manager
+                            .refresh_peer_interest(&contract, pk);
+                    } else {
+                        op_manager.interest_manager.register_peer_interest(
+                            &contract,
+                            pk.clone(),
+                            None, // New entry; summary arrives in their Summaries response
+                            false,
+                        );
+                    }
                 }
             }
 

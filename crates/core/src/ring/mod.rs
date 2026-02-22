@@ -560,13 +560,17 @@ impl Ring {
                 continue;
             }
 
-            // Get all connected peer addresses
+            // Get all connected peer addresses (deduplicated)
             let connections = ring.connection_manager.get_connections_by_location();
-            let peer_addrs: Vec<std::net::SocketAddr> = connections
-                .values()
-                .flat_map(|conns| conns.iter())
-                .filter_map(|conn| conn.location.socket_addr())
-                .collect();
+            let peer_addrs: Vec<std::net::SocketAddr> = {
+                let mut seen = HashSet::new();
+                connections
+                    .values()
+                    .flat_map(|conns| conns.iter())
+                    .filter_map(|conn| conn.location.socket_addr())
+                    .filter(|addr| seen.insert(*addr))
+                    .collect()
+            };
 
             if peer_addrs.is_empty() {
                 continue;
@@ -597,6 +601,8 @@ impl Ring {
                     ))
                     .await
                 {
+                    // Channel send failure means the receiver is dropped (node
+                    // shutting down). No point sending to remaining peers.
                     tracing::debug!(
                         peer = %peer_addr,
                         error = %e,
