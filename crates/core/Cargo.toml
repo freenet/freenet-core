@@ -57,6 +57,7 @@ rand = { features = ["small_rng"], workspace = true }
 redb = { workspace = true, optional = true }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
+socket2 = { workspace = true }
 toml = { workspace = true }
 serde_with = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite"], optional = true }

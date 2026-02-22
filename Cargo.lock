@@ -1846,6 +1846,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sha2",
+ "socket2 0.5.10",
  "sqlx",
  "statrs",
  "stretto",
