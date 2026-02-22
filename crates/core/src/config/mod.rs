@@ -573,7 +573,12 @@ impl ConfigArgs {
         };
 
         fs::create_dir_all(this.config_dir())?;
-        gateways.save_to_file(&gateways_file)?;
+        // Only persist gateways when they were fetched from the remote index.
+        // When skip_load_from_network is set (local test networks), the gateways.toml
+        // is managed externally and should not be overwritten.
+        if !self.network_api.skip_load_from_network {
+            gateways.save_to_file(&gateways_file)?;
+        }
 
         if should_persist {
             let path = this.config_dir().join("config.toml");

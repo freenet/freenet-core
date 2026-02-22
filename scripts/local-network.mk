@@ -121,10 +121,13 @@ start-nodes:
 		network_port=$$(( $(BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		ws_port=$$(( $(WS_BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		public_port=$$(( $(WS_BASE_PORT) + $(N_NODES) + $$i )); \
+		node_config_dir="$(BASE_DIR)/n$$i/config"; \
+		mkdir -p "$$node_config_dir"; \
+		cp "$(GW_CONFIG)" "$$node_config_dir/gateways.toml"; \
 		if [ -f "$(LOGS_DIR)/n$$i.log" ]; then : > $(LOGS_DIR)/n$$i.log; fi; \
 		($(ENV_VARS) freenet network \
 			--skip-load-from-network \
-			--config-dir $(BASE_DIR) \
+			--config-dir $$node_config_dir \
 			--ws-api-port $$ws_port \
 			--public-network-port $$public_port \
 			--data-dir $(BASE_DIR)/n$$i \
