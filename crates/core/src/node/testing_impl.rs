@@ -3280,6 +3280,8 @@ impl SimNetwork {
         let mut node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage> =
             HashMap::new();
 
+        let use_mock_wasm = self.use_mock_wasm;
+
         // Register all gateways as Turmoil hosts
         let gateways: Vec<_> = self.gateways.drain(..).collect();
         for (node, config) in gateways {
@@ -3345,12 +3347,21 @@ impl SimNetwork {
                         .take()
                         .expect("Turmoil host should only be called once");
 
-                    node.run_node_with_shared_storage(user_events, span, shared_storage)
-                        .await
-                        .map_err(|e| {
-                            Box::new(std::io::Error::other(e.to_string()))
-                                as Box<dyn std::error::Error>
-                        })
+                    if use_mock_wasm {
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e.to_string()))
+                                    as Box<dyn std::error::Error>
+                            })
+                    } else {
+                        node.run_node_with_shared_storage(user_events, span, shared_storage)
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e.to_string()))
+                                    as Box<dyn std::error::Error>
+                            })
+                    }
                 }
             });
         }
@@ -3419,12 +3430,21 @@ impl SimNetwork {
                         .take()
                         .expect("Turmoil host should only be called once");
 
-                    node.run_node_with_shared_storage(user_events, span, shared_storage)
-                        .await
-                        .map_err(|e| {
-                            Box::new(std::io::Error::other(e.to_string()))
-                                as Box<dyn std::error::Error>
-                        })
+                    if use_mock_wasm {
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e.to_string()))
+                                    as Box<dyn std::error::Error>
+                            })
+                    } else {
+                        node.run_node_with_shared_storage(user_events, span, shared_storage)
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e.to_string()))
+                                    as Box<dyn std::error::Error>
+                            })
+                    }
                 }
             });
         }

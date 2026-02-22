@@ -4654,3 +4654,412 @@ fn test_anti_starvation_exercised() {
 
     result.assert_ok().verify_state_report().check_convergence();
 }
+
+// =============================================================================
+// Contract Lifecycle Synthetic Tests (Stage 3, #3151)
+// =============================================================================
+
+/// Helper: extract per-peer state from logs for a contract and verify propagation.
+///
+/// Returns the peer states map for further inspection.
+fn verify_contract_propagation(
+    rt: &tokio::runtime::Runtime,
+    logs_handle: &Arc<Mutex<Vec<freenet::tracing::NetLogMessage>>>,
+    contract_key: freenet_stdlib::prelude::ContractKey,
+    min_peers: usize,
+) -> BTreeMap<SocketAddr, String> {
+    let contract_key_str = format!("{:?}", contract_key);
+
+    let peer_states: BTreeMap<SocketAddr, String> = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut states = BTreeMap::new();
+        for log in logs.iter() {
+            if let Some(key) = log.kind.contract_key() {
+                if format!("{:?}", key) == contract_key_str {
+                    if let Some(hash) = log.kind.stored_state_hash() {
+                        states.insert(log.peer_id.addr, hash.to_string());
+                    }
+                }
+            }
+        }
+        states
+    });
+
+    tracing::info!(
+        "Contract {} has state on {} peers (need {}): {:?}",
+        contract_key_str,
+        peer_states.len(),
+        min_peers,
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    assert!(
+        peer_states.len() >= min_peers,
+        "Contract {} propagation failed: only {} peer(s) have state, expected at least {}. \
+         Peers with state: {:?}",
+        contract_key_str,
+        peer_states.len(),
+        min_peers,
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    // Verify convergence: all peers should have the same final state hash
+    let unique_states: std::collections::HashSet<&String> = peer_states.values().collect();
+    assert!(
+        unique_states.len() == 1,
+        "Contract {} state divergence: {} unique states across {} peers. States: {:?}",
+        contract_key_str,
+        unique_states.len(),
+        peer_states.len(),
+        peer_states
+    );
+
+    peer_states
+}
+
+/// Six-peer multi-contract lifecycle test — direct replacement for River's
+/// six-peer regression test.
+///
+/// Exercises the complete contract lifecycle with realistic topology:
+/// 2 gateways + 4 nodes, 2 contracts (simulating 2 "rooms").
+///
+/// For each contract:
+///   1. Gateway 0 PUTs with subscribe=true
+///   2. All 5 other peers SUBSCRIBE
+///   3. Gateway 0 sends 3 rounds of UPDATEs
+///   4. Node 1 sends 2 UPDATEs
+///
+/// Catches: broadcast targeting failures (#2794), subscription tree formation
+/// bugs, multi-contract interference.
+#[test_log::test]
+fn test_six_peer_contract_lifecycle() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3151_0001_0001;
+    const NETWORK_NAME: &str = "six-peer-lifecycle";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Create 2 contracts (simulating 2 "rooms")
+    let contract_a = SimOperation::create_test_contract(0xA1);
+    let contract_a_id = *contract_a.key().id();
+    let contract_a_key = contract_a.key();
+    register_crdt_contract(contract_a_id);
+
+    let contract_b = SimOperation::create_test_contract(0xB2);
+    let contract_b_id = *contract_b.key().id();
+    let contract_b_key = contract_b.key();
+    register_crdt_contract(contract_b_id);
+
+    let mut operations = Vec::new();
+
+    // For each contract: gateway 0 puts, all others subscribe, then updates
+    for (contract, contract_id, contract_key, seed_byte) in [
+        (contract_a.clone(), contract_a_id, contract_a_key, 0xA1u8),
+        (contract_b.clone(), contract_b_id, contract_b_key, 0xB2u8),
+    ] {
+        // Gateway 0 puts with subscribe=true
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, seed_byte),
+                subscribe: true,
+            },
+        ));
+
+        // All 5 other peers subscribe: gateway 1, nodes 2-5
+        // (node indices start at number_of_gateways, so with 2 GWs: 2,3,4,5)
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ));
+        for i in 2..=5 {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, i),
+                SimOperation::Subscribe { contract_id },
+            ));
+        }
+
+        // Gateway 0 sends 3 rounds of updates (versions 10, 20, 30)
+        for v in [10u64, 20, 30] {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::gateway(NETWORK_NAME, 0),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: SimOperation::create_crdt_state(v, seed_byte),
+                },
+            ));
+        }
+
+        // Node 2 sends 2 updates (versions 40, 50)
+        for v in [40u64, 50] {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, 2),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: SimOperation::create_crdt_state(v, seed_byte),
+                },
+            ));
+        }
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Six-peer lifecycle simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify both contracts propagated to at least 4 of 6 peers
+    let states_a = verify_contract_propagation(&rt, &logs_handle, contract_a_key, 4);
+    let states_b = verify_contract_propagation(&rt, &logs_handle, contract_b_key, 4);
+
+    tracing::info!(
+        "test_six_peer_contract_lifecycle PASSED: contract_a on {} peers, contract_b on {} peers",
+        states_a.len(),
+        states_b.len()
+    );
+}
+
+/// Same scenario as `test_six_peer_contract_lifecycle` but using MockWasmRuntime.
+///
+/// Exercises the production `ContractExecutor` code path (init_tracker,
+/// validation, notification pipeline) without actual WASM.
+#[test_log::test]
+fn test_six_peer_lifecycle_mock_wasm() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3151_0002_0001;
+    const NETWORK_NAME: &str = "six-peer-mock-wasm";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    sim.use_mock_wasm = true;
+
+    let contract = SimOperation::create_test_contract(0xC3);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0xC3),
+            subscribe: true,
+        },
+    )];
+
+    // All other peers subscribe (node indices start at 2 with 2 gateways)
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 1),
+        SimOperation::Subscribe { contract_id },
+    ));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // Gateway 0 sends updates
+    for v in [10u64, 20, 30] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, 0xC3),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "MockWasm lifecycle simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    verify_contract_propagation(&rt, &logs_handle, contract_key, 4);
+
+    tracing::info!("test_six_peer_lifecycle_mock_wasm PASSED");
+}
+
+/// Verify a node joining after initial updates gets the current state.
+///
+/// Scenario:
+///   1. Gateway PUTs contract with subscribe=true
+///   2. Nodes 1-2 SUBSCRIBE
+///   3. Gateway UPDATEs to v10, v20
+///   4. Node 3 SUBSCRIBES (late joiner)
+///   5. Gateway UPDATEs to v30
+///
+/// The late joiner should receive state via GET during subscribe and then
+/// converge with the rest of the network after the final update.
+///
+/// Catches PR #2360 regression (contract key mismatch on late GET).
+#[test_log::test]
+fn test_late_joiner_receives_current_state() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3151_0003_0001;
+    const NETWORK_NAME: &str = "late-joiner";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, 3, 7, 3, 10, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xD4);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let operations = vec![
+        // 1. Gateway PUTs contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0xD4),
+                subscribe: true,
+            },
+        ),
+        // 2. Nodes 1-2 subscribe
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        // 3. Gateway updates to v10, v20
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10, 0xD4),
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(20, 0xD4),
+            },
+        ),
+        // 4. Node 3 subscribes (late joiner — joins after 2 updates)
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Subscribe { contract_id },
+        ),
+        // 5. Gateway updates to v30 (should reach all including late joiner)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(30, 0xD4),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Late joiner simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // All 4 peers (gateway + 3 nodes) should converge
+    let peer_states = verify_contract_propagation(&rt, &logs_handle, contract_key, 3);
+
+    // Specifically verify node 3 (the late joiner) has the contract state
+    // via the shared storage handle, not just log inference.
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    let node3_state = node3_storage.get_stored_state(&contract_key);
+    assert!(
+        node3_state.is_some(),
+        "Late joiner (node 3) should have contract state, but storage is empty. \
+         This indicates the subscribe-after-updates path failed to fetch current state."
+    );
+
+    tracing::info!(
+        "test_late_joiner_receives_current_state PASSED: {} peers converged, \
+         late joiner confirmed with state",
+        peer_states.len()
+    );
+}
+
+/// Long-running subscription renewal test — verifies subscriptions survive
+/// multiple TTL renewal cycles.
+///
+/// Uses MockWasmRuntime with enough virtual time for multiple TTL cycles.
+/// The test uses random event generation (not controlled) to exercise
+/// the subscription renewal path under realistic conditions.
+///
+/// Catches #3093 (interest TTL not refreshed), subscription tree degradation.
+///
+/// NOTE: Gated by nightly_tests — does NOT run in regular CI.
+#[test_log::test]
+#[cfg(feature = "nightly_tests")]
+fn test_subscribe_renewal_long_running() {
+    const SEED: u64 = 0x3151_0004_0001;
+
+    tracing::info!("=== Starting Subscription Renewal Long-Running Test ===");
+
+    TestConfig::long_running("sub-renewal-long", SEED)
+        .with_mock_wasm()
+        .run_direct()
+        .assert_ok()
+        .verify_operation_coverage()
+        .verify_state_report();
+
+    tracing::info!("test_subscribe_renewal_long_running PASSED");
+}
