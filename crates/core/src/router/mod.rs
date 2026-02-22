@@ -578,6 +578,7 @@ mod tests {
 
     #[test]
     fn test_request_time() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         // Define constants for the number of peers, number of events, and number of test iterations.
         const NUM_PEERS: usize = 25;
         const NUM_EVENTS: usize = 400000;
@@ -703,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_select_closest_peers_equality() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         const NUM_PEERS: u32 = 100;
         const CLOSEST_CAP: u32 = 10;
         let peers: Vec<PeerKeyLocation> = create_peers(NUM_PEERS);
@@ -865,6 +867,7 @@ mod tests {
     /// distances. Verify select_peer prefers peer A.
     #[test]
     fn test_failure_avoidance() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let peer_a = PeerKeyLocation::random();
         let peer_b = PeerKeyLocation::random();
 
@@ -1113,6 +1116,7 @@ mod tests {
     /// the router should use failure probability to prefer low-failure peers.
     #[test]
     fn test_failure_only_differentiates_peers() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let good_peer = PeerKeyLocation::random();
         let bad_peer = PeerKeyLocation::random();
         let contract_location = Location::random();
@@ -1421,6 +1425,9 @@ mod tests {
     /// low-failure, low-latency peers.
     #[test]
     fn test_realistic_mixed_traffic_routing() {
+        // Seed RNG so peer ring distances are deterministic; without this the
+        // isotonic regression's ascending monotonicity constraint can conflict
+        // with the failure-rate ordering when random distances are adversarial.
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let contract_location = Location::random();
         let close_peer = PeerKeyLocation::random();
@@ -1593,6 +1600,7 @@ mod tests {
     /// that primarily handles PUT/SUBSCRIBE/UPDATE traffic.
     #[test]
     fn test_untimed_only_network_peer_ranking() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let reliable_peer = PeerKeyLocation::random();
         let flaky_peer = PeerKeyLocation::random();
         let contract_location = Location::random();
