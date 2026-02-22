@@ -26,6 +26,7 @@ humantime = "2.2.0"
 [dev-dependencies]
 bincode = { workspace = true }
 freenet = { path = "../../../crates/core" }
+freenet-test-network = "0.1.23"
 serial_test = { workspace = true }
 test-log = { workspace = true }
 testresult = { workspace = true }

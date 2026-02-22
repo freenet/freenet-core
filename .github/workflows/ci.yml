@@ -2,10 +2,11 @@ name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
 # 1. Skip CI entirely for docs-only changes (paths-ignore)
-# 2. Skip expensive jobs (Test, six-peer) on main push - PR already validated
-# 3. Skip six-peer-regression for dependabot PRs - Test is sufficient for version bumps
+# 2. Skip expensive jobs on main push - PR already validated
+# 3. Skip NAT validation for dependabot PRs - Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
 # 5. Use merge_group to skip redundant tests before merge
+# 6. Split unit/integration and simulation tests for parallelism
 # Estimated savings: ~25-30% reduction in CI costs
 
 on:
@@ -123,8 +124,8 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -- -D warnings
 
-  test_all:
-    name: Test
+  test_unit:
+    name: Unit & Integration
     runs-on: ubicloud-standard-16
     timeout-minutes: 30
     needs: fmt_check
@@ -190,7 +191,7 @@ jobs:
           # Reduce gateway connection backoff for CI (default 30s is too aggressive
           # for localhost tests under CI resource pressure). See issue #3078.
           FREENET_BACKOFF_BASE_SECS: "5"
-        # Run all tests in parallel including simulation and determinism tests.
+        # Run unit and integration tests (simulation tests run in separate job).
         # nextest runs each test in its own process, providing full isolation
         # for global state (DashMaps, callbacks, etc.). Determinism tests no
         # longer need serialization — process isolation handles it (#3051).
@@ -203,7 +204,7 @@ jobs:
         run: |
           cargo nextest run --workspace --exclude freenet-ping-types \
             --no-default-features \
-            --features trace,websocket,redb,wasmtime-backend,simulation_tests,testing \
+            --features trace,websocket,redb,wasmtime-backend,testing \
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
@@ -225,16 +226,55 @@ jobs:
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
 
-  six_peer_regression:
-    name: six-peer-regression
-    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
+  test_simulation:
+    name: Simulation
+    runs-on: ubicloud-standard-16
+    timeout-minutes: 30
+    needs: fmt_check
+    # Same skip conditions as test_unit
+    if: |
+      github.event_name == 'pull_request' &&
+      !startsWith(github.head_ref, 'release/v')
+
+    env:
+      RUST_LOG: error
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run simulation tests
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo nextest run -p freenet --test simulation_integration \
+            --features simulation_tests,testing --profile ci
+
+  nat_validation:
+    name: NAT Validation
+    needs: fmt_check
     runs-on: ubicloud-standard-16
     timeout-minutes: 30
     # Skip on:
     # - merge_group: PR already passed full tests
-    # - push to main: PR already validated code before merge (saves ~$0.03/push)
+    # - push to main: PR already validated code before merge
     # - release PRs: only bump versions
-    # - dependabot PRs: just version bumps, Test job is sufficient (saves ~$0.03/dependabot PR)
+    # - dependabot PRs: just version bumps, Test job is sufficient
     if: |
       github.event_name == 'pull_request' &&
       !startsWith(github.head_ref, 'release/v') &&
@@ -242,66 +282,56 @@ jobs:
 
     env:
       RUST_LOG: error
-      # Increase rustc stack size to prevent SIGSEGV during compilation
-      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
       RUST_MIN_STACK: 268435456
 
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y mold liblzma-dev
 
-      - name: Checkout river
-        uses: actions/checkout@v6
-        with:
-          repository: freenet/river
-          path: river-src
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            river-src
 
       - name: Pull Docker images for NAT simulation
-        run: |
-          # Pre-pull alpine image used by NAT router simulation
-          # Without this, the test fails with "No such image: alpine:latest"
-          docker pull alpine:latest
+        run: docker pull alpine:latest
 
-      - name: Run six-peer regression
-        working-directory: river-src
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Build
         env:
-          FREENET_CORE_PATH: ${{ github.workspace }}
-          RUST_LOG: info
-          # Use mold linker to avoid rust-lld crashes (see issue #2519)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Use Docker NAT to simulate realistic network topology where peers
-        # are behind NAT and gateways are on the public network. This provides
-        # better test coverage for NAT traversal and gateway connection code paths.
-        # See issue #2204 for context.
-        # IMPORTANT: This test MUST run with Docker NAT. If Docker is unavailable,
-        # the test fails rather than silently falling back to local mode, which
-        # would skip NAT hole punching validation entirely.
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      - name: Run Docker NAT test
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          FREENET_TEST_DOCKER_NAT: "1"
+          FREENET_BINARY_PATH: ${{ github.workspace }}/target/debug/freenet
+        # Validates NAT hole-punching using Docker NAT simulation with
+        # freenet-ping contract operations (PUT, SUBSCRIBE, UPDATE, GET).
+        # Replaces the six-peer River regression test with a self-contained
+        # test that doesn't depend on the River repository.
         run: |
           if ! docker info >/dev/null 2>&1; then
             echo "ERROR: Docker is not available but is REQUIRED for NAT hole punching tests"
             echo "A test that doesn't test what it claims to test is worse than no test"
             exit 1
           fi
-          echo "Docker available - using Docker NAT backend"
-          export FREENET_TEST_DOCKER_NAT=1
-          cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
+          cargo nextest run -p freenet-ping-app --features testing \
+            --profile ci -E 'test(docker_nat)' -- --ignored
 
   claude-ci-analysis:
     name: Claude CI Analysis
