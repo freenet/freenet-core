@@ -545,7 +545,11 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
                 SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
                 // Reserved discriminants for removed variants
-                _ => "subscribe_reserved".to_string(),
+                SubscribeEvent::_Reserved6
+                | SubscribeEvent::_Reserved7
+                | SubscribeEvent::_Reserved8
+                | SubscribeEvent::_Reserved9
+                | SubscribeEvent::_Reserved10 => "subscribe_reserved".to_string(),
             }
         }
         EventKind::Update(update_event) => {
@@ -1061,7 +1065,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     })
                 }
                 // Reserved discriminants for removed variants
-                _ => serde_json::json!({"type": "reserved"}),
+                SubscribeEvent::_Reserved6
+                | SubscribeEvent::_Reserved7
+                | SubscribeEvent::_Reserved8
+                | SubscribeEvent::_Reserved9
+                | SubscribeEvent::_Reserved10 => serde_json::json!({"type": "reserved"}),
             }
         }
         EventKind::Update(update_event) => {
@@ -1328,7 +1336,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
                     let type_str = match &route_event.outcome {
                         RouteOutcome::SuccessUntimed => "route_success_untimed",
-                        _ => "route_failure",
+                        RouteOutcome::Success { .. } | RouteOutcome::Failure => "route_failure",
                     };
                     serde_json::json!({
                         "type": type_str,

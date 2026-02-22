@@ -534,7 +534,9 @@ impl SubscribeOp {
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
             SubscribeState::AwaitingResponse(data) => data.next_hop,
-            _ => None,
+            SubscribeState::PrepareRequest(_)
+            | SubscribeState::Completed(_)
+            | SubscribeState::Failed => None,
         }
     }
 

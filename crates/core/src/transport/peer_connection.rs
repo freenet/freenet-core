@@ -727,7 +727,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 );
                             }
                         }
-                        _ => {}
+                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
                     }
 
                     {

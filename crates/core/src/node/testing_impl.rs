@@ -2755,7 +2755,7 @@ impl SimNetwork {
                         GetEvent::Request { .. } => summary.get.requested += 1,
                         GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
                         GetEvent::GetFailure { .. } => summary.get.failed += 1,
-                        _ => {}
+                        GetEvent::GetNotFound { .. } | GetEvent::ResponseSent { .. } => {}
                     }
                 }
                 // Subscribe operations
@@ -2765,7 +2765,14 @@ impl SimNetwork {
                         SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
                         SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
                         SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
-                        _ => {}
+                        SubscribeEvent::ResponseSent { .. }
+                        | SubscribeEvent::SeedingStarted { .. }
+                        | SubscribeEvent::SeedingStopped { .. }
+                        | SubscribeEvent::_Reserved6
+                        | SubscribeEvent::_Reserved7
+                        | SubscribeEvent::_Reserved8
+                        | SubscribeEvent::_Reserved9
+                        | SubscribeEvent::_Reserved10 => {}
                     }
                 }
                 // Update operations (no UpdateFailure variant exists)
@@ -2777,14 +2784,26 @@ impl SimNetwork {
                         UpdateEvent::BroadcastReceived { .. } => {
                             summary.update.broadcasts_received += 1
                         }
-                        _ => {}
+                        UpdateEvent::BroadcastEmitted { .. }
+                        | UpdateEvent::BroadcastComplete { .. }
+                        | UpdateEvent::BroadcastApplied { .. }
+                        | UpdateEvent::BroadcastDeliverySummary { .. } => {}
                     }
                 }
                 // Timeouts
                 crate::tracing::EventKind::Timeout { .. } => {
                     summary.timeouts += 1;
                 }
-                _ => {}
+                crate::tracing::EventKind::Connect(_)
+                | crate::tracing::EventKind::Route(_)
+                | crate::tracing::EventKind::Transfer(_)
+                | crate::tracing::EventKind::Lifecycle(_)
+                | crate::tracing::EventKind::Ignored
+                | crate::tracing::EventKind::Disconnected { .. }
+                | crate::tracing::EventKind::TransportSnapshot(_)
+                | crate::tracing::EventKind::InterestSync(_)
+                | crate::tracing::EventKind::RoutingDecision(_)
+                | crate::tracing::EventKind::RouterSnapshot(_) => {}
             }
         }
 

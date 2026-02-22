@@ -1001,7 +1001,9 @@ impl CongestionControlConfig {
                     AlgorithmConfig::Bbr {
                         startup_min_pacing_rate,
                     } => *startup_min_pacing_rate,
-                    _ => BbrConfig::default().startup_min_pacing_rate,
+                    AlgorithmConfig::Ledbat { .. } | AlgorithmConfig::FixedRate { .. } => {
+                        BbrConfig::default().startup_min_pacing_rate
+                    }
                 };
 
                 let bbr_config = BbrConfig {
@@ -1060,7 +1062,9 @@ impl CongestionControlConfig {
             CongestionControlAlgorithm::FixedRate => {
                 let rate = match &self.algorithm_config {
                     AlgorithmConfig::FixedRate { rate_bytes_per_sec } => *rate_bytes_per_sec,
-                    _ => super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC,
+                    AlgorithmConfig::Bbr { .. } | AlgorithmConfig::Ledbat { .. } => {
+                        super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC
+                    }
                 };
 
                 let fixed_rate_config = FixedRateConfig::new(rate);

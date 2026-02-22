@@ -290,7 +290,11 @@ impl WebSocketEventCollector {
                 // Parse FlatBuffers message and convert to NetLogMessage
                 Self::parse_flatbuffer(&data)
             }
-            _ => anyhow::bail!("Unexpected message type"),
+            Message::Text(_)
+            | Message::Ping(_)
+            | Message::Pong(_)
+            | Message::Close(_)
+            | Message::Frame(_) => anyhow::bail!("Unexpected message type"),
         }
     }
 

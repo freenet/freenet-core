@@ -2716,7 +2716,15 @@ impl P2pConnManager {
                     ConnectionError::IOError(msg) => {
                         crate::node::network_status::FailureReason::Other(msg.clone())
                     }
-                    other => crate::node::network_status::FailureReason::Other(other.to_string()),
+                    other @ ConnectionError::LocationUnknown
+                    | other @ ConnectionError::SendNotCompleted(_)
+                    | other @ ConnectionError::UnexpectedReq
+                    | other @ ConnectionError::Serialization(_)
+                    | other @ ConnectionError::FailedConnectOp
+                    | other @ ConnectionError::UnwantedConnection
+                    | other @ ConnectionError::AddressBlocked(_) => {
+                        crate::node::network_status::FailureReason::Other(other.to_string())
+                    }
                 };
                 crate::node::network_status::record_gateway_failure(peer_addr, failure_reason);
 
@@ -4253,7 +4261,11 @@ async fn handle_peer_channel_message(
                         return Err(error);
                     }
                 }
-                other => {
+                other @ ConnEvent::InboundMessage(_)
+                | other @ ConnEvent::OutboundMessage(_)
+                | other @ ConnEvent::OutboundMessageWithTarget { .. }
+                | other @ ConnEvent::NodeAction(_)
+                | other @ ConnEvent::TransportClosed { .. } => {
                     unreachable!(
                         "Unexpected action from peer_connection_listener channel: {:?}",
                         other
@@ -4522,7 +4534,10 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             | NetMessageV1::Update(_)
             | NetMessageV1::Subscribe(_) => None,
             // Other message types don't have sender info
-            _ => None,
+            NetMessageV1::Aborted(_)
+            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::InterestSync { .. }
+            | NetMessageV1::ReadyState { .. } => None,
         },
     }
 }
@@ -4537,7 +4552,10 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
             | NetMessageV1::Put(_)
             | NetMessageV1::Update(_)
             | NetMessageV1::Subscribe(_) => None,
-            _ => None,
+            NetMessageV1::Aborted(_)
+            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::InterestSync { .. }
+            | NetMessageV1::ReadyState { .. } => None,
         },
     }
 }

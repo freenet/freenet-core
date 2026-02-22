@@ -168,7 +168,7 @@ impl InnerMessage for ConnectMsg {
             ConnectMsg::Rejected {
                 desired_location, ..
             } => Some(*desired_location),
-            _ => None,
+            ConnectMsg::Response { .. } | ConnectMsg::ObservedAddress { .. } => None,
         }
     }
 }

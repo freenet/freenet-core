@@ -103,7 +103,7 @@ impl ContractStore {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                 (*contract_v1.key(), contract_v1.code().clone())
             }
-            _ => unimplemented!(),
+            ContractContainer::Wasm(_) | _ => unimplemented!(),
         };
         let code_hash = key.code_hash();
         if self.contract_cache.get(code_hash).is_some() {

@@ -723,7 +723,10 @@ impl OpManager {
                 self.ops.connect.get(id).and_then(|op| op.get_target_peer())
             }
             // Other operations only store addresses, not full peer info
-            _ => None,
+            TransactionType::Put
+            | TransactionType::Get
+            | TransactionType::Subscribe
+            | TransactionType::Update => None,
         }
     }
 
@@ -734,7 +737,7 @@ impl OpManager {
             TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_current_hop()),
             TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_current_htl()),
             // TODO: Add support for Subscribe operations when they track HTL
-            _ => None,
+            TransactionType::Connect | TransactionType::Subscribe | TransactionType::Update => None,
         }
     }
 

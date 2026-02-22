@@ -693,7 +693,11 @@ async fn query_node_diagnostics(port: u16) -> Result<String> {
             // Serialize the diagnostics to JSON for the report
             serde_json::to_string_pretty(&diag).context("Failed to serialize diagnostics")
         }
-        _ => anyhow::bail!("Unexpected response from node"),
+        HostResponse::ContractResponse(_)
+        | HostResponse::DelegateResponse { .. }
+        | HostResponse::QueryResponse(_)
+        | HostResponse::Ok
+        | _ => anyhow::bail!("Unexpected response from node"),
     }
 }
 

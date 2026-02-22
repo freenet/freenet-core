@@ -1418,7 +1418,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     tracing::warn!(%error);
                                     crate::transport::signal_version_mismatch();
                                 }
-                                _ => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                 }
                             }
@@ -1954,7 +1954,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         } => {
                                             return Err(handle_ack_connection_error(err));
                                         }
-                                        _ => {
+                                        SymmetricMessagePayload::ShortMessage { .. }
+                                        | SymmetricMessagePayload::StreamFragment { .. }
+                                        | SymmetricMessagePayload::NoOp
+                                        | SymmetricMessagePayload::Ping { .. }
+                                        | SymmetricMessagePayload::Pong { .. } => {
                                             tracing::trace!(
                                                 peer_addr = %remote_addr,
                                                 direction = "outbound",

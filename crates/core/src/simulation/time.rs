@@ -84,7 +84,7 @@ impl Ord for Wakeup {
         // Ties broken by registration order (smaller ID = earlier registration)
         match other.deadline.cmp(&self.deadline) {
             Ordering::Equal => other.id.0.cmp(&self.id.0),
-            ord => ord,
+            ord @ Ordering::Less | ord @ Ordering::Greater => ord,
         }
     }
 }

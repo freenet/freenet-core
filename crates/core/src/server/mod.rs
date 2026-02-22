@@ -181,7 +181,7 @@ pub mod local_node {
             IpAddr::V6(ip) if !ip.is_loopback() => {
                 anyhow::bail!("invalid ip: {ip}, expecting localhost")
             }
-            _ => {}
+            IpAddr::V4(_) | IpAddr::V6(_) => {}
         }
         let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
@@ -243,7 +243,10 @@ pub mod local_node {
                     }
                     continue;
                 }
-                _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+                ClientRequest::Authenticate { .. }
+                | ClientRequest::NodeQueries(_)
+                | ClientRequest::Close
+                | _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
             };
 
             match res {

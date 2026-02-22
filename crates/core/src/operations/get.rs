@@ -1935,7 +1935,7 @@ impl Operation for GetOp {
                                         // Don't return error - the GET succeeded, caching is optional
                                         // Continue to process the GET result below
                                     }
-                                    _ => unreachable!(
+                                    ContractHandlerEvent::DelegateRequest { .. } | ContractHandlerEvent::DelegateResponse(_) | ContractHandlerEvent::PutQuery { .. } | ContractHandlerEvent::GetQuery { .. } | ContractHandlerEvent::GetResponse { .. } | ContractHandlerEvent::UpdateQuery { .. } | ContractHandlerEvent::UpdateResponse { .. } | ContractHandlerEvent::UpdateNoChange { .. } | ContractHandlerEvent::RegisterSubscriberListener { .. } | ContractHandlerEvent::RegisterSubscriberListenerResponse | ContractHandlerEvent::QuerySubscriptions { .. } | ContractHandlerEvent::QuerySubscriptionsResponse | ContractHandlerEvent::GetSummaryQuery { .. } | ContractHandlerEvent::GetSummaryResponse { .. } | ContractHandlerEvent::GetDeltaQuery { .. } | ContractHandlerEvent::GetDeltaResponse { .. } | ContractHandlerEvent::NotifySubscriptionError { .. } | ContractHandlerEvent::NotifySubscriptionErrorResponse | ContractHandlerEvent::ClientDisconnect { .. } => unreachable!(
                                         "PutQuery from Get operation should always return PutResponse"
                                     ),
                                 }

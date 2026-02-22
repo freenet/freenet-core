@@ -1914,7 +1914,7 @@ pub async fn run_local_node(
         IpAddr::V6(ip) if !ip.is_loopback() => {
             anyhow::bail!("invalid ip: {ip}, expecting localhost")
         }
-        _ => {}
+        IpAddr::V4(_) | IpAddr::V6(_) => {}
     }
 
     let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
@@ -1977,7 +1977,10 @@ pub async fn run_local_node(
                 }
                 continue;
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            ClientRequest::Authenticate { .. }
+            | ClientRequest::NodeQueries(_)
+            | ClientRequest::Close
+            | _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         };
 
         match res {

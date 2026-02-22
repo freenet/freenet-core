@@ -65,6 +65,7 @@ where
 ///
 /// See `handle_op_result` for how each variant is dispatched.
 #[must_use]
+#[allow(clippy::large_enum_variant)] // Hot path — boxing `OpEnum` would add indirection overhead
 pub(crate) enum OperationResult {
     /// Operation is fully complete on this node — nothing to send, no state to keep.
     Completed,
@@ -671,7 +672,26 @@ async fn has_contract(
             key,
             response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
         } => Ok(key),
-        _ => Ok(None),
+        crate::contract::ContractHandlerEvent::DelegateRequest { .. }
+        | crate::contract::ContractHandlerEvent::DelegateResponse(_)
+        | crate::contract::ContractHandlerEvent::PutQuery { .. }
+        | crate::contract::ContractHandlerEvent::PutResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetResponse { .. }
+        | crate::contract::ContractHandlerEvent::UpdateQuery { .. }
+        | crate::contract::ContractHandlerEvent::UpdateResponse { .. }
+        | crate::contract::ContractHandlerEvent::UpdateNoChange { .. }
+        | crate::contract::ContractHandlerEvent::RegisterSubscriberListener { .. }
+        | crate::contract::ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | crate::contract::ContractHandlerEvent::QuerySubscriptions { .. }
+        | crate::contract::ContractHandlerEvent::QuerySubscriptionsResponse
+        | crate::contract::ContractHandlerEvent::GetSummaryQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
+        | crate::contract::ContractHandlerEvent::NotifySubscriptionError { .. }
+        | crate::contract::ContractHandlerEvent::NotifySubscriptionErrorResponse
+        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
     }
 }
 

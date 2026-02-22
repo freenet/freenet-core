@@ -1843,7 +1843,10 @@ impl Executor<Runtime> {
                 }
                 Err(RequestError::Disconnect.into())
             }
-            other => {
+            other @ (ClientRequest::Authenticate { .. }
+            | ClientRequest::NodeQueries(_)
+            | ClientRequest::Close
+            | _) => {
                 tracing::warn!(
                     client = %id,
                     request = ?other,

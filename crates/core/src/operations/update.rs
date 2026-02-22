@@ -1383,7 +1383,26 @@ async fn update_contract(
                                 response: Ok(StoreResponse { state, .. }),
                                 ..
                             } => state,
-                            _ => None,
+                            ContractHandlerEvent::DelegateRequest { .. }
+                            | ContractHandlerEvent::DelegateResponse(_)
+                            | ContractHandlerEvent::PutQuery { .. }
+                            | ContractHandlerEvent::PutResponse { .. }
+                            | ContractHandlerEvent::GetQuery { .. }
+                            | ContractHandlerEvent::GetResponse { .. }
+                            | ContractHandlerEvent::UpdateQuery { .. }
+                            | ContractHandlerEvent::UpdateResponse { .. }
+                            | ContractHandlerEvent::UpdateNoChange { .. }
+                            | ContractHandlerEvent::RegisterSubscriberListener { .. }
+                            | ContractHandlerEvent::RegisterSubscriberListenerResponse
+                            | ContractHandlerEvent::QuerySubscriptions { .. }
+                            | ContractHandlerEvent::QuerySubscriptionsResponse
+                            | ContractHandlerEvent::GetSummaryQuery { .. }
+                            | ContractHandlerEvent::GetSummaryResponse { .. }
+                            | ContractHandlerEvent::GetDeltaQuery { .. }
+                            | ContractHandlerEvent::GetDeltaResponse { .. }
+                            | ContractHandlerEvent::NotifySubscriptionError { .. }
+                            | ContractHandlerEvent::NotifySubscriptionErrorResponse
+                            | ContractHandlerEvent::ClientDisconnect { .. } => None,
                         });
 
                     match fetched_state {

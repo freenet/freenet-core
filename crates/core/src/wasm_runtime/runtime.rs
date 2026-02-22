@@ -352,7 +352,7 @@ impl Runtime {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     contract_v1.code().data().to_vec()
                 }
-                _ => unimplemented!(),
+                ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
             // Re-check cache: another executor may have compiled this contract
