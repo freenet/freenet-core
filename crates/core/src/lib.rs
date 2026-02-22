@@ -121,4 +121,12 @@ pub mod dev_tool {
     pub use crate::transport::StreamId;
 }
 
+/// Deadlock detection for parking_lot locks in test builds.
+///
+/// Available when compiled with `--cfg test` (unit tests) or with the `testing`
+/// feature flag (integration tests). Uses parking_lot's `deadlock_detection`
+/// feature to catch Mutex/RwLock deadlocks at runtime.
+#[cfg(any(test, feature = "testing"))]
+pub mod deadlock_detection;
+
 pub mod test_utils;
