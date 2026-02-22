@@ -1871,30 +1871,22 @@ mod tests {
                 prop_assert!(router.has_sufficient_routing_events());
 
                 let peers = vec![good_peer.clone(), bad_peer.clone()];
-                let (_, decision) =
+                let (selected, decision) =
                     router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
 
-                // Find predictions for each peer
-                let good_pred = decision.candidates.iter()
-                    .find(|c| c.selected)
-                    .and_then(|c| c.prediction.as_ref());
-                let all_preds: Vec<_> = decision.candidates.iter()
-                    .filter_map(|c| c.prediction.as_ref())
-                    .collect();
+                let all_have_predictions = decision.candidates.iter()
+                    .all(|c| c.prediction.is_some());
 
                 // With enough data, predictions should exist for both
-                if all_preds.len() == 2 {
-                    // The selected peer (lowest expected_total_time) should be
-                    // the good peer since failures increase cost
-                    let selected_pred = &decision.candidates[0].prediction.as_ref().unwrap();
-                    let other_pred = &decision.candidates[1].prediction.as_ref().unwrap();
+                if all_have_predictions && selected.len() == 2 {
+                    // The first selected peer (lowest expected_total_time) should
+                    // be the good peer since failures increase cost via the
+                    // failure_cost_multiplier in predict_routing_outcome
                     prop_assert!(
-                        selected_pred.expected_total_time <= other_pred.expected_total_time,
-                        "Selected peer should have lower expected time"
+                        *selected[0] == good_peer,
+                        "Good peer (all successes) should be ranked first"
                     );
                 }
-                // At minimum, predictions should not be None for the good peer
-                prop_assert!(good_pred.is_some() || all_preds.is_empty());
             }
 
             /// Property: add_event is consistent with batch construction.
