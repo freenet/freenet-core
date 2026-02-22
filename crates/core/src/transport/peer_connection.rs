@@ -1334,7 +1334,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // Still register the handle for non-cancellation errors
                             if let Some(orphan_registry) = &self.orphan_stream_registry {
                                 orphan_registry
-                                    .register_orphan(stream_id, streaming_handle.clone());
+                                    .register_orphan(self.remote_conn.remote_addr, stream_id, streaming_handle.clone());
                                 tracing::trace!(
                                     peer_addr = %self.remote_conn.remote_addr,
                                     stream_id = %stream_id,
@@ -1355,7 +1355,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // This allows operations layer to claim the stream when metadata arrives,
                         // even if the stream fragments arrived first.
                         if let Some(orphan_registry) = &self.orphan_stream_registry {
-                            orphan_registry.register_orphan(stream_id, streaming_handle.clone());
+                            orphan_registry.register_orphan(self.remote_conn.remote_addr, stream_id, streaming_handle.clone());
                             tracing::trace!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
