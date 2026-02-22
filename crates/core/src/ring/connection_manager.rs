@@ -510,34 +510,40 @@ impl ConnectionManager {
 
     /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
     pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerKeyLocation> {
-        // Check connections by location (direct address match)
+        // Phase 1: Check connections by location (direct address match).
+        // We release the connections_by_location lock before phase 2 to
+        // respect the lock ordering: location_for_peer → connections_by_location.
+        {
+            let connections = self.connections_by_location.read();
+            for conns in connections.values() {
+                for conn in conns {
+                    if conn.location.socket_addr() == Some(addr) {
+                        return Some(conn.location.clone());
+                    }
+                }
+            }
+        }
+
+        // Phase 2 (fallback): The transport address may differ from the advertised
+        // address stored in PeerKeyLocation. Use location_for_peer to bridge the
+        // gap. We acquire location_for_peer first, then re-acquire
+        // connections_by_location — this respects the documented lock ordering
+        // (location_for_peer → connections_by_location) and avoids deadlock with
+        // prune_connection which acquires them in the same order with write locks.
+        let location = *self.location_for_peer.read().get(&addr)?;
         let connections = self.connections_by_location.read();
-        for conns in connections.values() {
-            for conn in conns {
-                if conn.location.socket_addr() == Some(addr) {
-                    return Some(conn.location.clone());
-                }
+        if let Some(conns) = connections.get(&location) {
+            if let Some(conn) = conns.first() {
+                tracing::debug!(
+                    requested_addr = %addr,
+                    resolved_via = "location_for_peer",
+                    location = %location,
+                    "get_peer_by_addr: resolved via location_for_peer fallback"
+                );
+                return Some(conn.location.clone());
             }
         }
 
-        // Fallback: the transport address may differ from the advertised address
-        // stored in PeerKeyLocation. Use location_for_peer (which maps transport
-        // addresses to ring locations) to bridge the gap.
-        if let Some(&location) = self.location_for_peer.read().get(&addr) {
-            if let Some(conns) = connections.get(&location) {
-                if let Some(conn) = conns.first() {
-                    tracing::debug!(
-                        requested_addr = %addr,
-                        resolved_via = "location_for_peer",
-                        location = %location,
-                        "get_peer_by_addr: resolved via location_for_peer fallback"
-                    );
-                    return Some(conn.location.clone());
-                }
-            }
-        }
-
-        drop(connections);
         None
     }
 
@@ -2461,5 +2467,269 @@ mod tests {
             !cm.is_peer_ready(addr1),
             "ready state should be cleaned up after prune"
         );
+    }
+
+    // ============ Concurrent stress tests (#3105) ============
+    //
+    // These tests exercise the documented lock ordering invariant:
+    //   location_for_peer → connections_by_location → pending_reservations
+    //
+    // A deadlock manifests as a test timeout. Each test spawns many concurrent
+    // tasks that call methods acquiring multiple locks in various combinations.
+
+    /// Stress test: concurrent add_connection + prune_connection + should_accept.
+    ///
+    /// Exercises all three RwLock-guarded maps simultaneously to detect ABBA
+    /// deadlocks. This is the scenario that caused the deadlock fixed in #3095:
+    /// `cleanup_stale_reservations` acquired `pending_reservations` before
+    /// `connections_by_location`, while `prune_connection` did the opposite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_connection_lifecycle_stress() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::sync::Arc;
+
+        const NUM_TASKS: usize = 80;
+        const OPS_PER_TASK: usize = 200;
+        const SEED: u64 = 0xDEAD_BEEF_CAFE_3105;
+
+        let cm = Arc::new(make_connection_manager(Some(make_addr(7000)), 2, 50, false));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_TASKS));
+
+        let mut handles = Vec::with_capacity(NUM_TASKS);
+        for task_id in 0..NUM_TASKS {
+            let cm = Arc::clone(&cm);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(tokio::spawn(async move {
+                // Each task gets a deterministic RNG derived from the global seed
+                // and its task_id, so runs are reproducible.
+                let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(task_id as u64));
+
+                // Wait for all tasks to be ready before starting, maximizing contention.
+                barrier.wait().await;
+
+                for _ in 0..OPS_PER_TASK {
+                    // Pick a peer port in a small range to create contention on the
+                    // same addresses across tasks.
+                    let port: u16 = rng.random_range(9000..9050);
+                    let addr = make_addr(port);
+                    let loc = Location::new(rng.random_range(0.01..0.99));
+
+                    match rng.random_range(0u8..8) {
+                        // should_accept: acquires pending_reservations(R), location_for_peer(R/W),
+                        // pending_reservations(W), topology_manager(W), connections_by_location(R)
+                        0 => {
+                            let _ = cm.should_accept(loc, addr);
+                        }
+                        // add_connection: acquires pending_reservations(W), location_for_peer(W),
+                        // connections_by_location(W)
+                        1 => {
+                            let keypair = TransportKeypair::new();
+                            cm.add_connection(loc, addr, keypair.public().clone(), rng.random());
+                        }
+                        // prune_alive_connection: acquires location_for_peer(W),
+                        // connections_by_location(W)
+                        2 => {
+                            let _ = cm.prune_alive_connection(addr);
+                        }
+                        // prune_in_transit_connection: acquires location_for_peer(W),
+                        // connections_by_location(W), pending_reservations(W)
+                        3 => {
+                            let _ = cm.prune_in_transit_connection(addr);
+                        }
+                        // cleanup_stale_reservations: acquires pending_reservations(W),
+                        // then location_for_peer(W), connections_by_location(R)
+                        4 => {
+                            let _ = cm.cleanup_stale_reservations();
+                        }
+                        // Read-heavy path: has_connection_or_pending acquires
+                        // location_for_peer(R), pending_reservations(R)
+                        5 => {
+                            let _ = cm.has_connection_or_pending(addr);
+                            let _ = cm.connection_count();
+                            let _ = cm.num_connections();
+                        }
+                        // get_peer_by_addr: acquires connections_by_location(R),
+                        // location_for_peer(R)
+                        6 => {
+                            let _ = cm.get_peer_by_addr(addr);
+                        }
+                        // Transient operations (DashMap, mostly lock-free but interact
+                        // with other bookkeeping)
+                        7 => {
+                            if rng.random() {
+                                let _ = cm.try_register_transient(addr, Some(loc));
+                            } else {
+                                let _ = cm.drop_transient(addr);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    // Yield occasionally to let the scheduler interleave tasks.
+                    if rng.random_range(0..4) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }));
+        }
+
+        // All tasks must complete within 30 seconds; a hang indicates a deadlock.
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
+
+        let results = result.expect("DEADLOCK DETECTED: concurrent ConnectionManager operations did not complete within 30 seconds");
+        for (i, r) in results.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
+        }
+    }
+
+    /// Stress test: concurrent admission control under gateway limits.
+    ///
+    /// Exercises the CAS loop in `try_admit_connect` with many concurrent tasks
+    /// to verify the atomic counter never goes negative or exceeds the limit,
+    /// and that guards properly release slots on drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_admission_control_stress() {
+        use std::sync::Arc;
+
+        const NUM_TASKS: usize = 80;
+        const OPS_PER_TASK: usize = 500;
+
+        // Gateway mode: limited to MAX_CONCURRENT_GATEWAY_CONNECTS (8)
+        let cm = Arc::new(make_connection_manager(Some(make_addr(7000)), 2, 50, true));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_TASKS));
+
+        let mut handles = Vec::with_capacity(NUM_TASKS);
+        for _ in 0..NUM_TASKS {
+            let cm = Arc::clone(&cm);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+
+                for _ in 0..OPS_PER_TASK {
+                    // Acquire a slot, hold it briefly, then release via drop
+                    if let Some(guard) = cm.try_admit_connect() {
+                        // Verify invariant: in-flight count is within bounds
+                        let current = cm.connect_in_flight.load(Ordering::SeqCst);
+                        assert!(
+                            current <= MAX_CONCURRENT_GATEWAY_CONNECTS,
+                            "in-flight count {current} exceeded limit {MAX_CONCURRENT_GATEWAY_CONNECTS}"
+                        );
+                        // Hold the guard briefly to create contention
+                        tokio::task::yield_now().await;
+                        drop(guard);
+                    }
+                }
+            }));
+        }
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
+
+        let results = result.expect(
+            "DEADLOCK DETECTED: concurrent admission control did not complete within 30 seconds",
+        );
+        for (i, r) in results.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
+        }
+
+        // After all tasks complete, all slots must be released
+        assert_eq!(
+            cm.connect_in_flight.load(Ordering::SeqCst),
+            0,
+            "all admission slots should be released after test completes"
+        );
+    }
+
+    /// Stress test: concurrent cleanup + accept + prune (the exact deadlock scenario from #3095).
+    ///
+    /// This specifically targets the lock ordering between `cleanup_stale_reservations`
+    /// and `prune_connection`. The original deadlock was:
+    ///   Thread A: cleanup_stale_reservations → pending_reservations(W), connections_by_location(R)
+    ///   Thread B: prune_connection → location_for_peer(W), connections_by_location(W), pending_reservations(W)
+    ///
+    /// The fix ensures cleanup releases pending_reservations before acquiring location_for_peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_cleanup_vs_prune_stress() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::sync::Arc;
+
+        const NUM_TASKS: usize = 60;
+        const OPS_PER_TASK: usize = 300;
+        const SEED: u64 = 0xCAFE_BABE_3095_DEAD;
+
+        let cm = Arc::new(make_connection_manager(Some(make_addr(7000)), 2, 50, false));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_TASKS));
+
+        let mut handles = Vec::with_capacity(NUM_TASKS);
+        for task_id in 0..NUM_TASKS {
+            let cm = Arc::clone(&cm);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(tokio::spawn(async move {
+                let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(task_id as u64));
+                barrier.wait().await;
+
+                for _ in 0..OPS_PER_TASK {
+                    let port: u16 = rng.random_range(9000..9030);
+                    let addr = make_addr(port);
+                    let loc = Location::new(rng.random_range(0.01..0.99));
+
+                    match rng.random_range(0u8..5) {
+                        // Inject a reservation that will look stale to cleanup
+                        0 => {
+                            cm.inject_reservation(
+                                addr,
+                                loc,
+                                Instant::now() - Duration::from_secs(120),
+                            );
+                        }
+                        // should_accept (creates both reservation + location_for_peer)
+                        1 => {
+                            let _ = cm.should_accept(loc, addr);
+                        }
+                        // cleanup_stale_reservations (the method that caused #3095)
+                        2 => {
+                            let _ = cm.cleanup_stale_reservations();
+                        }
+                        // prune_connection variants (the other side of the deadlock)
+                        3 => {
+                            if rng.random() {
+                                let _ = cm.prune_alive_connection(addr);
+                            } else {
+                                let _ = cm.prune_in_transit_connection(addr);
+                            }
+                        }
+                        // add_connection (interacts with all three maps)
+                        4 => {
+                            let keypair = TransportKeypair::new();
+                            cm.add_connection(loc, addr, keypair.public().clone(), rng.random());
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    if rng.random_range(0..3) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }));
+        }
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
+
+        let results = result.expect(
+            "DEADLOCK DETECTED: concurrent cleanup vs prune did not complete within 30 seconds",
+        );
+        for (i, r) in results.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
+        }
     }
 }
