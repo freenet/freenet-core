@@ -13,7 +13,7 @@ use freenet::{
 use std::sync::Arc;
 
 mod commands;
-use commands::{service::ServiceCommand, update::UpdateCommand};
+use commands::{check_version::CheckVersionCommand, service::ServiceCommand, update::UpdateCommand};
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
 #[derive(Parser, Debug)]
@@ -44,6 +44,8 @@ enum Command {
     Service(ServiceCommand),
     /// Update Freenet to the latest version
     Update(UpdateCommand),
+    /// Check if a newer version of Freenet is available
+    CheckVersion(CheckVersionCommand),
 }
 
 /// Build metadata embedded at compile time
@@ -436,6 +438,7 @@ fn freenet_main() -> anyhow::Result<()> {
             )
         }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
+        Some(Command::CheckVersion(cmd)) => cmd.run(build_info::VERSION),
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);
             run_node(config)

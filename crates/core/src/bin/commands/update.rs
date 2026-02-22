@@ -12,8 +12,7 @@ use std::process::Command;
 use super::service::generate_wrapper_script;
 #[cfg(target_os = "linux")]
 use super::service::{generate_system_service_file, generate_user_service_file};
-
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
+use super::utils::{get_latest_release, Release};
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
@@ -327,18 +326,6 @@ impl UpdateCommand {
     }
 }
 
-#[derive(serde::Deserialize, Debug)]
-struct Release {
-    tag_name: String,
-    assets: Vec<Asset>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
-}
-
 /// SHA256 checksums parsed from SHA256SUMS.txt
 struct Checksums {
     entries: std::collections::HashMap<String, String>,
@@ -362,31 +349,6 @@ impl Checksums {
     fn get(&self, filename: &str) -> Option<&str> {
         self.entries.get(filename).map(|s| s.as_str())
     }
-}
-
-async fn get_latest_release() -> Result<Release> {
-    let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        .build()?;
-
-    let response = client
-        .get(GITHUB_API_URL)
-        .send()
-        .await
-        .context("Failed to fetch release info")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "GitHub API returned error: {} {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        );
-    }
-
-    response
-        .json::<Release>()
-        .await
-        .context("Failed to parse release info")
 }
 
 async fn download_checksums(url: &str) -> Result<Checksums> {
