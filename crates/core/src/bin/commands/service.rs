@@ -368,6 +368,11 @@ ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
+# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
+# a stale process). Without this, systemd restarts indefinitely. The counter
+# resets after a successful start, so auto-update (exit 42) is unaffected.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 # Allow 15 seconds for graceful shutdown before SIGKILL
 # The node handles SIGTERM to properly close peer connections
 TimeoutStopSec=15
@@ -421,6 +426,11 @@ ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
+# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
+# a stale process). Without this, systemd restarts indefinitely. The counter
+# resets after a successful start, so auto-update (exit 42) is unaffected.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 # Allow 15 seconds for graceful shutdown before SIGKILL
 # The node handles SIGTERM to properly close peer connections
 TimeoutStopSec=15
@@ -1088,6 +1098,10 @@ mod tests {
         assert!(service_content.contains("Restart=always"));
         assert!(service_content.contains("RestartSec=10"));
 
+        // Verify restart loop prevention (limits consecutive failures)
+        assert!(service_content.contains("StartLimitBurst=5"));
+        assert!(service_content.contains("StartLimitIntervalSec=120"));
+
         // Verify auto-update support via ExecStopPost
         assert!(service_content.contains("ExecStopPost="));
 
@@ -1126,6 +1140,8 @@ mod tests {
 
         // Verify it still has all the standard settings
         assert!(service_content.contains("Restart=always"));
+        assert!(service_content.contains("StartLimitBurst=5"));
+        assert!(service_content.contains("StartLimitIntervalSec=120"));
         assert!(service_content.contains("LimitNOFILE=65536"));
         assert!(service_content.contains("ExecStopPost="));
     }

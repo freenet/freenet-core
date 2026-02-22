@@ -114,20 +114,43 @@ async fn serve_with_listener(
             std_listener.set_nonblocking(true)?;
             tokio::net::TcpListener::from_std(std_listener)?
         }
-        None => tokio::net::TcpListener::bind(socket).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "Port {} is already in use. Another freenet process may be running. \
-                         Use 'pkill freenet' to stop it, or specify a different port with --ws-api-port.",
-                        socket.port()
-                    ),
+        None => {
+            // Use SO_REUSEADDR so we can rebind immediately if the previous
+            // process exited but the socket is still in TIME_WAIT.
+            let std_listener = {
+                let sock = socket2::Socket::new(
+                    if socket.is_ipv4() {
+                        socket2::Domain::IPV4
+                    } else {
+                        socket2::Domain::IPV6
+                    },
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
                 )
-            } else {
-                e
-            }
-        })?,
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("Failed to create socket: {e}"))
+                })?;
+                sock.set_reuse_address(true)?;
+                sock.set_nonblocking(true)?;
+                sock.bind(&socket.into()).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!(
+                                "Port {} is already in use. Another freenet process may be running. \
+                                 Use 'pkill freenet' to stop it, or specify a different port with --ws-api-port.",
+                                socket.port()
+                            ),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+                sock.listen(128)?;
+                std::net::TcpListener::from(sock)
+            };
+            tokio::net::TcpListener::from_std(std_listener)?
+        }
     };
     tracing::info!("HTTP client API listening on {}", socket);
     GlobalExecutor::spawn(async move {

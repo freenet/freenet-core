@@ -85,6 +85,10 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Check if another freenet process is already using the WS API port.
+    // This gives a clear error message instead of a generic "address in use".
+    check_for_existing_process(&config);
+
     let clients = serve_client_api(config.ws_api)
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
@@ -253,6 +257,174 @@ async fn run_network_node_with_signals(
     }
 
     result
+}
+
+/// Log a warning if another freenet process is already listening on the WS API port.
+///
+/// This is a best-effort check — it tries to connect to the port before we bind it.
+/// If another process is there, we warn loudly so the user knows why startup will fail.
+/// The actual binding still happens in `serve_client_api` where `SO_REUSEADDR` handles
+/// TIME_WAIT sockets and the error message handles truly conflicting processes.
+fn check_for_existing_process(config: &Config) {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::from((config.ws_api.address, config.ws_api.port));
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+        let pid = find_process_on_port(config.ws_api.port);
+        // Log as warn, not error — this is advisory. The bind call in
+        // serve_client_api() is the authoritative check and will produce
+        // the actual error if the port is still occupied.
+        if let Some(pid) = pid {
+            tracing::warn!(
+                port = config.ws_api.port,
+                pid = pid,
+                "Another process (PID {pid}) is already listening on port {}. \
+                 If freenet is installed as a service, use 'freenet service stop' before \
+                 running manually. Otherwise use 'kill {pid}' to stop it.",
+                config.ws_api.port
+            );
+        } else {
+            tracing::warn!(
+                port = config.ws_api.port,
+                "Port {} is already in use by another process. \
+                 If freenet is installed as a service, use 'freenet service stop' before \
+                 running manually.",
+                config.ws_api.port
+            );
+        }
+    }
+}
+
+/// Try to find the PID of the process listening on the given port.
+/// Returns None if we can't determine it (non-Linux, no permissions, etc.).
+fn find_process_on_port(port: u16) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // Parse /proc/net/tcp and /proc/net/tcp6 to find the listening socket,
+        // then find its inode owner. This avoids requiring external tools like lsof or ss.
+        let port_hex = format!("{:04X}", port);
+
+        // Search both IPv4 and IPv6 socket tables
+        let target_inode = find_listening_inode("/proc/net/tcp", &port_hex)
+            .or_else(|| find_listening_inode("/proc/net/tcp6", &port_hex))?;
+
+        // Scan /proc/*/fd/ to find which process owns this inode
+        let expected_link = format!("socket:[{target_inode}]");
+        let proc_dir = std::fs::read_dir("/proc").ok()?;
+        for entry in proc_dir.filter_map(|e| e.ok()) {
+            let pid_str = entry.file_name();
+            let pid_str = pid_str.to_string_lossy();
+            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let fd_dir = format!("/proc/{pid_str}/fd");
+            if let Ok(fds) = std::fs::read_dir(&fd_dir) {
+                for fd in fds.filter_map(|e| e.ok()) {
+                    if let Ok(link) = std::fs::read_link(fd.path()) {
+                        if link.to_string_lossy() == expected_link {
+                            return pid_str.parse().ok();
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = port;
+        None
+    }
+}
+
+/// Search a /proc/net/tcp{,6} file for a LISTEN socket on the given port.
+/// Returns the inode number as a string if found.
+#[cfg(target_os = "linux")]
+fn find_listening_inode(proc_path: &str, port_hex: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(proc_path).ok()?;
+    parse_listening_inode(&contents, port_hex)
+}
+
+/// Parse /proc/net/tcp{,6} content for a LISTEN socket on the given hex port.
+///
+/// The format has a header line followed by socket entries. Each entry has
+/// whitespace-separated fields:
+///   [0]=sl [1]=local_address [2]=rem_address [3]=st [4]=tx_queue:rx_queue
+///   [5]=tr:tm->when [6]=retrnsmt [7]=uid [8]=timeout [9]=inode ...
+///
+/// State 0A = TCP_LISTEN. The local_address format is hex_ip:hex_port.
+#[cfg(target_os = "linux")]
+fn parse_listening_inode(contents: &str, port_hex: &str) -> Option<String> {
+    for line in contents.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        if fields[3] == "0A" {
+            if let Some(addr_port) = fields[1].rsplit_once(':') {
+                if addr_port.1 == port_hex {
+                    return Some(fields[9].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use super::parse_listening_inode;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_listening_inode_ipv4() {
+        // Real /proc/net/tcp format with a LISTEN socket on port 7509 (0x1D55)
+        let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1D55 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 54321 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 11111 1 0000000000000000 100 0 0 10 0
+   2: 00000000:1D55 0100007F:E234 01 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000000 100 0 0 10 0";
+
+        // Should find the LISTEN (0A) socket on port 7509, not the ESTABLISHED (01) one
+        assert_eq!(
+            parse_listening_inode(content, "1D55"),
+            Some("54321".to_string())
+        );
+        // Port 53 (0x0035) is also listening
+        assert_eq!(
+            parse_listening_inode(content, "0035"),
+            Some("11111".to_string())
+        );
+        // Port 8080 (0x1F90) is not present
+        assert_eq!(parse_listening_inode(content, "1F90"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_listening_inode_ipv6() {
+        // /proc/net/tcp6 format — IPv6 addresses are 32 hex chars
+        let content = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:1D55 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67890 1 0000000000000000 100 0 0 10 0";
+
+        assert_eq!(
+            parse_listening_inode(content, "1D55"),
+            Some("67890".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_listening_inode_short_line() {
+        // Lines with fewer than 10 fields should be skipped
+        let content = "\
+  sl  local_address rem_address   st
+   0: 00000000:1D55 00000000:0000 0A";
+
+        assert_eq!(parse_listening_inode(content, "1D55"), None);
+    }
 }
 
 fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
