@@ -906,8 +906,8 @@ fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
                 eprintln!("Restore error: {}", restore_err);
             }
         }
-        // Clean up temp file
-        let _ = fs::remove_file(&temp_new);
+        // Clean up temp file (best-effort, failure is non-fatal during error recovery)
+        drop(fs::remove_file(&temp_new));
         return Err(e).context("Failed to install new binary");
     }
 

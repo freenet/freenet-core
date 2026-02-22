@@ -155,7 +155,7 @@ fn has_user_service() -> bool {
 /// Used after creating directories with sudo so the service user can write to them.
 #[cfg(target_os = "linux")]
 fn chown_to_user(path: &Path, username: &str) {
-    let _ = std::process::Command::new("chown")
+    let _status = std::process::Command::new("chown")
         .args(["-R", username, &path.display().to_string()])
         .status();
 }
@@ -469,11 +469,11 @@ fn uninstall_service(system: bool) -> Result<()> {
 
     let system_mode = use_system_mode(system);
 
-    // Stop the service if running
-    let _ = systemctl(system_mode, &["stop", "freenet"]);
+    // Stop the service if running (best-effort, may already be stopped)
+    let _stop = systemctl(system_mode, &["stop", "freenet"]);
 
-    // Disable the service
-    let _ = systemctl(system_mode, &["disable", "freenet"]);
+    // Disable the service (best-effort, may already be disabled)
+    let _disable = systemctl(system_mode, &["disable", "freenet"]);
 
     // Remove the service file
     let service_path = if system_mode {
@@ -488,8 +488,8 @@ fn uninstall_service(system: bool) -> Result<()> {
         fs::remove_file(&service_path).context("Failed to remove service file")?;
     }
 
-    // Reload systemd
-    let _ = systemctl(system_mode, &["daemon-reload"]);
+    // Reload systemd (best-effort, failure is non-fatal during uninstall)
+    drop(systemctl(system_mode, &["daemon-reload"]));
 
     println!("Freenet service uninstalled.");
 

@@ -102,10 +102,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
 
     // 1. Test start_op function - this should always work now (validates no early return bug)
     let sub_op = start_op(*contract_key.id(), false);
-    assert!(matches!(
-        sub_op.state,
-        Some(SubscribeState::PrepareRequest { .. })
-    ));
+    assert!(matches!(sub_op.state, SubscribeState::PrepareRequest(_)));
 
     // 2. Test k_closest_potentially_caching with initial skip list containing self
     let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
@@ -262,10 +259,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
 
     // Test 1: Validate that start_op creates correct initial state
     let sub_op = start_op(*contract_key.id(), false);
-    assert!(matches!(
-        sub_op.state,
-        Some(SubscribeState::PrepareRequest { .. })
-    ));
+    assert!(matches!(sub_op.state, SubscribeState::PrepareRequest(_)));
 
     // Test 2: Simulate the k_closest_potentially_caching call made in request_subscribe
     let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
@@ -467,7 +461,7 @@ async fn test_subscription_validates_k_closest_usage() {
     {
         let op = SubscribeOp {
             id: transaction_id,
-            state: Some(SubscribeState::AwaitingResponse {
+            state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
                 next_hop: None,
                 instance_id: *contract_key.id(),
             }),
@@ -478,10 +472,7 @@ async fn test_subscription_validates_k_closest_usage() {
         };
 
         // State is simplified - skip list is now in the Request message, not state
-        assert!(matches!(
-            op.state,
-            Some(SubscribeState::AwaitingResponse { .. })
-        ));
+        assert!(matches!(op.state, SubscribeState::AwaitingResponse(_)));
     }
 }
 
@@ -498,8 +489,8 @@ fn test_start_op_creates_prepare_request_state() {
     assert!(
         matches!(
             sub_op.state,
-            Some(SubscribeState::PrepareRequest { id, instance_id: iid, .. })
-            if iid == instance_id && id == sub_op.id
+            SubscribeState::PrepareRequest(ref data)
+            if data.instance_id == instance_id && data.id == sub_op.id
         ),
         "start_op should create PrepareRequest state with correct instance_id"
     );
@@ -539,8 +530,8 @@ fn test_start_op_with_id_uses_provided_transaction() {
     assert!(
         matches!(
             sub_op.state,
-            Some(SubscribeState::PrepareRequest { id, instance_id: iid, .. })
-            if iid == instance_id && id == custom_tx
+            SubscribeState::PrepareRequest(ref data)
+            if data.instance_id == instance_id && data.id == custom_tx
         ),
         "PrepareRequest state should have provided transaction ID"
     );
@@ -566,7 +557,7 @@ fn test_subscribe_op_state_lifecycle() {
     // 1. Initial state: PrepareRequest (created by start_op)
     let op_initial = SubscribeOp {
         id: tx_id,
-        state: Some(SubscribeState::PrepareRequest {
+        state: SubscribeState::PrepareRequest(super::PrepareRequestData {
             id: tx_id,
             instance_id,
             is_renewal: false,
@@ -589,7 +580,7 @@ fn test_subscribe_op_state_lifecycle() {
     // 2. Awaiting response state (after sending Subscribe::Request)
     let op_awaiting = SubscribeOp {
         id: tx_id,
-        state: Some(SubscribeState::AwaitingResponse {
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
             next_hop: Some(peer_addr),
             instance_id,
         }),
@@ -616,7 +607,7 @@ fn test_subscribe_op_state_lifecycle() {
     // 3. Completed state (after receiving Subscribe::Response)
     let op_completed = SubscribeOp {
         id: tx_id,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -650,7 +641,7 @@ fn test_subscribe_op_failed_state_returns_error() {
     // Create operation with no state (indicates failure)
     let op_failed = SubscribeOp {
         id: tx_id,
-        state: None,
+        state: SubscribeState::Failed,
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -685,7 +676,7 @@ fn test_local_subscription_completion_state() {
     // In reality, this sends a LocalSubscribeComplete event and marks operation complete
     let op = SubscribeOp {
         id: tx_id,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None, // Local subscription, no network requester
         requester_pub_key: None,
         is_renewal: false,
@@ -722,7 +713,7 @@ fn test_is_renewal_flag() {
 
     let renewal_op = SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
@@ -732,7 +723,7 @@ fn test_is_renewal_flag() {
 
     let client_op = SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -751,7 +742,7 @@ fn test_op_enum_is_subscription_renewal() {
 
     let renewal = OpEnum::Subscribe(SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true,
@@ -761,7 +752,7 @@ fn test_op_enum_is_subscription_renewal() {
 
     let non_renewal = OpEnum::Subscribe(SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -784,7 +775,7 @@ fn test_subscribe_failure_outcome() {
     // Non-finalized op with stats → should return ContractOpFailure
     let op_with_stats = SubscribeOp {
         id: tx,
-        state: None, // Not completed = failed
+        state: SubscribeState::Failed, // Not completed = failed
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -810,7 +801,7 @@ fn test_subscribe_failure_outcome() {
     let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([31u8; 32]));
     let op_completed = SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -833,7 +824,7 @@ fn test_subscribe_failure_outcome() {
     // Non-finalized op without stats → should return Incomplete
     let op_no_stats = SubscribeOp {
         id: tx,
-        state: None,
+        state: SubscribeState::Failed,
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -847,7 +838,7 @@ fn test_subscribe_failure_outcome() {
     // Test failure_routing_info()
     let op_for_info = SubscribeOp {
         id: tx,
-        state: None,
+        state: SubscribeState::Failed,
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -878,7 +869,7 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -909,7 +900,7 @@ fn test_subscribe_outcome_irrelevant_without_stats() {
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -929,7 +920,7 @@ fn test_subscribe_outcome_failure_with_stats() {
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
-        state: None, // Not completed
+        state: SubscribeState::Failed, // Not completed
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -957,7 +948,7 @@ fn test_subscribe_outcome_incomplete_without_stats() {
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
-        state: None,
+        state: SubscribeState::Failed,
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
@@ -980,7 +971,7 @@ fn test_subscribe_stats_lifecycle() {
     // Step 1: Initial state with no stats — Incomplete
     let mut op = SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::AwaitingResponse {
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
             next_hop: None,
             instance_id,
         }),
@@ -1009,7 +1000,7 @@ fn test_subscribe_stats_lifecycle() {
     }
 
     // Step 3: Operation completes
-    op.state = Some(SubscribeState::Completed { key: contract_key });
+    op.state = SubscribeState::Completed(super::CompletedData { key: contract_key });
     match op.outcome() {
         OpOutcome::ContractOpSuccessUntimed {
             target_peer: peer,
@@ -1034,7 +1025,7 @@ fn test_subscribe_renewal_reports_outcome() {
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
-        state: Some(SubscribeState::Completed { key: contract_key }),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: true, // This is a renewal

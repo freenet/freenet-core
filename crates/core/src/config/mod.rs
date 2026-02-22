@@ -1300,7 +1300,7 @@ impl ConfigPathsArgs {
                 let unique_path =
                     std::env::temp_dir().join(format!("{}-{}", base_name, std::process::id()));
                 // Clean up any stale unique path too (unlikely but possible)
-                let _ = fs::remove_dir_all(&unique_path);
+                let _cleanup = fs::remove_dir_all(&unique_path);
                 return Ok(Either::Right(unique_path));
             }
             Either::Right(temp_path)

@@ -190,6 +190,30 @@ wasmtime-backend = ["dep:wasmtime"]
 
 # ==============================================================================
 # Lint Configuration
+#
+# These lints move runtime failure classes to compile-time errors.
+# See: https://github.com/freenet/freenet-core/issues/3141
 # ==============================================================================
 
 [lints.rust]
+# Catch discarded Results/Options on #[must_use] types and functions.
+# This is the single highest-value lint: it turns silent failures into
+# compile errors (e.g., ignored channel send results, dropped operation outcomes).
+unused_must_use = "deny"
+
+# Require `unsafe` blocks to carry a `// SAFETY: ...` comment explaining
+# the invariant that makes the code sound. Prevents cargo-cult unsafe.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Disallow `let _ = expr` when `expr` is #[must_use].
+# Forces explicit handling or an intentional `drop()` call.
+let_underscore_must_use = "deny"
+
+# Flag `_ =>` catch-all arms on non-exhaustive enums.
+# New variants added to an enum should trigger a compile error at every
+# match site, not silently fall through a wildcard.
+wildcard_enum_match_arm = "warn"
+
+# Require `// SAFETY:` comments on every `unsafe` block.
+undocumented_unsafe_blocks = "deny"

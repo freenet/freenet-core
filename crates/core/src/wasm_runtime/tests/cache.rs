@@ -29,7 +29,7 @@ async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> 
 
     // Load first contract - cache should have 1 entry
     let state = WrappedState::new(vec![]);
-    let _ = runtime.validate_state(
+    let _result = runtime.validate_state(
         &contract_key_1,
         &Parameters::from([].as_ref()),
         &state,
@@ -42,7 +42,7 @@ async fn test_module_cache_eviction() -> Result<(), Box<dyn std::error::Error>> 
     );
 
     // Load the same contract again - cache should still have 1 entry (cache hit)
-    let _ = runtime.validate_state(
+    let _result = runtime.validate_state(
         &contract_key_1,
         &Parameters::from([].as_ref()),
         &state,
@@ -124,7 +124,7 @@ async fn test_module_cache_capacity_one() -> Result<(), Box<dyn std::error::Erro
 
     // Load contract - cache should have 1 entry
     let state = WrappedState::new(vec![]);
-    let _ = runtime.validate_state(
+    let _result = runtime.validate_state(
         &contract_key,
         &Parameters::from([].as_ref()),
         &state,

@@ -407,6 +407,8 @@ pub(crate) async fn run_op_request_mediator(
                         max = MAX_PENDING_REQUESTS,
                         "Mediator at capacity, rejecting request"
                     );
+                    // Executor may have timed out; send is best-effort
+                    #[allow(clippy::let_underscore_must_use)]
                     let _ = response_tx.send(Err(OpRequestError::Failed(
                         "mediator at capacity".to_string()
                     )));
@@ -428,6 +430,8 @@ pub(crate) async fn run_op_request_mediator(
                     );
                     // Remove and notify the waiting executor
                     if let Some(pending) = pending_responses.remove(&transaction) {
+                        // Executor may have timed out; send is best-effort
+                        #[allow(clippy::let_underscore_must_use)]
                         let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
                     }
                 }
@@ -485,7 +489,8 @@ pub(crate) async fn run_op_request_mediator(
                                 age_secs = now.duration_since(pending.created_at).as_secs(),
                                 "Removing stale pending request"
                             );
-                            // Try to notify the executor (likely already timed out)
+                            // Executor likely already timed out; send is best-effort
+                            #[allow(clippy::let_underscore_must_use)]
                             let _ = pending.response_tx.send(Err(OpRequestError::Failed(
                                 "request exceeded stale threshold".to_string()
                             )));
@@ -503,6 +508,8 @@ pub(crate) async fn run_op_request_mediator(
                 // Notify any remaining waiters
                 for (tx, pending) in std::mem::take(&mut pending_responses) {
                     tracing::debug!(tx = %tx, "Notifying orphaned waiter of shutdown");
+                    // Executor may have timed out; send is best-effort
+                    #[allow(clippy::let_underscore_must_use)]
                     let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
                 }
                 break;

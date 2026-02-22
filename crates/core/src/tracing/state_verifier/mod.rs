@@ -226,7 +226,10 @@ impl StateVerifier {
                             applied_broadcasts.insert((event.tx, peer));
                         }
                     }
-                    _ => {}
+                    PutEvent::Request { .. }
+                    | PutEvent::PutSuccess { .. }
+                    | PutEvent::PutFailure { .. }
+                    | PutEvent::ResponseSent { .. } => {}
                 },
 
                 // UPDATE events
@@ -295,9 +298,24 @@ impl StateVerifier {
                             });
                         }
                     }
-                    _ => {}
+                    UpdateEvent::Request { .. }
+                    | UpdateEvent::UpdateSuccess { .. }
+                    | UpdateEvent::BroadcastComplete { .. }
+                    | UpdateEvent::BroadcastDeliverySummary { .. } => {}
                 },
-                _ => {}
+                EventKind::Connect(_)
+                | EventKind::Get(_)
+                | EventKind::Subscribe(_)
+                | EventKind::Route(_)
+                | EventKind::Transfer(_)
+                | EventKind::Lifecycle(_)
+                | EventKind::Ignored
+                | EventKind::Disconnected { .. }
+                | EventKind::Timeout { .. }
+                | EventKind::TransportSnapshot(_)
+                | EventKind::InterestSync(_)
+                | EventKind::RoutingDecision(_)
+                | EventKind::RouterSnapshot(_) => {}
             }
         }
 

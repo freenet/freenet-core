@@ -685,15 +685,19 @@ async fn query_node_diagnostics(port: u16) -> Result<String> {
         .await
         .context("Failed to receive diagnostics response")?;
 
-    // Close connection gracefully
-    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+    // Close connection gracefully; ignore errors since we're done
+    let _disconnect = client.send(ClientRequest::Disconnect { cause: None }).await;
 
     match response {
         HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
             // Serialize the diagnostics to JSON for the report
             serde_json::to_string_pretty(&diag).context("Failed to serialize diagnostics")
         }
-        _ => anyhow::bail!("Unexpected response from node"),
+        HostResponse::ContractResponse(_)
+        | HostResponse::DelegateResponse { .. }
+        | HostResponse::QueryResponse(_)
+        | HostResponse::Ok
+        | _ => anyhow::bail!("Unexpected response from node"),
     }
 }
 

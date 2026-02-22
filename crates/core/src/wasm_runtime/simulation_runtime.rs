@@ -80,7 +80,9 @@ impl InMemoryContractStore {
                 let params = contract_v1.params().clone().into_owned();
                 (key, code, params)
             }
-            _ => return Err(anyhow::anyhow!("unsupported contract type")),
+            ContractContainer::Wasm(_) | _ => {
+                return Err(anyhow::anyhow!("unsupported contract type"))
+            }
         };
 
         let code_hash = *key.code_hash();

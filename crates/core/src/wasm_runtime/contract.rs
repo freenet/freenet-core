@@ -111,6 +111,9 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
+            // SAFETY: `result` is the return value from the WASM `validate_state` call and
+            // `linear_mem` points to the instance's live linear memory, so `from_raw`
+            // reads a valid, in-bounds result descriptor.
             let is_valid = unsafe {
                 ContractInterfaceResult::from_raw(result, &linear_mem)
                     .unwrap_validate_state_res(linear_mem)
@@ -163,6 +166,9 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
+            // SAFETY: `result` is the return value from the WASM `update_state` call and
+            // `linear_mem` points to the instance's live linear memory, so `from_raw`
+            // reads a valid, in-bounds result descriptor.
             let update_res = unsafe {
                 ContractInterfaceResult::from_raw(result, &linear_mem)
                     .unwrap_update_state(linear_mem)
@@ -206,6 +212,9 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
+            // SAFETY: `result` is the return value from the WASM `summarize_state` call and
+            // `linear_mem` points to the instance's live linear memory, so `from_raw`
+            // reads a valid, in-bounds result descriptor.
             let summary = unsafe {
                 ContractInterfaceResult::from_raw(result, &linear_mem)
                     .unwrap_summarize_state(linear_mem)
@@ -256,6 +265,9 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
+            // SAFETY: `result` is the return value from the WASM `get_state_delta` call and
+            // `linear_mem` points to the instance's live linear memory, so `from_raw`
+            // reads a valid, in-bounds result descriptor.
             let delta = unsafe {
                 ContractInterfaceResult::from_raw(result, &linear_mem)
                     .unwrap_get_state_delta(linear_mem)

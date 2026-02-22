@@ -1382,7 +1382,14 @@ impl<'a> NetEventLog<'a> {
                     state_hash: None, // Hash not available from message
                 })
             }
-            _ => EventKind::Ignored,
+            NetMessageV1::Connect(_)
+            | NetMessageV1::Put(_)
+            | NetMessageV1::Get(_)
+            | NetMessageV1::Update(_)
+            | NetMessageV1::Aborted(_)
+            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::InterestSync { .. }
+            | NetMessageV1::ReadyState { .. } => EventKind::Ignored,
         };
         let own_loc = op_manager.ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {
@@ -1574,7 +1581,8 @@ impl EventFlushHandle {
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+            // Best-effort flush: timeout or channel error is acceptable
+            let _flush_result = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
         }
     }
 }
@@ -1659,7 +1667,8 @@ impl EventRegister {
                         EventLogCommand::Flush(reply) => {
                             // Flush any remaining events in the batch
                             Self::flush_batch(&mut event_log).await;
-                            // Signal completion
+                            // Signal completion; receiver may have timed out
+                            #[allow(clippy::let_underscore_must_use)]
                             let _ = reply.send(());
                         }
                     }
@@ -1736,7 +1745,10 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                let _ = self.log_sender.send(EventLogCommand::Log(log_msg)).await;
+                if let Err(e) = self.log_sender.send(EventLogCommand::Log(log_msg)).await {
+                    tracing::debug!(error = %e, "event log channel closed");
+                    break;
+                }
             }
         }
         .boxed()
@@ -1765,7 +1777,9 @@ impl NetEventRegister for EventRegister {
         };
         let sender = self.log_sender.clone();
         async move {
-            let _ = sender.send(EventLogCommand::Log(log_msg)).await;
+            if let Err(e) = sender.send(EventLogCommand::Log(log_msg)).await {
+                tracing::debug!(error = %e, "event log channel closed during timeout notification");
+            }
         }
         .boxed()
     }
@@ -2065,7 +2079,20 @@ async fn send_to_metrics_server(
             );
             ws_stream.send(Message::Binary(msg.into())).await
         }
-        _ => Ok(()),
+        EventKind::Connect(_)
+        | EventKind::Put(_)
+        | EventKind::Get(_)
+        | EventKind::Subscribe(_)
+        | EventKind::Route(_)
+        | EventKind::Update(_)
+        | EventKind::Transfer(_)
+        | EventKind::Lifecycle(_)
+        | EventKind::Ignored
+        | EventKind::Timeout { .. }
+        | EventKind::TransportSnapshot(_)
+        | EventKind::InterestSync(_)
+        | EventKind::RoutingDecision(_)
+        | EventKind::RouterSnapshot(_) => Ok(()),
     };
     if let Err(error) = res {
         tracing::warn!(%error, "Error while sending message to network metrics server");
@@ -2080,7 +2107,9 @@ async fn received_from_metrics_server(
     use tokio_tungstenite::tungstenite::Message;
     match msg {
         Ok(Message::Ping(ping)) => {
-            let _ = ws_stream.send(Message::Pong(ping)).await;
+            if let Err(e) = ws_stream.send(Message::Pong(ping)).await {
+                tracing::debug!(error = %e, "failed to send pong to metrics server");
+            }
         }
         Ok(Message::Close(_)) => {
             if let Err(error) = ws_stream.send(Message::Close(None)).await {
@@ -2328,7 +2357,7 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'a, ()> {
             async {
                 for log_msg in NetLogMessage::to_log_message(logs) {
-                    let _ = self.log_sender.send(log_msg).await;
+                    let _sent = self.log_sender.send(log_msg).await;
                 }
             }
             .boxed()
@@ -2346,7 +2375,7 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'_, ()> {
             async move {
                 if cfg!(test) {
-                    let _ = self.finished_tx_notifier.send(tx).await;
+                    let _sent = self.finished_tx_notifier.send(tx).await;
                 }
             }
             .boxed()
@@ -2468,7 +2497,17 @@ impl EventKind {
             EventKind::Get(get) => get.contract_key(),
             EventKind::Subscribe(sub) => sub.contract_key(),
             EventKind::Update(upd) => Some(upd.contract_key()),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Route(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
         }
     }
 
@@ -2479,7 +2518,19 @@ impl EventKind {
         match self {
             EventKind::Put(put) => put.state_hash(),
             EventKind::Update(upd) => upd.state_hash(),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
         }
     }
 
@@ -2502,7 +2553,19 @@ impl EventKind {
         match self {
             EventKind::Put(put) => put.stored_state_hash(),
             EventKind::Update(upd) => upd.stored_state_hash(),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
         }
     }
 
@@ -2519,7 +2582,20 @@ impl EventKind {
                 info.success_events,
                 info.prediction_active,
             )),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_) => None,
         }
     }
 
@@ -2534,7 +2610,20 @@ impl EventKind {
                 | crate::router::RouteOutcome::SuccessUntimed => true,
                 crate::router::RouteOutcome::Failure => false,
             }),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
         }
     }
 
@@ -2546,7 +2635,21 @@ impl EventKind {
         match self {
             EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. }) => Some(true),
             EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. }) => Some(false),
-            _ => None,
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
         }
     }
 
@@ -2653,7 +2756,7 @@ impl From<Option<String>> for DisconnectReason {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[allow(clippy::large_enum_variant)] // Connected variant needs PeerKeyLocation for observability
-enum ConnectEvent {
+pub(crate) enum ConnectEvent {
     /// Initial connection start (legacy event - see RequestSent/RequestReceived for detailed tracking).
     StartConnection {
         from: PeerId,
@@ -2903,7 +3006,9 @@ impl PutEvent {
             PutEvent::PutSuccess { state_hash, .. }
             | PutEvent::BroadcastEmitted { state_hash, .. }
             | PutEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
-            _ => None,
+            PutEvent::Request { .. }
+            | PutEvent::PutFailure { .. }
+            | PutEvent::ResponseSent { .. } => None,
         }
     }
 
@@ -2914,7 +3019,11 @@ impl PutEvent {
     fn stored_state_hash(&self) -> Option<&str> {
         match self {
             PutEvent::PutSuccess { state_hash, .. } => state_hash.as_deref(),
-            _ => None,
+            PutEvent::Request { .. }
+            | PutEvent::PutFailure { .. }
+            | PutEvent::ResponseSent { .. }
+            | PutEvent::BroadcastEmitted { .. }
+            | PutEvent::BroadcastReceived { .. } => None,
         }
     }
 }
@@ -3045,7 +3154,9 @@ impl UpdateEvent {
             } => state_hash_after.as_deref(),
             UpdateEvent::BroadcastEmitted { state_hash, .. }
             | UpdateEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
-            _ => None,
+            UpdateEvent::Request { .. }
+            | UpdateEvent::BroadcastComplete { .. }
+            | UpdateEvent::BroadcastDeliverySummary { .. } => None,
         }
     }
 
@@ -3066,7 +3177,11 @@ impl UpdateEvent {
             | UpdateEvent::BroadcastApplied {
                 state_hash_after, ..
             } => state_hash_after.as_deref(),
-            _ => None,
+            UpdateEvent::Request { .. }
+            | UpdateEvent::BroadcastEmitted { .. }
+            | UpdateEvent::BroadcastComplete { .. }
+            | UpdateEvent::BroadcastReceived { .. }
+            | UpdateEvent::BroadcastDeliverySummary { .. } => None,
         }
     }
 }
@@ -3160,7 +3275,9 @@ impl GetEvent {
         match self {
             GetEvent::GetSuccess { key, .. } => Some(*key),
             GetEvent::ResponseSent { key, .. } => *key,
-            _ => None,
+            GetEvent::Request { .. }
+            | GetEvent::GetNotFound { .. }
+            | GetEvent::GetFailure { .. } => None,
         }
     }
 }
@@ -3276,7 +3393,15 @@ impl SubscribeEvent {
         match self {
             SubscribeEvent::SubscribeSuccess { key, .. } => Some(*key),
             SubscribeEvent::ResponseSent { key, .. } => *key,
-            _ => None,
+            SubscribeEvent::Request { .. }
+            | SubscribeEvent::SubscribeNotFound { .. }
+            | SubscribeEvent::SeedingStarted { .. }
+            | SubscribeEvent::SeedingStopped { .. }
+            | SubscribeEvent::_Reserved6
+            | SubscribeEvent::_Reserved7
+            | SubscribeEvent::_Reserved8
+            | SubscribeEvent::_Reserved9
+            | SubscribeEvent::_Reserved10 => None,
         }
     }
 }

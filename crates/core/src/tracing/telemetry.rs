@@ -62,6 +62,8 @@ pub fn send_standalone_event(event_type: &str, event_data: serde_json::Value) {
             event_type: event_type.to_string(),
             event_data,
         };
+        // Fire-and-forget: channel full means telemetry event is dropped
+        #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(TelemetryCommand::Event(event));
     }
 }
@@ -151,6 +153,8 @@ impl TelemetryReporter {
         let (sender, receiver) = mpsc::channel(1000);
 
         // Store a clone in the global sender for standalone event emission
+        // OnceLock::set returns Err if already initialized; expected on repeated calls
+        #[allow(clippy::let_underscore_must_use)]
         let _ = TELEMETRY_SENDER.set(sender.clone());
 
         // Initialize the transfer event channel for per-transfer telemetry
@@ -169,7 +173,8 @@ impl TelemetryReporter {
     }
 
     async fn send_event(&self, event: TelemetryEvent) {
-        // Non-blocking send - drop if channel is full
+        // Fire-and-forget: non-blocking send, drop if channel is full
+        #[allow(clippy::let_underscore_must_use)]
         let _ = self.sender.try_send(TelemetryCommand::Event(event));
     }
 }
@@ -218,6 +223,8 @@ impl NetEventRegister for TelemetryReporter {
                     "target_peer": target_peer,
                 }),
             };
+            // Fire-and-forget: channel full means telemetry event is dropped
+            #[allow(clippy::let_underscore_must_use)]
             let _ = sender.try_send(TelemetryCommand::Event(event));
         }
         .boxed()
@@ -538,7 +545,11 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
                 SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
                 // Reserved discriminants for removed variants
-                _ => "subscribe_reserved".to_string(),
+                SubscribeEvent::_Reserved6
+                | SubscribeEvent::_Reserved7
+                | SubscribeEvent::_Reserved8
+                | SubscribeEvent::_Reserved9
+                | SubscribeEvent::_Reserved10 => "subscribe_reserved".to_string(),
             }
         }
         EventKind::Update(update_event) => {
@@ -1054,7 +1065,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     })
                 }
                 // Reserved discriminants for removed variants
-                _ => serde_json::json!({"type": "reserved"}),
+                SubscribeEvent::_Reserved6
+                | SubscribeEvent::_Reserved7
+                | SubscribeEvent::_Reserved8
+                | SubscribeEvent::_Reserved9
+                | SubscribeEvent::_Reserved10 => serde_json::json!({"type": "reserved"}),
             }
         }
         EventKind::Update(update_event) => {
@@ -1321,7 +1336,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
                     let type_str = match &route_event.outcome {
                         RouteOutcome::SuccessUntimed => "route_success_untimed",
-                        _ => "route_failure",
+                        RouteOutcome::Success { .. } | RouteOutcome::Failure => "route_failure",
                     };
                     serde_json::json!({
                         "type": type_str,

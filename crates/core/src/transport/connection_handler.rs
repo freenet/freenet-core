@@ -943,7 +943,13 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
                 );
             }
             Some(ConnectionState::NatTraversal { result_sender, .. }) => {
-                let _ = result_sender.send(Err(TransportError::ConnectionClosed(*addr)));
+                // Receiver may have timed out; log but don't fail
+                if result_sender
+                    .send(Err(TransportError::ConnectionClosed(*addr)))
+                    .is_err()
+                {
+                    tracing::debug!(peer_addr = %addr, "NAT traversal result receiver already dropped");
+                }
             }
             _ => {}
         }
@@ -1211,7 +1217,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             }
                                             self.connections.record_asym_attempt(remote_addr);
                                         }
-                                        let _ = self.connections.send_nat_traversal(&remote_addr, packet_data).await;
+                                        if let Err(()) = self.connections.send_nat_traversal(&remote_addr, packet_data).await {
+                                            tracing::debug!(peer_addr = %remote_addr, "failed to send NAT traversal packet");
+                                        }
                                         continue;
                                     }
 
@@ -1396,7 +1404,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 inbound_remote_connection.inbound_packet_sender,
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
-                                let _ = result_sender.send(Ok(outbound_remote_conn));
+                                if result_sender.send(Ok(outbound_remote_conn)).is_err() {
+                                    tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
+                                }
                             } else {
                                 tracing::debug!(peer_addr = %remote_addr, "Connection state changed during NAT traversal");
                             }
@@ -1408,13 +1418,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     tracing::warn!(%error);
                                     crate::transport::signal_version_mismatch();
                                 }
-                                _ => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                 }
                             }
                             self.expected_non_gateway.remove(&remote_addr.ip());
                             if let Some(result_sender) = self.connections.fail_nat_traversal(&remote_addr) {
-                                let _ = result_sender.send(Err(error));
+                                if result_sender.send(Err(error)).is_err() {
+                                    tracing::debug!(peer_addr = %remote_addr, "NAT traversal failure result receiver already dropped");
+                                }
                             }
                         }
                     }
@@ -1438,9 +1450,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // Check for existing NAT traversal in progress
                     if self.connections.has_nat_traversal(&remote_addr) {
                         tracing::debug!(peer_addr = %remote_addr, "NAT traversal already in progress");
-                        let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
+                        if open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
-                        }));
+                        })).is_err() {
+                            tracing::debug!(peer_addr = %remote_addr, "duplicate NAT traversal notification receiver already dropped");
+                        }
                         continue;
                     }
 
@@ -1940,7 +1954,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         } => {
                                             return Err(handle_ack_connection_error(err));
                                         }
-                                        _ => {
+                                        SymmetricMessagePayload::ShortMessage { .. }
+                                        | SymmetricMessagePayload::StreamFragment { .. }
+                                        | SymmetricMessagePayload::NoOp
+                                        | SymmetricMessagePayload::Ping { .. }
+                                        | SymmetricMessagePayload::Pong { .. } => {
                                             tracing::trace!(
                                                 peer_addr = %remote_addr,
                                                 direction = "outbound",
@@ -3023,10 +3041,10 @@ pub mod mock_transport {
                                 }
                             }
                         }
-                        let _ = peer_conn.send(test_gen_cp.gen_msg()).await;
+                        let _sent = peer_conn.send(test_gen_cp.gen_msg()).await;
 
                         tracing::info!(%peer_addr, "finished");
-                        let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
+                        let _recv = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
                         Ok(messages)
                     });
                 }
@@ -3062,13 +3080,13 @@ pub mod mock_transport {
 
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3089,13 +3107,13 @@ pub mod mock_transport {
 
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3116,14 +3134,14 @@ pub mod mock_transport {
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3207,7 +3225,7 @@ pub mod mock_transport {
             conn.send("some data").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 2nd message");
             })?;
-            let _ = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             Ok::<_, anyhow::Error>(conn)
         });
 
@@ -3229,15 +3247,15 @@ pub mod mock_transport {
                 tracing::error!(%error, "error while receiving 2nd message");
             })?;
             assert_eq!(&b[8..], b"some data");
-            let _ = conn.send("complete").await.inspect_err(|error| {
+            let _sent = conn.send("complete").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 3rd message");
             });
             Ok::<_, anyhow::Error>(conn)
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        let _ = a?;
-        let _ = b?;
+        let _a = a?;
+        let _b = b?;
 
         Ok(())
     }
@@ -3252,7 +3270,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3260,7 +3278,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3281,7 +3299,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3289,7 +3307,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3310,7 +3328,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3318,7 +3336,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3338,7 +3356,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3346,7 +3364,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3444,7 +3462,7 @@ pub mod mock_transport {
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
+            let _recv = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
             Ok::<_, anyhow::Error>(())
         });
 

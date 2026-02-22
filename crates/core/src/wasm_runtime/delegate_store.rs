@@ -157,7 +157,7 @@ impl DelegateStore {
             .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
         // Wait for cache to process the insert. Even if TinyLFU rejects it,
         // the disk fallback above ensures the delegate can still be fetched.
-        let _ = self.delegate_cache.wait();
+        let _cache_result = self.delegate_cache.wait();
 
         Ok(())
     }
@@ -214,7 +214,7 @@ mod test {
         let f = store.fetch_delegate(delegate.key(), &vec![].into());
         assert!(f.is_some());
         // Clean up after test
-        let _ = std::fs::remove_dir_all(&cdelegate_dir);
+        let _cleanup = std::fs::remove_dir_all(&cdelegate_dir);
         Ok(())
     }
 

@@ -276,7 +276,7 @@ async fn test_oversized_state_handling(ctx: &mut TestContext) -> TestResult {
     }
 
     // Clean disconnect (may fail if connection was dropped)
-    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+    let _disconnect = client.send(ClientRequest::Disconnect { cause: None }).await;
 
     Ok(())
 }

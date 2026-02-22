@@ -342,7 +342,9 @@ fn spawn_outbound<S: crate::transport::Socket>(
             },
         };
 
-        let _ = events_tx.send(event).await;
+        if let Err(e) = events_tx.send(event).await {
+            tracing::warn!(error = %e, "failed to send handshake event");
+        }
     });
 }
 

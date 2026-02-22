@@ -671,7 +671,20 @@ impl super::StateVerifier {
                         entry.3 = true;
                     }
                 }
-                _ => {}
+                EventKind::Connect(_)
+                | EventKind::Put(_)
+                | EventKind::Get(_)
+                | EventKind::Subscribe(_)
+                | EventKind::Route(_)
+                | EventKind::Update(_)
+                | EventKind::Transfer(_)
+                | EventKind::Lifecycle(_)
+                | EventKind::Ignored
+                | EventKind::Disconnected { .. }
+                | EventKind::TransportSnapshot(_)
+                | EventKind::InterestSync(_)
+                | EventKind::RoutingDecision(_)
+                | EventKind::RouterSnapshot(_) => {}
             }
         }
 
@@ -716,7 +729,20 @@ impl super::StateVerifier {
                     let key_str = format!("{:?}", key);
                     *resync_bytes.entry(key_str).or_insert(0) += state_size;
                 }
-                _ => {}
+                EventKind::Connect(_)
+                | EventKind::Put(_)
+                | EventKind::Get(_)
+                | EventKind::Subscribe(_)
+                | EventKind::Route(_)
+                | EventKind::Update(_)
+                | EventKind::Transfer(_)
+                | EventKind::Lifecycle(_)
+                | EventKind::Ignored
+                | EventKind::Disconnected { .. }
+                | EventKind::Timeout { .. }
+                | EventKind::TransportSnapshot(_)
+                | EventKind::RoutingDecision(_)
+                | EventKind::RouterSnapshot(_) => {}
             }
         }
 

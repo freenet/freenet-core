@@ -185,7 +185,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)
@@ -328,7 +328,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)
@@ -467,7 +467,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)

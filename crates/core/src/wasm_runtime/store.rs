@@ -57,8 +57,9 @@ impl<S: StoreFsManagement> SafeWriter<S> {
     /// new writes are lost.
     #[allow(dead_code)] // Used by run_compaction() for safe compaction with handle refresh
     pub fn reopen(&mut self) -> std::io::Result<()> {
-        // Flush any buffered data first (though it goes to the old file)
-        let _ = self.file.flush();
+        // Flush any buffered data first (though it goes to the old file);
+        // flush failure is expected since we're replacing the underlying file
+        let _flush = self.file.flush();
 
         let file = OpenOptions::new()
             .create(true)
