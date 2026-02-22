@@ -4040,9 +4040,16 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
 
     // Phase 2: Disconnect client B — should trigger upstream Unsubscribe
     tracing::info!("Phase 2: Disconnect client B");
-    client_b
-        .send(ClientRequest::Disconnect { cause: None })
-        .await?;
+    // Drain buffered responses so the client's background request_handler is not
+    // blocked on response_tx.send() — otherwise it can't process the Disconnect.
+    loop {
+        match timeout(Duration::from_millis(500), client_b.recv()).await {
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = client_b.send(ClientRequest::Disconnect { cause: None }).await;
+    drop(client_b);
 
     // Wait for the disconnect to propagate and unsubscribe to be sent upstream
     tokio::time::sleep(Duration::from_secs(10)).await;

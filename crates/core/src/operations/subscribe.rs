@@ -237,6 +237,7 @@ pub(crate) fn create_unsubscribe_op(
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
+        stats: None,
     }
 }
 

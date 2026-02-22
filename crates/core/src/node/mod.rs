@@ -790,7 +790,11 @@ where
 {
     // Register network events (pure network concern)
     event_listener
-        .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
+        .register_events(NetEventLog::from_inbound_msg_v1(
+            &msg,
+            &op_manager,
+            source_addr,
+        ))
         .await;
 
     const MAX_RETRIES: usize = 15usize;

@@ -472,7 +472,8 @@ impl HostingManager {
                 });
                 if peers.is_empty() {
                     drop(peers);
-                    self.downstream_subscribers.remove(&key);
+                    self.downstream_subscribers
+                        .remove_if(&key, |_, peers| peers.is_empty());
                     fully_unsubscribed.push(key);
                 }
             }

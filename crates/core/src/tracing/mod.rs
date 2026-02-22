@@ -1154,6 +1154,7 @@ impl<'a> NetEventLog<'a> {
     pub fn from_inbound_msg_v1(
         msg: &'a NetMessageV1,
         op_manager: &'a OpManager,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Either<Self, Vec<Self>> {
         let connection_count = op_manager.ring.connection_manager.connection_count();
         let is_gateway = op_manager.ring.connection_manager.is_gateway();
@@ -1399,10 +1400,13 @@ impl<'a> NetEventLog<'a> {
             }
             NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe { id, instance_id }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                let from = source_addr
+                    .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| this_peer.clone());
                 EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived {
                     id: *id,
                     instance_id: *instance_id,
-                    from: this_peer.clone(), // Actual sender not available here
+                    from,
                     at: this_peer,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
