@@ -3985,24 +3985,8 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
         }
     }
 
-    // Send an update and verify client B receives it (subscription is active)
+    // client_a must NOT subscribe — downstream subscribers would prevent the upstream Unsubscribe
     tracing::info!("Phase 1: Verify subscription works");
-    make_subscribe(&mut client_a, contract_key).await?;
-    loop {
-        match timeout(Duration::from_secs(30), client_a.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-                subscribed,
-                ..
-            }))) => {
-                assert!(subscribed);
-                break;
-            }
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => bail!("Error waiting for SUBSCRIBE response: {}", e),
-            Err(_) => bail!("Timeout waiting for SUBSCRIBE response"),
-        }
-    }
-
     let todo = test_utils::TodoList {
         tasks: vec![test_utils::Task {
             id: 1,
@@ -4042,13 +4026,13 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     tracing::info!("Phase 2: Disconnect client B");
     // Drain buffered responses so the client's background request_handler is not
     // blocked on response_tx.send() — otherwise it can't process the Disconnect.
-    loop {
-        match timeout(Duration::from_millis(500), client_b.recv()).await {
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    let _ = client_b.send(ClientRequest::Disconnect { cause: None }).await;
+    while timeout(Duration::from_millis(500), client_b.recv())
+        .await
+        .is_ok()
+    {}
+    let _ = client_b
+        .send(ClientRequest::Disconnect { cause: None })
+        .await;
     drop(client_b);
 
     // Wait for the disconnect to propagate and unsubscribe to be sent upstream
