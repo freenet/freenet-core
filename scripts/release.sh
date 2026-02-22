@@ -26,7 +26,7 @@ RELEASE_STEPS=(
     "TAG_CREATED"
     "CRATES_PUBLISHED"
     "RELEASE_CREATED"
-    "LOCAL_DEPLOYED"
+    "GATEWAYS_UPDATED"
     "MATRIX_ANNOUNCED"
     "RIVER_ANNOUNCED"
 )
@@ -45,8 +45,6 @@ show_help() {
     echo
     echo "Options:"
     echo "  --version X.Y.Z     Target version (required)"
-    echo "  --deploy-local      Deploy to local gateway after release (optional)"
-    echo "  --deploy-remote     Deploy to remote gateways after release (optional)"
     echo "  --skip-tests        Skip pre-release tests"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --help              Show this help"
@@ -59,8 +57,7 @@ show_help() {
     echo "Notes:"
     echo "  • Relies on GitHub CI for testing (more reliable than local tests)"
     echo "  • Cross-compilation triggered automatically when version tag is pushed"
-    echo "  • Can deploy to local gateway (--deploy-local) or remote (--deploy-remote)"
-    echo "  • Manual deployment: scripts/deploy-local-gateway.sh or scripts/update-remote-gws.sh"
+    echo "  • Gateways are updated immediately after binaries are available (no 10-min wait)"
     echo
     echo "Example: $0 --version 0.1.18"
 }
@@ -72,12 +69,9 @@ while [[ $# -gt 0 ]]; do
             VERSION="$2"
             shift 2
             ;;
-        --deploy-local)
-            DEPLOY_LOCAL=true
-            shift
-            ;;
-        --deploy-remote)
-            DEPLOY_REMOTE=true
+        --deploy-local|--deploy-remote)
+            echo "Note: --deploy-local and --deploy-remote are deprecated."
+            echo "      Gateways are now updated automatically after binaries are available."
             shift
             ;;
         --skip-tests)
@@ -1019,89 +1013,65 @@ create_github_release() {
 # See .github/workflows/cross-compile.yml - it has `tags: ['v*']` trigger
 # trigger_cross_compile function is no longer needed
 
-deploy_gateways() {
-    # Skip if no deployment requested
-    if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
-        echo "Skipping gateway deployment (use --deploy-local or --deploy-remote to enable)"
+trigger_gateway_updates() {
+    # Trigger immediate update on all known gateways by running gateway-auto-update.sh --force
+    # This avoids the 10-minute polling delay, ensuring gateways are updated before users
+    # install the new version (version mismatch = failed connections).
+
+    if is_step_completed "GATEWAYS_UPDATED"; then
+        echo "  ✓ [GATEWAYS_UPDATED] Gateways already updated (skipping)"
         return 0
     fi
 
-    # Skip if already deployed (only check if local deployment was requested)
-    if [[ "$DEPLOY_LOCAL" == "true" ]] && is_step_completed "LOCAL_DEPLOYED"; then
-        echo "  ✓ [LOCAL_DEPLOYED] Local gateway already deployed (skipping)"
+    echo "Triggering immediate gateway updates:"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  [DRY RUN] Would SSH into gateways and run gateway-auto-update.sh --force"
         return 0
     fi
 
-    echo "Gateway Deployment:"
+    # Known gateways: host, SSH user, SSH options
+    local -a GATEWAYS=(
+        "nova.locut.us:ian:"
+        "vega.locut.us:ian:"
+    )
 
-    # Deploy to local gateway
-    if [[ "$DEPLOY_LOCAL" == "true" ]]; then
-        echo
-        echo "Deploying to local gateway:"
+    local all_ok=true
 
-        if [[ "$DRY_RUN" == "true" ]]; then
-            echo "  [DRY RUN] Would download binary from GitHub and run: $SCRIPT_DIR/deploy-local-gateway.sh"
-        else
-            local deploy_script="$SCRIPT_DIR/deploy-local-gateway.sh"
-            if [[ ! -f "$deploy_script" ]]; then
-                echo "  ⚠️  Deployment script not found: $deploy_script"
-                echo "     Skipping local deployment"
+    for gw_info in "${GATEWAYS[@]}"; do
+        IFS=':' read -r host user ssh_opts <<< "$gw_info"
+
+        echo -n "  Updating $host... "
+
+        # SSH in, run gateway-auto-update.sh --force as root
+        local output
+        if output=$(ssh -o ConnectTimeout=10 -o BatchMode=yes ${ssh_opts:+$ssh_opts} "${user}@${host}" \
+            "sudo /usr/local/bin/gateway-auto-update.sh --force" 2>&1); then
+            # Extract version from output
+            local new_ver
+            new_ver=$(echo "$output" | grep -oE 'Successfully updated to v[0-9.]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+            if [[ -n "$new_ver" ]]; then
+                echo "✓ (v$new_ver)"
             else
-                # Download the release binary from GitHub (ensures we deploy exact same binary users get)
-                local release_binary
-                release_binary=$(download_release_binary "$VERSION" "/tmp")
-                if [[ $? -ne 0 ]] || [[ -z "$release_binary" ]] || [[ ! -f "$release_binary" ]]; then
-                    echo "  ⚠️  Failed to download release binary, falling back to local build"
-                    # Check for custom target-dir in .cargo/config.toml (e.g. shared target directory)
-                    local cargo_config="$PROJECT_ROOT/.cargo/config.toml"
-                    local custom_target_dir=""
-                    if [[ -f "$cargo_config" ]]; then
-                        custom_target_dir=$(grep -oP 'target-dir\s*=\s*"\K[^"]+' "$cargo_config" 2>/dev/null || true)
-                    fi
-                    if [[ -n "$custom_target_dir" ]]; then
-                        release_binary="$custom_target_dir/release/freenet"
-                    else
-                        release_binary="$PROJECT_ROOT/target/release/freenet"
-                    fi
-                fi
-
-                if "$deploy_script" --binary "$release_binary"; then
-                    echo "  ✓ Local gateway deployed successfully"
-                    mark_completed "LOCAL_DEPLOYED"
-                    # Clean up downloaded binary
-                    if [[ "$release_binary" == /tmp/freenet-release-* ]]; then
-                        rm -f "$release_binary"
-                    fi
+                # Maybe already at target version
+                local already
+                already=$(echo "$output" | grep -c "Already running latest" || true)
+                if [[ "$already" -gt 0 ]]; then
+                    echo "✓ (already up to date)"
                 else
-                    echo "  ⚠️  Local gateway deployment failed (non-fatal)"
-                    echo "     You can deploy manually with: $deploy_script"
+                    echo "✓"
                 fi
             fi
-        fi
-    fi
-
-    # Deploy to remote gateways
-    if [[ "$DEPLOY_REMOTE" == "true" ]]; then
-        echo
-        echo "Deploying to remote gateways:"
-
-        if [[ "$DRY_RUN" == "true" ]]; then
-            echo "  [DRY RUN] Would run: $SCRIPT_DIR/update-remote-gws.sh"
         else
-            local deploy_script="$SCRIPT_DIR/update-remote-gws.sh"
-            if [[ ! -f "$deploy_script" ]]; then
-                echo "  ⚠️  Deployment script not found: $deploy_script"
-                echo "     Skipping remote deployment"
-            else
-                echo "  Running remote deployment script..."
-                if "$deploy_script"; then
-                    echo "  ✓ Remote gateways deployed successfully"
-                else
-                    echo "  ⚠️  Remote gateway deployment failed (non-fatal)"
-                    echo "     You can deploy manually with: $deploy_script"
-                fi
-            fi
+            echo "⚠️  failed (non-fatal)"
+            echo "     $output" | head -3
+            echo "     Manual: ssh ${user}@${host} 'sudo gateway-auto-update.sh --force'"
+            all_ok=false
         fi
+    done
+
+    if [[ "$all_ok" == "true" ]]; then
+        mark_completed "GATEWAYS_UPDATED"
     fi
 }
 
@@ -1324,8 +1294,8 @@ create_release_pr
 publish_crates
 create_github_release
 wait_for_binaries
-deploy_gateways
-# Announce AFTER binaries are confirmed available and gateways deployed,
+trigger_gateway_updates
+# Announce AFTER binaries are confirmed available and gateways updated,
 # so users can actually update when they see the announcement.
 announce_to_matrix
 announce_to_river
@@ -1338,42 +1308,20 @@ echo "- freenet $VERSION published to crates.io"
 echo "- fdev $FDEV_VERSION published to crates.io"
 echo "- GitHub release created: https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
 echo "- Cross-compiled binaries attached to release"
+echo "- Gateways updated immediately"
 echo "- Announcement sent to Matrix (#freenet-locutus)"
 echo "- Announcement sent to River (Freenet Official room)"
 
-# Show deployment status
-if [[ "$DEPLOY_LOCAL" == "true" ]]; then
-    echo "- Local gateway deployed to $(hostname)"
-fi
-if [[ "$DEPLOY_REMOTE" == "true" ]]; then
-    echo "- Remote gateways deployment initiated"
-fi
-
 echo
 echo "Next steps:"
-
-# Suggest deployment options if not used
-if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
-    echo "- Deploy locally: scripts/deploy-local-gateway.sh"
-    echo "- Deploy to remote gateways: scripts/update-remote-gws.sh"
-elif [[ "$DEPLOY_LOCAL" == "false" ]]; then
-    echo "- Deploy locally: scripts/deploy-local-gateway.sh"
-elif [[ "$DEPLOY_REMOTE" == "false" ]]; then
-    echo "- Deploy to remote gateways: scripts/update-remote-gws.sh"
-fi
-
 echo "- Update any dependent projects to use the new version"
 echo
 echo "⚠️  IMPORTANT: Post-release log review required!"
-echo "   Wait 10-15 minutes for gateways to auto-update, then check logs on:"
-echo "   - nova.locut.us (gateway)"
-echo "   - vega.locut.us (gateway)"
-echo "   - technic (home peer)"
+echo "   Wait 5-10 minutes, then check gateway logs for issues:"
 echo
 echo "   Quick check commands:"
-echo "   ssh freenet@nova.locut.us 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
-echo "   ssh freenet@vega.locut.us 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
-echo "   ssh ian@technic 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
+echo "   ssh ian@nova.locut.us 'sudo /usr/local/bin/freenet --version'"
+echo "   ssh ian@vega.locut.us 'sudo /usr/local/bin/freenet --version'"
 echo
 echo "   Look for: log spam, rapid log growth, new error patterns"
 echo "   See: ~/.claude/skills/freenet-release/SKILL.md for full checklist"
