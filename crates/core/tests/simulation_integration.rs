@@ -5078,6 +5078,10 @@ fn test_subscribe_renewal_long_running() {
 ///
 /// Runs a medium network and scans event logs for subscribe outcomes.
 /// Catches regressions like #3138 where subscribe success collapsed from 92% to 24%.
+///
+/// Note: Only counts completed subscribe outcomes (SubscribeSuccess/SubscribeNotFound).
+/// Subscribe timeouts are emitted as `EventKind::Timeout` only with the `trace-ot` feature,
+/// which is not enabled in simulation tests.
 #[test_log::test]
 fn test_topology_subscribe_health() {
     const SEED: u64 = 0x3152_0001_0001;
@@ -5139,9 +5143,10 @@ fn test_topology_subscribe_health() {
 
 /// Verify router receives feedback and doesn't degrade over time.
 ///
-/// Checks that (a) router prediction becomes active (enough events), and
-/// (b) the failure rate in the second half of the simulation is not significantly
-/// worse than the first half. Catches #3128/#3136 (router never learns).
+/// Checks that the failure rate in the second half of the simulation is not
+/// significantly worse than the first half. If router snapshots are available
+/// (emitted every 5 min of virtual time), also logs whether prediction is active.
+/// Catches #3128/#3136 (router never learns).
 #[test_log::test]
 fn test_router_learning() {
     const SEED: u64 = 0x3152_0002_0001;
@@ -5154,7 +5159,8 @@ fn test_router_learning() {
         .run()
         .assert_ok();
 
-    // Check that router prediction becomes active
+    // Log router snapshot info if available (snapshots emitted every 5 min,
+    // may not fire in short simulations using turmoil's time model)
     let snapshots = result.router_snapshots();
     let any_prediction_active = snapshots.iter().any(|(_f, _s, active)| *active);
     tracing::info!(
@@ -5172,10 +5178,12 @@ fn test_router_learning() {
             .collect()
     });
 
-    if outcomes.is_empty() {
-        tracing::warn!("No route outcome events — skipping degradation check");
-        return;
-    }
+    assert!(
+        outcomes.len() >= 10,
+        "Only {} route outcome events — too few for meaningful comparison. \
+         Expected at least 10.",
+        outcomes.len()
+    );
 
     let mid = outcomes.len() / 2;
     let (first_half, second_half) = outcomes.split_at(mid);
@@ -5214,10 +5222,16 @@ fn test_router_learning() {
     tracing::info!("test_router_learning PASSED");
 }
 
-/// Verify subscriptions survive 2+ lease cycles (SUBSCRIPTION_LEASE_DURATION = 480s).
+/// Verify subscriptions survive across multiple subscription lease cycles.
 ///
-/// Runs long enough for ~2.5 lease cycles and checks that update broadcasts
-/// continue arriving in the second half. Catches #3093 (TTL not refreshed).
+/// SUBSCRIPTION_LEASE_DURATION = 480s (8 min). The simulation runs for
+/// 400 iterations * 3s = 1200s (~2.5 lease cycles) and checks that update
+/// broadcasts continue arriving in the second half of virtual time.
+///
+/// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
+/// Virtual time is controlled by iterations * event_wait, not `with_duration()`.
+///
+/// Catches #3093 (interest TTL not refreshed on broadcast send).
 #[test_log::test]
 fn test_interest_renewal() {
     const SEED: u64 = 0x3152_0003_0001;
@@ -5228,21 +5242,28 @@ fn test_interest_renewal() {
         .with_nodes(4)
         .with_iterations(400)
         .with_event_wait(Duration::from_secs(3))
-        .with_duration(Duration::from_secs(1400))
         .run_direct()
         .assert_ok();
 
-    // Count broadcast-received events in first vs second half
+    // Split broadcast-received events by time (log index as proxy for time order)
     let rt = create_runtime();
     let (early_broadcasts, late_broadcasts) = rt.block_on(async {
         let logs = result.logs_handle.lock().await;
-        let total = logs
-            .iter()
-            .filter(|log| log.kind.is_update_broadcast_received())
-            .count();
+        let log_count = logs.len();
+        let mid_index = log_count / 2;
 
-        let mid = total / 2;
-        (mid, total - mid)
+        let mut early = 0usize;
+        let mut late = 0usize;
+        for (i, log) in logs.iter().enumerate() {
+            if log.kind.is_update_broadcast_received() {
+                if i < mid_index {
+                    early += 1;
+                } else {
+                    late += 1;
+                }
+            }
+        }
+        (early, late)
     });
 
     let total = early_broadcasts + late_broadcasts;

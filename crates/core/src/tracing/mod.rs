@@ -2529,9 +2529,11 @@ impl EventKind {
     /// `Some(false)` for `RouteOutcome::Failure`, `None` for non-Route events.
     pub fn route_outcome_is_success(&self) -> Option<bool> {
         match self {
-            EventKind::Route(re) => {
-                Some(!matches!(re.outcome, crate::router::RouteOutcome::Failure))
-            }
+            EventKind::Route(re) => Some(match re.outcome {
+                crate::router::RouteOutcome::Success { .. }
+                | crate::router::RouteOutcome::SuccessUntimed => true,
+                crate::router::RouteOutcome::Failure => false,
+            }),
             _ => None,
         }
     }
