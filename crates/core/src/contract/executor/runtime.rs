@@ -1231,6 +1231,20 @@ where
             })
         })?;
 
+        // Check summary cache: if state hash matches, return cached summary
+        let state_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            state.as_ref().hash(&mut hasher);
+            hasher.finish()
+        };
+
+        if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
+            if *cached_hash == state_hash {
+                return Ok(cached_summary.clone());
+            }
+        }
+
         let params = self
             .state_store
             .get_params(&key)
@@ -1243,9 +1257,13 @@ where
                 })
             })?;
 
-        self.runtime
+        let summary = self
+            .runtime
             .summarize_state(&key, &params, &state)
-            .map_err(|e| ExecutorError::execution(e, None))
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        self.summary_cache.put(key, (state_hash, summary.clone()));
+        Ok(summary)
     }
 
     pub(super) async fn bridged_get_contract_state_delta(
@@ -1262,6 +1280,21 @@ where
             })
         })?;
 
+        // Check delta cache: if (state_hash, their_summary_hash) matches, return cached delta
+        let (state_hash, summary_hash) = {
+            use std::hash::{Hash, Hasher};
+            let mut h1 = std::collections::hash_map::DefaultHasher::new();
+            state.as_ref().hash(&mut h1);
+            let mut h2 = std::collections::hash_map::DefaultHasher::new();
+            their_summary.as_ref().hash(&mut h2);
+            (h1.finish(), h2.finish())
+        };
+
+        let cache_key = (key, state_hash, summary_hash);
+        if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
+            return Ok(cached_delta.clone());
+        }
+
         let params = self
             .state_store
             .get_params(&key)
@@ -1274,9 +1307,13 @@ where
                 })
             })?;
 
-        self.runtime
+        let delta = self
+            .runtime
             .get_state_delta(&key, &params, &state, &their_summary)
-            .map_err(|e| ExecutorError::execution(e, None))
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        self.delta_cache.put(cache_key, delta.clone());
+        Ok(delta)
     }
 
     // --- Helper methods ---

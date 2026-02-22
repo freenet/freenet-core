@@ -1064,12 +1064,14 @@ pub(super) mod in_memory {
     /// Contract handler using MockWasmRuntime — exercises the production ContractExecutor
     /// code path (init_tracker, validation, notification pipeline, corrupted state recovery)
     /// without requiring real WASM binaries.
+    #[allow(dead_code)]
     pub(crate) struct MockWasmContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         runtime: Executor<MockWasmRuntime, MockStateStorage>,
     }
 
     /// Builder for MockWasmContractHandler.
+    #[allow(dead_code)]
     pub struct MockWasmHandlerBuilder {
         pub identifier: String,
         pub shared_storage: MockStateStorage,

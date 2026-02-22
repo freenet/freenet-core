@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -772,6 +774,16 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
     /// See [`CorruptedStateRecoveryGuard`] for details.
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
+
+    /// Cache of contract summaries keyed by ContractKey, storing (state_hash, summary).
+    /// Avoids redundant WASM instantiations during the 5-minute interest heartbeat
+    /// which calls summarize_state() for every matching contract.
+    /// LRU-bounded to prevent unbounded growth on gateways that see many contracts over time.
+    summary_cache: LruCache<ContractKey, (u64, StateSummary<'static>)>,
+
+    /// Cache of delta results keyed by (ContractKey, state_hash, their_summary_hash).
+    /// Avoids redundant WASM instantiations for get_state_delta() calls.
+    delta_cache: LruCache<(ContractKey, u64, u64), StateDelta<'static>>,
 }
 
 impl<R, S> Executor<R, S>
@@ -804,6 +816,8 @@ where
             shared_notifications: None,
             shared_summaries: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
         })
     }
 
