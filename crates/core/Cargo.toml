@@ -122,6 +122,7 @@ freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
 libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
+parking_lot = { workspace = true, features = ["deadlock_detection"] }
 rstest = { workspace = true }
 statrs = { workspace = true }
 tempfile = { workspace = true }
@@ -172,7 +173,7 @@ sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
 websocket = ["axum/ws"]
-testing = ["freenet-stdlib/testing"]
+testing = ["freenet-stdlib/testing", "parking_lot/deadlock_detection"]
 console-subscriber = ["dep:console-subscriber"]
 test-network = ["dep:freenet-test-network"]
 bench = []  # Exposes internal test infrastructure for benchmarking
