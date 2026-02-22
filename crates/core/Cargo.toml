@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.140"
+version = "0.1.142"
 edition = "2021"
 rust-version = "1.80"
 publish = true
