@@ -713,4 +713,189 @@ mod tests {
             );
         }
     }
+
+    mod proptest_channel {
+        use super::*;
+        use crate::config::GlobalExecutor;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            /// Property: no messages are silently dropped under varying send rates.
+            /// With N senders each sending M messages through a bounded channel,
+            /// the receiver must collect exactly N * M messages.
+            #[test]
+            fn no_silent_drops(
+                n_senders in 1usize..20,
+                msgs_per_sender in 1usize..200,
+                capacity in 1usize..100,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                let total = n_senders * msgs_per_sender;
+
+                let received = rt.block_on(async {
+                    let (tx, rx) = bounded::<u64>(capacity);
+
+                    let handles: Vec<_> = (0..n_senders)
+                        .map(|sender_id| {
+                            let tx = tx.clone();
+                            GlobalExecutor::spawn(async move {
+                                for i in 0..msgs_per_sender {
+                                    tx.send_async(
+                                        (sender_id * msgs_per_sender + i) as u64
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                            })
+                        })
+                        .collect();
+                    drop(tx); // drop original so channel closes when senders finish
+
+                    let receiver = GlobalExecutor::spawn(async move {
+                        let mut count = 0u64;
+                        while rx.recv_async().await.is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                    receiver.await.unwrap()
+                });
+
+                prop_assert_eq!(
+                    received, total as u64,
+                    "Expected {} messages, received {}",
+                    total, received
+                );
+            }
+
+            /// Property: try_send returns Full (not silent drop) when channel
+            /// is at capacity. All successfully sent messages are received.
+            #[test]
+            fn backpressure_signals_full(
+                capacity in 1usize..50,
+                n_extra in 1usize..100,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (tx, rx) = bounded::<u64>(capacity);
+
+                    // Fill channel to capacity
+                    for i in 0..capacity {
+                        tx.try_send(i as u64).unwrap();
+                    }
+
+                    // Attempt to send beyond capacity -- must get Full, never silently drop
+                    let mut full_count = 0usize;
+                    for i in 0..n_extra {
+                        match tx.try_send((capacity + i) as u64) {
+                            Err(TrySendError::Full(_)) => full_count += 1,
+                            Ok(()) => {
+                                // Should not happen since we haven't drained
+                                panic!(
+                                    "try_send succeeded beyond capacity without draining"
+                                );
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                panic!("channel disconnected unexpectedly");
+                            }
+                        }
+                    }
+
+                    prop_assert_eq!(
+                        full_count, n_extra,
+                        "All extra sends should return Full"
+                    );
+
+                    // Drain and verify exactly `capacity` messages received
+                    let mut received = 0usize;
+                    while rx.try_recv().is_ok() {
+                        received += 1;
+                    }
+                    prop_assert_eq!(
+                        received, capacity,
+                        "Should receive exactly capacity messages"
+                    );
+
+                    Ok(())
+                })?;
+            }
+
+            /// Property: sender disconnection is properly detected by receiver.
+            /// After all senders drop, recv_async returns Err(RecvError) after
+            /// draining buffered messages.
+            #[test]
+            fn sender_disconnect_detected(
+                n_msgs in 0usize..100,
+                capacity in 1usize..50,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                let received = rt.block_on(async {
+                    let (tx, rx) = bounded::<u64>(capacity);
+
+                    // Send messages then drop sender
+                    let to_send = n_msgs.min(capacity); // can't exceed capacity synchronously
+                    for i in 0..to_send {
+                        tx.send(i as u64).unwrap();
+                    }
+                    drop(tx);
+
+                    // Receive all messages
+                    let mut count = 0u64;
+                    while rx.recv_async().await.is_ok() {
+                        count += 1;
+                    }
+                    count
+                });
+
+                prop_assert_eq!(
+                    received, n_msgs.min(capacity) as u64,
+                    "Should receive all buffered messages before disconnect"
+                );
+            }
+
+            /// Property: receiver drop is detected by senders.
+            /// After the receiver drops, is_closed() returns true and
+            /// send_async returns SendError.
+            #[test]
+            fn receiver_disconnect_detected(
+                capacity in 1usize..50,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (tx, rx) = bounded::<u64>(capacity);
+
+                    prop_assert!(!tx.is_closed());
+                    drop(rx);
+                    prop_assert!(tx.is_closed());
+
+                    let result = tx.send_async(42).await;
+                    prop_assert!(result.is_err(), "send_async should fail after receiver drops");
+
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }
