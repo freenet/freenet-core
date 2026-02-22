@@ -6,7 +6,8 @@ members = [
 	"apps/freenet-ping/types",
 	"apps/freenet-ping/contracts/ping",
 	"tests/test-contract-integration",
-	"tests/test-contract-update-nochange"
+	"tests/test-contract-update-nochange",
+	"tests/test-contract-mock-aligned"
 ]
 
 [workspace.dependencies]

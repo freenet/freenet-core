@@ -5491,6 +5491,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-mock-aligned"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [

@@ -60,7 +60,12 @@ struct TestConfig {
     latency_range: Option<std::ops::Range<Duration>>,
     /// Optional message loss rate for fault injection (0.0 to 1.0)
     message_loss_rate: f64,
-    /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime
+    /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime.
+    ///
+    /// **Prefer `true` for new tests.** MockWasmRuntime shares production `bridged_*`
+    /// code paths (init tracking, validation, subscriber notifications, corrupted state
+    /// recovery). MockRuntime has its own independent implementation that can silently
+    /// drift from production behavior. See issue #3141.
     use_mock_wasm: bool,
 }
 
