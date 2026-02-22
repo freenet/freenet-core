@@ -276,6 +276,12 @@ impl Ring {
             CONTRACT_CONNECT_INTERVAL,
         ));
 
+        // Spawn periodic interest heartbeat task.
+        // Sends full Interests { hashes } to each connected peer to keep
+        // interest entries alive and prevent the death spiral where expired
+        // entries block broadcast delivery.
+        GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone()));
+
         Ok(ring)
     }
 
@@ -520,6 +526,98 @@ impl Ring {
                     }
                 }
             }
+        }
+    }
+
+    /// Periodic heartbeat: send `Interests { hashes }` to each connected peer.
+    ///
+    /// This prevents the death spiral where interest entries expire because no
+    /// broadcasts are flowing, which in turn prevents broadcasts from ever
+    /// flowing again. By periodically re-sending the full interest set, we
+    /// keep entries alive on the remote side.
+    ///
+    /// Sends are spread evenly across the interval to avoid bursts.
+    async fn interest_heartbeat(ring: Arc<Self>) {
+        use crate::ring::interest::INTEREST_HEARTBEAT_INTERVAL;
+
+        // Random initial delay to prevent synchronized heartbeats across peers
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(15u64..=45u64));
+        tokio::time::sleep(initial_delay).await;
+
+        let mut interval = tokio::time::interval(INTEREST_HEARTBEAT_INTERVAL);
+        interval.tick().await; // Skip first immediate tick
+
+        loop {
+            interval.tick().await;
+
+            let Some(op_manager) = ring.upgrade_op_manager() else {
+                continue;
+            };
+
+            // Get our current interest hashes
+            let hashes = op_manager.interest_manager.get_all_interest_hashes();
+            if hashes.is_empty() {
+                continue;
+            }
+
+            // Get all connected peer addresses
+            let connections = ring.connection_manager.get_connections_by_location();
+            let peer_addrs: Vec<std::net::SocketAddr> = connections
+                .values()
+                .flat_map(|conns| conns.iter())
+                .filter_map(|conn| conn.location.socket_addr())
+                .collect();
+
+            if peer_addrs.is_empty() {
+                continue;
+            }
+
+            let num_peers = peer_addrs.len();
+            let spread_delay = INTEREST_HEARTBEAT_INTERVAL
+                .checked_div(num_peers as u32)
+                .unwrap_or(Duration::from_secs(1));
+
+            tracing::debug!(
+                num_peers,
+                num_hashes = hashes.len(),
+                "Interest heartbeat: sending Interests to peers"
+            );
+
+            let sender = op_manager.to_event_listener.notifications_sender();
+            for (i, peer_addr) in peer_addrs.into_iter().enumerate() {
+                let message = crate::message::InterestMessage::Interests {
+                    hashes: hashes.clone(),
+                };
+                if let Err(e) = sender
+                    .send(either::Either::Right(
+                        crate::message::NodeEvent::SendInterestMessage {
+                            target: peer_addr,
+                            message,
+                        },
+                    ))
+                    .await
+                {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        "Interest heartbeat: failed to queue message"
+                    );
+                    break;
+                }
+
+                // Spread sends evenly across the interval (skip delay after last)
+                if i + 1 < num_peers {
+                    tokio::time::sleep(spread_delay).await;
+                }
+            }
+
+            crate::tracing::telemetry::send_standalone_event(
+                "interest_heartbeat_cycle",
+                serde_json::json!({
+                    "peers_sent": num_peers,
+                    "interest_hashes": hashes.len(),
+                }),
+            );
         }
     }
 

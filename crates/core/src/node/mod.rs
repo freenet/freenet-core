@@ -1207,22 +1207,49 @@ async fn handle_interest_sync_message(
                 "Received Interests message"
             );
 
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+
+            // Full-replace semantics: the incoming hashes represent the peer's
+            // complete interest set. Remove entries for contracts whose hash is
+            // NOT in the incoming set, then register/refresh the rest.
+            if let Some(ref pk) = peer_key {
+                let incoming_hashes: std::collections::HashSet<u32> =
+                    hashes.iter().copied().collect();
+                let current_contracts = op_manager.interest_manager.get_contracts_for_peer(pk);
+
+                let mut removed = 0usize;
+                for contract in &current_contracts {
+                    let h = contract_hash(contract);
+                    if !incoming_hashes.contains(&h) {
+                        op_manager
+                            .interest_manager
+                            .remove_peer_interest(contract, pk);
+                        removed += 1;
+                    }
+                }
+                if removed > 0 {
+                    tracing::debug!(
+                        from = %source,
+                        removed,
+                        "Full-replace: removed stale interest entries"
+                    );
+                }
+            }
+
             // Find contracts we share interest in
             let matching = op_manager.interest_manager.get_matching_contracts(&hashes);
 
-            // Build summaries for shared contracts
+            // Build summaries for shared contracts and register/refresh peer interest
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
-                // Get our state summary for this contract
                 let summary = get_contract_summary(op_manager, &contract).await;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
 
-                // Register peer's interest
-                let peer_key = get_peer_key_from_addr(op_manager, source);
-                if let Some(pk) = peer_key {
+                if let Some(ref pk) = peer_key {
                     op_manager.interest_manager.register_peer_interest(
-                        &contract, pk,
+                        &contract,
+                        pk.clone(),
                         None, // We'll get their summary in their Summaries response
                         false,
                     );
