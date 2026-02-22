@@ -9,6 +9,7 @@
 pub(crate) mod app_packaging;
 pub(crate) mod client_api;
 pub(crate) mod errors;
+mod home_page;
 pub(crate) mod path_handlers;
 
 use std::net::SocketAddr;

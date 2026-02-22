@@ -77,6 +77,7 @@ pub fn record_connection_success() {
 pub struct NetworkStatusSnapshot {
     pub failures: Vec<FailureSnapshot>,
     pub connection_attempts: u32,
+    pub open_connections: u32,
     pub elapsed_secs: u64,
 }
 
@@ -122,6 +123,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     Some(NetworkStatusSnapshot {
         failures,
         connection_attempts: s.connection_attempts,
+        open_connections: s.open_connections,
         elapsed_secs: s.started_at.elapsed().as_secs(),
     })
 }

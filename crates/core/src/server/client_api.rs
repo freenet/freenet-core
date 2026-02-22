@@ -18,7 +18,9 @@ use tracing::instrument;
 use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;
 
-use super::{errors::WebSocketApiError, path_handlers, ApiVersion, AuthToken, ClientConnection};
+use super::{
+    errors::WebSocketApiError, home_page, path_handlers, ApiVersion, AuthToken, ClientConnection,
+};
 
 mod v1;
 mod v2;
@@ -101,7 +103,9 @@ impl HttpClientApi {
 
         let config = Config { localhost };
 
-        let router = v1::routes(config.clone())
+        let router = Router::new()
+            .route("/", axum::routing::get(home_page::homepage))
+            .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
             .layer(Extension(attested_contracts.clone()))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
