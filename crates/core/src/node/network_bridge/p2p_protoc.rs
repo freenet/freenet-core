@@ -4368,12 +4368,16 @@ async fn peer_connection_listener(
         // break determinism guarantees for simulation testing.
         tokio::task::yield_now().await;
 
-        // Drain all pending outbound messages first before checking inbound.
-        // This ensures queued outbound messages are sent promptly without starving
-        // the inbound channel (which would happen with biased select).
+        // Drain pending outbound messages before checking inbound, but with a
+        // bounded limit to prevent outbound from starving inbound packet processing.
+        // Remaining messages are picked up by the fair select's outbound branch.
+        // 8 messages ≈ 0.8ms of sends (8 × ~100µs per encrypt+send).
+        const MAX_OUTBOUND_DRAIN: usize = 8;
+        let mut drained = 0;
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
+                    drained += 1;
                     if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
                         tracing::debug!(
                             to = %remote_addr,
@@ -4386,6 +4390,9 @@ async fn peer_connection_listener(
                         notify_transport_closed(&conn_events, remote_addr, error, connection_id)
                             .await;
                         return;
+                    }
+                    if drained >= MAX_OUTBOUND_DRAIN {
+                        break;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
