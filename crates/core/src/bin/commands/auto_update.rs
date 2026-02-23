@@ -19,8 +19,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-// Re-export version mismatch detection from transport layer
-pub use freenet::transport::{clear_version_mismatch, has_version_mismatch};
+pub use freenet::transport::{
+    clear_version_mismatch, get_open_connection_count, has_version_mismatch,
+    version_mismatch_generation,
+};
 
 /// Exit code that signals "update needed and verified against GitHub".
 /// The service wrapper catches this and runs `freenet update` before restarting.
@@ -286,7 +288,9 @@ pub fn has_reached_max_backoff() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet::transport::signal_version_mismatch;
+    use freenet::transport::{
+        set_open_connection_count, signal_version_mismatch, version_mismatch_generation,
+    };
 
     #[test]
     fn test_version_mismatch_flag() {
@@ -301,6 +305,33 @@ mod tests {
         // Clear it
         clear_version_mismatch();
         assert!(!has_version_mismatch());
+    }
+
+    #[test]
+    fn test_mismatch_generation_increments() {
+        let gen_before = version_mismatch_generation();
+        signal_version_mismatch();
+        let gen_after = version_mismatch_generation();
+        assert!(
+            gen_after > gen_before,
+            "generation should increment on each signal"
+        );
+
+        // Multiple signals keep incrementing
+        signal_version_mismatch();
+        assert!(version_mismatch_generation() > gen_after);
+    }
+
+    #[test]
+    fn test_open_connection_count() {
+        set_open_connection_count(0);
+        assert_eq!(get_open_connection_count(), 0);
+
+        set_open_connection_count(5);
+        assert_eq!(get_open_connection_count(), 5);
+
+        set_open_connection_count(0);
+        assert_eq!(get_open_connection_count(), 0);
     }
 
     #[test]
