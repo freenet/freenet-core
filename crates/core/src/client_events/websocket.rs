@@ -630,14 +630,15 @@ async fn websocket_interface(
             }
         };
 
-        // IMPORTANT: client_stream.next() is the only part inside the select future.
-        // process_client_request runs in the branch handler AFTER the select resolves,
-        // so it cannot be cancelled by other branches (listeners, responses, pings).
-        // Previously, process_client_request ran inside the select future and could be
-        // cancelled mid-execution if a subscription notification or host response arrived
-        // during an .await point (e.g., waiting_for_transaction_result). This left
-        // operations registered in the router but never started — a silent hang.
-        tokio::select! { biased;
+        // IMPORTANT: Only cancellation-safe futures (recv, next, tick) go inside the
+        // select futures below. Processing functions (process_client_request,
+        // process_host_response) run in branch handlers AFTER the select resolves,
+        // so they cannot be cancelled by other branches.
+        //
+        // NOTE: Do NOT add `biased;` here. Biased select polls branches in declaration
+        // order, which starves host responses, subscription notifications, and pings
+        // when client messages arrive in bursts.
+        tokio::select! {
             next_msg = client_stream.next() => {
                 let next_msg = match next_msg
                     .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
@@ -687,8 +688,10 @@ async fn websocket_interface(
                     },
                 }
             }
-            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut server_sink).await } => {
-                let msg = match msg {
+            msg = response_rx.recv() => {
+                // process_host_response runs in the branch handler (not the select future)
+                // so it cannot be cancelled by other branches resolving first.
+                let msg = match process_host_response(msg, client_id, encoding_protoc, &mut server_sink).await {
                     Ok(msg) => msg,
                     Err(err) => {
                         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
@@ -697,8 +700,7 @@ async fn websocket_interface(
                 };
                 if let Some(NewSubscription { key, callback }) = msg {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
-                    let active_listeners = contract_updates.clone();
-                    let active_listeners = &mut *active_listeners.lock().await;
+                    let active_listeners = &mut *contract_updates.lock().await;
                     active_listeners.push_back((key, callback));
                 }
             }
