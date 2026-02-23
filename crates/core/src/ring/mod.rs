@@ -1812,65 +1812,40 @@ impl Ring {
                 );
             }
 
-            // Gateway bootstrap fallback: when at zero connections, acquire_new will
-            // always fail because it needs existing routing candidates. Directly
-            // attempt gateway connections instead of spinning uselessly (#3219).
+            // Gateway bootstrap fallback: at zero connections, acquire_new always
+            // fails (no routing candidates). Connect to gateways directly (#3219).
             if current_conn_count == 0 && !op_manager.configured_gateways.is_empty() {
-                let unconnected_gateways: Vec<_> = self
-                    .is_not_connected(op_manager.configured_gateways.iter())
-                    .cloned()
-                    .collect();
+                let eligible: Vec<_> = {
+                    let backoff = op_manager.gateway_backoff.lock();
+                    self.is_not_connected(op_manager.configured_gateways.iter())
+                        .filter(|gw| {
+                            gw.socket_addr()
+                                .map(|addr| !backoff.is_in_backoff(addr))
+                                .unwrap_or(true)
+                        })
+                        .cloned()
+                        .collect()
+                };
 
-                if !unconnected_gateways.is_empty() {
-                    // Filter out gateways in backoff
-                    let eligible: Vec<_> = {
-                        let backoff = op_manager.gateway_backoff.lock();
-                        unconnected_gateways
-                            .into_iter()
-                            .filter(|gw| {
-                                gw.socket_addr()
-                                    .map(|addr| !backoff.is_in_backoff(addr))
-                                    .unwrap_or(true)
-                            })
-                            .collect()
-                    };
-
-                    if !eligible.is_empty() {
-                        tracing::info!(
-                            eligible = eligible.len(),
-                            total_gateways = op_manager.configured_gateways.len(),
-                            "Zero connections — attempting direct gateway bootstrap from connection_maintenance"
-                        );
-                        for gw in &eligible {
-                            match crate::operations::connect::join_ring_request(gw, &op_manager)
-                                .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        gateway = %gw,
-                                        "Initiated gateway bootstrap connection"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        gateway = %gw,
-                                        error = %e,
-                                        "Failed to initiate gateway bootstrap"
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            total_gateways = op_manager.configured_gateways.len(),
-                            "Zero connections — all gateways in backoff, waiting for isolation recovery"
-                        );
-                    }
-                } else {
+                if eligible.is_empty() {
                     tracing::debug!(
                         total_gateways = op_manager.configured_gateways.len(),
-                        "Zero connections — all gateways appear connected/pending"
+                        "Zero connections — all gateways connected/pending or in backoff"
                     );
+                } else {
+                    tracing::info!(
+                        eligible = eligible.len(),
+                        total_gateways = op_manager.configured_gateways.len(),
+                        "Zero connections — attempting gateway bootstrap"
+                    );
+                    for gw in &eligible {
+                        match crate::operations::connect::join_ring_request(gw, &op_manager).await {
+                            Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
+                            Err(e) => {
+                                tracing::warn!(gateway = %gw, error = %e, "Gateway bootstrap failed")
+                            }
+                        }
+                    }
                 }
             }
 

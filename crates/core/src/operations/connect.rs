@@ -1933,9 +1933,7 @@ pub(crate) async fn initial_join_procedure(
 
             let unconnected_count = unconnected_gateways.len();
 
-            // Log at info level when we're below threshold but all gateways appear
-            // connected/pending — this was previously invisible, making it hard to
-            // diagnose why the join procedure wasn't attempting reconnection (#3219).
+            // Diagnose stalls: below threshold but no gateways available to retry (#3219).
             if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
                 tracing::info!(
                     open_conns,
