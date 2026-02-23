@@ -80,10 +80,11 @@ sequenceDiagram
 
 **Gateway Behavior:**
 1. Check if packet type is intro (0x01)
-2. Rate limit: Enforce 1 second minimum between intro packets from same IP
-3. Decrypt intro packet with local static secret key
-4. Extract protocol version and remote's symmetric key
-5. Validate protocol version
+2. Per-IP rate limit: Enforce 1 second minimum between intro packets from same IP
+3. Global rate limit: Connection acceptance ramp-up after gateway restart (5/s for 30s, 20/s for 2min, then unlimited) — prevents thundering herd when all peers reconnect simultaneously
+4. Decrypt intro packet with local static secret key
+5. Extract protocol version and remote's symmetric key
+6. Validate protocol version
 
 **Why Rate Limiting:** Intro packet decryption (X25519 operations) is expensive. Rate limiting prevents crypto exhaustion DoS attacks.
 

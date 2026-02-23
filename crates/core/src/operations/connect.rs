@@ -104,7 +104,7 @@ use tokio::task::JoinHandle;
 use either::Either;
 
 use crate::client_events::HostResult;
-use crate::config::GlobalExecutor;
+use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
@@ -1910,8 +1910,8 @@ pub(crate) async fn initial_join_procedure(
             return;
         }
 
-        const WAIT_TIME: u64 = 1;
-        const LONG_WAIT_TIME: u64 = 30;
+        const BASE_WAIT_SECS: u64 = 1;
+        const LONG_WAIT_SECS: u64 = 30;
         const BOOTSTRAP_THRESHOLD: usize = 4;
 
         tracing::info!(
@@ -2036,27 +2036,35 @@ pub(crate) async fn initial_join_procedure(
                 );
             }
 
-            let wait_time = if open_conns == 0 {
-                tracing::debug!("No connections yet, waiting {}s before retry", WAIT_TIME);
-                WAIT_TIME
-            } else if open_conns < BOOTSTRAP_THRESHOLD {
+            // Add random jitter to prevent thundering herd after gateway restart.
+            // Without jitter, all peers that lose their gateway connection retry
+            // at the same interval, causing synchronized reconnection storms.
+            let jitter_ms = GlobalRng::random_u64() % 2000; // 0-2s jitter
+            let base_wait_ms = if open_conns == 0 {
                 tracing::debug!(
-                    "Have {} connections (below threshold of {}), waiting {}s",
+                    "No connections yet, waiting ~{}s before retry",
+                    BASE_WAIT_SECS
+                );
+                BASE_WAIT_SECS * 1000
+            } else if open_conns < BOOTSTRAP_THRESHOLD {
+                let wait = BASE_WAIT_SECS * 3 * 1000;
+                tracing::debug!(
+                    "Have {} connections (below threshold of {}), waiting ~{}ms",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    WAIT_TIME * 3
+                    wait + jitter_ms
                 );
-                WAIT_TIME * 3
+                wait
             } else {
                 tracing::trace!(
-                    "Connection pool healthy ({} connections), waiting {}s",
+                    "Connection pool healthy ({} connections), waiting ~{}s",
                     open_conns,
-                    LONG_WAIT_TIME
+                    LONG_WAIT_SECS
                 );
-                LONG_WAIT_TIME
+                LONG_WAIT_SECS * 1000
             };
 
-            tokio::time::sleep(Duration::from_secs(wait_time)).await;
+            tokio::time::sleep(Duration::from_millis(base_wait_ms + jitter_ms)).await;
         }
     });
     Ok(handle)

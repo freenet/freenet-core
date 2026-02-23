@@ -93,6 +93,8 @@ NAT traversal:
   2. Use exponential backoff: 50ms → 300ms → 1s → 5s
   3. First relay observes external address (ObservedAddress msg)
   4. Rate limit: 1 intro packet/second per source IP
+  5. Gateway ramp-up: 5/s for 30s, 20/s for 2min, unlimited after
+     (prevents thundering herd after gateway restart)
 ```
 
 ### WHEN maintaining connections
