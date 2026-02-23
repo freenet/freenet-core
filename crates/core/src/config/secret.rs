@@ -58,19 +58,37 @@ pub struct SecretArgs {
 }
 
 impl SecretArgs {
-    pub(super) fn build(self) -> std::io::Result<Secrets> {
-        let transport_key = self
-            .transport_keypair
-            .as_ref()
-            .map(read_transport_keypair)
-            .transpose()?;
-        let (transport_keypair_path, transport_keypair) = if let Some(transport_key) = transport_key
-        {
-            (self.transport_keypair, transport_key)
-        } else {
-            let transport_key = TransportKeypair::new();
-            (None, transport_key)
-        };
+    pub(super) fn build(self, secrets_dir: Option<&Path>) -> std::io::Result<Secrets> {
+        let (transport_keypair_path, transport_keypair) =
+            if let Some(ref explicit_path) = self.transport_keypair {
+                // Explicit --transport-keypair path provided: load from it
+                let keypair = read_transport_keypair(explicit_path)?;
+                (self.transport_keypair, keypair)
+            } else if let Some(dir) = secrets_dir {
+                let default_path = dir.join("transport_keypair");
+                if default_path.exists() {
+                    // Auto-load persisted keypair
+                    tracing::info!(
+                        path = %default_path.display(),
+                        "Loading persisted transport keypair"
+                    );
+                    let keypair = read_transport_keypair(&default_path)?;
+                    (Some(default_path), keypair)
+                } else {
+                    // Generate new keypair and persist it
+                    std::fs::create_dir_all(dir)?;
+                    let keypair = TransportKeypair::new();
+                    keypair.save(&default_path)?;
+                    tracing::info!(
+                        path = %default_path.display(),
+                        "Generated and saved new transport keypair"
+                    );
+                    (Some(default_path), keypair)
+                }
+            } else {
+                // No secrets_dir (e.g. tests): ephemeral keypair
+                (None, TransportKeypair::new())
+            };
         let nonce = self.nonce.as_ref().map(read_nonce).transpose()?;
         let (nonce_path, nonce) = if let Some(nonce) = nonce {
             (self.nonce, nonce)
@@ -281,15 +299,79 @@ mod tests {
             cipher: Some(cipher_file.path().to_path_buf()),
         };
 
-        let loaded_secrets = secret_args.build().unwrap();
+        let loaded_secrets = secret_args.build(None).unwrap();
         assert_eq!(secrets, loaded_secrets);
     }
 
     #[test]
     fn test_load_default() {
         let secret_args = SecretArgs::default();
-        let loaded_secrets = secret_args.build().unwrap();
+        let loaded_secrets = secret_args.build(None).unwrap();
         assert_eq!(DelegateRequest::DEFAULT_CIPHER, loaded_secrets.cipher);
         assert_eq!(DelegateRequest::DEFAULT_NONCE, loaded_secrets.nonce);
+    }
+
+    #[test]
+    fn test_keypair_auto_persist_and_reload() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp_dir.path();
+
+        // First build: no keypair file exists, should generate and save
+        let args1 = SecretArgs::default();
+        let secrets1 = args1.build(Some(secrets_dir)).unwrap();
+
+        let keypair_path = secrets_dir.join("transport_keypair");
+        assert!(keypair_path.exists(), "keypair file should be created");
+        assert_eq!(
+            secrets1.transport_keypair_path.as_deref(),
+            Some(keypair_path.as_path())
+        );
+
+        // Second build: file exists, should load the same keypair
+        let args2 = SecretArgs::default();
+        let secrets2 = args2.build(Some(secrets_dir)).unwrap();
+
+        assert_eq!(
+            secrets1.transport_keypair.public(),
+            secrets2.transport_keypair.public(),
+            "reloaded keypair should have the same public key"
+        );
+        assert_eq!(
+            secrets2.transport_keypair_path.as_deref(),
+            Some(keypair_path.as_path()),
+            "reloaded keypair should preserve the path"
+        );
+    }
+
+    #[test]
+    fn test_explicit_keypair_overrides_secrets_dir() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp_dir.path();
+
+        // Pre-populate the default location
+        let args_seed = SecretArgs::default();
+        let seeded = args_seed.build(Some(secrets_dir)).unwrap();
+
+        // Create a different keypair at an explicit path
+        let explicit_file = tempfile::NamedTempFile::new().unwrap();
+        let different_keypair = TransportKeypair::new();
+        different_keypair.save(explicit_file.path()).unwrap();
+
+        // Build with explicit path — should use that, not the default
+        let args = SecretArgs {
+            transport_keypair: Some(explicit_file.path().to_path_buf()),
+            ..Default::default()
+        };
+        let loaded = args.build(Some(secrets_dir)).unwrap();
+
+        assert_eq!(
+            loaded.transport_keypair.public(),
+            different_keypair.public()
+        );
+        assert_ne!(
+            loaded.transport_keypair.public(),
+            seeded.transport_keypair.public(),
+            "explicit path should override auto-persisted keypair"
+        );
     }
 }
