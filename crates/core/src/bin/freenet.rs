@@ -123,8 +123,9 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, has_reached_max_backoff,
-        has_version_mismatch, UpdateCheckResult, UpdateNeededError,
+        check_if_update_available, clear_version_mismatch, get_open_connection_count,
+        has_reached_max_backoff, has_version_mismatch, reset_backoff, version_mismatch_generation,
+        UpdateCheckResult, UpdateNeededError,
     };
     use tokio::signal;
 
@@ -188,41 +189,111 @@ async fn run_network_node_with_signals(
 
     // Spawn a task to monitor for version mismatches and check for updates.
     // This is temporary alpha-testing infrastructure to reduce manual update burden.
+    //
+    // Mitigations against peers getting stuck on old versions (#3204):
+    // 1. Reset backoff on fresh mismatch — prevents stale disk state from skipping checks
+    // 2. Exit code 42 at max backoff + 0 connections — trusts gateway version signal
+    // 3. Never clear flag while isolated — keeps retrying at max backoff interval
+    // 4. Hard timeout — 6 hours with mismatch + 0 connections forces exit regardless
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
     let update_check_task = GlobalExecutor::spawn(async move {
+        use std::time::Instant;
+
+        /// Hard timeout: exit with code 42 after this long with version mismatch
+        /// and zero connections, regardless of GitHub check results.
+        const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut last_mismatch_generation: u64 = version_mismatch_generation();
+        let mut isolated_mismatch_since: Option<Instant> = None;
+
         loop {
             interval.tick().await;
 
+            // Detect fresh mismatch signals and reset backoff state.
+            // This prevents stale disk state (from a previous update cycle or
+            // suspend/resume) from causing the node to skip GitHub checks.
+            let current_generation = version_mismatch_generation();
+            if current_generation != last_mismatch_generation {
+                last_mismatch_generation = current_generation;
+                reset_backoff();
+                tracing::info!(
+                    generation = current_generation,
+                    "Fresh version mismatch detected — reset update check backoff"
+                );
+            }
+
             if has_version_mismatch() {
+                let open_connections = get_open_connection_count();
+
+                // Track how long we've been isolated with a version mismatch.
+                if open_connections == 0 {
+                    if isolated_mismatch_since.is_none() {
+                        isolated_mismatch_since = Some(Instant::now());
+                    }
+                } else {
+                    isolated_mismatch_since = None;
+                }
+
+                // Hard timeout: if isolated with mismatch for too long, exit
+                // regardless of GitHub check results. This is the ultimate safety
+                // net — no peer should be stuck forever under any failure combo.
+                if let Some(since) = isolated_mismatch_since {
+                    if since.elapsed() > HARD_EXIT_TIMEOUT {
+                        tracing::error!(
+                            isolated_secs = since.elapsed().as_secs(),
+                            "HARD TIMEOUT: isolated with version mismatch for >6 hours — \
+                             forcing exit for auto-update"
+                        );
+                        clear_version_mismatch();
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = update_tx.send("unknown (hard timeout)".to_string());
+                        return;
+                    }
+                }
+
                 tracing::info!("Version mismatch detected, checking GitHub for updates...");
 
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
-                        // Clear the flag - we've handled this mismatch
                         clear_version_mismatch();
                         tracing::info!(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
-                        // Oneshot send; receiver is guaranteed to exist here
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
                     }
                     UpdateCheckResult::Skipped => {
-                        // Don't clear the flag yet — either rate limited, no update yet, or error.
-                        // Will retry with exponential backoff (1min -> 2min -> ... -> 1hr max).
-                        // After reaching max backoff with no update found, clear the flag
-                        // to stop the every-60-second log spam (#2928).
                         if has_reached_max_backoff() {
+                            if open_connections == 0 {
+                                // Gateway told us there's a mismatch, we've retried
+                                // GitHub for ~1 hour, and we have zero connections.
+                                // Trust the gateway signal and exit for auto-update.
+                                tracing::warn!(
+                                    "Max backoff reached with 0 connections and version mismatch — \
+                                     trusting gateway version signal, exiting for auto-update"
+                                );
+                                clear_version_mismatch();
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send("unknown (gateway mismatch)".to_string());
+                                return;
+                            }
+                            // Node has connections — the mismatch might be from a
+                            // pre-release gateway. Clear flag to stop log spam.
                             tracing::info!(
-                                "Max update check failures reached with no update found — clearing version mismatch flag"
+                                open_connections,
+                                "Max update check backoff reached but node has connections — \
+                                 clearing version mismatch flag"
                             );
                             clear_version_mismatch();
                         }
                     }
                 }
+            } else {
+                // Flag was cleared (had connections at max backoff). Reset tracking.
+                isolated_mismatch_since = None;
             }
         }
     });

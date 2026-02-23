@@ -1731,6 +1731,9 @@ impl Ring {
             // Isolation recovery: when we have zero ring connections for too long,
             // reset all backoff state so we can retry aggressively (#2928).
             let current_conn_count = self.connection_manager.connection_count();
+            // Expose to the update check task so it can decide whether to trust
+            // a gateway version mismatch when the GitHub check keeps failing.
+            crate::transport::set_open_connection_count(current_conn_count);
             if current_conn_count == 0 {
                 if let Some(since) = zero_connections_since {
                     if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
