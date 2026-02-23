@@ -679,8 +679,8 @@ impl Operation for UpdateOp {
                     );
 
                     // Step 1: Claim the stream from orphan registry (atomic dedup)
-                    let peer_addr = source_addr
-                        .expect("streaming UPDATE request must have source_addr");
+                    let peer_addr =
+                        source_addr.expect("streaming UPDATE request must have source_addr");
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
                         .claim_or_wait(peer_addr, *stream_id, STREAM_CLAIM_TIMEOUT)

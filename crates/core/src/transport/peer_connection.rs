@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -258,6 +259,9 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Set by the node layer after connection establishment.
     orphan_stream_registry:
         Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
+    /// Hashes of recently dispatched metadata bytes, to dedup
+    /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
+    dispatched_msg_hashes: HashSet<u64>,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -491,7 +495,23 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
+            dispatched_msg_hashes: HashSet::new(),
         }
+    }
+
+    /// Compute a fast hash of the given bytes for dedup tracking.
+    fn msg_hash(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Returns true if this message was already dispatched (is a duplicate).
+    /// Only used on the embedded-metadata-in-fragment-#1 path to suppress
+    /// duplicates when the same metadata was already dispatched as a ShortMessage.
+    fn is_duplicate_dispatch(&mut self, bytes: &[u8]) -> bool {
+        !self.dispatched_msg_hashes.insert(Self::msg_hash(bytes))
     }
 
     /// Sets the orphan stream registry for handling race conditions between
@@ -1249,7 +1269,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     ) -> Result<Option<Vec<u8>>> {
         use SymmetricMessagePayload::*;
         match payload {
-            ShortMessage { payload } => Ok(Some(payload.to_vec())),
+            ShortMessage { payload } => {
+                let bytes = payload.to_vec();
+                // Record this message's hash so that if the same metadata arrives
+                // embedded in a stream fragment, it will be suppressed as a duplicate.
+                // We always dispatch ShortMessages — dedup only suppresses the
+                // redundant embedded-metadata copy, never the ShortMessage itself.
+                self.dispatched_msg_hashes.insert(Self::msg_hash(&bytes));
+                Ok(Some(bytes))
+            }
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
@@ -1333,8 +1361,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             );
                             // Still register the handle for non-cancellation errors
                             if let Some(orphan_registry) = &self.orphan_stream_registry {
-                                orphan_registry
-                                    .register_orphan(self.remote_conn.remote_addr, stream_id, streaming_handle.clone());
+                                orphan_registry.register_orphan(
+                                    self.remote_conn.remote_addr,
+                                    stream_id,
+                                    streaming_handle.clone(),
+                                );
                                 tracing::trace!(
                                     peer_addr = %self.remote_conn.remote_addr,
                                     stream_id = %stream_id,
@@ -1355,7 +1386,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // This allows operations layer to claim the stream when metadata arrives,
                         // even if the stream fragments arrived first.
                         if let Some(orphan_registry) = &self.orphan_stream_registry {
-                            orphan_registry.register_orphan(self.remote_conn.remote_addr, stream_id, streaming_handle.clone());
+                            orphan_registry.register_orphan(
+                                self.remote_conn.remote_addr,
+                                stream_id,
+                                streaming_handle.clone(),
+                            );
                             tracing::trace!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
@@ -1386,13 +1421,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // layer processes the metadata even if the separate metadata
                     // message was lost over UDP.
                     if let Some(meta) = metadata_bytes {
-                        tracing::debug!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            meta_len = meta.len(),
-                            "Dispatching embedded metadata from fragment #1"
-                        );
-                        return Ok(Some(meta.to_vec()));
+                        let bytes = meta.to_vec();
+                        if self.is_duplicate_dispatch(&bytes) {
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Suppressing duplicate embedded metadata (already dispatched via ShortMessage)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                meta_len = bytes.len(),
+                                "Dispatching embedded metadata from fragment #1"
+                            );
+                            return Ok(Some(bytes));
+                        }
                     }
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,

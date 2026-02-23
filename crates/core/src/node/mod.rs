@@ -297,7 +297,12 @@ impl NodeConfig {
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
-            relay_ready_connections: Some(3),
+            relay_ready_connections: if config.gateways.len() <= 1 {
+                // Small / local networks have too few peers to satisfy the relay gate.
+                Some(0)
+            } else {
+                Some(3)
+            },
         })
     }
 

@@ -469,9 +469,10 @@ mod tests {
         let addr = dummy_addr();
 
         // Insert with fake old timestamp by directly manipulating
-        registry
-            .orphan_streams
-            .insert((addr, stream_id), (handle, Instant::now() - EXPIRED_ORPHAN_AGE));
+        registry.orphan_streams.insert(
+            (addr, stream_id),
+            (handle, Instant::now() - EXPIRED_ORPHAN_AGE),
+        );
 
         assert_eq!(registry.orphan_count(), 1);
 
