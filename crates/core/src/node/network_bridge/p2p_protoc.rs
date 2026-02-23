@@ -4371,6 +4371,7 @@ async fn peer_connection_listener(
         // Drain pending outbound messages before checking inbound, but with a
         // bounded limit to prevent outbound from starving inbound packet processing.
         // Remaining messages are picked up by the fair select's outbound branch.
+        // 8 messages ≈ 0.8ms of sends (8 × ~100µs per encrypt+send).
         const MAX_OUTBOUND_DRAIN: usize = 8;
         let mut drained = 0;
         loop {

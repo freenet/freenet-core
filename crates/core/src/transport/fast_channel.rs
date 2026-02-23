@@ -248,8 +248,10 @@ impl<T> FastReceiver<T> {
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
                     // Wait for sender notification (data available or disconnect).
-                    // Notify::notify_one() stores a permit if no waiter exists,
-                    // so rapid sends between checks won't be missed.
+                    // Notify::notify_one() stores at most one permit. Multiple
+                    // sends may coalesce into a single wakeup, but correctness
+                    // is maintained because try_recv() at the top of the loop
+                    // drains all available messages before re-entering this wait.
                     self.recv_notify.notified().await;
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
@@ -462,6 +464,20 @@ mod tests {
             "Too many poll iterations ({polls}), notification wakeup may not be working"
         );
         assert!(polls > 0, "Should have polled at least once");
+    }
+
+    #[tokio::test]
+    async fn test_burst_send_before_recv_drains_all() {
+        // Verify that multiple sends with no receiver waiting (notify_one permits
+        // coalesce into one) still result in all messages being received, because
+        // recv_async loops on try_recv after waking.
+        let (tx, rx) = bounded::<i32>(100);
+        for i in 0..50 {
+            tx.send(i).unwrap();
+        }
+        for i in 0..50 {
+            assert_eq!(rx.recv_async().await.unwrap(), i);
+        }
     }
 
     #[tokio::test]

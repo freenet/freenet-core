@@ -952,7 +952,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
                     // Bound retransmissions per iteration to prevent monopolizing the
                     // select loop. Remaining resends are handled on the next iteration
-                    // via an immediate-ready future.
+                    // via an immediate-ready future. 4 packets keeps resend bursts
+                    // short enough for inbound branches to interleave.
                     const MAX_RESENDS_PER_ITERATION: usize = 4;
                     let mut resend_count = 0;
                     loop {
