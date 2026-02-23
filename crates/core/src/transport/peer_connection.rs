@@ -541,7 +541,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
+        // Delay between resend batches. Negligible vs RTO (~600ms) but prevents the
+        // resend branch from starving inbound processing during retransmission storms.
+        const RESEND_YIELD_DELAY: Duration = Duration::from_millis(2);
         loop {
+            // If resend_check_sleep was consumed by a previous select iteration
+            // (via .take()) but the resend branch didn't win, refill with a short
+            // delay. This prevents the resend branch from being immediately Ready
+            // on every iteration during retransmission storms, which would starve
+            // inbound packet processing and create an ACK-drop feedback loop.
+            if resend_check_sleep.is_none() {
+                resend_check_sleep = Some(self.time_source.sleep(RESEND_YIELD_DELAY));
+            }
+
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
@@ -949,11 +961,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         "Connection health check - still alive"
                     );
                 },
+                // The .take() consumes the sleep future; the unwrap_or(ready()) fallback
+                // should be unreachable since the top-of-loop guard always refills it,
+                // but is kept as a defensive measure.
                 _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
                     // Bound retransmissions per iteration to prevent monopolizing the
-                    // select loop. Remaining resends are handled on the next iteration
-                    // via an immediate-ready future. 4 packets keeps resend bursts
-                    // short enough for inbound branches to interleave.
+                    // select loop. Remaining resends are deferred by a short sleep
+                    // (see top of loop) so inbound branches can interleave.
                     const MAX_RESENDS_PER_ITERATION: usize = 4;
                     let mut resend_count = 0;
                     loop {
@@ -1002,8 +1016,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
-                            // Schedule immediate re-check on next select iteration
-                            resend_check_sleep = Some(Box::pin(std::future::ready(())));
+                            resend_check_sleep = Some(self.time_source.sleep(RESEND_YIELD_DELAY));
                             break;
                         }
                     }

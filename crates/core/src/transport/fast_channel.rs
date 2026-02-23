@@ -22,10 +22,10 @@
 //! - Bounded channels provide backpressure with negligible performance penalty (~1% vs unbounded)
 //! - Ring buffer in bounded channels has slightly better cache locality
 //!
-//! **Why capacity 1000?**
+//! **Why bounded capacity?**
 //! - Sweet spot between throughput (larger = less contention) and memory usage
 //! - ~15% better throughput than capacity 100
-//! - ~1.4MB memory footprint per channel (1000 × 1400 byte packets)
+//! - Actual capacity is set via `INBOUND_CHANNEL_CAPACITY` in `connection_handler.rs`
 //!
 //! # Usage
 //!

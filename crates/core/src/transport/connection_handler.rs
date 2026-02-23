@@ -45,6 +45,12 @@ use crate::simulation::{RealTime, TimeSource};
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Capacity of the inbound packet channel from connection_handler to PeerConnection.
+///
+/// At FixedRate 10 Mbps (~892 packets/sec), 2048 packets provides ~2.3 seconds
+/// of buffer headroom, up from ~1.1 seconds at capacity 1000.
+const INBOUND_CHANNEL_CAPACITY: usize = 2048;
+
 /// Minimum interval between asymmetric decryption attempts for the same address.
 /// Prevents CPU exhaustion from attackers sending intro-sized packets.
 /// Note: X25519 decryption is ~100x faster than RSA-2048, so this is very conservative.
@@ -1721,7 +1727,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 time_source.clone(),
             ));
 
-            let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
+            let (inbound_packet_tx, inbound_packet_rx) =
+                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
 
             // Issue #2395: Drain any packets that arrived during the handshake.
             // The peer may send application-level messages (like ConnectRequest) immediately
@@ -1996,7 +2003,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
-                                                fast_channel::bounded(1000);
+                                                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
 
                                             // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                             let congestion_controller = congestion_config
@@ -2103,7 +2110,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
+                                let (inbound_sender, inbound_recv) =
+                                    fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
 
                                 // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                 let congestion_controller = congestion_config
