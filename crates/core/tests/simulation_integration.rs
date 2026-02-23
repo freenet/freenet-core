@@ -5456,3 +5456,137 @@ fn test_interest_ttl_refresh_on_broadcast() {
         late_broadcasts
     );
 }
+
+// =============================================================================
+// Thundering Herd CONNECT Storm Regression Test (Issue #3207, PR #3208)
+// =============================================================================
+
+/// Helper to advance virtual time in steps while yielding to tokio.
+///
+/// This is the same pattern used in `simulation_smoke.rs` and `state_verification.rs`,
+/// duplicated here because it is test-file-scoped.
+async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < duration {
+        sim.advance_time(step);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        elapsed += step;
+    }
+}
+
+/// Regression test for thundering herd CONNECT storm after gateway restart.
+///
+/// **Background (Issue #3207):**
+/// When a gateway restarts, all peers reconnect simultaneously, generating a
+/// burst of CONNECT operations that can overwhelm per-connection fast_channel
+/// (capacity 1000), causing a non-recovering drop→retransmit feedback loop.
+/// PR #3208 fixed the underlying inbound starvation bug.
+///
+/// **Test scenario:**
+/// 1. Create a 1-gateway + 20-node network, let it stabilize
+/// 2. Crash the gateway (all peers lose connections)
+/// 3. Restart the gateway (triggers thundering herd reconnection)
+/// 4. Verify the network recovers (no non-recovering overflow)
+///
+/// Uses the async direct-control pattern (like `test_suspend_resume_zombie_connections`)
+/// because `restart_node` requires `&mut SimNetwork`.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_thundering_herd_connect_storm() {
+    const SEED: u64 = 0x3207_0000_3208;
+    const NETWORK_NAME: &str = "thundering-herd-connect";
+
+    tracing::info!("=== Thundering Herd CONNECT Storm Test (Issue #3207, PR #3208) ===");
+
+    // 1 gateway, 20 nodes — single bottleneck topology
+    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 20, 7, 3, 10, 2, SEED).await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10)
+        .await;
+
+    let logs_handle = sim.event_logs_handle();
+
+    // Phase 1: Stabilize
+    tracing::info!("Phase 1: Stabilizing network (5s)");
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    sim.check_partial_connectivity(Duration::from_secs(20), 0.8)
+        .await
+        .expect("Network should reach ≥80% connectivity before crash");
+    tracing::info!("Phase 1 complete: network connected");
+
+    // Record baseline Connect event count
+    let baseline_connects = {
+        let logs = logs_handle.lock().await;
+        logs.iter().filter(|log| log.kind.is_connect()).count()
+    };
+    tracing::info!("Baseline Connect events: {}", baseline_connects);
+
+    // Phase 2: Crash the gateway
+    let gateway_label = sim
+        .all_node_addresses()
+        .keys()
+        .find(|label| label.is_gateway())
+        .cloned()
+        .expect("Should have a gateway");
+
+    tracing::info!(?gateway_label, "Phase 2: Crashing gateway");
+    let crashed = sim.crash_node(&gateway_label);
+    assert!(crashed, "Gateway should crash successfully");
+
+    // Phase 3: Let peers detect the dead gateway
+    tracing::info!("Phase 3: Peers detecting dead gateway (10s)");
+    let_network_run(&mut sim, Duration::from_secs(10)).await;
+
+    // Phase 4: Restart gateway — all peers reconnect at once
+    tracing::info!("Phase 4: Restarting gateway (thundering herd begins)");
+    let restart_seed = SEED.wrapping_add(0x1000);
+    let handle = sim
+        .restart_node::<rand::rngs::SmallRng>(&gateway_label, restart_seed, 5, 5)
+        .await;
+    assert!(handle.is_some(), "Gateway should restart successfully");
+
+    // Phase 5: Let the reconnection storm play out
+    tracing::info!("Phase 5: Reconnection storm playing out (30s)");
+    let_network_run(&mut sim, Duration::from_secs(30)).await;
+
+    // Phase 6: Verify recovery
+    tracing::info!("Phase 6: Verifying network recovery");
+
+    // 6a: Verify the storm actually happened (Connect events increased)
+    let final_connects = {
+        let logs = logs_handle.lock().await;
+        logs.iter().filter(|log| log.kind.is_connect()).count()
+    };
+    let storm_connects = final_connects - baseline_connects;
+    tracing::info!(
+        "Connect events after restart: {} (baseline: {}, storm: {})",
+        final_connects,
+        baseline_connects,
+        storm_connects
+    );
+    assert!(
+        storm_connects >= 20,
+        "Expected ≥20 Connect events from thundering herd, got {}. \
+         The reconnection storm may not have occurred. Seed: 0x{:X}",
+        storm_connects,
+        SEED
+    );
+
+    // 6b: Verify network recovered (the actual regression check)
+    sim.check_partial_connectivity(Duration::from_secs(20), 0.8)
+        .await
+        .expect(
+            "Network should recover to ≥80% connectivity after thundering herd. \
+             If this fails, the fast_channel overflow fix (PR #3208) may have regressed.",
+        );
+
+    tracing::info!(
+        "test_thundering_herd_connect_storm PASSED: storm generated {} Connect events, \
+         network recovered to ≥80% connectivity",
+        storm_connects
+    );
+}

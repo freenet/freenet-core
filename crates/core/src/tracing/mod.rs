@@ -2665,6 +2665,11 @@ impl EventKind {
         )
     }
 
+    /// Returns true if this is a Connect event.
+    pub fn is_connect(&self) -> bool {
+        matches!(self, EventKind::Connect(_))
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
