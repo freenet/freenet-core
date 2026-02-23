@@ -601,6 +601,8 @@ mod test {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::util::tests::get_temp_dir;
 
     use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
@@ -642,6 +644,7 @@ mod test {
             SecretRemoved,
             LargeContextWritten(usize),
             LargeSecretStored(usize),
+            SecretStoreFailed,
         }
     }
 
@@ -1324,6 +1327,50 @@ mod test {
             other => panic!("Expected SecretResult(Some(...)), got {:?}", other),
         }
 
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_secret_failure_returns_secret_store_failed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Make secrets directory read-only so store_secret fails with an I/O error
+        let secrets_dir = temp_dir.path().join("secrets");
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o444))?;
+
+        let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+            key: vec![1, 2, 3],
+            value: vec![4, 5, 6],
+        })?;
+        let msg = ApplicationMessage::new(app, payload);
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            _ => panic!("Expected ApplicationMessage"),
+        };
+        assert!(
+            matches!(response, OutboundAppMessage::SecretStoreFailed),
+            "Expected SecretStoreFailed when secrets dir is read-only, got {:?}",
+            response
+        );
+
+        // Restore permissions so temp_dir cleanup works
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o755))?;
         std::mem::drop(temp_dir);
         Ok(())
     }

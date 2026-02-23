@@ -35,7 +35,14 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .current_dir(&module_path)
         .env("CARGO_TARGET_DIR", &target)
         .spawn()?;
-    child.wait()?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!(
+            "cargo build failed with {status} for module {name} at {}",
+            module_path.display()
+        )
+        .into());
+    }
     let output_file = target
         .join(WASM_TARGET)
         .join("debug")
