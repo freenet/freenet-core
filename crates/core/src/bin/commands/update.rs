@@ -712,9 +712,9 @@ fn update_service_file(
 ) -> Result<()> {
     let content = fs::read_to_string(service_path).context("Failed to read service file")?;
 
-    // Check if the auto-update hook is present
-    if content.contains("ExecStopPost=") {
-        return Ok(()); // Already has the hook
+    // Check if the auto-update hook and SuccessExitStatus are present
+    if content.contains("ExecStopPost=") && content.contains("SuccessExitStatus=42") {
+        return Ok(()); // Already up to date
     }
 
     if !quiet {
