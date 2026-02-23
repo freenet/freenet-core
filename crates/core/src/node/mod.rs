@@ -1205,7 +1205,7 @@ async fn handle_interest_sync_message(
     source: std::net::SocketAddr,
     message: crate::message::InterestMessage,
 ) -> Option<crate::message::InterestMessage> {
-    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::message::{InterestMessage, NodeEvent, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     match message {
@@ -1297,19 +1297,66 @@ async fn handle_interest_sync_message(
                 "Received Summaries message"
             );
 
-            // Update peer summaries in our interest tracker
+            // Update peer summaries and detect stale peers (#3221).
+            //
+            // After storing the peer's summary for each shared contract, compare
+            // it with our own. If they differ, the peer missed an earlier broadcast
+            // and needs to be brought up to date. Emitting BroadcastStateChange
+            // triggers the existing broadcast path which computes deltas and sends
+            // state to all interested peers with mismatching summaries.
             let peer_key = get_peer_key_from_addr(op_manager, source);
+            let mut stale_contracts = Vec::new();
+
             if let Some(pk) = peer_key {
                 for entry in entries {
                     // Handle hash collisions - lookup returns all contracts with this hash
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         // Only update if we have local interest in this contract
                         if op_manager.interest_manager.has_local_interest(&contract) {
-                            let summary = entry.to_summary();
-                            op_manager
-                                .interest_manager
-                                .update_peer_summary(&contract, &pk, summary);
+                            let their_summary = entry.to_summary();
+
+                            // Compare with our own summary before storing
+                            let our_summary = get_contract_summary(op_manager, &contract).await;
+                            let is_stale = match (&our_summary, &their_summary) {
+                                (Some(ours), Some(theirs)) => ours.as_ref() != theirs.as_ref(),
+                                // If either summary is missing, we can't determine staleness
+                                _ => false,
+                            };
+
+                            op_manager.interest_manager.update_peer_summary(
+                                &contract,
+                                &pk,
+                                their_summary,
+                            );
+
+                            if is_stale {
+                                stale_contracts.push(contract);
+                            }
                         }
+                    }
+                }
+            }
+
+            // Push current state to stale peers via the existing broadcast path
+            for contract in stale_contracts {
+                if let Some(state) = get_contract_state(op_manager, &contract).await {
+                    tracing::info!(
+                        contract = %contract,
+                        peer = %source,
+                        "Stale peer detected via interest sync — triggering broadcast"
+                    );
+                    if let Err(e) = op_manager
+                        .notify_node_event(NodeEvent::BroadcastStateChange {
+                            key: contract,
+                            new_state: state,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            contract = %contract,
+                            error = %e,
+                            "Failed to emit BroadcastStateChange for stale peer correction"
+                        );
                     }
                 }
             }
