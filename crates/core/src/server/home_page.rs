@@ -17,9 +17,7 @@ fn status_section() -> (&'static str, String) {
             let label = if n == 1 { "peer" } else { "peers" };
             (
                 "Connected to Freenet",
-                format!(
-                    r#"<p class="status connected">{n} {label} connected</p>"#
-                ),
+                format!(r#"<p class="status connected">{n} {label} connected</p>"#),
             )
         }
         Some(snap) if !snap.failures.is_empty() => {
