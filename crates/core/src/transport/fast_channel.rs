@@ -456,8 +456,6 @@ mod tests {
 
         sender.await.unwrap();
 
-        // With notification-based wakeup, expect very few iterations (~2):
-        // 1 initial try_recv (empty) + 1 after notify wakes the receiver
         let polls = rx.poll_count();
         assert!(
             polls < 10,

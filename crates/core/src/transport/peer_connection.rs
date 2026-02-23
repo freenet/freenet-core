@@ -964,7 +964,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .sent_tracker
                             .lock()
                             .get_resend();
-                        match maybe_resend {
+                        // Extract (idx, packet) from the resend action, applying
+                        // action-specific side effects (congestion notification, logging).
+                        let (idx, packet) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
                                 resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
                                 break;
@@ -972,26 +974,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             ResendAction::Resend(idx, packet) => {
                                 // Notify congestion controller of packet loss (timeout-based retransmission)
                                 self.remote_conn.congestion_controller.on_timeout();
-
-                                self.remote_conn
-                                    .socket
-                                    .send_to(&packet, self.remote_conn.remote_addr)
-                                    .await
-                                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-                                // Re-register packet for ACK tracking. Note: on_send() is NOT called here
-                                // because the bytes were already counted in flightsize during the initial send.
-                                // When the retransmitted packet is ACKed, on_ack_without_rtt() will decrement
-                                // flightsize once, maintaining correct accounting.
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
-                                resend_count += 1;
-                                if resend_count >= MAX_RESENDS_PER_ITERATION {
-                                    // Schedule immediate re-check on next select iteration
-                                    resend_check_sleep = Some(Box::pin(std::future::ready(())));
-                                    break;
-                                }
+                                (idx, packet)
                             }
                             ResendAction::TlpProbe(idx, packet) => {
-                                // TLP (Tail Loss Probe) - send probe to detect tail loss earlier
+                                // TLP (Tail Loss Probe) - send probe to detect tail loss earlier.
                                 // Unlike RTO, TLP does NOT call on_timeout() because it's speculative.
                                 // If the probe gets an ACK, no loss occurred. If not, RTO will fire later.
                                 tracing::trace!(
@@ -999,21 +985,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     packet_id = idx,
                                     "Sending TLP probe"
                                 );
-
-                                self.remote_conn
-                                    .socket
-                                    .send_to(&packet, self.remote_conn.remote_addr)
-                                    .await
-                                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-                                // Re-register packet for RTO tracking if TLP doesn't get ACKed
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
-                                resend_count += 1;
-                                if resend_count >= MAX_RESENDS_PER_ITERATION {
-                                    // Schedule immediate re-check on next select iteration
-                                    resend_check_sleep = Some(Box::pin(std::future::ready(())));
-                                    break;
-                                }
+                                (idx, packet)
                             }
+                        };
+
+                        // Common path for both Resend and TlpProbe: send the packet,
+                        // re-register for ACK tracking, and enforce per-iteration limit.
+                        self.remote_conn
+                            .socket
+                            .send_to(&packet, self.remote_conn.remote_addr)
+                            .await
+                            .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                        // Re-register packet for ACK/RTO tracking. on_send() is NOT called
+                        // because bytes were already counted in flightsize during the initial send.
+                        self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                        resend_count += 1;
+                        if resend_count >= MAX_RESENDS_PER_ITERATION {
+                            // Schedule immediate re-check on next select iteration
+                            resend_check_sleep = Some(Box::pin(std::future::ready(())));
+                            break;
                         }
                     }
                 },
