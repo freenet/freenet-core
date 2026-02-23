@@ -267,6 +267,10 @@ pub(crate) struct OpManager {
     /// join requests from blocked peers at the routing level, allowing the uphill
     /// hop mechanism to find alternate acceptors.
     pub blocked_addresses: Option<Arc<HashSet<SocketAddr>>>,
+    /// Configured gateway peers for bootstrap/re-bootstrap.
+    /// Used by connection_maintenance to directly attempt gateway connections
+    /// when the node has zero ring connections (#3219).
+    pub configured_gateways: Arc<Vec<PeerKeyLocation>>,
 }
 
 impl Clone for OpManager {
@@ -291,6 +295,7 @@ impl Clone for OpManager {
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
+            configured_gateways: self.configured_gateways.clone(),
         }
     }
 }
@@ -404,6 +409,13 @@ impl OpManager {
                 .blocked_addresses
                 .as_ref()
                 .map(|a| Arc::new(a.clone())),
+            configured_gateways: Arc::new(
+                config
+                    .gateways
+                    .iter()
+                    .map(|gw| gw.peer_key_location.clone())
+                    .collect(),
+            ),
         })
     }
 

@@ -5588,3 +5588,164 @@ async fn test_thundering_herd_connect_storm() {
         storm_connects
     );
 }
+
+// =============================================================================
+// Regression: Gateway re-bootstrap after total isolation (#3219)
+// =============================================================================
+
+/// Tests that a node isolated to zero connections re-bootstraps via gateways.
+///
+/// ## Scenario
+/// 1. Create a network (1 gateway + 4 nodes)
+/// 2. Let it stabilize with contracts propagated
+/// 3. Partition ONE non-gateway node from ALL other nodes
+/// 4. Wait for the isolated node to lose all ring connections
+/// 5. Heal the partition
+/// 6. Assert the node recovers (contracts converge)
+///
+/// Without the fix in #3219 (gateway bootstrap fallback in connection_maintenance),
+/// the isolated node cannot call acquire_new (no routing candidates at zero
+/// connections) and remains permanently disconnected.
+#[test_log::test]
+fn test_isolated_node_rebootstraps_via_gateway() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::Partition;
+
+    const SEED: u64 = 0x3219_B007_0001;
+    const NETWORK_NAME: &str = "isolated-rebootstrap";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            4,  // 4 nodes (5 total)
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Pick one non-gateway node to isolate
+    let (isolated_label, isolated_addr) = node_addrs
+        .iter()
+        .find(|(label, _)| label.is_node())
+        .map(|(l, a)| (l.clone(), *a))
+        .expect("Need at least one non-gateway node");
+
+    // side_a = just the isolated node, side_b = everyone else
+    let side_a: std::collections::HashSet<_> = [isolated_addr].into_iter().collect();
+    let side_b: std::collections::HashSet<_> = node_addrs
+        .iter()
+        .filter(|(label, _)| **label != isolated_label)
+        .map(|(_, addr)| *addr)
+        .collect();
+
+    tracing::info!(
+        isolated = %isolated_label,
+        isolated_addr = %isolated_addr,
+        rest_count = side_b.len(),
+        "Will isolate one node from all others"
+    );
+
+    let network_name = NETWORK_NAME.to_string();
+
+    // iterations=80 gives enough gen_event budget (80/5 peers = 16 iterations/peer)
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        3,                          // contracts
+        80,                         // iterations (also per-peer gen_event budget)
+        Duration::from_secs(120),   // simulation_duration
+        Duration::from_millis(500), // event_wait
+        move || async move {
+            // Phase 1: Events have been firing, contracts propagated. Now isolate one node.
+            tracing::info!("Injecting partition: isolating one node from all others");
+
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                let partition = Partition::new(side_a, side_b).permanent(0);
+                state.config.add_partition(partition);
+            }
+
+            // Phase 2: Wait for existing connections to time out.
+            // Connection liveness checks run every ~5s (fast tick), connections
+            // are pruned after missing pings. 20s is enough for full isolation.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            tracing::info!("Isolation period over — node should have zero connections now");
+
+            // Phase 3: Heal the partition. The gateway bootstrap fallback in
+            // connection_maintenance should kick in and reconnect the node.
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                state.config.partitions.clear();
+            }
+            tracing::info!("Partition healed — waiting for re-bootstrap");
+
+            // Phase 4: Wait for the node to re-bootstrap via gateway and
+            // converge state. connection_maintenance runs on 5s tick, so
+            // the gateway fallback should trigger quickly.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            tracing::info!("Post-heal convergence period complete");
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Isolated-node re-bootstrap simulation failed: {:?}",
+        result.err()
+    );
+
+    // Check convergence — if the isolated node re-bootstrapped, it should
+    // have re-subscribed and received contract state updates.
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    tracing::info!(
+        "Isolated-rebootstrap: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    // Hard assertion: the isolated node must have re-bootstrapped and
+    // converged state. Without the gateway bootstrap fallback, the node
+    // stays permanently disconnected and contracts diverge.
+    assert!(
+        convergence.diverged.is_empty(),
+        "Isolated node failed to re-bootstrap: {} contracts diverged (expected 0). \
+         This indicates the gateway bootstrap fallback in connection_maintenance \
+         did not recover the node after partition heal.",
+        convergence.diverged.len()
+    );
+
+    // Run anomaly detection
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== ISOLATED-REBOOTSTRAP ANOMALY REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    let divergences = report.divergences();
+    let stale = report.stale_peers();
+
+    tracing::warn!("  divergences={}, stale={}", divergences.len(), stale.len(),);
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+}

@@ -1812,6 +1812,51 @@ impl Ring {
                 );
             }
 
+            // Gateway bootstrap fallback: at zero connections, acquire_new always
+            // fails (no routing candidates). Connect to gateways directly (#3219).
+            //
+            // Note: initial_join_procedure may also be attempting gateway connections
+            // concurrently. is_not_connected provides best-effort dedup via pending
+            // reservations (should_accept creates one on each join_ring_request), so
+            // the second caller typically sees the gateway as "pending" and skips it.
+            // Occasional duplicate CONNECTs are harmless — the connect state machine
+            // handles them gracefully.
+            if current_conn_count == 0 && !op_manager.configured_gateways.is_empty() {
+                let eligible: Vec<_> = {
+                    let backoff = op_manager.gateway_backoff.lock();
+                    self.is_not_connected(op_manager.configured_gateways.iter())
+                        .filter(|gw| {
+                            gw.socket_addr()
+                                .map(|addr| !backoff.is_in_backoff(addr))
+                                .unwrap_or(false) // skip gateways without addresses
+                        })
+                        .cloned()
+                        .collect()
+                };
+
+                if eligible.is_empty() {
+                    tracing::debug!(
+                        total_gateways = op_manager.configured_gateways.len(),
+                        "Zero connections — all gateways connected/pending or in backoff"
+                    );
+                } else {
+                    let attempt_count = eligible.len().min(MAX_CONCURRENT_CONNECTIONS);
+                    tracing::info!(
+                        eligible = eligible.len(),
+                        attempting = attempt_count,
+                        "Zero connections — attempting gateway bootstrap"
+                    );
+                    for gw in eligible.iter().take(MAX_CONCURRENT_CONNECTIONS) {
+                        match crate::operations::connect::join_ring_request(gw, &op_manager).await {
+                            Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
+                            Err(e) => {
+                                tracing::warn!(gateway = %gw, error = %e, "Gateway bootstrap failed")
+                            }
+                        }
+                    }
+                }
+            }
+
             // Drain pending connections, initiating multiple attempts per tick
             // (up to MAX_CONCURRENT_CONNECTIONS) for faster mesh formation.
             let mut active_count = live_tx_tracker.active_connect_transaction_count();
