@@ -1068,12 +1068,9 @@ fn test_create_unsubscribe_op() {
     assert!(!op.is_renewal);
 
     match &op.state {
-        Some(SubscribeState::AwaitingResponse {
-            next_hop,
-            instance_id: state_iid,
-        }) => {
-            assert_eq!(*next_hop, Some(target_addr));
-            assert_eq!(*state_iid, instance_id);
+        SubscribeState::AwaitingResponse(data) => {
+            assert_eq!(data.next_hop, Some(target_addr));
+            assert_eq!(data.instance_id, instance_id);
         }
         other => panic!("Expected AwaitingResponse state, got {:?}", other),
     }

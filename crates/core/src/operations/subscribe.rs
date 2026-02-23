@@ -230,7 +230,7 @@ pub(crate) fn create_unsubscribe_op(
 ) -> SubscribeOp {
     SubscribeOp {
         id: tx,
-        state: Some(SubscribeState::AwaitingResponse {
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
             next_hop: Some(target_addr),
             instance_id,
         }),
@@ -1286,12 +1286,7 @@ impl Operation for SubscribeOp {
                         );
                     }
 
-                    Ok(OperationResult {
-                        return_msg: None,
-                        next_hop: None,
-                        state: None,
-                        stream_data: None,
-                    })
+                    Ok(OperationResult::Completed)
                 }
             }
         })

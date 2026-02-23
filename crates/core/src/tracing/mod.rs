@@ -2700,6 +2700,7 @@ impl EventKind {
     }
 
     /// Returns the contract instance id if this is an UnsubscribeReceived event.
+    #[allow(clippy::wildcard_enum_match_arm)]
     pub fn unsubscribe_received_instance_id(&self) -> Option<&ContractInstanceId> {
         match self {
             EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived { instance_id, .. }) => {
@@ -2710,6 +2711,7 @@ impl EventKind {
     }
 
     /// Returns the contract instance id if this is an UnsubscribeSent event.
+    #[allow(clippy::wildcard_enum_match_arm)]
     pub fn unsubscribe_sent_instance_id(&self) -> Option<&ContractInstanceId> {
         match self {
             EventKind::Subscribe(SubscribeEvent::UnsubscribeSent { instance_id, .. }) => {
@@ -3477,7 +3479,9 @@ impl SubscribeEvent {
             | SubscribeEvent::_Reserved7
             | SubscribeEvent::_Reserved8
             | SubscribeEvent::_Reserved9
-            | SubscribeEvent::_Reserved10 => None,
+            | SubscribeEvent::_Reserved10
+            | SubscribeEvent::UnsubscribeSent { .. }
+            | SubscribeEvent::UnsubscribeReceived { .. } => None,
         }
     }
 }

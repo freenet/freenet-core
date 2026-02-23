@@ -2772,7 +2772,9 @@ impl SimNetwork {
                         | SubscribeEvent::_Reserved7
                         | SubscribeEvent::_Reserved8
                         | SubscribeEvent::_Reserved9
-                        | SubscribeEvent::_Reserved10 => {}
+                        | SubscribeEvent::_Reserved10
+                        | SubscribeEvent::UnsubscribeSent { .. }
+                        | SubscribeEvent::UnsubscribeReceived { .. } => {}
                     }
                 }
                 // Update operations (no UpdateFailure variant exists)
