@@ -323,10 +323,32 @@ async fn report_op_init_error(
         "{op_name} request failed"
     );
 
-    let error_response = Err(ErrorKind::OperationError {
-        cause: format!("{op_name} operation failed: {err}").into(),
-    }
-    .into());
+    // Convert ring errors to type-safe ErrorKind variants so that downstream
+    // consumers (e.g. the HTTP handler's SERVICE_UNAVAILABLE page) can match on
+    // them instead of relying on error message string contents.
+    let error_kind = match err {
+        OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
+        OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
+        OpError::RingError(crate::ring::RingError::ConnError(_))
+        | OpError::RingError(crate::ring::RingError::NoCachingPeers(_))
+        | OpError::ConnError(_)
+        | OpError::ContractError(_)
+        | OpError::ExecutorError(_)
+        | OpError::UnexpectedOpState
+        | OpError::InvalidStateTransition { .. }
+        | OpError::NotificationError
+        | OpError::NotificationChannelError(_)
+        | OpError::IncorrectTxType(..)
+        | OpError::OpNotPresent(_)
+        | OpError::OpNotAvailable(_)
+        | OpError::StreamCancelled
+        | OpError::OrphanStreamClaimFailed
+        | OpError::StatePushed => ErrorKind::OperationError {
+            cause: format!("{op_name} operation failed: {err}").into(),
+        },
+    };
+
+    let error_response = Err(error_kind.into());
 
     if let Err(e) = op_manager.result_router_tx.send((tx, error_response)).await {
         tracing::error!(

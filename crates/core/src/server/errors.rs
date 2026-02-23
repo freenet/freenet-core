@@ -222,3 +222,37 @@ fn connecting_page() -> String {
 </html>"#
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_ring_returns_service_unavailable() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::EmptyRing,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn peer_not_joined_returns_service_unavailable() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::PeerNotJoined,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn other_axum_error_returns_internal_server_error() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::OperationError {
+                cause: "something broke".into(),
+            },
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

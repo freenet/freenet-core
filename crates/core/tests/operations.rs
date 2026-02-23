@@ -3148,7 +3148,10 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
             // An error is also acceptable if it's fast - the key is we don't timeout
             // "No ring connections found" is returned when gateway has no peers
             let err_str = e.to_string();
-            if err_str.contains("No ring connections") || err_str.contains("not found") {
+            if err_str.contains("no ring connections")
+                || err_str.contains("No ring connections")
+                || err_str.contains("not found")
+            {
                 tracing::info!(
                     "✓ Received fast error response in {:?}: {}",
                     elapsed,
