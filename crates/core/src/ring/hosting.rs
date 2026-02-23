@@ -1448,6 +1448,22 @@ mod tests {
         PeerKey(crate::transport::TransportPublicKey::from_bytes([seed; 32]))
     }
 
+    /// Test that should_unsubscribe_upstream returns true when contract is not
+    /// tracked (simulates "contract not found" early return in the Unsubscribe handler).
+    #[test]
+    fn test_should_unsubscribe_upstream_unknown_contract() {
+        let manager = HostingManager::new();
+        let unknown_contract = make_contract_key(99);
+
+        // Contract never added to any tracking structure
+        assert!(
+            manager.should_unsubscribe_upstream(&unknown_contract),
+            "Unknown contract with no clients and no downstream should return true"
+        );
+        assert!(!manager.has_downstream_subscribers(&unknown_contract));
+        assert!(!manager.has_client_subscriptions(unknown_contract.id()));
+    }
+
     #[test]
     fn test_should_unsubscribe_upstream() {
         let manager = HostingManager::new();

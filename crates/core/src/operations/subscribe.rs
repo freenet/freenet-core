@@ -1261,6 +1261,13 @@ impl Operation for SubscribeOp {
                         if let Some(peer) = &sender_peer {
                             op_manager.ring.remove_downstream_subscriber(&key, peer);
                             op_manager.interest_manager.remove_peer_interest(&key, peer);
+                        } else {
+                            tracing::warn!(
+                                tx = %id,
+                                %instance_id,
+                                source_addr = ?source_addr,
+                                "Unsubscribe: could not resolve sender peer, downstream entry not removed"
+                            );
                         }
 
                         // Chain propagation: if no more interest, unsubscribe upstream

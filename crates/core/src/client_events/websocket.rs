@@ -540,7 +540,7 @@ async fn notify_disconnect(
     api_version: ApiVersion,
 ) {
     tracing::debug!(%client_id, "Notifying node of disconnect for subscription cleanup");
-    let _ = request_sender
+    if let Err(e) = request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(ClientRequest::Disconnect { cause: None }),
@@ -548,7 +548,10 @@ async fn notify_disconnect(
             attested_contract: auth_token.as_ref().map(|t| t.1),
             api_version,
         })
-        .await;
+        .await
+    {
+        tracing::debug!(%client_id, error = %e, "Failed to send disconnect notification");
+    }
 }
 
 async fn websocket_interface(
@@ -642,7 +645,9 @@ async fn websocket_interface(
                     Err(err) => {
                         tracing::debug!(err = %err, "client channel closed");
                         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
-                        let _ = server_sink.send(Message::Close(None)).await;
+                        if let Err(e) = server_sink.send(Message::Close(None)).await {
+                            tracing::debug!(error = %e, "Failed to send WebSocket close frame");
+                        }
                         return Ok(());
                     }
                     Ok(v) => v,
@@ -670,7 +675,9 @@ async fn websocket_interface(
                     Err(None) => {
                         tracing::debug!(%client_id, "client channel closed during request processing");
                         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
-                        let _ = server_sink.send(Message::Close(None)).await;
+                        if let Err(e) = server_sink.send(Message::Close(None)).await {
+                            tracing::debug!(error = %e, "Failed to send WebSocket close frame");
+                        }
                         return Ok(())
                     },
                     Err(Some(err)) => {

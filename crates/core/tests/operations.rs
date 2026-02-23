@@ -4068,6 +4068,10 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     );
 
     assert!(
+        unsubscribe_sent_count > 0,
+        "Node B should have sent Unsubscribe upstream after client disconnect"
+    );
+    assert!(
         unsubscribe_received_count > 0,
         "Upstream node should have received the Unsubscribe message after client disconnect"
     );
