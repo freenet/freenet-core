@@ -484,8 +484,8 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
 # Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely. The counter
-# resets after a successful start, so auto-update (exit 42) is unaffected.
+# a stale process). Without this, systemd restarts indefinitely.
+# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
 # Allow 15 seconds for graceful shutdown before SIGKILL
@@ -496,6 +496,10 @@ TimeoutStopSec=15
 # run update before systemd restarts the service. The '-' prefix means
 # ExecStopPost failure won't affect service restart.
 ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
+# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
+# exhaust the burst limit and permanently kill the service.
+SuccessExitStatus=42
 
 # Logging - write to files for systems without active user journald
 # (headless servers, systems without lingering enabled, etc.)
@@ -542,8 +546,8 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
 # Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely. The counter
-# resets after a successful start, so auto-update (exit 42) is unaffected.
+# a stale process). Without this, systemd restarts indefinitely.
+# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
 # Allow 15 seconds for graceful shutdown before SIGKILL
@@ -554,6 +558,10 @@ TimeoutStopSec=15
 # run update before systemd restarts the service. The '-' prefix means
 # ExecStopPost failure won't affect service restart.
 ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
+# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
+# exhaust the burst limit and permanently kill the service.
+SuccessExitStatus=42
 
 # Logging - write to files for systems without active user journald
 StandardOutput=append:{log_dir}/freenet.log
@@ -1235,6 +1243,9 @@ mod tests {
         // Verify auto-update support via ExecStopPost
         assert!(service_content.contains("ExecStopPost="));
 
+        // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
+        assert!(service_content.contains("SuccessExitStatus=42"));
+
         // Verify graceful shutdown timeout is set
         assert!(service_content.contains("TimeoutStopSec=15"));
 
@@ -1274,6 +1285,9 @@ mod tests {
         assert!(service_content.contains("StartLimitIntervalSec=120"));
         assert!(service_content.contains("LimitNOFILE=65536"));
         assert!(service_content.contains("ExecStopPost="));
+
+        // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
+        assert!(service_content.contains("SuccessExitStatus=42"));
     }
 
     #[test]
