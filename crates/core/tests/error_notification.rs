@@ -545,7 +545,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         info!("Connection drop error notification test passed");
 
         // Try to disconnect cleanly (may fail if connection is already gone)
-        let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+        let _disconnect = client.send(ClientRequest::Disconnect { cause: None }).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok::<(), anyhow::Error>(())

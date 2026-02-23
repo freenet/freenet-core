@@ -316,7 +316,7 @@ fn test_polling_does_not_spin() {
         thread::sleep(Duration::from_millis(10)); // 10ms sleep between polls
     }
 
-    let _ = handle.join();
+    let _join = handle.join();
 
     // With 10ms polling interval and 100ms execution, we should have ~10-15 polls
     // (not hundreds or thousands which would indicate spinning)
@@ -394,7 +394,7 @@ fn test_orphaned_threads_eventually_complete() {
 
     // Timeout all of them with a short timeout
     for handle in handles {
-        let _ = simulate_execution_polling(handle, 0.05);
+        let _result = simulate_execution_polling(handle, 0.05);
     }
 
     // All were abandoned, but give them time to complete in background

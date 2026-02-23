@@ -35,7 +35,6 @@
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use std::sync::Arc;
 
 use crate::contract::executor::mock_runtime::MockRuntime;
 use crate::contract::executor::mock_wasm_runtime::MockWasmRuntime;
@@ -58,15 +57,7 @@ async fn create_mock_wasm_executor() -> Executor<MockWasmRuntime, MockStateStora
         .expect("create MockWasmRuntime executor")
 }
 
-/// Helper to create a test contract.
-fn test_contract(code_bytes: &[u8]) -> ContractContainer {
-    let code = ContractCode::from(code_bytes.to_vec());
-    let params = Parameters::from(vec![]);
-    ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-        Arc::new(code),
-        params,
-    )))
-}
+use super::super::mock_runtime::test::create_test_contract as test_contract;
 
 // =========================================================================
 // Invariant: PUT new contract → Updated result with same state
@@ -77,6 +68,8 @@ async fn conformance_put_new_contract_both_return_updated() {
     let mut mock = create_mock_runtime_executor().await;
     let mut wasm = create_mock_wasm_executor().await;
 
+    // Non-WASM bytes are fine here: neither runtime executes contract code
+    // during PUT (upsert_contract_state stores state without validation).
     let contract = test_contract(b"conformance_put_test");
     let key = contract.key();
     let state = WrappedState::new(vec![10, 20, 30]);

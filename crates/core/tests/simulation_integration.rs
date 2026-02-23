@@ -5314,3 +5314,277 @@ fn test_interest_renewal() {
         ratio
     );
 }
+
+/// Isolated integration test for interest TTL refresh on broadcast send.
+///
+/// Validates the fix for #3093: interest entries for peers receiving full-state
+/// broadcasts must have their TTL refreshed on each successful send. Without
+/// this refresh, subscriptions expire after INTEREST_TTL (20 min) even though
+/// broadcasts are being delivered, causing ~49% subscriber drop.
+///
+/// ## Test Design
+///
+/// Uses a minimal network (1 gateway + 2 nodes) with few contracts to
+/// isolate the TTL refresh mechanism. Virtual time spans ~1.5x INTEREST_TTL
+/// (1800s) so that without the broadcast-send TTL refresh, interest entries
+/// would expire and late-phase broadcasts would stop arriving.
+///
+/// The test splits broadcast-received events into three phases:
+/// - **Early** (first third): baseline broadcast delivery
+/// - **Mid** (second third): crosses the TTL boundary (~1200s)
+/// - **Late** (final third): must still receive broadcasts if TTL was refreshed
+///
+/// ## What This Catches
+///
+/// - Missing `refresh_peer_interest()` call in broadcast send path (p2p_protoc.rs)
+/// - TTL expiration causing silent subscriber loss
+/// - Regression of the #3093 fix
+///
+/// ## Related
+///
+/// - Issue #3093: Interest TTL not refreshed on full-state broadcast
+/// - Issue #3107: Add isolated integration test (this test)
+/// - Issue #3141: CI & Testing Redesign
+/// - `test_interest_renewal`: Scale test covering the same mechanism
+///
+/// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
+/// Virtual time: 300 iterations × 6s = 1800s (~1.5× INTEREST_TTL).
+/// Wall clock: typically < 15s.
+#[test_log::test]
+fn test_interest_ttl_refresh_on_broadcast() {
+    const SEED: u64 = 0x3107_0BCA_0001;
+
+    tracing::info!("=== Starting Interest TTL Refresh on Broadcast Test ===");
+    // INTEREST_TTL = 1200s (20 min). Virtual time = 300 × 6s = 1800s (~1.5× TTL).
+    tracing::info!("Virtual time target: 1800s (~1.5x INTEREST_TTL of 1200s)");
+
+    let result = TestConfig::small("ttl-refresh-bcast", SEED)
+        .with_gateways(1)
+        .with_nodes(2) // Minimal network: 1 gateway + 2 nodes
+        .with_max_contracts(2) // Few contracts → more updates per contract
+        .with_iterations(300) // 300 × 6s = 1800s virtual time
+        .with_event_wait(Duration::from_secs(6))
+        .run_direct()
+        .assert_ok();
+
+    // Analyze broadcast-received events across three phases of virtual time.
+    // The TTL boundary is at ~1200s (INTEREST_TTL). If refresh is working,
+    // broadcasts should continue in the late phase (1200s-1800s).
+    let rt = create_runtime();
+    let (early_broadcasts, mid_broadcasts, late_broadcasts) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let log_count = logs.len();
+        let third = log_count / 3;
+
+        let mut early = 0usize;
+        let mut mid = 0usize;
+        let mut late = 0usize;
+        for (i, log) in logs.iter().enumerate() {
+            if log.kind.is_update_broadcast_received() {
+                if i < third {
+                    early += 1;
+                } else if i < third * 2 {
+                    mid += 1;
+                } else {
+                    late += 1;
+                }
+            }
+        }
+        (early, mid, late)
+    });
+
+    let total = early_broadcasts + mid_broadcasts + late_broadcasts;
+    tracing::info!(
+        "Broadcast received events: {} total (early: {}, mid: {}, late: {})",
+        total,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts
+    );
+
+    // Must have some broadcasts overall — otherwise the simulation didn't
+    // generate enough update activity to be meaningful.
+    assert!(
+        total > 0,
+        "No BroadcastReceived events found in {} logged events — \
+         simulation may not be generating updates. Seed: 0x{:X}",
+        result.event_count,
+        SEED
+    );
+
+    // CRITICAL: Late-phase broadcasts must exist. If the TTL refresh on
+    // broadcast send is missing (regression of #3093), interest entries
+    // expire at ~1200s and no broadcasts are delivered after that point.
+    assert!(
+        late_broadcasts > 0,
+        "No BroadcastReceived events in the final third of simulation \
+         (after INTEREST_TTL boundary). Interest TTL is NOT being refreshed \
+         on broadcast send — subscriptions have silently expired. \
+         See #3093, #3107. Seed: 0x{:X}",
+        SEED
+    );
+
+    // The late/early ratio should be meaningful — at least 10% of early
+    // traffic. A drastic drop indicates partial TTL refresh failure.
+    let late_ratio = late_broadcasts as f64 / early_broadcasts.max(1) as f64;
+    tracing::info!(
+        "Late/early broadcast ratio: {:.2} ({}/{})",
+        late_ratio,
+        late_broadcasts,
+        early_broadcasts
+    );
+
+    assert!(
+        late_ratio > 0.1,
+        "Late broadcast ratio ({:.2}) dropped below 0.1 — \
+         interest TTL refresh may be partially broken. \
+         Early: {}, Mid: {}, Late: {}. See #3093, #3107. Seed: 0x{:X}",
+        late_ratio,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts,
+        SEED
+    );
+
+    tracing::info!(
+        "test_interest_ttl_refresh_on_broadcast PASSED: late/early ratio {:.2}, \
+         total broadcasts: {} (early: {}, mid: {}, late: {})",
+        late_ratio,
+        total,
+        early_broadcasts,
+        mid_broadcasts,
+        late_broadcasts
+    );
+}
+
+// =============================================================================
+// Thundering Herd CONNECT Storm Regression Test (Issue #3207, PR #3208)
+// =============================================================================
+
+/// Helper to advance virtual time in steps while yielding to tokio.
+///
+/// This is the same pattern used in `simulation_smoke.rs` and `state_verification.rs`,
+/// duplicated here because it is test-file-scoped.
+async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < duration {
+        sim.advance_time(step);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        elapsed += step;
+    }
+}
+
+/// Regression test for thundering herd CONNECT storm after gateway restart.
+///
+/// **Background (Issue #3207):**
+/// When a gateway restarts, all peers reconnect simultaneously, generating a
+/// burst of CONNECT operations that can overwhelm per-connection fast_channel
+/// (capacity 1000), causing a non-recovering drop→retransmit feedback loop.
+/// PR #3208 fixed the underlying inbound starvation bug.
+///
+/// **Test scenario:**
+/// 1. Create a 1-gateway + 20-node network, let it stabilize
+/// 2. Crash the gateway (all peers lose connections)
+/// 3. Restart the gateway (triggers thundering herd reconnection)
+/// 4. Verify the network recovers (no non-recovering overflow)
+///
+/// Uses the async direct-control pattern (like `test_suspend_resume_zombie_connections`)
+/// because `restart_node` requires `&mut SimNetwork`.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_thundering_herd_connect_storm() {
+    const SEED: u64 = 0x3207_0000_3208;
+    const NETWORK_NAME: &str = "thundering-herd-connect";
+
+    tracing::info!("=== Thundering Herd CONNECT Storm Test (Issue #3207, PR #3208) ===");
+
+    // 1 gateway, 20 nodes — single bottleneck topology
+    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 20, 7, 3, 10, 2, SEED).await;
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10)
+        .await;
+
+    let logs_handle = sim.event_logs_handle();
+
+    // Phase 1: Stabilize
+    tracing::info!("Phase 1: Stabilizing network (5s)");
+    let_network_run(&mut sim, Duration::from_secs(5)).await;
+
+    sim.check_partial_connectivity(Duration::from_secs(20), 0.8)
+        .await
+        .expect("Network should reach ≥80% connectivity before crash");
+    tracing::info!("Phase 1 complete: network connected");
+
+    // Record baseline Connect event count
+    let baseline_connects = {
+        let logs = logs_handle.lock().await;
+        logs.iter().filter(|log| log.kind.is_connect()).count()
+    };
+    tracing::info!("Baseline Connect events: {}", baseline_connects);
+
+    // Phase 2: Crash the gateway
+    let gateway_label = sim
+        .all_node_addresses()
+        .keys()
+        .find(|label| label.is_gateway())
+        .cloned()
+        .expect("Should have a gateway");
+
+    tracing::info!(?gateway_label, "Phase 2: Crashing gateway");
+    let crashed = sim.crash_node(&gateway_label);
+    assert!(crashed, "Gateway should crash successfully");
+
+    // Phase 3: Let peers detect the dead gateway
+    tracing::info!("Phase 3: Peers detecting dead gateway (10s)");
+    let_network_run(&mut sim, Duration::from_secs(10)).await;
+
+    // Phase 4: Restart gateway — all peers reconnect at once
+    tracing::info!("Phase 4: Restarting gateway (thundering herd begins)");
+    let restart_seed = SEED.wrapping_add(0x1000);
+    let handle = sim
+        .restart_node::<rand::rngs::SmallRng>(&gateway_label, restart_seed, 5, 5)
+        .await;
+    assert!(handle.is_some(), "Gateway should restart successfully");
+
+    // Phase 5: Let the reconnection storm play out
+    tracing::info!("Phase 5: Reconnection storm playing out (30s)");
+    let_network_run(&mut sim, Duration::from_secs(30)).await;
+
+    // Phase 6: Verify recovery
+    tracing::info!("Phase 6: Verifying network recovery");
+
+    // 6a: Log reconnection activity for diagnostics
+    let final_connects = {
+        let logs = logs_handle.lock().await;
+        logs.iter().filter(|log| log.kind.is_connect()).count()
+    };
+    let storm_connects = final_connects - baseline_connects;
+    tracing::info!(
+        "Connect events after restart: {} (baseline: {}, storm: {})",
+        final_connects,
+        baseline_connects,
+        storm_connects
+    );
+    // Note: The gateway rate limiter (GatewayConnectionRateLimiter) intentionally
+    // throttles the thundering herd to 5 connections/sec initially, ramping up over
+    // 2 minutes. In simulation, RealTime-based rate limiting means fewer connections
+    // complete than the 20 peers attempting to reconnect. This is the desired behavior
+    // — the storm is prevented, not just survived.
+
+    // 6b: Verify network recovered (the actual regression check for #3207/#3208)
+    sim.check_partial_connectivity(Duration::from_secs(20), 0.8)
+        .await
+        .expect(
+            "Network should recover to ≥80% connectivity after gateway restart. \
+             The rate limiter should throttle but not prevent reconnection.",
+        );
+
+    tracing::info!(
+        "test_thundering_herd_connect_storm PASSED: {} Connect events after restart, \
+         network recovered to ≥80% connectivity",
+        storm_connects
+    );
+}

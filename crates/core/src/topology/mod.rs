@@ -327,7 +327,35 @@ impl TopologyManager {
         // Below min_connections: add connections to reach the minimum.
         if current_connections < self.limits.min_connections {
             let needed = self.limits.min_connections - current_connections;
-            let locations = Self::sample_targets(my_location, needed);
+
+            // With 5+ connections, use Kleinberg sampling
+            if current_connections >= DENSITY_SELECTION_THRESHOLD {
+                let locations = Self::sample_targets(my_location, needed);
+                return TopologyAdjustment::AddConnections(locations);
+            }
+
+            let locations = bootstrap_target_locations(my_location, current_connections, needed);
+
+            #[cfg(debug_assertions)]
+            if current_connections == 0 {
+                thread_local! {
+                    static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                }
+                if LAST_LOG.with(|last_log| {
+                    last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
+                }) {
+                    LAST_LOG.with(|last_log| {
+                        tracing::trace!(
+                            minimum_num_peers_hard_limit = self.limits.min_connections,
+                            num_peers = current_connections,
+                            to_add = needed,
+                            "Bootstrap: adding first connection at own location"
+                        );
+                        *last_log.borrow_mut() = Instant::now();
+                    });
+                }
+            }
+
             return TopologyAdjustment::AddConnections(locations);
         }
 
@@ -507,6 +535,41 @@ impl TopologyManager {
             event!(Level::WARN, "Couldn't find a suitable peer to remove");
             TopologyAdjustment::NoChange
         }
+    }
+}
+
+/// Select target locations for bootstrap (0 to DENSITY_SELECTION_THRESHOLD-1 connections).
+///
+/// - **0 connections**: single target at own location (or random if unknown).
+/// - **1..DENSITY_SELECTION_THRESHOLD-1**: own location + evenly spaced ring targets.
+///   Distinct locations ensure all targets survive BTreeSet deduplication in the caller.
+fn bootstrap_target_locations(
+    my_location: &Option<Location>,
+    current_connections: usize,
+    needed: usize,
+) -> Vec<Location> {
+    debug_assert!(current_connections < DENSITY_SELECTION_THRESHOLD);
+
+    if current_connections == 0 {
+        // First connection targets own location to help clustering
+        return match my_location {
+            Some(location) => vec![*location],
+            None => vec![Location::random()],
+        };
+    }
+
+    // Spread targets: first at own location, rest evenly spaced around the ring
+    match my_location {
+        Some(location) => {
+            let mut locations = Vec::with_capacity(needed);
+            locations.push(*location);
+            for i in 1..needed {
+                let offset = i as f64 / needed as f64;
+                locations.push(Location::new_rounded(location.as_f64() + offset));
+            }
+            locations
+        }
+        None => (0..needed).map(|_| Location::random()).collect(),
     }
 }
 
@@ -845,7 +908,7 @@ mod tests {
         );
     }
 
-    // Test with no peers: should add connections using Kleinberg targets
+    // Test with no peers: bootstrap should target own location
     #[test_log::test]
     fn test_no_peers() {
         let mut resource_manager = setup_topology_manager(1000.0);
@@ -861,21 +924,11 @@ mod tests {
 
         match adjustment {
             TopologyAdjustment::AddConnections(v) => {
-                assert!(!v.is_empty());
-                // All locations should be valid ring values
-                for loc in &v {
-                    let val = loc.as_f64();
-                    assert!(
-                        (0.0..1.0).contains(&val),
-                        "Location {val} outside valid ring range"
-                    );
-                }
-                // Kleinberg sampling should produce distinct values
-                let as_set: std::collections::BTreeSet<Location> = v.iter().copied().collect();
+                // Zero connections: bootstrap returns single target at own location
+                assert_eq!(v.len(), 1);
                 assert_eq!(
-                    as_set.len(),
-                    v.len(),
-                    "Kleinberg targets should be distinct"
+                    v[0], my_location,
+                    "First bootstrap target should be own location"
                 );
             }
             _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
@@ -1048,10 +1101,9 @@ mod tests {
         );
     }
 
-    // Test that below min_connections, Kleinberg targets are produced with short-distance bias.
+    // Test that below DENSITY_SELECTION_THRESHOLD, bootstrap targets are evenly spaced.
     #[test_log::test]
-    fn test_below_min_uses_kleinberg_targets() {
-        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
+    fn test_below_threshold_uses_bootstrap_targets() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1077,16 +1129,54 @@ mod tests {
                 // Should request 24 more connections to reach min of 25
                 assert_eq!(locations.len(), 24);
 
-                // All locations must be distinct (Kleinberg sampling produces unique values)
+                // First target should be own location
+                assert_eq!(locations[0], my_location);
+
+                // All locations must be distinct
                 let as_set: std::collections::BTreeSet<Location> =
                     locations.iter().copied().collect();
                 assert_eq!(
                     as_set.len(),
                     locations.len(),
-                    "All Kleinberg targets must be distinct"
+                    "All bootstrap targets must be distinct"
                 );
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
 
-                // Majority should be short-distance (1/d bias)
+    // Test that at/above DENSITY_SELECTION_THRESHOLD, Kleinberg targets are used.
+    #[test_log::test]
+    fn test_above_threshold_uses_kleinberg_targets() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 25,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for _ in 0..5 {
+            let peer = PeerKeyLocation::random();
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        let my_location = Location::new(0.5);
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            5, // at DENSITY_SELECTION_THRESHOLD
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                // Should request 20 more connections to reach min of 25
+                assert_eq!(locations.len(), 20);
+
+                // Kleinberg 1/d bias: majority should be short-distance
                 let short_count = locations
                     .iter()
                     .filter(|loc| my_location.distance(**loc).as_f64() < 0.1)
@@ -1101,9 +1191,9 @@ mod tests {
         }
     }
 
-    // Test that needing 1 more connection produces a single Kleinberg target.
+    // Test that needing 1 more connection below threshold produces a bootstrap target.
     #[test_log::test]
-    fn test_single_kleinberg_target() {
+    fn test_single_bootstrap_target() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1128,20 +1218,17 @@ mod tests {
 
         match adjustment {
             TopologyAdjustment::AddConnections(locations) => {
+                // 4 connections, need 1 more: bootstrap returns own location
                 assert_eq!(locations.len(), 1);
-                let val = locations[0].as_f64();
-                assert!(
-                    (0.0..1.0).contains(&val),
-                    "Target {val} outside valid ring range"
-                );
+                assert_eq!(locations[0], my_location);
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
     }
 
-    // Test that Kleinberg targets wrap correctly near the ring boundary (1.0 wraps to 0.0).
+    // Test that bootstrap targets wrap correctly near the ring boundary (1.0 wraps to 0.0).
     #[test_log::test]
-    fn test_kleinberg_targets_wrap_near_boundary() {
+    fn test_bootstrap_targets_wrap_near_boundary() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1177,7 +1264,7 @@ mod tests {
                 assert_eq!(
                     as_set.len(),
                     locations.len(),
-                    "All Kleinberg targets must be distinct even when wrapping"
+                    "All bootstrap targets must be distinct even when wrapping"
                 );
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
@@ -1217,6 +1304,68 @@ mod tests {
             }
             _ => panic!("Expected AddConnections, got {adjustment:?}"),
         }
+    }
+
+    #[test]
+    fn test_bootstrap_zero_connections_with_location() {
+        let my_loc = Location::new(0.4);
+        let locations = bootstrap_target_locations(&Some(my_loc), 0, 5);
+        assert_eq!(
+            locations.len(),
+            1,
+            "Zero connections should produce exactly one target"
+        );
+        assert_eq!(locations[0], my_loc, "Should target own location");
+    }
+
+    #[test]
+    fn test_bootstrap_zero_connections_without_location() {
+        let locations = bootstrap_target_locations(&None, 0, 5);
+        assert_eq!(
+            locations.len(),
+            1,
+            "Zero connections should produce exactly one target"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_few_connections_with_location() {
+        let my_loc = Location::new(0.2);
+        let needed = 4;
+        let locations = bootstrap_target_locations(&Some(my_loc), 1, needed);
+        assert_eq!(locations.len(), needed);
+
+        // First target should be own location
+        assert_eq!(locations[0], my_loc);
+
+        // All targets should be distinct
+        let unique: std::collections::HashSet<_> = locations.iter().collect();
+        assert_eq!(
+            unique.len(),
+            needed,
+            "All bootstrap targets should be distinct"
+        );
+
+        // Targets should be evenly spaced (offsets 0/4, 1/4, 2/4, 3/4)
+        for (i, loc) in locations.iter().enumerate().skip(1) {
+            let expected_offset = i as f64 / needed as f64;
+            let expected = Location::new_rounded(my_loc.as_f64() + expected_offset);
+            assert_eq!(*loc, expected, "Target {i} should be evenly spaced");
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_few_connections_without_location() {
+        let needed = 3;
+        let locations = bootstrap_target_locations(&None, 2, needed);
+        assert_eq!(locations.len(), needed);
+
+        // All should be random but valid locations
+        let unique: std::collections::HashSet<_> = locations.iter().collect();
+        assert!(
+            unique.len() > 1,
+            "Random locations should generally be distinct"
+        );
     }
 }
 

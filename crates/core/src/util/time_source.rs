@@ -141,7 +141,9 @@ impl CachingSystemTimeSrc {
 impl TimeSource for CachingSystemTimeSrc {
     // Returns the current time from the global state.
     fn now(&self) -> Instant {
-        // Unsafe dereference is required for the raw pointer.
+        // SAFETY: The pointer stored in `GLOBAL_TIME_STATE` is always valid
+        // because `update_instant` writes a valid `Instant` before signalling
+        // readiness, and the updater thread runs for the lifetime of the process.
         unsafe { *GLOBAL_TIME_STATE.load(std::sync::atomic::Ordering::Acquire) }
     }
 }

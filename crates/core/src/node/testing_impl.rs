@@ -447,18 +447,18 @@ impl<S> EventChain<S> {
     }
 
     fn increment_count(self: Pin<&mut Self>) {
+        // SAFETY: We only modify `count` (a non-address-sensitive `usize` field)
+        // through the pinned reference; the EventChain itself is not moved.
         unsafe {
-            // This is safe because we're not moving the EventChain, just modifying a field
             let this = self.get_unchecked_mut();
             this.count += 1;
         }
     }
 
     fn choose_peer(self: Pin<&mut Self>) -> TransportPublicKey {
-        let this = unsafe {
-            // This is safe because we're not moving the EventChain, just copying one inner valur
-            self.get_unchecked_mut()
-        };
+        // SAFETY: We access `choice`, `rng`, and `labels` by mutable reference
+        // without moving the EventChain out of its pinned location.
+        let this = unsafe { self.get_unchecked_mut() };
         if let Some(id) = this.choice.take() {
             return id;
         }
@@ -469,10 +469,9 @@ impl<S> EventChain<S> {
     }
 
     fn set_choice(self: Pin<&mut Self>, id: TransportPublicKey) {
-        let this = unsafe {
-            // This is safe because we're not moving the EventChain, just copying one inner valur
-            self.get_unchecked_mut()
-        };
+        // SAFETY: We only write to the `choice` field without moving the
+        // pinned EventChain itself.
+        let this = unsafe { self.get_unchecked_mut() };
         this.choice = Some(id);
     }
 }
@@ -2756,7 +2755,7 @@ impl SimNetwork {
                         GetEvent::Request { .. } => summary.get.requested += 1,
                         GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
                         GetEvent::GetFailure { .. } => summary.get.failed += 1,
-                        _ => {}
+                        GetEvent::GetNotFound { .. } | GetEvent::ResponseSent { .. } => {}
                     }
                 }
                 // Subscribe operations
@@ -2766,7 +2765,14 @@ impl SimNetwork {
                         SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
                         SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
                         SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
-                        _ => {}
+                        SubscribeEvent::ResponseSent { .. }
+                        | SubscribeEvent::SeedingStarted { .. }
+                        | SubscribeEvent::SeedingStopped { .. }
+                        | SubscribeEvent::_Reserved6
+                        | SubscribeEvent::_Reserved7
+                        | SubscribeEvent::_Reserved8
+                        | SubscribeEvent::_Reserved9
+                        | SubscribeEvent::_Reserved10 => {}
                     }
                 }
                 // Update operations (no UpdateFailure variant exists)
@@ -2778,14 +2784,26 @@ impl SimNetwork {
                         UpdateEvent::BroadcastReceived { .. } => {
                             summary.update.broadcasts_received += 1
                         }
-                        _ => {}
+                        UpdateEvent::BroadcastEmitted { .. }
+                        | UpdateEvent::BroadcastComplete { .. }
+                        | UpdateEvent::BroadcastApplied { .. }
+                        | UpdateEvent::BroadcastDeliverySummary { .. } => {}
                     }
                 }
                 // Timeouts
                 crate::tracing::EventKind::Timeout { .. } => {
                     summary.timeouts += 1;
                 }
-                _ => {}
+                crate::tracing::EventKind::Connect(_)
+                | crate::tracing::EventKind::Route(_)
+                | crate::tracing::EventKind::Transfer(_)
+                | crate::tracing::EventKind::Lifecycle(_)
+                | crate::tracing::EventKind::Ignored
+                | crate::tracing::EventKind::Disconnected { .. }
+                | crate::tracing::EventKind::TransportSnapshot(_)
+                | crate::tracing::EventKind::InterestSync(_)
+                | crate::tracing::EventKind::RoutingDecision(_)
+                | crate::tracing::EventKind::RouterSnapshot(_) => {}
             }
         }
 
@@ -4390,7 +4408,8 @@ fn clean_up_tmp_dirs<'a>(labels: impl Iterator<Item = &'a NodeLabel>) {
             sim = "sim",
             label = label
         ));
-        let _ = std::fs::remove_dir_all(p);
+        // Best-effort cleanup of temp dirs; failure is not critical
+        let _removed = std::fs::remove_dir_all(p);
     }
 }
 

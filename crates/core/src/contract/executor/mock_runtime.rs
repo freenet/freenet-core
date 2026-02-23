@@ -797,7 +797,7 @@ where
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -838,7 +838,7 @@ mod test {
     }
 
     /// Helper to create a test contract with given code bytes
-    fn create_test_contract(code_bytes: &[u8]) -> ContractContainer {
+    pub(crate) fn create_test_contract(code_bytes: &[u8]) -> ContractContainer {
         use freenet_stdlib::prelude::*;
 
         let code = ContractCode::from(code_bytes.to_vec());
@@ -1718,5 +1718,192 @@ mod test {
             executor_b.recovery_guard.lock().unwrap().contains(&key),
             "Recovery guard should be visible across pool executors"
         );
+    }
+
+    mod proptest_state_merge {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy to generate distinct state byte vectors.
+        fn arb_states(count: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
+            proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..64), count..=count)
+        }
+
+        /// Pure hash-based merge: given current and incoming states,
+        /// returns the one with the lexicographically larger blake3 hash.
+        /// This mirrors the MockRuntime merge logic without needing an executor.
+        fn hash_merge(current: &[u8], incoming: &[u8]) -> Vec<u8> {
+            let current_hash = blake3::hash(current);
+            let incoming_hash = blake3::hash(incoming);
+            if incoming_hash.as_bytes() > current_hash.as_bytes() {
+                incoming.to_vec()
+            } else {
+                current.to_vec()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Property: applying a set of state updates in any permutation
+            /// converges to the same final state. The hash-based merge is
+            /// commutative and associative, so order should not matter.
+            #[test]
+            fn state_merge_order_independent(
+                states in arb_states(4),
+                perm_seed in any::<u64>(),
+            ) {
+                // Skip if all states are identical (trivially converges)
+                let all_same = states.windows(2).all(|w| w[0] == w[1]);
+                if all_same {
+                    return Ok(());
+                }
+
+                // Apply states in "natural" order: 0, 1, 2, 3
+                let mut result_natural = states[0].clone();
+                for s in &states[1..] {
+                    result_natural = hash_merge(&result_natural, s);
+                }
+
+                // Generate a deterministic permutation using the seed
+                let mut indices: Vec<usize> = (0..states.len()).collect();
+                // Simple Fisher-Yates using seed
+                let mut rng_val = perm_seed;
+                for i in (1..indices.len()).rev() {
+                    rng_val = rng_val.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let j = (rng_val as usize) % (i + 1);
+                    indices.swap(i, j);
+                }
+
+                // Apply states in permuted order
+                let mut result_permuted = states[indices[0]].clone();
+                for &idx in &indices[1..] {
+                    result_permuted = hash_merge(&result_permuted, &states[idx]);
+                }
+
+                prop_assert_eq!(
+                    result_natural, result_permuted,
+                    "States must converge regardless of application order"
+                );
+            }
+
+            /// Property: the final merged state always equals the state with
+            /// the largest blake3 hash among all candidates.
+            #[test]
+            fn merge_selects_largest_hash(
+                states in arb_states(5),
+            ) {
+                // Find the state with the largest hash
+                let winner = states
+                    .iter()
+                    .max_by_key(|s| blake3::hash(s).as_bytes().to_vec())
+                    .unwrap()
+                    .clone();
+
+                // Apply all states sequentially
+                let mut result = states[0].clone();
+                for s in &states[1..] {
+                    result = hash_merge(&result, s);
+                }
+
+                prop_assert_eq!(
+                    result, winner,
+                    "Merge must converge to state with largest hash"
+                );
+            }
+
+            /// Property: merge is idempotent -- merging a state with itself
+            /// produces no change.
+            #[test]
+            fn merge_idempotent(
+                state in proptest::collection::vec(any::<u8>(), 1..64),
+            ) {
+                let result = hash_merge(&state, &state);
+                prop_assert_eq!(
+                    result, state,
+                    "Merging a state with itself must be idempotent"
+                );
+            }
+
+            /// Property: merge is commutative -- merge(a, b) == merge(b, a)
+            /// when we track which state "wins" (the one with larger hash).
+            #[test]
+            fn merge_commutative(
+                a in proptest::collection::vec(any::<u8>(), 1..64),
+                b in proptest::collection::vec(any::<u8>(), 1..64),
+            ) {
+                let ab = hash_merge(&a, &b);
+                let ba = hash_merge(&b, &a);
+                prop_assert_eq!(ab, ba, "Merge must be commutative");
+            }
+
+            /// Property: CRDT LWW-Register merge converges regardless of order.
+            /// Higher version always wins; equal versions use hash tiebreaker.
+            #[test]
+            fn crdt_lww_merge_order_independent(
+                versions in proptest::collection::vec(1u64..20, 3..6),
+                data_bytes in proptest::collection::vec(
+                    proptest::collection::vec(any::<u8>(), 1..32),
+                    3..6,
+                ),
+                perm_seed in any::<u64>(),
+            ) {
+                let count = versions.len().min(data_bytes.len());
+                let versions = &versions[..count];
+                let data_bytes = &data_bytes[..count];
+
+                // Pure LWW merge function (mirrors apply_crdt_full_state logic)
+                fn lww_merge(
+                    current: (u64, Vec<u8>),
+                    incoming: (u64, Vec<u8>),
+                ) -> (u64, Vec<u8>) {
+                    if incoming.0 > current.0 {
+                        incoming
+                    } else if incoming.0 == current.0 {
+                        let incoming_hash = blake3::hash(&incoming.1);
+                        let current_hash = blake3::hash(&current.1);
+                        if incoming_hash.as_bytes() > current_hash.as_bytes() {
+                            incoming
+                        } else {
+                            current
+                        }
+                    } else {
+                        current
+                    }
+                }
+
+                // Build entries
+                let entries: Vec<(u64, Vec<u8>)> = versions
+                    .iter()
+                    .zip(data_bytes.iter())
+                    .map(|(&v, d)| (v, d.clone()))
+                    .collect();
+
+                // Apply in natural order
+                let mut result_natural = entries[0].clone();
+                for e in &entries[1..] {
+                    result_natural = lww_merge(result_natural, e.clone());
+                }
+
+                // Apply in permuted order
+                let mut indices: Vec<usize> = (0..entries.len()).collect();
+                let mut rng_val = perm_seed;
+                for i in (1..indices.len()).rev() {
+                    rng_val = rng_val.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let j = (rng_val as usize) % (i + 1);
+                    indices.swap(i, j);
+                }
+
+                let mut result_permuted = entries[indices[0]].clone();
+                for &idx in &indices[1..] {
+                    result_permuted = lww_merge(result_permuted, entries[idx].clone());
+                }
+
+                prop_assert_eq!(
+                    result_natural, result_permuted,
+                    "CRDT LWW merge must converge regardless of order"
+                );
+            }
+        }
     }
 }

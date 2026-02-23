@@ -348,13 +348,17 @@ mod tests {
         /// Caller must ensure the returned env does not outlive `self`.
         unsafe fn make_env(&mut self) -> DelegateCallEnv {
             let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-            DelegateCallEnv::new(
-                vec![],
-                &mut self.secret_store,
-                &self.contract_store,
-                Some(self.db.clone()),
-                delegate_key,
-            )
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    delegate_key,
+                )
+            }
         }
     }
 
@@ -365,6 +369,8 @@ mod tests {
         let state_data = vec![100, 200, 255];
         let contract_id = env_holder.store_contract(50, &state_data).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.get_contract_state_sync(&contract_id);
         assert!(result.is_ok());
@@ -376,6 +382,8 @@ mod tests {
     async fn test_env_get_contract_state_not_found() {
         let mut env_holder = TestEnv::new().await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([77u8; 32]);
         let result = env.get_contract_state_sync(&missing_id);
@@ -389,6 +397,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(60, &[]).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.get_contract_state_sync(&contract_id);
         assert!(result.is_ok());
@@ -403,6 +413,8 @@ mod tests {
         let id2 = env_holder.store_contract(20, &[2, 2, 2]).await;
         let id3 = env_holder.store_contract(30, &[3, 3, 3]).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
 
         assert_eq!(
@@ -425,6 +437,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
 
         let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the raw pointers to `secret_store` and `contract_store` remain valid.
         let env = unsafe {
             DelegateCallEnv::new(
                 vec![],
@@ -446,6 +460,8 @@ mod tests {
         let large_state: Vec<u8> = (0..1_000_000u32).map(|i| (i % 256) as u8).collect();
         let contract_id = env_holder.store_contract(70, &large_state).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
         assert_eq!(result.len(), 1_000_000);
@@ -498,6 +514,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
 
         let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the raw pointers to `secret_store` and `contract_store` remain valid.
         let env = unsafe {
             DelegateCallEnv::new(
                 vec![],
@@ -519,6 +537,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
 
         let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the raw pointers to `secret_store` and `contract_store` remain valid.
         let env = unsafe {
             DelegateCallEnv::new(
                 vec![],
@@ -541,6 +561,8 @@ mod tests {
         // store_contract registers the code hash + stores initial state
         let contract_id = env_holder.store_contract(80, &[1, 2, 3]).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         // PUT new state
         let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6]);
@@ -556,6 +578,8 @@ mod tests {
     async fn test_env_put_contract_state_unregistered() {
         let mut env_holder = TestEnv::new().await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([88u8; 32]);
         let result = env.put_contract_state_sync(&missing_id, vec![1, 2, 3]);
@@ -571,6 +595,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(81, &[10, 20, 30]).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.update_contract_state_sync(&contract_id, vec![40, 50, 60]);
         assert!(result.is_ok(), "update should succeed: {:?}", result);
@@ -590,6 +616,8 @@ mod tests {
         let contract_id = *key.id();
         env_holder.contract_store.ensure_key_indexed(&key).unwrap();
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
         assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
@@ -601,6 +629,8 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(90, &[1]).await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let result = env.subscribe_contract_sync(&contract_id);
         assert!(result.is_ok());
@@ -611,6 +641,8 @@ mod tests {
     async fn test_env_subscribe_unknown() {
         let mut env_holder = TestEnv::new().await;
 
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([99u8; 32]);
         let result = env.subscribe_contract_sync(&missing_id);

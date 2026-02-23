@@ -26,7 +26,7 @@ use crate::{
     operations::connect,
 };
 
-use super::OpManager;
+use super::{background_task_monitor::BackgroundTaskMonitor, OpManager};
 
 pub(crate) struct NodeP2P {
     pub(crate) op_manager: Arc<OpManager>,
@@ -46,6 +46,8 @@ pub(crate) struct NodeP2P {
     session_actor_task: JoinHandle<()>,
     result_router_task: JoinHandle<()>,
     op_mediator_task: JoinHandle<()>,
+    /// Monitor for background tasks spawned during node construction (Ring, OpManager, etc.)
+    background_task_monitor: BackgroundTaskMonitor,
 }
 
 impl NodeP2P {
@@ -215,6 +217,10 @@ impl NodeP2P {
             }
         };
 
+        // Monitor background tasks registered during node construction
+        // (Ring maintenance, garbage cleanup, etc.)
+        let background_monitor = self.background_task_monitor.wait_for_any_exit();
+
         let join_task = self.initial_join_task.take();
         let result = crate::deterministic_select! {
             r = f => {
@@ -236,6 +242,11 @@ impl NodeP2P {
             e = infra_monitor => {
                 eprintln!("CRITICAL: Infrastructure task exited: {e}");
                 tracing::error!("Infrastructure task exited: {:?}", e);
+                Err(e)
+            },
+            e = background_monitor => {
+                eprintln!("CRITICAL: Background task exited: {e}");
+                tracing::error!("Background task exited: {:?}", e);
                 Err(e)
             },
         };
@@ -324,6 +335,7 @@ impl NodeP2P {
 
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
+        let background_task_monitor = BackgroundTaskMonitor::new();
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
@@ -332,6 +344,7 @@ impl NodeP2P {
             event_register.clone(),
             connection_manager,
             result_router_tx,
+            &background_task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
 
@@ -430,6 +443,7 @@ impl NodeP2P {
                 session_actor_task,
                 result_router_task,
                 op_mediator_task,
+                background_task_monitor,
             },
             shutdown_tx,
         ))

@@ -933,7 +933,7 @@ mod tests {
                 if stream_clone.is_cancelled() {
                     break;
                 }
-                let _ = stream_clone.push_fragment(i, Bytes::from(format!("frag {}", i)));
+                let _push = stream_clone.push_fragment(i, Bytes::from(format!("frag {}", i)));
                 time_source_clone.sleep(Duration::from_millis(1)).await;
             }
         });
@@ -943,7 +943,7 @@ mod tests {
         stream.cancel();
 
         // Wait for pusher to finish
-        let _ = pusher.await;
+        let _join = pusher.await;
 
         // Stream should be cancelled
         assert!(stream.is_cancelled());

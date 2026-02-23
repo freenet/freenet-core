@@ -203,7 +203,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
 
     let gw_config = gateway_config.build().await?;
     let gateway = async move {
-        let _ = start_gateway_rx.await;
+        let _signal = start_gateway_rx.await;
         info!("Starting gateway...");
 
         let node = NodeConfig::new(gw_config.clone())
@@ -238,7 +238,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
         info!("All operations correctly rejected before join");
 
         info!("Starting gateway...");
-        let _ = start_gateway_tx.send(());
+        drop(start_gateway_tx.send(()));
 
         info!("Waiting for peer to join network (polling with retry)...");
         let contract2 = load_contract("test-contract-integration", vec![1].into())?;

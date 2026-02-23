@@ -232,7 +232,7 @@ mod test {
 
         assert!(f.is_ok());
         // Clean up after test
-        let _ = std::fs::remove_dir_all(&secrets_dir);
+        let _cleanup = std::fs::remove_dir_all(&secrets_dir);
         Ok(())
     }
 }

@@ -61,7 +61,9 @@ where
     // Extract initial params from the request (only ApplicationMessages has params we need)
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        _ => Parameters::from(Vec::new()),
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            Parameters::from(Vec::new())
+        }
     };
 
     let mut current_req = initial_req;
@@ -133,7 +135,9 @@ where
                 OutboundDelegateMsg::SubscribeContractRequest(req) => {
                     subscribe_requests.push(req);
                 }
-                other => {
+                other @ OutboundDelegateMsg::ApplicationMessage(_)
+                | other @ OutboundDelegateMsg::RequestUserInput(_)
+                | other @ OutboundDelegateMsg::ContextUpdated(_) => {
                     // Accumulate non-contract-request messages
                     accumulated_messages.push(other);
                 }
@@ -281,7 +285,14 @@ where
                             // StateAndDelta, RelatedState, RelatedDelta, RelatedStateAndDelta
                             // are not supported because the delegate API doesn't provide the
                             // related contract context needed to resolve them.
-                            other => {
+                            other @ freenet_stdlib::prelude::UpdateData::StateAndDelta {
+                                ..
+                            }
+                            | other @ freenet_stdlib::prelude::UpdateData::RelatedState { .. }
+                            | other @ freenet_stdlib::prelude::UpdateData::RelatedDelta { .. }
+                            | other @ freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
+                                ..
+                            } => {
                                 tracing::warn!(
                                     contract = %contract_id,
                                     variant = ?std::mem::discriminant(&other),
@@ -608,7 +619,12 @@ where
                         Either::Left(WrappedState::from(state.into_bytes()))
                     }
                     freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
-                    _ => unreachable!(),
+                    freenet_stdlib::prelude::UpdateData::StateAndDelta { .. }
+                    | freenet_stdlib::prelude::UpdateData::RelatedState { .. }
+                    | freenet_stdlib::prelude::UpdateData::RelatedDelta { .. }
+                    | freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta { .. } => {
+                        unreachable!()
+                    }
                 };
                 let update_result = contract_handler
                     .executor()
@@ -741,18 +757,20 @@ where
                 summary,
                 subscriber_listener,
             } => {
-                let _ = contract_handler
-                    .executor()
-                    .register_contract_notifier(key, client_id, subscriber_listener, summary)
-                    .inspect_err(|err| {
-                        tracing::warn!(
-                            contract = %key,
-                            client = %client_id,
-                            error = %err,
-                            phase = "registration_failed",
-                            "Error registering subscriber listener"
-                        );
-                    });
+                if let Err(err) = contract_handler.executor().register_contract_notifier(
+                    key,
+                    client_id,
+                    subscriber_listener,
+                    summary,
+                ) {
+                    tracing::warn!(
+                        contract = %key,
+                        client = %client_id,
+                        error = %err,
+                        phase = "registration_failed",
+                        "Error registering subscriber listener"
+                    );
+                }
 
                 // FIXME: if there is an error send actually an error back
                 // If the caller disconnected, just log and continue.
@@ -793,9 +811,12 @@ where
                     network_subscriptions: vec![], // Contract handler only tracks application subscriptions
                     connected_peers: connections,
                 };
-                let _ = callback
+                if let Err(e) = callback
                     .send(crate::message::QueryResult::NetworkDebug(network_debug))
-                    .await;
+                    .await
+                {
+                    tracing::debug!(error = %e, "failed to send network debug info via callback");
+                }
 
                 // If the caller disconnected, just log and continue.
                 if let Err(error) = contract_handler
@@ -854,7 +875,18 @@ where
                 contract_handler.executor().remove_client(client_id);
                 contract_handler.channel().drop_waiting_response(id);
             }
-            _ => unreachable!("response events should not be received by the handler"),
+            ContractHandlerEvent::DelegateResponse(_)
+            | ContractHandlerEvent::PutResponse { .. }
+            | ContractHandlerEvent::GetResponse { .. }
+            | ContractHandlerEvent::UpdateResponse { .. }
+            | ContractHandlerEvent::UpdateNoChange { .. }
+            | ContractHandlerEvent::RegisterSubscriberListenerResponse
+            | ContractHandlerEvent::QuerySubscriptionsResponse
+            | ContractHandlerEvent::GetSummaryResponse { .. }
+            | ContractHandlerEvent::GetDeltaResponse { .. }
+            | ContractHandlerEvent::NotifySubscriptionErrorResponse => {
+                unreachable!("response events should not be received by the handler")
+            }
         }
     }
 }

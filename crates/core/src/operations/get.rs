@@ -39,13 +39,13 @@ pub(crate) fn start_op(
     let contract_location = Location::from(&instance_id);
     let id = Transaction::new::<GetMsg>();
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location})");
-    let state = Some(GetState::PrepareRequest {
+    let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
         fetch_contract,
         subscribe,
         blocking_subscribe,
-    });
+    }));
     GetOp {
         id,
         state,
@@ -71,13 +71,13 @@ pub(crate) fn start_op_with_id(
 ) -> GetOp {
     let contract_location = Location::from(&instance_id);
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location}) with existing transaction ID");
-    let state = Some(GetState::PrepareRequest {
+    let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
         fetch_contract,
         subscribe,
         blocking_subscribe,
-    });
+    }));
     GetOp {
         id,
         state,
@@ -100,15 +100,13 @@ pub(crate) async fn request_get(
     visited: super::VisitedPeers,
 ) -> Result<(), OpError> {
     let (mut candidates, id, instance_id_val, _fetch_contract, local_fallback) = if let Some(
-        GetState::PrepareRequest {
-            instance_id,
-            id,
-            fetch_contract,
-            ..
-        },
+        GetState::PrepareRequest(data),
     ) =
         &get_op.state
     {
+        let instance_id = &data.instance_id;
+        let id = &data.id;
+        let fetch_contract = &data.fetch_contract;
         // Check local storage to have a fallback, but prefer network for freshness.
         // This implements "network first, local fallback" to ensure we get the latest
         // version of contracts rather than serving potentially stale cached data.
@@ -167,7 +165,7 @@ pub(crate) async fn request_get(
 
                 let completed_op = GetOp {
                     id: *id,
-                    state: Some(GetState::Finished { key }),
+                    state: Some(GetState::Finished(FinishedData { key })),
                     result: Some(GetResult {
                         key,
                         state,
@@ -225,19 +223,15 @@ pub(crate) async fn request_get(
     );
 
     match get_op.state {
-        Some(GetState::PrepareRequest {
-            fetch_contract,
-            instance_id: _,
-            id: _,
-            subscribe,
-            blocking_subscribe,
-        }) => {
+        Some(GetState::PrepareRequest(data)) => {
+            let (fetch_contract, subscribe, blocking_subscribe) =
+                (data.fetch_contract, data.subscribe, data.blocking_subscribe);
             let mut tried_peers = HashSet::new();
             if let Some(addr) = target.socket_addr() {
                 tried_peers.insert(addr);
             }
 
-            let new_state = Some(GetState::AwaitingResponse {
+            let new_state = Some(GetState::AwaitingResponse(AwaitingResponseData {
                 instance_id: instance_id_val,
                 retries: 0,
                 fetch_contract,
@@ -250,7 +244,7 @@ pub(crate) async fn request_get(
                 alternatives: candidates,
                 attempts_at_hop: 1,
                 visited: visited.clone(),
-            });
+            }));
 
             let msg = GetMsg::Request {
                 id,
@@ -292,6 +286,107 @@ pub(crate) async fn request_get(
     Ok(())
 }
 
+// ── Type-state data structs ──────────────────────────────────────────────
+//
+// Each state in the GET state machine is a named struct with typed
+// transition methods.  This gives compile-time guarantees:
+//
+//   ReceivedRequest ── (no transition methods, next state depends on message)
+//   PrepareRequest ── into_awaiting_response() ──► AwaitingResponse
+//   AwaitingResponse ── into_finished()         ──► Finished
+//                    ── with_retry_peer()        ──► AwaitingResponse (retry at same hop)
+//                    ── with_next_hop()           ──► AwaitingResponse (advance to next hop)
+//
+// Invalid transitions (e.g. Finished → PrepareRequest) are unrepresentable
+// because the target type simply has no such method.
+
+/// Data for the PrepareRequest state: originator preparing GET request.
+#[derive(Debug)]
+struct PrepareRequestData {
+    instance_id: ContractInstanceId,
+    id: Transaction,
+    fetch_contract: bool,
+    subscribe: bool,
+    blocking_subscribe: bool,
+}
+
+impl PrepareRequestData {
+    /// Transition to AwaitingResponse after sending the GET request.
+    ///
+    /// Encodes valid transition: PrepareRequest → AwaitingResponse.
+    /// Carries forward instance_id, fetch_contract, subscribe, blocking_subscribe.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern
+    fn into_awaiting_response(
+        self,
+        requester: Option<PeerKeyLocation>,
+        next_hop: PeerKeyLocation,
+        alternatives: Vec<PeerKeyLocation>,
+        visited: super::VisitedPeers,
+    ) -> AwaitingResponseData {
+        AwaitingResponseData {
+            instance_id: self.instance_id,
+            requester,
+            fetch_contract: self.fetch_contract,
+            retries: 0,
+            current_hop: 0,
+            subscribe: self.subscribe,
+            blocking_subscribe: self.blocking_subscribe,
+            next_hop,
+            tried_peers: HashSet::new(),
+            alternatives,
+            attempts_at_hop: 0,
+            visited,
+        }
+    }
+}
+
+/// Data for the AwaitingResponse state: request sent, waiting for downstream peer.
+///
+/// This is the most complex state, tracking retry logic across multiple hops.
+#[derive(Debug)]
+struct AwaitingResponseData {
+    /// Contract being fetched (by instance_id since we may not have full key yet)
+    instance_id: ContractInstanceId,
+    /// If specified the peer waiting for the response upstream
+    requester: Option<PeerKeyLocation>,
+    fetch_contract: bool,
+    retries: usize,
+    current_hop: usize,
+    subscribe: bool,
+    blocking_subscribe: bool,
+    /// Peer we are currently trying to reach.
+    /// Note: With connection-based routing, this is only used for state tracking,
+    /// not for response routing (which uses upstream_addr instead).
+    #[allow(dead_code)]
+    next_hop: PeerKeyLocation,
+    /// Peers we've already tried at this hop level
+    tried_peers: HashSet<std::net::SocketAddr>,
+    /// Alternative peers we could still try at this hop
+    alternatives: Vec<PeerKeyLocation>,
+    /// How many peers we've tried at this hop
+    attempts_at_hop: usize,
+    /// Bloom filter tracking visited peers across all hops
+    visited: super::VisitedPeers,
+}
+
+impl AwaitingResponseData {
+    /// Transition to Finished on successful GET response.
+    ///
+    /// Encodes valid transition: AwaitingResponse → Finished.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern
+    fn into_finished(self, key: ContractKey) -> FinishedData {
+        FinishedData { key }
+    }
+}
+
+/// Data for the Finished state: GET operation completed successfully.
+#[derive(Debug, Clone, Copy)]
+struct FinishedData {
+    key: ContractKey,
+}
+
+// ── State enum (wraps the typed structs) ─────────────────────────────────
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum GetState {
@@ -299,69 +394,32 @@ enum GetState {
     /// Note: We use GetOp::upstream_addr for response routing (not PeerKeyLocation).
     ReceivedRequest,
     /// Preparing request for get op.
-    PrepareRequest {
-        instance_id: ContractInstanceId,
-        id: Transaction,
-        fetch_contract: bool,
-        subscribe: bool,
-        blocking_subscribe: bool,
-    },
+    PrepareRequest(PrepareRequestData),
     /// Awaiting response from petition.
-    AwaitingResponse {
-        /// Contract being fetched (by instance_id since we may not have full key yet)
-        instance_id: ContractInstanceId,
-        /// If specified the peer waiting for the response upstream
-        requester: Option<PeerKeyLocation>,
-        fetch_contract: bool,
-        retries: usize,
-        current_hop: usize,
-        subscribe: bool,
-        blocking_subscribe: bool,
-        /// Peer we are currently trying to reach.
-        /// Note: With connection-based routing, this is only used for state tracking,
-        /// not for response routing (which uses upstream_addr instead).
-        #[allow(dead_code)]
-        next_hop: PeerKeyLocation,
-        /// Peers we've already tried at this hop level
-        tried_peers: HashSet<std::net::SocketAddr>,
-        /// Alternative peers we could still try at this hop
-        alternatives: Vec<PeerKeyLocation>,
-        /// How many peers we've tried at this hop
-        attempts_at_hop: usize,
-        /// Bloom filter tracking visited peers across all hops
-        visited: super::VisitedPeers,
-    },
+    AwaitingResponse(AwaitingResponseData),
     /// Operation completed successfully
-    Finished { key: ContractKey },
+    Finished(FinishedData),
 }
 
 impl Display for GetState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GetState::ReceivedRequest => write!(f, "ReceivedRequest"),
-            GetState::PrepareRequest {
-                instance_id,
-                id,
-                fetch_contract,
-                subscribe,
-                ..
-            } => {
+            GetState::PrepareRequest(data) => {
                 write!(
                     f,
-                    "PrepareRequest(instance_id: {instance_id}, id: {id}, fetch_contract: {fetch_contract}, subscribe: {subscribe})"
+                    "PrepareRequest(instance_id: {}, id: {}, fetch_contract: {}, subscribe: {})",
+                    data.instance_id, data.id, data.fetch_contract, data.subscribe
                 )
             }
-            GetState::AwaitingResponse {
-                requester,
-                fetch_contract,
-                retries,
-                current_hop,
-                subscribe,
-                ..
-            } => {
-                write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
+            GetState::AwaitingResponse(data) => {
+                write!(
+                    f,
+                    "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {}, subscribe: {})",
+                    data.requester, data.fetch_contract, data.retries, data.current_hop, data.subscribe
+                )
             }
-            GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
+            GetState::Finished(data) => write!(f, "Finished(key: {})", data.key),
         }
     }
 }
@@ -481,7 +539,7 @@ impl GetOp {
 
     /// Handle aborted outbound connections by directly retrying with alternative peers.
     pub(crate) async fn handle_abort(mut self, op_manager: &OpManager) -> Result<(), OpError> {
-        if let Some(GetState::AwaitingResponse {
+        if let Some(GetState::AwaitingResponse(AwaitingResponseData {
             instance_id,
             requester,
             fetch_contract,
@@ -494,7 +552,7 @@ impl GetOp {
             mut alternatives,
             attempts_at_hop,
             visited,
-        }) = self.state.take()
+        })) = self.state.take()
         {
             // Mark the failed peer as tried
             if let Some(addr) = failed_peer.socket_addr() {
@@ -516,7 +574,7 @@ impl GetOp {
                     tried_peers.insert(addr);
                 }
 
-                let new_state = Some(GetState::AwaitingResponse {
+                let new_state = Some(GetState::AwaitingResponse(AwaitingResponseData {
                     instance_id,
                     requester,
                     fetch_contract,
@@ -529,7 +587,7 @@ impl GetOp {
                     alternatives,
                     attempts_at_hop: attempts_at_hop + 1,
                     visited: visited.clone(),
-                });
+                }));
 
                 let msg = GetMsg::Request {
                     id: self.id,
@@ -582,7 +640,7 @@ impl GetOp {
                         new_tried_peers.insert(addr);
                     }
 
-                    let new_state = Some(GetState::AwaitingResponse {
+                    let new_state = Some(GetState::AwaitingResponse(AwaitingResponseData {
                         instance_id,
                         requester,
                         fetch_contract,
@@ -595,7 +653,7 @@ impl GetOp {
                         alternatives: new_candidates,
                         attempts_at_hop: 1,
                         visited: new_visited.clone(),
-                    });
+                    }));
 
                     let msg = GetMsg::Request {
                         id: self.id,
@@ -633,7 +691,7 @@ impl GetOp {
 
                 let completed_op = GetOp {
                     id: self.id,
-                    state: Some(GetState::Finished { key }),
+                    state: Some(GetState::Finished(FinishedData { key })),
                     result: Some(GetResult {
                         key,
                         state,
@@ -720,7 +778,7 @@ impl GetOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
+        self.result.is_some() && matches!(self.state, Some(GetState::Finished(_)))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -747,7 +805,7 @@ impl GetOp {
     /// an outbound message. Used for hop-by-hop routing.
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(GetState::AwaitingResponse { next_hop, .. }) => next_hop.socket_addr(),
+            Some(GetState::AwaitingResponse(data)) => data.next_hop.socket_addr(),
             _ => None,
         }
     }
@@ -756,7 +814,7 @@ impl GetOp {
     /// Returns None if the operation is not in AwaitingResponse state.
     pub(crate) fn get_current_hop(&self) -> Option<usize> {
         match &self.state {
-            Some(GetState::AwaitingResponse { current_hop, .. }) => Some(*current_hop),
+            Some(GetState::AwaitingResponse(data)) => Some(data.current_hop),
             _ => None,
         }
     }
@@ -781,7 +839,9 @@ impl Operation for GetOp {
                 // was an existing operation, other peer messaged back
             }
             Ok(Some(op)) => {
-                let _ = op_manager.push(tx, op).await;
+                if let Err(e) = op_manager.push(tx, op).await {
+                    tracing::warn!(tx = %tx, error = %e, "failed to push mismatched op back");
+                }
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
@@ -889,7 +949,7 @@ impl Operation for GetOp {
                     let sender = sender_from_addr.clone();
 
                     // Check if operation is already completed
-                    if matches!(self.state, Some(GetState::Finished { .. })) {
+                    if matches!(self.state, Some(GetState::Finished(_))) {
                         tracing::debug!(
                             tx = %id,
                             "GET: Request received for already completed operation, ignoring duplicate request"
@@ -925,8 +985,7 @@ impl Operation for GetOp {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
                             self.state,
-                            Some(GetState::ReceivedRequest)
-                                | Some(GetState::AwaitingResponse { .. })
+                            Some(GetState::ReceivedRequest) | Some(GetState::AwaitingResponse(_))
                         ));
                         tracing::debug!(
                             tx = %id,
@@ -1086,7 +1145,7 @@ impl Operation for GetOp {
                                         });
                                     }
                                 }
-                                Some(GetState::AwaitingResponse { .. })
+                                Some(GetState::AwaitingResponse(_))
                                     if self.upstream_addr.is_some() =>
                                 {
                                     // Forward contract to upstream
@@ -1140,15 +1199,16 @@ impl Operation for GetOp {
                                         });
                                     }
                                 }
-                                Some(GetState::AwaitingResponse {
-                                    requester: None, ..
-                                }) => {
+                                Some(GetState::AwaitingResponse(AwaitingResponseData {
+                                    requester: None,
+                                    ..
+                                })) => {
                                     // Operation completed for original requester
                                     tracing::debug!(
                                         tx = %id,
                                         "Completed operation, get response received for contract {key}"
                                     );
-                                    new_state = Some(GetState::Finished { key });
+                                    new_state = Some(GetState::Finished(FinishedData { key }));
                                     return_msg = None;
                                     result = Some(GetResult {
                                         key,
@@ -1158,7 +1218,7 @@ impl Operation for GetOp {
                                 }
                                 _ => {
                                     // This is the original requester (locally initiated request)
-                                    new_state = Some(GetState::Finished { key });
+                                    new_state = Some(GetState::Finished(FinishedData { key }));
                                     return_msg = None;
                                     result = Some(GetResult {
                                         key,
@@ -1223,7 +1283,7 @@ impl Operation for GetOp {
                     );
 
                     match self.state {
-                        Some(GetState::AwaitingResponse {
+                        Some(GetState::AwaitingResponse(AwaitingResponseData {
                             fetch_contract,
                             retries,
                             requester,
@@ -1237,7 +1297,7 @@ impl Operation for GetOp {
                             visited,
                             instance_id: state_instance_id,
                             ..
-                        }) => {
+                        })) => {
                             // Use instance_id from state for consistency
                             let instance_id = state_instance_id;
 
@@ -1277,23 +1337,24 @@ impl Operation for GetOp {
                                     tried_peers.insert(addr);
                                 }
                                 let updated_tried_peers = tried_peers.clone();
-                                new_state = Some(GetState::AwaitingResponse {
-                                    retries,
-                                    fetch_contract,
-                                    requester: requester.clone(),
-                                    current_hop,
-                                    subscribe,
-                                    blocking_subscribe,
-                                    tried_peers: updated_tried_peers.clone(),
-                                    alternatives,
-                                    attempts_at_hop: attempts_at_hop + 1,
-                                    instance_id,
-                                    next_hop: next_target,
-                                    // Preserve the accumulated visited so future candidate
-                                    // selection still avoids already-specified peers; tried_peers
-                                    // tracks attempts at this hop.
-                                    visited: visited.clone(),
-                                });
+                                new_state =
+                                    Some(GetState::AwaitingResponse(AwaitingResponseData {
+                                        retries,
+                                        fetch_contract,
+                                        requester: requester.clone(),
+                                        current_hop,
+                                        subscribe,
+                                        blocking_subscribe,
+                                        tried_peers: updated_tried_peers.clone(),
+                                        alternatives,
+                                        attempts_at_hop: attempts_at_hop + 1,
+                                        instance_id,
+                                        next_hop: next_target,
+                                        // Preserve the accumulated visited so future candidate
+                                        // selection still avoids already-specified peers; tried_peers
+                                        // tracks attempts at this hop.
+                                        visited: visited.clone(),
+                                    }));
                             } else if retries < MAX_RETRIES {
                                 // No more alternatives at this hop, try finding new peers
                                 let mut new_visited = visited.clone();
@@ -1337,20 +1398,21 @@ impl Operation for GetOp {
                                         new_tried_peers.insert(addr);
                                     }
 
-                                    new_state = Some(GetState::AwaitingResponse {
-                                        retries: retries + 1,
-                                        fetch_contract,
-                                        requester: requester.clone(),
-                                        current_hop,
-                                        subscribe,
-                                        blocking_subscribe,
-                                        tried_peers: new_tried_peers,
-                                        alternatives: new_candidates,
-                                        attempts_at_hop: 1,
-                                        instance_id,
-                                        next_hop: target,
-                                        visited: new_visited.clone(),
-                                    });
+                                    new_state =
+                                        Some(GetState::AwaitingResponse(AwaitingResponseData {
+                                            retries: retries + 1,
+                                            fetch_contract,
+                                            requester: requester.clone(),
+                                            current_hop,
+                                            subscribe,
+                                            blocking_subscribe,
+                                            tried_peers: new_tried_peers,
+                                            alternatives: new_candidates,
+                                            attempts_at_hop: 1,
+                                            instance_id,
+                                            next_hop: target,
+                                            visited: new_visited.clone(),
+                                        }));
                                 } else if let Some(requester_peer) = requester.clone() {
                                     // No more peers to try, return NotFound to requester
                                     tracing::warn!(
@@ -1379,7 +1441,7 @@ impl Operation for GetOp {
                                         );
 
                                         // Complete with local cached version
-                                        new_state = Some(GetState::Finished { key });
+                                        new_state = Some(GetState::Finished(FinishedData { key }));
                                         return_msg = None;
                                         result = Some(GetResult {
                                             key,
@@ -1494,7 +1556,7 @@ impl Operation for GetOp {
                                         );
 
                                         // Complete with local cached version
-                                        new_state = Some(GetState::Finished { key });
+                                        new_state = Some(GetState::Finished(FinishedData { key }));
                                         return_msg = None;
                                         result = Some(GetResult {
                                             key,
@@ -1607,23 +1669,19 @@ impl Operation for GetOp {
                     // Check if contract is required
                     let require_contract = matches!(
                         self.state,
-                        Some(GetState::AwaitingResponse {
+                        Some(GetState::AwaitingResponse(AwaitingResponseData {
                             fetch_contract: true,
                             ..
-                        })
+                        }))
                     );
 
                     // Get requester and current_hop from current state
-                    let (requester, current_hop) = if let Some(GetState::AwaitingResponse {
-                        requester,
-                        current_hop,
-                        ..
-                    }) = self.state.as_ref()
-                    {
-                        (requester.clone(), Some(*current_hop))
-                    } else {
-                        return Err(OpError::UnexpectedOpState);
-                    };
+                    let (requester, current_hop) =
+                        if let Some(GetState::AwaitingResponse(data)) = self.state.as_ref() {
+                            (data.requester.clone(), Some(data.current_hop))
+                        } else {
+                            return Err(OpError::UnexpectedOpState);
+                        };
 
                     // Handle case where contract is required but not provided
                     if require_contract && contract.is_none() {
@@ -1670,13 +1728,8 @@ impl Operation for GetOp {
 
                     // Check if subscription was requested
                     let (subscribe_requested, blocking_sub) =
-                        if let Some(GetState::AwaitingResponse {
-                            subscribe,
-                            blocking_subscribe,
-                            ..
-                        }) = &self.state
-                        {
-                            (*subscribe, *blocking_subscribe)
+                        if let Some(GetState::AwaitingResponse(data)) = &self.state {
+                            (data.subscribe, data.blocking_subscribe)
                         } else {
                             (false, false)
                         };
@@ -1882,7 +1935,7 @@ impl Operation for GetOp {
                                         // Don't return error - the GET succeeded, caching is optional
                                         // Continue to process the GET result below
                                     }
-                                    _ => unreachable!(
+                                    ContractHandlerEvent::DelegateRequest { .. } | ContractHandlerEvent::DelegateResponse(_) | ContractHandlerEvent::PutQuery { .. } | ContractHandlerEvent::GetQuery { .. } | ContractHandlerEvent::GetResponse { .. } | ContractHandlerEvent::UpdateQuery { .. } | ContractHandlerEvent::UpdateResponse { .. } | ContractHandlerEvent::UpdateNoChange { .. } | ContractHandlerEvent::RegisterSubscriberListener { .. } | ContractHandlerEvent::RegisterSubscriberListenerResponse | ContractHandlerEvent::QuerySubscriptions { .. } | ContractHandlerEvent::QuerySubscriptionsResponse | ContractHandlerEvent::GetSummaryQuery { .. } | ContractHandlerEvent::GetSummaryResponse { .. } | ContractHandlerEvent::GetDeltaQuery { .. } | ContractHandlerEvent::GetDeltaResponse { .. } | ContractHandlerEvent::NotifySubscriptionError { .. } | ContractHandlerEvent::NotifySubscriptionErrorResponse | ContractHandlerEvent::ClientDisconnect { .. } => unreachable!(
                                         "PutQuery from Get operation should always return PutResponse"
                                     ),
                                 }
@@ -1908,8 +1961,7 @@ impl Operation for GetOp {
                     // Use upstream_addr for routing decision (not requester which can fail for transient connections)
                     // First validate we're in an expected state
                     match &self.state {
-                        Some(GetState::AwaitingResponse { .. })
-                        | Some(GetState::ReceivedRequest) => {}
+                        Some(GetState::AwaitingResponse(_)) | Some(GetState::ReceivedRequest) => {}
                         Some(other) => {
                             // Can't take ownership, so format the state for error reporting
                             return Err(OpError::invalid_transition_with_state(
@@ -1942,7 +1994,7 @@ impl Operation for GetOp {
                             }
                         }
 
-                        new_state = Some(GetState::Finished { key });
+                        new_state = Some(GetState::Finished(FinishedData { key }));
                         return_msg = None;
                         result = Some(GetResult {
                             key,
@@ -2066,7 +2118,7 @@ impl Operation for GetOp {
                             // permanently lose the operation state, preventing subsequent
                             // ResponseStreaming from being matched to the operation.
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Get(GetOp {
@@ -2078,7 +2130,10 @@ impl Operation for GetOp {
                                             local_fallback,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push GET op state back after dedup");
+                                }
                             }
                             return Err(OpError::OpNotPresent(id));
                         }
@@ -2091,7 +2146,7 @@ impl Operation for GetOp {
                             );
                             // Push the operation state back to prevent loss
                             if self.state.is_some() {
-                                let _ = op_manager
+                                if let Err(e) = op_manager
                                     .push(
                                         id,
                                         OpEnum::Get(GetOp {
@@ -2103,7 +2158,10 @@ impl Operation for GetOp {
                                             local_fallback,
                                         }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(tx = %id, error = %e, "failed to push GET op state back after orphan claim failure");
+                                }
                             }
                             return Err(OpError::OrphanStreamClaimFailed);
                         }
@@ -2226,12 +2284,12 @@ impl Operation for GetOp {
                     let value = payload.value;
 
                     // Get current hop for telemetry
-                    let current_hop =
-                        if let Some(GetState::AwaitingResponse { current_hop, .. }) = &self.state {
-                            Some(*current_hop)
-                        } else {
-                            None
-                        };
+                    let current_hop = if let Some(GetState::AwaitingResponse(data)) = &self.state {
+                        let current_hop = &data.current_hop;
+                        Some(*current_hop)
+                    } else {
+                        None
+                    };
 
                     // Step 5: Cache the contract locally (same as regular Response)
                     if let Some(state) = &value.state {
@@ -2246,14 +2304,17 @@ impl Operation for GetOp {
 
                         if !already_hosting {
                             // Use put_query to cache the contract
-                            let _ = op_manager
+                            if let Err(e) = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
                                     state: state.clone(),
                                     related_contracts: RelatedContracts::default(),
                                     contract: contract_to_cache,
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
+                            }
                         }
 
                         // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
@@ -2304,7 +2365,7 @@ impl Operation for GetOp {
                             state,
                             contract: value.contract,
                         });
-                        new_state = Some(GetState::Finished { key });
+                        new_state = Some(GetState::Finished(FinishedData { key }));
                         return_msg = None;
                     } else if piping_started {
                         // Piping is already underway - no need to send return_msg
@@ -2385,8 +2446,8 @@ fn build_op_result(
         (Some(GetMsg::Response { .. }) | Some(GetMsg::ResponseStreaming { .. }), _) => {
             upstream_addr
         }
-        (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse { next_hop, .. })) => {
-            next_hop.socket_addr()
+        (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse(data))) => {
+            data.next_hop.socket_addr()
         }
         _ => None,
     };
@@ -2399,11 +2460,22 @@ fn build_op_result(
         upstream_addr,
         local_fallback: None, // Forwarding operations don't have local fallback
     });
-    Ok(OperationResult {
-        return_msg: msg.map(NetMessage::from),
-        next_hop,
-        state: output_op.map(OpEnum::Get),
-        stream_data,
+    let return_msg = msg.map(NetMessage::from);
+    let op_state = output_op.map(OpEnum::Get);
+    Ok(match (return_msg, op_state) {
+        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
+            msg,
+            next_hop,
+            state,
+            stream_data,
+        },
+        (Some(msg), None) => OperationResult::SendAndComplete {
+            msg,
+            next_hop,
+            stream_data,
+        },
+        (None, Some(state)) => OperationResult::ContinueOp(state),
+        (None, None) => OperationResult::Completed,
     })
 }
 
@@ -2481,7 +2553,7 @@ async fn try_forward_or_return(
         // applies to the originator node.
         build_op_result(
             id,
-            Some(GetState::AwaitingResponse {
+            Some(GetState::AwaitingResponse(AwaitingResponseData {
                 instance_id,
                 requester: sender,
                 retries: 0,
@@ -2494,7 +2566,7 @@ async fn try_forward_or_return(
                 alternatives,
                 attempts_at_hop: 1,
                 visited: new_visited.clone(),
-            }),
+            })),
             Some(GetMsg::Request {
                 id,
                 instance_id,
@@ -2544,7 +2616,7 @@ async fn try_forward_or_return(
 
 impl IsOperationCompleted for GetOp {
     fn is_completed(&self) -> bool {
-        matches!(self.state, Some(GetState::Finished { .. }))
+        matches!(self.state, Some(GetState::Finished(_)))
     }
 }
 
@@ -2730,7 +2802,7 @@ mod tests {
             state: WrappedState::new(vec![1, 2, 3]),
             contract: None,
         };
-        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), Some(result));
         assert!(
             op.finalized(),
             "GetOp should be finalized when state is Finished and result is present"
@@ -2740,7 +2812,7 @@ mod tests {
     #[test]
     fn get_op_not_finalized_when_finished_without_result() {
         let key = make_contract_key(1);
-        let op = make_get_op(Some(GetState::Finished { key }), None);
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), None);
         assert!(
             !op.finalized(),
             "GetOp should not be finalized when state is Finished but result is None"
@@ -2775,7 +2847,7 @@ mod tests {
             state: state_data.clone(),
             contract: None,
         };
-        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), Some(result));
         let host_result = op.to_host_result();
 
         assert!(
@@ -2817,7 +2889,7 @@ mod tests {
             state: WrappedState::new(vec![]),
             contract: None,
         };
-        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), Some(result));
         let outcome = op.outcome();
 
         assert!(matches!(outcome, OpOutcome::Incomplete));
@@ -2867,9 +2939,9 @@ mod tests {
 
     #[test]
     fn get_state_display_finished() {
-        let state = GetState::Finished {
+        let state = GetState::Finished(FinishedData {
             key: make_contract_key(1),
-        };
+        });
         let display = format!("{}", state);
         assert!(
             display.contains("Finished"),
@@ -3008,9 +3080,8 @@ mod tests {
         let instance_id = ContractInstanceId::new([1u8; 32]);
         let op = start_op(instance_id, true, true, true);
         match op.state {
-            Some(GetState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(GetState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     blocking_subscribe,
                     "blocking_subscribe should be true in PrepareRequest"
@@ -3026,9 +3097,8 @@ mod tests {
         let tx = Transaction::new::<GetMsg>();
         let op = start_op_with_id(instance_id, true, true, true, tx);
         match op.state {
-            Some(GetState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(GetState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     blocking_subscribe,
                     "blocking_subscribe should be true in PrepareRequest via start_op_with_id"
@@ -3043,9 +3113,8 @@ mod tests {
         let instance_id = ContractInstanceId::new([1u8; 32]);
         let op = start_op(instance_id, true, true, false);
         match op.state {
-            Some(GetState::PrepareRequest {
-                blocking_subscribe, ..
-            }) => {
+            Some(GetState::PrepareRequest(data)) => {
+                let blocking_subscribe = data.blocking_subscribe;
                 assert!(
                     !blocking_subscribe,
                     "blocking_subscribe should be false by default"
@@ -3144,9 +3213,9 @@ mod tests {
         // Result present, target_peer set, first_response_time has start but no end
         let op = GetOp {
             id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::Finished {
+            state: Some(GetState::Finished(FinishedData {
                 key: make_contract_key(1),
-            }),
+            })),
             result: Some(GetResult {
                 key: make_contract_key(1),
                 state: WrappedState::new(vec![1, 2, 3]),
@@ -3184,9 +3253,9 @@ mod tests {
 
         let op = GetOp {
             id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::Finished {
+            state: Some(GetState::Finished(FinishedData {
                 key: make_contract_key(1),
-            }),
+            })),
             result: Some(GetResult {
                 key: make_contract_key(1),
                 state: WrappedState::new(vec![1, 2, 3]),
@@ -3219,9 +3288,9 @@ mod tests {
     fn test_get_outcome_incomplete_result_no_peer() {
         let op = GetOp {
             id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::Finished {
+            state: Some(GetState::Finished(FinishedData {
                 key: make_contract_key(1),
-            }),
+            })),
             result: Some(GetResult {
                 key: make_contract_key(1),
                 state: WrappedState::new(vec![1, 2, 3]),

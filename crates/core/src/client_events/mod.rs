@@ -558,7 +558,9 @@ impl From<crate::ring::RingError> for Error {
     fn from(err: crate::ring::RingError) -> Self {
         match err {
             crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
-            other => Error::Node(other.to_string()),
+            other @ crate::ring::RingError::ConnError(_)
+            | other @ crate::ring::RingError::EmptyRing
+            | other @ crate::ring::RingError::NoCachingPeers(_) => Error::Node(other.to_string()),
         }
     }
 }
@@ -1781,7 +1783,7 @@ async fn process_open_request(
             ClientRequest::Close => {
                 return Err(Error::Disconnected);
             }
-            _ => {
+            ClientRequest::Authenticate { .. } | _ => {
                 tracing::error!(
                     client_id = %client_id,
                     request_id = %request_id,
@@ -1946,7 +1948,13 @@ pub(crate) mod test {
                     self.subscription_receivers.push(rx);
                     Some(tx)
                 }
-                _ => None,
+                ClientRequest::DelegateOp(_)
+                | ClientRequest::ContractOp(_)
+                | ClientRequest::Disconnect { .. }
+                | ClientRequest::Authenticate { .. }
+                | ClientRequest::NodeQueries(_)
+                | ClientRequest::Close
+                | _ => None,
             };
             OpenRequest {
                 client_id: ClientId::FIRST,

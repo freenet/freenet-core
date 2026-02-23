@@ -79,24 +79,89 @@ async fn fetch_contract_if_missing(
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
 
+// ── Type-state data structs ──────────────────────────────────────────────
+//
+// Each state in the subscribe state machine is a named struct with typed
+// transition methods.  This gives compile-time guarantees:
+//
+//   PrepareRequest ──┬── into_awaiting_response() ──► AwaitingResponse
+//                    └── into_completed()          ──► Completed
+//   AwaitingResponse ── into_completed()           ──► Completed
+//
+// Invalid transitions (e.g. Completed → PrepareRequest) are unrepresentable
+// because the target type simply has no such method.
+
+/// Data for the PrepareRequest state: operation is being prepared for network dispatch.
+#[derive(Debug)]
+struct PrepareRequestData {
+    id: Transaction,
+    instance_id: ContractInstanceId,
+    is_renewal: bool,
+}
+
+impl PrepareRequestData {
+    /// Transition to AwaitingResponse after sending the subscribe request.
+    ///
+    /// Encodes valid transition: PrepareRequest → AwaitingResponse.
+    /// The instance_id is carried forward automatically.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
+    fn into_awaiting_response(
+        self,
+        next_hop: Option<std::net::SocketAddr>,
+    ) -> AwaitingResponseData {
+        AwaitingResponseData {
+            next_hop,
+            instance_id: self.instance_id,
+        }
+    }
+
+    /// Transition directly to Completed when the contract is available locally
+    /// and no network forwarding is needed.
+    ///
+    /// Encodes valid transition: PrepareRequest → Completed (local-only path).
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
+    fn into_completed(self, key: ContractKey) -> CompletedData {
+        CompletedData { key }
+    }
+}
+
+/// Data for the AwaitingResponse state: request dispatched, waiting for peer response.
+#[derive(Debug)]
+struct AwaitingResponseData {
+    /// The target we're sending to (for hop-by-hop routing)
+    next_hop: Option<std::net::SocketAddr>,
+    /// The contract being subscribed to (needed for error notification on abort)
+    instance_id: ContractInstanceId,
+}
+
+impl AwaitingResponseData {
+    /// Transition to Completed on successful subscription response.
+    ///
+    /// Encodes valid transition: AwaitingResponse → Completed.
+    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
+    fn into_completed(self, key: ContractKey) -> CompletedData {
+        CompletedData { key }
+    }
+}
+
+/// Data for the Completed state: subscription was successfully established.
+#[derive(Debug, Clone, Copy)]
+struct CompletedData {
+    key: ContractKey,
+}
+
+// ── State enum (wraps the typed structs) ─────────────────────────────────
+
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
-    PrepareRequest {
-        id: Transaction,
-        instance_id: ContractInstanceId,
-        /// Whether this is a renewal (requester already has contract).
-        is_renewal: bool,
-    },
+    PrepareRequest(PrepareRequestData),
     /// Awaiting response from downstream peer.
-    AwaitingResponse {
-        /// The target we're sending to (for hop-by-hop routing)
-        next_hop: Option<std::net::SocketAddr>,
-        /// The contract being subscribed to (needed for error notification on abort)
-        instance_id: ContractInstanceId,
-    },
-    /// Subscription completed.
-    Completed { key: ContractKey },
+    AwaitingResponse(AwaitingResponseData),
+    /// Subscription completed successfully.
+    Completed(CompletedData),
+    /// The operation failed — contract not found and not available locally.
+    Failed,
 }
 
 pub(crate) struct SubscribeResult {}
@@ -105,7 +170,7 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
     fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        if let Some(SubscribeState::Completed { .. }) = value.state {
+        if let SubscribeState::Completed(_) = value.state {
             Ok(SubscribeResult {})
         } else {
             Err(OpError::UnexpectedOpState)
@@ -119,14 +184,13 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
 /// If true, the responder will skip sending state to save bandwidth.
 pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
-    let state = Some(SubscribeState::PrepareRequest {
-        id,
-        instance_id,
-        is_renewal,
-    });
     SubscribeOp {
         id,
-        state,
+        state: SubscribeState::PrepareRequest(PrepareRequestData {
+            id,
+            instance_id,
+            is_renewal,
+        }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
@@ -140,14 +204,13 @@ pub(crate) fn start_op_with_id(
     id: Transaction,
     is_renewal: bool,
 ) -> SubscribeOp {
-    let state = Some(SubscribeState::PrepareRequest {
-        id,
-        instance_id,
-        is_renewal,
-    });
     SubscribeOp {
         id,
-        state,
+        state: SubscribeState::PrepareRequest(PrepareRequestData {
+            id,
+            instance_id,
+            is_renewal,
+        }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
@@ -169,15 +232,12 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let Some(SubscribeState::PrepareRequest {
-        id,
-        instance_id,
-        is_renewal,
-    }) = &sub_op.state
-    else {
+    let SubscribeState::PrepareRequest(ref data) = sub_op.state else {
         return Err(OpError::UnexpectedOpState);
     };
-    let is_renewal = *is_renewal;
+    let id = &data.id;
+    let instance_id = &data.instance_id;
+    let is_renewal = data.is_renewal;
 
     tracing::debug!(tx = %id, contract = %instance_id, is_renewal, "subscribe: request_subscribe invoked");
 
@@ -311,7 +371,7 @@ pub(crate) async fn request_subscribe(
 
     let op = SubscribeOp {
         id: *id,
-        state: Some(SubscribeState::AwaitingResponse {
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
             next_hop: Some(target_addr),
             instance_id: *instance_id,
         }),
@@ -389,7 +449,7 @@ struct SubscribeStats {
 
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
-    state: Option<SubscribeState>,
+    state: SubscribeState,
     /// The address of the peer that requested this subscription.
     /// Used for routing responses back and registering them as downstream subscribers.
     requester_addr: Option<std::net::SocketAddr>,
@@ -409,9 +469,9 @@ impl SubscribeOp {
     /// Extract the contract instance_id from the current state, if available.
     pub(crate) fn instance_id(&self) -> Option<ContractInstanceId> {
         match &self.state {
-            Some(SubscribeState::PrepareRequest { instance_id, .. }) => Some(*instance_id),
-            Some(SubscribeState::AwaitingResponse { instance_id, .. }) => Some(*instance_id),
-            _ => None,
+            SubscribeState::PrepareRequest(data) => Some(data.instance_id),
+            SubscribeState::AwaitingResponse(data) => Some(data.instance_id),
+            SubscribeState::Completed(_) | SubscribeState::Failed => None,
         }
     }
 
@@ -450,14 +510,14 @@ impl SubscribeOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        matches!(self.state, Some(SubscribeState::Completed { .. }))
+        matches!(self.state, SubscribeState::Completed(_))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(SubscribeState::Completed { key }) = self.state {
+        if let SubscribeState::Completed(data) = &self.state {
             Ok(HostResponse::ContractResponse(
                 ContractResponse::SubscribeResponse {
-                    key,
+                    key: data.key,
                     subscribed: true,
                 },
             ))
@@ -473,8 +533,10 @@ impl SubscribeOp {
     /// an outbound message. Used for hop-by-hop routing.
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(SubscribeState::AwaitingResponse { next_hop, .. }) => *next_hop,
-            _ => None,
+            SubscribeState::AwaitingResponse(data) => data.next_hop,
+            SubscribeState::PrepareRequest(_)
+            | SubscribeState::Completed(_)
+            | SubscribeState::Failed => None,
         }
     }
 
@@ -492,7 +554,8 @@ impl SubscribeOp {
         if op_manager.is_sub_operation(self.id) {
             // Async sub-operation: no client is waiting on this transaction.
             // Notify via the subscription notification channel instead.
-            if let Some(SubscribeState::AwaitingResponse { instance_id, .. }) = &self.state {
+            if let SubscribeState::AwaitingResponse(data) = &self.state {
+                let instance_id = &data.instance_id;
                 let reason = format!(
                     "Subscription failed for contract {}: peer connection dropped",
                     instance_id
@@ -582,7 +645,9 @@ impl Operation for SubscribeOp {
                 })
             }
             Ok(Some(op)) => {
-                let _ = op_manager.push(id, op).await;
+                if let Err(e) = op_manager.push(id, op).await {
+                    tracing::warn!(tx = %id, error = %e, "failed to push mismatched op back");
+                }
                 Err(OpError::OpNotPresent(id))
             }
             Ok(None) => {
@@ -620,7 +685,7 @@ impl Operation for SubscribeOp {
                 Ok(OpInitialization {
                     op: Self {
                         id,
-                        state: Some(SubscribeState::AwaitingResponse {
+                        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
                             next_hop: None, // Will be determined during processing
                             instance_id: msg_instance_id,
                         }),
@@ -716,32 +781,28 @@ impl Operation for SubscribeOp {
                                 );
                             }
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                            return Ok(OperationResult::SendAndComplete {
+                                msg: NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
                                     instance_id: *instance_id,
                                     result: SubscribeMsgResult::Subscribed { key },
-                                })),
+                                }),
                                 next_hop: Some(requester_addr),
-                                state: None,
                                 stream_data: None,
                             });
                         } else {
                             // We're the originator and have the contract locally
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator has contract locally)");
-                            return Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                            return Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                SubscribeOp {
                                     id: *id,
-                                    state: Some(SubscribeState::Completed { key }),
+                                    state: SubscribeState::Completed(CompletedData { key }),
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                })),
-                                stream_data: None,
-                            });
+                                },
+                            )));
                         }
                     }
 
@@ -795,31 +856,27 @@ impl Operation for SubscribeOp {
                                     "Subscribe: could not find peer to register interest (after contract wait)"
                                 );
                             }
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                            return Ok(OperationResult::SendAndComplete {
+                                msg: NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
                                     instance_id: *instance_id,
                                     result: SubscribeMsgResult::Subscribed { key },
-                                })),
+                                }),
                                 next_hop: Some(requester_addr),
-                                state: None,
                                 stream_data: None,
                             });
                         } else {
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator, contract arrived after wait)");
-                            return Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                            return Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                SubscribeOp {
                                     id: *id,
-                                    state: Some(SubscribeState::Completed { key }),
+                                    state: SubscribeState::Completed(CompletedData { key }),
                                     requester_addr: None,
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                })),
-                                stream_data: None,
-                            });
+                                },
+                            )));
                         }
                     }
 
@@ -864,18 +921,18 @@ impl Operation for SubscribeOp {
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, is_renewal, "Forwarding subscribe request");
 
-                    Ok(OperationResult {
-                        return_msg: Some(NetMessage::from(SubscribeMsg::Request {
+                    Ok(OperationResult::SendAndContinue {
+                        msg: NetMessage::from(SubscribeMsg::Request {
                             id: *id,
                             instance_id: *instance_id,
                             htl: htl.saturating_sub(1),
                             visited: new_visited,
                             is_renewal: *is_renewal,
-                        })),
+                        }),
                         next_hop: Some(next_addr),
-                        state: Some(OpEnum::Subscribe(SubscribeOp {
+                        state: OpEnum::Subscribe(SubscribeOp {
                             id: *id,
-                            state: Some(SubscribeState::AwaitingResponse {
+                            state: SubscribeState::AwaitingResponse(AwaitingResponseData {
                                 next_hop: None, // Already routing via next_hop in OperationResult
                                 instance_id: *instance_id,
                             }),
@@ -883,7 +940,7 @@ impl Operation for SubscribeOp {
                             requester_pub_key: self.requester_pub_key,
                             is_renewal: self.is_renewal,
                             stats: None,
-                        })),
+                        }),
                         stream_data: None,
                     })
                 }
@@ -967,14 +1024,13 @@ impl Operation for SubscribeOp {
                                 // We're an intermediate node - forward response to the requester
                                 // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                                 tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
-                                Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                Ok(OperationResult::SendAndComplete {
+                                    msg: NetMessage::from(SubscribeMsg::Response {
                                         id: *msg_id,
                                         instance_id: *instance_id,
                                         result: SubscribeMsgResult::Subscribed { key: *key },
-                                    })),
+                                    }),
                                     next_hop: Some(requester_addr),
-                                    state: None,
                                     stream_data: None,
                                 })
                             } else {
@@ -993,19 +1049,18 @@ impl Operation for SubscribeOp {
                                     op_manager.ring.register_events(Either::Left(event)).await;
                                 }
 
-                                Ok(OperationResult {
-                                    return_msg: None,
-                                    next_hop: None,
-                                    state: Some(OpEnum::Subscribe(SubscribeOp {
+                                Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                    SubscribeOp {
                                         id,
-                                        state: Some(SubscribeState::Completed { key: *key }),
+                                        state: SubscribeState::Completed(CompletedData {
+                                            key: *key,
+                                        }),
                                         requester_addr: None,
                                         requester_pub_key: None,
                                         is_renewal: self.is_renewal,
                                         stats: self.stats,
-                                    })),
-                                    stream_data: None,
-                                })
+                                    },
+                                )))
                             }
                         }
                         SubscribeMsgResult::NotFound => {
@@ -1021,14 +1076,13 @@ impl Operation for SubscribeOp {
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward NotFound to requester
                                 tracing::debug!(tx = %msg_id, %instance_id, requester = %requester_addr, "Forwarding NotFound response to requester");
-                                Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                Ok(OperationResult::SendAndComplete {
+                                    msg: NetMessage::from(SubscribeMsg::Response {
                                         id: *msg_id,
                                         instance_id: *instance_id,
                                         result: SubscribeMsgResult::NotFound,
-                                    })),
+                                    }),
                                     next_hop: Some(requester_addr),
-                                    state: None,
                                     stream_data: None,
                                 })
                             } else {
@@ -1100,19 +1154,16 @@ impl Operation for SubscribeOp {
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
 
-                                    Ok(OperationResult {
-                                        return_msg: None,
-                                        next_hop: None,
-                                        state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                        SubscribeOp {
                                             id,
-                                            state: Some(SubscribeState::Completed { key }),
+                                            state: SubscribeState::Completed(CompletedData { key }),
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                        })),
-                                        stream_data: None,
-                                    })
+                                        },
+                                    )))
                                 } else {
                                     // No local cache - subscription failed
                                     tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
@@ -1148,20 +1199,17 @@ impl Operation for SubscribeOp {
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
 
-                                    // Return op with no inner state - to_host_result() will return error
-                                    Ok(OperationResult {
-                                        return_msg: None,
-                                        next_hop: None,
-                                        state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    // Return op in Failed state - to_host_result() will return error
+                                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                        SubscribeOp {
                                             id,
-                                            state: None,
+                                            state: SubscribeState::Failed,
                                             requester_addr: None,
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                        })),
-                                        stream_data: None,
-                                    })
+                                        },
+                                    )))
                                 }
                             }
                         }
@@ -1174,7 +1222,7 @@ impl Operation for SubscribeOp {
 
 impl IsOperationCompleted for SubscribeOp {
     fn is_completed(&self) -> bool {
-        matches!(self.state, Some(SubscribeState::Completed { .. }))
+        matches!(self.state, SubscribeState::Completed(_))
     }
 }
 

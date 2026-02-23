@@ -58,6 +58,22 @@ const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// Allows in-flight packets to drain without triggering asymmetric decryption.
 const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
 
+/// Gateway connection acceptance rate limiting after restart.
+///
+/// When a gateway restarts, all connected peers detect their connections are dead
+/// and attempt to reconnect simultaneously ("thundering herd"). This overwhelms
+/// the fast_channel buffers for inter-gateway links, triggering packet drops
+/// that can cascade into a non-recovering overflow loop.
+///
+/// The rate limiter gradually increases the connection acceptance rate:
+/// - Phase 1 (0-30s):   max 5 new connections/second
+/// - Phase 2 (30s-2m):  max 20 new connections/second
+/// - Phase 3 (>2m):     unlimited
+const GW_RAMP_PHASE1_DURATION: Duration = Duration::from_secs(30);
+const GW_RAMP_PHASE2_DURATION: Duration = Duration::from_secs(120);
+const GW_RAMP_PHASE1_RATE: u64 = 5;
+const GW_RAMP_PHASE2_RATE: u64 = 20;
+
 /// Duration to keep outdated peer entries before cleanup.
 /// Peers with incompatible protocol versions are ignored for this duration.
 const OUTDATED_PEER_EXPIRY: Duration = Duration::from_secs(600);
@@ -259,6 +275,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone()),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
         };
@@ -450,6 +467,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone()),
             time_source,
             congestion_config,
         };
@@ -604,6 +622,10 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Congestion control configuration for new connections.
     /// When None, uses the default configuration (BBR).
     congestion_config: Option<CongestionControlConfig>,
+    /// Rate limiter for gateway connection acceptance after restart.
+    /// Ramps up connection acceptance rate to prevent thundering herd.
+    /// Only active when `is_gateway` is true.
+    gw_rate_limiter: GatewayConnectionRateLimiter<T>,
 }
 
 type OngoingConnectionResult<S, T> = Option<
@@ -943,7 +965,13 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
                 );
             }
             Some(ConnectionState::NatTraversal { result_sender, .. }) => {
-                let _ = result_sender.send(Err(TransportError::ConnectionClosed(*addr)));
+                // Receiver may have timed out; log but don't fail
+                if result_sender
+                    .send(Err(TransportError::ConnectionClosed(*addr)))
+                    .is_err()
+                {
+                    tracing::debug!(peer_addr = %addr, "NAT traversal result receiver already dropped");
+                }
             }
             _ => {}
         }
@@ -1034,6 +1062,71 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         self.last_asym_attempt.retain(|_, last_attempt_nanos| {
             now.saturating_sub(*last_attempt_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
         });
+    }
+}
+
+/// Rate limiter for gateway connection acceptance after restart.
+///
+/// Prevents thundering herd when a gateway restarts and all peers reconnect
+/// simultaneously. Uses a 1-second tumbling window to count accepted connections
+/// and compares against a rate that ramps up over time since gateway start.
+struct GatewayConnectionRateLimiter<T: TimeSource> {
+    /// Nanos timestamp when the gateway started listening.
+    start_nanos: u64,
+    /// Nanos timestamp of the current 1-second window start.
+    window_start_nanos: u64,
+    /// Number of connections accepted in the current window.
+    window_count: u64,
+    time_source: T,
+}
+
+impl<T: TimeSource> GatewayConnectionRateLimiter<T> {
+    fn new(time_source: T) -> Self {
+        let now = time_source.now_nanos();
+        Self {
+            start_nanos: now,
+            window_start_nanos: now,
+            window_count: 0,
+            time_source,
+        }
+    }
+
+    /// Returns the maximum connections/second allowed based on time since gateway start.
+    fn current_rate_limit(&self) -> Option<u64> {
+        let elapsed = self
+            .time_source
+            .now_nanos()
+            .saturating_sub(self.start_nanos);
+        if elapsed < GW_RAMP_PHASE1_DURATION.as_nanos() as u64 {
+            Some(GW_RAMP_PHASE1_RATE)
+        } else if elapsed < GW_RAMP_PHASE2_DURATION.as_nanos() as u64 {
+            Some(GW_RAMP_PHASE2_RATE)
+        } else {
+            None // Unlimited
+        }
+    }
+
+    /// Check if a new connection should be accepted. Returns true if allowed.
+    fn try_accept(&mut self) -> bool {
+        let Some(max_rate) = self.current_rate_limit() else {
+            return true; // Unlimited phase
+        };
+
+        let now = self.time_source.now_nanos();
+        let window_elapsed = now.saturating_sub(self.window_start_nanos);
+
+        // Reset window every second
+        if window_elapsed >= Duration::from_secs(1).as_nanos() as u64 {
+            self.window_start_nanos = now;
+            self.window_count = 0;
+        }
+
+        if self.window_count < max_rate {
+            self.window_count += 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1211,7 +1304,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             }
                                             self.connections.record_asym_attempt(remote_addr);
                                         }
-                                        let _ = self.connections.send_nat_traversal(&remote_addr, packet_data).await;
+                                        if let Err(()) = self.connections.send_nat_traversal(&remote_addr, packet_data).await {
+                                            tracing::debug!(peer_addr = %remote_addr, "failed to send NAT traversal packet");
+                                        }
                                         continue;
                                     }
 
@@ -1235,18 +1330,33 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 // Clean up stale closed connections from same IP
                                 self.connections.remove_stale_from_ip(remote_addr);
 
-                                // Rate limit intro attempts
-                                if self.connections.is_rate_limited(&remote_addr) {
-                                    tracing::trace!(peer_addr = %remote_addr, "Rate limiting gateway intro attempt");
-                                    continue;
-                                }
-                                self.connections.record_asym_attempt(remote_addr);
-
-                                // Only process intro packets
+                                // Only process intro packets — check before rate limiters
+                                // to avoid wasting rate limit budget on non-intro packets.
                                 if !packet_data.is_intro_packet() {
                                     tracing::trace!(peer_addr = %remote_addr, "Dropping non-intro packet from unknown address");
                                     continue;
                                 }
+
+                                // Rate limit intro attempts (per-IP)
+                                if self.connections.is_rate_limited(&remote_addr) {
+                                    tracing::trace!(peer_addr = %remote_addr, "Rate limiting gateway intro attempt");
+                                    continue;
+                                }
+
+                                // Global rate limit: prevent thundering herd after gateway restart.
+                                // Gradually ramps up connection acceptance rate over 2 minutes.
+                                // Safe to drop: peers send multiple intro packets per attempt
+                                // and retry via initial_join_procedure's loop with jitter.
+                                if !self.gw_rate_limiter.try_accept() {
+                                    tracing::trace!(
+                                        peer_addr = %remote_addr,
+                                        max_rate = ?self.gw_rate_limiter.current_rate_limit(),
+                                        "Deferring connection: gateway ramp-up rate limit"
+                                    );
+                                    continue;
+                                }
+
+                                self.connections.record_asym_attempt(remote_addr);
 
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
@@ -1396,7 +1506,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 inbound_remote_connection.inbound_packet_sender,
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
-                                let _ = result_sender.send(Ok(outbound_remote_conn));
+                                if result_sender.send(Ok(outbound_remote_conn)).is_err() {
+                                    tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
+                                }
                             } else {
                                 tracing::debug!(peer_addr = %remote_addr, "Connection state changed during NAT traversal");
                             }
@@ -1408,13 +1520,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     tracing::warn!(%error);
                                     crate::transport::signal_version_mismatch();
                                 }
-                                _ => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                 }
                             }
                             self.expected_non_gateway.remove(&remote_addr.ip());
                             if let Some(result_sender) = self.connections.fail_nat_traversal(&remote_addr) {
-                                let _ = result_sender.send(Err(error));
+                                if result_sender.send(Err(error)).is_err() {
+                                    tracing::debug!(peer_addr = %remote_addr, "NAT traversal failure result receiver already dropped");
+                                }
                             }
                         }
                     }
@@ -1438,9 +1552,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // Check for existing NAT traversal in progress
                     if self.connections.has_nat_traversal(&remote_addr) {
                         tracing::debug!(peer_addr = %remote_addr, "NAT traversal already in progress");
-                        let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
+                        if open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
-                        }));
+                        })).is_err() {
+                            tracing::debug!(peer_addr = %remote_addr, "duplicate NAT traversal notification receiver already dropped");
+                        }
                         continue;
                     }
 
@@ -1940,7 +2056,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         } => {
                                             return Err(handle_ack_connection_error(err));
                                         }
-                                        _ => {
+                                        SymmetricMessagePayload::ShortMessage { .. }
+                                        | SymmetricMessagePayload::StreamFragment { .. }
+                                        | SymmetricMessagePayload::NoOp
+                                        | SymmetricMessagePayload::Ping { .. }
+                                        | SymmetricMessagePayload::Pong { .. } => {
                                             tracing::trace!(
                                                 peer_addr = %remote_addr,
                                                 direction = "outbound",
@@ -2351,6 +2471,68 @@ mod version_cmp {
             manager.get_state(&addr).is_none(),
             "State should be cleaned up after expiration"
         );
+    }
+
+    #[test]
+    fn test_gateway_connection_rate_limiter() {
+        use super::{
+            GatewayConnectionRateLimiter, GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE,
+            GW_RAMP_PHASE2_DURATION, GW_RAMP_PHASE2_RATE,
+        };
+        use crate::simulation::{TimeSource, VirtualTime};
+        use std::time::Duration;
+
+        let time = VirtualTime::new();
+        let mut limiter = GatewayConnectionRateLimiter::new(time.clone());
+
+        // Phase 1: should allow GW_RAMP_PHASE1_RATE connections per second
+        for _ in 0..GW_RAMP_PHASE1_RATE {
+            assert!(limiter.try_accept(), "Should accept within phase 1 rate");
+        }
+        // Next one should be rejected
+        assert!(
+            !limiter.try_accept(),
+            "Should reject when phase 1 rate exceeded"
+        );
+
+        // Advance past 1 second — window should reset inside try_accept
+        time.advance(Duration::from_millis(1001));
+        assert!(
+            limiter.try_accept(),
+            "Should accept after window reset in phase 1"
+        );
+
+        // Advance into phase 2 (past phase 1 boundary + past current window).
+        // Use the SAME limiter to verify try_accept handles long time gaps
+        // and correctly resets its sliding window across phase transitions.
+        time.advance(GW_RAMP_PHASE1_DURATION);
+        assert_eq!(
+            limiter.current_rate_limit(),
+            Some(GW_RAMP_PHASE2_RATE),
+            "Should be in phase 2 after advancing past phase 1 duration"
+        );
+
+        for _ in 0..GW_RAMP_PHASE2_RATE {
+            assert!(limiter.try_accept(), "Should accept within phase 2 rate");
+        }
+        assert!(
+            !limiter.try_accept(),
+            "Should reject when phase 2 rate exceeded"
+        );
+
+        // Advance into unlimited phase (past phase 2 boundary).
+        // Again, same limiter instance — validates window reset over long gaps.
+        time.advance(GW_RAMP_PHASE2_DURATION);
+        assert_eq!(
+            limiter.current_rate_limit(),
+            None,
+            "Should be unlimited after phase 2 duration"
+        );
+
+        // Should accept unlimited connections
+        for _ in 0..1000 {
+            assert!(limiter.try_accept(), "Should accept unlimited in phase 3");
+        }
     }
 }
 
@@ -3023,10 +3205,10 @@ pub mod mock_transport {
                                 }
                             }
                         }
-                        let _ = peer_conn.send(test_gen_cp.gen_msg()).await;
+                        let _sent = peer_conn.send(test_gen_cp.gen_msg()).await;
 
                         tracing::info!(%peer_addr, "finished");
-                        let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
+                        let _recv = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
                         Ok(messages)
                     });
                 }
@@ -3062,13 +3244,13 @@ pub mod mock_transport {
 
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3089,13 +3271,13 @@ pub mod mock_transport {
 
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3116,14 +3298,14 @@ pub mod mock_transport {
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3207,7 +3389,7 @@ pub mod mock_transport {
             conn.send("some data").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 2nd message");
             })?;
-            let _ = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
+            let _recv = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             Ok::<_, anyhow::Error>(conn)
         });
 
@@ -3229,15 +3411,15 @@ pub mod mock_transport {
                 tracing::error!(%error, "error while receiving 2nd message");
             })?;
             assert_eq!(&b[8..], b"some data");
-            let _ = conn.send("complete").await.inspect_err(|error| {
+            let _sent = conn.send("complete").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 3rd message");
             });
             Ok::<_, anyhow::Error>(conn)
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        let _ = a?;
-        let _ = b?;
+        let _a = a?;
+        let _b = b?;
 
         Ok(())
     }
@@ -3252,7 +3434,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3260,7 +3442,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3281,7 +3463,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3289,7 +3471,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3310,7 +3492,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3318,7 +3500,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3338,7 +3520,7 @@ pub mod mock_transport {
 
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
             Ok::<_, anyhow::Error>(())
@@ -3346,7 +3528,7 @@ pub mod mock_transport {
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
+            let _conn = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -3444,7 +3626,7 @@ pub mod mock_transport {
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
+            let _recv = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
             Ok::<_, anyhow::Error>(())
         });
 

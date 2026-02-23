@@ -168,6 +168,7 @@ impl Ring {
         event_register: ER,
         is_gateway: bool,
         connection_manager: ConnectionManager,
+        task_monitor: &crate::node::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Arc<Self>> {
         let live_tx_tracker = LiveTransactionTracker::new();
 
@@ -178,7 +179,10 @@ impl Ring {
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
-        GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
+        task_monitor.register(
+            "refresh_router",
+            GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone())),
+        );
 
         // Interval for periodic subscription state telemetry snapshots (1 minute)
         const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
@@ -226,61 +230,91 @@ impl Ring {
             tracing::info_span!(parent: current_span, "connection_maintenance")
         };
 
-        GlobalExecutor::spawn(
-            ring.clone()
-                .connection_maintenance(event_loop_notifier, live_tx_tracker)
-                .instrument(span),
+        task_monitor.register(
+            "connection_maintenance",
+            GlobalExecutor::spawn({
+                let fut = ring
+                    .clone()
+                    .connection_maintenance(event_loop_notifier, live_tx_tracker)
+                    .instrument(span);
+                async move {
+                    if let Err(e) = fut.await {
+                        tracing::error!(error = %e, "connection_maintenance exited with error");
+                    }
+                }
+            }),
         );
 
         // Spawn periodic subscription state telemetry task
-        GlobalExecutor::spawn(Self::emit_subscription_state_telemetry(
-            ring.clone(),
-            SUBSCRIPTION_STATE_INTERVAL,
-        ));
+        task_monitor.register(
+            "emit_subscription_state_telemetry",
+            GlobalExecutor::spawn(Self::emit_subscription_state_telemetry(
+                ring.clone(),
+                SUBSCRIPTION_STATE_INTERVAL,
+            )),
+        );
 
         // Spawn periodic subscription recovery task to fix "orphaned seeders"
         // (peers that have contracts cached but aren't in the subscription tree)
-        GlobalExecutor::spawn(Self::recover_orphaned_subscriptions(
-            ring.clone(),
-            SUBSCRIPTION_RECOVERY_INTERVAL,
-        ));
+        task_monitor.register(
+            "recover_orphaned_subscriptions",
+            GlobalExecutor::spawn(Self::recover_orphaned_subscriptions(
+                ring.clone(),
+                SUBSCRIPTION_RECOVERY_INTERVAL,
+            )),
+        );
 
         // Spawn periodic GET subscription cache sweep task
         // Cleans up expired GET-triggered subscriptions to maintain bounded memory
-        GlobalExecutor::spawn(Self::sweep_get_subscription_cache(
-            ring.clone(),
-            GET_SUBSCRIPTION_SWEEP_INTERVAL,
-        ));
+        task_monitor.register(
+            "sweep_get_subscription_cache",
+            GlobalExecutor::spawn(Self::sweep_get_subscription_cache(
+                ring.clone(),
+                GET_SUBSCRIPTION_SWEEP_INTERVAL,
+            )),
+        );
 
         // Spawn periodic topology snapshot registration task (test mode only)
         // This allows SimNetwork to validate subscription topology during tests
         #[cfg(any(test, feature = "testing"))]
-        GlobalExecutor::spawn(Self::register_topology_snapshots_periodically(
-            ring.clone(),
-            TOPOLOGY_SNAPSHOT_INTERVAL,
-        ));
+        task_monitor.register(
+            "register_topology_snapshots",
+            GlobalExecutor::spawn(Self::register_topology_snapshots_periodically(
+                ring.clone(),
+                TOPOLOGY_SNAPSHOT_INTERVAL,
+            )),
+        );
 
         // Spawn periodic router model snapshot telemetry (every 5 minutes)
-        GlobalExecutor::spawn(Self::emit_router_snapshot_telemetry(
-            ring.clone(),
-            Duration::from_secs(60 * 5),
-        ));
+        task_monitor.register(
+            "emit_router_snapshot_telemetry",
+            GlobalExecutor::spawn(Self::emit_router_snapshot_telemetry(
+                ring.clone(),
+                Duration::from_secs(60 * 5),
+            )),
+        );
 
         // Spawn periodic contract-directed CONNECT task.
         // When a peer is a "subscription root" (closest to contract among neighbors),
         // it sends CONNECTs toward the contract's ring location to merge disconnected
         // subscription subtrees.
         const CONTRACT_CONNECT_INTERVAL: Duration = Duration::from_secs(30);
-        GlobalExecutor::spawn(Self::contract_directed_connects(
-            ring.clone(),
-            CONTRACT_CONNECT_INTERVAL,
-        ));
+        task_monitor.register(
+            "contract_directed_connects",
+            GlobalExecutor::spawn(Self::contract_directed_connects(
+                ring.clone(),
+                CONTRACT_CONNECT_INTERVAL,
+            )),
+        );
 
         // Spawn periodic interest heartbeat task.
         // Sends full Interests { hashes } to each connected peer to keep
         // interest entries alive and prevent the death spiral where expired
         // entries block broadcast delivery.
-        GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone()));
+        task_monitor.register(
+            "interest_heartbeat",
+            GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone())),
+        );
 
         Ok(ring)
     }
@@ -645,14 +679,16 @@ impl Ring {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let history = register
-                .get_router_events(10_000)
-                .await
-                .map_err(|error| {
+            let history = match register.get_router_events(10_000).await {
+                Ok(h) => h,
+                Err(error) => {
+                    // Previously this was an `expect()` that would silently panic
+                    // the task. Now that the task is monitored, returning will
+                    // trigger the BackgroundTaskMonitor and propagate the failure.
                     tracing::error!(error = %error, "Shutting down refresh router task");
-                    error
-                })
-                .expect("todo: propagate this to main thread");
+                    return;
+                }
+            };
             if !history.is_empty() {
                 let router_ref = &mut *router.write();
                 *router_ref = Router::new(&history);
@@ -1205,7 +1241,7 @@ impl Ring {
     fn refresh_density_request_cache(&self) {
         let cbl = self.connection_manager.get_connections_by_location();
         let topology_manager = &mut self.connection_manager.topology_manager.write();
-        let _ = topology_manager.refresh_cache(&cbl);
+        let _refreshed = topology_manager.refresh_cache(&cbl);
     }
 
     /// Returns a filtered iterator for peers that are not connected to this node already.
@@ -1695,6 +1731,8 @@ impl Ring {
             // Isolation recovery: when we have zero ring connections for too long,
             // reset all backoff state so we can retry aggressively (#2928).
             let current_conn_count = self.connection_manager.connection_count();
+            // Expose to update check task for version mismatch decisions (#3204).
+            crate::transport::set_open_connection_count(current_conn_count);
             if current_conn_count == 0 {
                 if let Some(since) = zero_connections_since {
                     if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
@@ -1961,10 +1999,26 @@ impl Ring {
                 self_addr = ?self.connection_manager.get_own_addr(),
                 "Looking for peer to route through"
             );
-            if let Some(target) =
-                self.connection_manager
-                    .routing(ideal_location, None, skip_list, &router)
-            {
+            // CONNECT operations bypass readiness gating — peers need to route
+            // through ANY ring connection to acquire new connections, even if those
+            // connections haven't advertised readiness yet. Without this, peers get
+            // stuck below the readiness threshold: they can't initiate CONNECTs
+            // because routing() filters out all their "not ready" connections,
+            // but they can't become ready without more connections.
+            let candidates = self.connection_manager.routing_candidates(
+                ideal_location,
+                None,
+                skip_list,
+                false, // bypass readiness — this is a CONNECT for connection acquisition
+            );
+            let selected = if !candidates.is_empty() {
+                let (selected, _) =
+                    router.select_k_best_peers_with_telemetry(candidates.iter(), ideal_location, 1);
+                selected.into_iter().next().cloned()
+            } else {
+                None
+            };
+            if let Some(target) = selected {
                 tracing::debug!(
                     query_target = %target,
                     target_location = %ideal_location,
@@ -1976,7 +2030,7 @@ impl Ring {
                     current_connections,
                     is_gateway,
                     target_location = %ideal_location,
-                    "acquire_new: routing() returned None - cannot find peer to query"
+                    "acquire_new: no routing candidates found - cannot find peer to query"
                 );
                 return Ok(None);
             }

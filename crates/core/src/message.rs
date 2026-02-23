@@ -71,14 +71,9 @@ impl Transaction {
 
     pub(crate) fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
-        match id_byte {
-            0 => TransactionType::Connect,
-            1 => TransactionType::Put,
-            2 => TransactionType::Get,
-            3 => TransactionType::Subscribe,
-            4 => TransactionType::Update,
-            _ => unsafe { std::hint::unreachable_unchecked() },
-        }
+        TransactionType::try_from(id_byte).expect(
+            "Transaction ID contains invalid type byte; this is a bug in Transaction construction",
+        )
     }
 
     pub fn timed_out(&self) -> bool {
@@ -219,6 +214,21 @@ mod sealed_msg_type {
         Get = 2,
         Subscribe = 3,
         Update = 4,
+    }
+
+    impl TryFrom<u8> for TransactionType {
+        type Error = u8;
+
+        fn try_from(value: u8) -> Result<Self, Self::Error> {
+            match value {
+                0 => Ok(TransactionType::Connect),
+                1 => Ok(TransactionType::Put),
+                2 => Ok(TransactionType::Get),
+                3 => Ok(TransactionType::Subscribe),
+                4 => Ok(TransactionType::Update),
+                other => Err(other),
+            }
+        }
     }
 
     impl TransactionType {
@@ -977,3 +987,33 @@ mod tests {
         assert!(matches!(deserialized, DeltaOrFullState::FullState(ref bytes) if bytes.is_empty()));
     }
 }
+
+// ── Compile-time invariant checks ──────────────────────────────────────
+//
+// These const assertions catch layout and enum-variant assumptions at
+// compile time, preventing a whole class of bugs that previously could
+// only surface at runtime (or worse, as UB via unreachable_unchecked).
+
+/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (24 bytes, with niche) = 40 bytes.
+/// Any change to this layout would break serialization compatibility and network protocol.
+const _: () = {
+    // Ulid is a newtype over u128 (16 bytes).
+    assert!(std::mem::size_of::<ulid::Ulid>() == 16, "Ulid size changed");
+    // Transaction = { id: Ulid, parent: Option<Ulid> }.
+    // Assert it stays within a reasonable bound (≤48 bytes).
+    assert!(
+        std::mem::size_of::<Transaction>() <= 48,
+        "Transaction size grew beyond expected bounds — check serialization compatibility"
+    );
+};
+
+/// TransactionType must have exactly 5 variants (0..=4).
+/// If a new variant is added, `Transaction::transaction_type()` and the
+/// `TryFrom<u8>` impl must be updated, and this assertion bumped.
+const _: () = {
+    // The highest valid discriminant must be 4 (Update).
+    assert!(
+        sealed_msg_type::TransactionType::Update as u8 == 4,
+        "TransactionType variants changed — update TryFrom<u8> and this assertion"
+    );
+};

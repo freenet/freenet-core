@@ -103,7 +103,7 @@ impl ContractStore {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                 (*contract_v1.key(), contract_v1.code().clone())
             }
-            _ => unimplemented!(),
+            ContractContainer::Wasm(_) | _ => unimplemented!(),
         };
         let code_hash = key.code_hash();
         if self.contract_cache.get(code_hash).is_some() {
@@ -153,7 +153,7 @@ impl ContractStore {
             .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
         // Wait for cache to process the insert. Even if TinyLFU rejects it,
         // the disk fallback above ensures the contract can still be fetched.
-        let _ = self.contract_cache.wait();
+        let _cache_result = self.contract_cache.wait();
 
         Ok(())
     }

@@ -1596,7 +1596,7 @@ fn test_harness_timeout_clears_scheduled_slowdown() {
     let mut harness = LedbatTestHarness::new(config, condition, 11111);
 
     // Run until we've had at least one slowdown (establishes next_slowdown_time)
-    let _ = harness.run_until_slowdown(200, 100_000);
+    let _slowdown_result = harness.run_until_slowdown(200, 100_000);
 
     let pre_timeout = harness.snapshot();
     println!(

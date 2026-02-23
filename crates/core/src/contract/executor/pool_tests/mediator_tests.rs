@@ -54,9 +54,9 @@ impl TestMediator {
             Some((tx, response_tx)) = self.op_request_rx.recv() => {
                 // Check capacity
                 if self.pending.len() >= self.max_pending {
-                    let _ = response_tx.send(Err(OpRequestError::Failed(
+                    drop(response_tx.send(Err(OpRequestError::Failed(
                         "mediator at capacity".to_string()
-                    )));
+                    ))));
                     return true;
                 }
 
@@ -64,7 +64,7 @@ impl TestMediator {
                 self.pending.insert(tx, response_tx);
                 if self.to_event_loop_tx.send(tx).await.is_err() {
                     if let Some(pending) = self.pending.remove(&tx) {
-                        let _ = pending.send(Err(OpRequestError::ChannelClosed));
+                        drop(pending.send(Err(OpRequestError::ChannelClosed)));
                     }
                 }
                 true
@@ -72,7 +72,7 @@ impl TestMediator {
             Some(op_result) = self.from_event_loop_rx.recv() => {
                 let tx = *op_result.id();
                 if let Some(pending) = self.pending.remove(&tx) {
-                    let _ = pending.send(Ok(op_result));
+                    drop(pending.send(Ok(op_result)));
                 }
                 true
             }
@@ -199,9 +199,9 @@ async fn test_stale_cleanup_notifies_waiters() {
     let (response_tx, response_rx) = oneshot::channel::<Result<OpEnum, OpRequestError>>();
 
     // Simulate stale cleanup notification
-    let _ = response_tx.send(Err(OpRequestError::Failed(
+    drop(response_tx.send(Err(OpRequestError::Failed(
         "request exceeded stale threshold".to_string(),
-    )));
+    ))));
 
     // Waiter should receive the error
     let result = response_rx.await.unwrap();
@@ -342,7 +342,7 @@ async fn test_response_routed_to_correct_executor() {
     // "Respond" to the middle one
     let target_tx = transactions[1];
     if let Some(sender) = pending.remove(&target_tx) {
-        let _ = sender.send(Err(OpRequestError::Failed("test response".to_string())));
+        drop(sender.send(Err(OpRequestError::Failed("test response".to_string()))));
     }
 
     // Only middle receiver should have a response

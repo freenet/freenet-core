@@ -6,7 +6,7 @@
 //! Handles the raw sending and receiving of byte packets over the network.
 //! See `architecture.md`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -26,11 +26,22 @@ use tokio::net::UdpSocket;
 /// Global flag set by transport layer when a version mismatch is detected.
 static VERSION_MISMATCH_DETECTED: AtomicBool = AtomicBool::new(false);
 
+/// Generation counter incremented on each `signal_version_mismatch()` call.
+/// The update check task uses this to detect fresh mismatches and reset backoff.
+static VERSION_MISMATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Signal that a version mismatch was detected with another peer.
 /// Called from the transport layer when a connection fails due to
 /// protocol version incompatibility.
 pub fn signal_version_mismatch() {
     VERSION_MISMATCH_DETECTED.store(true, Ordering::SeqCst);
+    VERSION_MISMATCH_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Get the current mismatch generation counter.
+/// Each call to `signal_version_mismatch()` increments this.
+pub fn version_mismatch_generation() -> u64 {
+    VERSION_MISMATCH_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Check if there's a pending version mismatch that should trigger an update check.
@@ -41,6 +52,21 @@ pub fn has_version_mismatch() -> bool {
 /// Clear the version mismatch flag (called after checking for updates).
 pub fn clear_version_mismatch() {
     VERSION_MISMATCH_DETECTED.store(false, Ordering::SeqCst);
+}
+
+/// Global counter of open ring connections, updated by `connection_maintenance`.
+/// The update check task reads this to decide whether to trust a gateway
+/// version mismatch signal when the GitHub check keeps failing.
+static OPEN_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Update the global open connection count (called from `connection_maintenance`).
+pub fn set_open_connection_count(count: usize) {
+    OPEN_CONNECTION_COUNT.store(count, Ordering::SeqCst);
+}
+
+/// Get the current open connection count.
+pub fn get_open_connection_count() -> usize {
+    OPEN_CONNECTION_COUNT.load(Ordering::SeqCst)
 }
 
 pub mod connection_handler;

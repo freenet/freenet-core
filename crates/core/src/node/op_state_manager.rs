@@ -303,6 +303,7 @@ impl OpManager {
         event_register: ER,
         connection_manager: ConnectionManager,
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+        task_monitor: &super::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -310,6 +311,7 @@ impl OpManager {
             event_register.clone(),
             config.is_gateway,
             connection_manager,
+            task_monitor,
         )?;
         let ops = Arc::new(Ops::default());
 
@@ -328,21 +330,24 @@ impl OpManager {
             Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        GlobalExecutor::spawn(
-            garbage_cleanup_task(
-                rx,
-                ops.clone(),
-                ring.live_tx_tracker.clone(),
-                notification_channel.clone(),
-                event_register,
-                sub_op_tracker.clone(),
-                result_router_tx.clone(),
-                request_router.clone(),
-                ring.clone(),
-                ch_outbound.clone(),
-                contract_waiters.clone(),
-            )
-            .instrument(garbage_span),
+        task_monitor.register(
+            "garbage_cleanup",
+            GlobalExecutor::spawn(
+                garbage_cleanup_task(
+                    rx,
+                    ops.clone(),
+                    ring.live_tx_tracker.clone(),
+                    notification_channel.clone(),
+                    event_register,
+                    sub_op_tracker.clone(),
+                    result_router_tx.clone(),
+                    request_router.clone(),
+                    ring.clone(),
+                    ch_outbound.clone(),
+                    contract_waiters.clone(),
+                )
+                .instrument(garbage_span),
+            ),
         );
 
         // Gateways are ready immediately (peer_id set from config)
@@ -723,7 +728,10 @@ impl OpManager {
                 self.ops.connect.get(id).and_then(|op| op.get_target_peer())
             }
             // Other operations only store addresses, not full peer info
-            _ => None,
+            TransactionType::Put
+            | TransactionType::Get
+            | TransactionType::Subscribe
+            | TransactionType::Update => None,
         }
     }
 
@@ -734,7 +742,7 @@ impl OpManager {
             TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_current_hop()),
             TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_current_htl()),
             // TODO: Add support for Subscribe operations when they track HTL
-            _ => None,
+            TransactionType::Connect | TransactionType::Subscribe | TransactionType::Update => None,
         }
     }
 
@@ -954,7 +962,8 @@ impl OpManager {
         if let Some(senders) = waiters.remove(key.id()) {
             let count = senders.len();
             for sender in senders {
-                // Ignore errors if receiver was dropped (e.g., operation timed out)
+                // Receiver may already be dropped (e.g., operation timed out)
+                #[allow(clippy::let_underscore_must_use)]
                 let _ = sender.send(());
             }
             if count > 0 {
@@ -1322,14 +1331,16 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
                             sub_op_tracker.remove_child_link(parent_tx, tx);
                             sub_op_tracker.mark_sub_op_completed(parent_tx);
-                            let _ = sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx);
+                            drop(sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx));
                             sub_op_tracker.cleanup_parent_tracking(parent_tx);
 
                             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                                 cause: format!("Sub-operation {} timed out", tx).into(),
                             }.into());
 
-                            let _ = result_router_tx.send((parent_tx, error_result)).await;
+                            if let Err(e) = result_router_tx.send((parent_tx, error_result)).await {
+                                tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
+                            }
                         }
 
                         notify_transaction_timeout(&event_loop_notifier, tx);
@@ -1404,14 +1415,16 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
                             sub_op_tracker.remove_child_link(parent_tx, tx);
                             sub_op_tracker.mark_sub_op_completed(parent_tx);
-                            let _ = sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx);
+                            drop(sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx));
                             sub_op_tracker.cleanup_parent_tracking(parent_tx);
 
                             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                                 cause: format!("Sub-operation {} timed out", tx).into(),
                             }.into());
 
-                            let _ = result_router_tx.send((parent_tx, error_result)).await;
+                            if let Err(e) = result_router_tx.send((parent_tx, error_result)).await {
+                                tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
+                            }
                         }
 
                         notify_transaction_timeout(&event_loop_notifier, tx);

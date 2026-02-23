@@ -115,6 +115,8 @@ pub(super) struct DelegateCallEnv {
 // SecretsStore) is alive and on the same call stack. Wasmer's Singlepass compiler
 // executes WASM synchronously on the calling thread.
 unsafe impl Send for DelegateCallEnv {}
+// SAFETY: Same rationale as Send above -- single-threaded synchronous WASM execution
+// means DelegateCallEnv is never accessed from multiple threads concurrently.
 unsafe impl Sync for DelegateCallEnv {}
 
 /// Typed errors from `DelegateCallEnv` contract operations.
@@ -384,6 +386,8 @@ pub(super) mod log {
             tracing::error!("Memory bounds violation in freenet_log::info");
             return;
         };
+        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to be within the
+        // WASM linear memory bounds, and WASM contracts produce valid UTF-8 log messages.
         let msg =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
@@ -410,6 +414,8 @@ pub(super) mod rand {
             tracing::error!("Memory bounds violation in freenet_rand::rand_bytes");
             return;
         };
+        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to point to `len`
+        // bytes within the WASM linear memory, so constructing a mutable slice is valid.
         let slice = unsafe { &mut *std::ptr::slice_from_raw_parts_mut(ptr, len as usize) };
         let mut rng = rng();
         rng.fill_bytes(slice);
@@ -439,6 +445,8 @@ pub(super) mod time {
             tracing::error!("Memory bounds violation in freenet_time::utc_now");
             return;
         };
+        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to point to a region
+        // large enough for `DateTime<Utc>` within the WASM linear memory.
         unsafe {
             ptr.write(now);
         };
@@ -519,6 +527,9 @@ pub(super) mod delegate_context {
             tracing::error!("Memory bounds violation in delegate context_read");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `dst` was validated by `validate_and_compute_ptr` to be within WASM
+        // linear memory bounds, and `env.context` is a valid `Vec<u8>` with at least
+        // `to_copy` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(env.context.as_ptr(), dst, to_copy);
         }
@@ -560,6 +571,8 @@ pub(super) mod delegate_context {
             tracing::error!("Memory bounds violation in delegate context_write");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to `len`
+        // bytes within the WASM linear memory.
         let bytes = unsafe { std::slice::from_raw_parts(src, len as usize) };
         env.context = bytes.to_vec();
         error_codes::SUCCESS
@@ -620,6 +633,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate get_secret_len");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `key_src` was validated by `validate_and_compute_ptr` to point to
+        // `key_len` bytes within the WASM linear memory.
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -678,6 +693,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate get_secret (key)");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `key_src` was validated by `validate_and_compute_ptr` to point to
+        // `key_len` bytes within the WASM linear memory.
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -708,6 +725,9 @@ pub(super) mod delegate_secrets {
                     tracing::error!("Memory bounds violation in delegate get_secret (output)");
                     return error_codes::ERR_MEMORY_BOUNDS;
                 };
+                // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
+                // `secret_len` bytes within WASM linear memory, and `plaintext` is a
+                // valid byte slice of that length.
                 unsafe {
                     std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
                 }
@@ -756,6 +776,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate set_secret (key)");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `key_src` was validated by `validate_and_compute_ptr` to point to
+        // `key_len` bytes within the WASM linear memory.
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -768,6 +790,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate set_secret (value)");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `val_src` was validated by `validate_and_compute_ptr` to point to
+        // `val_len` bytes within the WASM linear memory.
         let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
 
         match env
@@ -817,6 +841,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate has_secret");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `key_src` was validated by `validate_and_compute_ptr` to point to
+        // `key_len` bytes within the WASM linear memory.
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -862,6 +888,8 @@ pub(super) mod delegate_secrets {
             tracing::error!("Memory bounds violation in delegate remove_secret");
             return error_codes::ERR_MEMORY_BOUNDS;
         };
+        // SAFETY: `key_src` was validated by `validate_and_compute_ptr` to point to
+        // `key_len` bytes within the WASM linear memory.
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
@@ -941,6 +969,8 @@ pub(super) mod delegate_contracts {
             tracing::error!("Memory bounds violation in delegate get_contract_state_len");
             return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
         };
+        // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
+        // 32 bytes within the WASM linear memory.
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -1011,6 +1041,8 @@ pub(super) mod delegate_contracts {
         let Some(id_src) = validate_and_compute_ptr::<u8>(id_ptr, start_ptr, 32, mem_size) else {
             return Err(contract_error_codes::ERR_MEMORY_BOUNDS as i64);
         };
+        // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
+        // 32 bytes within the WASM linear memory.
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -1057,6 +1089,8 @@ pub(super) mod delegate_contracts {
             tracing::error!("Memory bounds violation in delegate get_contract_state (id)");
             return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
         };
+        // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
+        // 32 bytes within the WASM linear memory.
         let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
             .try_into()
             .unwrap();
@@ -1089,6 +1123,9 @@ pub(super) mod delegate_contracts {
                     );
                     return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
                 };
+                // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
+                // `state_len` bytes within WASM linear memory, and `state_bytes` is a
+                // valid `Vec<u8>` of that length.
                 unsafe {
                     std::ptr::copy_nonoverlapping(state_bytes.as_ptr(), dst, state_len);
                 }
@@ -1163,6 +1200,8 @@ pub(super) mod delegate_contracts {
                 tracing::error!("Memory bounds violation in delegate put_contract_state (state)");
                 return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
             };
+            // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to
+            // `state_len` bytes within the WASM linear memory.
             unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
         };
 
@@ -1232,6 +1271,8 @@ pub(super) mod delegate_contracts {
                 );
                 return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
             };
+            // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to
+            // `state_len` bytes within the WASM linear memory.
             unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
         };
 

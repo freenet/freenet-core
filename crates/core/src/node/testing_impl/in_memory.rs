@@ -21,6 +21,7 @@ use crate::{
         SimulationContractHandler, SimulationHandlerBuilder,
     },
     node::{
+        background_task_monitor::BackgroundTaskMonitor,
         network_bridge::{event_loop_notification_channel, p2p_protoc::P2pConnManager},
         op_state_manager::OpManager,
         EventLoopExitReason, MessageProcessor, NetEventRegister,
@@ -83,6 +84,9 @@ impl<ER> Builder<ER> {
         // Create result router channel - needed for MessageProcessor
         let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
 
+        // In-memory nodes use a monitor for API compatibility; tasks are cleaned
+        // up when the monitor is dropped at the end of scope.
+        let task_monitor = BackgroundTaskMonitor::new();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
@@ -90,6 +94,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             connection_manager.clone(),
             result_router_tx.clone(),
+            &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
@@ -180,7 +185,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)
@@ -221,6 +226,7 @@ impl<ER> Builder<ER> {
         // Create result router channel
         let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
 
+        let task_monitor = BackgroundTaskMonitor::new();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
@@ -228,6 +234,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             connection_manager.clone(),
             result_router_tx.clone(),
+            &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
@@ -321,7 +328,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)
@@ -359,6 +366,7 @@ impl<ER> Builder<ER> {
         // Create result router channel
         let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
 
+        let task_monitor = BackgroundTaskMonitor::new();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
@@ -366,6 +374,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             connection_manager.clone(),
             result_router_tx.clone(),
+            &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
@@ -458,7 +467,7 @@ impl<ER> Builder<ER> {
 
         if let Some(handle) = join_task {
             handle.abort();
-            let _ = handle.await;
+            let _join_result = handle.await;
         }
 
         handle_event_loop_result(result)

@@ -6,7 +6,9 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use directories::ProjectDirs;
 use freenet::config::ConfigPaths;
+use freenet::tracing::tracer::get_log_dir;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -74,6 +76,12 @@ pub enum ServiceCommand {
         /// Uninstall the system-wide service instead of the user service
         #[arg(long)]
         system: bool,
+        /// Also remove all Freenet data, config, and logs
+        #[arg(long, conflicts_with = "keep_data")]
+        purge: bool,
+        /// Only remove the service (skip interactive prompt)
+        #[arg(long, conflicts_with = "purge")]
+        keep_data: bool,
     },
     /// Check the status of the Freenet service
     Status {
@@ -120,7 +128,11 @@ impl ServiceCommand {
     ) -> Result<()> {
         match self {
             ServiceCommand::Install { system } => install_service(*system),
-            ServiceCommand::Uninstall { system } => uninstall_service(*system),
+            ServiceCommand::Uninstall {
+                system,
+                purge,
+                keep_data,
+            } => uninstall_service(*system, *purge, *keep_data),
             ServiceCommand::Status { system } => service_status(*system),
             ServiceCommand::Start { system } => start_service(*system),
             ServiceCommand::Stop { system } => stop_service(*system),
@@ -131,6 +143,109 @@ impl ServiceCommand {
             }
         }
     }
+}
+
+/// Determine whether the user wants to purge data directories.
+///
+/// - `--purge` → true
+/// - `--keep-data` → false
+/// - Neither → prompt interactively (defaults to false if stdin is not a TTY)
+fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
+    if purge {
+        return Ok(true);
+    }
+    if keep_data {
+        return Ok(false);
+    }
+
+    use std::io::{self, BufRead, IsTerminal, Write};
+
+    // Check if stdin is a TTY for interactive prompting
+    if io::stdin().is_terminal() {
+        print!("Also remove all Freenet data, config, and logs? [y/N] ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let answer = line.trim().to_ascii_lowercase();
+        Ok(answer == "y" || answer == "yes")
+    } else {
+        println!("Non-interactive mode: keeping data. Use --purge to also remove data, config, and logs.");
+        Ok(false)
+    }
+}
+
+/// Remove a directory if it exists, printing what is being removed.
+fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
+    if path.exists() {
+        println!("Removing {label}: {}", path.display());
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove {label} directory: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove Freenet data, config, cache, and log directories.
+///
+/// When `system_mode` is true on Linux, resolves directories for the service
+/// user (via SUDO_USER) rather than root's home directory.
+fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
+    // On Linux with --system, the service runs as the SUDO_USER, not root.
+    // We need to resolve that user's directories, not root's.
+    #[cfg(target_os = "linux")]
+    let home_override: Option<std::path::PathBuf> = if system_mode {
+        std::env::var("SUDO_USER")
+            .ok()
+            .map(|u| home_dir_for_user(&u))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let home_override: Option<std::path::PathBuf> = None;
+
+    // If we have a home override (system mode), construct paths manually using
+    // XDG defaults. Otherwise use ProjectDirs which resolves from the current user.
+    if let Some(ref home) = home_override {
+        // XDG defaults for the service user
+        remove_if_exists("data", &home.join(".local/share/Freenet"))?;
+        remove_if_exists("config", &home.join(".config/Freenet"))?;
+        remove_if_exists("cache", &home.join(".cache/Freenet"))?;
+        // Also remove lowercase cache dir used by webapp cache
+        remove_if_exists("cache", &home.join(".cache/freenet"))?;
+        remove_if_exists("logs", &home.join(".local/state/freenet"))?;
+    } else {
+        match ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
+            Some(ref dirs) => {
+                let data_dir = dirs.data_dir();
+                remove_if_exists("data", data_dir)?;
+
+                let config_dir = dirs.config_dir();
+                // On macOS, config_dir == data_dir; skip if already removed
+                if config_dir != data_dir {
+                    remove_if_exists("config", config_dir)?;
+                }
+
+                remove_if_exists("cache", dirs.cache_dir())?;
+            }
+            None => {
+                eprintln!("Warning: Could not determine Freenet directories. Data and config may not have been removed.");
+            }
+        }
+
+        // Also remove lowercase "freenet" cache dir used by webapp cache
+        // (may differ from uppercase "Freenet" on case-sensitive filesystems)
+        if let Some(ref dirs) = ProjectDirs::from("", "The Freenet Project Inc", "freenet") {
+            let cache_dir = dirs.cache_dir();
+            if cache_dir.exists() {
+                remove_if_exists("cache", cache_dir)?;
+            }
+        }
+
+        if let Some(log_dir) = get_log_dir() {
+            remove_if_exists("logs", &log_dir)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Path to the system-wide systemd service file.
@@ -155,7 +270,7 @@ fn has_user_service() -> bool {
 /// Used after creating directories with sudo so the service user can write to them.
 #[cfg(target_os = "linux")]
 fn chown_to_user(path: &Path, username: &str) {
-    let _ = std::process::Command::new("chown")
+    let _status = std::process::Command::new("chown")
         .args(["-R", username, &path.display().to_string()])
         .status();
 }
@@ -464,16 +579,16 @@ WantedBy=multi-user.target
 }
 
 #[cfg(target_os = "linux")]
-fn uninstall_service(system: bool) -> Result<()> {
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
     use std::fs;
 
     let system_mode = use_system_mode(system);
 
-    // Stop the service if running
-    let _ = systemctl(system_mode, &["stop", "freenet"]);
+    // Stop the service if running (best-effort, may already be stopped)
+    let _stop = systemctl(system_mode, &["stop", "freenet"]);
 
-    // Disable the service
-    let _ = systemctl(system_mode, &["disable", "freenet"]);
+    // Disable the service (best-effort, may already be disabled)
+    let _disable = systemctl(system_mode, &["disable", "freenet"]);
 
     // Remove the service file
     let service_path = if system_mode {
@@ -488,10 +603,15 @@ fn uninstall_service(system: bool) -> Result<()> {
         fs::remove_file(&service_path).context("Failed to remove service file")?;
     }
 
-    // Reload systemd
-    let _ = systemctl(system_mode, &["daemon-reload"]);
+    // Reload systemd (best-effort, failure is non-fatal during uninstall)
+    drop(systemctl(system_mode, &["daemon-reload"]));
 
     println!("Freenet service uninstalled.");
+
+    if should_purge(purge, keep_data)? {
+        purge_data_dirs(system_mode)?;
+        println!("All Freenet data, config, and logs removed.");
+    }
 
     Ok(())
 }
@@ -716,7 +836,7 @@ fn check_no_system_flag(system: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_service(system: bool) -> Result<()> {
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
     use std::fs;
 
     check_no_system_flag(system)?;
@@ -743,6 +863,11 @@ fn uninstall_service(system: bool) -> Result<()> {
     }
 
     println!("Freenet service uninstalled.");
+
+    if should_purge(purge, keep_data)? {
+        purge_data_dirs(false)?;
+        println!("All Freenet data, config, and logs removed.");
+    }
 
     Ok(())
 }
@@ -930,7 +1055,7 @@ fn check_no_system_flag_windows(system: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn uninstall_service(system: bool) -> Result<()> {
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
     // Stop if running
@@ -949,6 +1074,11 @@ fn uninstall_service(system: bool) -> Result<()> {
     }
 
     println!("Freenet scheduled task uninstalled.");
+
+    if should_purge(purge, keep_data)? {
+        purge_data_dirs(false)?;
+        println!("All Freenet data, config, and logs removed.");
+    }
 
     Ok(())
 }
@@ -1036,7 +1166,7 @@ fn install_service(_system: bool) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn uninstall_service(_system: bool) -> Result<()> {
+fn uninstall_service(_system: bool, _purge: bool, _keep_data: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
@@ -1175,5 +1305,21 @@ mod tests {
         // Verify RunAtLoad is set
         assert!(plist_content.contains("<key>RunAtLoad</key>"));
         assert!(plist_content.contains("<true/>"));
+    }
+
+    #[test]
+    fn test_should_purge_with_purge_flag() {
+        assert!(should_purge(true, false).unwrap());
+    }
+
+    #[test]
+    fn test_should_purge_with_keep_data_flag() {
+        assert!(!should_purge(false, true).unwrap());
+    }
+
+    #[test]
+    fn test_should_purge_no_flags_non_tty() {
+        // In CI/test environments stdin is not a TTY, so this should default to false
+        assert!(!should_purge(false, false).unwrap());
     }
 }

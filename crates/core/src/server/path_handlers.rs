@@ -117,8 +117,8 @@ pub(super) async fn contract_home(
                         }
                     }
 
-                    // Clear existing cache if any
-                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    // Clear existing cache if any; may not exist yet
+                    let _cleanup = tokio::fs::remove_dir_all(&path).await;
                     tokio::fs::create_dir_all(&path).await.map_err(|e| {
                         WebSocketApiError::NodeError {
                             error_cause: format!("Failed to create cache dir: {e}"),

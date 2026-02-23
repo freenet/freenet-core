@@ -104,7 +104,7 @@ use tokio::task::JoinHandle;
 use either::Either;
 
 use crate::client_events::HostResult;
-use crate::config::GlobalExecutor;
+use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
@@ -168,7 +168,7 @@ impl InnerMessage for ConnectMsg {
             ConnectMsg::Rejected {
                 desired_location, ..
             } => Some(*desired_location),
-            _ => None,
+            ConnectMsg::Response { .. } | ConnectMsg::ObservedAddress { .. } => None,
         }
     }
 }
@@ -1762,21 +1762,32 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     // Hop-by-hop routing: messages are sent directly via network_bridge.send() with
     // explicit target addresses. No next_hop is embedded in the result.
-    OperationResult {
-        return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
-        next_hop: None,
-        state: state_clone.map(|state| {
-            OpEnum::Connect(Box::new(ConnectOp {
-                id: op.id,
-                state: Some(state),
-                first_hop: op.first_hop.clone(),
-                desired_location: op.desired_location,
-                recency: op.recency.clone(),
-                forward_attempts: op.forward_attempts.clone(),
-                connect_forward_estimator: op.connect_forward_estimator.clone(),
-            }))
-        }),
-        stream_data: None,
+    let return_msg = msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m)));
+    let state = state_clone.map(|state| {
+        OpEnum::Connect(Box::new(ConnectOp {
+            id: op.id,
+            state: Some(state),
+            first_hop: op.first_hop.clone(),
+            desired_location: op.desired_location,
+            recency: op.recency.clone(),
+            forward_attempts: op.forward_attempts.clone(),
+            connect_forward_estimator: op.connect_forward_estimator.clone(),
+        }))
+    });
+    match (return_msg, state) {
+        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
+            msg,
+            next_hop: None,
+            state,
+            stream_data: None,
+        },
+        (Some(msg), None) => OperationResult::SendAndComplete {
+            msg,
+            next_hop: None,
+            stream_data: None,
+        },
+        (None, Some(state)) => OperationResult::ContinueOp(state),
+        (None, None) => OperationResult::Completed,
     }
 }
 
@@ -1899,8 +1910,8 @@ pub(crate) async fn initial_join_procedure(
             return;
         }
 
-        const WAIT_TIME: u64 = 1;
-        const LONG_WAIT_TIME: u64 = 30;
+        const BASE_WAIT_SECS: u64 = 1;
+        const LONG_WAIT_SECS: u64 = 30;
         const BOOTSTRAP_THRESHOLD: usize = 4;
 
         tracing::info!(
@@ -2025,27 +2036,35 @@ pub(crate) async fn initial_join_procedure(
                 );
             }
 
-            let wait_time = if open_conns == 0 {
-                tracing::debug!("No connections yet, waiting {}s before retry", WAIT_TIME);
-                WAIT_TIME
-            } else if open_conns < BOOTSTRAP_THRESHOLD {
+            // Add random jitter to prevent thundering herd after gateway restart.
+            // Without jitter, all peers that lose their gateway connection retry
+            // at the same interval, causing synchronized reconnection storms.
+            let jitter_ms = GlobalRng::random_u64() % 2000; // 0-2s jitter
+            let base_wait_ms = if open_conns == 0 {
                 tracing::debug!(
-                    "Have {} connections (below threshold of {}), waiting {}s",
+                    "No connections yet, waiting ~{}s before retry",
+                    BASE_WAIT_SECS
+                );
+                BASE_WAIT_SECS * 1000
+            } else if open_conns < BOOTSTRAP_THRESHOLD {
+                let wait = BASE_WAIT_SECS * 3 * 1000;
+                tracing::debug!(
+                    "Have {} connections (below threshold of {}), waiting ~{}ms",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    WAIT_TIME * 3
+                    wait + jitter_ms
                 );
-                WAIT_TIME * 3
+                wait
             } else {
                 tracing::trace!(
-                    "Connection pool healthy ({} connections), waiting {}s",
+                    "Connection pool healthy ({} connections), waiting ~{}s",
                     open_conns,
-                    LONG_WAIT_TIME
+                    LONG_WAIT_SECS
                 );
-                LONG_WAIT_TIME
+                LONG_WAIT_SECS * 1000
             };
 
-            tokio::time::sleep(Duration::from_secs(wait_time)).await;
+            tokio::time::sleep(Duration::from_millis(base_wait_ms + jitter_ms)).await;
         }
     });
     Ok(handle)

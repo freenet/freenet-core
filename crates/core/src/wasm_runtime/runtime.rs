@@ -305,6 +305,8 @@ impl Runtime {
         let data = data.as_ref();
         let builder_ptr = self.engine.initiate_buffer(handle, data.len() as u32)?;
         let linear_mem = self.linear_mem(handle)?;
+        // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
+        // `BufferBuilder` within the instance's linear memory described by `linear_mem`.
         unsafe {
             Ok(BufferMut::from_ptr(
                 builder_ptr as *mut BufferBuilder,
@@ -315,6 +317,8 @@ impl Runtime {
 
     pub(super) fn linear_mem(&mut self, handle: &InstanceHandle) -> RuntimeResult<WasmLinearMem> {
         let (ptr, size) = self.engine.memory_info(handle)?;
+        // SAFETY: `ptr` and `size` come from the engine's live memory export for this
+        // instance, so they describe a valid, allocated linear memory region.
         Ok(unsafe { WasmLinearMem::new(ptr, size as u64) })
     }
 
@@ -348,7 +352,7 @@ impl Runtime {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     contract_v1.code().data().to_vec()
                 }
-                _ => unimplemented!(),
+                ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
             // Re-check cache: another executor may have compiled this contract
