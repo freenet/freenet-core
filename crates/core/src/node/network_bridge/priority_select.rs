@@ -132,10 +132,10 @@ where
         }
     }
 
-    /// Maximum consecutive Tier-1 (P1-P4, P6) items before force-polling protected
-    /// channels (Handshake + Tier-2 P7/P8). Prevents starvation of connection
-    /// lifecycle events and client/executor transactions under sustained
-    /// high-priority traffic. See issue #3074.
+    /// Maximum consecutive unprotected (P1-P6) items before force-polling protected
+    /// channels (Handshake, P7 Client tx, P8 Executor tx). Prevents starvation
+    /// of connection lifecycle events and client/executor transactions under
+    /// sustained high-priority traffic. See issues #3074, #3224.
     pub(crate) const MAX_HIGH_PRIORITY_BURST: u32 = 32;
 }
 
@@ -153,9 +153,9 @@ where
         // Track if any channel closed (to report after checking all sources)
         let mut first_closed_channel: Option<SelectResult> = None;
 
-        // Track whether Tier-2 channels were already polled in Phase 1
+        // Track whether protected channels were already polled in Phase 1
         // to avoid double-polling in Phase 2.
-        let mut tier2_polled_in_phase1 = false;
+        let mut force_polled_in_phase1 = false;
 
         // Phase 1: Anti-starvation — force-poll Handshake and Tier-2 (P7/P8)
         // when the high-priority streak has reached the burst limit.
@@ -169,7 +169,7 @@ where
                 streak = this.high_priority_streak,
                 "Anti-starvation: forcing poll of Handshake + Tier-2 channels"
             );
-            tier2_polled_in_phase1 = true;
+            force_polled_in_phase1 = true;
             crate::config::GlobalTestMetrics::record_anti_starvation_trigger();
 
             // Force-poll Handshake: connection lifecycle events
@@ -278,7 +278,7 @@ where
 
         // Priority 2: Handshake handler — connection lifecycle events
         // Skip if already polled during Phase 1 force-poll
-        if !tier2_polled_in_phase1 && !this.handshake_closed {
+        if !force_polled_in_phase1 && !this.handshake_closed {
             match Pin::new(&mut this.handshake_handler).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
                     this.high_priority_streak += 1;
@@ -364,7 +364,7 @@ where
 
         // Priority 7: Client transaction handler
         // Skip if already polled during Phase 1 force-poll
-        if !tier2_polled_in_phase1 && !this.client_transaction_closed {
+        if !force_polled_in_phase1 && !this.client_transaction_closed {
             match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
                 Poll::Ready(Some(result)) => {
                     this.high_priority_streak = 0;
@@ -384,7 +384,7 @@ where
 
         // Priority 8: Executor transaction handler
         // Skip if already polled during Phase 1 force-poll
-        if !tier2_polled_in_phase1 && !this.executor_transaction_closed {
+        if !force_polled_in_phase1 && !this.executor_transaction_closed {
             match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
                 Poll::Ready(Some(tx)) => {
                     this.high_priority_streak = 0;

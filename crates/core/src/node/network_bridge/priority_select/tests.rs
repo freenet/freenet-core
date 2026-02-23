@@ -2542,6 +2542,53 @@ async fn test_handshake_not_starved_under_notification_load() {
     );
 }
 
+/// Handshake at P2 is polled before op_execution at P3 in normal Phase 2 polling.
+/// This tests the priority promotion (P5→P2) when P1 is Pending (empty).
+#[tokio::test]
+#[test_log::test]
+async fn test_handshake_p2_before_op_execution_p3() {
+    // P1 is empty, so Phase 2 normal polling applies.
+    // Handshake (P2) and op_execution (P3) both have one event ready.
+    // Handshake should be returned first.
+    let (_, notif_rx) = mpsc::channel(1);
+    let (op_tx, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (hs_tx, hs_rx) = mpsc::channel(1);
+
+    hs_tx.send(dummy_handshake_event()).await.unwrap();
+    let dummy_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+        crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+    ));
+    let (callback_tx, _) = mpsc::channel(1);
+    op_tx.send((callback_tx, dummy_msg)).await.unwrap();
+
+    drop(hs_tx);
+    drop(op_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        MockHandshakeReceiverStream { rx: hs_rx },
+        node_rx,
+        MockClientStream,
+        MockExecutorStream,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, 5).await;
+
+    assert_eq!(events.len(), 2, "Should receive both events");
+    assert_eq!(
+        events[0], "handshake",
+        "Handshake (P2) should be returned before op_execution (P3)"
+    );
+    assert_eq!(events[1], "op_execution");
+}
+
 /// Anti-starvation force-polls handshake even when P1 is continuously ready.
 /// This tests the Phase 1 mechanism — after MAX_HIGH_PRIORITY_BURST consecutive
 /// tier-1 items, the handshake channel is force-polled.
