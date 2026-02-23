@@ -1933,6 +1933,18 @@ pub(crate) async fn initial_join_procedure(
 
             let unconnected_count = unconnected_gateways.len();
 
+            // Log at info level when we're below threshold but all gateways appear
+            // connected/pending — this was previously invisible, making it hard to
+            // diagnose why the join procedure wasn't attempting reconnection (#3219).
+            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
+                tracing::info!(
+                    open_conns,
+                    total_gateways = gateways.len(),
+                    "Below bootstrap threshold but all gateways appear connected/pending — \
+                     waiting for handshakes to complete or pending reservations to expire"
+                );
+            }
+
             if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
