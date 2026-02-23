@@ -616,6 +616,91 @@ impl OpManager {
             .collect()
     }
 
+    /// Send an Unsubscribe message to the upstream peer for a contract.
+    ///
+    /// Finds the upstream peer from the interest manager, resolves its address,
+    /// and sends a fire-and-forget Unsubscribe message via the operation routing
+    /// mechanism. Also removes the local active subscription and interest tracking.
+    pub async fn send_unsubscribe_upstream(&self, contract: &ContractKey) {
+        // Find the upstream peer for this contract
+        let upstream = self
+            .interest_manager
+            .get_interested_peers(contract)
+            .into_iter()
+            .find(|(_, interest)| interest.is_upstream);
+
+        let Some((peer_key, _)) = upstream else {
+            tracing::debug!(
+                contract = %contract,
+                "No upstream peer found for unsubscribe"
+            );
+            self.ring.unsubscribe(contract);
+            return;
+        };
+
+        // Resolve peer address
+        let Some(peer_location) = self
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(&peer_key.0)
+        else {
+            tracing::debug!(
+                contract = %contract,
+                "Upstream peer address not found, cleaning up locally"
+            );
+            self.ring.unsubscribe(contract);
+            self.interest_manager
+                .remove_peer_interest(contract, &peer_key);
+            return;
+        };
+
+        let Some(&target_addr) = peer_location.peer_addr.as_known() else {
+            tracing::debug!(
+                contract = %contract,
+                "Upstream peer has no known address, cleaning up locally"
+            );
+            self.ring.unsubscribe(contract);
+            self.interest_manager
+                .remove_peer_interest(contract, &peer_key);
+            return;
+        };
+
+        let instance_id = *contract.id();
+        let tx = Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+        let msg = NetMessage::from(crate::operations::subscribe::SubscribeMsg::Unsubscribe {
+            id: tx,
+            instance_id,
+        });
+
+        let op = OpEnum::Subscribe(crate::operations::subscribe::create_unsubscribe_op(
+            instance_id,
+            tx,
+            target_addr,
+        ));
+
+        match self.notify_op_change_nonblocking(msg, op).await {
+            Ok(()) => {
+                tracing::debug!(
+                    contract = %contract,
+                    target = %target_addr,
+                    "Sent Unsubscribe upstream"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    contract = %contract,
+                    error = %e,
+                    "Failed to send Unsubscribe upstream"
+                );
+            }
+        }
+
+        // Clean up local state regardless of send result.
+        self.ring.unsubscribe(contract);
+        self.interest_manager
+            .remove_peer_interest(contract, &peer_key);
+    }
+
     #[allow(dead_code)] // FIXME: enable async sub-transactions
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
         let (response_sender, mut response_receiver): (

@@ -218,6 +218,29 @@ pub(crate) fn start_op_with_id(
     }
 }
 
+/// Create a SubscribeOp for routing an Unsubscribe message to a target peer.
+///
+/// The operation is created in `AwaitingResponse` state so `peek_next_hop_addr`
+/// resolves the target address for the event loop's message router.
+/// The caller should mark it completed immediately after sending.
+pub(crate) fn create_unsubscribe_op(
+    instance_id: ContractInstanceId,
+    tx: Transaction,
+    target_addr: std::net::SocketAddr,
+) -> SubscribeOp {
+    SubscribeOp {
+        id: tx,
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: Some(target_addr),
+            instance_id,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    }
+}
+
 /// Request to subscribe to value changes from a contract.
 ///
 /// # Errors
@@ -609,6 +632,54 @@ impl SubscribeOp {
     }
 }
 
+/// Register a downstream subscriber for a contract.
+///
+/// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
+/// avoids NAT timing window failures) or falls back to an address lookup. If a key
+/// is found, records the peer in both the downstream subscriber list and the interest
+/// manager so UPDATE broadcasts reach them immediately.
+fn register_downstream_subscriber(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    requester_addr: std::net::SocketAddr,
+    requester_pub_key: Option<&crate::transport::TransportPublicKey>,
+    source_addr: Option<std::net::SocketAddr>,
+    tx: &Transaction,
+    warn_suffix: &str,
+) {
+    let peer_key = requester_pub_key
+        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+        .or_else(|| {
+            op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(requester_addr)
+                .or_else(|| {
+                    source_addr
+                        .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
+                })
+                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
+        });
+
+    if let Some(peer_key) = peer_key {
+        op_manager
+            .ring
+            .add_downstream_subscriber(key, peer_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, false);
+    } else {
+        tracing::warn!(
+            tx = %tx,
+            contract = %key,
+            requester_addr = %requester_addr,
+            source_addr = ?source_addr,
+            "Subscribe: could not find peer to register interest{}",
+            warn_suffix
+        );
+    }
+}
+
 impl Operation for SubscribeOp {
     type Message = SubscribeMsg;
     type Result = SubscribeResult;
@@ -619,10 +690,10 @@ impl Operation for SubscribeOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let id = *msg.id();
-        let msg_type = if matches!(msg, SubscribeMsg::Request { .. }) {
-            "Request"
-        } else {
-            "Response"
+        let msg_type = match msg {
+            SubscribeMsg::Request { .. } => "Request",
+            SubscribeMsg::Response { .. } => "Response",
+            SubscribeMsg::Unsubscribe { .. } => "Unsubscribe",
         };
         tracing::debug!(
             tx = %id,
@@ -656,20 +727,21 @@ impl Operation for SubscribeOp {
                 if matches!(msg, SubscribeMsg::Response { .. }) {
                     tracing::debug!(
                         tx = %id,
+                        %msg_type,
                         phase = "load_or_init",
-                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation (likely timed out or race)"
+                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation"
                     );
                     return Err(OpError::OpNotPresent(id));
                 }
 
-                // New request from another peer - we're an intermediate/terminal node
-                // Extract is_renewal and instance_id from the Request message
+                // New Request or Unsubscribe from another peer
                 let (is_renewal, msg_instance_id) = match msg {
                     SubscribeMsg::Request {
                         is_renewal,
                         instance_id,
                         ..
                     } => (*is_renewal, *instance_id),
+                    SubscribeMsg::Unsubscribe { instance_id, .. } => (false, *instance_id),
                     _ => unreachable!("Response case handled above"),
                 };
                 // Resolve requester's public key at init time, when the connection
@@ -689,7 +761,7 @@ impl Operation for SubscribeOp {
                             next_hop: None, // Will be determined during processing
                             instance_id: msg_instance_id,
                         }),
-                        requester_addr: source_addr, // Store who sent us this request
+                        requester_addr: source_addr, // Store who sent us this message
                         requester_pub_key,
                         is_renewal,
                         stats: None,
@@ -739,47 +811,18 @@ impl Operation for SubscribeOp {
                         // In the lease-based model (2026-01), we just confirm we have the contract.
                         // Updates propagate via proximity cache, not explicit tree.
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the subscribing peer in the interest manager so that
-                            // update broadcasts include them as a target immediately.
-                            // Use requester_pub_key (resolved at init time) when available,
-                            // falling back to addr lookup. The pub_key path avoids failures
-                            // during NAT traversal timing windows. (#2886)
-                            let peer_key = self
-                                .requester_pub_key
-                                .as_ref()
-                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-                                .or_else(|| {
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .get_peer_by_addr(requester_addr)
-                                        .or_else(|| {
-                                            source_addr.and_then(|sa| {
-                                                op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .get_peer_by_addr(sa)
-                                            })
-                                        })
-                                        .map(|pkl| {
-                                            crate::ring::interest::PeerKey::from(
-                                                pkl.pub_key.clone(),
-                                            )
-                                        })
-                                });
-                            if let Some(peer_key) = peer_key {
-                                op_manager
-                                    .interest_manager
-                                    .register_peer_interest(&key, peer_key, None, false);
-                            } else {
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester_addr = %requester_addr,
-                                    source_addr = ?source_addr,
-                                    "Subscribe: could not find peer to register interest"
-                                );
-                            }
+                            // Register the subscribing peer as a downstream subscriber.
+                            // Uses requester_pub_key (resolved at init time) to avoid
+                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            register_downstream_subscriber(
+                                op_manager,
+                                &key,
+                                requester_addr,
+                                self.requester_pub_key.as_ref(),
+                                source_addr,
+                                id,
+                                "",
+                            );
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
@@ -817,45 +860,18 @@ impl Operation for SubscribeOp {
                         // Contract arrived - respond to confirm subscription
                         // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
-                            // Register the subscribing peer in the interest manager.
-                            // Use requester_pub_key (resolved at init time) when available,
-                            // falling back to addr lookup. (#2886)
-                            let peer_key = self
-                                .requester_pub_key
-                                .as_ref()
-                                .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-                                .or_else(|| {
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .get_peer_by_addr(requester_addr)
-                                        .or_else(|| {
-                                            source_addr.and_then(|sa| {
-                                                op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .get_peer_by_addr(sa)
-                                            })
-                                        })
-                                        .map(|pkl| {
-                                            crate::ring::interest::PeerKey::from(
-                                                pkl.pub_key.clone(),
-                                            )
-                                        })
-                                });
-                            if let Some(peer_key) = peer_key {
-                                op_manager
-                                    .interest_manager
-                                    .register_peer_interest(&key, peer_key, None, false);
-                            } else {
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    requester_addr = %requester_addr,
-                                    source_addr = ?source_addr,
-                                    "Subscribe: could not find peer to register interest (after contract wait)"
-                                );
-                            }
+                            // Register the subscribing peer as a downstream subscriber.
+                            // Uses requester_pub_key (resolved at init time) to avoid
+                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            register_downstream_subscriber(
+                                op_manager,
+                                &key,
+                                requester_addr,
+                                self.requester_pub_key.as_ref(),
+                                source_addr,
+                                id,
+                                " (after contract wait)",
+                            );
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -999,12 +1015,11 @@ impl Operation for SubscribeOp {
                             // This ensures UPDATE broadcasts will reach us. Without this,
                             // if the contract was already cached (fetch_contract_if_missing returned early),
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
-                            // See: https://github.com/freenet/freenet-core/issues/XXX
                             super::announce_contract_cached(op_manager, key).await;
 
-                            // Register the responding peer in our interest manager.
-                            // The peer that fulfilled our subscription has the contract,
-                            // so we should include them in update broadcasts.
+                            // Register the responding peer as our upstream in the interest manager.
+                            // This peer fulfilled our subscription, so it's the target for
+                            // Unsubscribe messages when we no longer need updates.
                             if let Some(resp_addr) = source_addr {
                                 if let Some(pkl) = op_manager
                                     .ring
@@ -1015,7 +1030,7 @@ impl Operation for SubscribeOp {
                                         crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
                                     op_manager
                                         .interest_manager
-                                        .register_peer_interest(key, peer_key, None, false);
+                                        .register_peer_interest(key, peer_key, None, true);
                                 }
                             }
 
@@ -1215,6 +1230,71 @@ impl Operation for SubscribeOp {
                         }
                     }
                 }
+
+                SubscribeMsg::Unsubscribe { id, instance_id } => {
+                    tracing::debug!(
+                        tx = %id,
+                        %instance_id,
+                        source_addr = ?source_addr,
+                        "received unsubscribe notification"
+                    );
+
+                    // Resolve the sender's PeerKey
+                    let sender_peer = self
+                        .requester_pub_key
+                        .as_ref()
+                        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+                        .or_else(|| {
+                            source_addr.and_then(|addr| {
+                                op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(addr)
+                                    .map(|pkl| {
+                                        crate::ring::interest::PeerKey::from(pkl.pub_key.clone())
+                                    })
+                            })
+                        });
+
+                    // Look up the full ContractKey from storage
+                    if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+                        if let Some(peer) = &sender_peer {
+                            op_manager.ring.remove_downstream_subscriber(&key, peer);
+                            op_manager.interest_manager.remove_peer_interest(&key, peer);
+                        } else {
+                            tracing::warn!(
+                                tx = %id,
+                                %instance_id,
+                                source_addr = ?source_addr,
+                                "Unsubscribe: could not resolve sender peer, downstream entry not removed"
+                            );
+                        }
+
+                        // Chain propagation: if no more interest, unsubscribe upstream
+                        if op_manager.ring.should_unsubscribe_upstream(&key) {
+                            tracing::debug!(
+                                tx = %id,
+                                contract = %key,
+                                "No remaining subscribers, propagating unsubscribe upstream"
+                            );
+                            op_manager.send_unsubscribe_upstream(&key).await;
+                        } else {
+                            tracing::debug!(
+                                tx = %id,
+                                contract = %key,
+                                "Still have subscribers, not propagating unsubscribe"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %instance_id,
+                            "Contract not found locally, ignoring unsubscribe"
+                        );
+                    }
+
+                    Ok(OperationResult::Completed)
+                }
             }
         })
     }
@@ -1273,20 +1353,28 @@ mod messages {
             instance_id: ContractInstanceId,
             result: SubscribeMsgResult,
         },
+        /// Explicit unsubscribe notification sent upstream for fast cleanup.
+        /// Fire-and-forget: does not require a response or existing operation state.
+        Unsubscribe {
+            id: Transaction,
+            instance_id: ContractInstanceId,
+        },
     }
 
     impl InnerMessage for SubscribeMsg {
         fn id(&self) -> &Transaction {
             match self {
-                Self::Request { id, .. } | Self::Response { id, .. } => id,
+                Self::Request { id, .. }
+                | Self::Response { id, .. }
+                | Self::Unsubscribe { id, .. } => id,
             }
         }
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { instance_id, .. } | Self::Response { instance_id, .. } => {
-                    Some(Location::from(instance_id))
-                }
+                Self::Request { instance_id, .. }
+                | Self::Response { instance_id, .. }
+                | Self::Unsubscribe { instance_id, .. } => Some(Location::from(instance_id)),
             }
         }
     }
@@ -1310,6 +1398,12 @@ mod messages {
                     write!(
                         f,
                         "Subscribe::Response(id: {id}, instance_id: {instance_id}, result: {result_str})"
+                    )
+                }
+                Self::Unsubscribe { instance_id, .. } => {
+                    write!(
+                        f,
+                        "Subscribe::Unsubscribe(id: {id}, contract: {instance_id})"
                     )
                 }
             }

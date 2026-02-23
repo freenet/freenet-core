@@ -550,6 +550,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 | SubscribeEvent::_Reserved8
                 | SubscribeEvent::_Reserved9
                 | SubscribeEvent::_Reserved10 => "subscribe_reserved".to_string(),
+                SubscribeEvent::UnsubscribeSent { .. } => "unsubscribe_sent".to_string(),
+                SubscribeEvent::UnsubscribeReceived { .. } => "unsubscribe_received".to_string(),
             }
         }
         EventKind::Update(update_event) => {
@@ -1070,6 +1072,38 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 | SubscribeEvent::_Reserved8
                 | SubscribeEvent::_Reserved9
                 | SubscribeEvent::_Reserved10 => serde_json::json!({"type": "reserved"}),
+                SubscribeEvent::UnsubscribeSent {
+                    id,
+                    instance_id,
+                    from,
+                    to,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "unsubscribe_sent",
+                        "id": id.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::UnsubscribeReceived {
+                    id,
+                    instance_id,
+                    from,
+                    at,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "unsubscribe_received",
+                        "id": id.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "from": from.to_string(),
+                        "at": at.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
             }
         }
         EventKind::Update(update_event) => {

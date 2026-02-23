@@ -1715,6 +1715,17 @@ async fn process_open_request(
                     );
                 }
 
+                // Send Unsubscribe upstream for contracts with no remaining interest
+                for contract in &result.affected_contracts {
+                    if op_manager.ring.should_unsubscribe_upstream(contract) {
+                        let op_mgr = op_manager.clone();
+                        let contract = *contract;
+                        GlobalExecutor::spawn(async move {
+                            op_mgr.send_unsubscribe_upstream(&contract).await;
+                        });
+                    }
+                }
+
                 // Notify contract handler to clean up shared_summaries and
                 // shared_notifications for this client (fire-and-forget — no response needed).
                 if let Err(err) = op_manager.ch_outbound.send_to_handler_fire_and_forget(

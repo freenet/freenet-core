@@ -532,6 +532,28 @@ async fn websocket_commands(
         .on_upgrade(on_upgrade)
 }
 
+/// Send a synthetic Disconnect to the node so subscription cleanup always runs.
+async fn notify_disconnect(
+    request_sender: &WebSocketRequest,
+    client_id: ClientId,
+    auth_token: &Option<(AuthToken, ContractInstanceId)>,
+    api_version: ApiVersion,
+) {
+    tracing::debug!(%client_id, "Notifying node of disconnect for subscription cleanup");
+    if let Err(e) = request_sender
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(ClientRequest::Disconnect { cause: None }),
+            auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+            attested_contract: auth_token.as_ref().map(|t| t.1),
+            api_version,
+        })
+        .await
+    {
+        tracing::debug!(%client_id, error = %e, "Failed to send disconnect notification");
+    }
+}
+
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
@@ -621,22 +643,10 @@ async fn websocket_interface(
                     .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
                 {
                     Err(err) => {
-                        tracing::debug!(err = %err, "client channel error");
-                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
-                        if let Err(e) = request_sender
-                            .send(ClientConnection::Request {
-                                client_id,
-                                req: Box::new(ClientRequest::Disconnect { cause: None }),
-                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
-                                attested_contract: auth_token.as_ref().map(|t| t.1),
-                                api_version,
-                            })
-                            .await
-                        {
-                            tracing::warn!(%client_id, error = %e, "failed to send disconnect notification");
-                        }
+                        tracing::debug!(err = %err, "client channel closed");
+                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
-                            tracing::debug!(%client_id, error = %e, "failed to send close frame");
+                            tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
                         return Ok(());
                     }
@@ -655,91 +665,92 @@ async fn websocket_interface(
                 .await
                 {
                     Ok(Some(error)) => {
-                        server_sink.send(error).await.inspect_err(|err| {
-                            tracing::debug!(err = %err, "error sending message to client");
-                        })?;
+                        if let Err(err) = server_sink.send(error).await {
+                            tracing::debug!(err = %err, "error sending error response to client");
+                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            return Err(err.into());
+                        }
                     }
                     Ok(None) => continue,
                     Err(None) => {
-                        tracing::debug!(%client_id, "Client channel closed during request processing");
-                        if let Err(e) = request_sender
-                            .send(ClientConnection::Request {
-                                client_id,
-                                req: Box::new(ClientRequest::Disconnect { cause: None }),
-                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
-                                attested_contract: auth_token.as_ref().map(|t| t.1),
-                                api_version,
-                            })
-                            .await
-                        {
-                            tracing::warn!(%client_id, error = %e, "failed to send disconnect notification");
-                        }
+                        tracing::debug!(%client_id, "client channel closed during request processing");
+                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
-                            tracing::debug!(%client_id, error = %e, "failed to send close frame");
+                            tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
                         return Ok(())
                     },
                     Err(Some(err)) => {
-                        tracing::debug!(%client_id, err = %err, "Client request error, notifying node for subscription cleanup");
-                        if let Err(e) = request_sender
-                            .send(ClientConnection::Request {
-                                client_id,
-                                req: Box::new(ClientRequest::Disconnect { cause: None }),
-                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
-                                attested_contract: auth_token.as_ref().map(|t| t.1),
-                                api_version,
-                            })
-                            .await
-                        {
-                            tracing::warn!(%client_id, error = %e, "failed to send disconnect notification");
-                        }
+                        tracing::debug!(%client_id, err = %err, "client request error");
+                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                         return Err(err)
                     },
                 }
             }
             msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut server_sink).await } => {
-                let active_listeners = contract_updates.clone();
-                if let Some(NewSubscription { key, callback }) = msg? {
+                let msg = match msg {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        return Err(err);
+                    }
+                };
+                if let Some(NewSubscription { key, callback }) = msg {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
+                    let active_listeners = contract_updates.clone();
                     let active_listeners = &mut *active_listeners.lock().await;
                     active_listeners.push_back((key, callback));
                 }
             }
             response = listeners_task => {
-                let response = response?;
+                let response = match response {
+                    Ok(r) => r,
+                    Err(err) => {
+                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        return Err(err);
+                    }
+                };
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
                 let serialized_res = match encoding_protoc {
                     EncodingProtocol::Flatbuffers => match response {
-                        Ok(res) => res.into_fbs_bytes()?,
-                        Err(err) => err.into_fbs_bytes()?,
+                        Ok(res) => match res.into_fbs_bytes() {
+                            Ok(b) => b,
+                            Err(err) => {
+                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                return Err(err.into());
+                            }
+                        },
+                        Err(err) => match err.into_fbs_bytes() {
+                            Ok(b) => b,
+                            Err(err) => {
+                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                return Err(err.into());
+                            }
+                        },
                     },
-                    EncodingProtocol::Native => bincode::serialize(&response)?,
+                    EncodingProtocol::Native => match bincode::serialize(&response) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            return Err(err.into());
+                        }
+                    },
                 };
-                server_sink.send(Message::Binary(serialized_res.into())).await.inspect_err(|err| {
-                    tracing::debug!(err = %err, "error sending message to client");
-                })?;
+                if let Err(err) = server_sink.send(Message::Binary(serialized_res.into())).await {
+                    tracing::debug!(err = %err, "error sending notification to client");
+                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                    return Err(err.into());
+                }
             }
             // Send periodic pings to keep connection alive and prevent idle timeout
             _ = ping_interval.tick() => {
                 tracing::trace!(%client_id, "sending WebSocket ping to keep connection alive");
                 if let Err(err) = server_sink.send(Message::Ping(vec![].into())).await {
-                    tracing::debug!(%client_id, %err, "failed to send ping, connection may be dead");
-                    // Connection is likely dead, clean up and exit
-                    if let Err(e) = request_sender
-                        .send(ClientConnection::Request {
-                            client_id,
-                            req: Box::new(ClientRequest::Disconnect { cause: None }),
-                            auth_token: auth_token.as_ref().map(|t| t.0.clone()),
-                            attested_contract: auth_token.as_ref().map(|t| t.1),
-                            api_version,
-                        })
-                        .await
-                    {
-                        tracing::warn!(%client_id, error = %e, "failed to send disconnect notification");
-                    }
+                    tracing::debug!(%client_id, %err, "ping failed, connection dead");
+                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                     return Err(err.into());
                 }
             }

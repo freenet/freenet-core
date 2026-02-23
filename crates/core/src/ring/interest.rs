@@ -1806,6 +1806,47 @@ mod tests {
     }
 
     #[test]
+    fn test_is_upstream_flag_registration() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream_peer = make_peer_key(1);
+        let downstream_peer = make_peer_key(2);
+
+        // Register upstream peer with is_upstream=true
+        manager.register_peer_interest(&contract, upstream_peer.clone(), None, true);
+
+        // Register downstream peer with is_upstream=false
+        manager.register_peer_interest(&contract, downstream_peer.clone(), None, false);
+
+        // Verify the is_upstream flag is preserved correctly
+        let upstream_interest = manager
+            .get_peer_interest(&contract, &upstream_peer)
+            .unwrap();
+        assert!(
+            upstream_interest.is_upstream,
+            "Peer registered with is_upstream=true should have is_upstream=true"
+        );
+
+        let downstream_interest = manager
+            .get_peer_interest(&contract, &downstream_peer)
+            .unwrap();
+        assert!(
+            !downstream_interest.is_upstream,
+            "Peer registered with is_upstream=false should have is_upstream=false"
+        );
+
+        // Verify get_interested_peers returns both with correct flags
+        let peers = manager.get_interested_peers(&contract);
+        assert_eq!(peers.len(), 2);
+
+        let upstream_entry = peers.iter().find(|(k, _)| k == &upstream_peer).unwrap();
+        assert!(upstream_entry.1.is_upstream);
+
+        let downstream_entry = peers.iter().find(|(k, _)| k == &downstream_peer).unwrap();
+        assert!(!downstream_entry.1.is_upstream);
+    }
+
+    #[test]
     fn test_register_peer_interest_resets_ttl() {
         // Verify that register_peer_interest resets TTL for existing entries.
         // The heartbeat relies on this for new-entry registration.

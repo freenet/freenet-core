@@ -1046,3 +1046,34 @@ fn test_subscribe_renewal_reports_outcome() {
         _ => panic!("Expected ContractOpSuccessUntimed for renewal subscribe"),
     }
 }
+
+// =============================================================================
+// Upstream Unsubscribe Tests
+// =============================================================================
+
+/// Verify that create_unsubscribe_op produces the correct routing state.
+///
+/// This is the only non-trivial unit test for the unsubscribe message path:
+/// it validates that the temporary operation created for routing carries the
+/// correct target address so `peek_next_hop_addr` can resolve it.
+#[test]
+fn test_create_unsubscribe_op() {
+    let instance_id = ContractInstanceId::new([77u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+    let target_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    let op = create_unsubscribe_op(instance_id, tx, target_addr);
+
+    assert_eq!(op.id, tx);
+    assert!(!op.is_renewal);
+
+    match &op.state {
+        SubscribeState::AwaitingResponse(data) => {
+            assert_eq!(data.next_hop, Some(target_addr));
+            assert_eq!(data.instance_id, instance_id);
+        }
+        other => panic!("Expected AwaitingResponse state, got {:?}", other),
+    }
+
+    assert_eq!(op.get_next_hop_addr(), Some(target_addr));
+}

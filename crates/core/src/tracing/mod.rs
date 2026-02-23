@@ -1127,6 +1127,21 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
+            NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe {
+                id,
+                instance_id,
+            })) => {
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone());
+                EventKind::Subscribe(SubscribeEvent::UnsubscribeSent {
+                    id: *id,
+                    instance_id: *instance_id,
+                    from: own_loc.clone(),
+                    to,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             _ => EventKind::Ignored,
         };
         Either::Left(NetEventLog {
@@ -1139,6 +1154,7 @@ impl<'a> NetEventLog<'a> {
     pub fn from_inbound_msg_v1(
         msg: &'a NetMessageV1,
         op_manager: &'a OpManager,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Either<Self, Vec<Self>> {
         let connection_count = op_manager.ring.connection_manager.connection_count();
         let is_gateway = op_manager.ring.connection_manager.is_gateway();
@@ -1380,6 +1396,19 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer, // We are the target
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
+                })
+            }
+            NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe { id, instance_id }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                let from = source_addr
+                    .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| this_peer.clone());
+                EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived {
+                    id: *id,
+                    instance_id: *instance_id,
+                    from,
+                    at: this_peer,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             NetMessageV1::Connect(_)
@@ -2670,6 +2699,28 @@ impl EventKind {
         matches!(self, EventKind::Connect(_))
     }
 
+    /// Returns the contract instance id if this is an UnsubscribeReceived event.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn unsubscribe_received_instance_id(&self) -> Option<&ContractInstanceId> {
+        match self {
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeReceived { instance_id, .. }) => {
+                Some(instance_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the contract instance id if this is an UnsubscribeSent event.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn unsubscribe_sent_instance_id(&self) -> Option<&ContractInstanceId> {
+        match self {
+            EventKind::Subscribe(SubscribeEvent::UnsubscribeSent { instance_id, .. }) => {
+                Some(instance_id)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -3389,6 +3440,28 @@ pub(crate) enum SubscribeEvent {
     _Reserved9,
     #[doc(hidden)]
     _Reserved10,
+    /// An explicit Unsubscribe message was sent upstream for fast cleanup.
+    UnsubscribeSent {
+        id: Transaction,
+        /// Contract instance being unsubscribed from.
+        instance_id: ContractInstanceId,
+        /// The peer sending the unsubscribe.
+        from: PeerKeyLocation,
+        /// The upstream peer receiving the unsubscribe.
+        to: PeerKeyLocation,
+        timestamp: u64,
+    },
+    /// An explicit Unsubscribe message was received from a downstream peer.
+    UnsubscribeReceived {
+        id: Transaction,
+        /// Contract instance being unsubscribed from.
+        instance_id: ContractInstanceId,
+        /// The downstream peer that sent the unsubscribe.
+        from: PeerKeyLocation,
+        /// This peer (the upstream that received it).
+        at: PeerKeyLocation,
+        timestamp: u64,
+    },
 }
 
 impl SubscribeEvent {
@@ -3406,7 +3479,9 @@ impl SubscribeEvent {
             | SubscribeEvent::_Reserved7
             | SubscribeEvent::_Reserved8
             | SubscribeEvent::_Reserved9
-            | SubscribeEvent::_Reserved10 => None,
+            | SubscribeEvent::_Reserved10
+            | SubscribeEvent::UnsubscribeSent { .. }
+            | SubscribeEvent::UnsubscribeReceived { .. } => None,
         }
     }
 }
