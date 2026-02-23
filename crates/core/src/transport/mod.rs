@@ -26,10 +26,8 @@ use tokio::net::UdpSocket;
 /// Global flag set by transport layer when a version mismatch is detected.
 static VERSION_MISMATCH_DETECTED: AtomicBool = AtomicBool::new(false);
 
-/// Generation counter incremented on each new version mismatch signal.
-/// The update check task compares this against its last-seen value to detect
-/// fresh mismatches and reset backoff state (prevents stale disk state from
-/// causing the node to skip GitHub checks entirely).
+/// Generation counter incremented on each `signal_version_mismatch()` call.
+/// The update check task uses this to detect fresh mismatches and reset backoff.
 static VERSION_MISMATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Signal that a version mismatch was detected with another peer.
@@ -56,26 +54,17 @@ pub fn clear_version_mismatch() {
     VERSION_MISMATCH_DETECTED.store(false, Ordering::SeqCst);
 }
 
-// =============================================================================
-// Open connection count (for update check task)
-// =============================================================================
-//
-// The update check task needs to know if the node has zero ring connections
-// to decide whether to trust a gateway version mismatch signal when the
-// GitHub check keeps failing. Updated by the connection_maintenance loop.
-
-/// Global counter of open ring connections, updated by connection_maintenance.
+/// Global counter of open ring connections, updated by `connection_maintenance`.
+/// The update check task reads this to decide whether to trust a gateway
+/// version mismatch signal when the GitHub check keeps failing.
 static OPEN_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Update the global open connection count.
-/// Called from the connection_maintenance loop.
+/// Update the global open connection count (called from `connection_maintenance`).
 pub fn set_open_connection_count(count: usize) {
     OPEN_CONNECTION_COUNT.store(count, Ordering::SeqCst);
 }
 
 /// Get the current open connection count.
-/// Used by the update check task to decide whether to trust a gateway
-/// version mismatch when the GitHub check fails.
 pub fn get_open_connection_count() -> usize {
     OPEN_CONNECTION_COUNT.load(Ordering::SeqCst)
 }

@@ -19,7 +19,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-// Re-export version mismatch detection and connection count from transport layer
 pub use freenet::transport::{
     clear_version_mismatch, get_open_connection_count, has_version_mismatch,
     version_mismatch_generation,
