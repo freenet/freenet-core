@@ -5714,6 +5714,17 @@ fn test_isolated_node_rebootstraps_via_gateway() {
         convergence.diverged.len()
     );
 
+    // Hard assertion: the isolated node must have re-bootstrapped and
+    // converged state. Without the gateway bootstrap fallback, the node
+    // stays permanently disconnected and contracts diverge.
+    assert!(
+        convergence.diverged.is_empty(),
+        "Isolated node failed to re-bootstrap: {} contracts diverged (expected 0). \
+         This indicates the gateway bootstrap fallback in connection_maintenance \
+         did not recover the node after partition heal.",
+        convergence.diverged.len()
+    );
+
     // Run anomaly detection
     let report = rt.block_on(async {
         let logs = logs_handle.lock().await;

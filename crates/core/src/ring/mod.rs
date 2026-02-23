@@ -1828,7 +1828,7 @@ impl Ring {
                         .filter(|gw| {
                             gw.socket_addr()
                                 .map(|addr| !backoff.is_in_backoff(addr))
-                                .unwrap_or(true)
+                                .unwrap_or(false) // skip gateways without addresses
                         })
                         .cloned()
                         .collect()
