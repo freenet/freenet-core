@@ -448,6 +448,17 @@ async fn complete_local_subscription(
         "Local subscription completed - client will receive updates via executor notification channel"
     );
 
+    // Register local interest so that ChangeInterests from peers get properly
+    // processed. This enables bidirectional interest discovery: when peers
+    // announce they seed this contract via ChangeInterests, our has_local_interest()
+    // check will pass, and we'll register their peer interest, enabling direct
+    // update broadcasts from them to us.
+    let became_interested = !op_manager.interest_manager.has_local_interest(&key);
+    op_manager.interest_manager.register_local_interest(&key);
+    if became_interested {
+        super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+    }
+
     // Notify client layer that subscription is complete.
     // The actual update delivery happens through the executor's update_notifications
     // when contract state changes, not through network broadcast targets.
@@ -1168,6 +1179,23 @@ impl Operation for SubscribeOp {
                             } else {
                                 // We're the originator - return completed state for handle_op_result
                                 tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
+
+                                // Register local interest so that ChangeInterests from peers
+                                // get properly processed. Without this, when other nodes broadcast
+                                // ChangeInterests for contracts they seed, the has_local_interest()
+                                // check in the ChangeInterests handler fails, preventing peer
+                                // interest registration and breaking update propagation.
+                                let became_interested =
+                                    !op_manager.interest_manager.has_local_interest(key);
+                                op_manager.interest_manager.register_local_interest(key);
+                                if became_interested {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        vec![*key],
+                                        vec![],
+                                    )
+                                    .await;
+                                }
 
                                 // Emit telemetry for successful subscription
                                 let own_loc = op_manager.ring.connection_manager.own_location();
