@@ -4,11 +4,6 @@ use freenet_stdlib::client_api::ErrorKind;
 use freenet_stdlib::prelude::ContractInstanceId;
 use std::fmt::{Display, Formatter};
 
-/// Marker string used to identify EmptyRing errors without needing to modify freenet-stdlib.
-/// If this string changes in ring/mod.rs, update it here too.
-const EMPTY_RING_ERROR: &str = "No ring connections found";
-const PEER_NOT_JOINED_ERROR: &str = "PEER_NOT_JOINED";
-
 #[derive(Debug)]
 pub(super) enum WebSocketApiError {
     /// Something went wrong when calling the user repo.
@@ -67,8 +62,7 @@ impl IntoResponse for WebSocketApiError {
     fn into_response(self) -> Response {
         // Check for errors that indicate the peer is still connecting to the network
         if let WebSocketApiError::AxumError { ref error } = self {
-            let error_str = format!("{error}");
-            if error_str.contains(EMPTY_RING_ERROR) || error_str.contains(PEER_NOT_JOINED_ERROR) {
+            if matches!(error, ErrorKind::EmptyRing | ErrorKind::PeerNotJoined) {
                 return (StatusCode::SERVICE_UNAVAILABLE, Html(connecting_page())).into_response();
             }
         }

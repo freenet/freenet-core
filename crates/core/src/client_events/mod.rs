@@ -414,9 +414,14 @@ where
                                 client_id = %cli_id,
                                 "Operation rejected: peer has not joined network yet - client should retry after join"
                             );
-                            (cli_id, Err(ErrorKind::OperationError {
-                                cause: "PEER_NOT_JOINED: peer has not joined the network yet - retry after node joins".into()
-                            }.into()))
+                            (cli_id, Err(ErrorKind::PeerNotJoined.into()))
+                        }
+                        Err(Error::EmptyRing) => {
+                            tracing::warn!(
+                                client_id = %cli_id,
+                                "Operation rejected: no ring connections found - client should retry after connections are established"
+                            );
+                            (cli_id, Err(ErrorKind::EmptyRing.into()))
                         }
                         Err(err) => {
                             tracing::error!(
@@ -542,6 +547,8 @@ enum Error {
     Disconnected,
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
+    #[error("No ring connections found")]
+    EmptyRing,
     #[error("Node error: {0}")]
     Node(String),
     #[error(transparent)]
@@ -558,8 +565,8 @@ impl From<crate::ring::RingError> for Error {
     fn from(err: crate::ring::RingError) -> Self {
         match err {
             crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
+            crate::ring::RingError::EmptyRing => Error::EmptyRing,
             other @ crate::ring::RingError::ConnError(_)
-            | other @ crate::ring::RingError::EmptyRing
             | other @ crate::ring::RingError::NoCachingPeers(_) => Error::Node(other.to_string()),
         }
     }
