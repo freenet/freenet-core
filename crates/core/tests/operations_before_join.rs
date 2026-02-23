@@ -1,6 +1,6 @@
 //! Tests for operations attempted before peer join completes.
 //!
-//! Verifies that PUT, GET, and SUBSCRIBE operations return PEER_NOT_JOINED error
+//! Verifies that PUT, GET, and SUBSCRIBE operations return PeerNotJoined error
 //! when the peer hasn't joined the network yet.
 
 use freenet::{
