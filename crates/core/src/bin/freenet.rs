@@ -254,6 +254,9 @@ async fn run_network_node_with_signals(
                         return;
                     }
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
+                        // Re-read connection count after the await — it may
+                        // have changed during the GitHub HTTP request.
+                        let open_connections = get_open_connection_count();
                         if open_connections == 0 {
                             tracing::warn!(
                                 "Max backoff + 0 connections — \
