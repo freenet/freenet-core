@@ -642,6 +642,7 @@ mod test {
             SecretRemoved,
             LargeContextWritten(usize),
             LargeSecretStored(usize),
+            SecretStoreFailed,
         }
     }
 

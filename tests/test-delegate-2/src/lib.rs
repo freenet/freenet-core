@@ -65,6 +65,8 @@ pub enum OutboundAppMessage {
     LargeContextWritten(usize),
     /// New: Result of large secret store (returns size stored)
     LargeSecretStored(usize),
+    /// Secret store operation failed
+    SecretStoreFailed,
 }
 
 // -- Delegate implementation --
@@ -88,7 +90,14 @@ impl DelegateInterface for Delegate {
                 match message {
                     InboundAppMessage::CreateInboxRequest => {
                         // Store the secret directly via ctx handle
-                        ctx.set_secret(&PRIVATE_KEY, &PRIVATE_KEY);
+                        if !ctx.set_secret(&PRIVATE_KEY, &PRIVATE_KEY) {
+                            let payload =
+                                bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
+                                    .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
+                            return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
+                        }
 
                         let response_msg_content =
                             OutboundAppMessage::CreateInboxResponse(PUB_KEY.to_vec());
@@ -194,7 +203,14 @@ impl DelegateInterface for Delegate {
                     }
 
                     InboundAppMessage::StoreSecret { key, value } => {
-                        ctx.set_secret(&key, &value);
+                        if !ctx.set_secret(&key, &value) {
+                            let payload =
+                                bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
+                                    .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
+                            return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
+                        }
 
                         let response_msg_content = OutboundAppMessage::SecretStored;
                         let payload = bincode::serialize(&response_msg_content)
@@ -231,7 +247,14 @@ impl DelegateInterface for Delegate {
                     InboundAppMessage::StoreLargeSecret { key, size } => {
                         // Generate deterministic data pattern
                         let value: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-                        ctx.set_secret(&key, &value);
+                        if !ctx.set_secret(&key, &value) {
+                            let payload =
+                                bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
+                                    .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
+                            return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
+                        }
 
                         let response_msg_content = OutboundAppMessage::LargeSecretStored(size);
                         let payload = bincode::serialize(&response_msg_content)
