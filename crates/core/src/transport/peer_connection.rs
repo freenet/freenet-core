@@ -542,6 +542,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
+            // If resend_check_sleep was consumed by a previous select iteration
+            // (via .take()) but the resend branch didn't win, refill with a short
+            // delay. This prevents the resend branch from being immediately Ready
+            // on every iteration during retransmission storms, which would starve
+            // inbound packet processing and create an ACK-drop feedback loop.
+            if resend_check_sleep.is_none() {
+                resend_check_sleep = Some(self.time_source.sleep(Duration::from_millis(2)));
+            }
+
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
@@ -1002,8 +1011,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
-                            // Schedule immediate re-check on next select iteration
-                            resend_check_sleep = Some(Box::pin(std::future::ready(())));
+                            // Yield to inbound processing before re-checking. 2ms is negligible
+                            // vs RTO (~600ms) but prevents the resend branch from starving inbound.
+                            resend_check_sleep = Some(self.time_source.sleep(Duration::from_millis(2)));
                             break;
                         }
                     }
