@@ -2363,6 +2363,256 @@ async fn test_high_load_fairness_config(
 }
 
 // =============================================================================
+// Handshake starvation tests (issue #3224)
+// =============================================================================
+
+/// Mock PeerConnectionApi for testing — no real transport needed
+struct MockPeerConnection {
+    addr: std::net::SocketAddr,
+}
+
+impl crate::transport::PeerConnectionApi for MockPeerConnection {
+    fn remote_addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    fn send_message(
+        &mut self,
+        _msg: crate::message::NetMessage,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<u8>, crate::transport::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn set_orphan_stream_registry(
+        &mut self,
+        _registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+    ) {
+    }
+
+    fn send_stream_data(
+        &mut self,
+        _stream_id: crate::transport::peer_connection::StreamId,
+        _data: bytes::Bytes,
+        _metadata: Option<bytes::Bytes>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn pipe_stream_data(
+        &mut self,
+        _outbound_stream_id: crate::transport::peer_connection::StreamId,
+        _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        _metadata: Option<bytes::Bytes>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Mock handshake stream that wraps a receiver, allowing test to inject events
+struct MockHandshakeReceiverStream {
+    rx: mpsc::Receiver<crate::node::network_bridge::handshake::Event>,
+}
+
+impl Stream for MockHandshakeReceiverStream {
+    type Item = crate::node::network_bridge::handshake::Event;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+/// Helper: create a dummy handshake event (InboundConnection)
+fn dummy_handshake_event() -> crate::node::network_bridge::handshake::Event {
+    crate::node::network_bridge::handshake::Event::InboundConnection {
+        transaction: None,
+        peer: None,
+        connection: Box::new(MockPeerConnection {
+            addr: "127.0.0.1:9999".parse().unwrap(),
+        }),
+        transient: false,
+    }
+}
+
+/// Handshake events are delivered under sustained P1 (notification) load.
+/// Before the fix (#3224), handshake was at P5 and would be starved indefinitely
+/// when the notification channel was always ready. After promotion to P2, the
+/// handshake event should appear early in the output sequence.
+#[tokio::test]
+#[test_log::test]
+async fn test_handshake_not_starved_under_notification_load() {
+    const P1_COUNT: usize = 100;
+    const HS_COUNT: usize = 1;
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (hs_tx, hs_rx) = mpsc::channel(HS_COUNT + 1);
+
+    // Pre-fill: 100 P1 messages and 1 handshake event
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    hs_tx.send(dummy_handshake_event()).await.unwrap();
+
+    drop(notif_tx);
+    drop(hs_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        MockHandshakeReceiverStream { rx: hs_rx },
+        node_rx,
+        MockClientStream,
+        MockExecutorStream,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, P1_COUNT + HS_COUNT + 20).await;
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    let total_hs = events.iter().filter(|&&e| e == "handshake").count();
+
+    assert_eq!(total_notif, P1_COUNT, "All P1 messages received");
+    assert_eq!(total_hs, HS_COUNT, "All handshake events received");
+
+    // With strict priority polling, P1 (notification) returns immediately when Ready,
+    // so P2 (handshake) is only reached when P1 is Pending. Since all P1 messages are
+    // pre-filled, handshake is delivered via the Phase 1 anti-starvation force-poll
+    // after MAX_HIGH_PRIORITY_BURST consecutive tier-1 items.
+    //
+    // Before this fix, handshake (at old P5) was NOT in the force-poll group and would
+    // be starved INDEFINITELY. Now it appears at exactly the burst limit.
+    let first_hs_idx = events
+        .iter()
+        .position(|&e| e == "handshake")
+        .expect("Handshake event must exist");
+
+    assert!(
+        first_hs_idx <= burst,
+        "Handshake event at index {} but should appear within {} polls (was starved!)",
+        first_hs_idx,
+        burst
+    );
+
+    assert_eq!(
+        first_hs_idx, burst,
+        "Handshake should appear at exactly index {} (anti-starvation trigger), got {}",
+        burst, first_hs_idx
+    );
+
+    tracing::info!(
+        "Handshake starvation test: handshake at index {}, {} notifications total",
+        first_hs_idx,
+        total_notif
+    );
+}
+
+/// Anti-starvation force-polls handshake even when P1 is continuously ready.
+/// This tests the Phase 1 mechanism — after MAX_HIGH_PRIORITY_BURST consecutive
+/// tier-1 items, the handshake channel is force-polled.
+#[tokio::test]
+#[test_log::test]
+async fn test_anti_starvation_includes_handshake() {
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    // Pre-fill P1 with enough messages to trigger anti-starvation multiple times.
+    // Both handshake and client_tx are in the Phase 1 force-poll group, with
+    // handshake polled first. Verify both are delivered and handshake precedes
+    // client_tx (reflecting force-poll ordering).
+    let p1_count = burst * 3;
+
+    let (notif_tx, notif_rx) = mpsc::channel(p1_count + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (hs_tx, hs_rx) = mpsc::channel(5);
+    let (client_tx, client_rx) = mpsc::channel(5);
+
+    for _ in 0..p1_count {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    hs_tx.send(dummy_handshake_event()).await.unwrap();
+    client_tx.send(dummy_client_tx()).await.unwrap();
+
+    drop(notif_tx);
+    drop(hs_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        MockHandshakeReceiverStream { rx: hs_rx },
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorStream,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, p1_count + 10).await;
+
+    let total_hs = events.iter().filter(|&&e| e == "handshake").count();
+    let total_client = events
+        .iter()
+        .filter(|&&e| e == "client_transaction")
+        .count();
+
+    assert_eq!(total_hs, 1, "Handshake event must be delivered");
+    assert_eq!(total_client, 1, "Client transaction must be delivered");
+
+    // Both should appear well before all P1 messages are drained
+    let hs_idx = events.iter().position(|&e| e == "handshake").unwrap();
+    let client_idx = events
+        .iter()
+        .position(|&e| e == "client_transaction")
+        .unwrap();
+
+    // In Phase 1 force-poll, handshake is polled before client_tx
+    assert!(
+        hs_idx < client_idx,
+        "Handshake (idx={}) should appear before client tx (idx={}) in force-poll order",
+        hs_idx,
+        client_idx
+    );
+}
+
+// =============================================================================
 // Property-based tests (issue #3074)
 // =============================================================================
 

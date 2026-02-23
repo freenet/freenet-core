@@ -87,8 +87,8 @@ where
     executor_transaction_closed: bool,
 
     /// Counts consecutive items returned from Tier-1 (P1-P6) channels.
-    /// When this reaches MAX_HIGH_PRIORITY_BURST, Tier-2 (P7-P8) channels
-    /// are force-polled first to prevent starvation.
+    /// When this reaches MAX_HIGH_PRIORITY_BURST, Tier-2 (P7-P8) and
+    /// the Handshake channel are force-polled first to prevent starvation.
     high_priority_streak: u32,
 }
 
@@ -132,8 +132,9 @@ where
         }
     }
 
-    /// Maximum consecutive Tier-1 (P1-P6) items before force-polling Tier-2 (P7-P8).
-    /// Prevents starvation of client/executor transaction channels under sustained
+    /// Maximum consecutive Tier-1 (P1-P4, P6) items before force-polling protected
+    /// channels (Handshake + Tier-2 P7/P8). Prevents starvation of connection
+    /// lifecycle events and client/executor transactions under sustained
     /// high-priority traffic. See issue #3074.
     pub(crate) const MAX_HIGH_PRIORITY_BURST: u32 = 32;
 }
@@ -156,17 +157,37 @@ where
         // to avoid double-polling in Phase 2.
         let mut tier2_polled_in_phase1 = false;
 
-        // Phase 1: Anti-starvation — force-poll Tier-2 (P7/P8) when the
-        // high-priority streak has reached the burst limit.
+        // Phase 1: Anti-starvation — force-poll Handshake and Tier-2 (P7/P8)
+        // when the high-priority streak has reached the burst limit.
+        // Handshake events are rare but critical for connection lifecycle;
+        // without this protection, sustained notification traffic can
+        // indefinitely starve new peer connections (see #3224).
         let force_low_priority = this.high_priority_streak >= Self::MAX_HIGH_PRIORITY_BURST;
 
         if force_low_priority {
             tracing::debug!(
                 streak = this.high_priority_streak,
-                "Anti-starvation: forcing poll of Tier-2 channels"
+                "Anti-starvation: forcing poll of Handshake + Tier-2 channels"
             );
             tier2_polled_in_phase1 = true;
             crate::config::GlobalTestMetrics::record_anti_starvation_trigger();
+
+            // Force-poll Handshake: connection lifecycle events
+            if !this.handshake_closed {
+                match Pin::new(&mut this.handshake_handler).poll_next(cx) {
+                    Poll::Ready(Some(event)) => {
+                        this.high_priority_streak = 0;
+                        return Poll::Ready(Some(SelectResult::Handshake(Some(event))));
+                    }
+                    Poll::Ready(None) => {
+                        this.handshake_closed = true;
+                        if first_closed_channel.is_none() {
+                            first_closed_channel = Some(SelectResult::Handshake(None));
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
 
             // Force-poll P7: Client transaction handler
             if !this.client_transaction_closed {
@@ -206,9 +227,12 @@ where
                 }
             }
 
-            // Neither P7 nor P8 yielded an item. Decide whether to reset streak:
-            if this.client_transaction_closed && this.executor_transaction_closed {
-                // Both channels are permanently closed — no more Tier-2 items
+            // Neither Handshake, P7, nor P8 yielded an item. Decide whether to reset streak:
+            if this.handshake_closed
+                && this.client_transaction_closed
+                && this.executor_transaction_closed
+            {
+                // All protected channels are permanently closed — no more items
                 // possible. Reset streak so we stop force-polling.
                 this.high_priority_streak = 0;
             }
@@ -218,7 +242,22 @@ where
             // (incrementing streak past MAX) or re-enters Phase 1 directly.
         }
 
-        // Phase 2: Normal priority polling (P1-P6, then P7-P8)
+        // Phase 2: Normal priority polling
+        //
+        // Priority order rationale:
+        //   P1 Notification    — operation state changes, highest volume
+        //   P2 Handshake       — connection lifecycle (rare but blocks new peers)
+        //   P3 Op execution    — operation message dispatch
+        //   P4 Peer connection — established connection events
+        //   P5 Conn bridge     — bridge commands
+        //   P6 Node controller — node-level events
+        //   P7 Client tx       — client API transactions (protected by anti-starvation)
+        //   P8 Executor tx     — executor transactions (protected by anti-starvation)
+        //
+        // Handshake was promoted from P5→P2 to prevent notification traffic
+        // from starving new peer connections on loaded gateways (#3224).
+        // It is also protected by the Phase 1 anti-starvation mechanism
+        // as a safety net (skip in Phase 2 if already polled in Phase 1).
 
         // Priority 1: Notification channel (highest priority)
         if !this.notification_closed {
@@ -237,7 +276,25 @@ where
             }
         }
 
-        // Priority 2: Op execution
+        // Priority 2: Handshake handler — connection lifecycle events
+        // Skip if already polled during Phase 1 force-poll
+        if !tier2_polled_in_phase1 && !this.handshake_closed {
+            match Pin::new(&mut this.handshake_handler).poll_next(cx) {
+                Poll::Ready(Some(event)) => {
+                    this.high_priority_streak += 1;
+                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))));
+                }
+                Poll::Ready(None) => {
+                    this.handshake_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::Handshake(None));
+                    }
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        // Priority 3: Op execution
         if !this.op_execution_closed {
             match Pin::new(&mut this.op_execution).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
@@ -254,7 +311,7 @@ where
             }
         }
 
-        // Priority 3: Peer connection events
+        // Priority 4: Peer connection events
         if !this.conn_events_closed {
             match Pin::new(&mut this.conn_events).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
@@ -271,7 +328,7 @@ where
             }
         }
 
-        // Priority 4: Connection bridge
+        // Priority 5: Connection bridge
         if !this.conn_bridge_closed {
             match Pin::new(&mut this.conn_bridge).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
@@ -282,23 +339,6 @@ where
                     this.conn_bridge_closed = true;
                     if first_closed_channel.is_none() {
                         first_closed_channel = Some(SelectResult::ConnBridge(None));
-                    }
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        // Priority 5: Handshake handler (implements Stream directly)
-        if !this.handshake_closed {
-            match Pin::new(&mut this.handshake_handler).poll_next(cx) {
-                Poll::Ready(Some(event)) => {
-                    this.high_priority_streak += 1;
-                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))));
-                }
-                Poll::Ready(None) => {
-                    this.handshake_closed = true;
-                    if first_closed_channel.is_none() {
-                        first_closed_channel = Some(SelectResult::Handshake(None));
                     }
                 }
                 Poll::Pending => {}
