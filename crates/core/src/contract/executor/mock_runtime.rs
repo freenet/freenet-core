@@ -797,7 +797,7 @@ where
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -838,7 +838,7 @@ mod test {
     }
 
     /// Helper to create a test contract with given code bytes
-    fn create_test_contract(code_bytes: &[u8]) -> ContractContainer {
+    pub(crate) fn create_test_contract(code_bytes: &[u8]) -> ContractContainer {
         use freenet_stdlib::prelude::*;
 
         let code = ContractCode::from(code_bytes.to_vec());

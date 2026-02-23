@@ -374,9 +374,13 @@ async fn wasm_conformance_state_and_delta() -> Result<(), Box<dyn std::error::Er
         .update_state(&wasm.contract_key, &params, &current, &updates)?;
     let mock_result = mock.update_state(&wasm.contract_key, &params, &current, &updates)?;
 
+    let wasm_state = wasm_result.unwrap_valid();
+    let mock_state = mock_result.unwrap_valid();
+    assert_eq!(wasm_state.as_ref(), mock_state.as_ref());
     assert_eq!(
-        wasm_result.unwrap_valid().as_ref(),
-        mock_result.unwrap_valid().as_ref(),
+        wasm_state.as_ref(),
+        state_part.as_ref(),
+        "StateAndDelta must use the State part"
     );
     Ok(())
 }
