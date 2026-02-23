@@ -2,8 +2,7 @@
 //!
 //! This module provides a hybrid channel that combines:
 //! - **crossbeam::channel** for fast, lock-free message passing (~2x faster than tokio::sync::mpsc)
-//! - **Exponential backoff** (1µs to 50ms) for async receive polling
-//! - **tokio::sync::Notify** for instant sender-disconnect detection
+//! - **tokio::sync::Notify** for instant wakeup on data arrival and sender-disconnect detection
 //!
 //! # Performance
 //!
@@ -135,7 +134,10 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self.inner.send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::SendError(msg)) => Err(SendError(msg)),
         }
     }
@@ -148,6 +150,7 @@ impl<T> FastSender<T> {
         loop {
             match self.inner.try_send(msg) {
                 Ok(()) => {
+                    self.recv_notify.notify_one();
                     return Ok(());
                 }
                 Err(crossbeam::channel::TrySendError::Full(returned)) => {
@@ -169,7 +172,10 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         match self.inner.try_send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::TrySendError::Full(msg)) => Err(TrySendError::Full(msg)),
             Err(crossbeam::channel::TrySendError::Disconnected(msg)) => {
                 Err(TrySendError::Disconnected(msg))
@@ -225,16 +231,11 @@ impl<T> FastReceiver<T> {
     /// Receives a message asynchronously.
     ///
     /// This is the primary receive method for async contexts.
-    /// Uses exponential backoff (1µs to 50ms) when the channel is empty,
-    /// with instant wakeup via [`Notify`] when all senders disconnect.
-    ///
-    /// The 50ms cap keeps idle-channel overhead low (~20 polls/sec per
-    /// channel) while maintaining sub-millisecond latency for active
-    /// connections (backoff resets to 1µs on each successful receive).
+    /// Senders call `recv_notify.notify_one()` on every successful send,
+    /// so this method wakes instantly when data arrives — zero CPU when idle,
+    /// no polling backoff needed. Sender `Drop` also fires `notify_one()`
+    /// so the receiver can detect disconnection.
     pub async fn recv_async(&self) -> Result<T, RecvError> {
-        let mut backoff_us = 1u64;
-        const MAX_BACKOFF_US: u64 = 50_000; // 50ms max
-
         loop {
             #[cfg(test)]
             self.poll_count.fetch_add(1, Ordering::Relaxed);
@@ -246,17 +247,10 @@ impl<T> FastReceiver<T> {
                     return Ok(msg);
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // Wait with exponential backoff, but also listen for
-                    // sender disconnection via Notify (fired from Drop).
-                    tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep(std::time::Duration::from_micros(backoff_us)) => {
-                            backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
-                        }
-                        _ = self.recv_notify.notified() => {
-                            // Sender disconnected (or spurious wake) — recheck channel
-                        }
-                    }
+                    // Wait for sender notification (data available or disconnect).
+                    // Notify::notify_one() stores a permit if no waiter exists,
+                    // so rapid sends between checks won't be missed.
+                    self.recv_notify.notified().await;
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
                     return Err(RecvError);
@@ -445,9 +439,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_async_no_busy_loop() {
-        // Verify recv_async uses exponential backoff, not tight-loop polling.
-        // With 50ms max backoff and a 1-second wait, we expect ~30 iterations
-        // (exponential series 1us..50ms plus steady-state at 50ms).
+        // Verify recv_async uses notification-based wakeup, not tight-loop polling.
+        // With notification from senders, we expect ~2 iterations:
+        // one initial try_recv (empty), then one after the notify wakes us.
         let (tx, rx) = bounded::<i32>(10);
 
         // Spawn sender that waits 1 second before sending
@@ -462,13 +456,12 @@ mod tests {
 
         sender.await.unwrap();
 
-        // With 50ms max backoff over ~1s, expect ~30-35 iterations:
-        // ~17 during exponential ramp-up (1us to 50ms ≈ 100ms total)
-        // ~18 at steady-state (900ms / 50ms)
+        // With notification-based wakeup, expect very few iterations (~2):
+        // 1 initial try_recv (empty) + 1 after notify wakes the receiver
         let polls = rx.poll_count();
         assert!(
-            polls < 100,
-            "Too many poll iterations ({polls}), backoff may not be working"
+            polls < 10,
+            "Too many poll iterations ({polls}), notification wakeup may not be working"
         );
         assert!(polls > 0, "Should have polled at least once");
     }

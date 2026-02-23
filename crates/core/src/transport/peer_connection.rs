@@ -950,6 +950,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                 },
                 _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
+                    // Bound retransmissions per iteration to prevent monopolizing the
+                    // select loop. Remaining resends are handled on the next iteration
+                    // via an immediate-ready future.
+                    const MAX_RESENDS_PER_ITERATION: usize = 4;
+                    let mut resend_count = 0;
                     loop {
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
@@ -978,6 +983,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // When the retransmitted packet is ACKed, on_ack_without_rtt() will decrement
                                 // flightsize once, maintaining correct accounting.
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                resend_count += 1;
+                                if resend_count >= MAX_RESENDS_PER_ITERATION {
+                                    // Schedule immediate re-check on next select iteration
+                                    resend_check_sleep = Some(Box::pin(std::future::ready(())));
+                                    break;
+                                }
                             }
                             ResendAction::TlpProbe(idx, packet) => {
                                 // TLP (Tail Loss Probe) - send probe to detect tail loss earlier
@@ -996,6 +1007,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                                 // Re-register packet for RTO tracking if TLP doesn't get ACKed
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                resend_count += 1;
+                                if resend_count >= MAX_RESENDS_PER_ITERATION {
+                                    // Schedule immediate re-check on next select iteration
+                                    resend_check_sleep = Some(Box::pin(std::future::ready(())));
+                                    break;
+                                }
                             }
                         }
                     }
