@@ -183,19 +183,19 @@ jobs:
 
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
       # With simulation-mode timer optimizations (~5x fewer timer firings),
-      # estimated ~30-40 min for 500 nodes × 5000 events.
+      # completes in ~4 min locally for 10000 events.
       - name: Large scale test (500 nodes)
         timeout-minutes: 60
         env:
           RUST_LOG: warn
         run: |
-          echo "Running large scale simulation (500 nodes, 5000 events)"
+          echo "Running large scale simulation (500 nodes, 10000 events)"
           target/release/fdev test \
             --name "nightly-large-500" \
             --seed 0x500BEEF \
             --gateways 10 \
             --nodes 490 \
-            --events 5000 \
+            --events 10000 \
             --ring-max-htl 15 \
             --max-connections 30 \
             --min-connections 10 \
