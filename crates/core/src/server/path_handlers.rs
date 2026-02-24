@@ -1,4 +1,9 @@
 //! Handle the `web` part of the bundles.
+//!
+//! Contract web apps are served inside sandboxed iframes to provide origin isolation.
+//! The gateway returns a "shell" page that holds the auth token and proxies WebSocket
+//! connections via postMessage, while the contract runs in an `<iframe sandbox="allow-scripts">`
+//! with an opaque origin that cannot access other contracts' data.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +30,7 @@ pub(super) async fn contract_home(
     request_sender: HttpClientApiRequest,
     assigned_token: AuthToken,
     api_version: ApiVersion,
+    query_string: Option<String>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
         "contract_home: Converting string key to ContractInstanceId: {}",
@@ -137,12 +143,15 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                match get_web_body(&path, &assigned_token, &key, api_version).await {
+                // Return the shell page instead of the contract HTML directly.
+                // The shell page wraps the contract in a sandboxed iframe for
+                // origin isolation (GHSA-824h-7x5x-wfmf).
+                match shell_page(&assigned_token, &key, api_version, query_string) {
                     Ok(b) => b.into_response(),
                     Err(err) => {
-                        tracing::error!("Failed to read webapp after unpacking: {err}");
+                        tracing::error!("Failed to generate shell page: {err}");
                         return Err(WebSocketApiError::NodeError {
-                            error_cause: format!("Failed to read webapp: {err}"),
+                            error_cause: format!("Failed to generate shell page: {err}"),
                         });
                     }
                 }
@@ -261,19 +270,89 @@ pub(super) async fn variable_content(
         .map(|r| r.into_response())
 }
 
-#[instrument(level = "debug", skip(auth_token))]
-async fn get_web_body(
-    path: &Path,
+/// Generates the shell page HTML that wraps the contract in a sandboxed iframe.
+///
+/// The shell page holds the auth token and proxies WebSocket connections via
+/// postMessage, providing origin isolation between contracts.
+fn shell_page(
     auth_token: &AuthToken,
     contract_key: &str,
     api_version: ApiVersion,
+    query_string: Option<String>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
-    debug!(
-        "get_web_body: Attempting to read index.html from path: {:?}",
-        path
+    let version_prefix = api_version.prefix();
+    let base_path = format!("/{version_prefix}/contract/web/{contract_key}/");
+
+    // Build the iframe src URL: same path with __sandbox=1 plus any original query params
+    let mut iframe_params = vec!["__sandbox=1".to_string()];
+    if let Some(qs) = &query_string {
+        // Forward the original query params (e.g., ?invitation=...) to the iframe
+        for param in qs.split('&') {
+            if !param.is_empty() && !param.starts_with("__sandbox") {
+                iframe_params.push(param.to_string());
+            }
+        }
+    }
+    let iframe_src = format!("{}?{}", base_path, iframe_params.join("&"));
+
+    // Safety: auth_token is base58 (alphanumeric only), contract_key is base58,
+    // iframe_src is composed from controlled values. No HTML escaping needed.
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freenet Contract</title>
+<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
+</head>
+<body>
+<iframe id="app" sandbox="allow-scripts allow-forms" src="{iframe_src}"></iframe>
+<script>
+{SHELL_BRIDGE_JS}
+</script>
+<script>freenetBridge("{auth_token}");</script>
+</body>
+</html>"##,
+        iframe_src = iframe_src,
+        auth_token = auth_token.as_str(),
+        SHELL_BRIDGE_JS = SHELL_BRIDGE_JS,
     );
+
+    Ok(Html(html))
+}
+
+/// Serves the contract's actual HTML content for display inside the sandboxed iframe.
+///
+/// This is called when the iframe requests `?__sandbox=1`. It reads the cached
+/// contract HTML, rewrites asset paths, and injects the WebSocket shim that
+/// routes connections through the shell page's postMessage bridge.
+#[instrument(level = "debug")]
+pub(super) async fn serve_sandbox_content(
+    key: String,
+    api_version: ApiVersion,
+) -> Result<impl IntoResponse, WebSocketApiError> {
+    debug!("serve_sandbox_content: serving iframe content for key: {key}");
+    let instance_id =
+        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+            error_cause: format!("{err}"),
+        })?;
+    let path = contract_web_path(&instance_id);
+    if !path.exists() {
+        return Err(WebSocketApiError::NodeError {
+            error_cause: format!("Contract not cached yet: {key}"),
+        });
+    }
+    sandbox_content_body(&path, &key, api_version).await
+}
+
+/// Reads the contract's index.html, rewrites paths, and injects the WebSocket shim.
+async fn sandbox_content_body(
+    path: &Path,
+    contract_key: &str,
+    api_version: ApiVersion,
+) -> Result<impl IntoResponse, WebSocketApiError> {
     let web_path = path.join("index.html");
-    debug!("get_web_body: Full web path: {:?}", web_path);
     let mut key_file = File::open(&web_path)
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -293,31 +372,209 @@ async fn get_web_body(
     // Rewrite root-relative asset paths so they resolve under the contract's web prefix.
     // Dioxus generates paths like /./assets/app.js which browsers normalize to /assets/app.js
     // (root-relative). These bypass the /v1/contract/web/{key}/ prefix and 404.
-    // Safety: contract_key is a base58-encoded contract ID (alphanumeric only).
     let version_prefix = api_version.prefix();
     let prefix = format!("/{version_prefix}/contract/web/{contract_key}/");
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
 
-    // Inject auth token into HTML so web apps can access it without re-fetching.
-    // Safety: AuthToken uses base58 encoding which only produces alphanumeric characters
-    // (0-9, A-Z, a-z excluding 0, O, I, l), so no escaping is needed for the JavaScript string.
-    let token_script = format!(
-        r#"<script>window.__FREENET_AUTH_TOKEN__ = "{}";</script>"#,
-        auth_token.as_str()
-    );
+    // Inject the WebSocket shim before any other scripts. The shim overrides
+    // window.WebSocket so that wasm-bindgen (which calls `new WebSocket(url)` from
+    // global scope at call time) routes connections through the shell page's bridge.
+    let shim_script = format!("<script>{WEBSOCKET_SHIM_JS}</script>");
     if let Some(pos) = body.find("</head>") {
-        body.insert_str(pos, &token_script);
+        body.insert_str(pos, &shim_script);
     } else if let Some(pos) = body.find("<body") {
-        // Fallback: insert before <body> if no </head>
-        body.insert_str(pos, &token_script);
+        body.insert_str(pos, &shim_script);
     } else {
-        // Last resort: prepend to document
-        body = format!("{token_script}{body}");
+        body = format!("{shim_script}{body}");
     }
 
     Ok(Html(body))
 }
+
+/// JavaScript for the shell page's postMessage bridge.
+///
+/// The bridge listens for WebSocket requests from the sandboxed iframe,
+/// creates real WebSocket connections with the auth token injected, and
+/// forwards messages in both directions. Only allows connections to the
+/// gateway itself (same origin) to prevent the contract from using the
+/// bridge as an open proxy to other localhost services.
+const SHELL_BRIDGE_JS: &str = r#"
+function freenetBridge(authToken) {
+  'use strict';
+  var GATEWAY_ORIGIN = location.origin;
+  var iframe = document.getElementById('app');
+  var connections = new Map();
+
+  window.addEventListener('message', function(event) {
+    if (event.source !== iframe.contentWindow) return;
+    var msg = event.data;
+    if (!msg || !msg.__freenet_ws__) return;
+
+    switch (msg.type) {
+      case 'open': {
+        // Security: only allow WebSocket connections to the gateway itself
+        try {
+          var u = new URL(msg.url);
+          var wsOrigin = u.protocol.replace('ws', 'http') + '//' + u.host;
+          if (wsOrigin !== GATEWAY_ORIGIN) {
+            iframe.contentWindow.postMessage({
+              __freenet_ws__: true, type: 'error', id: msg.id
+            }, '*');
+            return;
+          }
+        } catch(e) {
+          iframe.contentWindow.postMessage({
+            __freenet_ws__: true, type: 'error', id: msg.id
+          }, '*');
+          return;
+        }
+        // Inject auth token into the WebSocket URL
+        u.searchParams.set('authToken', authToken);
+        var ws = new WebSocket(u.toString(), msg.protocols || undefined);
+        ws.binaryType = 'arraybuffer';
+        connections.set(msg.id, ws);
+
+        ws.onopen = function() {
+          iframe.contentWindow.postMessage({
+            __freenet_ws__: true, type: 'open', id: msg.id
+          }, '*');
+        };
+        ws.onmessage = function(e) {
+          var transfer = e.data instanceof ArrayBuffer ? [e.data] : [];
+          iframe.contentWindow.postMessage({
+            __freenet_ws__: true, type: 'message', id: msg.id, data: e.data
+          }, '*', transfer);
+        };
+        ws.onclose = function(e) {
+          iframe.contentWindow.postMessage({
+            __freenet_ws__: true, type: 'close', id: msg.id,
+            code: e.code, reason: e.reason
+          }, '*');
+          connections.delete(msg.id);
+        };
+        ws.onerror = function() {
+          iframe.contentWindow.postMessage({
+            __freenet_ws__: true, type: 'error', id: msg.id
+          }, '*');
+        };
+        break;
+      }
+      case 'send': {
+        var ws = connections.get(msg.id);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(msg.data);
+        }
+        break;
+      }
+      case 'close': {
+        var ws = connections.get(msg.id);
+        if (ws) {
+          ws.close(msg.code, msg.reason);
+          connections.delete(msg.id);
+        }
+        break;
+      }
+    }
+  });
+}
+"#;
+
+/// JavaScript WebSocket shim injected into the sandboxed iframe content.
+///
+/// Overrides `window.WebSocket` so that `web_sys::WebSocket::new()` (which
+/// compiles to `new WebSocket(url)` via wasm-bindgen, resolving from global
+/// scope at call time) is intercepted and routed through postMessage to the
+/// shell page's bridge.
+const WEBSOCKET_SHIM_JS: &str = r#"
+(function() {
+  'use strict';
+  var wsInstances = new Map();
+  var idCounter = 0;
+
+  function FreenetWebSocket(url, protocols) {
+    this._id = '__fws_' + (++idCounter);
+    this.url = url;
+    this.readyState = 0;
+    this.bufferedAmount = 0;
+    this.extensions = '';
+    this.protocol = '';
+    this.binaryType = 'blob';
+    this.onopen = null;
+    this.onmessage = null;
+    this.onclose = null;
+    this.onerror = null;
+    this._listeners = {};
+    wsInstances.set(this._id, this);
+    window.parent.postMessage({
+      __freenet_ws__: true, type: 'open', id: this._id,
+      url: url, protocols: protocols
+    }, '*');
+  }
+  FreenetWebSocket.CONNECTING = 0;
+  FreenetWebSocket.OPEN = 1;
+  FreenetWebSocket.CLOSING = 2;
+  FreenetWebSocket.CLOSED = 3;
+  FreenetWebSocket.prototype.send = function(data) {
+    if (this.readyState !== 1) throw new DOMException('WebSocket is not open', 'InvalidStateError');
+    var transfer = data instanceof ArrayBuffer ? [data] : [];
+    window.parent.postMessage({
+      __freenet_ws__: true, type: 'send', id: this._id, data: data
+    }, '*', transfer);
+  };
+  FreenetWebSocket.prototype.close = function(code, reason) {
+    if (this.readyState >= 2) return;
+    this.readyState = 2;
+    window.parent.postMessage({
+      __freenet_ws__: true, type: 'close', id: this._id, code: code, reason: reason
+    }, '*');
+  };
+  FreenetWebSocket.prototype.addEventListener = function(type, listener) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(listener);
+  };
+  FreenetWebSocket.prototype.removeEventListener = function(type, listener) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(function(l) { return l !== listener; });
+  };
+  FreenetWebSocket.prototype.dispatchEvent = function(event) {
+    var handler = this['on' + event.type];
+    if (handler) handler.call(this, event);
+    var listeners = this._listeners[event.type];
+    if (listeners) for (var i = 0; i < listeners.length; i++) listeners[i].call(this, event);
+    return true;
+  };
+
+  window.addEventListener('message', function(event) {
+    var msg = event.data;
+    if (!msg || !msg.__freenet_ws__) return;
+    var ws = wsInstances.get(msg.id);
+    if (!ws) return;
+    switch (msg.type) {
+      case 'open':
+        ws.readyState = 1;
+        ws.dispatchEvent(new Event('open'));
+        break;
+      case 'message':
+        var data = msg.data;
+        if (ws.binaryType === 'blob' && data instanceof ArrayBuffer) data = new Blob([data]);
+        ws.dispatchEvent(new MessageEvent('message', { data: data }));
+        break;
+      case 'close':
+        ws.readyState = 3;
+        ws.dispatchEvent(new CloseEvent('close', { code: msg.code, reason: msg.reason, wasClean: true }));
+        wsInstances.delete(msg.id);
+        break;
+      case 'error':
+        ws.dispatchEvent(new Event('error'));
+        break;
+    }
+  });
+
+  window.WebSocket = FreenetWebSocket;
+  if (typeof globalThis !== 'undefined') globalThis.WebSocket = FreenetWebSocket;
+})();
+"#;
 
 /// Extracts the relative file path from a contract web URI.
 ///
@@ -395,8 +652,7 @@ mod tests {
 </html>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
             .await
             .unwrap();
         let body = response.into_response();
@@ -423,10 +679,10 @@ mod tests {
             "original /./assets/ paths still present"
         );
 
-        // Auth token script should also be present
+        // WebSocket shim should be injected instead of raw auth token
         assert!(
-            result.contains("__FREENET_AUTH_TOKEN__"),
-            "auth token not injected"
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected"
         );
     }
 
@@ -437,8 +693,7 @@ mod tests {
         let html = r#"<head><link href="/./assets/app.js"></head><body></body>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, ApiVersion::V2)
+        let response = sandbox_content_body(dir.path(), key, ApiVersion::V2)
             .await
             .unwrap();
         let body = response.into_response();
@@ -465,8 +720,7 @@ mod tests {
         let html = "<head><script src='/./assets/app.js'></script></head>";
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
             .await
             .unwrap();
         let body = response.into_response();
@@ -491,8 +745,7 @@ mod tests {
         let html = r#"<head><link href="/assets/app.css"></head><body></body>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let token = AuthToken::generate();
-        let response = get_web_body(dir.path(), &token, key, ApiVersion::V1)
+        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
             .await
             .unwrap();
         let body = response.into_response();
@@ -505,6 +758,104 @@ mod tests {
         assert!(
             result.contains("\"/assets/app.css\""),
             "path without /. was incorrectly rewritten.\nGot: {result}"
+        );
+    }
+
+    #[test]
+    fn shell_page_contains_iframe_and_bridge() {
+        let token = AuthToken::generate();
+        let response = shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap();
+        let body = response.into_response();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bytes = rt
+            .block_on(axum::body::to_bytes(body.into_body(), 1024 * 1024))
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Shell page must contain sandboxed iframe
+        assert!(
+            html.contains(r#"sandbox="allow-scripts allow-forms"#),
+            "iframe sandbox attribute missing"
+        );
+        // Iframe src must include __sandbox=1
+        assert!(
+            html.contains("__sandbox=1"),
+            "iframe src missing __sandbox=1 param"
+        );
+        // Bridge script must be present
+        assert!(
+            html.contains("freenetBridge"),
+            "bridge script not found in shell page"
+        );
+        // Auth token must NOT be exposed as window.__FREENET_AUTH_TOKEN__
+        assert!(
+            !html.contains("__FREENET_AUTH_TOKEN__"),
+            "auth token exposed in global variable (security risk)"
+        );
+        // Auth token should be passed to the bridge function
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\")", token.as_str())),
+            "auth token not passed to bridge"
+        );
+    }
+
+    #[test]
+    fn shell_page_forwards_query_params_to_iframe() {
+        let token = AuthToken::generate();
+        let qs = Some("invitation=abc123&room=test".to_string());
+        let response = shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap();
+        let body = response.into_response();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bytes = rt
+            .block_on(axum::body::to_bytes(body.into_body(), 1024 * 1024))
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Query params should be forwarded to iframe src
+        assert!(
+            html.contains("invitation=abc123"),
+            "invitation param not forwarded to iframe"
+        );
+        assert!(
+            html.contains("room=test"),
+            "room param not forwarded to iframe"
+        );
+        // __sandbox=1 must always be first
+        assert!(
+            html.contains("?__sandbox=1&"),
+            "__sandbox=1 not first in iframe params"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_injects_ws_shim_not_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let html = r#"<!DOCTYPE html><html><head></head><body>Hello</body></html>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            .await
+            .unwrap();
+        let body = response.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // WS shim must be injected
+        assert!(
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected"
+        );
+        assert!(
+            result.contains("window.WebSocket = FreenetWebSocket"),
+            "WebSocket override not set"
+        );
+        // Auth token must NOT appear in sandbox content
+        assert!(
+            !result.contains("__FREENET_AUTH_TOKEN__"),
+            "auth token leaked into sandbox content"
         );
     }
 
