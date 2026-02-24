@@ -715,13 +715,15 @@ impl ConnectionManager {
         None
     }
 
+    /// Add a connection to the ring topology. Returns `true` if the connection
+    /// was actually inserted, `false` if it was rejected (e.g., capacity cap).
     pub fn add_connection(
         &self,
         loc: Location,
         addr: SocketAddr,
         pub_key: TransportPublicKey,
         was_reserved: bool,
-    ) {
+    ) -> bool {
         tracing::info!(
             addr = %addr,
             peer_location = %loc,
@@ -750,7 +752,7 @@ impl ConnectionManager {
             if was_reserved {
                 self.pending_reservations.write().remove(&addr);
             }
-            return;
+            return false;
         }
 
         if let Some(prev_loc) = previous_location {
@@ -778,13 +780,34 @@ impl ConnectionManager {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc)
                 .or_default()
-                .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
+                .push(Connection::new(PeerKeyLocation::new(pub_key.clone(), addr)));
+        }
+
+        // Verify the insertion actually persisted — detect silent state corruption.
+        let count_after = self.connection_count();
+        let in_location_map = self.location_for_peer.read().contains_key(&addr);
+        if !in_location_map || count_after == 0 {
+            tracing::error!(
+                addr = %addr,
+                peer_location = %loc,
+                connection_count = count_after,
+                in_location_map,
+                "add_connection: INVARIANT VIOLATION - connection not found after insertion"
+            );
+        } else {
+            tracing::info!(
+                addr = %addr,
+                peer_location = %loc,
+                connection_count = count_after,
+                "add_connection: successfully added to ring"
+            );
         }
 
         // Remove from transient connections if present, since we're now a full ring connection.
         if self.transient_connections.remove(&addr).is_some() {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
         }
+        true
     }
 
     pub fn update_peer_identity(
