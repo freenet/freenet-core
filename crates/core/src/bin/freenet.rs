@@ -192,9 +192,23 @@ async fn run_network_node_with_signals(
     //   1. Reset backoff on fresh mismatch (prevents stale disk state)
     //   2. Exit code 42 at max backoff + 0 connections (trusts gateway signal)
     //   3. Hard timeout: 6h isolated with mismatch forces exit regardless
+    //   4. Disabled for dirty builds — `freenet update` replaces the binary with a
+    //      prebuilt release, which would discard local modifications (#3245)
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
+    let auto_update_disabled = !build_info::GIT_DIRTY.is_empty();
     let update_check_task = GlobalExecutor::spawn(async move {
         use std::time::Instant;
+
+        if auto_update_disabled {
+            tracing::info!(
+                git_dirty = build_info::GIT_DIRTY,
+                "Auto-update disabled: this is a dirty (locally modified) build. \
+                 Run `freenet update` manually if needed."
+            );
+            // Don't exit — just sit idle forever so the oneshot channel stays open
+            std::future::pending::<()>().await;
+            return;
+        }
 
         const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
