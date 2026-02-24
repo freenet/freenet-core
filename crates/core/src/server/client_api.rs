@@ -158,6 +158,15 @@ async fn web_home(
         let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
         let mut response = contract_response.into_response();
         add_sandbox_cors_headers(&mut response);
+        // CSP for sandbox content: allow loading resources from the gateway ('self')
+        // but block direct network requests (fetch/XHR) via connect-src 'none'.
+        // WebSocket connections are routed through the postMessage bridge instead.
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(
+                "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src 'none'",
+            ),
+        );
         return Ok(response);
     }
 

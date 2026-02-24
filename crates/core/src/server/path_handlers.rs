@@ -271,6 +271,22 @@ pub(super) async fn variable_content(
         .map(|r| r.into_response())
 }
 
+/// Escapes characters that are dangerous inside an HTML attribute value.
+fn html_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Generates the shell page HTML that wraps the contract in a sandboxed iframe.
 ///
 /// The shell page holds the auth token and proxies WebSocket connections via
@@ -294,10 +310,13 @@ fn shell_page(
             }
         }
     }
-    let iframe_src = format!("{}?{}", base_path, iframe_params.join("&"));
+    let iframe_src_raw = format!("{}?{}", base_path, iframe_params.join("&"));
+    // HTML-escape the iframe src to prevent XSS via crafted query parameters.
+    // While browsers typically percent-encode special chars in URLs, we must not
+    // rely on that for defense-in-depth.
+    let iframe_src = html_escape_attr(&iframe_src_raw);
 
-    // Safety: auth_token is base58 (alphanumeric only), contract_key is base58,
-    // iframe_src is composed from controlled values. No HTML escaping needed.
+    // auth_token is base58 (alphanumeric only), safe for unescaped interpolation.
     let auth_token = auth_token.as_str();
     let html = format!(
         r##"<!DOCTYPE html>
@@ -402,8 +421,13 @@ const SHELL_BRIDGE_JS: &str = r#"
 function freenetBridge(authToken) {
   'use strict';
   var GATEWAY_ORIGIN = location.origin;
+  var MAX_CONNECTIONS = 32;
   var iframe = document.getElementById('app');
   var connections = new Map();
+
+  function sendToIframe(msg) {
+    iframe.contentWindow.postMessage(msg, '*');
+  }
 
   window.addEventListener('message', function(event) {
     if (event.source !== iframe.contentWindow) return;
@@ -412,20 +436,26 @@ function freenetBridge(authToken) {
 
     switch (msg.type) {
       case 'open': {
-        // Security: only allow WebSocket connections to the gateway itself
+        // Limit concurrent connections to prevent resource exhaustion
+        if (connections.size >= MAX_CONNECTIONS) {
+          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+          return;
+        }
+        // Security: only allow WebSocket connections to the gateway itself.
+        // Validate protocol explicitly and compare origin.
         try {
           var u = new URL(msg.url);
-          var wsOrigin = u.protocol.replace('ws', 'http') + '//' + u.host;
-          if (wsOrigin !== GATEWAY_ORIGIN) {
-            iframe.contentWindow.postMessage({
-              __freenet_ws__: true, type: 'error', id: msg.id
-            }, '*');
+          if (u.protocol !== 'ws:' && u.protocol !== 'wss:') {
+            sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+            return;
+          }
+          var httpProto = u.protocol === 'wss:' ? 'https:' : 'http:';
+          if (httpProto + '//' + u.host !== GATEWAY_ORIGIN) {
+            sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
             return;
           }
         } catch(e) {
-          iframe.contentWindow.postMessage({
-            __freenet_ws__: true, type: 'error', id: msg.id
-          }, '*');
+          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
           return;
         }
         // Inject auth token into the WebSocket URL
@@ -435,9 +465,7 @@ function freenetBridge(authToken) {
         connections.set(msg.id, ws);
 
         ws.onopen = function() {
-          iframe.contentWindow.postMessage({
-            __freenet_ws__: true, type: 'open', id: msg.id
-          }, '*');
+          sendToIframe({ __freenet_ws__: true, type: 'open', id: msg.id });
         };
         ws.onmessage = function(e) {
           var transfer = e.data instanceof ArrayBuffer ? [e.data] : [];
@@ -446,16 +474,15 @@ function freenetBridge(authToken) {
           }, '*', transfer);
         };
         ws.onclose = function(e) {
-          iframe.contentWindow.postMessage({
+          sendToIframe({
             __freenet_ws__: true, type: 'close', id: msg.id,
             code: e.code, reason: e.reason
-          }, '*');
+          });
           connections.delete(msg.id);
         };
         ws.onerror = function() {
-          iframe.contentWindow.postMessage({
-            __freenet_ws__: true, type: 'error', id: msg.id
-          }, '*');
+          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+          connections.delete(msg.id);
         };
         break;
       }
@@ -545,6 +572,8 @@ const WEBSOCKET_SHIM_JS: &str = r#"
   };
 
   window.addEventListener('message', function(event) {
+    // Only accept messages from the parent shell page
+    if (event.source !== window.parent) return;
     var msg = event.data;
     if (!msg || !msg.__freenet_ws__) return;
     var ws = wsInstances.get(msg.id);
@@ -844,6 +873,129 @@ mod tests {
         assert!(
             !result.contains("__FREENET_AUTH_TOKEN__"),
             "auth token leaked into sandbox content"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_shim_injected_without_head_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        // HTML with <body> but no </head> tag
+        let html = "<body><div>Hello</div></body>";
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected when no </head> tag"
+        );
+        // Shim should appear before <body
+        let shim_pos = result.find("FreenetWebSocket").unwrap();
+        let body_pos = result.find("<body").unwrap();
+        assert!(
+            shim_pos < body_pos,
+            "shim should be injected before <body> tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_shim_injected_in_minimal_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        // Minimal HTML with no <head> or <body> tags
+        let html = "<div>Hello World</div>";
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected in minimal HTML"
+        );
+        // Shim should be prepended (appears before the content)
+        assert!(
+            result.starts_with("<script>"),
+            "shim should be prepended to content when no head/body tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_page_strips_sandbox_prefixed_params() {
+        let token = AuthToken::generate();
+        let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+
+        // __sandbox-prefixed params must be stripped
+        assert!(
+            !html.contains("__sandbox_extra"),
+            "__sandbox_extra param should be stripped"
+        );
+        assert!(
+            !html.contains("__sandboxFoo"),
+            "__sandboxFoo param should be stripped"
+        );
+        // Normal params should be forwarded
+        assert!(
+            html.contains("invitation=abc"),
+            "normal param should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_page_escapes_html_in_query_params() {
+        let token = AuthToken::generate();
+        let qs = Some("foo=\"><script>alert(1)</script>".to_string());
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+
+        // The double quote and angle brackets must be escaped
+        assert!(
+            !html.contains("\"><script>alert"),
+            "unescaped HTML injection in iframe src"
+        );
+        assert!(
+            html.contains("&quot;"),
+            "double quote should be HTML-escaped"
+        );
+    }
+
+    #[test]
+    fn bridge_js_contains_origin_check() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("GATEWAY_ORIGIN"),
+            "bridge JS must validate WebSocket origin"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("u.protocol !== 'ws:'"),
+            "bridge JS must explicitly check WebSocket protocol"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("MAX_CONNECTIONS"),
+            "bridge JS must limit concurrent connections"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("connections.delete(msg.id)"),
+            "bridge JS must clean up connections"
+        );
+    }
+
+    #[test]
+    fn shim_js_validates_message_source() {
+        assert!(
+            WEBSOCKET_SHIM_JS.contains("event.source !== window.parent"),
+            "shim JS must validate message source"
         );
     }
 
