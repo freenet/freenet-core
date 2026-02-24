@@ -1224,6 +1224,8 @@ impl Ring {
     ///
     /// Returns `true` if this connection caused us to cross the readiness threshold
     /// (i.e., we just became ready to accept non-CONNECT operations).
+    /// Returns `false` if the connection was rejected (e.g., capacity cap) or we
+    /// were already ready.
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) -> bool {
         tracing::info!(
             peer = %peer,
@@ -1237,8 +1239,17 @@ impl Ring {
 
         let addr = peer.addr;
         let pub_key = peer.pub_key.clone();
-        self.connection_manager
+        let added = self
+            .connection_manager
             .add_connection(loc, addr, pub_key, was_reserved);
+        if !added {
+            tracing::warn!(
+                peer = %peer,
+                peer_location = %loc,
+                "Ring rejected connection - not updating caches or logging connection event"
+            );
+            return false;
+        }
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
         }

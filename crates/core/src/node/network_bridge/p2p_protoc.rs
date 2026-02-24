@@ -714,14 +714,26 @@ impl P2pConnManager {
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
                 let notifier = &op_manager.to_event_listener;
+                let transport_connections = ctx.connections.len();
+                let ring_connections = op_manager.ring.connection_manager.connection_count();
                 tracing::info!(
                     iterations = loop_iteration_count,
                     slow_events = slow_event_count,
                     notification_channel_pending = notifier.notification_channel_pending(),
                     notification_channel_capacity = notifier.notifications_sender.capacity(),
-                    active_connections = ctx.connections.len(),
+                    active_connections = transport_connections,
+                    ring_connections,
                     "Event loop stats"
                 );
+                // Detect transport/ring divergence: transport has connections but ring doesn't
+                if transport_connections > 0 && ring_connections == 0 {
+                    tracing::error!(
+                        transport_connections,
+                        ring_connections,
+                        "RING_TRANSPORT_DESYNC: transport has connections but ring topology is empty - \
+                         connections are not being promoted or are being immediately pruned"
+                    );
+                }
 
                 #[cfg(all(unix, feature = "jemalloc-prof"))]
                 {
