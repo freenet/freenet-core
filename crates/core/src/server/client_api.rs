@@ -157,15 +157,7 @@ async fn web_home(
         // No auth token or cookie — the shell page handles auth via postMessage.
         let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
         let mut response = contract_response.into_response();
-        // Sandboxed iframes have null origin — allow CORS for resource loading
-        response.headers_mut().insert(
-            axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            axum::http::HeaderValue::from_static("*"),
-        );
-        response.headers_mut().insert(
-            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-            axum::http::HeaderValue::from_static("nosniff"),
-        );
+        add_sandbox_cors_headers(&mut response);
         return Ok(response);
     }
 
@@ -226,17 +218,24 @@ async fn web_subpages(
         .map_err(|e| *e)
         .map(|r| {
             let mut response = r.into_response();
-            // Sandboxed iframes have null origin — sub-resources need CORS headers
-            response.headers_mut().insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                axum::http::HeaderValue::from_static("*"),
-            );
-            response.headers_mut().insert(
-                axum::http::header::X_CONTENT_TYPE_OPTIONS,
-                axum::http::HeaderValue::from_static("nosniff"),
-            );
+            add_sandbox_cors_headers(&mut response);
             response
         })
+}
+
+/// Adds CORS and security headers needed for sandbox iframe responses.
+///
+/// Sandboxed iframes have a null origin, so sub-resource requests require
+/// `Access-Control-Allow-Origin: *` to load correctly.
+fn add_sandbox_cors_headers(response: &mut axum::response::Response) {
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
 }
 
 impl ClientEventsProxy for HttpClientApi {

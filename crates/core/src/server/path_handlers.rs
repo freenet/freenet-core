@@ -2,8 +2,9 @@
 //!
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The gateway returns a "shell" page that holds the auth token and proxies WebSocket
-//! connections via postMessage, while the contract runs in an `<iframe sandbox="allow-scripts">`
-//! with an opaque origin that cannot access other contracts' data.
+//! connections via postMessage, while the contract runs in an
+//! `<iframe sandbox="allow-scripts allow-forms">` with an opaque origin that cannot
+//! access other contracts' data.
 
 use std::path::{Path, PathBuf};
 
@@ -297,6 +298,7 @@ fn shell_page(
 
     // Safety: auth_token is base58 (alphanumeric only), contract_key is base58,
     // iframe_src is composed from controlled values. No HTML escaping needed.
+    let auth_token = auth_token.as_str();
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -313,10 +315,7 @@ fn shell_page(
 </script>
 <script>freenetBridge("{auth_token}");</script>
 </body>
-</html>"##,
-        iframe_src = iframe_src,
-        auth_token = auth_token.as_str(),
-        SHELL_BRIDGE_JS = SHELL_BRIDGE_JS,
+</html>"##
     );
 
     Ok(Html(html))
@@ -637,6 +636,15 @@ fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Extracts the response body as a UTF-8 string for test assertions.
+    async fn response_body(resp: impl IntoResponse) -> String {
+        let body = resp.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
     #[tokio::test]
     async fn root_relative_asset_paths_rewritten() {
         let dir = tempfile::tempdir().unwrap();
@@ -652,14 +660,12 @@ mod tests {
 </html>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
-            .await
-            .unwrap();
-        let body = response.into_response();
-        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         let expected_href = format!("href=\"/v1/contract/web/{key}/assets/app.js\"");
         assert!(
@@ -693,14 +699,12 @@ mod tests {
         let html = r#"<head><link href="/./assets/app.js"></head><body></body>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let response = sandbox_content_body(dir.path(), key, ApiVersion::V2)
-            .await
-            .unwrap();
-        let body = response.into_response();
-        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V2)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         let expected = format!("href=\"/v2/contract/web/{key}/assets/app.js\"");
         assert!(
@@ -720,14 +724,12 @@ mod tests {
         let html = "<head><script src='/./assets/app.js'></script></head>";
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
-            .await
-            .unwrap();
-        let body = response.into_response();
-        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         let expected = format!("'/v1/contract/web/{key}/assets/app.js'");
         assert!(
@@ -745,14 +747,12 @@ mod tests {
         let html = r#"<head><link href="/assets/app.css"></head><body></body>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
-            .await
-            .unwrap();
-        let body = response.into_response();
-        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         // The /assets/ path should remain unchanged (no /. prefix)
         assert!(
@@ -761,16 +761,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_page_contains_iframe_and_bridge() {
+    #[tokio::test]
+    async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
-        let response = shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap();
-        let body = response.into_response();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let bytes = rt
-            .block_on(axum::body::to_bytes(body.into_body(), 1024 * 1024))
-            .unwrap();
-        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -799,17 +794,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_page_forwards_query_params_to_iframe() {
+    #[tokio::test]
+    async fn shell_page_forwards_query_params_to_iframe() {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
-        let response = shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap();
-        let body = response.into_response();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let bytes = rt
-            .block_on(axum::body::to_bytes(body.into_body(), 1024 * 1024))
-            .unwrap();
-        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -834,14 +824,12 @@ mod tests {
         let html = r#"<!DOCTYPE html><html><head></head><body>Hello</body></html>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
-        let response = sandbox_content_body(dir.path(), key, ApiVersion::V1)
-            .await
-            .unwrap();
-        let body = response.into_response();
-        let bytes = axum::body::to_bytes(body.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         // WS shim must be injected
         assert!(
