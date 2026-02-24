@@ -141,6 +141,7 @@ async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpClientApiRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
+    req_headers: axum::http::HeaderMap,
     api_version: ApiVersion,
     query_string: Option<String>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
@@ -158,15 +159,24 @@ async fn web_home(
         let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
         let mut response = contract_response.into_response();
         add_sandbox_cors_headers(&mut response);
-        // CSP for sandbox content: allow loading resources from the gateway ('self')
-        // but block direct network requests (fetch/XHR) via connect-src 'none'.
-        // WebSocket connections are routed through the postMessage bridge instead.
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            axum::http::HeaderValue::from_static(
-                "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src 'none'",
-            ),
+        // CSP for sandbox content: the iframe has an opaque origin (null) because the
+        // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
+        // the gateway's actual origin, so we must use the explicit gateway origin derived
+        // from the Host header. This allows the iframe to load scripts, styles, images,
+        // and WASM from the gateway while blocking access to other origins.
+        let gateway_origin = req_headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|host| format!("http://{host}"))
+            .unwrap_or_else(|| "'self'".to_string());
+        let csp = format!(
+            "default-src {gateway_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {gateway_origin} blob: data:"
         );
+        if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
+        }
         return Ok(response);
     }
 
@@ -195,11 +205,13 @@ async fn web_home(
         headers::SetCookie::name(),
         headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
     );
-    // CSP: shell page only runs inline bridge script and embeds an iframe
+    // CSP: shell page runs the inline postMessage bridge script, embeds a sandboxed
+    // iframe, and opens the real WebSocket on behalf of the iframe. connect-src must
+    // allow ws:/wss: so the bridge can establish the WebSocket connection.
     response.headers_mut().insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'",
+            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; connect-src ws: wss:",
         ),
     );
     // Shell page must not be framed itself
