@@ -625,15 +625,19 @@ async fn report_result(
         Err(err) => {
             // Mark operation as completed and notify waiting clients of the error
             if let Some(tx) = tx {
-                op_manager.completed(tx);
+                // Sub-operations (e.g., Subscribe spawned by PUT) have no client
+                // registered — sending errors for them would pollute the
+                // SessionActor's pending_results cache.
+                if !op_manager.is_sub_operation(tx) {
+                    let client_error = freenet_stdlib::client_api::ClientError::from(
+                        freenet_stdlib::client_api::ErrorKind::OperationError {
+                            cause: err.to_string().into(),
+                        },
+                    );
+                    op_manager.send_client_result(tx, Err(client_error)).await;
+                }
 
-                // Send error to client so they don't timeout waiting for a response
-                let client_error = freenet_stdlib::client_api::ClientError::from(
-                    freenet_stdlib::client_api::ErrorKind::OperationError {
-                        cause: err.to_string().into(),
-                    },
-                );
-                op_manager.send_client_result(tx, Err(client_error)).await;
+                op_manager.completed(tx);
             }
             #[cfg(any(debug_assertions, test))]
             {

@@ -459,9 +459,10 @@ impl ContractHandlerChannel<SenderHalve> {
 
     /// Notify the session actor about a transaction registration, if installed.
     ///
-    /// Uses `.send().await` to ensure the registration is never silently dropped.
-    /// If the session actor channel is full, this will wait for capacity rather
-    /// than losing the registration (which would cause the client to timeout).
+    /// Uses `.send().await` with a timeout to ensure the registration is not
+    /// silently dropped (which would cause the client to timeout waiting for a
+    /// response that will never arrive). If the session actor channel is full,
+    /// this waits up to `WAIT_FOR_RES_SEND_TIMEOUT` for capacity.
     async fn notify_session_actor(
         &self,
         tx: Transaction,
@@ -481,14 +482,26 @@ impl ContractHandlerChannel<SenderHalve> {
             client_id,
             request_id,
         };
-        if let Err(e) = session_tx.send(msg).await {
-            tracing::error!(
-                tx = %tx,
-                client = %client_id,
-                request_id = %request_id,
-                error = %e,
-                "Failed to notify session actor — receiver dropped"
-            );
+        match tokio::time::timeout(Self::WAIT_FOR_RES_SEND_TIMEOUT, session_tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    tx = %tx,
+                    client = %client_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "Failed to notify session actor — receiver dropped"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    tx = %tx,
+                    client = %client_id,
+                    request_id = %request_id,
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out notifying session actor — channel full, client will not receive response"
+                );
+            }
         }
     }
 }
