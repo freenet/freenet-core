@@ -1795,7 +1795,18 @@ async fn handle_aborted_op(
                                     backoff_secs = duration.as_secs(),
                                     "Gateway connection failed, waiting before retry"
                                 );
-                                tokio::time::sleep(duration).await;
+                                // Use select! so suspend/isolation recovery can
+                                // wake us immediately via gateway_backoff_cleared,
+                                // matching the pattern in initial_join_procedure.
+                                tokio::select! {
+                                    _ = tokio::time::sleep(duration) => {},
+                                    _ = op_manager.gateway_backoff_cleared.notified() => {
+                                        tracing::info!(
+                                            gateway = %gateway,
+                                            "Gateway backoff cleared externally, retrying immediately"
+                                        );
+                                    },
+                                }
                             }
                         }
 

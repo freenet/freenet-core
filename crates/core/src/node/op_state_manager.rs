@@ -260,8 +260,8 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
-    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
-    /// so it can wake from a long backoff sleep and retry immediately.
+    /// Notifies `initial_join_procedure` and `handle_aborted_op` when gateway
+    /// backoff is cleared, so they can wake from backoff sleeps and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
     /// Addresses blocked by local policy. Used by the connect protocol to reject
     /// join requests from blocked peers at the routing level, allowing the uphill
