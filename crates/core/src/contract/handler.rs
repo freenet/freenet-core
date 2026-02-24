@@ -943,6 +943,69 @@ pub mod test {
             result
         );
     }
+
+    /// Regression test for issue #3246: Verifies that `notify_session_actor` delivers
+    /// the `RegisterTransaction` message even when the session actor channel has
+    /// backpressure, instead of silently dropping it via `try_send`.
+    #[tokio::test]
+    async fn notify_session_actor_delivers_under_backpressure() {
+        use crate::client_events::RequestId;
+        use crate::contract::SessionMessage;
+        use crate::message::Transaction;
+        use crate::operations::put::PutMsg;
+
+        let (mut send_halve, _rcv_halve, _wait_res) = contract_handler_channel();
+
+        // Use a tiny channel (capacity 1) to simulate backpressure.
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::channel::<SessionMessage>(1);
+        send_halve.with_session_adapter(session_tx);
+
+        // Fill the session channel to capacity.
+        let filler_tx = Transaction::new::<PutMsg>();
+        send_halve
+            .notify_session_actor(filler_tx, ClientId::FIRST, RequestId::new())
+            .await;
+
+        // Channel is now full. Spawn a concurrent drain so .send().await unblocks.
+        let drain_handle = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(msg) = session_rx.recv().await {
+                received.push(msg);
+                if received.len() == 2 {
+                    break;
+                }
+            }
+            received
+        });
+
+        // This would have been silently dropped by the old try_send.
+        let test_tx = Transaction::new::<PutMsg>();
+        let test_client = ClientId::FIRST;
+        let test_request_id = RequestId::new();
+        send_halve
+            .notify_session_actor(test_tx, test_client, test_request_id)
+            .await;
+
+        let received = drain_handle.await.expect("drain task should complete");
+        assert_eq!(received.len(), 2, "Both messages should be delivered");
+
+        // Verify the second message is our test registration.
+        match &received[1] {
+            SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            } => {
+                assert_eq!(*tx, test_tx);
+                assert_eq!(*client_id, test_client);
+                assert_eq!(*request_id, test_request_id);
+            }
+            other => panic!(
+                "Expected RegisterTransaction, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
 }
 
 pub(super) mod in_memory {
