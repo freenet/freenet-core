@@ -172,6 +172,7 @@ impl Runtime {
             InboundDelegateMsg::PutContractResponse(_) => "PutContractResponse",
             InboundDelegateMsg::UpdateContractResponse(_) => "UpdateContractResponse",
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
+            InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
         };
         tracing::debug!(
             inbound_msg_name,
@@ -533,7 +534,8 @@ impl DelegateRuntimeInterface for Runtime {
                     }
                     msg @ (InboundDelegateMsg::PutContractResponse(_)
                     | InboundDelegateMsg::UpdateContractResponse(_)
-                    | InboundDelegateMsg::SubscribeContractResponse(_)) => {
+                    | InboundDelegateMsg::SubscribeContractResponse(_)
+                    | InboundDelegateMsg::ContractNotification(_)) => {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
