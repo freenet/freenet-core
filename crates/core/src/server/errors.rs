@@ -93,104 +93,39 @@ impl IntoResponse for WebSocketApiError {
     }
 }
 
-/// Returns a user-friendly HTML page shown while the peer is connecting to the network.
-/// Includes actionable diagnostics when connection failures have been recorded.
+/// Returns a short HTML page that redirects to the dashboard while the peer connects.
+///
+/// The homepage at `/` already shows full connection diagnostics, so rather than
+/// duplicating that rendering here we redirect with a meta-refresh. The 503 status
+/// code (set by the caller) tells programmatic clients the node is not yet ready.
 fn connecting_page() -> String {
-    use crate::node::network_status;
-
-    let diagnostics_html = match network_status::get_snapshot() {
-        Some(snap) if !snap.failures.is_empty() => {
-            let mut items = String::new();
-            for f in &snap.failures {
-                items.push_str(&format!(
-                    "<li><code>{}</code>: {}</li>",
-                    f.address, f.reason_html
-                ));
-            }
-            format!(
-                r#"<div class="diagnostics">
-            <h3>Connection Issues</h3>
-            <ul>{items}</ul>
-            <p class="attempts">Attempted {attempts} connection(s) over {elapsed}. Retrying...</p>
-        </div>"#,
-                attempts = snap.connection_attempts,
-                elapsed = network_status::format_duration(snap.elapsed_secs),
-            )
-        }
-        Some(snap) if snap.connection_attempts > 0 => {
-            format!(
-                r#"<p class="attempts">Attempted {} connection(s) over {}. Retrying...</p>"#,
-                snap.connection_attempts,
-                network_status::format_duration(snap.elapsed_secs),
-            )
-        }
-        _ => String::new(),
-    };
-
-    format!(
-        r#"<!DOCTYPE html>
+    r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="3">
+    <meta http-equiv="refresh" content="3;url=/">
     <title>Connecting to Freenet</title>
     <link rel="icon" href="https://freenet.org/favicon.ico">
     <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            background: #f5f5f5;
-        }}
-        .container {{
-            text-align: center;
-            padding: 2rem;
-            max-width: 600px;
-        }}
-        .logo {{ width: 80px; height: 80px; margin-bottom: 1.5rem; }}
-        h1 {{ color: #333; font-size: 1.5rem; margin-bottom: 0.5rem; }}
-        p {{ color: #666; margin-bottom: 1rem; line-height: 1.5; }}
-        .spinner {{
-            width: 24px;
-            height: 24px;
-            border: 3px solid #e0e0e0;
-            border-top-color: #2196F3;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto;
-        }}
-        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-        .diagnostics {{
-            text-align: left;
-            background: #fff3cd;
-            border: 1px solid #ffc107;
-            border-radius: 8px;
-            padding: 1rem 1.5rem;
-            margin-top: 1.5rem;
-        }}
-        .diagnostics h3 {{ color: #856404; font-size: 1rem; margin-bottom: 0.4rem; }}
-        .diagnostics ul {{ padding-left: 1.2rem; margin: 0.4rem 0; list-style: disc; }}
-        .diagnostics li {{ color: #555; margin-bottom: 0.35rem; font-size: 0.85rem; }}
-        .attempts {{ color: #888; font-size: 0.8rem; margin-top: 0.4rem; }}
-        code {{ background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.85em; }}
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
+               margin: 0; background: #f5f5f5; }
+        .container { text-align: center; padding: 2rem; }
+        .logo { width: 80px; height: 80px; margin-bottom: 1.5rem; }
+        h1 { color: #333; font-size: 1.5rem; margin-bottom: 0.5rem; }
+        p { color: #666; line-height: 1.5; }
+        a { color: #1976D2; }
     </style>
 </head>
 <body>
     <div class="container">
         <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
         <h1>Connecting to Freenet...</h1>
-        <p>This peer is establishing network connections.<br>This page will refresh automatically.</p>
-        <div class="spinner"></div>
-        {diagnostics_html}
+        <p>Redirecting to the <a href="/">dashboard</a>...</p>
     </div>
 </body>
 </html>"#
-    )
+        .to_string()
 }
 
 #[cfg(test)]

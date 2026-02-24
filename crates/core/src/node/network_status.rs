@@ -272,13 +272,21 @@ pub struct ContractSnapshot {
     pub last_updated_secs: Option<u64>,
 }
 
-/// Snapshot of operation stats.
+/// Snapshot of operation stats. Each tuple is `(success_count, failure_count)`.
 #[derive(Default)]
 pub struct OpStatsSnapshot {
     pub gets: (u32, u32),
     pub puts: (u32, u32),
     pub updates: (u32, u32),
     pub subscribes: (u32, u32),
+}
+
+impl OpStatsSnapshot {
+    /// Total number of operations (successes + failures across all types).
+    pub fn total(&self) -> u32 {
+        let sum = |pair: (u32, u32)| pair.0 + pair.1;
+        sum(self.gets) + sum(self.puts) + sum(self.updates) + sum(self.subscribes)
+    }
 }
 
 /// Snapshot of NAT stats.

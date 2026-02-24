@@ -146,14 +146,12 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         String::new()
     };
 
-    // NAT stats
+    // NAT stats (suppress the detailed advice when the gateway warning already covers it)
     let nat_html = if snap.nat_stats.attempts > 0 {
-        let class = if snap.nat_stats.successes == 0 {
-            " nat-fail"
-        } else {
-            ""
-        };
-        let extra = if snap.nat_stats.successes == 0 {
+        let all_failed = snap.nat_stats.successes == 0;
+        let class = if all_failed { " nat-fail" } else { "" };
+        // Only show the "try forwarding" advice if the gateway_only warning isn't already visible
+        let extra = if all_failed && !snap.gateway_only {
             format!(
                 r#"<p class="nat-advice">All NAT traversal attempts have failed. Your firewall or router is likely blocking UDP connections. Try forwarding UDP port <code>{}</code> on your router.</p>"#,
                 snap.listening_port
@@ -409,15 +407,7 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
         return String::new();
     };
     let ops = &snap.op_stats;
-    let total = ops.gets.0
-        + ops.gets.1
-        + ops.puts.0
-        + ops.puts.1
-        + ops.updates.0
-        + ops.updates.1
-        + ops.subscribes.0
-        + ops.subscribes.1;
-    if total == 0 && snap.open_connections == 0 {
+    if ops.total() == 0 && snap.open_connections == 0 {
         return String::new();
     }
 
@@ -533,7 +523,6 @@ main {
 }
 .dot-green { background: #4caf50; }
 .dot-yellow { background: #ff9800; }
-.dot-red { background: #f44336; }
 .spinner {
     width: 20px;
     height: 20px;
