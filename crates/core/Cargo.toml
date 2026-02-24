@@ -109,7 +109,6 @@ tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = ["sysinfoapi"] }
-wmi = { workspace = true }
 serde = { workspace = true }
 zip = { workspace = true }
 
