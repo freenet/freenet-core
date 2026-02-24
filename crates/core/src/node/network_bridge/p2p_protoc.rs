@@ -26,7 +26,6 @@ use crate::node::network_bridge::handshake::{
     HandshakeHandler,
 };
 use crate::node::network_bridge::priority_select;
-use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
 use crate::ring::{Location, PeerKey};
 use crate::transport::{
@@ -392,8 +391,6 @@ pub(in crate::node) struct P2pConnManager {
     /// Congestion control configuration.
     congestion_config: CongestionControlConfig,
     blocked_addresses: Option<HashSet<SocketAddr>>,
-    /// MessageProcessor for clean client handling separation
-    message_processor: Arc<MessageProcessor>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
 }
@@ -407,7 +404,6 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
-        message_processor: Arc<MessageProcessor>,
     ) -> anyhow::Result<Self> {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
@@ -483,7 +479,6 @@ impl P2pConnManager {
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
-            message_processor,
             broadcast_retries: HashMap::new(),
         })
     }
@@ -549,7 +544,6 @@ impl P2pConnManager {
             ledbat_min_ssthresh,
             congestion_config,
             blocked_addresses,
-            message_processor,
             broadcast_retries,
         } = self;
 
@@ -633,7 +627,6 @@ impl P2pConnManager {
             ledbat_min_ssthresh,
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
-            message_processor,
             broadcast_retries,
         };
 
@@ -2125,11 +2118,6 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        // Use MessageProcessor for clean client handling separation
-        tracing::debug!(
-            "Using PURE network processing - zero client types in network layer for transaction {}",
-            msg.id()
-        );
         GlobalExecutor::spawn(
             process_message_decoupled(
                 msg,
@@ -2138,7 +2126,6 @@ impl P2pConnManager {
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
                 executor_callback_opt,
-                self.message_processor.clone(),
                 pending_op_result,
             )
             .instrument(span),

@@ -414,7 +414,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
 
         if let WaitingTransaction::Transaction(tx) = waiting_tx {
-            self.notify_session_actor(tx, client_id, request_id);
+            self.notify_session_actor(tx, client_id, request_id).await;
         }
 
         Ok(())
@@ -452,13 +452,23 @@ impl ContractHandlerChannel<SenderHalve> {
             }
         }
 
-        self.notify_session_actor(tx, client_id, request_id);
+        self.notify_session_actor(tx, client_id, request_id).await;
 
         Ok(())
     }
 
     /// Notify the session actor about a transaction registration, if installed.
-    fn notify_session_actor(&self, tx: Transaction, client_id: ClientId, request_id: RequestId) {
+    ///
+    /// Uses `.send().await` with a timeout to ensure the registration is not
+    /// silently dropped (which would cause the client to timeout waiting for a
+    /// response that will never arrive). If the session actor channel is full,
+    /// this waits up to `WAIT_FOR_RES_SEND_TIMEOUT` for capacity.
+    async fn notify_session_actor(
+        &self,
+        tx: Transaction,
+        client_id: ClientId,
+        request_id: RequestId,
+    ) {
         let Some(session_tx) = &self.session_adapter_tx else {
             tracing::warn!(
                 client = %client_id,
@@ -472,14 +482,26 @@ impl ContractHandlerChannel<SenderHalve> {
             client_id,
             request_id,
         };
-        if let Err(e) = session_tx.try_send(msg) {
-            tracing::warn!(
-                tx = %tx,
-                client = %client_id,
-                request_id = %request_id,
-                error = %e,
-                "Failed to notify session actor"
-            );
+        match tokio::time::timeout(Self::WAIT_FOR_RES_SEND_TIMEOUT, session_tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    tx = %tx,
+                    client = %client_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "Failed to notify session actor — receiver dropped"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    tx = %tx,
+                    client = %client_id,
+                    request_id = %request_id,
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out notifying session actor — channel full, client will not receive response"
+                );
+            }
         }
     }
 }
@@ -920,6 +942,69 @@ pub mod test {
             "Expected NoEvHandlerResponse timeout error, got {:?}",
             result
         );
+    }
+
+    /// Regression test for issue #3246: Verifies that `notify_session_actor` delivers
+    /// the `RegisterTransaction` message even when the session actor channel has
+    /// backpressure, instead of silently dropping it via `try_send`.
+    #[tokio::test]
+    async fn notify_session_actor_delivers_under_backpressure() {
+        use crate::client_events::RequestId;
+        use crate::contract::SessionMessage;
+        use crate::message::Transaction;
+        use crate::operations::put::PutMsg;
+
+        let (mut send_halve, _rcv_halve, _wait_res) = contract_handler_channel();
+
+        // Use a tiny channel (capacity 1) to simulate backpressure.
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::channel::<SessionMessage>(1);
+        send_halve.with_session_adapter(session_tx);
+
+        // Fill the session channel to capacity.
+        let filler_tx = Transaction::new::<PutMsg>();
+        send_halve
+            .notify_session_actor(filler_tx, ClientId::FIRST, RequestId::new())
+            .await;
+
+        // Channel is now full. Spawn a concurrent drain so .send().await unblocks.
+        let drain_handle = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(msg) = session_rx.recv().await {
+                received.push(msg);
+                if received.len() == 2 {
+                    break;
+                }
+            }
+            received
+        });
+
+        // This would have been silently dropped by the old try_send.
+        let test_tx = Transaction::new::<PutMsg>();
+        let test_client = ClientId::FIRST;
+        let test_request_id = RequestId::new();
+        send_halve
+            .notify_session_actor(test_tx, test_client, test_request_id)
+            .await;
+
+        let received = drain_handle.await.expect("drain task should complete");
+        assert_eq!(received.len(), 2, "Both messages should be delivered");
+
+        // Verify the second message is our test registration.
+        match &received[1] {
+            SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            } => {
+                assert_eq!(*tx, test_tx);
+                assert_eq!(*client_id, test_client);
+                assert_eq!(*request_id, test_request_id);
+            }
+            other => panic!(
+                "Expected RegisterTransaction, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 }
 

@@ -65,7 +65,6 @@ use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod message_processor;
 mod network_bridge;
 
 // Re-export fault injection types for test infrastructure.
@@ -80,7 +79,6 @@ pub(crate) mod proximity_cache;
 mod request_router;
 pub(crate) mod testing_impl;
 
-pub use message_processor::MessageProcessor;
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
 /// Handle to trigger graceful shutdown of the node.
@@ -625,8 +623,20 @@ async fn report_result(
             tracing::debug!(?tx, "No operation result found");
         }
         Err(err) => {
-            // just mark the operation as completed so no redundant messages are processed for this transaction anymore
+            // Mark operation as completed and notify waiting clients of the error
             if let Some(tx) = tx {
+                // Sub-operations (e.g., Subscribe spawned by PUT) have no client
+                // registered — sending errors for them would pollute the
+                // SessionActor's pending_results cache.
+                if !op_manager.is_sub_operation(tx) {
+                    let client_error = freenet_stdlib::client_api::ClientError::from(
+                        freenet_stdlib::client_api::ErrorKind::OperationError {
+                            cause: err.to_string().into(),
+                        },
+                    );
+                    op_manager.send_client_result(tx, Err(client_error)).await;
+                }
+
                 op_manager.completed(tx);
             }
             #[cfg(any(debug_assertions, test))]
@@ -679,8 +689,8 @@ async fn report_result(
     }
 }
 
-/// Pure network message processing using MessageProcessor for client handling
-#[allow(clippy::too_many_arguments)]
+/// Process a network message and deliver results to clients via the canonical
+/// path: report_result → send_client_result → ResultRouter → SessionActor.
 pub(crate) async fn process_message_decoupled<CB>(
     msg: NetMessage,
     source_addr: Option<std::net::SocketAddr>,
@@ -688,14 +698,12 @@ pub(crate) async fn process_message_decoupled<CB>(
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    message_processor: std::sync::Arc<MessageProcessor>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
     let tx = *msg.id();
 
-    // Pure network message processing - no client types involved
     let op_result = handle_pure_network_message(
         msg,
         source_addr,
@@ -706,18 +714,8 @@ pub(crate) async fn process_message_decoupled<CB>(
     )
     .await;
 
-    // Prepare host result for session actor routing
-    let host_result = match &op_result {
-        Ok(Some(op_res)) => Some(op_res.to_host_result()),
-        Ok(None) => None,
-        Err(e) => Some(Err(freenet_stdlib::client_api::ClientError::from(
-            freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: e.to_string().into(),
-            },
-        ))),
-    };
-
-    // Report operation completion for telemetry/result routing
+    // Report result and deliver to clients via the single canonical path:
+    // report_result → send_client_result → ResultRouter → SessionActor
     report_result(
         Some(tx),
         op_result,
@@ -726,18 +724,6 @@ pub(crate) async fn process_message_decoupled<CB>(
         &mut *event_listener,
     )
     .await;
-
-    // Delegate to MessageProcessor - it handles all client concerns internally
-    if let Err(e) = message_processor
-        .handle_network_result(tx, host_result)
-        .await
-    {
-        tracing::error!(
-            "Failed to handle network result for transaction {}: {}",
-            tx,
-            e
-        );
-    }
 }
 
 /// Pure network message handling (no client concerns)
