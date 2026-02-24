@@ -3087,7 +3087,10 @@ impl P2pConnManager {
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
                 crate::node::network_status::record_peer_connected(peer_addr, Some(loc.as_f64()));
-                crate::node::network_status::record_nat_attempt(true);
+                // Only count as NAT success for non-gateway peers (gateway connections are direct)
+                if !crate::node::network_status::is_known_gateway(&peer_addr) {
+                    crate::node::network_status::record_nat_attempt(true);
+                }
 
                 // tell the new peer about our subscriptions and cache
                 for (target, msg) in self

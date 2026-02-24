@@ -110,14 +110,22 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
     let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
 }
 
+/// Check if an address is a known gateway.
+pub fn is_known_gateway(addr: &SocketAddr) -> bool {
+    NETWORK_STATUS
+        .get()
+        .and_then(|s| s.read().ok())
+        .is_some_and(|s| s.gateway_addresses.contains(addr))
+}
+
 /// Record a gateway connection failure with a classified reason.
 pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
-            s.connection_attempts += 1;
+            s.connection_attempts = s.connection_attempts.saturating_add(1);
             // Track NAT failures
             if matches!(reason, FailureReason::NatTraversalFailed) {
-                s.nat_stats.attempts += 1;
+                s.nat_stats.attempts = s.nat_stats.attempts.saturating_add(1);
             }
             s.gateway_failures.push(GatewayFailure { address, reason });
             // Keep only the most recent failures to avoid unbounded growth
@@ -182,7 +190,7 @@ pub fn record_contract_updated(key_encoded: &str) {
 }
 
 /// Record a subscription removal.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn record_subscription_removed(key_encoded: &str) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -214,9 +222,9 @@ pub fn record_op_result(op_type: OpType, success: bool) {
 pub fn record_nat_attempt(success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
-            s.nat_stats.attempts += 1;
+            s.nat_stats.attempts = s.nat_stats.attempts.saturating_add(1);
             if success {
-                s.nat_stats.successes += 1;
+                s.nat_stats.successes = s.nat_stats.successes.saturating_add(1);
             }
         }
     }
@@ -284,8 +292,11 @@ pub struct OpStatsSnapshot {
 impl OpStatsSnapshot {
     /// Total number of operations (successes + failures across all types).
     pub fn total(&self) -> u32 {
-        let sum = |pair: (u32, u32)| pair.0 + pair.1;
-        sum(self.gets) + sum(self.puts) + sum(self.updates) + sum(self.subscribes)
+        let sum = |pair: (u32, u32)| pair.0.saturating_add(pair.1);
+        sum(self.gets)
+            .saturating_add(sum(self.puts))
+            .saturating_add(sum(self.updates))
+            .saturating_add(sum(self.subscribes))
     }
 }
 
@@ -309,6 +320,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             address: f.address,
             reason_html: match &f.reason {
                 FailureReason::VersionMismatch { local, gateway } => {
+                    let local = html_escape(local);
+                    let gateway = html_escape(gateway);
                     format!(
                         "<strong>Version mismatch</strong>: Your version: <code>{local}</code> \
                          — Gateway requires: <code>{gateway}</code><br>\
@@ -350,8 +363,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         .subscribed_contracts
         .values()
         .map(|c| {
-            let key_short = if c.key_encoded.len() > 12 {
-                format!("{}...", &c.key_encoded[..12])
+            // Use char boundary for safe truncation (contract keys are base58/ASCII,
+            // but be defensive against future encoding changes).
+            let key_short = if c.key_encoded.chars().count() > 12 {
+                let trunc: String = c.key_encoded.chars().take(12).collect();
+                format!("{trunc}...")
             } else {
                 c.key_encoded.clone()
             };

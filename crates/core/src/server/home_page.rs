@@ -296,10 +296,11 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
     );
 
     // Ring circle
-    let _ = write!(
+    write!(
         svg,
         "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\" stroke=\"#e0e0e0\" stroke-width=\"2\"/>"
-    );
+    )
+    .ok();
 
     // Helper: location (0.0-1.0) to (x, y) on the ring.
     // 0.0 is at the top, increasing clockwise.
@@ -315,10 +316,11 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
             if let Some(ploc) = p.location {
                 let (px, py) = loc_to_xy(ploc);
                 let stroke = if p.is_gateway { "#ffa726" } else { "#90caf9" };
-                let _ = write!(
+                write!(
                     svg,
                     "<line x1=\"{ox:.1}\" y1=\"{oy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" stroke=\"{stroke}\" stroke-width=\"1\" opacity=\"0.4\"/>"
-                );
+                )
+                .ok();
             }
         }
     }
@@ -328,20 +330,22 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         if let Some(loc) = p.location {
             let (px, py) = loc_to_xy(loc);
             let fill = if p.is_gateway { "#ff9800" } else { "#2196F3" };
-            let _ = write!(
+            write!(
                 svg,
                 "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/>"
-            );
+            )
+            .ok();
         }
     }
 
     // Own location (drawn last so it's on top)
     if let Some(own_loc) = own_location {
         let (ox, oy) = loc_to_xy(own_loc);
-        let _ = write!(
+        write!(
             svg,
             "<circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#4caf50\" stroke=\"#fff\" stroke-width=\"2\"/>"
-        );
+        )
+        .ok();
     }
 
     svg.push_str("</svg>");
