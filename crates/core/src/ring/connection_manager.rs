@@ -992,8 +992,21 @@ impl ConnectionManager {
     }
 
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
-        if self.location_for_peer.read().contains_key(&addr) {
-            return true;
+        if let Some(loc) = self.location_for_peer.read().get(&addr).copied() {
+            // Verify the location_for_peer entry has a backing established connection.
+            // Without this check, stale entries from failed connect operations block the
+            // bootstrap loop from retrying gateways (#3244).
+            let has_established = self
+                .connections_by_location
+                .read()
+                .get(&loc)
+                .is_some_and(|conns| conns.iter().any(|c| c.location.socket_addr() == Some(addr)));
+            if has_established {
+                return true;
+            }
+            // No established connection — fall through to check pending reservations.
+            // The location_for_peer entry is orphaned and will be cleaned up by
+            // cleanup_stale_reservations().
         }
         let pending = self.pending_reservations.read();
         if let Some((_loc, created)) = pending.get(&addr) {
@@ -2248,6 +2261,47 @@ mod tests {
         // The established connection should be untouched
         assert!(cm.has_connection_or_pending(existing_addr));
         assert_eq!(cm.connection_count(), 1);
+    }
+
+    /// Regression test for #3244: has_connection_or_pending should return false for
+    /// orphaned location_for_peer entries IMMEDIATELY — without waiting for
+    /// cleanup_stale_reservations to run. The previous behavior caused the bootstrap
+    /// loop to stall for up to 65 seconds because it thought all gateways were
+    /// "connected/pending" when they actually had only stale location_for_peer entries.
+    #[test]
+    fn test_has_connection_or_pending_ignores_orphaned_location() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let keypair = TransportKeypair::new();
+        let existing_addr = make_addr(8001);
+        let orphan_addr = make_addr(8002);
+        let orphan_loc = Location::new(0.5);
+
+        // Establish one real connection so open > 0
+        cm.add_connection(
+            Location::new(0.1),
+            existing_addr,
+            keypair.public().clone(),
+            false,
+        );
+
+        // should_accept with open > 0 creates entries in both data structures
+        assert!(cm.should_accept(orphan_loc, orphan_addr));
+
+        // Expire the pending reservation (simulates connect timeout)
+        age_reservation(&cm, orphan_addr, Duration::from_secs(120));
+
+        // The orphaned location_for_peer entry still exists...
+        assert!(cm.location_for_peer.read().contains_key(&orphan_addr));
+        // ...but has_connection_or_pending should return false because there's
+        // no established connection backing it (the fix for #3244).
+        assert!(
+            !cm.has_connection_or_pending(orphan_addr),
+            "has_connection_or_pending should return false for orphaned location_for_peer \
+             entries without established connections (#3244)"
+        );
+
+        // Established connection should still be visible
+        assert!(cm.has_connection_or_pending(existing_addr));
     }
 
     /// Verify that cleanup_stale_reservations does NOT remove location_for_peer
