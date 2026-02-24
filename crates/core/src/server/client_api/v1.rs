@@ -15,9 +15,10 @@ async fn web_home_v1(
     key: Path<String>,
     rs: Extension<HttpClientApiRequest>,
     config: axum::extract::State<Config>,
+    headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_home(key, rs, config, ApiVersion::V1, query).await
+    web_home(key, rs, config, headers, ApiVersion::V1, query).await
 }
 
 async fn web_subpages_v1(

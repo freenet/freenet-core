@@ -401,37 +401,43 @@ async fn connection_info(
         }
     };
 
-    // Check Origin header — browsers always send this on WS upgrade, CLI tools don't.
+    // Check Origin header for WebSocket upgrades only.
     // This blocks cross-site WebSocket hijacking (evil.com connecting to our gateway)
     // while allowing both localhost and legitimate remote access.
     //
-    // Localhost origins are always allowed (the request is local).
-    // Non-localhost origins are allowed if they pass the same-origin check
-    // (Origin host == Host header), which blocks cross-site attacks while
-    // supporting remote access, port-forwarded setups, and VirtualBox networking.
-    // CLI tools (no Origin header) are always allowed.
-    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-        if let Ok(origin_str) = origin.to_str() {
-            let allowed =
-                is_localhost_origin(origin_str) || is_same_origin(origin_str, req.headers());
-            if !allowed {
-                let host_header = req
-                    .headers()
-                    .get(axum::http::header::HOST)
-                    .and_then(|h| h.to_str().ok());
-                tracing::warn!(
-                    origin = origin_str,
-                    host = ?host_header,
-                    "Rejected WebSocket connection from disallowed origin"
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    "WebSocket connections from this origin are not allowed",
-                )
-                    .into_response();
+    // Only applied to WebSocket upgrade requests — regular HTTP requests (e.g., asset
+    // loads from sandboxed iframes with Origin: null) must pass through without origin
+    // validation, since iframe sub-resources legitimately have opaque origins.
+    let is_ws_upgrade = req
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+
+    if is_ws_upgrade {
+        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+            if let Ok(origin_str) = origin.to_str() {
+                let allowed =
+                    is_localhost_origin(origin_str) || is_same_origin(origin_str, req.headers());
+                if !allowed {
+                    let host_header = req
+                        .headers()
+                        .get(axum::http::header::HOST)
+                        .and_then(|h| h.to_str().ok());
+                    tracing::warn!(
+                        origin = origin_str,
+                        host = ?host_header,
+                        "Rejected WebSocket connection from disallowed origin"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "WebSocket connections from this origin are not allowed",
+                    )
+                        .into_response();
+                }
+            } else {
+                return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
             }
-        } else {
-            return (StatusCode::BAD_REQUEST, "Invalid Origin header").into_response();
         }
     }
 
