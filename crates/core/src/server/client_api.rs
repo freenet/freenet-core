@@ -142,9 +142,35 @@ async fn web_home(
     Extension(rs): Extension<HttpClientApiRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
     api_version: ApiVersion,
+    query_string: Option<String>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
+    // Check if this is the sandboxed iframe requesting its content
+    let is_sandbox = query_string
+        .as_ref()
+        .map(|qs| qs.split('&').any(|p| p == "__sandbox=1"))
+        .unwrap_or(false);
+
+    if is_sandbox {
+        // Serve sandbox content (contract HTML + WS shim) inside the iframe.
+        // No auth token or cookie — the shell page handles auth via postMessage.
+        let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
+        let mut response = contract_response.into_response();
+        add_sandbox_cors_headers(&mut response);
+        // CSP for sandbox content: allow loading resources from the gateway ('self')
+        // but block direct network requests (fetch/XHR) via connect-src 'none'.
+        // WebSocket connections are routed through the postMessage bridge instead.
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(
+                "default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src 'none'",
+            ),
+        );
+        return Ok(response);
+    }
+
+    // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
@@ -161,13 +187,29 @@ async fn web_home(
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version).await?;
+        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string).await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
         headers::SetCookie::name(),
         headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
+    );
+    // CSP: shell page only runs inline bridge script and embeds an iframe
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'",
+        ),
+    );
+    // Shell page must not be framed itself
+    response.headers_mut().insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
     );
 
     Ok(response)
@@ -183,7 +225,26 @@ async fn web_subpages(
     path_handlers::variable_content(key, full_path, api_version)
         .await
         .map_err(|e| *e)
-        .map(|r| r.into_response())
+        .map(|r| {
+            let mut response = r.into_response();
+            add_sandbox_cors_headers(&mut response);
+            response
+        })
+}
+
+/// Adds CORS and security headers needed for sandbox iframe responses.
+///
+/// Sandboxed iframes have a null origin, so sub-resource requests require
+/// `Access-Control-Allow-Origin: *` to load correctly.
+fn add_sandbox_cors_headers(response: &mut axum::response::Response) {
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
 }
 
 impl ClientEventsProxy for HttpClientApi {

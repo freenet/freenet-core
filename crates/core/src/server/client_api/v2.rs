@@ -18,8 +18,9 @@ async fn web_home_v2(
     key: Path<String>,
     rs: Extension<HttpClientApiRequest>,
     config: axum::extract::State<Config>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_home(key, rs, config, ApiVersion::V2).await
+    web_home(key, rs, config, ApiVersion::V2, query).await
 }
 
 async fn web_subpages_v2(
