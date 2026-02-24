@@ -649,7 +649,15 @@ pub(super) mod delegate_secrets {
                     len as i32
                 }
             }
-            Err(_) => error_codes::ERR_SECRET_NOT_FOUND,
+            Err(e) => {
+                tracing::debug!(
+                    delegate = %env.delegate_key,
+                    secret_id = ?secret_id,
+                    error = %e,
+                    "get_secret_len: secret not found or storage error"
+                );
+                error_codes::ERR_SECRET_NOT_FOUND
+            }
         }
     }
 
@@ -733,7 +741,15 @@ pub(super) mod delegate_secrets {
                 }
                 secret_len as i32
             }
-            Err(_) => error_codes::ERR_SECRET_NOT_FOUND,
+            Err(e) => {
+                tracing::debug!(
+                    delegate = %env.delegate_key,
+                    secret_id = ?secret_id,
+                    error = %e,
+                    "get_secret: secret not found or storage error"
+                );
+                error_codes::ERR_SECRET_NOT_FOUND
+            }
         }
     }
 

@@ -570,6 +570,42 @@ impl WasmEngine for WasmtimeEngine {
     }
 }
 
+/// Refresh the cached MEM_ADDR entry for an instance using the current memory
+/// from the wasmtime `Caller`.
+///
+/// WASM linear memory can be relocated by `memory.grow`. The initial pointer
+/// stored in `MEM_ADDR` at instance creation may become stale. This function
+/// reads the current memory base address from the `Caller` (which always
+/// reflects the live store state) and updates MEM_ADDR if it has changed.
+///
+/// Called at the start of every host function to ensure `native_api` functions
+/// see the correct memory base pointer.
+fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id: i64) {
+    if instance_id < 0 {
+        return;
+    }
+    let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        return;
+    };
+    let data = memory.data(&*caller);
+    let new_ptr = data.as_ptr() as i64;
+    let new_size = data.len();
+    if let Some(mut info) = MEM_ADDR.get_mut(&instance_id) {
+        if info.start_ptr != new_ptr || info.mem_size != new_size {
+            tracing::debug!(
+                instance_id,
+                old_ptr = info.start_ptr,
+                new_ptr,
+                old_size = info.mem_size,
+                new_size,
+                "Refreshed stale MEM_ADDR after memory relocation"
+            );
+            info.start_ptr = new_ptr;
+            info.mem_size = new_size;
+        }
+    }
+}
+
 impl WasmtimeEngine {
     /// Create a new backend engine that can be shared across multiple Runtime instances.
     pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
@@ -749,9 +785,22 @@ impl WasmtimeEngine {
     }
 
     fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), ContractError> {
+        // =====================================================================
+        // All host functions refresh the cached MEM_ADDR entry via the Caller
+        // before calling into native_api. This prevents stale memory base
+        // pointers after WASM memory.grow relocates linear memory (#3248).
+        // =====================================================================
+
         // Log namespace
         linker
-            .func_wrap("freenet_log", "__frnt__logger__info", native_api::log::info)
+            .func_wrap(
+                "freenet_log",
+                "__frnt__logger__info",
+                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::log::info(id, ptr, len);
+                },
+            )
             .map_err(WasmError::Other)?;
 
         // Rand namespace
@@ -759,7 +808,10 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_rand",
                 "__frnt__rand__rand_bytes",
-                native_api::rand::rand_bytes,
+                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: u32| {
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::rand::rand_bytes(id, ptr, len);
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -768,16 +820,24 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_time",
                 "__frnt__time__utc_now",
-                native_api::time::utc_now,
+                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::time::utc_now(id, ptr);
+                },
             )
             .map_err(WasmError::Other)?;
 
         // Delegate context namespace (synchronous)
+        // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID.
         linker
             .func_wrap(
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_len",
-                native_api::delegate_context::context_len,
+                |mut caller: Caller<'_, HostState>| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_context::context_len()
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -785,7 +845,11 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_read",
-                native_api::delegate_context::context_read,
+                |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_context::context_read(ptr, len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -793,7 +857,11 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_write",
-                native_api::delegate_context::context_write,
+                |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_context::context_write(ptr, len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -802,7 +870,15 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret",
-                native_api::delegate_secrets::get_secret,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i64,
+                 key_len: i32,
+                 out_ptr: i64,
+                 out_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::get_secret(key_ptr, key_len, out_ptr, out_len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -810,7 +886,11 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret_len",
-                native_api::delegate_secrets::get_secret_len,
+                |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::get_secret_len(key_ptr, key_len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -818,7 +898,15 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_secrets",
                 "__frnt__delegate__set_secret",
-                native_api::delegate_secrets::set_secret,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i64,
+                 key_len: i32,
+                 val_ptr: i64,
+                 val_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::set_secret(key_ptr, key_len, val_ptr, val_len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -826,7 +914,11 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_secrets",
                 "__frnt__delegate__has_secret",
-                native_api::delegate_secrets::has_secret,
+                |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::has_secret(key_ptr, key_len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -834,7 +926,11 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_delegate_secrets",
                 "__frnt__delegate__remove_secret",
-                native_api::delegate_secrets::remove_secret,
+                |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::remove_secret(key_ptr, key_len)
+                },
             )
             .map_err(WasmError::Other)?;
 
@@ -845,8 +941,10 @@ impl WasmtimeEngine {
             .func_wrap_async(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state",
-                |_caller: Caller<'_, HostState>,
+                |mut caller: Caller<'_, HostState>,
                  (id_ptr, id_len, out_ptr, out_len): (i64, i32, i64, i64)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::get_contract_state_impl(
                             id_ptr, id_len, out_ptr, out_len,
@@ -860,7 +958,9 @@ impl WasmtimeEngine {
             .func_wrap_async(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
-                |_caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::get_contract_state_len_impl(id_ptr, id_len)
                     })
@@ -872,8 +972,10 @@ impl WasmtimeEngine {
             .func_wrap_async(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__put_contract_state",
-                |_caller: Caller<'_, HostState>,
+                |mut caller: Caller<'_, HostState>,
                  (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::put_contract_state_impl(
                             id_ptr, id_len, state_ptr, state_len,
@@ -887,8 +989,10 @@ impl WasmtimeEngine {
             .func_wrap_async(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__update_contract_state",
-                |_caller: Caller<'_, HostState>,
+                |mut caller: Caller<'_, HostState>,
                  (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::update_contract_state_impl(
                             id_ptr, id_len, state_ptr, state_len,
@@ -902,7 +1006,9 @@ impl WasmtimeEngine {
             .func_wrap_async(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__subscribe_contract",
-                |_caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
                     })
