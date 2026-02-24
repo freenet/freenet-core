@@ -1492,6 +1492,14 @@ impl Operation for ConnectOp {
                                             "connect ConnectPeer failed"
                                         );
                                     }
+                                } else {
+                                    tracing::warn!(
+                                        tx=%self.id,
+                                        acceptor = %new_acceptor.peer,
+                                        elapsed_ms = self.id.elapsed().as_millis(),
+                                        "ConnectPeer callback channel closed without result; \
+                                         peer promotion may not have completed"
+                                    );
                                 }
                             }
 
@@ -1880,12 +1888,21 @@ pub(crate) async fn join_ring_request(
         "Attempting network connect"
     );
 
-    op_manager
+    if let Err(e) = op_manager
         .notify_op_change(
             NetMessage::V1(NetMessageV1::Connect(msg)),
             OpEnum::Connect(Box::new(op)),
         )
-        .await?;
+        .await
+    {
+        // Clean up the reservation that should_accept() created, so the bootstrap
+        // loop doesn't think this gateway is still "connected/pending" (#3244).
+        op_manager
+            .ring
+            .connection_manager
+            .prune_in_transit_connection(gateway_addr);
+        return Err(e);
+    }
 
     Ok(())
 }
