@@ -101,9 +101,11 @@ NAT traversal:
 
 ```
 Keep-alive:
-  → Ping every 5 seconds if no traffic
-  → 5 consecutive missed pings → connection dead
+  → Ping every 5 seconds initially
+  → After 5 unanswered pings, interval backs off: 10s → 20s → 40s → 60s cap
   → Idle timeout: 120s (RealTime), 24h (VirtualTime/simulation)
+  → On idle-timeout closure, per-peer backoff is recorded to prevent
+    rapid reconnection cycles to dead peers (#3252)
 ```
 
 ### WHEN closing connections

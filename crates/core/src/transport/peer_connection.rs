@@ -284,6 +284,24 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
 /// Interval between keep-alive ping packets.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maximum keepalive interval after backoff (caps the exponential growth).
+const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Returns the keepalive interval for the given number of pending (unanswered) pings.
+///
+/// At or below `MAX_UNANSWERED_PINGS`: returns `KEEP_ALIVE_INTERVAL` (5s).
+/// Above that threshold: doubles per additional unanswered ping, capped at 60s.
+fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
+    if pending_count > MAX_UNANSWERED_PINGS {
+        let extra = (pending_count - MAX_UNANSWERED_PINGS).min(4) as u32;
+        KEEP_ALIVE_INTERVAL
+            .saturating_mul(2u32.pow(extra))
+            .min(MAX_KEEPALIVE_INTERVAL)
+    } else {
+        KEEP_ALIVE_INTERVAL
+    }
+}
+
 /// Maximum number of unanswered pings before considering the connection dead.
 ///
 /// With 5-second ping interval, 5 unanswered pings means 25 seconds of no response.
@@ -333,24 +351,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "Keep-alive task STARTED for connection"
             );
 
-            let mut interval =
-                TimeSourceInterval::new(task_time_source.clone(), KEEP_ALIVE_INTERVAL);
-
-            // Skip the first immediate tick
-            interval.tick().await;
-
             let mut tick_count = 0u64;
             let mut ping_seq = 0u64;
             let task_start_nanos = task_time_source.now_nanos();
 
             loop {
-                let tick_start_nanos = task_time_source.now_nanos();
-                interval.tick().await;
+                // Back off keepalive interval when pings go unanswered (#3252).
+                let pending_count = pending_pings_for_task.read().len();
+                let wait_duration = keepalive_interval_for_pending(pending_count);
+                task_time_source.sleep(wait_duration).await;
                 tick_count += 1;
 
                 let now_nanos = task_time_source.now_nanos();
                 let elapsed_since_start_nanos = now_nanos.saturating_sub(task_start_nanos);
-                let elapsed_since_last_tick_nanos = now_nanos.saturating_sub(tick_start_nanos);
 
                 // Use local ping sequence counter
                 let current_ping_seq = ping_seq;
@@ -362,7 +375,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     tick_count,
                     ping_sequence = current_ping_seq,
                     elapsed_since_start_secs = Duration::from_nanos(elapsed_since_start_nanos).as_secs_f64(),
-                    tick_interval_ms = Duration::from_nanos(elapsed_since_last_tick_nanos).as_millis(),
+                    wait_interval_secs = wait_duration.as_secs_f64(),
+                    unanswered_pings = pending_count,
                     "Keep-alive tick - sending Ping"
                 );
 
@@ -2193,5 +2207,41 @@ mod tests {
             0,
             "All packets ACKed, flightsize should be 0"
         );
+    }
+
+    /// Keepalive interval backs off exponentially past the unanswered-ping threshold (#3252).
+    #[test]
+    fn keepalive_interval_backs_off_for_unanswered_pings() {
+        use super::{
+            keepalive_interval_for_pending, KEEP_ALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL,
+            MAX_UNANSWERED_PINGS,
+        };
+
+        // At or below threshold: base interval (5s)
+        for count in 0..=MAX_UNANSWERED_PINGS {
+            assert_eq!(
+                keepalive_interval_for_pending(count),
+                KEEP_ALIVE_INTERVAL,
+                "pending_count={count} should use base interval"
+            );
+        }
+
+        // Above threshold: exponential backoff, capped at MAX_KEEPALIVE_INTERVAL
+        let expected = [
+            (1, Duration::from_secs(10)),  // 5s * 2^1
+            (2, Duration::from_secs(20)),  // 5s * 2^2
+            (3, Duration::from_secs(40)),  // 5s * 2^3
+            (4, MAX_KEEPALIVE_INTERVAL),   // 5s * 2^4 = 80s, capped at 60s
+            (100, MAX_KEEPALIVE_INTERVAL), // far beyond threshold, still capped
+        ];
+        for (above, interval) in expected {
+            assert_eq!(
+                keepalive_interval_for_pending(MAX_UNANSWERED_PINGS + above),
+                interval,
+                "pending_count={} should produce {:?}",
+                MAX_UNANSWERED_PINGS + above,
+                interval,
+            );
+        }
     }
 }
