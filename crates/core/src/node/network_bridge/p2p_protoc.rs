@@ -2578,6 +2578,11 @@ impl P2pConnManager {
                     "Inbound connection established"
                 );
 
+                // Clear backoff on inbound connection: the peer is demonstrably alive (#3252).
+                if !remote_addr.ip().is_unspecified() {
+                    state.peer_backoff.record_success(remote_addr);
+                }
+
                 // Treat only transient connections as transient. Normal inbound dials (including
                 // gateway bootstrap from peers) should be promoted into the ring once established.
                 let is_transient = transient;
@@ -3188,7 +3193,6 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<EventResult> {
-        let _ = state;
         match event {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
@@ -3337,6 +3341,12 @@ impl P2pConnManager {
                     self.bridge
                         .op_manager
                         .on_ring_connection_lost(peer.pub_key());
+
+                    // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).
+                    if !remote_addr.ip().is_unspecified() {
+                        state.peer_backoff.record_failure(remote_addr);
+                        tracing::debug!(remote = %remote_addr, "Recorded peer backoff after transport closure");
+                    }
 
                     if let Err(error) = handshake_commands
                         .send(HandshakeCommand::DropConnection { peer: peer.clone() })
