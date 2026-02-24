@@ -725,6 +725,49 @@ pub struct RestartableNodeConfig {
     pub shared_storage: crate::wasm_runtime::MockStateStorage,
 }
 
+/// State for a node in the direct simulation runner, shared with the chaos driver.
+#[cfg(any(test, feature = "testing"))]
+struct DirectNodeState {
+    label: NodeLabel,
+    addr: SocketAddr,
+    is_gateway: bool,
+    permanently_dropped: bool,
+}
+
+/// Configuration for deterministic node churn (crash/restart) during simulation.
+///
+/// When enabled, a chaos driver task periodically crashes and restarts nodes
+/// to test network resilience under churn conditions.
+#[derive(Debug, Clone)]
+pub struct ChurnConfig {
+    /// Probability (0.0–1.0) that a non-gateway node is crashed each tick.
+    pub crash_probability: f64,
+    /// How often the chaos driver evaluates crashes.
+    pub tick_interval: Duration,
+    /// How long a crashed node stays down before restarting.
+    pub recovery_delay: Duration,
+    /// Maximum number of nodes crashed simultaneously.
+    /// Defaults to 25% of non-gateway node count.
+    pub max_simultaneous_crashes: Option<usize>,
+    /// Fraction (0.0–1.0) of crashes that are permanent (no restart).
+    pub permanent_crash_rate: f64,
+    /// Time to wait before the chaos driver starts crashing nodes.
+    pub warmup_delay: Duration,
+}
+
+impl Default for ChurnConfig {
+    fn default() -> Self {
+        Self {
+            crash_probability: 0.1,
+            tick_interval: Duration::from_secs(5),
+            recovery_delay: Duration::from_secs(3),
+            max_simultaneous_crashes: None,
+            permanent_crash_rate: 0.05,
+            warmup_delay: Duration::from_secs(5),
+        }
+    }
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -763,6 +806,8 @@ pub struct SimNetwork {
     /// When true, use `MockWasmRuntime` (production `ContractExecutor` code path)
     /// instead of `MockRuntime` (simplified hash-based merge).
     pub use_mock_wasm: bool,
+    /// Optional churn (crash/restart) configuration for the chaos driver.
+    churn_config: Option<ChurnConfig>,
 }
 
 impl SimNetwork {
@@ -821,6 +866,7 @@ impl SimNetwork {
             streaming_threshold: None,
             connection_managers: HashMap::new(),
             use_mock_wasm: false,
+            churn_config: None,
         };
         net.config_gateways(
             gateways
@@ -895,6 +941,12 @@ impl SimNetwork {
 impl SimNetwork {
     pub fn with_start_backoff(&mut self, value: Duration) {
         self.start_backoff = value;
+    }
+
+    /// Enables the chaos driver which periodically crashes and restarts nodes.
+    pub fn with_churn(&mut self, config: ChurnConfig) -> &mut Self {
+        self.churn_config = Some(config);
+        self
     }
 
     /// Returns the VirtualTime instance for this simulation.
@@ -3814,7 +3866,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
-        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
         use crate::ring::topology_registry::set_current_network_name;
 
         // Set up deterministic RNG and time for reproducible simulation
@@ -3834,6 +3886,15 @@ impl SimNetwork {
             .build()?;
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
+
+        // Relax transport timers for large-scale simulation (disables keepalive,
+        // uses 5x slower ACK/resend/rate-update intervals). This reduces timer
+        // firings from ~900K/sec to ~180K/sec across all connections.
+        // Only enable for large networks where timer overhead dominates; small
+        // tests (< 50 nodes) need production-like timer behavior for convergence.
+        if total_peer_num >= 50 {
+            SimulationTransportOpt::enable();
+        }
         let use_mock_wasm = self.use_mock_wasm;
 
         let result: anyhow::Result<()> = rt.block_on(async {
@@ -3850,6 +3911,10 @@ impl SimNetwork {
                 }
             });
 
+            // Shared state for chaos driver to crash/restart nodes
+            let direct_nodes: Arc<tokio::sync::Mutex<HashMap<NodeLabel, DirectNodeState>>> =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
             // Spawn gateway nodes
             let mut node_handles = Vec::new();
 
@@ -3857,6 +3922,7 @@ impl SimNetwork {
             for (node, config) in gateways {
                 let label = config.label.clone();
                 let receiver_ch = self.receiver_ch.clone();
+                let addr = *self.node_addresses.get(&label).expect("gateway address");
 
                 let shared_storage = crate::wasm_runtime::MockStateStorage::new();
 
@@ -3875,7 +3941,7 @@ impl SimNetwork {
                 let span = tracing::info_span!("direct_gateway", %label);
 
                 self.labels
-                    .push((label, node.config.key_pair.public().clone()));
+                    .push((label.clone(), node.config.key_pair.public().clone()));
 
                 let handle = if use_mock_wasm {
                     tokio::spawn(async move {
@@ -3888,6 +3954,20 @@ impl SimNetwork {
                             .await
                     })
                 };
+
+                {
+                    let mut nodes_map = direct_nodes.lock().await;
+                    nodes_map.insert(
+                        label.clone(),
+                        DirectNodeState {
+                            label: label.clone(),
+                            addr,
+                            is_gateway: true,
+                            permanently_dropped: false,
+                        },
+                    );
+                }
+
                 node_handles.push(handle);
             }
 
@@ -3895,6 +3975,7 @@ impl SimNetwork {
             let nodes: Vec<_> = self.nodes.drain(..).collect();
             for (i, (node, label)) in nodes.into_iter().enumerate() {
                 let receiver_ch = self.receiver_ch.clone();
+                let addr = *self.node_addresses.get(&label).expect("node address");
 
                 let shared_storage = crate::wasm_runtime::MockStateStorage::new();
 
@@ -3913,7 +3994,7 @@ impl SimNetwork {
                 let span = tracing::info_span!("direct_node", %label);
 
                 self.labels
-                    .push((label, node.config.key_pair.public().clone()));
+                    .push((label.clone(), node.config.key_pair.public().clone()));
 
                 let backoff = self.start_backoff * (i as u32 + 1);
                 let handle = if use_mock_wasm {
@@ -3929,8 +4010,160 @@ impl SimNetwork {
                             .await
                     })
                 };
+
+                {
+                    let mut nodes_map = direct_nodes.lock().await;
+                    nodes_map.insert(
+                        label.clone(),
+                        DirectNodeState {
+                            label: label.clone(),
+                            addr,
+                            is_gateway: false,
+                            permanently_dropped: false,
+                        },
+                    );
+                }
+
                 node_handles.push(handle);
             }
+
+            // Chaos driver: periodically crash/recover nodes via fault injection.
+            //
+            // Uses "soft crash" via the fault injector (blocks all messages to/from
+            // a node) rather than aborting tasks. This avoids orphaned sub-tasks
+            // that would stall tokio's time auto-advance in start_paused(true).
+            // The node's event loop keeps running but is functionally dead since
+            // all its messages are dropped.
+            let chaos_driver = if let Some(churn_config) = self.churn_config.clone() {
+                use crate::node::network_bridge::get_fault_injector;
+                use rand::prelude::*;
+                use rand::SeedableRng;
+
+                let chaos_nodes = direct_nodes.clone();
+                let network_name = self.name.clone();
+                let non_gateway_count = self.number_of_nodes;
+                let max_crashes = churn_config
+                    .max_simultaneous_crashes
+                    .unwrap_or((non_gateway_count / 4).max(1));
+
+                Some(tokio::spawn(async move {
+                    let mut chaos_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(
+                        seed.wrapping_add(0xC1_0055_DEAD),
+                    );
+
+                    // Wait for warmup before starting churn
+                    tokio::time::sleep(churn_config.warmup_delay).await;
+
+                    // Track which nodes are currently crashed (pending recovery)
+                    let mut pending_recovery: Vec<(NodeLabel, tokio::time::Instant)> = Vec::new();
+                    let mut total_crashes: usize = 0;
+                    let mut total_recoveries: usize = 0;
+                    let mut total_permanent: usize = 0;
+
+                    loop {
+                        tokio::time::sleep(churn_config.tick_interval).await;
+
+                        // Phase 1: Recover nodes whose recovery delay has elapsed
+                        let now = tokio::time::Instant::now();
+                        let mut recovered = Vec::new();
+                        pending_recovery.retain(|(label, crash_time)| {
+                            if now.duration_since(*crash_time) >= churn_config.recovery_delay {
+                                recovered.push(label.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
+                        for label in recovered {
+                            let nodes_map = chaos_nodes.lock().await;
+                            let state = match nodes_map.get(&label) {
+                                Some(s) if !s.permanently_dropped => s,
+                                _ => continue,
+                            };
+                            let addr = state.addr;
+                            drop(nodes_map);
+
+                            // Unblock messages — node resumes normal operation
+                            if let Some(injector) = get_fault_injector(&network_name) {
+                                let mut inj = injector.lock().unwrap();
+                                inj.config.recover_node(&addr);
+                            }
+
+                            total_recoveries += 1;
+                            tracing::info!(
+                                ?label,
+                                ?addr,
+                                total_recoveries,
+                                "Chaos driver: node recovered"
+                            );
+                        }
+
+                        // Phase 2: Crash eligible nodes
+                        let mut currently_crashed = pending_recovery.len();
+                        if currently_crashed >= max_crashes {
+                            continue;
+                        }
+
+                        let nodes_map = chaos_nodes.lock().await;
+                        let eligible: Vec<(NodeLabel, SocketAddr)> = nodes_map
+                            .values()
+                            .filter(|s| {
+                                !s.is_gateway
+                                    && !s.permanently_dropped
+                                    && !pending_recovery.iter().any(|(l, _)| l == &s.label)
+                            })
+                            .map(|s| (s.label.clone(), s.addr))
+                            .collect();
+                        drop(nodes_map);
+
+                        for (label, addr) in eligible {
+                            if currently_crashed >= max_crashes {
+                                break;
+                            }
+                            if !chaos_rng.random_bool(churn_config.crash_probability) {
+                                continue;
+                            }
+
+                            let is_permanent =
+                                chaos_rng.random_bool(churn_config.permanent_crash_rate);
+
+                            // Block all messages to/from this node
+                            if let Some(injector) = get_fault_injector(&network_name) {
+                                let mut inj = injector.lock().unwrap();
+                                inj.config.crash_node(addr);
+                            }
+
+                            total_crashes += 1;
+
+                            if is_permanent {
+                                let mut nodes_map = chaos_nodes.lock().await;
+                                if let Some(state) = nodes_map.get_mut(&label) {
+                                    state.permanently_dropped = true;
+                                }
+                                total_permanent += 1;
+                                tracing::info!(
+                                    ?label,
+                                    ?addr,
+                                    total_permanent,
+                                    "Chaos driver: node permanently crashed"
+                                );
+                            } else {
+                                pending_recovery.push((label.clone(), tokio::time::Instant::now()));
+                                currently_crashed += 1;
+                                tracing::info!(
+                                    ?label,
+                                    ?addr,
+                                    total_crashes,
+                                    "Chaos driver: node crashed (will recover)"
+                                );
+                            }
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
 
             // Event driver: identical logic to run_fdev_test's client
             let user_ev_controller = self
@@ -3988,7 +4221,10 @@ impl SimNetwork {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
 
-            // Shutdown: abort time driver, then check node tasks for errors/panics
+            // Shutdown: abort chaos driver, time driver, then check node tasks
+            if let Some(chaos) = chaos_driver {
+                chaos.abort();
+            }
             time_driver.abort();
 
             let mut first_error: Option<anyhow::Error> = None;

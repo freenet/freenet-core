@@ -2035,6 +2035,49 @@ impl GlobalSimulationTime {
 }
 
 // =============================================================================
+// Simulation Transport Optimization
+// =============================================================================
+
+std::thread_local! {
+    static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opt-in transport timer optimization for large-scale simulations.
+///
+/// When enabled, the transport layer uses relaxed timer intervals (5x slower ACK,
+/// resend, and rate-update checks) and disables keepalive pings. This dramatically
+/// reduces tokio scheduler overhead for 100+ node simulations where ~15K connections
+/// would otherwise create ~900K timer firings per second of virtual time.
+///
+/// This is a separate flag from `GlobalSimulationTime` because some simulation tests
+/// need realistic keepalive behavior (e.g., connection timeout tests). Only
+/// large-scale simulations that prioritize throughput should enable this.
+///
+/// # Safety
+///
+/// Only affects code paths in `PeerConnection::recv()` and `RealTime::supports_keepalive()`.
+/// Production code never sets this flag — it is only called from `run_simulation_direct()`
+/// which is gated behind `#[cfg(any(test, feature = "testing"))]`.
+pub struct SimulationTransportOpt;
+
+impl SimulationTransportOpt {
+    /// Enable relaxed transport timers for the current thread.
+    pub fn enable() {
+        SIMULATION_TRANSPORT_OPT.with(|f| f.set(true));
+    }
+
+    /// Disable relaxed transport timers (restore production behavior).
+    pub fn disable() {
+        SIMULATION_TRANSPORT_OPT.with(|f| f.set(false));
+    }
+
+    /// Returns `true` if relaxed transport timers are enabled on this thread.
+    pub fn is_enabled() -> bool {
+        SIMULATION_TRANSPORT_OPT.with(|f| f.get())
+    }
+}
+
+// =============================================================================
 // Global Test Metrics (for simulation testing)
 // =============================================================================
 

@@ -91,16 +91,17 @@ See: `crates/core/src/transport/in_memory_socket.rs`
 
 ```
 Need mid-simulation fault injection (partitions, crashes, churn)?
-  → YES: Use Turmoil runner (.run() / run_simulation())
-  → NO: Continue...
+  → Partitions/targeted crashes: Use Turmoil runner (.run() / run_simulation())
+  → Node churn (random crash/recover): Use direct runner with ChurnConfig
+  → Neither: Continue...
 
 Scale > 50 nodes or virtual time > 5 minutes?
   → YES: Use direct runner (.run_direct() / run_simulation_direct())
   → NO: Either runner works; prefer direct for 100% determinism
 ```
 
-- **Direct runner** (`run_simulation_direct`): Single `current_thread` + `start_paused(true)` tokio runtime. 100% deterministic. Scales to 500+ nodes. Used by fdev CLI and nightly tests.
-- **Turmoil runner** (`run_simulation`): Turmoil scheduler. ~99% deterministic. Supports mid-simulation fault injection via closures. Better for fault tolerance tests.
+- **Direct runner** (`run_simulation_direct`): Single `current_thread` + `start_paused(true)` tokio runtime. 100% deterministic. Scales to 500+ nodes. Supports `ChurnConfig` for automated crash/recover cycles via fault injection. Used by fdev CLI and nightly tests.
+- **Turmoil runner** (`run_simulation`): Turmoil scheduler. ~99% deterministic. Supports mid-simulation fault injection via closures (partitions, targeted crashes). Better for fine-grained fault tolerance tests.
 
 ## Fault Injection in Turmoil Tests
 

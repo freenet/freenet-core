@@ -197,6 +197,19 @@ impl TimeSource for RealTime {
     {
         Box::pin(async move { tokio::time::timeout(duration, future).await.ok() })
     }
+
+    /// Disable keepalive when `SimulationTransportOpt` is enabled.
+    ///
+    /// The direct runner uses `RealTime` (with `start_paused(true)`) rather than
+    /// `VirtualTime` for connections, so keepalive is enabled by default. But in
+    /// large-scale simulations, connections never actually drop, and 15K keepalive
+    /// tasks pinging every 5 seconds creates enormous scheduling overhead.
+    ///
+    /// This is opt-in via `SimulationTransportOpt::enable()` so that tests which
+    /// need keepalive behavior (e.g., connection timeout tests) can leave it off.
+    fn supports_keepalive(&self) -> bool {
+        !crate::config::SimulationTransportOpt::is_enabled()
+    }
 }
 
 // ============================================================================

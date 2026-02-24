@@ -113,6 +113,27 @@ pub struct TestConfig {
     #[arg(long)]
     print_network_stats: bool,
 
+    // =========================================================================
+    // Node Churn Options (crash/restart chaos driver)
+    // =========================================================================
+    /// Enable node churn with the specified crash probability per tick (0.0 to 1.0).
+    /// Example: --churn-rate 0.1 for 10% chance each tick
+    #[arg(long, value_name = "RATE")]
+    churn_rate: Option<f64>,
+
+    /// Recovery delay in milliseconds before a crashed node restarts.
+    /// Default: 3000
+    #[arg(long, value_name = "MS", default_value = "3000")]
+    churn_recovery_delay_ms: u64,
+
+    /// Fraction of crashes that are permanent (no restart). Default: 0.05
+    #[arg(long, value_name = "RATE", default_value = "0.05")]
+    churn_permanent_rate: f64,
+
+    /// How often (in milliseconds) the chaos driver evaluates crashes. Default: 5000
+    #[arg(long, value_name = "MS", default_value = "5000")]
+    churn_tick_ms: u64,
+
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -320,6 +341,11 @@ mod tests {
             min_success_rate: 0.95,
             print_summary: false,
             print_network_stats: false,
+            // Churn options
+            churn_rate: None,
+            churn_recovery_delay_ms: 3000,
+            churn_permanent_rate: 0.05,
+            churn_tick_ms: 5000,
             command: TestMode::SingleProcess,
         })
         .await
@@ -358,6 +384,10 @@ mod tests {
             min_success_rate: 0.95,
             print_summary: false,
             print_network_stats: false,
+            churn_rate: None,
+            churn_recovery_delay_ms: 3000,
+            churn_permanent_rate: 0.05,
+            churn_tick_ms: 5000,
             command: TestMode::SingleProcess,
         };
         assert!(config.build_fault_config().is_none());

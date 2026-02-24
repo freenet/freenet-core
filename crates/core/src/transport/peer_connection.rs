@@ -79,6 +79,20 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 /// This caused ~600ms delays per hop for streams larger than 20 packets.
 const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Relaxed timer intervals for simulation mode (direct runner with `start_paused(true)`).
+///
+/// In the direct runner, the transport layer uses `RealTime` but time is virtual via
+/// tokio's paused clock. With 500 nodes × ~30 connections = ~15K connections, the default
+/// timer intervals create ~900K timer firings per second of virtual time, which dominates
+/// wall-clock runtime. These relaxed intervals reduce that to ~180K/sec (5x improvement).
+///
+/// Safety: SimulationSocket uses in-memory delivery with no real packet loss, so slower
+/// ACK/retransmit checking doesn't cause correctness issues — it only affects simulated
+/// throughput slightly.
+const SIMULATION_ACK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const SIMULATION_RESEND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
+
 #[must_use]
 pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
@@ -520,10 +534,29 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
+        // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce
+        // scheduling overhead from ~900K to ~180K timer firings/sec across all connections.
+        let in_simulation = crate::config::SimulationTransportOpt::is_enabled();
+        let ack_interval = if in_simulation {
+            SIMULATION_ACK_CHECK_INTERVAL
+        } else {
+            ACK_CHECK_INTERVAL
+        };
+        let resend_initial = if in_simulation {
+            SIMULATION_RESEND_CHECK_INTERVAL
+        } else {
+            Duration::from_millis(10)
+        };
+        let resend_yield = if in_simulation {
+            SIMULATION_RESEND_YIELD_DELAY
+        } else {
+            Duration::from_millis(2)
+        };
+
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check_sleep: Option<
             std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        > = Some(self.time_source.sleep(Duration::from_millis(10)));
+        > = Some(self.time_source.sleep(resend_initial));
 
         let kill_connection_after = self.time_source.connection_idle_timeout();
         let kill_connection_after_nanos = kill_connection_after.as_nanos() as u64;
@@ -533,31 +566,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let mut timeout_check =
             TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
 
-        // Background ACK timer - sends pending ACKs proactively every 100ms
+        // Background ACK timer - sends pending ACKs proactively
         // This prevents delays when there's no outgoing traffic to piggyback ACKs on
         // Use interval_at to delay the first tick - unlike the keep-alive task which can
         // block to skip its first tick, we're inside a select! loop so we delay instead
-        let ack_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
-        let mut ack_check = TimeSourceInterval::new_at(
-            self.time_source.clone(),
-            ack_start_nanos,
-            ACK_CHECK_INTERVAL,
-        );
+        let ack_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
+        let mut ack_check =
+            TimeSourceInterval::new_at(self.time_source.clone(), ack_start_nanos, ack_interval);
 
-        // Rate update timer - updates TokenBucket rate based on BBR cwnd every 100ms
+        // Rate update timer - updates TokenBucket rate based on BBR cwnd
         // This allows the token bucket to adapt to network conditions dynamically
-        let rate_start_nanos = self.time_source.now_nanos() + ACK_CHECK_INTERVAL.as_nanos() as u64;
-        let mut rate_update_check = TimeSourceInterval::new_at(
-            self.time_source.clone(),
-            rate_start_nanos,
-            ACK_CHECK_INTERVAL,
-        );
+        let rate_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
+        let mut rate_update_check =
+            TimeSourceInterval::new_at(self.time_source.clone(), rate_start_nanos, ack_interval);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
-        // Delay between resend batches. Negligible vs RTO (~600ms) but prevents the
-        // resend branch from starving inbound processing during retransmission storms.
-        const RESEND_YIELD_DELAY: Duration = Duration::from_millis(2);
         loop {
             // If resend_check_sleep was consumed by a previous select iteration
             // (via .take()) but the resend branch didn't win, refill with a short
@@ -565,7 +589,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // on every iteration during retransmission storms, which would starve
             // inbound packet processing and create an ACK-drop feedback loop.
             if resend_check_sleep.is_none() {
-                resend_check_sleep = Some(self.time_source.sleep(RESEND_YIELD_DELAY));
+                resend_check_sleep = Some(self.time_source.sleep(resend_yield));
             }
 
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
@@ -1030,7 +1054,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
-                            resend_check_sleep = Some(self.time_source.sleep(RESEND_YIELD_DELAY));
+                            resend_check_sleep = Some(self.time_source.sleep(resend_yield));
                             break;
                         }
                     }

@@ -16,7 +16,7 @@
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::GlobalTestMetrics;
-use freenet::config::{GlobalRng, GlobalSimulationTime};
+use freenet::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
 use freenet::dev_tool::{
     check_convergence_from_logs, reset_channel_id_counter, reset_event_id_counter,
     reset_global_node_index, reset_nonce_counter, RequestId, SimNetwork, StreamId, VirtualTime,
@@ -749,6 +749,9 @@ fn setup_deterministic_state(seed: u64) {
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
     GlobalTestMetrics::reset();
+    // Reset transport optimization — run_simulation_direct() enables it when needed,
+    // but tests that reuse a thread should start with production timer behavior.
+    SimulationTransportOpt::disable();
 
     // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();
@@ -5748,4 +5751,76 @@ fn test_isolated_node_rebootstraps_via_gateway() {
     for (i, anomaly) in report.anomalies.iter().enumerate() {
         tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
     }
+}
+
+// =============================================================================
+// Direct Runner: Churn Resilience
+// =============================================================================
+
+/// Verifies that the direct runner can complete a simulation with node churn enabled.
+///
+/// Runs 2 gateways + 8 nodes with 20% crash rate, 200ms ticks, 500ms recovery.
+/// Asserts the simulation completes without panicking and produces events.
+#[test]
+fn test_direct_runner_churn() {
+    use freenet::dev_tool::ChurnConfig;
+
+    const SEED: u64 = 0xC1_0055_FEED;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-churn",
+            2,  // gateways
+            8,  // nodes
+            10, // ring_max_htl
+            5,  // rnd_if_htl_above
+            15, // max_connections
+            3,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    sim.with_churn(ChurnConfig {
+        crash_probability: 0.20,
+        tick_interval: Duration::from_millis(200),
+        recovery_delay: Duration::from_millis(500),
+        max_simultaneous_crashes: Some(2),
+        permanent_crash_rate: 0.05,
+        // Must be >= connection wait (2s) + buffer to avoid crashing nodes during startup
+        warmup_delay: Duration::from_secs(5),
+    });
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        10, // max_contract_num
+        30, // iterations
+        Duration::from_millis(200),
+    )
+    .expect("Direct simulation with churn should complete without panic");
+
+    // Verify events were produced despite churn
+    let rt = create_runtime();
+    let event_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.len()
+    });
+
+    assert!(
+        event_count > 0,
+        "Simulation with churn should produce events, got 0"
+    );
+
+    tracing::info!(
+        "CHURN TEST PASSED: {} events produced with node churn enabled",
+        event_count
+    );
 }
