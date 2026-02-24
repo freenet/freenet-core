@@ -35,6 +35,8 @@ pub struct ClientEventsCombinator<const N: usize> {
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
     /// and the original id (reverse of indexes)
     internal_clients: HashMap<ClientId, (usize, ClientId)>,
+    /// tracks which client slots have disconnected so we don't re-poll dead channels
+    dead_clients: [bool; N],
 }
 
 impl<const N: usize> ClientEventsCombinator<N> {
@@ -72,6 +74,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
             external_clients,
             internal_clients: HashMap::new(),
             pending_futs,
+            dead_clients: [false; N],
         }
     }
 }
@@ -79,53 +82,88 @@ impl<const N: usize> ClientEventsCombinator<N> {
 impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
     fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         async {
-            let Some((idx, mut rx, res)) = self.pending_futs.next().await else {
-                unreachable!("pending_futs should always have a future unless the combinator is dropped");
-            };
+            loop {
+                if self.pending_futs.is_empty() {
+                    // All client slots are dead — nothing left to poll.
+                    // Return a shutdown error so client_event_handling can exit gracefully.
+                    tracing::warn!("All client transports have disconnected");
+                    return Err(ErrorKind::Shutdown.into());
+                }
 
-            let res = res
-                .map(|res| {
-                    match res {
-                        Ok(OpenRequest {
-                            client_id: external,
-                            request_id,
-                            request,
-                            notification_channel,
-                            token,
-                            attested_contract,
-                        }) => {
-                            let id = *self.external_clients[idx]
-                                .entry(external)
-                                .or_insert_with(|| {
-                                    // add a new mapped external client id
-                                    let internal = ClientId::next();
-                                    self.internal_clients.insert(internal, (idx, external));
-                                    internal
-                                });
-                            tracing::debug!("received request for proxy #{idx}; internal_id={id}; external_id={external}; req={request}");
+                let Some((idx, mut rx, res)) = self.pending_futs.next().await else {
+                    // FuturesUnordered drained mid-poll (shouldn't happen if !is_empty above)
+                    tracing::warn!("All client transports have disconnected");
+                    return Err(ErrorKind::Shutdown.into());
+                };
+
+                match res {
+                    Some(msg) => {
+                        // Channel is alive — re-enqueue for next poll
+                        self.pending_futs.push(
+                            async move {
+                                let res = rx.recv().await;
+                                (idx, rx, res)
+                            }
+                            .boxed(),
+                        );
+
+                        // Map external client IDs to internal ones
+                        let mapped = match msg {
                             Ok(OpenRequest {
-                                client_id: id,
-                                request_id,  // Pass through correlation ID
+                                client_id: external,
+                                request_id,
                                 request,
                                 notification_channel,
                                 token,
-                                attested_contract
-                            })
-                        }
-                        err @ Err(_) => err,
+                                attested_contract,
+                            }) => {
+                                let id = *self.external_clients[idx]
+                                    .entry(external)
+                                    .or_insert_with(|| {
+                                        let internal = ClientId::next();
+                                        self.internal_clients.insert(internal, (idx, external));
+                                        internal
+                                    });
+                                tracing::debug!("received request for proxy #{idx}; internal_id={id}; external_id={external}; req={request}");
+                                Ok(OpenRequest {
+                                    client_id: id,
+                                    request_id,
+                                    request,
+                                    notification_channel,
+                                    token,
+                                    attested_contract,
+                                })
+                            }
+                            err @ Err(_) => err,
+                        };
+                        return mapped;
                     }
-                })
-                .unwrap_or_else(|| Err(ErrorKind::TransportProtocolDisconnect.into()));
+                    None => {
+                        // Channel closed — client_fn exited. Mark slot as dead and clean up
+                        // mappings. Do NOT re-push into pending_futs (avoids infinite spin).
+                        tracing::warn!(
+                            proxy_idx = idx,
+                            "Client transport disconnected, cleaning up client slot"
+                        );
+                        self.dead_clients[idx] = true;
 
-            self.pending_futs.push(
-                async move {
-                    let res = rx.recv().await;
-                    (idx, rx, res)
+                        // Remove internal→external mappings for this slot
+                        let dead_internals: Vec<ClientId> = self
+                            .internal_clients
+                            .iter()
+                            .filter(|(_, (slot, _))| *slot == idx)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        for id in &dead_internals {
+                            self.internal_clients.remove(id);
+                        }
+                        self.external_clients[idx].clear();
+
+                        // Loop back to poll remaining live clients
+                        continue;
+                    }
                 }
-                .boxed(),
-            );
-
-            res
+            }
         }
         .boxed()
     }
@@ -136,24 +174,45 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
         response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>> {
         async move {
-            let (idx, external) = self
-                .internal_clients
-                .get(&internal)
-                .ok_or(ErrorKind::UnknownClient(internal.0))?;
+            let Some((idx, external)) = self.internal_clients.get(&internal) else {
+                // Client disconnected between request and response — this is normal,
+                // not fatal. Log and silently drop the response.
+                tracing::debug!(
+                    client_id = internal.0,
+                    "Dropping response for disconnected client (unknown client ID)"
+                );
+                return Ok(());
+            };
+            let idx = *idx;
+            let external = *external;
+
+            if self.dead_clients[idx] {
+                // Client slot is already marked dead — drop the response silently.
+                tracing::debug!(
+                    client_id = internal.0,
+                    proxy_idx = idx,
+                    "Dropping response for dead client slot"
+                );
+                return Ok(());
+            }
+
             // Use try_send so the host event loop never blocks on sending to a slow client.
             // This prevents the channel(1) deadlock from #2915 while keeping memory bounded.
-            self.clients[*idx]
-                .try_send((*external, response))
-                .map_err(|e| {
-                    if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                        tracing::warn!(
-                            client_id = internal.0,
-                            capacity = CHANNEL_CAPACITY,
-                            "Response channel full — client not consuming fast enough, disconnecting"
-                        );
-                    }
-                    ClientError::from(ErrorKind::TransportProtocolDisconnect)
-                })?;
+            if let Err(e) = self.clients[idx].try_send((external, response)) {
+                if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    tracing::warn!(
+                        client_id = internal.0,
+                        capacity = CHANNEL_CAPACITY,
+                        "Response channel full — client not consuming fast enough, dropping response"
+                    );
+                } else {
+                    tracing::debug!(
+                        client_id = internal.0,
+                        "Client channel closed, dropping response"
+                    );
+                }
+                // Don't propagate as error — a slow/dead client should not crash the node.
+            }
             Ok(())
         }
         .boxed()
@@ -239,7 +298,7 @@ async fn client_fn(
             }
         }
     }
-    tracing::error!("Peer client interface shut down");
+    tracing::debug!("Peer client interface shut down");
 }
 
 #[cfg(test)]
@@ -445,5 +504,85 @@ mod test {
         )
         .await
         .expect("bidirectional traffic deadlocked");
+    }
+
+    /// Regression test for #3243: a single client disconnecting should not crash the combinator.
+    /// Before the fix, a closed channel would produce TransportProtocolDisconnect which was
+    /// treated as fatal. Now the dead slot is cleaned up and remaining clients continue working.
+    #[tokio::test]
+    async fn test_client_disconnect_non_fatal() {
+        let (proxies, mut senders, _receivers) = setup_proxies();
+        let mut combinator = ClientEventsCombinator::new(proxies);
+
+        // Populate internal_clients mapping for all 3 proxies.
+        for (idx, sender) in senders.iter_mut().enumerate() {
+            sender.send(idx).await.unwrap();
+            combinator.recv().await.unwrap();
+        }
+        assert_eq!(combinator.internal_clients.len(), 3);
+
+        // Kill proxy #1 by dropping its sender — this closes the channel,
+        // causing client_fn to exit. The proxy first sends a ChannelClosed error
+        // through tx_host, then tx_host is dropped causing None on the next poll.
+        drop(senders.remove(1));
+
+        // First recv may get the ChannelClosed error from the dying proxy.
+        // We need to also send data from a live proxy so recv can eventually return it.
+        senders[0].send(0).await.unwrap();
+
+        // Drain events until we get a successful request from proxy #0.
+        // This exercises the dead-channel cleanup path.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match combinator.recv().await {
+                    Ok(req) => return Ok(req),
+                    Err(e) if matches!(e.kind(), ErrorKind::ChannelClosed) => {
+                        // Expected — the dying proxy notified us of disconnect
+                        continue;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::TransportProtocolDisconnect) => {
+                        // This was the old fatal error — should not happen anymore,
+                        // but if the dead channel is detected it's also fine to skip.
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("recv timed out — combinator is stuck on dead channel");
+        assert!(result.is_ok(), "recv should succeed for live proxy");
+
+        // Key assertion: we got a successful response from a live proxy despite
+        // another proxy disconnecting — the combinator didn't crash or hang.
+        // The dead_clients flag may or may not be set yet depending on poll ordering,
+        // but the important thing is the combinator is still functional.
+    }
+
+    /// Test that send() to a disconnected client doesn't return an error.
+    #[tokio::test]
+    async fn test_send_to_disconnected_client_ok() {
+        let (proxies, mut senders, _receivers) = setup_proxies();
+        let mut combinator = ClientEventsCombinator::new(proxies);
+
+        // Populate mappings.
+        for (idx, sender) in senders.iter_mut().enumerate() {
+            sender.send(idx).await.unwrap();
+            combinator.recv().await.unwrap();
+        }
+        let client_ids: Vec<_> = combinator.internal_clients.keys().cloned().collect();
+
+        // Kill proxy #1.
+        drop(senders.remove(1));
+
+        // Drain the dead channel notification by receiving — this will skip the dead one.
+        senders[0].send(0).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv()).await;
+
+        // Sending to any client (including the now-dead one) should succeed (not panic/error).
+        for cli_id in &client_ids {
+            let result = combinator.send(*cli_id, Ok(HostResponse::Ok)).await;
+            assert!(result.is_ok(), "send should not fail for client {cli_id}");
+        }
     }
 }

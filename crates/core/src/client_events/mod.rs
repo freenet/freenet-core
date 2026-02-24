@@ -408,7 +408,10 @@ where
                         anyhow::bail!("shutdown event");
                     }
                     Err(error) if matches!(error.kind(), ErrorKind::TransportProtocolDisconnect) => {
-                        return Err(anyhow::anyhow!(error));
+                        // A single client disconnecting is not fatal — continue serving
+                        // other clients. The combinator already cleaned up the dead slot.
+                        tracing::debug!(error = %error, "Client transport disconnected");
+                        continue;
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "Client error");
@@ -470,9 +473,8 @@ where
                         tracing::debug!(
                             client_id = %cli_id,
                             error = %err,
-                            "Client channel closed"
+                            "Client channel closed, response dropped"
                         );
-                        anyhow::bail!(err);
                     }
                 }
             },
@@ -541,21 +543,24 @@ where
                             tracing::debug!(
                                 client_id = %cli_id,
                                 error = %err,
-                                "Client channel closed"
+                                "Client channel closed, operation response dropped"
                             );
-                            anyhow::bail!(err);
                         }
                     }
                     (_, Ok(None)) => continue,
-                    // TODO: we should change the API so client requests have a unique id so we can map specific responses
-                    // to the specific client request
                     (cli_id, Err(err)) => {
                         tracing::error!(
                             client_id = %cli_id,
                             error = %err,
                             "Sending error response to client"
                         );
-                        client_events.send(cli_id, Err(err)).await?
+                        if let Err(send_err) = client_events.send(cli_id, Err(err)).await {
+                            tracing::debug!(
+                                client_id = %cli_id,
+                                error = %send_err,
+                                "Client channel closed, error response dropped"
+                            );
+                        }
                     }
                 }
             },
