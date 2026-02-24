@@ -182,7 +182,8 @@ jobs:
             single-process
 
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
-      # Wall-clock budget: ~50 min for 500 nodes × 5000 events at ~87 reqs/min
+      # With simulation-mode timer optimizations (~5x fewer timer firings),
+      # estimated ~30-40 min for 500 nodes × 5000 events.
       - name: Large scale test (500 nodes)
         timeout-minutes: 60
         env:

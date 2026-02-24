@@ -16,7 +16,7 @@
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::GlobalTestMetrics;
-use freenet::config::{GlobalRng, GlobalSimulationTime};
+use freenet::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
 use freenet::dev_tool::{
     check_convergence_from_logs, reset_channel_id_counter, reset_event_id_counter,
     reset_global_node_index, reset_nonce_counter, RequestId, SimNetwork, StreamId, VirtualTime,
@@ -749,6 +749,9 @@ fn setup_deterministic_state(seed: u64) {
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
     GlobalTestMetrics::reset();
+    // Reset transport optimization — run_simulation_direct() enables it when needed,
+    // but tests that reuse a thread should start with production timer behavior.
+    SimulationTransportOpt::disable();
 
     // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();

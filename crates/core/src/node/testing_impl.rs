@@ -3866,7 +3866,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
-        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
         use crate::ring::topology_registry::set_current_network_name;
 
         // Set up deterministic RNG and time for reproducible simulation
@@ -3876,6 +3876,11 @@ impl SimNetwork {
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
         let epoch_offset = seed % RANGE_MS;
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Relax transport timers for large-scale simulation (disables keepalive,
+        // uses 5x slower ACK/resend/rate-update intervals). This reduces timer
+        // firings from ~900K/sec to ~180K/sec across all connections.
+        SimulationTransportOpt::enable();
 
         set_current_network_name(&self.name);
 
