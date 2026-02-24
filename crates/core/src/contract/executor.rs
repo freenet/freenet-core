@@ -49,6 +49,17 @@ pub(super) mod mock_wasm_runtime;
 mod pool_tests;
 pub(super) mod runtime;
 
+/// Notification sent when a subscribed contract's state changes.
+/// Delivered from `commit_state_update()` to the `contract_handling()` loop.
+pub(crate) struct DelegateNotification {
+    pub delegate_key: DelegateKey,
+    pub contract_id: ContractInstanceId,
+    pub new_state: WrappedState,
+}
+
+pub(crate) type DelegateNotificationSender = mpsc::UnboundedSender<DelegateNotification>;
+pub(crate) type DelegateNotificationReceiver = mpsc::UnboundedReceiver<DelegateNotification>;
+
 pub(crate) use init_tracker::{
     now_nanos, ContractInitTracker, InitCheckResult, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
@@ -714,6 +725,15 @@ pub(crate) trait ContractExecutor: Send + 'static {
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> impl Future<Output = Result<StateDelta<'static>, ExecutorError>> + Send;
+
+    /// Take the delegate notification receiver, if available.
+    ///
+    /// Returns `Some(rx)` for pool-based executors that support delegate subscription
+    /// notifications. Returns `None` for mock/test executors.
+    /// This can only be called once — subsequent calls return `None`.
+    fn take_delegate_notification_rx(&mut self) -> Option<DelegateNotificationReceiver> {
+        None
+    }
 }
 
 /// Tracks contracts that have undergone corrupted-state recovery.
@@ -791,6 +811,10 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Cache of delta results keyed by (ContractKey, state_hash, their_summary_hash).
     /// Avoids redundant WASM instantiations for get_state_delta() calls.
     delta_cache: LruCache<(ContractKey, u64, u64), StateDelta<'static>>,
+
+    /// Channel to send delegate notifications when subscribed contracts change state.
+    /// Set when running in a pool via `set_delegate_notification_tx()`.
+    delegate_notification_tx: Option<DelegateNotificationSender>,
 }
 
 impl<R, S> Executor<R, S>
@@ -825,6 +849,7 @@ where
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
             summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            delegate_notification_tx: None,
         })
     }
 
@@ -855,6 +880,12 @@ where
     /// tracking is consistent regardless of which executor handles a request.
     pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
         self.recovery_guard = guard;
+    }
+
+    /// Set the delegate notification sender for pool-based operation.
+    /// When set, `commit_state_update()` will send notifications to subscribed delegates.
+    pub(crate) fn set_delegate_notification_tx(&mut self, tx: DelegateNotificationSender) {
+        self.delegate_notification_tx = Some(tx);
     }
 
     /// Create all stores including StateStore. Used when creating a standalone executor.

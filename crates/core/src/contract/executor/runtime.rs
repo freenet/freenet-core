@@ -137,6 +137,8 @@ pub struct RuntimePool {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Receiver for delegate notifications (taken once by `contract_handling()`).
+    delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
 }
 
 impl RuntimePool {
@@ -162,6 +164,10 @@ impl RuntimePool {
         // so we can pass references to each executor
         let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
         let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
+
+        // Create delegate notification channel for subscription delivery
+        let (delegate_notification_tx, delegate_notification_rx) =
+            tokio::sync::mpsc::unbounded_channel();
 
         // Create shared module caches so all pool executors share one set of compiled WASM modules.
         // Without this, each of the N executors would maintain its own LRU cache, causing
@@ -197,6 +203,7 @@ impl RuntimePool {
         first_executor
             .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
+        first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
         runtimes.push(Some(first_executor));
 
         for i in 1..pool_size_usize {
@@ -215,6 +222,7 @@ impl RuntimePool {
             executor
                 .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
             executor.set_recovery_guard(shared_recovery_guard.clone());
+            executor.set_delegate_notification_tx(delegate_notification_tx.clone());
 
             runtimes.push(Some(executor));
 
@@ -242,6 +250,7 @@ impl RuntimePool {
             shared_delegate_modules,
             shared_backend_engine,
             shared_recovery_guard,
+            delegate_notification_rx: Some(delegate_notification_rx),
         })
     }
 
@@ -621,6 +630,10 @@ impl ContractExecutor for RuntimePool {
         self.return_checked(executor, "get_contract_state_delta")
             .await;
         result
+    }
+
+    fn take_delegate_notification_rx(&mut self) -> Option<super::DelegateNotificationReceiver> {
+        self.delegate_notification_rx.take()
     }
 }
 
@@ -1460,6 +1473,9 @@ where
             );
         }
 
+        // Notify subscribed delegates about the state change
+        self.send_delegate_contract_notifications(key, new_state);
+
         if let Some(op_manager) = &self.op_manager {
             if let Err(err) = op_manager
                 .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
@@ -1477,6 +1493,45 @@ where
         }
 
         Ok(())
+    }
+
+    /// Send notifications to delegates subscribed to a contract's state changes.
+    ///
+    /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
+    /// `DelegateNotification` for each subscribed delegate through the channel.
+    fn send_delegate_contract_notifications(&self, key: &ContractKey, new_state: &WrappedState) {
+        let tx = match &self.delegate_notification_tx {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        let instance_id = *key.id();
+        let subscribers = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
+        let subscribers = match subscribers {
+            Some(ref s) if !s.is_empty() => s,
+            _ => return,
+        };
+
+        tracing::debug!(
+            contract = %key,
+            subscriber_count = subscribers.len(),
+            "Sending delegate contract notifications"
+        );
+
+        for delegate_key in subscribers.iter() {
+            if let Err(e) = tx.send(super::DelegateNotification {
+                delegate_key: delegate_key.clone(),
+                contract_id: instance_id,
+                new_state: new_state.clone(),
+            }) {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Delegate notification channel closed"
+                );
+                return;
+            }
+        }
     }
 
     fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
@@ -2024,6 +2079,13 @@ impl Executor<Runtime> {
             }
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_attested_ids.remove(&key);
+
+                // Remove delegate from all contract subscription entries
+                crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
+                    subscribers.remove(&key);
+                    !subscribers.is_empty()
+                });
+
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
