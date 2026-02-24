@@ -746,6 +746,10 @@ mod test {
                 success: bool,
                 error: Option<String>,
             },
+            ContractNotificationReceived {
+                contract_id: ContractInstanceId,
+                new_state: Vec<u8>,
+            },
             Error {
                 message: String,
             },
@@ -2628,6 +2632,51 @@ mod test {
                 assert!(error.is_some());
             }
             other => panic!("Expected ContractSubscribeResult, got {:?}", other),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error::Error>> {
+        use capabilities_messages::*;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        let new_state = vec![10, 20, 30, 40];
+
+        let notification = InboundDelegateMsg::ContractNotification(ContractNotification {
+            contract_id,
+            new_state: WrappedState::new(new_state.clone()),
+            context: DelegateContext::default(),
+        });
+
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![notification],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+        let msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&msg.payload)?;
+        match response {
+            DelegateResponse::ContractNotificationReceived {
+                contract_id: id,
+                new_state: state,
+            } => {
+                assert_eq!(id, contract_id);
+                assert_eq!(state, new_state);
+            }
+            other => panic!("Expected ContractNotificationReceived, got {:?}", other),
         }
 
         std::mem::drop(temp_dir);
