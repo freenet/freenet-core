@@ -3877,11 +3877,6 @@ impl SimNetwork {
         let epoch_offset = seed % RANGE_MS;
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
 
-        // Relax transport timers for large-scale simulation (disables keepalive,
-        // uses 5x slower ACK/resend/rate-update intervals). This reduces timer
-        // firings from ~900K/sec to ~180K/sec across all connections.
-        SimulationTransportOpt::enable();
-
         set_current_network_name(&self.name);
 
         // Single-threaded runtime with paused time for deterministic execution
@@ -3891,6 +3886,15 @@ impl SimNetwork {
             .build()?;
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
+
+        // Relax transport timers for large-scale simulation (disables keepalive,
+        // uses 5x slower ACK/resend/rate-update intervals). This reduces timer
+        // firings from ~900K/sec to ~180K/sec across all connections.
+        // Only enable for large networks where timer overhead dominates; small
+        // tests (< 50 nodes) need production-like timer behavior for convergence.
+        if total_peer_num >= 50 {
+            SimulationTransportOpt::enable();
+        }
         let use_mock_wasm = self.use_mock_wasm;
 
         let result: anyhow::Result<()> = rt.block_on(async {
