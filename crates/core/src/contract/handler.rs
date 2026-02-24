@@ -414,7 +414,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
 
         if let WaitingTransaction::Transaction(tx) = waiting_tx {
-            self.notify_session_actor(tx, client_id, request_id);
+            self.notify_session_actor(tx, client_id, request_id).await;
         }
 
         Ok(())
@@ -452,13 +452,22 @@ impl ContractHandlerChannel<SenderHalve> {
             }
         }
 
-        self.notify_session_actor(tx, client_id, request_id);
+        self.notify_session_actor(tx, client_id, request_id).await;
 
         Ok(())
     }
 
     /// Notify the session actor about a transaction registration, if installed.
-    fn notify_session_actor(&self, tx: Transaction, client_id: ClientId, request_id: RequestId) {
+    ///
+    /// Uses `.send().await` to ensure the registration is never silently dropped.
+    /// If the session actor channel is full, this will wait for capacity rather
+    /// than losing the registration (which would cause the client to timeout).
+    async fn notify_session_actor(
+        &self,
+        tx: Transaction,
+        client_id: ClientId,
+        request_id: RequestId,
+    ) {
         let Some(session_tx) = &self.session_adapter_tx else {
             tracing::warn!(
                 client = %client_id,
@@ -472,13 +481,13 @@ impl ContractHandlerChannel<SenderHalve> {
             client_id,
             request_id,
         };
-        if let Err(e) = session_tx.try_send(msg) {
-            tracing::warn!(
+        if let Err(e) = session_tx.send(msg).await {
+            tracing::error!(
                 tx = %tx,
                 client = %client_id,
                 request_id = %request_id,
                 error = %e,
-                "Failed to notify session actor"
+                "Failed to notify session actor — receiver dropped"
             );
         }
     }

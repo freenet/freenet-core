@@ -183,6 +183,7 @@ async fn put_contract(
 
     // Wait for server response before closing connection (with timeout)
     tracing::info!(
+        %key,
         "Request submitted, waiting for network response (timeout: {}s)...",
         RESPONSE_TIMEOUT.as_secs()
     );
@@ -208,7 +209,7 @@ async fn put_contract(
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds.\n\
+            "Timeout waiting for server response for contract {key} after {} seconds.\n\
              The operation may have succeeded on the network - check server logs.\n\
              If this timeout is consistently too short, consider:\n\
              - Network latency between you and the gateway\n\
@@ -265,6 +266,7 @@ For additional hardening is recommended to use a different cipher and nonce to e
 
     // Wait for server response before closing connection (with timeout)
     tracing::info!(
+        delegate = %delegate_key.encode(),
         "Request submitted, waiting for network response (timeout: {}s)...",
         RESPONSE_TIMEOUT.as_secs()
     );
@@ -277,11 +279,12 @@ For additional hardening is recommended to use a different cipher and nonce to e
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds.\n\
+            "Timeout waiting for server response for delegate {} after {} seconds.\n\
              The operation may have succeeded on the network - check server logs.\n\
              If this timeout is consistently too short, consider:\n\
              - Network latency between you and the gateway\n\
              - Delegate size and propagation time through the network",
+            delegate_key.encode(),
             RESPONSE_TIMEOUT.as_secs()
         )),
     };
@@ -346,6 +349,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
 
     // Wait for server response before closing connection (with timeout)
     tracing::info!(
+        %key,
         "Request submitted, waiting for network response (timeout: {}s)...",
         RESPONSE_TIMEOUT.as_secs()
     );
@@ -364,7 +368,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response after {} seconds.\n\
+            "Timeout waiting for server response for contract {key} after {} seconds.\n\
              The operation may have succeeded on the network - check server logs.\n\
              If this timeout is consistently too short, consider:\n\
              - Network latency between you and the gateway\n\

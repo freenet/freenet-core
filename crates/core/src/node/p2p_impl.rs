@@ -366,18 +366,8 @@ impl NodeP2P {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        // Create MessageProcessor - direct to SessionActor
-        use crate::node::MessageProcessor;
-        let message_processor = Arc::new(MessageProcessor::new(session_tx.clone()));
-
-        let conn_manager = P2pConnManager::build(
-            &config,
-            op_manager.clone(),
-            event_register,
-            message_processor,
-        )
-        .await?;
-        tracing::info!("P2P layer configured with MessageProcessor - network processing decoupled from client handling");
+        let conn_manager =
+            P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
         let contract_executor_task = GlobalExecutor::spawn({

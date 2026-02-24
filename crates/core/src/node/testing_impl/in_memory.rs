@@ -24,7 +24,7 @@ use crate::{
         background_task_monitor::BackgroundTaskMonitor,
         network_bridge::{event_loop_notification_channel, p2p_protoc::P2pConnManager},
         op_state_manager::OpManager,
-        EventLoopExitReason, MessageProcessor, NetEventRegister,
+        EventLoopExitReason, NetEventRegister,
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
@@ -81,7 +81,6 @@ impl<ER> Builder<ER> {
         let _guard = parent_span.enter();
         let connection_manager = ConnectionManager::new(&self.config);
 
-        // Create result router channel - needed for MessageProcessor
         let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
 
         // In-memory nodes use a monitor for API compatibility; tasks are cleaned
@@ -125,17 +124,10 @@ impl<ER> Builder<ER> {
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
-        // Create MessageProcessor with dummy session channel for testing
-        // In tests, results are not routed to clients through the session actor
-        let (session_tx, _session_rx) = tokio::sync::mpsc::channel(100);
-        let message_processor = Arc::new(MessageProcessor::new(session_tx));
-
-        // Build P2pConnManager with test configuration
         let conn_manager = P2pConnManager::build(
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
-            message_processor,
         )
         .await?;
 
@@ -269,16 +261,10 @@ impl<ER> Builder<ER> {
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
-        // Create MessageProcessor with dummy session channel for testing
-        let (session_tx, _session_rx) = tokio::sync::mpsc::channel(100);
-        let message_processor = Arc::new(MessageProcessor::new(session_tx));
-
-        // Build P2pConnManager with test configuration
         let conn_manager = P2pConnManager::build(
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
-            message_processor,
         )
         .await?;
 
@@ -409,16 +395,10 @@ impl<ER> Builder<ER> {
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
-        // Create MessageProcessor with dummy session channel for testing
-        let (session_tx, _session_rx) = tokio::sync::mpsc::channel(100);
-        let message_processor = Arc::new(MessageProcessor::new(session_tx));
-
-        // Build P2pConnManager with test configuration
         let conn_manager = P2pConnManager::build(
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
-            message_processor,
         )
         .await?;
 
