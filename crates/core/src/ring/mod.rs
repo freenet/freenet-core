@@ -1239,6 +1239,9 @@ impl Ring {
         let pub_key = peer.pub_key.clone();
         self.connection_manager
             .add_connection(loc, addr, pub_key, was_reserved);
+        if let Some(own_loc) = self.connection_manager.own_location().location() {
+            crate::node::network_status::set_own_location(own_loc.as_f64());
+        }
         if let Some(event) = NetEventLog::connected(self, peer, loc) {
             self.event_register
                 .register_events(Either::Left(event))
@@ -1596,6 +1599,7 @@ impl Ring {
         use crate::tracing::DisconnectReason;
 
         tracing::debug!(%peer, "Removing connection");
+        crate::node::network_status::record_peer_disconnected(peer.addr);
         let orphaned_transactions = self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
 
         if !orphaned_transactions.is_empty() {

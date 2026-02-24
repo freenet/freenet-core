@@ -1768,6 +1768,7 @@ async fn deliver_update_result(
     };
 
     let host_result = op.to_host_result();
+    crate::node::network_status::record_contract_updated(&format!("{key}"));
 
     op_manager
         .result_router_tx

@@ -128,7 +128,17 @@ impl NodeP2P {
         let start_time = tokio::time::Instant::now();
 
         // Initialize network status tracking for the connecting page diagnostics
-        super::network_status::init(self.conn_manager.listening_port());
+        let gateway_addrs: std::collections::HashSet<std::net::SocketAddr> = self
+            .conn_manager
+            .gateways
+            .iter()
+            .filter_map(|g| g.socket_addr())
+            .collect();
+        super::network_status::init(
+            self.conn_manager.listening_port(),
+            gateway_addrs,
+            crate::config::PCK_VERSION.to_string(),
+        );
 
         // Emit peer startup event
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(

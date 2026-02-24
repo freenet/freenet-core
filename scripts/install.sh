@@ -420,6 +420,7 @@ main() {
                 "$install_dir/freenet" service install
                 echo ""
                 success "Service installed! Start it with: freenet service start"
+                echo "  Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
                 ;;
             *)
                 info "Skipping service installation"
@@ -433,6 +434,8 @@ main() {
     echo ""
     echo "To run Freenet manually:"
     echo "  freenet network"
+    echo ""
+    echo "Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
     echo ""
     echo "For more information, visit: https://freenet.org"
 }

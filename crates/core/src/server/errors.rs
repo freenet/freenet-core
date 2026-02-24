@@ -109,18 +109,19 @@ fn connecting_page() -> String {
             }
             format!(
                 r#"<div class="diagnostics">
-            <h2>Connection Issues</h2>
+            <h3>Connection Issues</h3>
             <ul>{items}</ul>
-            <p class="attempts">Attempted {attempts} connection(s) over {elapsed}s. Retrying...</p>
+            <p class="attempts">Attempted {attempts} connection(s) over {elapsed}. Retrying...</p>
         </div>"#,
                 attempts = snap.connection_attempts,
-                elapsed = snap.elapsed_secs,
+                elapsed = network_status::format_duration(snap.elapsed_secs),
             )
         }
         Some(snap) if snap.connection_attempts > 0 => {
             format!(
-                r#"<p class="attempts">Attempted {} connection(s) over {}s. Retrying...</p>"#,
-                snap.connection_attempts, snap.elapsed_secs,
+                r#"<p class="attempts">Attempted {} connection(s) over {}. Retrying...</p>"#,
+                snap.connection_attempts,
+                network_status::format_duration(snap.elapsed_secs),
             )
         }
         _ => String::new(),
@@ -134,7 +135,9 @@ fn connecting_page() -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="3">
     <title>Connecting to Freenet</title>
+    <link rel="icon" href="https://freenet.org/favicon.ico">
     <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             display: flex;
@@ -149,20 +152,9 @@ fn connecting_page() -> String {
             padding: 2rem;
             max-width: 600px;
         }}
-        .logo {{
-            width: 80px;
-            height: 80px;
-            margin-bottom: 1.5rem;
-        }}
-        h1 {{
-            color: #333;
-            font-size: 1.5rem;
-            margin-bottom: 0.5rem;
-        }}
-        p {{
-            color: #666;
-            margin-bottom: 1rem;
-        }}
+        .logo {{ width: 80px; height: 80px; margin-bottom: 1.5rem; }}
+        h1 {{ color: #333; font-size: 1.5rem; margin-bottom: 0.5rem; }}
+        p {{ color: #666; margin-bottom: 1rem; line-height: 1.5; }}
         .spinner {{
             width: 24px;
             height: 24px;
@@ -172,9 +164,7 @@ fn connecting_page() -> String {
             animation: spin 1s linear infinite;
             margin: 0 auto;
         }}
-        @keyframes spin {{
-            to {{ transform: rotate(360deg); }}
-        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
         .diagnostics {{
             text-align: left;
             background: #fff3cd;
@@ -183,31 +173,11 @@ fn connecting_page() -> String {
             padding: 1rem 1.5rem;
             margin-top: 1.5rem;
         }}
-        .diagnostics h2 {{
-            color: #856404;
-            font-size: 1.1rem;
-            margin: 0 0 0.5rem 0;
-        }}
-        .diagnostics ul {{
-            padding-left: 1.2rem;
-            margin: 0.5rem 0;
-        }}
-        .diagnostics li {{
-            color: #555;
-            margin-bottom: 0.5rem;
-            font-size: 0.9rem;
-        }}
-        .attempts {{
-            color: #888;
-            font-size: 0.85rem;
-            margin-top: 0.5rem;
-        }}
-        code {{
-            background: #f0f0f0;
-            padding: 0.1rem 0.3rem;
-            border-radius: 3px;
-            font-size: 0.85em;
-        }}
+        .diagnostics h3 {{ color: #856404; font-size: 1rem; margin-bottom: 0.4rem; }}
+        .diagnostics ul {{ padding-left: 1.2rem; margin: 0.4rem 0; list-style: disc; }}
+        .diagnostics li {{ color: #555; margin-bottom: 0.35rem; font-size: 0.85rem; }}
+        .attempts {{ color: #888; font-size: 0.8rem; margin-top: 0.4rem; }}
+        code {{ background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.85em; }}
     </style>
 </head>
 <body>

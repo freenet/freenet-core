@@ -998,6 +998,7 @@ impl Operation for SubscribeOp {
                                 contract = %format!("{:.8}", key),
                                 "SUBSCRIPTION_ACCEPTED: registered lease-based subscription"
                             );
+                            crate::node::network_status::record_subscription(format!("{key}"));
 
                             // Fetch contract if we don't have it.
                             // This is non-fatal - if it fails, we still continue with forwarding/completing
