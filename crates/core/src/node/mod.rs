@@ -571,6 +571,49 @@ async fn report_result(
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
 
+            // Record operation result for dashboard stats
+            {
+                use crate::node::network_status::{self, OpType};
+                let (op_type, success) = match (op_res.id().transaction_type(), op_res.outcome()) {
+                    (
+                        TransactionType::Get,
+                        OpOutcome::ContractOpSuccess { .. }
+                        | OpOutcome::ContractOpSuccessUntimed { .. },
+                    ) => (Some(OpType::Get), true),
+                    (TransactionType::Get, OpOutcome::ContractOpFailure { .. }) => {
+                        (Some(OpType::Get), false)
+                    }
+                    (
+                        TransactionType::Put,
+                        OpOutcome::ContractOpSuccess { .. }
+                        | OpOutcome::ContractOpSuccessUntimed { .. },
+                    ) => (Some(OpType::Put), true),
+                    (TransactionType::Put, OpOutcome::ContractOpFailure { .. }) => {
+                        (Some(OpType::Put), false)
+                    }
+                    (
+                        TransactionType::Update,
+                        OpOutcome::ContractOpSuccess { .. }
+                        | OpOutcome::ContractOpSuccessUntimed { .. },
+                    ) => (Some(OpType::Update), true),
+                    (TransactionType::Update, OpOutcome::ContractOpFailure { .. }) => {
+                        (Some(OpType::Update), false)
+                    }
+                    (
+                        TransactionType::Subscribe,
+                        OpOutcome::ContractOpSuccess { .. }
+                        | OpOutcome::ContractOpSuccessUntimed { .. },
+                    ) => (Some(OpType::Subscribe), true),
+                    (TransactionType::Subscribe, OpOutcome::ContractOpFailure { .. }) => {
+                        (Some(OpType::Subscribe), false)
+                    }
+                    _ => (None, false),
+                };
+                if let Some(op_type) = op_type {
+                    network_status::record_op_result(op_type, success);
+                }
+            }
+
             let route_event = match op_res.outcome() {
                 OpOutcome::ContractOpSuccess {
                     target_peer,

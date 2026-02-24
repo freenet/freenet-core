@@ -3042,7 +3042,7 @@ impl P2pConnManager {
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
-            crate::node::network_status::record_connection_success();
+            crate::node::network_status::record_peer_connected(peer_addr, None);
             if promote_to_ring {
                 // Only prune reservation when promoting to ring - transient connections
                 // don't go through should_accept() so they have no reservation to prune
@@ -3086,6 +3086,11 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
+                crate::node::network_status::record_peer_connected(peer_addr, Some(loc.as_f64()));
+                // Only count as NAT success for non-gateway peers (gateway connections are direct)
+                if !crate::node::network_status::is_known_gateway(&peer_addr) {
+                    crate::node::network_status::record_nat_attempt(true);
+                }
 
                 // tell the new peer about our subscriptions and cache
                 for (target, msg) in self

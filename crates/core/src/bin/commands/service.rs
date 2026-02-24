@@ -636,6 +636,7 @@ fn start_service(system: bool) -> Result<()> {
     let system_mode = use_system_mode(system);
     systemctl_with_hint(system_mode, &["start", "freenet"], "start service")?;
     println!("Freenet service started.");
+    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
     Ok(())
 }
 
@@ -652,6 +653,7 @@ fn restart_service(system: bool) -> Result<()> {
     let system_mode = use_system_mode(system);
     systemctl_with_hint(system_mode, &["restart", "freenet"], "restart service")?;
     println!("Freenet service restarted.");
+    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
     Ok(())
 }
 
@@ -925,6 +927,7 @@ fn start_service(system: bool) -> Result<()> {
 
     if status.success() {
         println!("Freenet service started.");
+        println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
     } else {
         anyhow::bail!("Failed to start service");
     }
@@ -1122,6 +1125,7 @@ fn start_service(system: bool) -> Result<()> {
 
     if status.success() {
         println!("Freenet started.");
+        println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
     } else {
         anyhow::bail!("Failed to start Freenet. Make sure the scheduled task is installed.");
     }
