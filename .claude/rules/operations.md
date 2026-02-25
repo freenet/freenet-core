@@ -132,6 +132,35 @@ Use: tx.timed_out()
 → Ensures deterministic testing
 ```
 
+## State Consistency
+
+### WHEN a connection is removed
+
+```
+All failure paths that remove a connection MUST also clean up
+pending operation state for that peer.
+
+MUST:
+  → Remove any in-flight operations targeting the disconnected peer
+  → Fail pending sub-operations that depend on the peer
+  → Log stale operation cleanup at debug level
+
+WHY: Orphaned operations to dead peers cause timeouts and resource leaks.
+```
+
+### WHEN syncing peer lists across nodes
+
+```
+Sync protocols that exchange peer lists MUST filter out
+peers not currently in the live connection set.
+
+WRONG:
+  send_peer_list(all_known_peers)  // Includes long-dead peers
+
+CORRECT:
+  send_peer_list(connected_peers.filter(|p| is_live_connection(p)))
+```
+
 ## Error Handling
 
 ### WHEN encountering OpNotPresent
