@@ -924,6 +924,20 @@ impl SimNetwork {
         }
     }
 
+    /// Sets the readiness gating threshold for all nodes.
+    ///
+    /// Nodes must have at least `min` ring connections before they advertise
+    /// readiness for non-CONNECT operations. Retroactively updates all
+    /// already-built gateway and node configs.
+    pub fn with_readiness_gating(&mut self, min: usize) {
+        for (builder, _) in &mut self.gateways {
+            builder.config.relay_ready_connections = Some(min);
+        }
+        for (builder, _) in &mut self.nodes {
+            builder.config.relay_ready_connections = Some(min);
+        }
+    }
+
     /// Derives a deterministic per-peer seed from the master seed and peer index.
     fn derive_peer_seed(&self, peer_index: usize) -> u64 {
         // Use a simple but effective mixing function

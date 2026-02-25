@@ -1399,6 +1399,21 @@ impl Ring {
             .topology_manager
             .write()
             .report_outbound_request(event.peer.clone(), event.contract_location);
+
+        // Update peer health tracking based on routing outcome.
+        if let Some(addr) = event.peer.socket_addr() {
+            let mut health = self.connection_manager.peer_health.lock();
+            match &event.outcome {
+                crate::router::RouteOutcome::Success { .. }
+                | crate::router::RouteOutcome::SuccessUntimed => {
+                    health.record_success(addr);
+                }
+                crate::router::RouteOutcome::Failure => {
+                    health.record_failure(addr);
+                }
+            }
+        }
+
         self.router.write().add_event(event);
     }
 
@@ -1696,6 +1711,8 @@ impl Ring {
 
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = Instant::now();
+        let mut last_health_check = Instant::now();
+        const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
@@ -1795,6 +1812,32 @@ impl Ring {
 
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
+
+            // Periodic peer health check: evict peers with sustained routing failures.
+            if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
+                last_health_check = Instant::now();
+                let current_ring = self.connection_manager.connection_count();
+                let unhealthy = self
+                    .connection_manager
+                    .peer_health
+                    .lock()
+                    .unhealthy_peers(self.connection_manager.min_connections, current_ring);
+                for addr in unhealthy {
+                    tracing::warn!(
+                        peer = %addr,
+                        "Evicting unhealthy peer (sustained routing failures)"
+                    );
+                    if let Err(e) = notifier
+                        .notifications_sender
+                        .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                            addr,
+                        )))
+                        .await
+                    {
+                        tracing::debug!(error = ?e, "Failed to send DropConnection for unhealthy peer");
+                    }
+                }
+            }
 
             // Isolation recovery: when we have zero ring connections for too long,
             // reset all backoff state so we can retry aggressively (#2928).

@@ -121,6 +121,29 @@ use super::VisitedPeers;
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Minimum forward estimator score for a peer to be considered for CONNECT forwarding.
+/// Peers scoring below this threshold are filtered out when alternatives exist,
+/// preventing routing through known-bad paths.
+const MIN_FORWARD_SCORE: f64 = 0.15;
+
+/// Filter out scored peers below `MIN_FORWARD_SCORE` when alternatives exist.
+///
+/// If filtering would leave zero scored peers AND zero eligible (unscored) peers,
+/// the scored list is left unchanged so we still have a fallback.
+fn filter_low_score_peers<T>(scored: &mut Vec<(f64, T)>, eligible_count: usize) {
+    if scored.len() + eligible_count <= 1 {
+        return;
+    }
+    let survivors = scored
+        .iter()
+        .filter(|(s, _)| *s >= MIN_FORWARD_SCORE)
+        .count();
+    // Only filter if at least one scored peer survives OR unscored fallbacks exist.
+    if survivors > 0 || eligible_count > 0 {
+        scored.retain(|(score, _)| *score >= MIN_FORWARD_SCORE);
+    }
+}
+
 /// Top-level message envelope used by the new connect handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ConnectMsg {
@@ -702,6 +725,9 @@ impl RelayContext for RelayEnv<'_> {
             }
             eligible.push(cand.clone());
         }
+
+        // Filter out low-score peers when alternatives exist.
+        filter_low_score_peers(&mut scored, eligible.len());
 
         if !scored.is_empty() {
             let best_score = scored
@@ -3451,5 +3477,48 @@ mod tests {
         );
         assert!(retry_actions.forward.is_none());
         assert!(retry_actions.accept_response.is_none());
+    }
+
+    // ============ filter_low_score_peers tests ============
+
+    #[test]
+    fn test_filter_low_score_peers_removes_bad_when_alternatives_exist() {
+        let mut scored: Vec<(f64, &str)> = vec![(0.05, "bad"), (0.8, "good")];
+        super::filter_low_score_peers(&mut scored, 0);
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].1, "good");
+    }
+
+    #[test]
+    fn test_filter_low_score_peers_keeps_sole_option() {
+        let mut scored: Vec<(f64, &str)> = vec![(0.05, "only")];
+        super::filter_low_score_peers(&mut scored, 0);
+        assert_eq!(
+            scored.len(),
+            1,
+            "Single peer must be kept even with low score"
+        );
+    }
+
+    #[test]
+    fn test_filter_low_score_peers_removes_when_unscored_fallback_exists() {
+        let mut scored: Vec<(f64, &str)> = vec![(0.05, "low")];
+        super::filter_low_score_peers(&mut scored, 1);
+        assert!(
+            scored.is_empty(),
+            "Low-score peer should be filtered when unscored fallback exists"
+        );
+    }
+
+    #[test]
+    fn test_filter_low_score_peers_keeps_all_bad_when_no_alternatives() {
+        // All scored peers below threshold AND no eligible fallback → keep them all.
+        let mut scored: Vec<(f64, &str)> = vec![(0.05, "bad1"), (0.10, "bad2")];
+        super::filter_low_score_peers(&mut scored, 0);
+        assert_eq!(
+            scored.len(),
+            2,
+            "Must keep all low-score peers when no alternatives exist"
+        );
     }
 }

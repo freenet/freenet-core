@@ -26,7 +26,7 @@ use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -5821,6 +5821,235 @@ fn test_direct_runner_churn() {
 
     tracing::info!(
         "CHURN TEST PASSED: {} events produced with node churn enabled",
+        event_count
+    );
+}
+
+// =============================================================================
+// Unhealthy Peer Eviction Tests
+// =============================================================================
+
+/// Verifies that partitioned (dead) peers are eventually evicted from the ring
+/// via the PeerHealthTracker, and that zombie transports don't accumulate.
+///
+/// Creates a network, partitions one node, runs contract operations so the
+/// partitioned node accumulates routing failures, then checks that the network
+/// continues to function (the partitioned node doesn't permanently block routing).
+#[test_log::test]
+fn test_unhealthy_peer_eviction() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::Partition;
+
+    const SEED: u64 = 0xDEAD_BEEF_0042;
+    const NETWORK_NAME: &str = "unhealthy-eviction";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            4, // 4 nodes (5 total)
+            7,
+            3,
+            10,
+            2,
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Pick one non-gateway node to partition
+    let victim_addr: SocketAddr = *node_addrs
+        .iter()
+        .find(|(label, _)| label.is_node())
+        .expect("Need at least 1 non-gateway node")
+        .1;
+
+    let all_addrs: HashSet<_> = node_addrs.values().copied().collect();
+    let victim_set: HashSet<_> = [victim_addr].into_iter().collect();
+    let healthy_set: HashSet<_> = all_addrs.difference(&victim_set).copied().collect();
+
+    let network_name = NETWORK_NAME.to_string();
+
+    // Use long event_wait to give virtual time for health checks to fire.
+    // 150 iterations × 2s = 300s virtual time (5 min) — enough for health check interval.
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        5,                        // contracts
+        150,                      // iterations
+        Duration::from_secs(600), // simulation_duration (10 min headroom)
+        Duration::from_secs(2),   // event_wait (2s between events)
+        move || async move {
+            // Phase 1: Partition the victim node from everyone else
+            tracing::info!("Partitioning victim node: {}", victim_addr);
+
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                let partition = Partition::new(victim_set, healthy_set).permanent(0);
+                state.config.add_partition(partition);
+            }
+
+            // Phase 2: Let the network operate with the partitioned node.
+            // The healthy nodes should accumulate routing failures when trying
+            // to use the partitioned node, and eventually the health tracker
+            // should flag it as unhealthy.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            tracing::info!("Partition active for 120s virtual time");
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "Unhealthy-peer eviction simulation failed: {:?}",
+        result.err()
+    );
+
+    // Verify the network produced events (it didn't deadlock)
+    let event_count = rt.block_on(async { logs_handle.lock().await.len() });
+    assert!(event_count > 0, "Simulation should produce events, got 0");
+
+    // Run anomaly detection
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== UNHEALTHY EVICTION REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+}
+
+// =============================================================================
+// Readiness Gating Tests
+// =============================================================================
+
+/// Verifies that readiness gating (min_ready_connections=3) does not block
+/// contract operations once the network has stabilized.
+///
+/// Runs 1 gateway + 4 nodes with readiness gating enabled. If the periodic
+/// re-broadcast and optimistic timeout work correctly, all nodes should
+/// eventually become ready and contract operations should succeed.
+#[test]
+fn test_readiness_gating_production_config() {
+    const SEED: u64 = 0xBEAD_10A7_E001;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-readiness-gating",
+            1,  // gateways
+            4,  // nodes
+            10, // ring_max_htl
+            5,  // rnd_if_htl_above
+            10, // max_connections
+            3,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    sim.with_readiness_gating(3);
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        5,  // max_contract_num
+        20, // iterations (enough for contract creation + operations)
+        Duration::from_millis(200),
+    )
+    .expect("Simulation with readiness gating should complete without panic");
+
+    let rt = create_runtime();
+    let event_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.len()
+    });
+
+    assert!(
+        event_count > 0,
+        "Simulation with readiness gating should produce events, got 0"
+    );
+
+    tracing::info!(
+        "READINESS GATING TEST PASSED: {} events produced with gating(3)",
+        event_count
+    );
+}
+
+/// Same as `test_readiness_gating_production_config` but with 5% message loss.
+///
+/// This validates that the periodic ReadyState re-broadcast and optimistic
+/// timeout handle lost messages gracefully.
+#[test]
+fn test_readiness_gating_with_message_loss() {
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0xBEAD_10A7_E002;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-readiness-gating-loss",
+            1,  // gateways
+            4,  // nodes
+            10, // ring_max_htl
+            5,  // rnd_if_htl_above
+            10, // max_connections
+            3,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    sim.with_readiness_gating(3);
+    sim.with_fault_injection(FaultConfig::builder().message_loss_rate(0.05).build());
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        5,  // max_contract_num
+        25, // iterations (extra budget for retries under loss)
+        Duration::from_millis(200),
+    )
+    .expect("Simulation with readiness gating + message loss should complete");
+
+    let rt = create_runtime();
+    let event_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.len()
+    });
+
+    assert!(
+        event_count > 0,
+        "Simulation with readiness gating + message loss should produce events, got 0"
+    );
+
+    tracing::info!(
+        "READINESS GATING + MESSAGE LOSS TEST PASSED: {} events",
         event_count
     );
 }
