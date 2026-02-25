@@ -244,6 +244,12 @@ pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
 /// It unifies what was previously split between the subscription tree and proximity cache.
 ///
 /// Generic over `T: TimeSource` to support deterministic simulation testing.
+///
+/// **Dual-tracking with `HostingManager::downstream_subscribers`:** both must be
+/// kept in sync during register/remove operations. This manager drives UPDATE
+/// broadcast targeting and upstream peer lookup; `downstream_subscribers` drives
+/// unsubscribe-upstream decisions. See the Unsubscribe handler in
+/// `operations/subscribe.rs` for the sync point.
 pub struct InterestManager<T: TimeSource> {
     /// Track interested peers and their summaries for each contract.
     /// Key: ContractKey, Value: Map of PeerKey -> PeerInterest
