@@ -3155,7 +3155,10 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            _ => panic!("Expected ContractOpFailure"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpSuccessUntimed { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => panic!("Expected ContractOpFailure"),
         }
 
         // GetOp with no stats and no result → should return Incomplete
@@ -3239,7 +3242,12 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+            other @ OpOutcome::ContractOpSuccess { .. }
+            | other @ OpOutcome::ContractOpFailure { .. }
+            | other @ OpOutcome::Incomplete
+            | other @ OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed, got {other:?}")
+            }
         }
     }
 
@@ -3279,7 +3287,12 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+            other @ OpOutcome::ContractOpSuccess { .. }
+            | other @ OpOutcome::ContractOpFailure { .. }
+            | other @ OpOutcome::Incomplete
+            | other @ OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed, got {other:?}")
+            }
         }
     }
 
@@ -3343,7 +3356,10 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            other => panic!("Expected ContractOpFailure, got {other:?}"),
+            other @ OpOutcome::ContractOpSuccess { .. }
+            | other @ OpOutcome::ContractOpSuccessUntimed { .. }
+            | other @ OpOutcome::Incomplete
+            | other @ OpOutcome::Irrelevant => panic!("Expected ContractOpFailure, got {other:?}"),
         }
     }
 }

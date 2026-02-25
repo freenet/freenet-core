@@ -182,7 +182,15 @@ async fn test_priority_select_future_priority_ordering() {
 
     match result.unwrap().expect("Stream should yield value") {
         SelectResult::Notification(_) => {}
-        _ => panic!("Notification should be received first due to priority"),
+        SelectResult::OpExecution(_)
+        | SelectResult::PeerConnection(_)
+        | SelectResult::ConnBridge(_)
+        | SelectResult::Handshake(_)
+        | SelectResult::NodeController(_)
+        | SelectResult::ClientTransaction(_)
+        | SelectResult::ExecutorTransaction(_) => {
+            panic!("Notification should be received first due to priority")
+        }
     }
 }
 
@@ -222,7 +230,14 @@ async fn test_priority_select_future_concurrent_messages() {
     assert!(result.is_ok(), "Should receive first message");
     match result.unwrap().expect("Stream should yield value") {
         SelectResult::Notification(Some(_)) => {}
-        _ => panic!("Expected notification"),
+        SelectResult::Notification(_)
+        | SelectResult::OpExecution(_)
+        | SelectResult::PeerConnection(_)
+        | SelectResult::ConnBridge(_)
+        | SelectResult::Handshake(_)
+        | SelectResult::NodeController(_)
+        | SelectResult::ClientTransaction(_)
+        | SelectResult::ExecutorTransaction(_) => panic!("Expected notification"),
     }
 }
 
@@ -264,7 +279,14 @@ async fn test_priority_select_future_buffered_messages() {
 
     match result.unwrap().expect("Stream should yield value") {
         SelectResult::Notification(Some(_)) => {}
-        _ => panic!("Expected notification"),
+        SelectResult::Notification(_)
+        | SelectResult::OpExecution(_)
+        | SelectResult::PeerConnection(_)
+        | SelectResult::ConnBridge(_)
+        | SelectResult::Handshake(_)
+        | SelectResult::NodeController(_)
+        | SelectResult::ClientTransaction(_)
+        | SelectResult::ExecutorTransaction(_) => panic!("Expected notification"),
     }
 }
 
@@ -416,7 +438,9 @@ async fn test_priority_select_event_loop_simulation() {
             SelectResult::ConnBridge(_) => received_events.push("conn_bridge"),
             SelectResult::Handshake(_) => received_events.push("handshake"),
             SelectResult::NodeController(_) => received_events.push("node_controller"),
-            _ => received_events.push("other"),
+            SelectResult::PeerConnection(_)
+            | SelectResult::ClientTransaction(_)
+            | SelectResult::ExecutorTransaction(_) => received_events.push("other"),
         }
 
         tracing::info!(
@@ -1059,7 +1083,7 @@ async fn test_priority_select_all_pending_waker_registration() {
         SelectResult::ExecutorTransaction(_) => {
             panic!("Should prioritize Notification over ExecutorTransaction")
         }
-        _ => panic!("Unexpected result"),
+        SelectResult::PeerConnection(_) | SelectResult::Handshake(_) => panic!("Unexpected result"),
     }
 }
 
@@ -1962,7 +1986,14 @@ where
                     SelectResult::ClientTransaction(Ok(_)) => "client_transaction",
                     SelectResult::ExecutorTransaction(Ok(_)) => "executor_transaction",
                     // Channel closures — skip
-                    _ => continue,
+                    SelectResult::Notification(_)
+                    | SelectResult::OpExecution(_)
+                    | SelectResult::PeerConnection(_)
+                    | SelectResult::ConnBridge(_)
+                    | SelectResult::Handshake(_)
+                    | SelectResult::NodeController(_)
+                    | SelectResult::ClientTransaction(_)
+                    | SelectResult::ExecutorTransaction(_) => continue,
                 };
                 events.push(name);
             }
@@ -2754,7 +2785,14 @@ async fn run_prefilled_stream(
                     SelectResult::NodeController(Some(_)) => Some(false),
                     SelectResult::ClientTransaction(Ok(_)) => Some(true),
                     SelectResult::ExecutorTransaction(Ok(_)) => Some(true),
-                    _ => None, // Channel closure
+                    SelectResult::Notification(_)
+                    | SelectResult::OpExecution(_)
+                    | SelectResult::PeerConnection(_)
+                    | SelectResult::ConnBridge(_)
+                    | SelectResult::Handshake(_)
+                    | SelectResult::NodeController(_)
+                    | SelectResult::ClientTransaction(_)
+                    | SelectResult::ExecutorTransaction(_) => None, // Channel closure
                 };
                 if let Some(t) = tier {
                     tiers.push(t);

@@ -780,7 +780,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let contract_request = match &outbound[0] {
             OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
-            other => panic!("Expected GetContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected GetContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(contract_request.contract_id, target_contract_id);
         assert!(!contract_request.processed);
@@ -798,7 +805,14 @@ mod test {
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(final_msg.processed);
 
@@ -808,7 +822,15 @@ mod test {
                 assert_eq!(contract_id, target_contract_id);
                 assert_eq!(state, Some(contract_state));
             }
-            other => panic!("Expected ContractState response, got {:?}", other),
+            other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractState response, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -838,7 +860,14 @@ mod test {
 
         let contract_request = match &outbound[0] {
             OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
-            other => panic!("Expected GetContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected GetContractRequest, got {:?}", other)
+            }
         };
 
         let response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
@@ -852,7 +881,14 @@ mod test {
 
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
 
         let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
@@ -860,7 +896,15 @@ mod test {
             DelegateResponse::ContractState { state, .. } => {
                 assert!(state.is_none());
             }
-            other => panic!("Expected ContractState response, got {:?}", other),
+            other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractState response, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -894,7 +938,14 @@ mod test {
         assert_eq!(outbound.len(), 1);
         let req1 = match &outbound[0] {
             OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
-            other => panic!("Expected GetContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected GetContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(req1.contract_id, contract1);
 
@@ -910,7 +961,14 @@ mod test {
         assert_eq!(outbound2.len(), 1);
         let req2 = match &outbound2[0] {
             OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
-            other => panic!("Expected GetContractRequest for contract2, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected GetContractRequest for contract2, got {:?}", other)
+            }
         };
         assert_eq!(req2.contract_id, contract2);
 
@@ -926,7 +984,14 @@ mod test {
         assert_eq!(outbound3.len(), 1);
         let req3 = match &outbound3[0] {
             OutboundDelegateMsg::GetContractRequest(req) => req.clone(),
-            other => panic!("Expected GetContractRequest for contract3, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected GetContractRequest for contract3, got {:?}", other)
+            }
         };
         assert_eq!(req3.contract_id, contract3);
 
@@ -942,7 +1007,14 @@ mod test {
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(final_msg.processed);
 
@@ -957,7 +1029,15 @@ mod test {
                 assert_eq!(results[2].0, contract3);
                 assert_eq!(results[2].1, Some(vec![3, 3, 3]));
             }
-            other => panic!("Expected MultipleContractStates, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected MultipleContractStates, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -994,7 +1074,12 @@ mod test {
             .iter()
             .find_map(|msg| match msg {
                 OutboundDelegateMsg::GetContractRequest(req) => Some(req.clone()),
-                _ => None,
+                OutboundDelegateMsg::ApplicationMessage(_)
+                | OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
             })
             .expect("Expected a GetContractRequest");
         assert_eq!(contract_request.contract_id, contract_id);
@@ -1003,7 +1088,12 @@ mod test {
             .iter()
             .find_map(|msg| match msg {
                 OutboundDelegateMsg::ApplicationMessage(m) => Some(m.clone()),
-                _ => None,
+                OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
             })
             .expect("Expected an ApplicationMessage (Echo)");
         assert!(echo_msg.processed);
@@ -1013,7 +1103,15 @@ mod test {
             DelegateResponse::Echo { message } => {
                 assert_eq!(message, echo_message);
             }
-            other => panic!("Expected Echo response, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected Echo response, got {:?}", other)
+            }
         }
 
         let contract_response = InboundDelegateMsg::GetContractResponse(GetContractResponse {
@@ -1032,7 +1130,14 @@ mod test {
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
 
         let response: DelegateResponse = bincode::deserialize(&final_msg.payload)?;
@@ -1044,7 +1149,15 @@ mod test {
                 assert_eq!(id, contract_id);
                 assert_eq!(state, Some(vec![1, 2, 3, 4]));
             }
-            other => panic!("Expected ContractState response, got {:?}", other),
+            other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractState response, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1124,19 +1237,46 @@ mod test {
 
         let response1: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response1, OutboundAppMessage::ContextWritten));
 
         let response2: OutboundAppMessage = match &outbound[1] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response2 {
             OutboundAppMessage::ContextData(data) => {
                 assert_eq!(data, test_data);
             }
-            other => panic!("Expected ContextData, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected ContextData, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1165,7 +1305,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::CounterValue(1)));
 
@@ -1180,7 +1327,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::CounterValue(1)));
 
@@ -1213,7 +1367,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretExists(false)));
 
@@ -1240,7 +1401,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretExists(true)));
 
@@ -1272,7 +1440,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretResult(None)));
 
@@ -1308,7 +1483,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretStored));
 
@@ -1324,13 +1506,34 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::SecretResult(Some(value)) => {
                 assert_eq!(value, secret_value);
             }
-            other => panic!("Expected SecretResult(Some(...)), got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::ContextData(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected SecretResult(Some(...)), got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1367,7 +1570,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(
             matches!(response, OutboundAppMessage::SecretStoreFailed),
@@ -1403,13 +1613,33 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::ContextData(data) => {
                 assert!(data.is_empty());
             }
-            other => panic!("Expected ContextData, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected ContextData, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1448,7 +1678,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::ContextCleared));
 
@@ -1463,13 +1700,33 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::ContextData(data) => {
                 assert!(data.is_empty());
             }
-            other => panic!("Expected ContextData, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected ContextData, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1502,13 +1759,33 @@ mod test {
         for (i, msg) in outbound.iter().enumerate() {
             let response: OutboundAppMessage = match msg {
                 OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-                _ => panic!("Expected ApplicationMessage"),
+                OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                    panic!("Expected ApplicationMessage")
+                }
             };
             match response {
                 OutboundAppMessage::CounterValue(value) => {
                     assert_eq!(value, (i + 1) as u32);
                 }
-                other => panic!("Expected CounterValue, got {:?}", other),
+                other @ OutboundAppMessage::CreateInboxResponse(_)
+                | other @ OutboundAppMessage::MessageSigned(_)
+                | other @ OutboundAppMessage::ContextData(_)
+                | other @ OutboundAppMessage::SecretExists(_)
+                | other @ OutboundAppMessage::SecretResult(_)
+                | other @ OutboundAppMessage::ContextWritten
+                | other @ OutboundAppMessage::ContextCleared
+                | other @ OutboundAppMessage::SecretStored
+                | other @ OutboundAppMessage::SecretRemoved
+                | other @ OutboundAppMessage::LargeContextWritten(_)
+                | other @ OutboundAppMessage::LargeSecretStored(_)
+                | other @ OutboundAppMessage::SecretStoreFailed => {
+                    panic!("Expected CounterValue, got {:?}", other)
+                }
             }
         }
 
@@ -1552,7 +1829,14 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretExists(true)));
 
@@ -1566,7 +1850,14 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretRemoved));
 
@@ -1580,7 +1871,14 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         assert!(matches!(response, OutboundAppMessage::SecretExists(false)));
 
@@ -1611,13 +1909,33 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::LargeContextWritten(size) => {
                 assert_eq!(size, large_size);
             }
-            other => panic!("Expected LargeContextWritten, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::ContextData(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected LargeContextWritten, got {:?}", other)
+            }
         }
 
         let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
@@ -1630,13 +1948,33 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::ContextData(data) => {
                 assert!(data.is_empty());
             }
-            other => panic!("Expected ContextData, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected ContextData, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1671,7 +2009,14 @@ mod test {
 
         let response: OutboundAppMessage = match &outbound[1] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::ContextData(data) => {
@@ -1680,7 +2025,20 @@ mod test {
                     assert_eq!(*byte, (i % 256) as u8, "Data pattern mismatch at index {i}");
                 }
             }
-            other => panic!("Expected ContextData, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected ContextData, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1714,13 +2072,33 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::LargeSecretStored(size) => {
                 assert_eq!(size, large_size);
             }
-            other => panic!("Expected LargeSecretStored, got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::ContextData(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected LargeSecretStored, got {:?}", other)
+            }
         }
 
         let payload =
@@ -1734,7 +2112,14 @@ mod test {
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
-            _ => panic!("Expected ApplicationMessage"),
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage")
+            }
         };
         match response {
             OutboundAppMessage::SecretResult(Some(data)) => {
@@ -1743,7 +2128,21 @@ mod test {
                     assert_eq!(*byte, (i % 256) as u8, "Data pattern mismatch at index {i}");
                 }
             }
-            other => panic!("Expected SecretResult(Some(...)), got {:?}", other),
+            other @ OutboundAppMessage::CreateInboxResponse(_)
+            | other @ OutboundAppMessage::MessageSigned(_)
+            | other @ OutboundAppMessage::ContextData(_)
+            | other @ OutboundAppMessage::CounterValue(_)
+            | other @ OutboundAppMessage::SecretExists(_)
+            | other @ OutboundAppMessage::SecretResult(_)
+            | other @ OutboundAppMessage::ContextWritten
+            | other @ OutboundAppMessage::ContextCleared
+            | other @ OutboundAppMessage::SecretStored
+            | other @ OutboundAppMessage::SecretRemoved
+            | other @ OutboundAppMessage::LargeContextWritten(_)
+            | other @ OutboundAppMessage::LargeSecretStored(_)
+            | other @ OutboundAppMessage::SecretStoreFailed => {
+                panic!("Expected SecretResult(Some(...)), got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -1819,13 +2218,32 @@ mod test {
                 OutboundDelegateMsg::ApplicationMessage(m) => {
                     bincode::deserialize(&m.payload).unwrap()
                 }
-                _ => panic!("Expected ApplicationMessage"),
+                OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                    panic!("Expected ApplicationMessage")
+                }
             };
             match response {
                 OutboundAppMessage::SecretResult(Some(value)) => {
                     assert_eq!(value, secret_value);
                 }
-                other => panic!(
+                other @ OutboundAppMessage::CreateInboxResponse(_)
+                | other @ OutboundAppMessage::MessageSigned(_)
+                | other @ OutboundAppMessage::ContextData(_)
+                | other @ OutboundAppMessage::CounterValue(_)
+                | other @ OutboundAppMessage::SecretExists(_)
+                | other @ OutboundAppMessage::SecretResult(_)
+                | other @ OutboundAppMessage::ContextWritten
+                | other @ OutboundAppMessage::ContextCleared
+                | other @ OutboundAppMessage::SecretStored
+                | other @ OutboundAppMessage::SecretRemoved
+                | other @ OutboundAppMessage::LargeContextWritten(_)
+                | other @ OutboundAppMessage::LargeSecretStored(_)
+                | other @ OutboundAppMessage::SecretStoreFailed => panic!(
                     "Thread 1: Expected SecretResult(Some(...)), got {:?}",
                     other
                 ),
@@ -1879,13 +2297,32 @@ mod test {
                 OutboundDelegateMsg::ApplicationMessage(m) => {
                     bincode::deserialize(&m.payload).unwrap()
                 }
-                _ => panic!("Expected ApplicationMessage"),
+                OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                    panic!("Expected ApplicationMessage")
+                }
             };
             match response {
                 OutboundAppMessage::SecretResult(Some(value)) => {
                     assert_eq!(value, secret_value);
                 }
-                other => panic!(
+                other @ OutboundAppMessage::CreateInboxResponse(_)
+                | other @ OutboundAppMessage::MessageSigned(_)
+                | other @ OutboundAppMessage::ContextData(_)
+                | other @ OutboundAppMessage::CounterValue(_)
+                | other @ OutboundAppMessage::SecretExists(_)
+                | other @ OutboundAppMessage::SecretResult(_)
+                | other @ OutboundAppMessage::ContextWritten
+                | other @ OutboundAppMessage::ContextCleared
+                | other @ OutboundAppMessage::SecretStored
+                | other @ OutboundAppMessage::SecretRemoved
+                | other @ OutboundAppMessage::LargeContextWritten(_)
+                | other @ OutboundAppMessage::LargeSecretStored(_)
+                | other @ OutboundAppMessage::SecretStoreFailed => panic!(
                     "Thread 2: Expected SecretResult(Some(...)), got {:?}",
                     other
                 ),
@@ -2106,7 +2543,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let response_msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(response_msg.processed);
 
@@ -2119,7 +2563,9 @@ mod test {
                     "V2 delegate should read contract state via host functions"
                 );
             }
-            other => {
+            other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Success { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
                 panic!("V2 delegate returned {other:?} — expected ContractState");
             }
         }
@@ -2184,7 +2630,14 @@ mod test {
         assert_eq!(outbound.len(), 1);
         let response_msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
 
         let response: OutboundAppMessage = bincode::deserialize(&response_msg.payload)?;
@@ -2195,7 +2648,9 @@ mod test {
                     "Expected negative error code for not-found, got {error_code}"
                 );
             }
-            other => {
+            other @ OutboundAppMessage::ContractState { .. }
+            | other @ OutboundAppMessage::Success { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
                 panic!("Expected ContractNotFound for non-existent contract, got {other:?}");
             }
         }
@@ -2287,7 +2742,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let response_msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(response_msg.processed);
 
@@ -2316,7 +2778,11 @@ mod test {
             OutboundAppMessage::Success { contract_id } => {
                 assert_eq!(contract_id, cid);
             }
-            other => panic!("Expected Success from PUT, got {:?}", other),
+            other @ OutboundAppMessage::ContractState { .. }
+            | other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
+                panic!("Expected Success from PUT, got {:?}", other)
+            }
         }
 
         // GET it back
@@ -2330,7 +2796,11 @@ mod test {
                 assert_eq!(contract_id, cid);
                 assert_eq!(state, vec![100, 200, 150]);
             }
-            other => panic!("Expected ContractState from GET, got {:?}", other),
+            other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Success { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
+                panic!("Expected ContractState from GET, got {:?}", other)
+            }
         }
 
         Ok(())
@@ -2358,7 +2828,11 @@ mod test {
             OutboundAppMessage::Success { contract_id } => {
                 assert_eq!(contract_id, cid);
             }
-            other => panic!("Expected Success from UPDATE, got {:?}", other),
+            other @ OutboundAppMessage::ContractState { .. }
+            | other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
+                panic!("Expected Success from UPDATE, got {:?}", other)
+            }
         }
 
         // Verify via GET
@@ -2371,7 +2845,11 @@ mod test {
             OutboundAppMessage::ContractState { state, .. } => {
                 assert_eq!(state, vec![7, 8, 9]);
             }
-            other => panic!("Expected ContractState, got {:?}", other),
+            other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Success { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
+                panic!("Expected ContractState, got {:?}", other)
+            }
         }
 
         Ok(())
@@ -2401,7 +2879,9 @@ mod test {
                     "Expected negative error code, got {error_code}"
                 );
             }
-            other => panic!(
+            other @ OutboundAppMessage::ContractState { .. }
+            | other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Success { .. } => panic!(
                 "Expected Failed from UPDATE on non-existent, got {:?}",
                 other
             ),
@@ -2428,7 +2908,11 @@ mod test {
             OutboundAppMessage::Success { contract_id } => {
                 assert_eq!(contract_id, cid);
             }
-            other => panic!("Expected Success from SUBSCRIBE, got {:?}", other),
+            other @ OutboundAppMessage::ContractState { .. }
+            | other @ OutboundAppMessage::ContractNotFound { .. }
+            | other @ OutboundAppMessage::Failed { .. } => {
+                panic!("Expected Success from SUBSCRIBE, got {:?}", other)
+            }
         }
 
         Ok(())
@@ -2465,7 +2949,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let put_request = match &outbound[0] {
             OutboundDelegateMsg::PutContractRequest(req) => req.clone(),
-            other => panic!("Expected PutContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected PutContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(put_request.contract.key(), contract_key);
         assert!(!put_request.processed);
@@ -2486,7 +2977,14 @@ mod test {
         );
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(final_msg.processed);
 
@@ -2496,7 +2994,15 @@ mod test {
                 assert!(success);
                 assert!(error.is_none());
             }
-            other => panic!("Expected ContractPutResult, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractPutResult, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -2529,7 +3035,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let update_request = match &outbound[0] {
             OutboundDelegateMsg::UpdateContractRequest(req) => req.clone(),
-            other => panic!("Expected UpdateContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected UpdateContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(update_request.contract_id, contract_id);
         assert!(!update_request.processed);
@@ -2550,7 +3063,14 @@ mod test {
         );
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(final_msg.processed);
 
@@ -2565,7 +3085,15 @@ mod test {
                 assert!(success);
                 assert!(error.is_none());
             }
-            other => panic!("Expected ContractUpdateResult, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractUpdateResult, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -2595,7 +3123,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let subscribe_request = match &outbound[0] {
             OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
-            other => panic!("Expected SubscribeContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_) => {
+                panic!("Expected SubscribeContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(subscribe_request.contract_id, contract_id);
         assert!(!subscribe_request.processed);
@@ -2616,7 +3151,14 @@ mod test {
         );
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(final_msg.processed);
 
@@ -2631,7 +3173,15 @@ mod test {
                 assert!(!success);
                 assert!(error.is_some());
             }
-            other => panic!("Expected ContractSubscribeResult, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractNotificationReceived { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractSubscribeResult, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -2663,7 +3213,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
         let msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(msg.processed);
 
@@ -2676,7 +3233,15 @@ mod test {
                 assert_eq!(id, contract_id);
                 assert_eq!(state, new_state);
             }
-            other => panic!("Expected ContractNotificationReceived, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractNotificationReceived, got {:?}", other)
+            }
         }
 
         std::mem::drop(temp_dir);
@@ -2759,7 +3324,14 @@ mod test {
         assert_eq!(outbound.len(), 1);
         let subscribe_req = match &outbound[0] {
             OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
-            other => panic!("Expected SubscribeContractRequest, got {:?}", other),
+            other @ OutboundDelegateMsg::ApplicationMessage(_)
+            | other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_) => {
+                panic!("Expected SubscribeContractRequest, got {:?}", other)
+            }
         };
         assert_eq!(subscribe_req.contract_id, contract_instance_id);
 
@@ -2805,10 +3377,25 @@ mod test {
                     DelegateResponse::ContractSubscribeResult { success, .. } => {
                         assert!(success, "Subscribe response should indicate success");
                     }
-                    other => panic!("Expected ContractSubscribeResult, got {:?}", other),
+                    other @ DelegateResponse::ContractState { .. }
+                    | other @ DelegateResponse::MultipleContractStates { .. }
+                    | other @ DelegateResponse::Echo { .. }
+                    | other @ DelegateResponse::ContractPutResult { .. }
+                    | other @ DelegateResponse::ContractUpdateResult { .. }
+                    | other @ DelegateResponse::ContractNotificationReceived { .. }
+                    | other @ DelegateResponse::Error { .. } => {
+                        panic!("Expected ContractSubscribeResult, got {:?}", other)
+                    }
                 }
             }
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         }
 
         // --- Step 2: Verify registry is populated ---
@@ -2844,7 +3431,14 @@ mod test {
         assert_eq!(outbound.len(), 1, "Expected one outbound from notification");
         let msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", other)
+            }
         };
         assert!(msg.processed);
 
@@ -2857,7 +3451,15 @@ mod test {
                 assert_eq!(id, contract_instance_id);
                 assert_eq!(state, updated_state);
             }
-            other => panic!("Expected ContractNotificationReceived, got {:?}", other),
+            other @ DelegateResponse::ContractState { .. }
+            | other @ DelegateResponse::MultipleContractStates { .. }
+            | other @ DelegateResponse::Echo { .. }
+            | other @ DelegateResponse::ContractPutResult { .. }
+            | other @ DelegateResponse::ContractUpdateResult { .. }
+            | other @ DelegateResponse::ContractSubscribeResult { .. }
+            | other @ DelegateResponse::Error { .. } => {
+                panic!("Expected ContractNotificationReceived, got {:?}", other)
+            }
         }
 
         // --- Step 5: Cleanup on delegate unregister ---
@@ -2905,7 +3507,7 @@ mod test {
         // Store the WASM file so remove_contract can delete it
         let wasm_path = runtime.contract_store.get_contract_path(&contract_key)?;
         std::fs::create_dir_all(wasm_path.parent().unwrap())?;
-        std::fs::write(&wasm_path, &[0u8; 10])?;
+        std::fs::write(&wasm_path, [0u8; 10])?;
         runtime.contract_store.ensure_key_indexed(&contract_key)?;
 
         // Simulate delegate subscriptions

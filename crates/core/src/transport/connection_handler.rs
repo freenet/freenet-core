@@ -2487,7 +2487,7 @@ mod version_cmp {
             GatewayConnectionRateLimiter, GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE,
             GW_RAMP_PHASE2_DURATION, GW_RAMP_PHASE2_RATE,
         };
-        use crate::simulation::{TimeSource, VirtualTime};
+        use crate::simulation::VirtualTime;
         use std::time::Duration;
 
         let time = VirtualTime::new();
@@ -2575,7 +2575,13 @@ pub mod mock_transport {
                 assert_eq!(expected, "1.2.3");
                 assert_eq!(actual, PCK_VERSION);
             }
-            _ => panic!("Expected ProtocolVersionMismatch error"),
+            TransportError::ChannelClosed
+            | TransportError::ConnectionClosed(_)
+            | TransportError::ConnectionEstablishmentFailure { .. }
+            | TransportError::IO(_)
+            | TransportError::Other(_)
+            | TransportError::PubKeyDecryptionError(_)
+            | TransportError::Serialization(_) => panic!("Expected ProtocolVersionMismatch error"),
         }
 
         let err_msg_no_version = "remote is using a different protocol version".to_string();
@@ -2583,7 +2589,15 @@ pub mod mock_transport {
             TransportError::ConnectionEstablishmentFailure { cause } => {
                 assert_eq!(cause, err_msg_no_version);
             }
-            _ => panic!("Expected ConnectionEstablishmentFailure error"),
+            TransportError::ChannelClosed
+            | TransportError::ConnectionClosed(_)
+            | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::IO(_)
+            | TransportError::Other(_)
+            | TransportError::PubKeyDecryptionError(_)
+            | TransportError::Serialization(_) => {
+                panic!("Expected ConnectionEstablishmentFailure error")
+            }
         }
     }
 

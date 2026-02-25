@@ -222,9 +222,12 @@ impl UpdateCommand {
                 if is_launchd_service_active() {
                     println!("Restarting Freenet service...");
                     // launchctl doesn't have a restart command, so stop + start
-                    let _ = Command::new("launchctl")
+                    if let Err(e) = Command::new("launchctl")
                         .args(["stop", "org.freenet.node"])
-                        .status();
+                        .status()
+                    {
+                        eprintln!("Warning: failed to stop service: {e}");
+                    }
                     let status = Command::new("launchctl")
                         .args(["start", "org.freenet.node"])
                         .status();

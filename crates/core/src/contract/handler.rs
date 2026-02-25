@@ -1000,7 +1000,11 @@ pub mod test {
                 assert_eq!(*client_id, test_client);
                 assert_eq!(*request_id, test_request_id);
             }
-            other => panic!(
+            other @ SessionMessage::RegisterClient { .. }
+            | other @ SessionMessage::DeliverResult { .. }
+            | other @ SessionMessage::DeliverHostResponse { .. }
+            | other @ SessionMessage::DeliverHostResponseWithRequestId { .. }
+            | other @ SessionMessage::ClientDisconnect { .. } => panic!(
                 "Expected RegisterTransaction, got {:?}",
                 std::mem::discriminant(other)
             ),

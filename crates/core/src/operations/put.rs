@@ -1864,7 +1864,12 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            _ => panic!("Expected ContractOpSuccessUntimed for finalized put with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpFailure { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed for finalized put with stats")
+            }
         }
     }
 
@@ -1912,7 +1917,12 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            _ => panic!("Expected ContractOpFailure for non-finalized put with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpSuccessUntimed { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpFailure for non-finalized put with stats")
+            }
         }
     }
 
@@ -2041,7 +2051,12 @@ mod tests {
             OpOutcome::ContractOpFailure {
                 target_peer: peer, ..
             } => assert_eq!(*peer, target_peer),
-            _ => panic!("Expected ContractOpFailure for in-progress put with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpSuccessUntimed { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpFailure for in-progress put with stats")
+            }
         }
         assert!(op.failure_routing_info().is_some());
 
@@ -2057,7 +2072,12 @@ mod tests {
                 assert_eq!(*peer, target_peer);
                 assert_eq!(loc, contract_location);
             }
-            _ => panic!("Expected ContractOpSuccessUntimed for finished put with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpFailure { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed for finished put with stats")
+            }
         }
     }
 

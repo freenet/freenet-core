@@ -1506,6 +1506,11 @@ where
     ///
     /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
     /// `DelegateNotification` for each subscribed delegate through the channel.
+    ///
+    /// This is a **best-effort, lossy** notification path: if the bounded channel
+    /// is full, notifications are dropped rather than blocking the commit path.
+    /// Delegates that require guaranteed delivery should poll contract state
+    /// periodically as a fallback.
     fn send_delegate_contract_notifications(&self, key: &ContractKey, new_state: &WrappedState) {
         let tx = match &self.delegate_notification_tx {
             Some(tx) => tx,
@@ -1551,8 +1556,11 @@ where
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     tracing::warn!(
                         contract = %key,
-                        "Delegate notification channel closed"
+                        "Delegate notification channel closed — removing stale subscriptions"
                     );
+                    // Receiver is gone; clean up all subscriptions for this contract
+                    // to prevent repeated failed sends on future state updates.
+                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
                     return;
                 }
             }

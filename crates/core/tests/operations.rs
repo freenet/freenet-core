@@ -1011,7 +1011,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
                             tracing::info!("Client 1: Successfully verified update content");
                         }
-                        _ => {
+                        UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. } => {
                             tracing::warn!(
                                 "Client 1: Received unexpected update type: {:?}",
                                 update
@@ -1082,7 +1086,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
                             tracing::info!("Client 2: Successfully verified update content");
                         }
-                        _ => {
+                        UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. } => {
                             tracing::warn!(
                                 "Client 2: Received unexpected update type: {:?}",
                                 update
@@ -1154,7 +1162,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                                 "Client 3: Successfully verified update content (cross-node)"
                             );
                         }
-                        _ => {
+                        UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. } => {
                             tracing::warn!(
                                 "Client 3: Received unexpected update type: {:?}",
                                 update
@@ -1431,7 +1443,11 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
                         tracing::info!("Client 1: Successfully verified update content");
                     }
-                    _ => {
+                    UpdateData::Delta(_)
+                    | UpdateData::StateAndDelta { .. }
+                    | UpdateData::RelatedState { .. }
+                    | UpdateData::RelatedDelta { .. }
+                    | UpdateData::RelatedStateAndDelta { .. } => {
                         tracing::warn!("Client 1: Received unexpected update type: {:?}", update);
                     }
                 }
@@ -1867,7 +1883,11 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                             "UPDATE notification received and verified"
                         );
                     }
-                    _ => {
+                    UpdateData::Delta(_)
+                    | UpdateData::StateAndDelta { .. }
+                    | UpdateData::RelatedState { .. }
+                    | UpdateData::RelatedDelta { .. }
+                    | UpdateData::RelatedStateAndDelta { .. } => {
                         tracing::warn!(
                             contract = %contract_key,
                             client = 1,
@@ -2206,7 +2226,10 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
             );
             tracing::info!("Successfully registered delegate with key: {key}");
         }
-        other => {
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => {
             bail!(
                 "Unexpected response while waiting for register: {:?}",
                 other
@@ -2250,7 +2273,14 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
 
             let app_msg = match &outbound[0] {
                 OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-                other => bail!("Expected ApplicationMessage, got {:?}", other),
+                other @ OutboundDelegateMsg::RequestUserInput(_)
+                | other @ OutboundDelegateMsg::ContextUpdated(_)
+                | other @ OutboundDelegateMsg::GetContractRequest(_)
+                | other @ OutboundDelegateMsg::PutContractRequest(_)
+                | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+                | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                    bail!("Expected ApplicationMessage, got {:?}", other)
+                }
             };
 
             assert!(app_msg.processed, "Message not marked as processed");
@@ -2279,7 +2309,10 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                 }
             }
         }
-        other => {
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => {
             bail!(
                 "Unexpected response while waiting for delegate response: {:?}",
                 other
@@ -2559,7 +2592,11 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
             );
             tracing::info!("Test passed - query subscription info works");
         }
-        other => {
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => {
             bail!("Unexpected response: {:?}", other);
         }
     }
@@ -3578,7 +3615,10 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
             ensure!(key == delegate_key, "Delegate key mismatch on register");
             tracing::info!("Delegate registered: {key}");
         }
-        other => bail!("Unexpected register response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected register response: {:?}", other),
     }
 
     // Step 2: PUT contract via delegate
@@ -3631,10 +3671,21 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
                     );
                     tracing::info!("Delegate PUT succeeded");
                 }
-                other => bail!("Expected ContractPutResult, got {:?}", other),
+                other @ DelegateCommandResponse::ContractState { .. }
+                | other @ DelegateCommandResponse::MultipleContractStates { .. }
+                | other @ DelegateCommandResponse::Echo { .. }
+                | other @ DelegateCommandResponse::ContractUpdateResult { .. }
+                | other @ DelegateCommandResponse::ContractSubscribeResult { .. }
+                | other @ DelegateCommandResponse::ContractNotificationReceived { .. }
+                | other @ DelegateCommandResponse::Error { .. } => {
+                    bail!("Expected ContractPutResult, got {:?}", other)
+                }
             }
         }
-        other => bail!("Unexpected delegate PUT response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected delegate PUT response: {:?}", other),
     }
 
     // Step 3: Verify contract state via direct GET
@@ -3658,7 +3709,11 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
                 stored.version
             );
         }
-        other => bail!("Unexpected GET response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected GET response: {:?}", other),
     }
 
     // Step 4: UPDATE contract via delegate (add a task)
@@ -3717,10 +3772,21 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
                     );
                     tracing::info!("Delegate UPDATE succeeded");
                 }
-                other => bail!("Expected ContractUpdateResult, got {:?}", other),
+                other @ DelegateCommandResponse::ContractState { .. }
+                | other @ DelegateCommandResponse::MultipleContractStates { .. }
+                | other @ DelegateCommandResponse::Echo { .. }
+                | other @ DelegateCommandResponse::ContractPutResult { .. }
+                | other @ DelegateCommandResponse::ContractSubscribeResult { .. }
+                | other @ DelegateCommandResponse::ContractNotificationReceived { .. }
+                | other @ DelegateCommandResponse::Error { .. } => {
+                    bail!("Expected ContractUpdateResult, got {:?}", other)
+                }
             }
         }
-        other => bail!("Unexpected delegate UPDATE response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected delegate UPDATE response: {:?}", other),
     }
 
     // Step 5: Verify updated state via direct GET
@@ -3747,7 +3813,11 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
                 stored.tasks[0].title
             );
         }
-        other => bail!("Unexpected GET response after UPDATE: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected GET response after UPDATE: {:?}", other),
     }
 
     tracing::info!("Delegate contract PUT and UPDATE E2E test passed");
@@ -3804,7 +3874,11 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
             ensure!(key == contract_key, "PUT key mismatch");
             tracing::info!("Direct PUT succeeded");
         }
-        other => bail!("Unexpected PUT response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected PUT response: {:?}", other),
     }
 
     // Step 2: Register delegate
@@ -3825,7 +3899,10 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
             ensure!(key == delegate_key, "Delegate key mismatch on register");
             tracing::info!("Delegate registered");
         }
-        other => bail!("Unexpected register response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected register response: {:?}", other),
     }
 
     // Step 3: GET contract via delegate
@@ -3886,10 +3963,21 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
                         todo.version
                     );
                 }
-                other => bail!("Expected ContractState, got {:?}", other),
+                other @ DelegateCommandResponse::MultipleContractStates { .. }
+                | other @ DelegateCommandResponse::Echo { .. }
+                | other @ DelegateCommandResponse::ContractPutResult { .. }
+                | other @ DelegateCommandResponse::ContractUpdateResult { .. }
+                | other @ DelegateCommandResponse::ContractSubscribeResult { .. }
+                | other @ DelegateCommandResponse::ContractNotificationReceived { .. }
+                | other @ DelegateCommandResponse::Error { .. } => {
+                    bail!("Expected ContractState, got {:?}", other)
+                }
             }
         }
-        other => bail!("Unexpected delegate GET response: {:?}", other),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected delegate GET response: {:?}", other),
     }
 
     tracing::info!("Delegate contract GET E2E test passed");
@@ -4037,9 +4125,11 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
         .await
         .is_ok()
     {}
-    let _ = client_b
-        .send(ClientRequest::Disconnect { cause: None })
-        .await;
+    drop(
+        client_b
+            .send(ClientRequest::Disconnect { cause: None })
+            .await,
+    );
     drop(client_b);
 
     // Wait for the disconnect to propagate and unsubscribe to be sent upstream

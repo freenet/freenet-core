@@ -107,7 +107,13 @@ async fn test_result_router_receives_host_responses() {
                 assert_eq!(received_tx, tx);
                 assert!((*response).is_ok());
             }
-            other => panic!("Expected DeliverHostResponse, got {:?}", other),
+            other @ SessionMessage::RegisterClient { .. }
+            | other @ SessionMessage::RegisterTransaction { .. }
+            | other @ SessionMessage::DeliverResult { .. }
+            | other @ SessionMessage::DeliverHostResponseWithRequestId { .. }
+            | other @ SessionMessage::ClientDisconnect { .. } => {
+                panic!("Expected DeliverHostResponse, got {:?}", other)
+            }
         }
     } else {
         panic!("Router should forward message within timeout");

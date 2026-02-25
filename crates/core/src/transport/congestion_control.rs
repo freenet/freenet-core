@@ -1235,7 +1235,9 @@ mod tests {
                     super::super::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC
                 );
             }
-            _ => panic!("Expected FixedRate"),
+            CongestionController::Bbr(_) | CongestionController::Ledbat(_) => {
+                panic!("Expected FixedRate")
+            }
         }
     }
 
@@ -1254,7 +1256,9 @@ mod tests {
                 let stats = bbr.stats();
                 assert!(stats.cwnd > 0);
             }
-            _ => panic!("Expected BBR"),
+            CongestionController::Ledbat(_) | CongestionController::FixedRate(_) => {
+                panic!("Expected BBR")
+            }
         }
     }
 
@@ -1275,7 +1279,9 @@ mod tests {
                 // LEDBAT-specific field
                 assert_eq!(stats.periodic_slowdowns, 0);
             }
-            _ => panic!("Expected LEDBAT"),
+            CongestionController::Bbr(_) | CongestionController::FixedRate(_) => {
+                panic!("Expected LEDBAT")
+            }
         }
     }
 

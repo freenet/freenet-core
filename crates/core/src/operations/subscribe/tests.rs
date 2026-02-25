@@ -793,7 +793,12 @@ fn test_subscribe_failure_outcome() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        _ => panic!("Expected ContractOpFailure for non-finalized op with stats"),
+        OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpSuccessUntimed { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpFailure for non-finalized op with stats")
+        }
     }
 
     // Completed op with stats → should return Irrelevant (success path)
@@ -818,7 +823,12 @@ fn test_subscribe_failure_outcome() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        _ => panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats"),
+        OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpFailure { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats")
+        }
     }
 
     // Non-finalized op without stats → should return Incomplete
@@ -886,7 +896,12 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        other => panic!("Expected ContractOpSuccessUntimed, got {other:?}"),
+        other @ OpOutcome::ContractOpSuccess { .. }
+        | other @ OpOutcome::ContractOpFailure { .. }
+        | other @ OpOutcome::Incomplete
+        | other @ OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpSuccessUntimed, got {other:?}")
+        }
     }
 }
 
@@ -937,7 +952,10 @@ fn test_subscribe_outcome_failure_with_stats() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        other => panic!("Expected ContractOpFailure, got {other:?}"),
+        other @ OpOutcome::ContractOpSuccess { .. }
+        | other @ OpOutcome::ContractOpSuccessUntimed { .. }
+        | other @ OpOutcome::Incomplete
+        | other @ OpOutcome::Irrelevant => panic!("Expected ContractOpFailure, got {other:?}"),
     }
 }
 
@@ -996,7 +1014,12 @@ fn test_subscribe_stats_lifecycle() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        _ => panic!("Expected ContractOpFailure for in-progress subscribe with stats"),
+        OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpSuccessUntimed { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpFailure for in-progress subscribe with stats")
+        }
     }
 
     // Step 3: Operation completes
@@ -1009,7 +1032,12 @@ fn test_subscribe_stats_lifecycle() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        _ => panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats"),
+        OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpFailure { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats")
+        }
     }
 }
 
@@ -1043,7 +1071,12 @@ fn test_subscribe_renewal_reports_outcome() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        _ => panic!("Expected ContractOpSuccessUntimed for renewal subscribe"),
+        OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpFailure { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant => {
+            panic!("Expected ContractOpSuccessUntimed for renewal subscribe")
+        }
     }
 }
 
@@ -1072,7 +1105,11 @@ fn test_create_unsubscribe_op() {
             assert_eq!(data.next_hop, Some(target_addr));
             assert_eq!(data.instance_id, instance_id);
         }
-        other => panic!("Expected AwaitingResponse state, got {:?}", other),
+        other @ SubscribeState::PrepareRequest(_)
+        | other @ SubscribeState::Completed(_)
+        | other @ SubscribeState::Failed => {
+            panic!("Expected AwaitingResponse state, got {:?}", other)
+        }
     }
 
     assert_eq!(op.get_next_hop_addr(), Some(target_addr));

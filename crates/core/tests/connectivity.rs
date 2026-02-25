@@ -684,7 +684,13 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
                             "✅ Peer2 received UpdateNotification via proximity cache (issue #2294 regression test passed)"
                         );
                     }
-                    other => bail!("Unexpected update data type: {:?}", other),
+                    other @ UpdateData::Delta(_)
+                    | other @ UpdateData::StateAndDelta { .. }
+                    | other @ UpdateData::RelatedState { .. }
+                    | other @ UpdateData::RelatedDelta { .. }
+                    | other @ UpdateData::RelatedStateAndDelta { .. } => {
+                        bail!("Unexpected update data type: {:?}", other)
+                    }
                 }
                 break;
             }

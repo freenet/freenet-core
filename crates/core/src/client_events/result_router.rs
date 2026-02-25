@@ -153,7 +153,11 @@ mod tests {
                 assert_eq!(received_tx, tx);
                 assert!(response.is_ok(), "Expected success result");
             }
-            _ => panic!("Unexpected message type"),
+            SessionMessage::RegisterClient { .. }
+            | SessionMessage::RegisterTransaction { .. }
+            | SessionMessage::DeliverResult { .. }
+            | SessionMessage::DeliverHostResponseWithRequestId { .. }
+            | SessionMessage::ClientDisconnect { .. } => panic!("Unexpected message type"),
         }
     }
 
@@ -195,7 +199,11 @@ mod tests {
                     assert_eq!(received_tx, expected_tx);
                     assert!(response.is_ok(), "Expected success result");
                 }
-                _ => panic!("Unexpected message type"),
+                SessionMessage::RegisterClient { .. }
+                | SessionMessage::RegisterTransaction { .. }
+                | SessionMessage::DeliverResult { .. }
+                | SessionMessage::DeliverHostResponseWithRequestId { .. }
+                | SessionMessage::ClientDisconnect { .. } => panic!("Unexpected message type"),
             }
         }
     }
@@ -308,7 +316,11 @@ mod tests {
                 assert_eq!(received_tx, tx);
                 assert!(response.is_ok(), "Expected success result");
             }
-            _ => panic!("Unexpected message type"),
+            SessionMessage::RegisterClient { .. }
+            | SessionMessage::RegisterTransaction { .. }
+            | SessionMessage::DeliverResult { .. }
+            | SessionMessage::DeliverHostResponseWithRequestId { .. }
+            | SessionMessage::ClientDisconnect { .. } => panic!("Unexpected message type"),
         }
 
         // Router should exit gracefully after network channel closes

@@ -570,7 +570,9 @@ pub(in crate::transport) mod tests {
         // This should not trigger a resend yet (TLP fires at 10ms)
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => (),
-            _ => panic!("Expected WaitUntil, got Resend/TlpProbe too early"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Expected WaitUntil, got Resend/TlpProbe too early")
+            }
         }
 
         // Now advance time to trigger TLP for packet 2
@@ -610,7 +612,9 @@ pub(in crate::transport) mod tests {
                     "Wait deadline should be in the future"
                 );
             }
-            _ => panic!("Expected ResendAction::WaitUntil"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Expected ResendAction::WaitUntil")
+            }
         }
     }
 
@@ -1114,7 +1118,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(39));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected - still waiting
-            _ => panic!("Should not fire before TLP timeout (40ms)"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Should not fire before TLP timeout (40ms)")
+            }
         }
 
         // At 41ms total, TLP should fire (faster than 500ms RTO!)
@@ -1236,7 +1242,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(99));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
-            _ => panic!("Should not fire before TLP timeout"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Should not fire before TLP timeout")
+            }
         }
 
         // At 101ms, TLP should fire (not full RTO)
@@ -1265,7 +1273,7 @@ pub(in crate::transport) mod tests {
 
         match tracker.get_resend() {
             ResendAction::TlpProbe(_, _) => {}
-            _ => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
         }
 
         // Backoff should NOT have increased (TLP is speculative)
@@ -1293,7 +1301,7 @@ pub(in crate::transport) mod tests {
                 assert_eq!(id, 2);
                 payload
             }
-            _ => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
         };
 
         // Re-register for RTO tracking after TLP
@@ -1304,7 +1312,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(499));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Still waiting for RTO
-            _ => panic!("Should still be waiting for RTO"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Should still be waiting for RTO")
+            }
         }
 
         tracker.time_source.advance(Duration::from_millis(2));
@@ -1361,14 +1371,18 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(9));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {}
-            _ => panic!("Should not fire before minimum TLP timeout"),
+            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+                panic!("Should not fire before minimum TLP timeout")
+            }
         }
 
         // At 11ms, TLP should fire
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
             ResendAction::TlpProbe(id, _) => assert_eq!(id, 2),
-            _ => panic!("TLP should fire at minimum 10ms"),
+            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => {
+                panic!("TLP should fire at minimum 10ms")
+            }
         }
     }
 
@@ -1419,7 +1433,7 @@ pub(in crate::transport) mod tests {
                 // Should probe the oldest unacked packet
                 assert_eq!(id, 2, "TLP should probe oldest unacked packet");
             }
-            _ => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
         }
     }
 }

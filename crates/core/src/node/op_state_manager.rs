@@ -1572,7 +1572,9 @@ mod tests {
             Either::Right(NodeEvent::TransactionTimedOut(observed)) => {
                 assert_eq!(observed, tx, "unexpected transaction in notification");
             }
-            other => panic!("unexpected notification: {other:?}"),
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("unexpected notification: {other:?}")
+            }
         }
     }
 
