@@ -1448,6 +1448,9 @@ where
             "Contract state updated"
         );
 
+        // Record update timestamp for dashboard display
+        crate::node::network_status::record_contract_updated(&format!("{key}"));
+
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)
             .await
