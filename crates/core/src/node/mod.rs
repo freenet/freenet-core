@@ -573,42 +573,9 @@ async fn report_result(
 
             // Record operation result for dashboard stats
             {
-                use crate::node::network_status::{self, OpType};
-                let (op_type, success) = match (op_res.id().transaction_type(), op_res.outcome()) {
-                    (
-                        TransactionType::Get,
-                        OpOutcome::ContractOpSuccess { .. }
-                        | OpOutcome::ContractOpSuccessUntimed { .. },
-                    ) => (Some(OpType::Get), true),
-                    (TransactionType::Get, OpOutcome::ContractOpFailure { .. }) => {
-                        (Some(OpType::Get), false)
-                    }
-                    (
-                        TransactionType::Put,
-                        OpOutcome::ContractOpSuccess { .. }
-                        | OpOutcome::ContractOpSuccessUntimed { .. },
-                    ) => (Some(OpType::Put), true),
-                    (TransactionType::Put, OpOutcome::ContractOpFailure { .. }) => {
-                        (Some(OpType::Put), false)
-                    }
-                    (
-                        TransactionType::Update,
-                        OpOutcome::ContractOpSuccess { .. }
-                        | OpOutcome::ContractOpSuccessUntimed { .. },
-                    ) => (Some(OpType::Update), true),
-                    (TransactionType::Update, OpOutcome::ContractOpFailure { .. }) => {
-                        (Some(OpType::Update), false)
-                    }
-                    (
-                        TransactionType::Subscribe,
-                        OpOutcome::ContractOpSuccess { .. }
-                        | OpOutcome::ContractOpSuccessUntimed { .. },
-                    ) => (Some(OpType::Subscribe), true),
-                    (TransactionType::Subscribe, OpOutcome::ContractOpFailure { .. }) => {
-                        (Some(OpType::Subscribe), false)
-                    }
-                    _ => (None, false),
-                };
+                use crate::node::network_status;
+                let (op_type, success) =
+                    classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
                 if let Some(op_type) = op_type {
                     network_status::record_op_result(op_type, success);
                 }
@@ -2179,6 +2146,57 @@ impl IsOperationCompleted for OpEnum {
     }
 }
 
+/// Classify a `(TransactionType, OpOutcome)` pair into an optional `OpType` and success flag
+/// for dashboard recording. Returns `(None, false)` for CONNECT transactions (not contract ops).
+///
+/// - `Irrelevant`: operation completed but without routing stats for this peer → success
+/// - `Incomplete`: operation never finalized → failure
+fn classify_op_outcome(
+    tx_type: TransactionType,
+    outcome: OpOutcome<'_>,
+) -> (Option<network_status::OpType>, bool) {
+    use network_status::OpType;
+    match (tx_type, outcome) {
+        (
+            TransactionType::Get,
+            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
+        ) => (Some(OpType::Get), true),
+        (TransactionType::Get, OpOutcome::ContractOpFailure { .. }) => (Some(OpType::Get), false),
+        (
+            TransactionType::Put,
+            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
+        ) => (Some(OpType::Put), true),
+        (TransactionType::Put, OpOutcome::ContractOpFailure { .. }) => (Some(OpType::Put), false),
+        (
+            TransactionType::Update,
+            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
+        ) => (Some(OpType::Update), true),
+        (TransactionType::Update, OpOutcome::ContractOpFailure { .. }) => {
+            (Some(OpType::Update), false)
+        }
+        (
+            TransactionType::Subscribe,
+            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
+        ) => (Some(OpType::Subscribe), true),
+        (TransactionType::Subscribe, OpOutcome::ContractOpFailure { .. }) => {
+            (Some(OpType::Subscribe), false)
+        }
+        // Irrelevant = completed successfully but without routing stats
+        // (e.g., UPDATE when stats.target is None, SUBSCRIBE when stats is None)
+        (TransactionType::Get, OpOutcome::Irrelevant) => (Some(OpType::Get), true),
+        (TransactionType::Put, OpOutcome::Irrelevant) => (Some(OpType::Put), true),
+        (TransactionType::Update, OpOutcome::Irrelevant) => (Some(OpType::Update), true),
+        (TransactionType::Subscribe, OpOutcome::Irrelevant) => (Some(OpType::Subscribe), true),
+        // Incomplete = operation never finalized
+        (TransactionType::Get, OpOutcome::Incomplete) => (Some(OpType::Get), false),
+        (TransactionType::Put, OpOutcome::Incomplete) => (Some(OpType::Put), false),
+        (TransactionType::Update, OpOutcome::Incomplete) => (Some(OpType::Update), false),
+        (TransactionType::Subscribe, OpOutcome::Incomplete) => (Some(OpType::Subscribe), false),
+        // CONNECT is not a contract operation
+        _ => (None, false),
+    }
+}
+
 /// Check if an operation result indicates completion
 pub fn is_operation_completed(op_result: &Result<Option<OpEnum>, OpError>) -> bool {
     match op_result {
@@ -2352,5 +2370,53 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(is_operation_completed(&result), expected);
+    }
+
+    // classify_op_outcome tests
+    mod classify_op_outcome_tests {
+        use super::super::{classify_op_outcome, network_status::OpType};
+        use crate::message::TransactionType;
+        use crate::operations::OpOutcome;
+
+        #[test]
+        fn irrelevant_counted_as_success() {
+            let (op_type, success) =
+                classify_op_outcome(TransactionType::Update, OpOutcome::Irrelevant);
+            assert!(matches!(op_type, Some(OpType::Update)));
+            assert!(success);
+        }
+
+        #[test]
+        fn incomplete_counted_as_failure() {
+            let (op_type, success) =
+                classify_op_outcome(TransactionType::Get, OpOutcome::Incomplete);
+            assert!(matches!(op_type, Some(OpType::Get)));
+            assert!(!success);
+        }
+
+        #[test]
+        fn connect_skipped() {
+            let (op_type, _) = classify_op_outcome(TransactionType::Connect, OpOutcome::Irrelevant);
+            assert!(op_type.is_none());
+
+            let (op_type, _) = classify_op_outcome(TransactionType::Connect, OpOutcome::Incomplete);
+            assert!(op_type.is_none());
+        }
+
+        #[test]
+        fn subscribe_irrelevant_is_success() {
+            let (op_type, success) =
+                classify_op_outcome(TransactionType::Subscribe, OpOutcome::Irrelevant);
+            assert!(matches!(op_type, Some(OpType::Subscribe)));
+            assert!(success);
+        }
+
+        #[test]
+        fn put_incomplete_is_failure() {
+            let (op_type, success) =
+                classify_op_outcome(TransactionType::Put, OpOutcome::Incomplete);
+            assert!(matches!(op_type, Some(OpType::Put)));
+            assert!(!success);
+        }
     }
 }

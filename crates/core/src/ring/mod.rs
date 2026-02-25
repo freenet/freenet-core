@@ -1813,6 +1813,15 @@ impl Ring {
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
+            // Clean up expired transient connections
+            let expired_transients = self.connection_manager.cleanup_expired_transients();
+            if expired_transients > 0 {
+                tracing::debug!(
+                    expired_transients,
+                    "Cleaned up expired transient connections"
+                );
+            }
+
             // Periodic peer health check: evict peers with sustained routing failures.
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
                 last_health_check = Instant::now();

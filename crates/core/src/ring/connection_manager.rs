@@ -31,6 +31,8 @@ pub(crate) struct TransientEntry {
     /// Transient connections are typically unsolicited inbound connections to gateways.
     /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
+    /// When this transient entry was created (for expiration cleanup).
+    pub created_at: Instant,
 }
 
 /// Maximum time a pending reservation can remain before being considered stale.
@@ -740,8 +742,13 @@ impl ConnectionManager {
             return false;
         }
 
-        self.transient_connections
-            .insert(addr, TransientEntry { location });
+        self.transient_connections.insert(
+            addr,
+            TransientEntry {
+                location,
+                created_at: Instant::now(),
+            },
+        );
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
         if prev >= self.transient_budget {
             // Undo if we raced past the budget.
@@ -1163,6 +1170,39 @@ impl ConnectionManager {
         stale_reservations + orphaned_locations
     }
 
+    /// Remove transient connection entries that have exceeded `transient_ttl`.
+    /// Returns the number of expired entries removed.
+    ///
+    /// Concurrency safety: `DashMap::retain` holds shard-level write locks during
+    /// iteration. Concurrent `drop_transient`/`add_connection` calls on the same
+    /// shard will block until `retain` releases the lock. If a concurrent call
+    /// removes an entry before `retain` visits it, `retain` simply won't see it.
+    /// If `retain` removes an entry first, the concurrent `remove()` returns `None`
+    /// and skips its `fetch_sub`. Each entry is decremented exactly once.
+    pub(crate) fn cleanup_expired_transients(&self) -> usize {
+        let now = Instant::now();
+        let ttl = self.transient_ttl;
+        let mut removed = 0;
+        self.transient_connections.retain(|addr, entry| {
+            let age = now.duration_since(entry.created_at);
+            if age > ttl {
+                tracing::debug!(
+                    addr = %addr,
+                    age_secs = age.as_secs(),
+                    "Removing expired transient connection"
+                );
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            self.transient_in_use.fetch_sub(removed, Ordering::SeqCst);
+        }
+        removed
+    }
+
     /// Check whether a peer address has an established connection in `connections_by_location`.
     /// Unlike `has_connection_or_pending`, this checks only fully established ring connections.
     pub fn is_in_ring(&self, addr: SocketAddr) -> bool {
@@ -1453,6 +1493,45 @@ mod tests {
         if let Some(entry) = pending.get_mut(&addr) {
             entry.1 = Instant::now() - age;
         }
+    }
+
+    fn age_transient(cm: &ConnectionManager, addr: SocketAddr, age: Duration) {
+        if let Some(mut entry) = cm.transient_connections.get_mut(&addr) {
+            entry.created_at = Instant::now() - age;
+        }
+    }
+
+    // ============ cleanup_expired_transients tests ============
+
+    #[test]
+    fn test_cleanup_expired_transients_spares_fresh() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, true);
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        assert_eq!(cm.cleanup_expired_transients(), 0);
+        assert_eq!(cm.transient_count(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_expired_transients_removes_old() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, true);
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        // Age past the 60s TTL used in tests
+        age_transient(&cm, make_addr(8001), Duration::from_secs(61));
+        assert_eq!(cm.cleanup_expired_transients(), 1);
+        assert_eq!(cm.transient_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_transients_mixed() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, true);
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        assert!(cm.try_register_transient(make_addr(8002), None));
+        // Only age the first one
+        age_transient(&cm, make_addr(8001), Duration::from_secs(61));
+        assert_eq!(cm.cleanup_expired_transients(), 1);
+        assert_eq!(cm.transient_count(), 1);
+        assert!(cm.is_transient(make_addr(8002)));
+        assert!(!cm.is_transient(make_addr(8001)));
     }
 
     // ============ Basic ConnectionManager tests ============

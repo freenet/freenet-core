@@ -354,15 +354,27 @@ struct ConnectionEntry {
 }
 
 /// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring, not transient, and not pending reservation.
-fn is_zombie(
-    created_at_elapsed: Duration,
-    in_ring: bool,
-    is_transient: bool,
-    has_pending: bool,
-) -> bool {
+/// promoted to ring and not pending reservation.
+///
+/// Two thresholds:
+/// - `ZOMBIE_THRESHOLD` (300s): catches connections with no pending reservation.
+/// - `ABSOLUTE_ZOMBIE_THRESHOLD` (600s): overrides `has_pending` to break the
+///   refresh cycle where `connection_maintenance()` perpetually renews pending
+///   reservations on gateway transports.
+fn is_zombie(created_at_elapsed: Duration, in_ring: bool, has_pending: bool) -> bool {
     const ZOMBIE_THRESHOLD: Duration = Duration::from_secs(300);
-    created_at_elapsed > ZOMBIE_THRESHOLD && !in_ring && !is_transient && !has_pending
+    const ABSOLUTE_ZOMBIE_THRESHOLD: Duration = Duration::from_secs(600);
+
+    if in_ring {
+        return false;
+    }
+    if created_at_elapsed > ZOMBIE_THRESHOLD && !has_pending {
+        return true;
+    }
+    if created_at_elapsed > ABSOLUTE_ZOMBIE_THRESHOLD {
+        return true;
+    }
+    false
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -778,8 +790,9 @@ impl P2pConnManager {
                 last_stats_log = Instant::now();
 
                 // Zombie transport cleanup: remove connections older than 5 min
-                // that haven't been promoted to ring, aren't transient, and
-                // have no pending reservation.
+                // that haven't been promoted to ring and have no pending reservation.
+                // An absolute threshold of 10 min overrides pending reservations to
+                // catch gateway transports stuck in a pending-refresh cycle.
                 let zombie_addrs: Vec<SocketAddr> = ctx
                     .connections
                     .iter()
@@ -787,7 +800,6 @@ impl P2pConnManager {
                         is_zombie(
                             entry.created_at.elapsed(),
                             op_manager.ring.connection_manager.is_in_ring(**addr),
-                            op_manager.ring.connection_manager.is_transient(**addr),
                             op_manager
                                 .ring
                                 .connection_manager
@@ -799,7 +811,7 @@ impl P2pConnManager {
                 for addr in &zombie_addrs {
                     tracing::info!(
                         peer = %addr,
-                        "Dropping zombie transport (not promoted to ring after 5 min)"
+                        "Dropping zombie transport (not promoted to ring within threshold)"
                     );
                     ctx.drop_connection_by_addr(*addr, &handshake_cmd_sender)
                         .await;
@@ -4876,7 +4888,7 @@ mod tests {
         // Connection younger than 5 min should never be a zombie
         let elapsed = Duration::from_secs(200); // < 300s
         assert!(
-            !super::is_zombie(elapsed, false, false, false),
+            !super::is_zombie(elapsed, false, false),
             "Young connection should not be zombie"
         );
     }
@@ -4886,38 +4898,61 @@ mod tests {
         // In-ring connection should never be a zombie regardless of age
         let elapsed = Duration::from_secs(600);
         assert!(
-            !super::is_zombie(elapsed, true, false, false),
+            !super::is_zombie(elapsed, true, false),
             "Ring connection should not be zombie"
         );
     }
 
     #[test]
-    fn test_zombie_detection_ignores_transient_connections() {
-        // Transient connection should never be a zombie regardless of age
-        let elapsed = Duration::from_secs(600);
-        assert!(
-            !super::is_zombie(elapsed, false, true, false),
-            "Transient connection should not be zombie"
-        );
-    }
-
-    #[test]
     fn test_zombie_detection_catches_old_unpromoted() {
-        // Old connection that isn't in ring, not transient, no pending → zombie
-        let elapsed = Duration::from_secs(600);
+        // Old connection that isn't in ring, no pending → zombie
+        let elapsed = Duration::from_secs(301);
         assert!(
-            super::is_zombie(elapsed, false, false, false),
+            super::is_zombie(elapsed, false, false),
             "Old unpromoted connection should be zombie"
         );
     }
 
     #[test]
     fn test_zombie_detection_ignores_pending_reservation() {
-        // Old connection not in ring, not transient, but has pending reservation → not zombie
-        let elapsed = Duration::from_secs(600);
+        // Old connection not in ring, but has pending reservation → not zombie (under absolute)
+        let elapsed = Duration::from_secs(400); // > 300s but < 600s
         assert!(
-            !super::is_zombie(elapsed, false, false, true),
-            "Connection with pending reservation should not be zombie"
+            !super::is_zombie(elapsed, false, true),
+            "Connection with pending reservation below absolute threshold should not be zombie"
         );
+    }
+
+    #[test]
+    fn test_zombie_absolute_threshold_overrides_pending() {
+        // Connection 601s old, has_pending=true, not in ring → IS zombie
+        // The absolute threshold (600s) overrides has_pending
+        let elapsed = Duration::from_secs(601);
+        assert!(
+            super::is_zombie(elapsed, false, true),
+            "Absolute threshold should override has_pending"
+        );
+    }
+
+    #[test]
+    fn test_zombie_absolute_threshold_spares_ring() {
+        // Connection 601s old, in_ring=true → NOT zombie
+        let elapsed = Duration::from_secs(601);
+        assert!(
+            !super::is_zombie(elapsed, true, true),
+            "Ring connection should never be zombie even past absolute threshold"
+        );
+    }
+
+    #[test]
+    fn test_zombie_boundary_exactly_300s() {
+        // Exactly 300s, no pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(Duration::from_secs(300), false, false));
+    }
+
+    #[test]
+    fn test_zombie_boundary_exactly_600s() {
+        // Exactly 600s, has_pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(Duration::from_secs(600), false, true));
     }
 }
