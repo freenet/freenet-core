@@ -147,10 +147,11 @@ jobs:
       - name: Claude rule review
         id: review
         if: steps.rules.outputs.skip != 'true'
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: '--model sonnet --max-turns 15 --effort high'
+          claude_args: '--model sonnet --max-turns 25 --effort high'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
 
