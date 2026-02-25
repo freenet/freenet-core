@@ -51,10 +51,11 @@ pub(super) mod runtime;
 
 /// Notification sent when a subscribed contract's state changes.
 /// Delivered from `commit_state_update()` to the `contract_handling()` loop.
+/// Uses `Arc<WrappedState>` so multiple subscribers share one allocation.
 pub(crate) struct DelegateNotification {
     pub delegate_key: DelegateKey,
     pub contract_id: ContractInstanceId,
-    pub new_state: WrappedState,
+    pub new_state: Arc<WrappedState>,
 }
 
 pub(crate) type DelegateNotificationSender = mpsc::UnboundedSender<DelegateNotification>;

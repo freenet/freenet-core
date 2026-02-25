@@ -2,6 +2,8 @@
 //!
 //! Internally uses the wasm_runtime module to execute contract and/or delegate instructions.
 
+use std::sync::Arc;
+
 use either::Either;
 use freenet_stdlib::prelude::*;
 
@@ -361,9 +363,16 @@ where
         }
 
         // Process SUBSCRIBE requests
-        // V2 delegates call subscribe_contract() which registers in the global
-        // DELEGATE_SUBSCRIPTIONS registry. Here we confirm the subscription and
-        // the delegate will receive ContractNotification messages when state changes.
+        // There are two registration paths that converge on DELEGATE_SUBSCRIPTIONS:
+        // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
+        //    during WASM execution and returns success/error synchronously.
+        // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
+        // Both paths are idempotent — inserting the same (contract_id, delegate_key) twice
+        // is a no-op on the HashSet. After registration, the delegate receives
+        // ContractNotification messages when the subscribed contract's state changes.
+        //
+        // TODO(#2830): UnsubscribeContractRequest is not yet handled. Delegates can
+        // only unsubscribe implicitly via UnregisterDelegate cleanup.
         if !subscribe_requests.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
@@ -375,16 +384,30 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // Register subscription in the global registry
-                crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                    .entry(contract_id)
-                    .or_default()
-                    .insert(delegate_key.clone());
+                // Validate contract existence before registering (matches V2 host function behavior)
+                let result = if contract_handler
+                    .executor()
+                    .lookup_key(&contract_id)
+                    .is_some()
+                {
+                    // Register subscription in the global registry
+                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                        .entry(contract_id)
+                        .or_default()
+                        .insert(delegate_key.clone());
+                    Ok(())
+                } else {
+                    tracing::debug!(
+                        contract = %contract_id,
+                        "Contract not found locally for delegate SubscribeContractRequest"
+                    );
+                    Err("Contract not found".to_string())
+                };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {
                         contract_id,
-                        result: Ok(()),
+                        result,
                         context,
                     },
                 ));
@@ -452,10 +475,14 @@ async fn handle_delegate_notification<CH>(
         "Delivering contract notification to delegate"
     );
 
+    // Unwrap the Arc — if this is the last subscriber the state moves without cloning,
+    // otherwise a clone is made (unavoidable since ContractNotification owns the state).
+    let owned_state = Arc::try_unwrap(new_state).unwrap_or_else(|arc| (*arc).clone());
+
     let inbound = vec![InboundDelegateMsg::ContractNotification(
         ContractNotification {
             contract_id,
-            new_state,
+            new_state: owned_state,
             context: DelegateContext::default(),
         },
     )];
@@ -466,15 +493,40 @@ async fn handle_delegate_notification<CH>(
         inbound,
     };
 
-    let response =
+    let outbound =
         handle_delegate_with_contract_requests(contract_handler, req, None, &delegate_key).await;
 
-    if !response.is_empty() {
-        tracing::debug!(
-            delegate = %delegate_key,
-            outbound_count = response.len(),
-            "Delegate produced outbound messages from contract notification (discarded)"
-        );
+    // TODO-MUST-FIX: Route outbound ApplicationMessages to subscribed apps #2830
+    // handle_delegate_with_contract_requests already processes contract requests
+    // (GET/PUT/UPDATE/SUBSCRIBE) internally. The remaining outbound messages are
+    // ApplicationMessages meant for connected apps, but notification-driven
+    // invocations have no originating client connection to route them to.
+    // When delegate-to-app notification routing is implemented, these should be
+    // forwarded to all apps registered with this delegate.
+    for msg in &outbound {
+        match msg {
+            OutboundDelegateMsg::ApplicationMessage(app_msg) => {
+                tracing::warn!(
+                    delegate = %delegate_key,
+                    app = %app_msg.app,
+                    payload_len = app_msg.payload.len(),
+                    "Delegate produced ApplicationMessage from contract notification \
+                     but no client routing is available yet — message dropped"
+                );
+            }
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                tracing::warn!(
+                    delegate = %delegate_key,
+                    msg_type = ?std::mem::discriminant(msg),
+                    "Delegate produced unexpected outbound message from contract notification — dropped"
+                );
+            }
+        }
     }
 }
 

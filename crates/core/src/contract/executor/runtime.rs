@@ -1506,10 +1506,13 @@ where
         };
 
         let instance_id = *key.id();
-        let subscribers = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
-        let subscribers = match subscribers {
-            Some(ref s) if !s.is_empty() => s,
-            _ => return,
+        // Snapshot subscribers and release the DashMap read-lock before sending
+        let subscribers: Vec<DelegateKey> = {
+            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
+            match entry {
+                Some(ref s) if !s.is_empty() => s.iter().cloned().collect(),
+                _ => return,
+            }
         };
 
         tracing::debug!(
@@ -1518,11 +1521,14 @@ where
             "Sending delegate contract notifications"
         );
 
-        for delegate_key in subscribers.iter() {
+        // Share one Arc allocation across all subscribers
+        let shared_state = Arc::new(new_state.clone());
+
+        for delegate_key in subscribers {
             if let Err(e) = tx.send(super::DelegateNotification {
-                delegate_key: delegate_key.clone(),
+                delegate_key,
                 contract_id: instance_id,
-                new_state: new_state.clone(),
+                new_state: Arc::clone(&shared_state),
             }) {
                 tracing::warn!(
                     contract = %key,

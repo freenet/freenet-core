@@ -1310,8 +1310,9 @@ pub(super) mod delegate_contracts {
     /// Implementation of subscribe_contract.
     ///
     /// Validates that the contract is known (code hash resolvable) and registers
-    /// subscription interest. Currently a no-op beyond validation; real notification
-    /// delivery is a follow-up.
+    /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
+    /// When the subscribed contract's state changes via `commit_state_update()`,
+    /// a `ContractNotification` is delivered to this delegate.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)
