@@ -3,6 +3,7 @@
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
@@ -26,6 +27,15 @@ pub(super) static MEM_ADDR: LazyLock<DashMap<InstanceId, InstanceInfo>> =
 /// and removes the entry.
 pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
     LazyLock::new(DashMap::default);
+
+/// Global registry of delegate subscriptions to contracts.
+///
+/// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
+/// recorded here. When `commit_state_update()` persists a new contract state, it checks
+/// this registry and sends notifications to subscribed delegates.
+pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
+    DashMap<ContractInstanceId, HashSet<DelegateKey>>,
+> = LazyLock::new(DashMap::default);
 
 // Thread-local tracking of the currently-executing delegate instance ID.
 // Set before a WASM process() call, cleared after. This allows the new
@@ -284,11 +294,9 @@ impl DelegateCallEnv {
 
     /// Register a subscription interest for a contract.
     ///
-    /// Currently validates that the contract is known (code hash resolvable)
-    /// and returns success. Actual notification delivery is a follow-up.
-    // TODO(#2830): Implement actual subscription notification delivery
-    // Currently this is a no-op beyond validation — delegates will believe they
-    // are subscribed but will never receive notifications.
+    /// Validates the contract is known and records the (contract, delegate) pair in
+    /// the global subscription registry. When `commit_state_update()` persists a new
+    /// state for this contract, it will send a `ContractNotification` to the delegate.
     pub(super) fn subscribe_contract_sync(
         &self,
         instance_id: &ContractInstanceId,
@@ -296,8 +304,12 @@ impl DelegateCallEnv {
         // Validate the contract is known
         let _contract_key = self.resolve_contract_key(instance_id)?;
 
-        // No-op for now — real subscription notification delivery is a follow-up.
-        // The fact that we resolved the key validates the contract is registered.
+        // Register in global subscription registry
+        DELEGATE_SUBSCRIPTIONS
+            .entry(*instance_id)
+            .or_default()
+            .insert(self.delegate_key.clone());
+
         Ok(())
     }
 }
@@ -1298,8 +1310,9 @@ pub(super) mod delegate_contracts {
     /// Implementation of subscribe_contract.
     ///
     /// Validates that the contract is known (code hash resolvable) and registers
-    /// subscription interest. Currently a no-op beyond validation; real notification
-    /// delivery is a follow-up.
+    /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
+    /// When the subscribed contract's state changes via `commit_state_update()`,
+    /// a `ContractNotification` is delivered to this delegate.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)

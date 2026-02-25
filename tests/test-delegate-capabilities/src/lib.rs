@@ -140,6 +140,11 @@ pub enum DelegateResponse {
         success: bool,
         error: Option<String>,
     },
+    /// Contract notification received (subscribed contract state changed)
+    ContractNotificationReceived {
+        contract_id: ContractInstanceId,
+        new_state: Vec<u8>,
+    },
     /// Error occurred
     Error { message: String },
     // Future responses:
@@ -170,6 +175,9 @@ impl DelegateInterface for TestDelegate {
             }
             InboundDelegateMsg::SubscribeContractResponse(response) => {
                 handle_subscribe_contract_response(response)
+            }
+            InboundDelegateMsg::ContractNotification(notification) => {
+                handle_contract_notification(notification)
             }
             InboundDelegateMsg::UserResponse(_) => {
                 // Not used by this delegate
@@ -444,6 +452,24 @@ fn handle_subscribe_contract_response(
             error,
         },
     )
+}
+
+fn handle_contract_notification(
+    notification: ContractNotification,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let response_payload = DelegateResponse::ContractNotificationReceived {
+        contract_id: notification.contract_id,
+        new_state: notification.new_state.to_vec(),
+    };
+
+    let payload = bincode::serialize(&response_payload)
+        .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
+
+    let app_msg = ApplicationMessage::new(ContractInstanceId::new([0u8; 32]), payload)
+        .processed(true)
+        .with_context(DelegateContext::default());
+
+    Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
 }
 
 #[cfg(test)]
@@ -1057,6 +1083,72 @@ mod tests {
                         assert_eq!(error, Some("contract not found".to_string()));
                     }
                     other => panic!("Expected ContractSubscribeResult, got {:?}", other),
+                }
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_contract_notification_received() {
+        let contract_id = ContractInstanceId::new([1u8; 32]);
+        let new_state = vec![10, 20, 30, 40];
+
+        let notification = ContractNotification {
+            contract_id,
+            new_state: WrappedState::new(new_state.clone()),
+            context: DelegateContext::default(),
+        };
+
+        let result =
+            call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => {
+                assert!(msg.processed);
+                let response: DelegateResponse = bincode::deserialize(&msg.payload).unwrap();
+                match response {
+                    DelegateResponse::ContractNotificationReceived {
+                        contract_id: id,
+                        new_state: state,
+                    } => {
+                        assert_eq!(id, contract_id);
+                        assert_eq!(state, new_state);
+                    }
+                    other => panic!("Expected ContractNotificationReceived, got {:?}", other),
+                }
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_contract_notification_empty_state() {
+        let contract_id = ContractInstanceId::new([5u8; 32]);
+
+        let notification = ContractNotification {
+            contract_id,
+            new_state: WrappedState::new(vec![]),
+            context: DelegateContext::default(),
+        };
+
+        let result =
+            call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => {
+                let response: DelegateResponse = bincode::deserialize(&msg.payload).unwrap();
+                match response {
+                    DelegateResponse::ContractNotificationReceived {
+                        contract_id: id,
+                        new_state: state,
+                    } => {
+                        assert_eq!(id, contract_id);
+                        assert!(state.is_empty());
+                    }
+                    other => panic!("Expected ContractNotificationReceived, got {:?}", other),
                 }
             }
             other => panic!("Expected ApplicationMessage, got {:?}", other),

@@ -3515,6 +3515,10 @@ enum DelegateCommandResponse {
         success: bool,
         error: Option<String>,
     },
+    ContractNotificationReceived {
+        contract_id: ContractInstanceId,
+        new_state: Vec<u8>,
+    },
     Error {
         message: String,
     },

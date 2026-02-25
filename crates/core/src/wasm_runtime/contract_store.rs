@@ -175,6 +175,9 @@ impl ContractStore {
         // Remove from in-memory index
         self.key_to_code_part.remove(key.id());
 
+        // Clean up any delegate subscriptions for this contract
+        super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+
         let key_path = self
             .contracts_dir
             .join(contract_hash.encode())
