@@ -2763,12 +2763,53 @@ mod test {
         };
         assert_eq!(subscribe_req.contract_id, contract_instance_id);
 
-        // Simulate the runtime processing the subscribe request — register in global registry
-        // (In production, handle_delegate_with_contract_requests does this)
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(contract_instance_id)
-            .or_default()
-            .insert(delegate_key.clone());
+        // Simulate the V1 subscribe handler path (contract/mod.rs:387-405):
+        // validate contract existence via lookup, then register if found.
+        let subscribe_result = if runtime
+            .contract_store
+            .code_hash_from_id(&subscribe_req.contract_id)
+            .is_some()
+        {
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                .entry(subscribe_req.contract_id)
+                .or_default()
+                .insert(delegate_key.clone());
+            Ok(())
+        } else {
+            Err("Contract not found".to_string())
+        };
+        assert!(
+            subscribe_result.is_ok(),
+            "Subscribe should succeed for known contract"
+        );
+
+        // Feed the SubscribeContractResponse back to the delegate
+        let subscribe_response =
+            InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+                contract_id: subscribe_req.contract_id,
+                result: subscribe_result,
+                context: subscribe_req.context.clone(),
+            });
+        let outbound = runtime.inbound_app_message(
+            &delegate_key,
+            &vec![].into(),
+            None,
+            vec![subscribe_response],
+        )?;
+        // Delegate should emit a ContractSubscribeResult ApplicationMessage
+        assert_eq!(outbound.len(), 1);
+        match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => {
+                let resp: DelegateResponse = bincode::deserialize(&msg.payload)?;
+                match resp {
+                    DelegateResponse::ContractSubscribeResult { success, .. } => {
+                        assert!(success, "Subscribe response should indicate success");
+                    }
+                    other => panic!("Expected ContractSubscribeResult, got {:?}", other),
+                }
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
 
         // --- Step 2: Verify registry is populated ---
         {
@@ -2779,6 +2820,14 @@ mod test {
                 "Delegate should be registered as subscriber"
             );
         }
+
+        // Also verify that subscribing to an UNKNOWN contract fails validation
+        let unknown_id = ContractInstanceId::new([99u8; 32]);
+        let has_code = runtime
+            .contract_store
+            .code_hash_from_id(&unknown_id)
+            .is_some();
+        assert!(!has_code, "Unknown contract should not be in store");
 
         // --- Step 3: Deliver ContractNotification ---
         let updated_state = vec![10, 20, 30, 40, 50];

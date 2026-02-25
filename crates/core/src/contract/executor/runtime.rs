@@ -137,6 +137,8 @@ pub struct RuntimePool {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Sender for delegate notifications (cloned into each executor and replacements).
+    delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
     delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
 }
@@ -250,6 +252,7 @@ impl RuntimePool {
             shared_delegate_modules,
             shared_backend_engine,
             shared_recovery_guard,
+            delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
         })
     }
@@ -381,6 +384,7 @@ impl RuntimePool {
             self.shared_summaries.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
+        executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());
 
         Ok(executor)
     }
@@ -1532,9 +1536,12 @@ where
             }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+                    let total = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::warn!(
                         contract = %key,
                         delegate = %delegate_key,
+                        total_dropped = total,
                         "Delegate notification channel full — notification dropped"
                     );
                 }
