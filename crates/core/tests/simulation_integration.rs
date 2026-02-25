@@ -26,7 +26,7 @@ use freenet::transport::in_memory_socket::{
     clear_all_socket_registries, register_address_network, register_network_time_source,
     SimulationSocket,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -5859,21 +5859,20 @@ fn test_unhealthy_peer_eviction() {
         )
         .await;
         let logs_handle = sim.event_logs_handle();
-        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        let node_addrs: HashMap<NodeLabel, SocketAddr> = sim.all_node_addresses().clone();
         (sim, logs_handle, node_addrs)
     });
 
     // Pick one non-gateway node to partition
-    let victim_addr: std::net::SocketAddr = *node_addrs
+    let victim_addr: SocketAddr = *node_addrs
         .iter()
         .find(|(label, _)| label.is_node())
         .expect("Need at least 1 non-gateway node")
         .1;
 
-    let all_addrs: std::collections::HashSet<_> = node_addrs.values().copied().collect();
-    let victim_set: std::collections::HashSet<_> = [victim_addr].into_iter().collect();
-    let healthy_set: std::collections::HashSet<_> =
-        all_addrs.difference(&victim_set).copied().collect();
+    let all_addrs: HashSet<_> = node_addrs.values().copied().collect();
+    let victim_set: HashSet<_> = [victim_addr].into_iter().collect();
+    let healthy_set: HashSet<_> = all_addrs.difference(&victim_set).copied().collect();
 
     let network_name = NETWORK_NAME.to_string();
 

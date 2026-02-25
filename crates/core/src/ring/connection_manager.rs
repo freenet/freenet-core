@@ -124,9 +124,7 @@ const HEALTH_BURST_MIN_FAILURES: u64 = 10;
 
 impl PeerHealthTracker {
     pub fn new() -> Self {
-        Self {
-            stats: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Initialize health tracking for a newly added peer.
@@ -189,17 +187,12 @@ impl PeerHealthTracker {
                     return true;
                 }
 
-                // Criterion 3: Last success > timeout ago with > burst threshold failures since
+                // Criterion 3: Last success was long ago and total failures exceed burst threshold.
                 if let Some(last_ok) = stats.last_success {
-                    if now.duration_since(last_ok) > HEALTH_LAST_SUCCESS_TIMEOUT {
-                        // Count failures that could have occurred since last success.
-                        // We don't track per-interval failures, so use total failures
-                        // minus successes as a conservative proxy for "failures since last success".
-                        // (In reality, failures_since >= failures - successes when successes
-                        // are front-loaded, which is the concerning pattern.)
-                        if stats.failures > HEALTH_BURST_MIN_FAILURES {
-                            return true;
-                        }
+                    if now.duration_since(last_ok) > HEALTH_LAST_SUCCESS_TIMEOUT
+                        && stats.failures > HEALTH_BURST_MIN_FAILURES
+                    {
+                        return true;
                     }
                 }
 
@@ -263,7 +256,7 @@ pub(crate) struct ConnectionManager {
     /// Used for optimistic readiness timeout: if a peer hasn't sent a ReadyState
     /// message but has been connected for longer than `OPTIMISTIC_READY_TIMEOUT`,
     /// we treat them as ready (assuming the ReadyState message was lost).
-    connected_since: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, Instant>>>,
+    connected_since: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
     /// Per-peer routing health statistics for eviction decisions.
     pub(crate) peer_health: Arc<Mutex<PeerHealthTracker>>,
 }
@@ -380,7 +373,7 @@ impl ConnectionManager {
             recently_failed_addrs: Arc::new(RwLock::new(BTreeMap::new())),
             ready_peers: Arc::new(DashSet::new()),
             min_ready_connections,
-            connected_since: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            connected_since: Arc::new(RwLock::new(BTreeMap::new())),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
         }
     }

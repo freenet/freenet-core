@@ -355,8 +355,6 @@ struct ConnectionEntry {
 
 /// Check whether a transport connection is a zombie: old enough but not
 /// promoted to ring, not transient, and not pending reservation.
-///
-/// Extracted as a standalone function for testability.
 fn is_zombie(
     created_at_elapsed: Duration,
     in_ring: bool,
@@ -785,21 +783,18 @@ impl P2pConnManager {
                 let zombie_addrs: Vec<SocketAddr> = ctx
                     .connections
                     .iter()
-                    .filter_map(|(addr, entry)| {
-                        if is_zombie(
+                    .filter(|(addr, entry)| {
+                        is_zombie(
                             entry.created_at.elapsed(),
-                            op_manager.ring.connection_manager.is_in_ring(*addr),
-                            op_manager.ring.connection_manager.is_transient(*addr),
+                            op_manager.ring.connection_manager.is_in_ring(**addr),
+                            op_manager.ring.connection_manager.is_transient(**addr),
                             op_manager
                                 .ring
                                 .connection_manager
-                                .has_connection_or_pending(*addr),
-                        ) {
-                            Some(*addr)
-                        } else {
-                            None
-                        }
+                                .has_connection_or_pending(**addr),
+                        )
                     })
+                    .map(|(addr, _)| *addr)
                     .collect();
                 for addr in &zombie_addrs {
                     tracing::info!(
