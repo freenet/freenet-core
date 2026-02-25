@@ -201,7 +201,8 @@ impl PeerHealthTracker {
             .map(|(addr, _)| *addr)
             .collect();
 
-        // Never evict if it would drop below min_connections
+        // Never evict if it would drop below min_connections.
+        // Truncation is by BTreeMap (SocketAddr) order, not severity.
         if current_count.saturating_sub(candidates.len()) < min_connections {
             let max_evictable = current_count.saturating_sub(min_connections);
             candidates.truncate(max_evictable);
@@ -996,6 +997,20 @@ impl ConnectionManager {
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
             entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
+        }
+
+        // Migrate connected_since and peer_health to the new address.
+        {
+            let mut cs = self.connected_since.write();
+            if let Some(since) = cs.remove(&old_addr) {
+                cs.insert(new_addr, since);
+            }
+        }
+        {
+            let mut health = self.peer_health.lock();
+            if let Some(stats) = health.stats.remove(&old_addr) {
+                health.stats.insert(new_addr, stats);
+            }
         }
 
         true
@@ -1832,6 +1847,65 @@ mod tests {
 
         let updated = cm.update_peer_identity(old_addr, new_addr, keypair.public().clone());
         assert!(!updated);
+    }
+
+    #[test]
+    fn test_update_peer_identity_migrates_health_and_connected_since() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let new_keypair = TransportKeypair::new();
+
+        let old_addr = make_addr(8001);
+        let new_addr = make_addr(8002);
+        let loc = Location::new(0.5);
+
+        // Add connection (this sets connected_since and init_peer)
+        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
+
+        // Record some health events on old address
+        cm.peer_health.lock().record_success(old_addr);
+        cm.peer_health.lock().record_failure(old_addr);
+        cm.peer_health.lock().record_success(old_addr);
+
+        // Verify old address has data
+        assert!(cm.connected_since.read().contains_key(&old_addr));
+        assert_eq!(
+            cm.peer_health
+                .lock()
+                .stats
+                .get(&old_addr)
+                .unwrap()
+                .successes,
+            2
+        );
+        assert_eq!(
+            cm.peer_health.lock().stats.get(&old_addr).unwrap().failures,
+            1
+        );
+
+        // Update identity
+        let updated = cm.update_peer_identity(old_addr, new_addr, new_keypair.public().clone());
+        assert!(updated);
+
+        // Old address should have no data
+        assert!(!cm.connected_since.read().contains_key(&old_addr));
+        assert!(!cm.peer_health.lock().stats.contains_key(&old_addr));
+
+        // New address should have migrated data
+        assert!(cm.connected_since.read().contains_key(&new_addr));
+        assert_eq!(
+            cm.peer_health
+                .lock()
+                .stats
+                .get(&new_addr)
+                .unwrap()
+                .successes,
+            2
+        );
+        assert_eq!(
+            cm.peer_health.lock().stats.get(&new_addr).unwrap().failures,
+            1
+        );
     }
 
     // ============ routing tests ============

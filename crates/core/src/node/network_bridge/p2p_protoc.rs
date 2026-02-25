@@ -4910,4 +4910,14 @@ mod tests {
             "Old unpromoted connection should be zombie"
         );
     }
+
+    #[test]
+    fn test_zombie_detection_ignores_pending_reservation() {
+        // Old connection not in ring, not transient, but has pending reservation → not zombie
+        let elapsed = Duration::from_secs(600);
+        assert!(
+            !super::is_zombie(elapsed, false, false, true),
+            "Connection with pending reservation should not be zombie"
+        );
+    }
 }

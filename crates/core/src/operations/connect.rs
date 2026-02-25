@@ -131,7 +131,15 @@ const MIN_FORWARD_SCORE: f64 = 0.15;
 /// If filtering would leave zero scored peers AND zero eligible (unscored) peers,
 /// the scored list is left unchanged so we still have a fallback.
 fn filter_low_score_peers<T>(scored: &mut Vec<(f64, T)>, eligible_count: usize) {
-    if scored.len() + eligible_count > 1 {
+    if scored.len() + eligible_count <= 1 {
+        return;
+    }
+    let survivors = scored
+        .iter()
+        .filter(|(s, _)| *s >= MIN_FORWARD_SCORE)
+        .count();
+    // Only filter if at least one scored peer survives OR unscored fallbacks exist.
+    if survivors > 0 || eligible_count > 0 {
         scored.retain(|(score, _)| *score >= MIN_FORWARD_SCORE);
     }
 }
@@ -3499,6 +3507,18 @@ mod tests {
         assert!(
             scored.is_empty(),
             "Low-score peer should be filtered when unscored fallback exists"
+        );
+    }
+
+    #[test]
+    fn test_filter_low_score_peers_keeps_all_bad_when_no_alternatives() {
+        // All scored peers below threshold AND no eligible fallback → keep them all.
+        let mut scored: Vec<(f64, &str)> = vec![(0.05, "bad1"), (0.10, "bad2")];
+        super::filter_low_score_peers(&mut scored, 0);
+        assert_eq!(
+            scored.len(),
+            2,
+            "Must keep all low-score peers when no alternatives exist"
         );
     }
 }
