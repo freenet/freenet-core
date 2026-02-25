@@ -1768,7 +1768,8 @@ async fn deliver_update_result(
     };
 
     let host_result = op.to_host_result();
-    crate::node::network_status::record_contract_updated(&format!("{key}"));
+    // Note: record_contract_updated is called in commit_state_update (the single
+    // chokepoint for all state updates), so we don't call it here to avoid double-counting.
 
     op_manager
         .result_router_tx
