@@ -235,21 +235,21 @@ jobs:
             const fs = require('fs');
             const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
 
-            // Read Claude's output
+            // Read Claude's output — the file is a JSON array of Turn objects
             let report = '';
             try {
               const raw = fs.readFileSync(execFile, 'utf8');
-              const data = JSON.parse(raw);
-              // Extract the final text output from Claude
-              if (data.result) {
-                report = data.result;
-              } else if (data.messages) {
-                // Find the last assistant message
-                const msgs = data.messages.filter(m => m.role === 'assistant');
-                if (msgs.length > 0) {
-                  const last = msgs[msgs.length - 1];
-                  report = typeof last.content === 'string' ? last.content :
-                    last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+              const turns = JSON.parse(raw);
+
+              // Find the last assistant turn with text content
+              if (Array.isArray(turns)) {
+                const assistantTurns = turns.filter(t => t.type === 'assistant' && t.message?.content);
+                if (assistantTurns.length > 0) {
+                  const last = assistantTurns[assistantTurns.length - 1];
+                  const textParts = last.message.content
+                    .filter(c => c.type === 'text')
+                    .map(c => c.text);
+                  report = textParts.join('\n');
                 }
               }
             } catch (e) {
