@@ -607,6 +607,26 @@ async fn report_result(
                     (TransactionType::Subscribe, OpOutcome::ContractOpFailure { .. }) => {
                         (Some(OpType::Subscribe), false)
                     }
+                    // Irrelevant = completed successfully but without routing stats
+                    // (e.g., UPDATE when stats.target is None, SUBSCRIBE when stats is None)
+                    (TransactionType::Get, OpOutcome::Irrelevant) => (Some(OpType::Get), true),
+                    (TransactionType::Put, OpOutcome::Irrelevant) => (Some(OpType::Put), true),
+                    (TransactionType::Update, OpOutcome::Irrelevant) => {
+                        (Some(OpType::Update), true)
+                    }
+                    (TransactionType::Subscribe, OpOutcome::Irrelevant) => {
+                        (Some(OpType::Subscribe), true)
+                    }
+                    // Incomplete = operation never finalized
+                    (TransactionType::Get, OpOutcome::Incomplete) => (Some(OpType::Get), false),
+                    (TransactionType::Put, OpOutcome::Incomplete) => (Some(OpType::Put), false),
+                    (TransactionType::Update, OpOutcome::Incomplete) => {
+                        (Some(OpType::Update), false)
+                    }
+                    (TransactionType::Subscribe, OpOutcome::Incomplete) => {
+                        (Some(OpType::Subscribe), false)
+                    }
+                    // CONNECT is not a contract operation
                     _ => (None, false),
                 };
                 if let Some(op_type) = op_type {

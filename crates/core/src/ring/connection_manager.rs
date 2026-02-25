@@ -31,6 +31,8 @@ pub(crate) struct TransientEntry {
     /// Transient connections are typically unsolicited inbound connections to gateways.
     /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
+    /// When this transient entry was created (for expiration cleanup).
+    pub created_at: Instant,
 }
 
 /// Maximum time a pending reservation can remain before being considered stale.
@@ -740,8 +742,13 @@ impl ConnectionManager {
             return false;
         }
 
-        self.transient_connections
-            .insert(addr, TransientEntry { location });
+        self.transient_connections.insert(
+            addr,
+            TransientEntry {
+                location,
+                created_at: Instant::now(),
+            },
+        );
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
         if prev >= self.transient_budget {
             // Undo if we raced past the budget.
@@ -1161,6 +1168,32 @@ impl ConnectionManager {
         };
 
         stale_reservations + orphaned_locations
+    }
+
+    /// Remove transient connection entries that have exceeded `transient_ttl`.
+    /// Returns the number of expired entries removed.
+    pub(crate) fn cleanup_expired_transients(&self) -> usize {
+        let now = Instant::now();
+        let ttl = self.transient_ttl;
+        let mut removed = 0;
+        self.transient_connections.retain(|addr, entry| {
+            let age = now.duration_since(entry.created_at);
+            if age > ttl {
+                tracing::debug!(
+                    addr = %addr,
+                    age_secs = age.as_secs(),
+                    "Removing expired transient connection"
+                );
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            self.transient_in_use.fetch_sub(removed, Ordering::SeqCst);
+        }
+        removed
     }
 
     /// Check whether a peer address has an established connection in `connections_by_location`.
