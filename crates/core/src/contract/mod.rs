@@ -496,7 +496,7 @@ async fn handle_delegate_notification<CH>(
     let outbound =
         handle_delegate_with_contract_requests(contract_handler, req, None, &delegate_key).await;
 
-    // TODO-MUST-FIX: Route outbound ApplicationMessages to subscribed apps #2830
+    // TODO-MUST-FIX: Route outbound ApplicationMessages to subscribed apps #3275
     // handle_delegate_with_contract_requests already processes contract requests
     // (GET/PUT/UPDATE/SUBSCRIBE) internally. The remaining outbound messages are
     // ApplicationMessages meant for connected apps, but notification-driven
