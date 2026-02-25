@@ -74,7 +74,26 @@ Host functions (callable from WASM):
   - Registration: backend-specific in wasmtime_engine.rs
   - Logic implementations: keep in native_api.rs as pub(super) helpers
 
-Pattern:
+CRITICAL — Memory pointer refresh (#3248):
+  Every func_wrap / func_wrap_async registration in wasmtime_engine.rs
+  MUST call refresh_mem_addr_from_caller(&mut caller, id) BEFORE
+  delegating to native_api. WASM memory.grow can relocate linear memory,
+  invalidating the cached base pointer in MEM_ADDR. Without the refresh,
+  host functions use a stale pointer and read/write garbage data.
+
+  For functions that take an explicit `id` parameter, pass it directly.
+  For delegate functions that use thread-local state, read the instance
+  ID from CURRENT_DELEGATE_INSTANCE.
+
+Pattern (registration in wasmtime_engine.rs):
+  linker.func_wrap("namespace", "name",
+      |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
+          refresh_mem_addr_from_caller(&mut caller, id);
+          native_api::module::host_function(id, ptr, len)
+      },
+  )
+
+Pattern (logic in native_api.rs):
   pub(super) fn host_function(id: i64, ptr: i64, len: i32) -> i64 {
       // Use MEM_ADDR map to access instance memory
       // Validate args

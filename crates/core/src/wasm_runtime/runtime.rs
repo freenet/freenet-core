@@ -78,14 +78,7 @@ impl RunningInstance {
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
-        native_api::MEM_ADDR.insert(
-            id,
-            InstanceInfo {
-                start_ptr: ptr as i64,
-                mem_size: size,
-                key,
-            },
-        );
+        native_api::MEM_ADDR.insert(id, InstanceInfo::new(ptr as i64, size, key));
 
         Ok(Self {
             id,
@@ -116,6 +109,14 @@ pub(crate) struct InstanceInfo {
 }
 
 impl InstanceInfo {
+    pub(crate) fn new(start_ptr: i64, mem_size: usize, key: Key) -> Self {
+        Self {
+            start_ptr,
+            mem_size,
+            key,
+        }
+    }
+
     pub fn key(&self) -> String {
         match &self.key {
             Key::Contract(k) => k.encode(),
