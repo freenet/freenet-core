@@ -145,11 +145,11 @@ jobs:
           wc -l /tmp/relevant_rules.txt
 
       - name: Claude rule review
+        id: review
         if: steps.rules.outputs.skip != 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          use_sticky_comment: true
           claude_args: '--model sonnet --max-turns 15 --effort high'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
@@ -199,7 +199,7 @@ jobs:
 
             ## Output Format
 
-            Post your findings as a structured comment. If there are NO findings, say so briefly.
+            Return your findings as markdown. If there are NO findings, say so briefly.
 
             Use this format:
 
@@ -217,9 +217,6 @@ jobs:
             #### Info
             - [ ] `file:line` — description (rule: X)
 
-            ---
-            *Automated review against `.claude/rules/`. Advisory only — does not block merge.*
-
             If there are no findings at any severity level, output:
 
             ### ✅ Rule Review: No issues found
@@ -229,5 +226,69 @@ jobs:
 
             No rule violations detected in this PR.
 
-            ---
-            *Automated review against `.claude/rules/`. Advisory only — does not block merge.*
+      - name: Post review comment
+        if: steps.rules.outputs.skip != 'true' && steps.review.outputs.execution_file
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const execFile = '${{ steps.review.outputs.execution_file }}';
+
+            // Read Claude's output
+            let report = '';
+            try {
+              const raw = fs.readFileSync(execFile, 'utf8');
+              const data = JSON.parse(raw);
+              // Extract the final text output from Claude
+              if (data.result) {
+                report = data.result;
+              } else if (data.messages) {
+                // Find the last assistant message
+                const msgs = data.messages.filter(m => m.role === 'assistant');
+                if (msgs.length > 0) {
+                  const last = msgs[msgs.length - 1];
+                  report = typeof last.content === 'string' ? last.content :
+                    last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+                }
+              }
+            } catch (e) {
+              console.log(`Could not parse execution file: ${e.message}`);
+              return;
+            }
+
+            if (!report || report.trim().length === 0) {
+              console.log('No report content found');
+              return;
+            }
+
+            const body = report + '\n\n---\n*Automated review against `.claude/rules/`. Advisory only — does not block merge.*';
+
+            // Find and update existing sticky comment, or create new one
+            const marker = '<!-- claude-rule-review -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            const fullBody = marker + '\n' + body;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+              console.log(`Updated existing comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+              console.log('Created new review comment');
+            }
