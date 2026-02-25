@@ -4943,4 +4943,16 @@ mod tests {
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
+
+    #[test]
+    fn test_zombie_boundary_exactly_300s() {
+        // Exactly 300s, no pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(Duration::from_secs(300), false, false));
+    }
+
+    #[test]
+    fn test_zombie_boundary_exactly_600s() {
+        // Exactly 600s, has_pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(Duration::from_secs(600), false, true));
+    }
 }
