@@ -43,6 +43,7 @@ fn homepage_html() -> String {
     <title>Freenet</title>
     <link rel="icon" href="https://freenet.org/favicon.ico">
     <style>{CSS}</style>
+    <script>{JS}</script>
 </head>
 <body>
     <header>
@@ -52,7 +53,10 @@ fn homepage_html() -> String {
             <span class="badge">v{version}</span>
         </div>
         <div class="header-right">
-            Up {uptime}
+            <span class="uptime">Up {uptime}</span>
+            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark mode">
+                <span id="theme-icon">🌙</span>
+            </button>
         </div>
     </header>
 
@@ -90,6 +94,7 @@ fn homepage_html() -> String {
 </body>
 </html>"##,
         CSS = CSS,
+        JS = JS,
         version = html_escape(version),
         uptime = uptime,
         status_card = status_card,
@@ -693,10 +698,97 @@ p:last-child { margin-bottom: 0; }
 .ring-dot-self { background: #4caf50; }
 .ring-dot-peer { background: #2196F3; }
 .ring-dot-gw { background: #ff9800; }
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: #888;
+    font-size: 0.9rem;
+}
+.theme-btn {
+    background: none;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+    color: inherit;
+    transition: border-color 0.15s;
+}
+.theme-btn:hover { border-color: #bbb; }
 @media (max-width: 600px) {
     .op-grid { grid-template-columns: repeat(2, 1fr); }
     header { padding: 0.5rem 1rem; }
     main { margin: 1rem auto; }
     .ring-svg { width: 180px; height: 180px; }
 }
+/* Dark mode */
+[data-theme="dark"] body { background: #121212; color: #e0e0e0; }
+[data-theme="dark"] header { background: #1e1e1e; border-bottom-color: #333; }
+[data-theme="dark"] .header-right { color: #aaa; }
+[data-theme="dark"] .theme-btn { border-color: #444; }
+[data-theme="dark"] .theme-btn:hover { border-color: #888; }
+[data-theme="dark"] .badge { background: #1a2a40; color: #90caf9; }
+[data-theme="dark"] .card { background: #1e1e1e; border-color: #333; }
+[data-theme="dark"] .card-muted { background: #181818; }
+[data-theme="dark"] .card h2 { color: #aaa; }
+[data-theme="dark"] .own-loc { color: #aaa; }
+[data-theme="dark"] thead th { border-bottom-color: #333; color: #aaa; }
+[data-theme="dark"] tbody td { border-bottom-color: #2a2a2a; }
+[data-theme="dark"] code { background: #2a2a2a; color: #e0e0e0; }
+[data-theme="dark"] .op-cell { background: #181818; border-color: #2a2a2a; }
+[data-theme="dark"] .op-name { color: #aaa; }
+[data-theme="dark"] .spinner { border-color: #333; border-top-color: #90caf9; }
+[data-theme="dark"] .warning { background: #2a1a00; border-color: #5a3a00; color: #ffcc80; }
+[data-theme="dark"] .warning ul { color: #ffcc80; }
+[data-theme="dark"] .diagnostics { background: #2a1a00; border-color: #5a3a00; }
+[data-theme="dark"] .diagnostics h3 { color: #ffcc80; }
+[data-theme="dark"] .diagnostics li { color: #ccc; }
+[data-theme="dark"] .nat-stat { color: #aaa; }
+[data-theme="dark"] .nat-fail { color: #ff6b6b; }
+[data-theme="dark"] .nat-advice { background: #2a0000; border-color: #5a0000; color: #ff8a80; }
+[data-theme="dark"] .attempts { color: #888; }
+[data-theme="dark"] .empty { color: #666; }
+[data-theme="dark"] .note { color: #888; }
+[data-theme="dark"] .note a { color: #90caf9; }
+[data-theme="dark"] .app-list a, [data-theme="dark"] .link-list a { color: #90caf9; }
+[data-theme="dark"] .ring-legend { color: #aaa; }
+[data-theme="dark"] .ring-svg circle:first-child { stroke: #444 !important; }
+"##;
+
+/// Inline JavaScript for the dark mode toggle.
+/// A plain (non-module) script so it runs synchronously before first paint
+/// and so toggleTheme() is reachable from the button's onclick attribute.
+/// The page auto-refreshes every 5 s, so restoring the saved theme before
+/// render is essential to avoid a flash of the wrong theme on each refresh.
+const JS: &str = r##"
+(function() {
+    try {
+        if (localStorage.getItem('theme') === 'dark') {
+            document.documentElement.setAttribute('data-theme', 'dark');
+        }
+    } catch (e) { /* localStorage unavailable (e.g. private browsing) */ }
+})();
+
+function toggleTheme() {
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    var icon = document.getElementById('theme-icon');
+    if (isDark) {
+        document.documentElement.removeAttribute('data-theme');
+        if (icon) icon.textContent = '\uD83C\uDF19'; /* moon */
+        try { localStorage.removeItem('theme'); } catch (e) {}
+    } else {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        if (icon) icon.textContent = '\u2600\uFE0F'; /* sun */
+        try { localStorage.setItem('theme', 'dark'); } catch (e) {}
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    var icon = document.getElementById('theme-icon');
+    if (icon && document.documentElement.getAttribute('data-theme') === 'dark') {
+        icon.textContent = '\u2600\uFE0F'; /* sun = switch to light */
+    }
+});
 "##;
