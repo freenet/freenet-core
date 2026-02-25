@@ -329,11 +329,18 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                     )
                 }
                 FailureReason::NatTraversalFailed => {
-                    format!(
-                        "<strong>NAT traversal failed</strong>: Can't reach gateway. \
-                         Check that UDP port <code>{}</code> is open in your firewall.",
-                        s.listening_port
-                    )
+                    let has_peer_connections = s.connected_peers.iter().any(|p| !p.is_gateway);
+                    if has_peer_connections {
+                        "<strong>NAT traversal failed</strong>: Could not connect to this \
+                         peer. This is normal — not all NAT traversal attempts succeed."
+                            .to_string()
+                    } else {
+                        format!(
+                            "<strong>NAT traversal failed</strong>: Can't reach gateway. \
+                             Check that UDP port <code>{}</code> is open in your firewall.",
+                            s.listening_port
+                        )
+                    }
                 }
                 FailureReason::Timeout => {
                     "<strong>Connection timed out</strong>: Gateway did not respond.".to_string()
@@ -479,6 +486,11 @@ pub(crate) fn format_ago(secs: u64) -> String {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Mutex;
+
+    /// Tests that touch the shared NETWORK_STATUS global must hold this lock
+    /// to prevent interleaving with other tests running in parallel.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_classify_version_mismatch() {
@@ -522,6 +534,7 @@ mod tests {
 
     #[test]
     fn test_failure_snapshot_rendering() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337);
 
         // Test version mismatch rendering
@@ -557,41 +570,67 @@ mod tests {
 
     #[test]
     fn test_gateway_only_detection() {
-        // OnceLock may already be set by another test in the same process,
-        // so we ensure the state we need by writing directly to the global.
+        let _lock = TEST_MUTEX.lock().unwrap();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
-        init(31339, HashSet::new(), "0.1.148".to_string()); // may be ignored if already set
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
+        init(31339, HashSet::new(), "0.1.148".to_string());
 
-        // Insert the gateway address directly into the existing global state
-        if let Some(status) = NETWORK_STATUS.get() {
+        let status = NETWORK_STATUS.get().unwrap();
+
+        // Gateway-only: one gateway peer connected
+        {
             let mut s = status.write().unwrap();
             s.gateway_addresses.insert(gw_addr);
-            s.connected_peers.clear(); // clean slate for this test
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+            s.connected_peers.push(ConnectedPeer {
+                address: gw_addr,
+                is_gateway: true,
+                location: Some(0.5),
+                connected_since: Instant::now(),
+            });
         }
-
-        // Connect a gateway peer
-        record_peer_connected(gw_addr, Some(0.5));
         let snap = get_snapshot().unwrap();
         assert!(snap.gateway_only);
 
-        // Connect a non-gateway peer
-        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
-        record_peer_connected(peer_addr, Some(0.3));
+        // Not gateway-only: add a non-gateway peer
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.push(ConnectedPeer {
+                address: peer_addr,
+                is_gateway: false,
+                location: Some(0.3),
+                connected_since: Instant::now(),
+            });
+        }
         let snap = get_snapshot().unwrap();
         assert!(!snap.gateway_only);
 
-        // Disconnect the non-gateway peer
-        record_peer_disconnected(peer_addr);
+        // Back to gateway-only: remove non-gateway peer
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.retain(|p| p.address != peer_addr);
+        }
         let snap = get_snapshot().unwrap();
         assert!(snap.gateway_only);
 
-        // Cleanup: remove test peers
-        record_peer_disconnected(gw_addr);
+        // Cleanup
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+        }
     }
 
     #[test]
     fn test_op_stats_recording() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         init(31340, HashSet::new(), "0.1.148".to_string());
+
+        // Reset op stats to avoid interference from other tests
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.op_stats = OperationStats::default();
+        }
 
         record_op_result(OpType::Get, true);
         record_op_result(OpType::Get, true);
@@ -605,6 +644,7 @@ mod tests {
 
     #[test]
     fn test_subscription_tracking() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         init(31341, HashSet::new(), "0.1.148".to_string());
 
         record_subscription("ABC123DEF456".to_string());
@@ -623,7 +663,14 @@ mod tests {
 
     #[test]
     fn test_nat_stats() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         init(31342, HashSet::new(), "0.1.148".to_string());
+
+        // Reset NAT stats to avoid interference from other tests
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.nat_stats = NatStats::default();
+        }
 
         record_nat_attempt(true);
         record_nat_attempt(false);
@@ -632,5 +679,85 @@ mod tests {
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.nat_stats.attempts, 3);
         assert_eq!(snap.nat_stats.successes, 1);
+    }
+
+    #[test]
+    fn test_nat_failure_no_peers_shows_firewall_message() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337);
+        init(31343, HashSet::new(), "0.1.148".to_string());
+
+        // Ensure clean state: no peers, no failures
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+        }
+
+        record_gateway_failure(addr, FailureReason::NatTraversalFailed);
+        let snap = get_snapshot().unwrap();
+
+        let html = &snap.failures.last().unwrap().reason_html;
+        assert!(html.contains("NAT traversal failed"));
+        assert!(html.contains("Check that UDP port"));
+        assert!(html.contains("open in your firewall"));
+    }
+
+    #[test]
+    fn test_nat_failure_with_peer_connections_shows_benign_message() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
+        let fail_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 31337);
+        init(31344, HashSet::new(), "0.1.148".to_string());
+
+        // Ensure clean state
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+        }
+
+        // Connect a non-gateway peer, then record a NAT failure to a different peer
+        record_peer_connected(peer_addr, Some(0.5));
+        record_gateway_failure(fail_addr, FailureReason::NatTraversalFailed);
+        let snap = get_snapshot().unwrap();
+
+        let html = &snap.failures.last().unwrap().reason_html;
+        assert!(html.contains("NAT traversal failed"));
+        assert!(html.contains("This is normal"));
+        assert!(!html.contains("firewall"));
+
+        // Cleanup
+        record_peer_disconnected(peer_addr);
+    }
+
+    #[test]
+    fn test_nat_failure_with_only_gateway_connections_shows_firewall_message() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        let fail_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 31337);
+        init(31345, HashSet::new(), "0.1.148".to_string());
+
+        // Register gateway and ensure clean state
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+        }
+
+        // Connect only a gateway peer, then record NAT failure
+        record_peer_connected(gw_addr, None);
+        record_gateway_failure(fail_addr, FailureReason::NatTraversalFailed);
+        let snap = get_snapshot().unwrap();
+
+        // With only gateway connections, should still show firewall warning
+        let html = &snap.failures.last().unwrap().reason_html;
+        assert!(html.contains("NAT traversal failed"));
+        assert!(html.contains("firewall"));
+        assert!(!html.contains("This is normal"));
+
+        // Cleanup
+        record_peer_disconnected(gw_addr);
     }
 }
