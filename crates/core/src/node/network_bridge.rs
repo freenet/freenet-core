@@ -455,7 +455,15 @@ mod connection_error_tests {
             ConnectionError::IOError(msg) => {
                 assert!(msg.contains("test io error"));
             }
-            _ => panic!("Expected IOError variant"),
+            ConnectionError::LocationUnknown
+            | ConnectionError::SendNotCompleted(_)
+            | ConnectionError::UnexpectedReq
+            | ConnectionError::Serialization(_)
+            | ConnectionError::TransportError(_)
+            | ConnectionError::FailedConnectOp
+            | ConnectionError::UnwantedConnection
+            | ConnectionError::AddressBlocked(_)
+            | ConnectionError::Timeout => panic!("Expected IOError variant"),
         }
     }
 
@@ -488,7 +496,16 @@ mod connection_error_tests {
 
         match cloned {
             ConnectionError::Serialization(None) => {} // Expected - inner is lost
-            _ => panic!("Expected Serialization(None) after clone"),
+            ConnectionError::LocationUnknown
+            | ConnectionError::SendNotCompleted(_)
+            | ConnectionError::UnexpectedReq
+            | ConnectionError::Serialization(_)
+            | ConnectionError::TransportError(_)
+            | ConnectionError::FailedConnectOp
+            | ConnectionError::UnwantedConnection
+            | ConnectionError::AddressBlocked(_)
+            | ConnectionError::IOError(_)
+            | ConnectionError::Timeout => panic!("Expected Serialization(None) after clone"),
         }
     }
 

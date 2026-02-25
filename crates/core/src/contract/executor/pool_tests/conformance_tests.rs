@@ -340,11 +340,17 @@ async fn conformance_update_full_state_both_succeed() {
     // In both cases, a different state should be accepted.
     let mock_state = match mock_result {
         crate::contract::UpsertResult::Updated(s) => s,
-        other => panic!("MockRuntime: expected Updated, got {other:?}"),
+        other @ crate::contract::UpsertResult::NoChange
+        | other @ crate::contract::UpsertResult::CurrentWon(_) => {
+            panic!("MockRuntime: expected Updated, got {other:?}")
+        }
     };
     let wasm_state = match wasm_result {
         crate::contract::UpsertResult::Updated(s) => s,
-        other => panic!("MockWasmRuntime: expected Updated, got {other:?}"),
+        other @ crate::contract::UpsertResult::NoChange
+        | other @ crate::contract::UpsertResult::CurrentWon(_) => {
+            panic!("MockWasmRuntime: expected Updated, got {other:?}")
+        }
     };
 
     // Both runtimes should have stored the updated state

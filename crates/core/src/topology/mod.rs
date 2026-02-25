@@ -760,7 +760,9 @@ mod tests {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0], *worst_peer);
             }
-            _ => panic!("Expected to remove a peer, adjustment was {adjustment:?}"),
+            TopologyAdjustment::AddConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected to remove a peer, adjustment was {adjustment:?}")
+            }
         }
     }
 
@@ -800,7 +802,9 @@ mod tests {
             TopologyAdjustment::AddConnections(locations) => {
                 assert_eq!(locations.len(), 1);
             }
-            _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected to add a connection, adjustment was {adjustment:?}")
+            }
         }
     }
 
@@ -832,7 +836,9 @@ mod tests {
 
         match adjustment {
             TopologyAdjustment::NoChange => {}
-            _ => panic!("Expected no adjustment, adjustment was {adjustment:?}"),
+            TopologyAdjustment::AddConnections(_) | TopologyAdjustment::RemoveConnections(_) => {
+                panic!("Expected no adjustment, adjustment was {adjustment:?}")
+            }
         }
     }
 
@@ -891,7 +897,9 @@ mod tests {
         );
         match adjustment {
             TopologyAdjustment::AddConnections(_) => {}
-            _ => panic!("Expected AddConnections when below min, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections when below min, got {adjustment:?}")
+            }
         }
 
         // With 6 connections and min=5: passes threshold, enters resource eval.
@@ -931,7 +939,9 @@ mod tests {
                     "First bootstrap target should be own location"
                 );
             }
-            _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, but was: {adjustment:?}")
+            }
         }
     }
 
@@ -974,7 +984,9 @@ mod tests {
                         close_count += 1;
                     }
                 }
-                _ => panic!("Expected AddConnections, got {adjustment:?}"),
+                TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                    panic!("Expected AddConnections, got {adjustment:?}")
+                }
             }
         }
         // Kleinberg 1/d should produce mostly close targets
@@ -1141,7 +1153,9 @@ mod tests {
                     "All bootstrap targets must be distinct"
                 );
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, got {adjustment:?}")
+            }
         }
     }
 
@@ -1187,7 +1201,9 @@ mod tests {
                     locations.len()
                 );
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, got {adjustment:?}")
+            }
         }
     }
 
@@ -1222,7 +1238,9 @@ mod tests {
                 assert_eq!(locations.len(), 1);
                 assert_eq!(locations[0], my_location);
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, got {adjustment:?}")
+            }
         }
     }
 
@@ -1267,7 +1285,9 @@ mod tests {
                     "All bootstrap targets must be distinct even when wrapping"
                 );
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, got {adjustment:?}")
+            }
         }
     }
 
@@ -1302,7 +1322,9 @@ mod tests {
                     locations.len()
                 );
             }
-            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                panic!("Expected AddConnections, got {adjustment:?}")
+            }
         }
     }
 

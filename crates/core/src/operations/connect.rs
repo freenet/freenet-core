@@ -2589,7 +2589,9 @@ mod tests {
                     assert!(visited.probably_visited(target_addr));
                 }
             }
-            other => panic!("unexpected message: {other:?}"),
+            other @ ConnectMsg::Response { .. }
+            | other @ ConnectMsg::ObservedAddress { .. }
+            | other @ ConnectMsg::Rejected { .. } => panic!("unexpected message: {other:?}"),
         }
 
         assert!(matches!(
@@ -3220,7 +3222,9 @@ mod tests {
         // Extract the request from the message
         let request = match msg {
             ConnectMsg::Request { payload, .. } => payload,
-            _ => panic!("Expected ConnectMsg::Request"),
+            ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::Rejected { .. } => panic!("Expected ConnectMsg::Request"),
         };
 
         // Restore hash keys to check (simulating what relay does)

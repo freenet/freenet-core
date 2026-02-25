@@ -577,7 +577,7 @@ mod test {
 
         // Drain the dead channel notification by receiving — this will skip the dead one.
         senders[0].send(0).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv()).await;
+        drop(tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv()).await);
 
         // Sending to any client (including the now-dead one) should succeed (not panic/error).
         for cli_id in &client_ids {

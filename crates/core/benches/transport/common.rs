@@ -832,7 +832,9 @@ impl ValueFormatter for VirtualTimeFormatter {
                 "elem/s (simulated)"
             }
             // Handle other throughput types (Bits, BytesDecimal, ElementsAndBytes)
-            _ => {
+            criterion::Throughput::Bits(_)
+            | criterion::Throughput::BytesDecimal(_)
+            | criterion::Throughput::ElementsAndBytes { .. } => {
                 // For other types, just report raw values
                 for v in values.iter_mut() {
                     *v = 1.0 / *v * 1_000_000_000.0;

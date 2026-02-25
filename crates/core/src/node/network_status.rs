@@ -501,7 +501,9 @@ mod tests {
                 assert_eq!(local, "0.1.133");
                 assert_eq!(gateway, "0.1.135");
             }
-            _ => panic!("Expected VersionMismatch"),
+            FailureReason::NatTraversalFailed
+            | FailureReason::Timeout
+            | FailureReason::Other(_) => panic!("Expected VersionMismatch"),
         }
     }
 

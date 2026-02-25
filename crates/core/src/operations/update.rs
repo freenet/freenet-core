@@ -2053,7 +2053,12 @@ mod tests {
                 assert_eq!(*target_peer, target);
                 assert_eq!(contract_location, loc);
             }
-            _ => panic!("Expected ContractOpSuccessUntimed for finalized update with full stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpFailure { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed for finalized update with full stats")
+            }
         }
     }
 
@@ -2104,7 +2109,12 @@ mod tests {
                 assert_eq!(*target_peer, target);
                 assert_eq!(contract_location, loc);
             }
-            _ => panic!("Expected ContractOpFailure for non-finalized update with full stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpSuccessUntimed { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpFailure for non-finalized update with full stats")
+            }
         }
     }
 
@@ -2210,7 +2220,12 @@ mod tests {
                 assert_eq!(*target_peer, target);
                 assert_eq!(contract_location, loc);
             }
-            _ => panic!("Expected ContractOpFailure for in-progress update with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpSuccessUntimed { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpFailure for in-progress update with stats")
+            }
         }
         assert!(op.failure_routing_info().is_some());
 
@@ -2227,7 +2242,12 @@ mod tests {
                 assert_eq!(*target_peer, target);
                 assert_eq!(contract_location, loc);
             }
-            _ => panic!("Expected ContractOpSuccessUntimed for finished update with stats"),
+            OpOutcome::ContractOpSuccess { .. }
+            | OpOutcome::ContractOpFailure { .. }
+            | OpOutcome::Incomplete
+            | OpOutcome::Irrelevant => {
+                panic!("Expected ContractOpSuccessUntimed for finished update with stats")
+            }
         }
     }
 

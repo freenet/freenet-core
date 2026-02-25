@@ -238,7 +238,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
         info!("All operations correctly rejected before join");
 
         info!("Starting gateway...");
-        drop(start_gateway_tx.send(()));
+        start_gateway_tx.send(()).expect("gateway receiver dropped");
 
         info!("Waiting for peer to join network (polling with retry)...");
         let contract2 = load_contract("test-contract-integration", vec![1].into())?;

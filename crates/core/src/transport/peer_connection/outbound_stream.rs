@@ -718,7 +718,11 @@ mod tests {
                     SymmetricMessagePayload::StreamFragment { .. } => {
                         // Expected
                     }
-                    _ => panic!("Expected stream fragment"),
+                    SymmetricMessagePayload::AckConnection { .. }
+                    | SymmetricMessagePayload::ShortMessage { .. }
+                    | SymmetricMessagePayload::NoOp
+                    | SymmetricMessagePayload::Ping { .. }
+                    | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
                 }
             }
             (packet_count, total_bytes)
