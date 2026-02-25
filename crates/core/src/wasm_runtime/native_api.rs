@@ -864,7 +864,15 @@ pub(super) mod delegate_secrets {
 
         match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
             Ok(_) => 1,
-            Err(_) => 0,
+            Err(e) => {
+                tracing::debug!(
+                    delegate = %env.delegate_key,
+                    secret_id = ?secret_id,
+                    error = %e,
+                    "has_secret: secret not found or storage error"
+                );
+                0
+            }
         }
     }
 
@@ -915,7 +923,12 @@ pub(super) mod delegate_secrets {
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
-                tracing::debug!("delegate remove_secret failed: {e}");
+                tracing::debug!(
+                    delegate = %env.delegate_key,
+                    secret_id = ?secret_id,
+                    error = %e,
+                    "remove_secret: secret not found or storage error"
+                );
                 error_codes::ERR_SECRET_NOT_FOUND
             }
         }

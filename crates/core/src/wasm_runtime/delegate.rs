@@ -1683,6 +1683,13 @@ mod test {
         Ok(())
     }
 
+    /// Indirect regression test for #3248 (stale WASM memory base pointer).
+    ///
+    /// Storing a 1 MB secret forces `memory.grow` which can relocate WASM linear
+    /// memory. If the cached `MEM_ADDR.start_ptr` is not refreshed via
+    /// `refresh_mem_addr_from_caller`, the subsequent read uses a stale pointer
+    /// and returns garbage data. Under full parallel test suite runs (~1600 tests)
+    /// the relocation is more likely due to memory pressure.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
         use delegate2_messages::{InboundAppMessage, OutboundAppMessage};

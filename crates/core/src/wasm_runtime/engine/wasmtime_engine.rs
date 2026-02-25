@@ -585,6 +585,11 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
         return;
     }
     let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        tracing::warn!(
+            instance_id,
+            "refresh_mem_addr: no 'memory' export found — \
+             stale pointer will persist until next successful refresh"
+        );
         return;
     };
     let data = memory.data(&*caller);
@@ -603,6 +608,12 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
             info.start_ptr = new_ptr;
             info.mem_size = new_size;
         }
+    } else {
+        tracing::warn!(
+            instance_id,
+            "refresh_mem_addr: no MEM_ADDR entry for instance — \
+             native_api calls will fail"
+        );
     }
 }
 
@@ -937,6 +948,15 @@ impl WasmtimeEngine {
         // Delegate contracts namespace (async host functions for V2 delegates)
         // These are registered as async to support future async operations,
         // but currently complete synchronously (ReDb reads).
+        //
+        // SAFETY of refreshing before the async block: The _impl functions
+        // (e.g. get_contract_state_impl) are synchronous ReDb reads that
+        // complete immediately inside the async block — no .await points
+        // exist that could yield back to the WASM guest and allow further
+        // memory.grow calls. If these ever become truly async with .await
+        // points, the refresh must move inside the async block using a
+        // mechanism that can access the Store (e.g. wasmtime's
+        // `Caller`-based async pattern).
         linker
             .func_wrap_async(
                 "freenet_delegate_contracts",
@@ -1570,5 +1590,108 @@ mod tests {
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// Deterministic regression test for #3248: stale memory base pointer.
+    ///
+    /// Creates a WAT module that calls `memory.grow` to force relocation,
+    /// then calls a host function. Verifies that `MEM_ADDR.start_ptr` is
+    /// updated to reflect the new memory base address.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_memory_grow_refreshes_mem_addr() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        // WAT module that:
+        // 1. Starts with 1 page (64 KiB)
+        // 2. grow_and_log: grows memory by 100 pages, then calls log host function
+        //    (the log call triggers refresh_mem_addr_from_caller)
+        let wat = r#"
+        (module
+          (import "freenet_log" "__frnt__logger__info"
+            (func $log (param i64 i64 i32)))
+          (memory (export "memory") 1)
+          (global $instance_id (mut i64) (i64.const 0))
+          (func (export "__frnt_set_id") (param i64)
+            local.get 0
+            global.set $instance_id)
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            i64.const 0)
+          (func (export "grow_and_log") (param i64 i64 i64) (result i64)
+            ;; Grow memory by 100 pages (6.4 MiB) — may relocate
+            i32.const 100
+            memory.grow
+            drop
+            ;; Call log host function with instance_id, ptr=0, len=0
+            ;; This triggers refresh_mem_addr_from_caller
+            global.get $instance_id
+            i64.const 0
+            i32.const 0
+            call $log
+            i64.const 0))
+        "#;
+
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        let instance_id: i64 = 42_000;
+        let handle = engine
+            .create_instance(&module, instance_id, 1024)
+            .expect("create instance");
+
+        // Manually populate MEM_ADDR — normally RunningInstance::new does this,
+        // but we're testing at the engine level directly.
+        let (init_ptr, init_size) = engine.memory_info(&handle).unwrap();
+        MEM_ADDR.insert(
+            instance_id,
+            InstanceInfo::new(
+                init_ptr as i64,
+                init_size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+
+        // Record the initial memory pointer from MEM_ADDR
+        let _initial_ptr = init_ptr as i64;
+        let initial_size = init_size;
+
+        // Call the function that grows memory then calls a host function
+        let result = engine.call_3i64(&handle, "grow_and_log", 0, 0, 0);
+        assert!(result.is_ok(), "grow_and_log should succeed: {:?}", result);
+
+        // After the host function call, MEM_ADDR should reflect the grown memory
+        let updated_info = MEM_ADDR
+            .get(&instance_id)
+            .expect("MEM_ADDR should still have entry");
+        let updated_size = updated_info.mem_size;
+
+        // Memory must have grown: initial was 1 page (65536), now at least 101 pages
+        assert!(
+            updated_size > initial_size,
+            "MEM_ADDR.mem_size should reflect grown memory: \
+             initial={initial_size}, updated={updated_size}"
+        );
+        assert!(
+            updated_size >= 101 * 65536,
+            "Expected at least 101 pages (6.5 MiB), got {} bytes",
+            updated_size
+        );
+
+        // Verify the engine's live memory agrees with MEM_ADDR
+        let (live_ptr, live_size) = engine
+            .memory_info(&handle)
+            .expect("memory_info should succeed");
+        assert_eq!(
+            updated_info.start_ptr, live_ptr as i64,
+            "MEM_ADDR.start_ptr should match live memory pointer"
+        );
+        assert_eq!(
+            updated_size, live_size,
+            "MEM_ADDR.mem_size should match live memory size"
+        );
+
+        engine.drop_instance(&handle);
+        // engine.drop_instance already removes MEM_ADDR entry
     }
 }
