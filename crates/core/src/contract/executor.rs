@@ -58,8 +58,13 @@ pub(crate) struct DelegateNotification {
     pub new_state: Arc<WrappedState>,
 }
 
-pub(crate) type DelegateNotificationSender = mpsc::UnboundedSender<DelegateNotification>;
-pub(crate) type DelegateNotificationReceiver = mpsc::UnboundedReceiver<DelegateNotification>;
+/// Buffer size for the delegate notification channel. Notifications that exceed
+/// this limit are dropped with a warning — the delegate will see the next state
+/// change instead. This prevents unbounded memory growth under load.
+pub(crate) const DELEGATE_NOTIFICATION_CHANNEL_SIZE: usize = 1000;
+
+pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
+pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 
 pub(crate) use init_tracker::{
     now_nanos, ContractInitTracker, InitCheckResult, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,

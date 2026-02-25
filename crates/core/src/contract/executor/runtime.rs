@@ -167,7 +167,7 @@ impl RuntimePool {
 
         // Create delegate notification channel for subscription delivery
         let (delegate_notification_tx, delegate_notification_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(super::DELEGATE_NOTIFICATION_CHANNEL_SIZE);
 
         // Create shared module caches so all pool executors share one set of compiled WASM modules.
         // Without this, each of the N executors would maintain its own LRU cache, causing
@@ -1525,17 +1525,26 @@ where
         let shared_state = Arc::new(new_state.clone());
 
         for delegate_key in subscribers {
-            if let Err(e) = tx.send(super::DelegateNotification {
-                delegate_key,
+            match tx.try_send(super::DelegateNotification {
+                delegate_key: delegate_key.clone(),
                 contract_id: instance_id,
                 new_state: Arc::clone(&shared_state),
             }) {
-                tracing::warn!(
-                    contract = %key,
-                    error = %e,
-                    "Delegate notification channel closed"
-                );
-                return;
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        contract = %key,
+                        delegate = %delegate_key,
+                        "Delegate notification channel full — notification dropped"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        contract = %key,
+                        "Delegate notification channel closed"
+                    );
+                    return;
+                }
             }
         }
     }

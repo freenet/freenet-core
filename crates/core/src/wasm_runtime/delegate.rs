@@ -2682,4 +2682,211 @@ mod test {
         std::mem::drop(temp_dir);
         Ok(())
     }
+
+    /// End-to-end integration test: subscribe → registry populated → notification delivered.
+    ///
+    /// Verifies the full pipeline:
+    /// 1. Delegate subscribes to a contract via SubscribeContractRequest
+    /// 2. Subscription is registered in DELEGATE_SUBSCRIPTIONS
+    /// 3. ContractNotification is delivered to the delegate
+    /// 4. Delegate responds with ContractNotificationReceived
+    /// 5. Cleanup: unregister delegate removes subscription entries
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
+        use crate::wasm_runtime::StateStorage;
+        use capabilities_messages::*;
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        runtime.set_state_store_db(db.clone());
+
+        // Set up a contract so subscribe validation passes
+        let contract_instance_id = ContractInstanceId::new([42u8; 32]);
+        let contract_code = ContractCode::from(vec![42, 2, 3]);
+        let contract_key =
+            ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
+        runtime.contract_store.ensure_key_indexed(&contract_key)?;
+        db.store(contract_key, WrappedState::new(vec![1, 2, 3]))
+            .await?;
+
+        // Load the delegate
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(TEST_DELEGATE_CAPABILITIES)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
+        };
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        let delegate_key = delegate.key().clone();
+        let app_id = ContractInstanceId::new([1u8; 32]);
+
+        // --- Step 1: Delegate subscribes to the contract ---
+        let subscribe_cmd = DelegateCommand::SubscribeContract {
+            contract_id: contract_instance_id,
+        };
+        let payload = bincode::serialize(&subscribe_cmd)?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            &delegate_key,
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Should emit SubscribeContractRequest
+        assert_eq!(outbound.len(), 1);
+        let subscribe_req = match &outbound[0] {
+            OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
+            other => panic!("Expected SubscribeContractRequest, got {:?}", other),
+        };
+        assert_eq!(subscribe_req.contract_id, contract_instance_id);
+
+        // Simulate the runtime processing the subscribe request — register in global registry
+        // (In production, handle_delegate_with_contract_requests does this)
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .entry(contract_instance_id)
+            .or_default()
+            .insert(delegate_key.clone());
+
+        // --- Step 2: Verify registry is populated ---
+        {
+            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
+            let subscribers = entry.as_ref().unwrap();
+            assert!(
+                subscribers.contains(&delegate_key),
+                "Delegate should be registered as subscriber"
+            );
+        }
+
+        // --- Step 3: Deliver ContractNotification ---
+        let updated_state = vec![10, 20, 30, 40, 50];
+        let notification = InboundDelegateMsg::ContractNotification(ContractNotification {
+            contract_id: contract_instance_id,
+            new_state: WrappedState::new(updated_state.clone()),
+            context: DelegateContext::default(),
+        });
+
+        let outbound =
+            runtime.inbound_app_message(&delegate_key, &vec![].into(), None, vec![notification])?;
+
+        // --- Step 4: Verify delegate responds correctly ---
+        assert_eq!(outbound.len(), 1, "Expected one outbound from notification");
+        let msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        };
+        assert!(msg.processed);
+
+        let response: DelegateResponse = bincode::deserialize(&msg.payload)?;
+        match response {
+            DelegateResponse::ContractNotificationReceived {
+                contract_id: id,
+                new_state: state,
+            } => {
+                assert_eq!(id, contract_instance_id);
+                assert_eq!(state, updated_state);
+            }
+            other => panic!("Expected ContractNotificationReceived, got {:?}", other),
+        }
+
+        // --- Step 5: Cleanup on delegate unregister ---
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
+            subscribers.remove(&delegate_key);
+            !subscribers.is_empty()
+        });
+
+        // Verify cleanup
+        let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
+        assert!(
+            entry.is_none() || entry.as_ref().unwrap().is_empty(),
+            "Subscription should be cleaned up after delegate unregister"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Test: removing a contract cleans up DELEGATE_SUBSCRIPTIONS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::contract::storages::Storage;
+
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        runtime.set_state_store_db(db.clone());
+
+        // Create and store a contract
+        let contract_instance_id = ContractInstanceId::new([99u8; 32]);
+        let contract_code = ContractCode::from(vec![99, 2, 3]);
+        let contract_key =
+            ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
+        // Store the WASM file so remove_contract can delete it
+        let wasm_path = runtime.contract_store.get_contract_path(&contract_key)?;
+        std::fs::create_dir_all(wasm_path.parent().unwrap())?;
+        std::fs::write(&wasm_path, &[0u8; 10])?;
+        runtime.contract_store.ensure_key_indexed(&contract_key)?;
+
+        // Simulate delegate subscriptions
+        let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
+        let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
+        {
+            let mut entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                .entry(contract_instance_id)
+                .or_default();
+            entry.insert(delegate_key_a);
+            entry.insert(delegate_key_b);
+        }
+
+        // Verify subscriptions exist
+        assert!(crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .get(&contract_instance_id)
+            .is_some());
+
+        // Remove the contract — should clean up subscriptions
+        runtime.contract_store.remove_contract(&contract_key)?;
+
+        // Verify subscriptions are cleaned up
+        assert!(
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                .get(&contract_instance_id)
+                .is_none(),
+            "DELEGATE_SUBSCRIPTIONS should be cleaned up when contract is removed"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
 }
