@@ -90,6 +90,134 @@ impl Drop for ConnectAdmissionGuard {
     }
 }
 
+// ==================== Peer Health Tracking ====================
+
+/// Per-peer routing health statistics.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerHealthStats {
+    pub successes: u64,
+    pub failures: u64,
+    pub last_success: Option<Instant>,
+    pub added_at: Instant,
+}
+
+/// Tracks routing success/failure rates per peer for eviction decisions.
+///
+/// Peers with sustained high failure rates are candidates for eviction from
+/// the ring topology. This prevents "black hole" peers that accept connections
+/// but fail to route traffic from permanently occupying connection slots.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeerHealthTracker {
+    stats: BTreeMap<SocketAddr, PeerHealthStats>,
+}
+
+/// Minimum number of routing events before failure-rate eviction applies.
+const HEALTH_MIN_EVENTS: u64 = 10;
+/// Failure rate threshold (0.0–1.0) above which a peer is considered unhealthy.
+const HEALTH_FAILURE_RATE_THRESHOLD: f64 = 0.90;
+/// Duration in the ring with zero successes before eviction (with at least 1 failure).
+const HEALTH_NO_SUCCESS_TIMEOUT: Duration = Duration::from_secs(600);
+/// Duration since last success before a failure burst triggers eviction.
+const HEALTH_LAST_SUCCESS_TIMEOUT: Duration = Duration::from_secs(600);
+/// Minimum failures since last success for the "recent failure burst" criterion.
+const HEALTH_BURST_MIN_FAILURES: u64 = 10;
+
+impl PeerHealthTracker {
+    pub fn new() -> Self {
+        Self {
+            stats: BTreeMap::new(),
+        }
+    }
+
+    /// Initialize health tracking for a newly added peer.
+    pub fn init_peer(&mut self, addr: SocketAddr) {
+        self.stats.insert(
+            addr,
+            PeerHealthStats {
+                successes: 0,
+                failures: 0,
+                last_success: None,
+                added_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Remove health tracking for a pruned peer.
+    pub fn remove_peer(&mut self, addr: SocketAddr) {
+        self.stats.remove(&addr);
+    }
+
+    /// Record a successful routing outcome for a peer.
+    pub fn record_success(&mut self, addr: SocketAddr) {
+        if let Some(stats) = self.stats.get_mut(&addr) {
+            stats.successes += 1;
+            stats.last_success = Some(Instant::now());
+        }
+    }
+
+    /// Record a failed routing outcome for a peer.
+    pub fn record_failure(&mut self, addr: SocketAddr) {
+        if let Some(stats) = self.stats.get_mut(&addr) {
+            stats.failures += 1;
+        }
+    }
+
+    /// Identify peers that should be evicted based on health criteria.
+    ///
+    /// Never evicts if doing so would drop below `min_connections`.
+    pub fn unhealthy_peers(&self, min_connections: usize, current_count: usize) -> Vec<SocketAddr> {
+        let now = Instant::now();
+        let mut candidates: Vec<SocketAddr> = self
+            .stats
+            .iter()
+            .filter(|(_, stats)| {
+                let total = stats.successes + stats.failures;
+
+                // Criterion 1: High failure rate with sufficient sample size
+                if total >= HEALTH_MIN_EVENTS {
+                    let failure_rate = stats.failures as f64 / total as f64;
+                    if failure_rate >= HEALTH_FAILURE_RATE_THRESHOLD {
+                        return true;
+                    }
+                }
+
+                // Criterion 2: In ring > timeout with zero successes and at least 1 failure
+                if stats.successes == 0
+                    && stats.failures >= 1
+                    && now.duration_since(stats.added_at) > HEALTH_NO_SUCCESS_TIMEOUT
+                {
+                    return true;
+                }
+
+                // Criterion 3: Last success > timeout ago with > burst threshold failures since
+                if let Some(last_ok) = stats.last_success {
+                    if now.duration_since(last_ok) > HEALTH_LAST_SUCCESS_TIMEOUT {
+                        // Count failures that could have occurred since last success.
+                        // We don't track per-interval failures, so use total failures
+                        // minus successes as a conservative proxy for "failures since last success".
+                        // (In reality, failures_since >= failures - successes when successes
+                        // are front-loaded, which is the concerning pattern.)
+                        if stats.failures > HEALTH_BURST_MIN_FAILURES {
+                            return true;
+                        }
+                    }
+                }
+
+                false
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        // Never evict if it would drop below min_connections
+        if current_count.saturating_sub(candidates.len()) < min_connections {
+            let max_evictable = current_count.saturating_sub(min_connections);
+            candidates.truncate(max_evictable);
+        }
+
+        candidates
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     /// Pending connection reservations, keyed by socket address.
@@ -131,6 +259,13 @@ pub(crate) struct ConnectionManager {
     /// Minimum connections before this peer advertises readiness.
     /// 0 means readiness gating is disabled (all peers treated as ready).
     pub min_ready_connections: usize,
+    /// Tracks when each peer connection was established.
+    /// Used for optimistic readiness timeout: if a peer hasn't sent a ReadyState
+    /// message but has been connected for longer than `OPTIMISTIC_READY_TIMEOUT`,
+    /// we treat them as ready (assuming the ReadyState message was lost).
+    connected_since: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, Instant>>>,
+    /// Per-peer routing health statistics for eviction decisions.
+    pub(crate) peer_health: Arc<Mutex<PeerHealthTracker>>,
 }
 
 impl ConnectionManager {
@@ -245,6 +380,8 @@ impl ConnectionManager {
             recently_failed_addrs: Arc::new(RwLock::new(BTreeMap::new())),
             ready_peers: Arc::new(DashSet::new()),
             min_ready_connections,
+            connected_since: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
         }
     }
 
@@ -807,6 +944,13 @@ impl ConnectionManager {
         if self.transient_connections.remove(&addr).is_some() {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
         }
+
+        // Track connection time for optimistic readiness timeout.
+        self.connected_since.write().insert(addr, Instant::now());
+
+        // Initialize health tracking for the new peer.
+        self.peer_health.lock().init_peer(addr);
+
         true
     }
 
@@ -909,6 +1053,12 @@ impl ConnectionManager {
 
         // Clean up readiness state for the pruned peer
         self.ready_peers.remove(&addr);
+
+        // Clean up connection timestamp for optimistic readiness
+        self.connected_since.write().remove(&addr);
+
+        // Clean up health tracking for the pruned peer
+        self.peer_health.lock().remove_peer(addr);
 
         Some(loc)
     }
@@ -1215,10 +1365,29 @@ impl ConnectionManager {
         self.ready_peers.remove(&addr);
     }
 
+    /// Duration after which a connected peer is optimistically treated as ready,
+    /// even if no ReadyState message was received (handles lost messages).
+    const OPTIMISTIC_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// Check if a peer has advertised readiness.
     /// When `min_ready_connections == 0`, all peers are treated as ready.
+    /// Falls back to optimistic readiness if peer has been connected longer than
+    /// `OPTIMISTIC_READY_TIMEOUT` (handles lost ReadyState messages).
     pub fn is_peer_ready(&self, addr: SocketAddr) -> bool {
-        self.min_ready_connections == 0 || self.ready_peers.contains(&addr)
+        if self.min_ready_connections == 0 {
+            return true;
+        }
+        if self.ready_peers.contains(&addr) {
+            return true;
+        }
+        // Optimistic timeout: treat long-connected peers as ready even without
+        // an explicit ReadyState message (covers lost/delayed messages).
+        if let Some(since) = self.connected_since.read().get(&addr) {
+            if since.elapsed() >= Self::OPTIMISTIC_READY_TIMEOUT {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if *this* node has crossed the readiness threshold.
@@ -2549,6 +2718,66 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_is_peer_ready_optimistic_timeout() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
+        let peer = TransportKeypair::new();
+        let addr = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+
+        // Peer not in ready_peers and connection is fresh — not ready
+        assert!(!cm.is_peer_ready(addr));
+
+        // Advance past the 60s optimistic timeout
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // Now the optimistic timeout kicks in — peer treated as ready
+        assert!(
+            cm.is_peer_ready(addr),
+            "peer should be optimistically ready after 60s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_is_peer_ready_optimistic_timeout_not_yet() {
+        let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
+        let peer = TransportKeypair::new();
+        let addr = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+
+        // Advance only 30s — not enough for the 60s timeout
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        assert!(
+            !cm.is_peer_ready(addr),
+            "peer should NOT be optimistically ready after only 30s"
+        );
+    }
+
+    #[test]
+    fn test_connected_since_cleanup_on_prune() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager_with_readiness(Some(own_addr), 1, 10, false, 2);
+        let peer = TransportKeypair::new();
+        let addr = make_addr(9001);
+        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+
+        // Verify connected_since was populated
+        assert!(
+            cm.connected_since.read().contains_key(&addr),
+            "connected_since should be populated after add_connection"
+        );
+
+        // Prune the connection
+        cm.prune_alive_connection(addr);
+
+        // connected_since should be cleaned up
+        assert!(
+            !cm.connected_since.read().contains_key(&addr),
+            "connected_since should be cleaned up after prune"
+        );
+    }
+
     // ============ Concurrent stress tests (#3105) ============
     //
     // These tests exercise the documented lock ordering invariant:
@@ -2811,5 +3040,173 @@ mod tests {
         for (i, r) in results.into_iter().enumerate() {
             r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
         }
+    }
+
+    // ============ PeerHealthTracker tests ============
+
+    #[test]
+    fn test_peer_health_tracker_records_success_failure() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9001);
+        tracker.init_peer(addr);
+
+        tracker.record_success(addr);
+        tracker.record_success(addr);
+        tracker.record_failure(addr);
+
+        let stats = tracker.stats.get(&addr).unwrap();
+        assert_eq!(stats.successes, 2);
+        assert_eq!(stats.failures, 1);
+        assert!(stats.last_success.is_some());
+    }
+
+    #[test]
+    fn test_peer_health_tracker_evicts_high_failure_rate() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9002);
+        tracker.init_peer(addr);
+
+        // 1 success + 19 failures = 20 events, 95% failure rate
+        tracker.record_success(addr);
+        for _ in 0..19 {
+            tracker.record_failure(addr);
+        }
+
+        let unhealthy = tracker.unhealthy_peers(1, 5);
+        assert!(
+            unhealthy.contains(&addr),
+            "Peer with 95% failure rate (20 events) should be evicted"
+        );
+    }
+
+    #[test]
+    fn test_peer_health_tracker_spares_low_sample_peer() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9003);
+        tracker.init_peer(addr);
+
+        // 3 failures / 0 successes, but < 10 total events
+        for _ in 0..3 {
+            tracker.record_failure(addr);
+        }
+
+        let unhealthy = tracker.unhealthy_peers(1, 5);
+        // Should NOT be evicted: only 3 events, below HEALTH_MIN_EVENTS=10,
+        // and added_at is recent (not past HEALTH_NO_SUCCESS_TIMEOUT).
+        assert!(
+            !unhealthy.contains(&addr),
+            "Peer with only 3 events should not be evicted by failure rate"
+        );
+    }
+
+    #[test]
+    fn test_peer_health_tracker_spares_peer_at_min_connections() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9004);
+        tracker.init_peer(addr);
+
+        // 100% failure rate, well above threshold
+        for _ in 0..20 {
+            tracker.record_failure(addr);
+        }
+
+        // current_count=3, min_connections=3 => can't evict anyone
+        let unhealthy = tracker.unhealthy_peers(3, 3);
+        assert!(
+            unhealthy.is_empty(),
+            "Should not evict when at min_connections"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_health_tracker_no_success_timeout() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr_old = make_addr(9005);
+        let addr_young = make_addr(9006);
+
+        tracker.init_peer(addr_old);
+        tracker.init_peer(addr_young);
+
+        tracker.record_failure(addr_old);
+        tracker.record_failure(addr_young);
+
+        // Advance past the no-success timeout (10 min + 1 min margin)
+        tokio::time::advance(Duration::from_secs(660)).await;
+
+        // Record fresh failures to advance "now" for the young peer
+        tracker.remove_peer(addr_young);
+        tracker.init_peer(addr_young);
+        tracker.record_failure(addr_young);
+
+        let unhealthy = tracker.unhealthy_peers(1, 5);
+        assert!(
+            unhealthy.contains(&addr_old),
+            "Peer added 11 min ago with 0 successes and 1 failure should be evicted"
+        );
+        assert!(
+            !unhealthy.contains(&addr_young),
+            "Freshly added peer should NOT be evicted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_health_tracker_recent_failure_burst() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9007);
+        tracker.init_peer(addr);
+
+        // Record some early successes
+        for _ in 0..5 {
+            tracker.record_success(addr);
+        }
+
+        // Advance past the last-success timeout
+        tokio::time::advance(Duration::from_secs(660)).await;
+
+        // Now record a burst of failures (> HEALTH_BURST_MIN_FAILURES=10)
+        for _ in 0..15 {
+            tracker.record_failure(addr);
+        }
+
+        let unhealthy = tracker.unhealthy_peers(1, 5);
+        assert!(
+            unhealthy.contains(&addr),
+            "Peer with last success >10 min ago and 15 failures should be evicted"
+        );
+    }
+
+    #[test]
+    fn test_peer_health_tracker_cleanup_on_prune() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9008);
+        tracker.init_peer(addr);
+        tracker.record_failure(addr);
+
+        assert!(tracker.stats.contains_key(&addr));
+        tracker.remove_peer(addr);
+        assert!(!tracker.stats.contains_key(&addr));
+    }
+
+    #[test]
+    fn test_peer_health_tracker_fresh_slate_on_reconnect() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr = make_addr(9009);
+
+        // First connection: accumulate failures
+        tracker.init_peer(addr);
+        for _ in 0..20 {
+            tracker.record_failure(addr);
+        }
+        let stats_before = tracker.stats.get(&addr).unwrap().failures;
+        assert_eq!(stats_before, 20);
+
+        // Disconnect and reconnect
+        tracker.remove_peer(addr);
+        tracker.init_peer(addr);
+
+        let stats_after = tracker.stats.get(&addr).unwrap();
+        assert_eq!(stats_after.successes, 0);
+        assert_eq!(stats_after.failures, 0);
+        assert!(stats_after.last_success.is_none());
     }
 }

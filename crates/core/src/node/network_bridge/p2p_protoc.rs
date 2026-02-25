@@ -347,6 +347,24 @@ struct ConnectionEntry {
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
     connection_id: u64,
+    /// When this transport connection was established.
+    /// Used for zombie detection: connections not promoted to the ring
+    /// within a timeout are considered zombies and dropped.
+    created_at: Instant,
+}
+
+/// Check whether a transport connection is a zombie: old enough but not
+/// promoted to ring, not transient, and not pending reservation.
+///
+/// Extracted as a standalone function for testability.
+fn is_zombie(
+    created_at_elapsed: Duration,
+    in_ring: bool,
+    is_transient: bool,
+    has_pending: bool,
+) -> bool {
+    const ZOMBIE_THRESHOLD: Duration = Duration::from_secs(300);
+    created_at_elapsed > ZOMBIE_THRESHOLD && !in_ring && !is_transient && !has_pending
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -735,6 +753,15 @@ impl P2pConnManager {
                     );
                 }
 
+                // Periodic ReadyState re-broadcast: if we are ready and have readiness
+                // gating enabled, re-broadcast our ReadyState to all peers every 30s.
+                // This ensures lost ReadyState messages are recovered within one tick.
+                if op_manager.ring.connection_manager.min_ready_connections > 0
+                    && op_manager.ring.connection_manager.is_self_ready()
+                {
+                    ctx.handle_broadcast_ready_state(true).await;
+                }
+
                 #[cfg(all(unix, feature = "jemalloc-prof"))]
                 {
                     use tikv_jemalloc_ctl::{epoch, stats};
@@ -751,6 +778,37 @@ impl P2pConnManager {
                 loop_iteration_count = 0;
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
+
+                // Zombie transport cleanup: remove connections older than 5 min
+                // that haven't been promoted to ring, aren't transient, and
+                // have no pending reservation.
+                let zombie_addrs: Vec<SocketAddr> = ctx
+                    .connections
+                    .iter()
+                    .filter_map(|(addr, entry)| {
+                        if is_zombie(
+                            entry.created_at.elapsed(),
+                            op_manager.ring.connection_manager.is_in_ring(*addr),
+                            op_manager.ring.connection_manager.is_transient(*addr),
+                            op_manager
+                                .ring
+                                .connection_manager
+                                .has_connection_or_pending(*addr),
+                        ) {
+                            Some(*addr)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for addr in &zombie_addrs {
+                    tracing::info!(
+                        peer = %addr,
+                        "Dropping zombie transport (not promoted to ring after 5 min)"
+                    );
+                    ctx.drop_connection_by_addr(*addr, &handshake_cmd_sender)
+                        .await;
+                }
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -2966,6 +3024,7 @@ impl P2pConnManager {
                 // when the peer sends its first message (e.g., ConnectRequest)
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
+                created_at: Instant::now(),
             },
         );
         // Only add to reverse lookup if we know the pub_key
@@ -4594,7 +4653,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{sleep, timeout, Duration, Instant};
 
     /// Regression test for message loss during shutdown.
     ///
@@ -4721,7 +4780,7 @@ mod tests {
             }
 
             // Signal that we're about to enter select! and then immediately timeout
-            drop(ready_tx.send(()));
+            assert!(ready_tx.send(()).is_ok(), "ready_tx receiver dropped");
 
             // Immediate timeout to simulate error - messages sent after this starts are lost
             tokio::select! {
@@ -4790,6 +4849,7 @@ mod tests {
                 sender: tx1,
                 pub_key: None,
                 connection_id: 10,
+                created_at: Instant::now(),
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -4799,6 +4859,7 @@ mod tests {
                 sender: tx2,
                 pub_key: None,
                 connection_id: 20,
+                created_at: Instant::now(),
             },
         );
 
@@ -4811,5 +4872,47 @@ mod tests {
         assert_eq!(current.connection_id, 20, "current event must match");
         connections.remove(&addr);
         assert!(!connections.contains_key(&addr));
+    }
+
+    // ============ Zombie detection tests ============
+
+    #[test]
+    fn test_zombie_detection_ignores_young_connections() {
+        // Connection younger than 5 min should never be a zombie
+        let elapsed = Duration::from_secs(200); // < 300s
+        assert!(
+            !super::is_zombie(elapsed, false, false, false),
+            "Young connection should not be zombie"
+        );
+    }
+
+    #[test]
+    fn test_zombie_detection_ignores_ring_connections() {
+        // In-ring connection should never be a zombie regardless of age
+        let elapsed = Duration::from_secs(600);
+        assert!(
+            !super::is_zombie(elapsed, true, false, false),
+            "Ring connection should not be zombie"
+        );
+    }
+
+    #[test]
+    fn test_zombie_detection_ignores_transient_connections() {
+        // Transient connection should never be a zombie regardless of age
+        let elapsed = Duration::from_secs(600);
+        assert!(
+            !super::is_zombie(elapsed, false, true, false),
+            "Transient connection should not be zombie"
+        );
+    }
+
+    #[test]
+    fn test_zombie_detection_catches_old_unpromoted() {
+        // Old connection that isn't in ring, not transient, no pending → zombie
+        let elapsed = Duration::from_secs(600);
+        assert!(
+            super::is_zombie(elapsed, false, false, false),
+            "Old unpromoted connection should be zombie"
+        );
     }
 }
