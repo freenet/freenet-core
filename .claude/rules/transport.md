@@ -145,6 +145,45 @@ Token reservation:
   → RTT-adaptive update interval
 ```
 
+## Backoff, Jitter, and Recovery Rules
+
+### WHEN implementing retry/backoff
+
+```
+All retry/backoff loops MUST apply random jitter:
+  → At least ±20% of the interval
+  → WHY: Prevents thundering herd after gateway restart (all peers reconnect simultaneously)
+
+Backoff sleeps MUST be interruptible:
+  → Use tokio::select! to race sleep against cancellation signal (Notify, CancellationToken)
+  → Plain tokio::time::sleep() in retry loop is PROHIBITED unless <1s
+  → WHY: Uninterruptible sleeps prevent recovery when conditions change (e.g., isolation cleared)
+```
+
+### WHEN node has zero connections
+
+```
+MUST have an explicit gateway re-bootstrap path:
+  → Cannot depend on routing through existing connections (there are none)
+  → Direct gateway contact must be a fallback
+
+WHY: Normal recovery mechanisms (acquire_new) route through existing connections.
+With zero connections, the node gets stuck permanently.
+```
+
+### WHEN sending critical control messages (ReadyState, etc.)
+
+```
+Single fire-and-forget UDP sends for state that affects routing decisions are PROHIBITED.
+
+MUST:
+  → Implement retry with backoff for critical control messages
+  → Consider optimistic timeout (e.g., treat peer as ready after N seconds even without ACK)
+
+WHY: In lossy environments, a single lost packet can permanently prevent a peer
+from being seen as ready. ReadyState bug required re-broadcast every 30s + 60s fallback.
+```
+
 ## Socket Abstraction Rules
 
 ### WHEN writing socket code

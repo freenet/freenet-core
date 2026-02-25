@@ -49,6 +49,51 @@ WHEN routing fails (no peers):
   → Do NOT panic or unwrap
 ```
 
+## State Consistency Invariants
+
+### Cross-Validation of Related Data Structures
+
+```
+connections_by_location and the transport connection set MUST be
+periodically cross-validated. They can drift apart when failure
+paths skip cleanup.
+
+WHEN removing a connection (any failure path):
+  → MUST clean up location_for_peer
+  → MUST clean up connections_by_location
+  → MUST clean up any pending operation state
+  → Missing any of these creates orphaned entries that block future operations
+
+WHEN exchanging peer lists in sync protocols (e.g., interest sync):
+  → MUST filter out peers not currently in the live connection set
+  → Stale peer entries cause operations to be sent to dead nodes
+```
+
+### Cleanup Exemptions Must Be Time-Bounded
+
+```
+Any condition that exempts an entry from garbage collection
+(is_transient, has_pending, etc.) MUST:
+  1. Expire via TTL, OR
+  2. Be overridden by an absolute age threshold
+
+Unbounded exemptions create permanent GC blind spots.
+
+WRONG:
+  retain(|entry| !entry.is_zombie() || entry.is_transient)  // Transient = forever
+
+CORRECT:
+  retain(|entry| {
+      let dominated_by_age = entry.age() > ABSOLUTE_ZOMBIE_THRESHOLD;
+      (!entry.is_zombie() || entry.is_transient) && !dominated_by_age
+  })
+```
+
+**Audit targets:**
+- All `prune_connection` / `drop_connection` call sites — verify all related maps are cleaned up
+- All `retain()` / sweep loops — verify exemption conditions have TTL or absolute age bounds
+- `ConnectionManager` fields — verify each map has a documented cleanup owner
+
 ## Trigger-Action Rules
 
 ### BEFORE modifying ConnectionManager

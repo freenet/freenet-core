@@ -37,6 +37,25 @@ DO NOT delete or comment out the test.
 → Create GitHub issue
 ```
 
+### WHEN writing cleanup/GC logic
+
+```
+Cleanup exemptions MUST be time-bounded.
+
+Any condition that exempts an entry from garbage collection
+(is_transient, has_pending, etc.) MUST either:
+  1. Expire via TTL, OR
+  2. Be overridden by an absolute age threshold
+
+WHY: Unbounded exemptions create permanent GC blind spots.
+This is a recurring meta-pattern where a fix introduces cleanup with
+exemptions, then a follow-up discovers the exemptions themselves are
+buggy (permanently refreshable, missing TTL enforcement).
+Exemptions in GC deserve the same scrutiny as the original bug.
+
+See: docs/weekly-fix-review-2025-02.md (befb0bd → 0b88945 cycle)
+```
+
 ### WHEN you discover outdated or missing documentation
 
 ```
@@ -123,6 +142,7 @@ docs/architecture/  # Design docs
 | Code style | `.claude/rules/code-style.md` |
 | Git workflow | `.claude/rules/git-workflow.md` |
 | DST testing | `.claude/rules/testing.md` |
+| Deployment | `.claude/rules/deployment.md` |
 
 ## External Resources
 

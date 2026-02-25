@@ -1,0 +1,232 @@
+name: Claude PR Rule Review
+
+# Advisory review: checks every PR against .claude/rules/ and posts findings
+# as a sticky comment. Non-blocking — does not gate merge.
+#
+# Complements (does not replace):
+# - ci.yml: cargo fmt, clippy, tests, conventional commits
+# - claude.yml: interactive @claude mentions
+# - claude-ci-analysis (in ci.yml): failure debugging
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/FUNDING.yml'
+
+concurrency:
+  group: claude-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rule-review:
+    name: Claude Rule Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip draft PRs, release branches, and dependabot
+    if: |
+      !github.event.pull_request.draft &&
+      !startsWith(github.head_ref, 'release/v') &&
+      !startsWith(github.head_ref, 'dependabot/')
+
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine applicable rules
+        id: rules
+        run: |
+          # Get changed files relative to the PR base
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD 2>/dev/null || echo "")
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No changed files detected"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          # Always include git-workflow rules
+          RULES="git-workflow.md"
+          HAS_RUST=false
+          HAS_CORE=false
+          HAS_OPERATIONS=false
+          HAS_TRANSPORT=false
+          HAS_CONTRACTS=false
+          HAS_RING=false
+
+          while IFS= read -r file; do
+            # Check for Rust files
+            if echo "$file" | grep -qE '\.rs$'; then
+              HAS_RUST=true
+            fi
+
+            # Check for crates/core/ changes
+            if echo "$file" | grep -q '^crates/core/'; then
+              HAS_CORE=true
+            fi
+
+            # Check for operations module
+            if echo "$file" | grep -q '^crates/core/src/operations/'; then
+              HAS_OPERATIONS=true
+            fi
+
+            # Check for transport module
+            if echo "$file" | grep -q '^crates/core/src/transport/'; then
+              HAS_TRANSPORT=true
+            fi
+
+            # Check for contract/wasm_runtime module
+            if echo "$file" | grep -qE '^crates/core/src/(contract|wasm_runtime)/'; then
+              HAS_CONTRACTS=true
+            fi
+
+            # Check for ring module
+            if echo "$file" | grep -q '^crates/core/src/ring/'; then
+              HAS_RING=true
+            fi
+          done <<< "$CHANGED_FILES"
+
+          # Build rule list
+          if [ "$HAS_RUST" = true ]; then
+            RULES="$RULES code-style.md"
+          fi
+          if [ "$HAS_CORE" = true ]; then
+            RULES="$RULES testing.md"
+          fi
+          if [ "$HAS_OPERATIONS" = true ]; then
+            RULES="$RULES operations.md"
+          fi
+          if [ "$HAS_TRANSPORT" = true ]; then
+            RULES="$RULES transport.md"
+          fi
+          if [ "$HAS_CONTRACTS" = true ]; then
+            RULES="$RULES contracts.md"
+          fi
+          if [ "$HAS_RING" = true ]; then
+            RULES="$RULES ring.md"
+          fi
+
+          echo "Applicable rules: $RULES"
+          echo "rule_names=$RULES" >> "$GITHUB_OUTPUT"
+
+          # Concatenate relevant rule files into a single file for the prompt
+          {
+            for rule in $RULES; do
+              RULE_PATH=".claude/rules/$rule"
+              if [ -f "$RULE_PATH" ]; then
+                echo "=========================================="
+                echo "RULE FILE: $rule"
+                echo "=========================================="
+                cat "$RULE_PATH"
+                echo ""
+                echo ""
+              fi
+            done
+          } > /tmp/relevant_rules.txt
+
+          echo "--- Relevant rules summary ---"
+          echo "Rules: $RULES"
+          echo "Has Rust: $HAS_RUST"
+          echo "Has Core: $HAS_CORE"
+          wc -l /tmp/relevant_rules.txt
+
+      - name: Claude rule review
+        if: steps.rules.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_sticky_comment: true
+          claude_args: '--model sonnet --max-turns 15 --effort high'
+          prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
+
+            ## Your Task
+
+            Review the diff of this PR against the project's coding rules listed below.
+            Only check rules that are relevant to the actual changes — do not report on
+            files or patterns that were not modified in this PR.
+
+            Focus on the DIFF only. Do not review unchanged code.
+
+            ## Applicable Rules
+
+            The following rules apply to this PR based on the changed file paths:
+            **${{ steps.rules.outputs.rule_names }}**
+
+            Read each applicable rule file from `.claude/rules/` to understand the full requirements.
+
+            ## Review Instructions
+
+            1. Read the relevant rule files from `.claude/rules/`
+            2. Run `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD` to see the full diff
+            3. Check each changed file against the applicable rules
+            4. Report findings grouped by severity
+
+            ## Severity Levels
+
+            **CRITICAL** — Violations that will cause bugs or break deterministic simulation:
+            - `std::time::Instant::now()` or `tokio::time::sleep()` in crates/core/ (must use TimeSource)
+            - `rand::random()` or `rand::thread_rng()` in crates/core/ (must use GlobalRng)
+            - `tokio::net::UdpSocket` in crates/core/ (must use Socket trait)
+            - Network send before `op_manager.push()` (push-before-send violation)
+            - Deleted or commented-out tests (must use #[ignore] + TODO-MUST-FIX)
+
+            **WARNING** — Issues that should be addressed but aren't showstoppers:
+            - `.unwrap()` in new production code (not tests)
+            - Fire-and-forget spawns without BackgroundTaskMonitor
+            - Retry loops without jitter
+            - Missing PR description sections
+            - Cleanup exemptions without TTL or age threshold
+            - Unguarded `biased;` in tokio::select!
+
+            **INFO** — Style suggestions and minor improvements:
+            - Missing doc comments on new public APIs
+            - Catch-all `_ =>` in exhaustive matches
+
+            ## Output Format
+
+            Post your findings as a structured comment. If there are NO findings, say so briefly.
+
+            Use this format:
+
+            ### 🔍 Rule Review: [summary]
+
+            **Rules checked:** [list of rule files checked]
+            **Files reviewed:** [count]
+
+            #### Critical
+            - [ ] `file:line` — description (rule: X)
+
+            #### Warnings
+            - [ ] `file:line` — description (rule: X)
+
+            #### Info
+            - [ ] `file:line` — description (rule: X)
+
+            ---
+            *Automated review against `.claude/rules/`. Advisory only — does not block merge.*
+
+            If there are no findings at any severity level, output:
+
+            ### ✅ Rule Review: No issues found
+
+            **Rules checked:** [list]
+            **Files reviewed:** [count]
+
+            No rule violations detected in this PR.
+
+            ---
+            *Automated review against `.claude/rules/`. Advisory only — does not block merge.*
