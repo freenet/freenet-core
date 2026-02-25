@@ -228,12 +228,12 @@ jobs:
             No rule violations detected in this PR.
 
       - name: Post review comment
-        if: steps.rules.outputs.skip != 'true' && steps.review.outputs.execution_file
+        if: steps.rules.outputs.skip != 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const execFile = '${{ steps.review.outputs.execution_file }}';
+            const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
 
             // Read Claude's output
             let report = '';
