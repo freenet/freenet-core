@@ -38,7 +38,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read
@@ -62,4 +63,3 @@ jobs:
           #   - Push commits (git push, git push --force-with-lease)
           #   - Update PRs (gh pr edit, gh pr review, gh pr merge)
           #   - Comment on issues and PRs (gh issue comment, gh pr comment)
-
