@@ -1343,19 +1343,16 @@ async fn handle_interest_sync_message(
             );
 
             // Update peer summaries and detect stale peers (#3221).
+            // Also register unregistered peers from Summaries (NO_TARGETS fix).
             //
             // Compare each peer summary with our own before storing it. If they
             // differ, the peer missed an earlier broadcast. Emitting
             // BroadcastStateChange triggers the existing broadcast path which
             // computes deltas and sends state only to peers with stale summaries.
             //
-            // Both sides may detect the same mismatch (A sees B is stale, B sees
-            // A is stale). This is safe: the contract's merge semantics (CRDTs
-            // etc.) ensure the newer/correct state wins regardless of push order.
-            //
-            // When either summary is None, we skip the comparison. A peer with
-            // no summary has no state yet and should receive it via the normal
-            // subscription/GET flow, not via broadcast.
+            // If a peer responds with Summaries but isn't registered as interested,
+            // register them — they have the contract and are tracking its state.
+            // Without registration, they won't appear in get_broadcast_targets_update().
             let peer_key = get_peer_key_from_addr(op_manager, source);
             let mut stale_contracts = Vec::new();
 
@@ -1367,21 +1364,42 @@ async fn handle_interest_sync_message(
                         }
 
                         let their_summary = entry.to_summary();
-                        let our_summary = get_contract_summary(op_manager, &contract).await;
 
-                        let is_stale = our_summary
-                            .as_ref()
-                            .zip(their_summary.as_ref())
-                            .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
+                        if op_manager
+                            .interest_manager
+                            .get_peer_interest(&contract, &pk)
+                            .is_some()
+                        {
+                            // Peer already registered — update summary and check staleness
+                            let our_summary = get_contract_summary(op_manager, &contract).await;
 
-                        op_manager.interest_manager.update_peer_summary(
-                            &contract,
-                            &pk,
-                            their_summary,
-                        );
+                            let is_stale = our_summary
+                                .as_ref()
+                                .zip(their_summary.as_ref())
+                                .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
 
-                        if is_stale && !stale_contracts.contains(&contract) {
-                            stale_contracts.push(contract);
+                            op_manager.interest_manager.update_peer_summary(
+                                &contract,
+                                &pk,
+                                their_summary,
+                            );
+
+                            if is_stale && !stale_contracts.contains(&contract) {
+                                stale_contracts.push(contract);
+                            }
+                        } else {
+                            // Peer not yet registered — register with summary for delta sync
+                            op_manager.interest_manager.register_peer_interest(
+                                &contract,
+                                pk.clone(),
+                                their_summary,
+                                false,
+                            );
+                            tracing::debug!(
+                                from = %source,
+                                contract = %format!("{:.8}", contract),
+                                "Registered new peer interest from Summaries response"
+                            );
                         }
                     }
                 }

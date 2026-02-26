@@ -3885,10 +3885,12 @@ impl P2pConnManager {
     }
 
     /// Maximum retry attempts when a broadcast finds no targets.
-    const MAX_BROADCAST_RETRIES: u8 = 3;
+    const MAX_BROADCAST_RETRIES: u8 = 5;
 
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
-    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+    /// Total window: 2+4+6+8+10 = 30s, giving ChangeInterests/Summaries round-trips
+    /// ample time to complete and register peer interests.
+    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
     /// Notify interested network peers about a state change.
     ///
