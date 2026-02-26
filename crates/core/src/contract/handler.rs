@@ -335,6 +335,19 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         ev: ContractHandlerEvent,
     ) -> Result<ContractHandlerEvent, ContractError> {
+        self.send_to_handler_with_timeout(ev, Self::CH_EV_RESPONSE_TIME_OUT)
+            .await
+    }
+
+    /// Send an event to the contract handler with a custom timeout.
+    ///
+    /// Use shorter timeouts for calls from the event loop path (e.g., broadcast
+    /// state change) to avoid blocking the event loop for extended periods.
+    pub async fn send_to_handler_with_timeout(
+        &self,
+        ev: ContractHandlerEvent,
+        timeout: Duration,
+    ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.with(|c| {
             let v = c.get();
             c.set(v + 1);
@@ -345,7 +358,7 @@ impl ContractHandlerChannel<SenderHalve> {
             .event_sender
             .send(InternalCHEvent { ev, id, result })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        match tokio::time::timeout(Self::CH_EV_RESPONSE_TIME_OUT, result_receiver).await {
+        match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
             Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
         }

@@ -739,6 +739,20 @@ impl OpManager {
         self.ch_outbound.send_to_handler(msg).await
     }
 
+    /// Send an event to the contract handler with a custom timeout.
+    ///
+    /// Use shorter timeouts for broadcast-path callers (e.g., delta
+    /// computation) to prevent tasks from accumulating when the handler is slow.
+    pub async fn notify_contract_handler_with_timeout(
+        &self,
+        msg: ContractHandlerEvent,
+        timeout: std::time::Duration,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        self.ch_outbound
+            .send_to_handler_with_timeout(msg, timeout)
+            .await
+    }
+
     pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         // Check if operation is already completed - don't push back to HashMap
         if self.ops.completed.contains(&id) {
