@@ -3871,6 +3871,48 @@ impl P2pConnManager {
         // Targets found - clear any pending retry state for this contract
         self.broadcast_retries.remove(&key);
 
+        // In production, spawn the heavy broadcast work off the event loop.
+        // Contract handler calls (summary + delta) and per-peer sends can
+        // take seconds under load; running inline blocks the event loop and
+        // causes peer channel backpressure deadlocks.
+        //
+        // In simulation tests, call inline to preserve deterministic message
+        // ordering — tokio::spawn in start_paused(true) changes broadcast
+        // delivery order and breaks convergence.
+        #[cfg(not(feature = "simulation_tests"))]
+        {
+            let bridge = self.bridge.clone();
+            let op_manager = op_manager.clone();
+            tokio::spawn(async move {
+                Self::broadcast_state_to_peers(bridge, &op_manager, key, new_state, target_result)
+                    .await;
+            });
+        }
+        #[cfg(feature = "simulation_tests")]
+        {
+            Self::broadcast_state_to_peers(
+                self.bridge.clone(),
+                op_manager,
+                key,
+                new_state,
+                target_result,
+            )
+            .await;
+        }
+    }
+
+    /// Send state change broadcasts to interested peers.
+    ///
+    /// Extracted as a static method so it can be spawned off the event loop
+    /// when needed. In production, spawning prevents the event loop from
+    /// blocking during slow contract handler calls and per-peer sends.
+    async fn broadcast_state_to_peers(
+        bridge: P2pBridge,
+        op_manager: &Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        target_result: crate::operations::update::BroadcastTargetResult,
+    ) {
         // Get our summary once for all targets
         let our_summary = op_manager
             .interest_manager
@@ -4023,11 +4065,10 @@ impl P2pConnManager {
                         None
                     }
                 };
-                let send_res = self.bridge.send(peer_addr, net_msg).await;
+                let send_res = bridge.send(peer_addr, net_msg).await;
                 if send_res.is_ok() {
                     // Send the stream data after the metadata message
-                    if let Err(err) = self
-                        .bridge
+                    if let Err(err) = bridge
                         .send_stream(peer_addr, sid, bytes::Bytes::from(payload_bytes), metadata)
                         .await
                     {
@@ -4051,7 +4092,7 @@ impl P2pConnManager {
                         .map(|s| s.as_ref().to_vec())
                         .unwrap_or_default(),
                 };
-                self.bridge.send(peer_addr, msg.into()).await
+                bridge.send(peer_addr, msg.into()).await
             };
 
             if let Err(err) = send_result {
@@ -4111,10 +4152,7 @@ impl P2pConnManager {
             send_success,
             send_failed,
         ) {
-            self.bridge
-                .log_register
-                .register_events(Either::Left(log))
-                .await;
+            bridge.log_register.register_events(Either::Left(log)).await;
         }
     }
 }
