@@ -120,18 +120,20 @@ fn homepage_html() -> String {
 /// - Red: connection failures
 /// - Blue: connected
 fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    // Color is pre-encoded for data URI (# → %23) to avoid scanning the entire SVG.
     let color = match snap {
-        None => "#9e9e9e",                              // grey — starting up
-        Some(s) if s.open_connections > 0 => "#2196F3", // blue — connected
-        Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "#8b0000", // dark red — NAT problems
-        Some(s) if !s.failures.is_empty() => "#f44336", // red — connection issues
-        Some(_) => "#ff9800",                           // amber — connecting
+        None => "%239e9e9e",                              // grey — starting up
+        Some(s) if s.open_connections > 0 => "%232196F3", // blue — connected
+        Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "%238b0000", // dark red — NAT problems
+        Some(s) if !s.failures.is_empty() => "%23f44336", // red — connection issues
+        Some(_) => "%23ff9800",                           // amber — connecting
     };
 
-    // Minimal rabbit silhouette derived from freenet_logo.svg, scaled to a 32×32 favicon.
-    // Uses a solid fill instead of the gradient so the status color is immediately visible.
-    let svg = format!(
+    // Minimal rabbit silhouette derived from freenet_logo.svg.
+    // Solid fill (no gradient) so the status color is immediately visible at favicon size.
+    format!(
         concat!(
+            "data:image/svg+xml,",
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 471'>",
             "<path d='",
             "M358.864 40.470C358.605 40.728 354.143 42.467 348.947 44.334",
@@ -198,10 +200,7 @@ fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) 
             "</svg>",
         ),
         color = color,
-    );
-
-    // Encode as a data URI. The SVG is already URL-safe with single quotes.
-    format!("data:image/svg+xml,{}", svg.replace('#', "%23"))
+    )
 }
 
 fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
