@@ -27,6 +27,7 @@ fn homepage_html() -> String {
     };
 
     let is_connected = snap.as_ref().is_some_and(|s| s.open_connections > 0);
+    let favicon = build_favicon_data_uri(&snap);
 
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
@@ -41,7 +42,7 @@ fn homepage_html() -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="5">
     <title>Freenet</title>
-    <link rel="icon" href="https://freenet.org/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
     <script>{JS}</script>
 </head>
@@ -71,7 +72,7 @@ fn homepage_html() -> String {
             <ul class="app-list">
                 <li>
                     <a href="/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/">River Chat</a>
-                    <p class="note">You'll need an <a href="https://freenet.org/quickstart/">invite</a> to join the "Freenet Official" room.</p>
+                    <p class="note">You'll need an <a href="https://freenet.org/quickstart/" target="_blank" rel="noopener noreferrer">invite</a> to join the "Freenet Official" room.</p>
                 </li>
             </ul>
         </div>
@@ -79,15 +80,15 @@ fn homepage_html() -> String {
         <div class="card card-muted">
             <h2>Links</h2>
             <ul class="link-list">
-                <li><a href="https://freenet.org">freenet.org</a></li>
-                <li><a href="https://matrix.to/#/#freenet-locutus:matrix.org">Freenet Matrix channel</a></li>
-                <li><a href="https://github.com/freenet/freenet-core">GitHub</a></li>
+                <li><a href="https://freenet.org" target="_blank" rel="noopener noreferrer">freenet.org</a></li>
+                <li><a href="https://matrix.to/#/#freenet-locutus:matrix.org" target="_blank" rel="noopener noreferrer">Freenet Matrix channel</a></li>
+                <li><a href="https://github.com/freenet/freenet-core" target="_blank" rel="noopener noreferrer">GitHub</a></li>
             </ul>
         </div>
 
         <div class="card card-muted">
             <h2>Troubleshooting</h2>
-            <p>If you're having problems, run <code>freenet service report</code> in your terminal and share the code on our <a href="https://matrix.to/#/#freenet-locutus:matrix.org">Matrix channel</a>.</p>
+            <p>If you're having problems, run <code>freenet service report</code> in your terminal and share the code on our <a href="https://matrix.to/#/#freenet-locutus:matrix.org" target="_blank" rel="noopener noreferrer">Matrix channel</a>.</p>
             {port_note}
         </div>
     </main>
@@ -95,6 +96,7 @@ fn homepage_html() -> String {
 </html>"##,
         CSS = CSS,
         JS = JS,
+        favicon = favicon,
         version = html_escape(version),
         uptime = uptime,
         status_card = status_card,
@@ -107,6 +109,99 @@ fn homepage_html() -> String {
             String::new()
         },
     )
+}
+
+/// Build a `data:` URI for an SVG favicon colored by connection status.
+///
+/// Colors follow issue #3287:
+/// - Grey: starting up (no snapshot yet)
+/// - Amber: attempting to connect
+/// - Dark red: NAT traversal failing
+/// - Red: connection failures
+/// - Blue: connected
+fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let color = match snap {
+        None => "#9e9e9e",                              // grey — starting up
+        Some(s) if s.open_connections > 0 => "#2196F3", // blue — connected
+        Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "#8b0000", // dark red — NAT problems
+        Some(s) if !s.failures.is_empty() => "#f44336", // red — connection issues
+        Some(_) => "#ff9800",                           // amber — connecting
+    };
+
+    // Minimal rabbit silhouette derived from freenet_logo.svg, scaled to a 32×32 favicon.
+    // Uses a solid fill instead of the gradient so the status color is immediately visible.
+    let svg = format!(
+        concat!(
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 471'>",
+            "<path d='",
+            "M358.864 40.470C358.605 40.728 354.143 42.467 348.947 44.334",
+            "C284.621 67.446 232.573 113.729 201.443 175.500",
+            "C193.895 190.478 184.375 213.708 185.375 214.708",
+            "C185.621 214.954 187.715 211.857 190.030 207.827",
+            "C211.190 170.984 229.863 146.093 255.968 119.933",
+            "C274.854 101.008 282.998 94.207 302.034 81.466",
+            "C334.671 59.621 367.531 47.376 401.250 44.492",
+            "L409.000 43.829 408.984 47.165",
+            "C408.958 52.704 405.255 68.515 401.010 81.213",
+            "C382.392 136.898 338.799 184.709 277.000 217.224",
+            "C271.225 220.263 263.913 223.788 260.750 225.058",
+            "C254.629 227.517 254.126 228.307 256.511 231.712",
+            "C258.282 234.241 258.484 234.089 249.500 237.002",
+            "C226.868 244.341 200.420 256.771 183.918 267.825",
+            "C173.918 274.522 156.961 289.225 158.000 290.296",
+            "C158.275 290.579 163.450 287.694 169.500 283.883",
+            "C175.550 280.073 186.125 274.083 193.000 270.573",
+            "C264.905 233.856 345.414 226.155 422.387 248.633",
+            "C434.634 252.210 468.194 264.823 465.830 264.961",
+            "C465.461 264.982 459.741 263.440 453.118 261.534",
+            "C422.666 252.769 376.068 246.967 347.500 248.384",
+            "C320.590 249.719 284.052 255.527 283.798 258.510",
+            "C283.694 259.727 291.796 264.541 298.477 267.231",
+            "C306.163 270.326 319.360 270.612 338.812 268.103",
+            "C385.602 262.070 433.627 269.250 469.963 287.712",
+            "C475.721 290.638 480.874 293.474 481.416 294.016",
+            "C482.061 294.661 476.225 295.004 464.450 295.010",
+            "C407.520 295.043 349.853 308.084 300.500 332.086",
+            "C290.412 336.992 272.833 346.834 271.147 348.519",
+            "C269.278 350.389 273.301 349.263 283.966 344.933",
+            "C302.548 337.389 332.479 327.629 351.000 323.074",
+            "C386.266 314.400 413.893 311.393 450.000 312.298",
+            "C474.559 312.914 491.602 315.535 509.306 321.421",
+            "C520.784 325.236 519.954 325.640 504.924 323.552",
+            "C419.615 311.701 330.506 332.225 238.000 385.033",
+            "C224.991 392.460 221.855 394.386 200.762 407.913",
+            "C184.591 418.282 178.817 420.978 172.750 420.990",
+            "C167.060 421.002 164.441 418.869 163.413 413.387",
+            "C160.912 400.055 178.394 366.762 202.136 339.644",
+            "L206.387 334.788 197.443 335.644",
+            "C183.073 337.019 158.519 336.519 150.152 334.681",
+            "C132.833 330.876 120.785 321.947 117.439 310.437",
+            "C112.326 292.850 123.492 270.717 146.912 252.015",
+            "C154.528 245.934 155.702 244.562 156.798 240.464",
+            "C158.983 232.296 168.599 206.900 174.208 194.482",
+            "C184.044 172.710 197.989 150.083 213.332 131.000",
+            "C229.597 110.770 255.612 87.415 277.277 73.590",
+            "C286.990 67.393 310.855 55.436 323.062 50.653",
+            "C335.623 45.730 360.750 38.583 358.864 40.470",
+            "M375.000 209.596",
+            "C430.712 216.655 477.541 237.609 509.241 269.661",
+            "C514.049 274.523 518.765 279.625 519.721 281.000",
+            "C521.404 283.419 521.347 283.408 517.980 280.669",
+            "C500.484 266.434 486.556 257.516 468.000 248.668",
+            "C452.323 241.193 438.766 236.261 424.000 232.663",
+            "C395.297 225.667 374.955 223.024 349.705 223.010",
+            "C333.212 223.000 332.865 222.956 330.455 220.545",
+            "C329.105 219.195 328.000 217.046 328.000 215.768",
+            "C328.000 212.845 330.558 209.125 333.357 207.978",
+            "C336.189 206.817 360.536 207.763 375.000 209.596",
+            "' fill='{color}' fill-rule='evenodd'/>",
+            "</svg>",
+        ),
+        color = color,
+    );
+
+    // Encode as a data URI. The SVG is already URL-safe with single quotes.
+    format!("data:image/svg+xml,{}", svg.replace('#', "%23"))
 }
 
 fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
@@ -792,3 +887,89 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::network_status::{
+        FailureSnapshot, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
+    };
+    use std::net::SocketAddr;
+
+    fn base_snapshot() -> NetworkStatusSnapshot {
+        NetworkStatusSnapshot {
+            failures: Vec::new(),
+            connection_attempts: 0,
+            open_connections: 0,
+            elapsed_secs: 10,
+            listening_port: 31337,
+            version: "0.1.0".to_string(),
+            own_location: None,
+            peers: Vec::new(),
+            contracts: Vec::new(),
+            op_stats: OpStatsSnapshot::default(),
+            nat_stats: NatStatsSnapshot::default(),
+            gateway_only: false,
+        }
+    }
+
+    #[test]
+    fn favicon_grey_when_no_snapshot() {
+        let uri = build_favicon_data_uri(&None);
+        assert!(uri.starts_with("data:image/svg+xml,"));
+        assert!(uri.contains("%239e9e9e"), "expected grey color");
+    }
+
+    #[test]
+    fn favicon_blue_when_connected() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(uri.contains("%232196F3"), "expected blue color");
+    }
+
+    #[test]
+    fn favicon_dark_red_when_nat_fails() {
+        let mut snap = base_snapshot();
+        snap.nat_stats.attempts = 5;
+        snap.nat_stats.successes = 0;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(uri.contains("%238b0000"), "expected dark red color");
+    }
+
+    #[test]
+    fn favicon_red_when_failures_present() {
+        let mut snap = base_snapshot();
+        snap.failures.push(FailureSnapshot {
+            address: "1.2.3.4:1234".parse::<SocketAddr>().unwrap(),
+            reason_html: "timeout".to_string(),
+        });
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(uri.contains("%23f44336"), "expected red color");
+    }
+
+    #[test]
+    fn favicon_amber_when_connecting() {
+        let snap = base_snapshot();
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(uri.contains("%23ff9800"), "expected amber color");
+    }
+
+    #[test]
+    fn external_links_open_in_new_tab() {
+        // Verify all external links in the template have target="_blank"
+        let html = homepage_html();
+        for line in html.lines() {
+            if line.contains("href=\"https://") {
+                assert!(
+                    line.contains("target=\"_blank\""),
+                    "external link missing target=\"_blank\": {line}"
+                );
+                assert!(
+                    line.contains("rel=\"noopener noreferrer\""),
+                    "external link missing rel=\"noopener noreferrer\": {line}"
+                );
+            }
+        }
+    }
+}
