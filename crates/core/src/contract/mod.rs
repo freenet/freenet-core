@@ -419,9 +419,22 @@ where
             }
         }
 
-        // Deliver delegate-to-delegate messages (fire-and-forget).
-        // Each message is delivered to the target delegate as an InboundDelegateMsg::DelegateMessage.
-        // Any outbound messages from the target are accumulated alongside the sender's.
+        // Deliver delegate-to-delegate messages (fire-and-forget, single-hop).
+        //
+        // Design notes:
+        // - Delivery is intentionally single-hop: if target delegate B emits its own
+        //   SendDelegateMessage in response, it is filtered out (not delivered). This
+        //   prevents infinite recursion between delegates. We use execute_delegate_request
+        //   (not the full delivery loop) for the same reason.
+        // - Target delegate receives empty params because params are not stored in the
+        //   delegate registry — they are passed per-request at the API layer. If a target
+        //   delegate's process() relies on params, the caller must use ApplicationMessages
+        //   directly. This is a known v1 limitation.
+        // - attested_contract is None for inter-delegate delivery since the message
+        //   originates from another delegate, not from a contract attestation context.
+        // - Inter-delegate messaging only works via ApplicationMessages path; messages
+        //   from handle_delegate_notification (contract state change callbacks) do not
+        //   trigger delegate-to-delegate delivery.
         if !delegate_messages.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
@@ -446,8 +459,12 @@ where
                         values,
                         ..
                     }) => {
+                        // Filter out SendDelegateMessage from target's output to enforce
+                        // single-hop delivery. Only accumulate client-visible messages.
                         for value in values {
-                            accumulated_messages.push(value);
+                            if !matches!(value, OutboundDelegateMsg::SendDelegateMessage(_)) {
+                                accumulated_messages.push(value);
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -455,7 +472,7 @@ where
                         tracing::warn!(
                             target_delegate = %target_key,
                             error = %err,
-                            "Failed to deliver delegate message"
+                            "Failed to deliver delegate message (fire-and-forget)"
                         );
                     }
                 }

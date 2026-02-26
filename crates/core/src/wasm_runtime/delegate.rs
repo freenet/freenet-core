@@ -428,8 +428,23 @@ impl Runtime {
                     // Sender attestation: overwrite sender with the actual delegate key
                     msg.sender = delegate_key.clone();
                     results.push(OutboundDelegateMsg::SendDelegateMessage(msg));
+                    // Attest any remaining SendDelegateMessage variants to prevent
+                    // spoofing via drain bypass (see PR #3282 review).
                     for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
+                        match remaining {
+                            OutboundDelegateMsg::SendDelegateMessage(mut m) if !m.processed => {
+                                m.sender = delegate_key.clone();
+                                results.push(OutboundDelegateMsg::SendDelegateMessage(m));
+                            }
+                            msg @ (OutboundDelegateMsg::ApplicationMessage(_)
+                            | OutboundDelegateMsg::RequestUserInput(_)
+                            | OutboundDelegateMsg::ContextUpdated(_)
+                            | OutboundDelegateMsg::GetContractRequest(_)
+                            | OutboundDelegateMsg::PutContractRequest(_)
+                            | OutboundDelegateMsg::UpdateContractRequest(_)
+                            | OutboundDelegateMsg::SubscribeContractRequest(_)
+                            | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
+                        }
                     }
                     break;
                 }
@@ -3906,6 +3921,82 @@ mod test {
             OutboundAppMessage::MessageSent | OutboundAppMessage::PingResponse { .. } => {
                 panic!("Expected DelegateMessageReceived, got {:?}", response)
             }
+        }
+
+        Ok(())
+    }
+
+    /// Verify that when a delegate emits multiple SendDelegateMessage outbound,
+    /// all of them get sender attestation (not just the first one).
+    /// Regression test for PR #3282 review: drain(..) bypass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_send_delegate_messages_all_attested(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (delegate_a, mut runtime, _temp_dir) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![1]).await?;
+        let key_a = delegate_a.key().clone();
+
+        // Create two different target keys
+        let target_b = DelegateKey::new([42u8; 32], CodeHash::new([99u8; 32]));
+        let target_c = DelegateKey::new([43u8; 32], CodeHash::new([98u8; 32]));
+
+        // Send two messages via two separate inbound ApplicationMessages.
+        // The first triggers SendDelegateMessage → break + drain, so
+        // the second SendDelegateMessage goes through drain(..).
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let payload1 =
+            bincode::serialize(&messaging_messages::InboundAppMessage::SendToDelegate {
+                target_key_bytes: target_b.bytes().to_vec(),
+                target_code_hash: target_b.code_hash().as_ref().to_vec(),
+                payload: b"msg1".to_vec(),
+            })?;
+        let payload2 =
+            bincode::serialize(&messaging_messages::InboundAppMessage::SendToDelegate {
+                target_key_bytes: target_c.bytes().to_vec(),
+                target_code_hash: target_c.code_hash().as_ref().to_vec(),
+                payload: b"msg2".to_vec(),
+            })?;
+
+        let outbound = runtime.inbound_app_message(
+            &key_a,
+            &vec![1u8].into(),
+            None,
+            vec![
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app_id, payload1)),
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app_id, payload2)),
+            ],
+        )?;
+
+        // Collect all SendDelegateMessage from outbound
+        let send_msgs: Vec<&DelegateMessage> = outbound
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::SendDelegateMessage(msg) => Some(msg),
+                OutboundDelegateMsg::ApplicationMessage(_)
+                | OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            })
+            .collect();
+
+        // Should have at least 1 (the first triggers break+drain,
+        // second may come through drain)
+        assert!(
+            !send_msgs.is_empty(),
+            "Expected at least one SendDelegateMessage"
+        );
+
+        // ALL SendDelegateMessage must have sender attested as key_a
+        for (i, msg) in send_msgs.iter().enumerate() {
+            assert_eq!(
+                msg.sender, key_a,
+                "SendDelegateMessage[{i}] sender should be attested as delegate A, \
+                 but got {:?}",
+                msg.sender
+            );
         }
 
         Ok(())

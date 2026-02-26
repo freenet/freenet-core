@@ -47,10 +47,12 @@ impl DelegateInterface for Delegate {
                         target_code_hash,
                         payload,
                     } => {
-                        let mut key_arr = [0u8; 32];
-                        key_arr.copy_from_slice(&target_key_bytes);
-                        let mut hash_arr = [0u8; 32];
-                        hash_arr.copy_from_slice(&target_code_hash);
+                        let key_arr: [u8; 32] = target_key_bytes
+                            .try_into()
+                            .map_err(|_| DelegateError::Other("key must be 32 bytes".into()))?;
+                        let hash_arr: [u8; 32] = target_code_hash
+                            .try_into()
+                            .map_err(|_| DelegateError::Other("hash must be 32 bytes".into()))?;
                         let target = DelegateKey::new(key_arr, CodeHash::new(hash_arr));
 
                         // Sender is a placeholder; the runtime will overwrite it
