@@ -37,13 +37,13 @@ jobs:
         run: cargo build --release --target x86_64-unknown-linux-musl -p freenet -p fdev
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-linux-freenet
           path: target/x86_64-unknown-linux-musl/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-linux-fdev
           path: target/x86_64-unknown-linux-musl/release/fdev
@@ -74,13 +74,13 @@ jobs:
         run: cargo build --release --target aarch64-unknown-linux-musl -p freenet -p fdev
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-arm64-linux-freenet
           path: target/aarch64-unknown-linux-musl/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-arm64-linux-fdev
           path: target/aarch64-unknown-linux-musl/release/fdev
@@ -120,13 +120,13 @@ jobs:
           codesign -v target/release/fdev
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-arm64-macos-freenet
           path: target/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-arm64-macos-fdev
           path: target/release/fdev
@@ -168,13 +168,13 @@ jobs:
           codesign -v target/x86_64-apple-darwin/release/fdev
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-macos-freenet
           path: target/x86_64-apple-darwin/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-macos-fdev
           path: target/x86_64-apple-darwin/release/fdev
@@ -198,13 +198,13 @@ jobs:
         run: cargo build --release
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-windows-freenet
           path: target/release/freenet.exe
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-windows-fdev
           path: target/release/fdev.exe
