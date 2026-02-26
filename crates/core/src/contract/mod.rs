@@ -119,11 +119,12 @@ where
             }
         };
 
-        // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE)
+        // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE) and delegate messages
         let mut get_requests: Vec<GetContractRequest> = Vec::new();
         let mut put_requests: Vec<PutContractRequest> = Vec::new();
         let mut update_requests: Vec<UpdateContractRequest> = Vec::new();
         let mut subscribe_requests: Vec<SubscribeContractRequest> = Vec::new();
+        let mut delegate_messages: Vec<DelegateMessage> = Vec::new();
 
         for msg in values {
             match msg {
@@ -139,6 +140,9 @@ where
                 OutboundDelegateMsg::SubscribeContractRequest(req) => {
                     subscribe_requests.push(req);
                 }
+                OutboundDelegateMsg::SendDelegateMessage(msg) => {
+                    delegate_messages.push(msg);
+                }
                 other @ OutboundDelegateMsg::ApplicationMessage(_)
                 | other @ OutboundDelegateMsg::RequestUserInput(_)
                 | other @ OutboundDelegateMsg::ContextUpdated(_) => {
@@ -148,11 +152,12 @@ where
             }
         }
 
-        // If no contract requests, we're done - return all accumulated messages
+        // If no contract requests and no delegate messages, we're done
         if get_requests.is_empty()
             && put_requests.is_empty()
             && update_requests.is_empty()
             && subscribe_requests.is_empty()
+            && delegate_messages.is_empty()
         {
             return accumulated_messages;
         }
@@ -414,6 +419,66 @@ where
             }
         }
 
+        // Deliver delegate-to-delegate messages (fire-and-forget, single-hop).
+        //
+        // Design notes:
+        // - Delivery is intentionally single-hop: if target delegate B emits its own
+        //   SendDelegateMessage in response, it is filtered out (not delivered). This
+        //   prevents infinite recursion between delegates. We use execute_delegate_request
+        //   (not the full delivery loop) for the same reason.
+        // - Target delegate receives empty params because params are not stored in the
+        //   delegate registry — they are passed per-request at the API layer. If a target
+        //   delegate's process() relies on params, the caller must use ApplicationMessages
+        //   directly. This is a known v1 limitation.
+        // - attested_contract is None for inter-delegate delivery since the message
+        //   originates from another delegate, not from a contract attestation context.
+        // - Inter-delegate messaging only works via ApplicationMessages path; messages
+        //   from handle_delegate_notification (contract state change callbacks) do not
+        //   trigger delegate-to-delegate delivery.
+        if !delegate_messages.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = delegate_messages.len(),
+                "Delivering delegate-to-delegate messages"
+            );
+
+            for msg in delegate_messages {
+                let target_key = msg.target.clone();
+                let inbound = vec![InboundDelegateMsg::DelegateMessage(msg)];
+                let target_req = DelegateRequest::ApplicationMessages {
+                    key: target_key.clone(),
+                    params: Parameters::from(Vec::new()),
+                    inbound,
+                };
+                match contract_handler
+                    .executor()
+                    .execute_delegate_request(target_req, None)
+                    .await
+                {
+                    Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                        values,
+                        ..
+                    }) => {
+                        // Filter out SendDelegateMessage from target's output to enforce
+                        // single-hop delivery. Only accumulate client-visible messages.
+                        for value in values {
+                            if !matches!(value, OutboundDelegateMsg::SendDelegateMessage(_)) {
+                                accumulated_messages.push(value);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            target_delegate = %target_key,
+                            error = %err,
+                            "Failed to deliver delegate message (fire-and-forget)"
+                        );
+                    }
+                }
+            }
+        }
+
         // Create a new request to send the responses back to the delegate
         current_req = DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
@@ -519,7 +584,8 @@ async fn handle_delegate_notification<CH>(
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 tracing::warn!(
                     delegate = %delegate_key,
                     msg_type = ?std::mem::discriminant(msg),

@@ -27,7 +27,7 @@ RUN rustup target add wasm32-unknown-unknown
 
 # Entrypoint syncs source from read-only mount to a local copy,
 # then runs the requested command with native Linux filesystem speed.
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/test-runner/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /build
