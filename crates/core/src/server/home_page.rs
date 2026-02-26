@@ -856,13 +856,20 @@ p:last-child { margin-bottom: 0; }
 /// and so toggleTheme() is reachable from the button's onclick attribute.
 /// The page auto-refreshes every 5 s, so restoring the saved theme before
 /// render is essential to avoid a flash of the wrong theme on each refresh.
+/// Theme priority: localStorage override > OS prefers-color-scheme > light.
 const JS: &str = r##"
 (function() {
+    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     try {
-        if (localStorage.getItem('theme') === 'dark') {
+        var saved = localStorage.getItem('theme');
+        if (saved === 'dark' || (saved === null && prefersDark)) {
             document.documentElement.setAttribute('data-theme', 'dark');
         }
-    } catch (e) { /* localStorage unavailable (e.g. private browsing) */ }
+    } catch (e) {
+        if (prefersDark) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+        }
+    }
 })();
 
 function toggleTheme() {
@@ -871,7 +878,7 @@ function toggleTheme() {
     if (isDark) {
         document.documentElement.removeAttribute('data-theme');
         if (icon) icon.textContent = '\uD83C\uDF19'; /* moon */
-        try { localStorage.removeItem('theme'); } catch (e) {}
+        try { localStorage.setItem('theme', 'light'); } catch (e) {}
     } else {
         document.documentElement.setAttribute('data-theme', 'dark');
         if (icon) icon.textContent = '\u2600\uFE0F'; /* sun */
