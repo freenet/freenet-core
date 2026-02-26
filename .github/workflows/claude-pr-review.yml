@@ -151,6 +151,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: '--model sonnet --max-turns 25 --effort high'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
@@ -233,6 +234,44 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const marker = '<!-- claude-rule-review -->';
+            const reviewOutcome = '${{ steps.review.outcome }}';
+
+            // If Claude step failed, post a warning instead of silently doing nothing
+            if (reviewOutcome === 'failure') {
+              const warningBody = marker + '\n' +
+                '### ⚠️ Claude Rule Review: Failed to run\n\n' +
+                'The Claude rule review step failed (likely an authentication or API issue). ' +
+                'Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n' +
+                '---\n*Automated review against `.claude/rules/`. Advisory only — does not block merge.*';
+
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+
+              const existing = comments.find(c => c.body.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body: warningBody,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: warningBody,
+                });
+              }
+              core.warning('Claude rule review failed — warning comment posted on PR');
+              return;
+            }
+
             const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
 
             // Read Claude's output — the file is a JSON array of Turn objects
@@ -265,7 +304,6 @@ jobs:
             const body = report + '\n\n---\n*Automated review against `.claude/rules/`. Advisory only — does not block merge.*';
 
             // Find and update existing sticky comment, or create new one
-            const marker = '<!-- claude-rule-review -->';
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
