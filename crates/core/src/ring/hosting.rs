@@ -30,7 +30,7 @@
 mod cache;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
-use crate::util::time_source::InstantTimeSrc;
+use crate::util::time_source::{InstantTimeSrc, TimeSource};
 pub use cache::{AccessType, RecordAccessResult};
 use cache::{HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL};
 use dashmap::{DashMap, DashSet};
@@ -137,9 +137,15 @@ pub(crate) struct HostingManager {
     /// This is the single source of truth for which contracts we're hosting.
     hosting_cache: RwLock<HostingCache<InstantTimeSrc>>,
 
-    /// Downstream peers subscribed to contracts we host.
-    /// Used to determine when it's safe to unsubscribe upstream.
+    /// Downstream peers subscribed to contracts we host, with lease timestamps.
+    /// Drives `should_unsubscribe_upstream()` decisions.
+    ///
+    /// Must be kept in sync with `InterestManager::interested_peers`
+    /// (see `InterestManager` docs for the dual-tracking relationship).
     downstream_subscribers: DashMap<ContractKey, HashMap<PeerKey, Instant>>,
+
+    /// Time source for downstream subscriber lease tracking.
+    time_source: InstantTimeSrc,
 
     /// Contracts with subscription requests currently in-flight.
     pending_subscription_requests: DashSet<ContractKey>,
@@ -168,6 +174,7 @@ impl HostingManager {
                 InstantTimeSrc::new(),
             )),
             downstream_subscribers: DashMap::new(),
+            time_source: InstantTimeSrc::new(),
             pending_subscription_requests: DashSet::new(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
@@ -415,7 +422,7 @@ impl HostingManager {
         self.downstream_subscribers
             .entry(*contract)
             .or_default()
-            .insert(peer, Instant::now());
+            .insert(peer, self.time_source.now());
     }
 
     /// Renew a downstream peer's subscription lease.
@@ -424,7 +431,7 @@ impl HostingManager {
     pub fn renew_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
             if peers.contains_key(peer) {
-                peers.insert(peer.clone(), Instant::now());
+                peers.insert(peer.clone(), self.time_source.now());
                 return true;
             }
         }
@@ -456,7 +463,7 @@ impl HostingManager {
     /// Remove downstream subscribers whose leases have expired.
     /// Returns the contracts that lost all downstream subscribers.
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<ContractKey> {
-        let now = Instant::now();
+        let now = self.time_source.now();
         let mut fully_unsubscribed = Vec::new();
 
         let keys: Vec<ContractKey> = self
@@ -1706,5 +1713,82 @@ mod tests {
             !manager.should_unsubscribe_upstream(&contract),
             "Contract with remaining downstream should NOT trigger unsubscribe"
         );
+    }
+
+    // =========================================================================
+    // Unsubscribe Handler Logic Tests
+    // =========================================================================
+
+    fn make_interest_manager() -> crate::ring::interest::InterestManager<InstantTimeSrc> {
+        crate::ring::interest::InterestManager::new(InstantTimeSrc::new())
+    }
+
+    /// Contract found + peer resolved → removes both tracking structures,
+    /// triggers upstream unsubscribe propagation.
+    #[test]
+    fn test_unsubscribe_handler_contract_found_peer_resolved() {
+        let manager = HostingManager::new();
+        let interest = make_interest_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(10);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        interest.register_peer_interest(&contract, peer.clone(), None, true);
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+
+        manager.remove_downstream_subscriber(&contract, &peer);
+        interest.remove_peer_interest(&contract, &peer);
+
+        assert!(!manager.has_downstream_subscribers(&contract));
+        assert!(manager.should_unsubscribe_upstream(&contract));
+    }
+
+    /// Removing an unknown peer is a noop; existing entries remain intact.
+    #[test]
+    fn test_unsubscribe_handler_unknown_peer_is_noop() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(2);
+        let known_peer = make_peer_key(20);
+        let unknown_peer = make_peer_key(99);
+
+        manager.add_downstream_subscriber(&contract, known_peer.clone());
+
+        assert!(!manager.remove_downstream_subscriber(&contract, &unknown_peer));
+        assert!(manager.has_downstream_subscribers(&contract));
+        assert!(!manager.should_unsubscribe_upstream(&contract));
+    }
+
+    /// Removing from an untracked contract is a noop; other contracts unaffected.
+    #[test]
+    fn test_unsubscribe_handler_unknown_contract_is_noop() {
+        let manager = HostingManager::new();
+        let known_contract = make_contract_key(3);
+        let unknown_contract = make_contract_key(99);
+        let peer = make_peer_key(30);
+
+        manager.add_downstream_subscriber(&known_contract, peer.clone());
+
+        assert!(!manager.remove_downstream_subscriber(&unknown_contract, &peer));
+        assert!(manager.has_downstream_subscribers(&known_contract));
+        assert!(!manager.has_downstream_subscribers(&unknown_contract));
+    }
+
+    /// `downstream_subscribers` is authoritative for unsubscribe decisions,
+    /// independent of `InterestManager` state.
+    #[test]
+    fn test_unsubscribe_dual_tracking_authority() {
+        let manager = HostingManager::new();
+        let interest = make_interest_manager();
+        let contract = make_contract_key(4);
+        let peer = make_peer_key(40);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        interest.register_peer_interest(&contract, peer.clone(), None, true);
+
+        manager.remove_downstream_subscriber(&contract, &peer);
+
+        assert!(manager.should_unsubscribe_upstream(&contract));
+        // InterestManager still tracks the peer — independent of unsubscribe decision
+        assert!(interest.remove_peer_interest(&contract, &peer));
     }
 }
