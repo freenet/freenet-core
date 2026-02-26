@@ -72,6 +72,11 @@ use crate::config::GlobalRng;
 /// Maximum number of entries in the delta memoization cache.
 const DELTA_CACHE_SIZE: usize = 1024;
 
+/// Timeout for contract handler queries in the broadcast path (summary and
+/// delta computation). Much shorter than the default 300s to prevent spawned
+/// broadcast tasks from accumulating when the contract handler is slow.
+const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Identifies a peer for interest tracking purposes.
 ///
 /// Uses the peer's public key rather than socket address, since addresses
@@ -837,7 +842,10 @@ impl<T: TimeSource> InterestManager<T> {
         use crate::contract::ContractHandlerEvent;
 
         match op_manager
-            .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetSummaryQuery { key: *key },
+                BROADCAST_CH_TIMEOUT,
+            )
             .await
         {
             Ok(ContractHandlerEvent::GetSummaryResponse { summary: Ok(s), .. }) => Some(s),
@@ -913,12 +921,15 @@ impl<T: TimeSource> InterestManager<T> {
             return Err("Delta not efficient for this contract".to_string());
         }
 
-        // Compute delta via contract handler
+        // Compute delta via contract handler (short timeout for broadcast path)
         match op_manager
-            .notify_contract_handler(ContractHandlerEvent::GetDeltaQuery {
-                key: *key,
-                their_summary: their_summary.clone(),
-            })
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetDeltaQuery {
+                    key: *key,
+                    their_summary: their_summary.clone(),
+                },
+                BROADCAST_CH_TIMEOUT,
+            )
             .await
         {
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
