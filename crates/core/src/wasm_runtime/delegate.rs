@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, GetContractRequest, InboundDelegateMsg,
+    DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId, SubscribeContractRequest,
     UpdateContractRequest,
 };
@@ -173,6 +173,7 @@ impl Runtime {
             InboundDelegateMsg::UpdateContractResponse(_) => "UpdateContractResponse",
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
+            InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
         };
         tracing::debug!(
             inbound_msg_name,
@@ -244,6 +245,13 @@ impl Runtime {
                     OutboundDelegateMsg::SubscribeContractRequest(req) => {
                         format!("SubscribeContractRequest(contract={})", req.contract_id)
                     }
+                    OutboundDelegateMsg::SendDelegateMessage(msg) => {
+                        format!(
+                            "SendDelegateMessage(target={}, payload_len={})",
+                            msg.target,
+                            msg.payload.len()
+                        )
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -281,6 +289,7 @@ impl Runtime {
                         OutboundDelegateMsg::PutContractRequest(r) => format!("PutContractReq({})", r.contract.key()),
                         OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::SendDelegateMessage(m) => format!("SendDelegateMsg(target={})", m.target),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -411,6 +420,25 @@ impl Runtime {
                     tracing::debug!("SubscribeContractRequest processed");
                     *context = ctx.as_ref().to_vec();
                 }
+                OutboundDelegateMsg::SendDelegateMessage(mut msg) if !msg.processed => {
+                    tracing::debug!(
+                        target_delegate = %msg.target,
+                        "Passing SendDelegateMessage to executor for delivery"
+                    );
+                    // Sender attestation: overwrite sender with the actual delegate key
+                    msg.sender = delegate_key.clone();
+                    results.push(OutboundDelegateMsg::SendDelegateMessage(msg));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
+                }
+                OutboundDelegateMsg::SendDelegateMessage(DelegateMessage {
+                    context: ctx, ..
+                }) => {
+                    tracing::debug!("SendDelegateMessage processed");
+                    *context = ctx.as_ref().to_vec();
+                }
             }
         }
         Ok(())
@@ -535,7 +563,8 @@ impl DelegateRuntimeInterface for Runtime {
                     msg @ (InboundDelegateMsg::PutContractResponse(_)
                     | InboundDelegateMsg::UpdateContractResponse(_)
                     | InboundDelegateMsg::SubscribeContractResponse(_)
-                    | InboundDelegateMsg::ContractNotification(_)) => {
+                    | InboundDelegateMsg::ContractNotification(_)
+                    | InboundDelegateMsg::DelegateMessage(_)) => {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
@@ -785,7 +814,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected GetContractRequest, got {:?}", other)
             }
         };
@@ -810,7 +840,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -865,7 +896,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected GetContractRequest, got {:?}", other)
             }
         };
@@ -886,7 +918,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -943,7 +976,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected GetContractRequest, got {:?}", other)
             }
         };
@@ -966,7 +1000,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected GetContractRequest for contract2, got {:?}", other)
             }
         };
@@ -989,7 +1024,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected GetContractRequest for contract3, got {:?}", other)
             }
         };
@@ -1012,7 +1048,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -1079,7 +1116,8 @@ mod test {
                 | OutboundDelegateMsg::ContextUpdated(_)
                 | OutboundDelegateMsg::PutContractRequest(_)
                 | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+                | OutboundDelegateMsg::SubscribeContractRequest(_)
+                | OutboundDelegateMsg::SendDelegateMessage(_) => None,
             })
             .expect("Expected a GetContractRequest");
         assert_eq!(contract_request.contract_id, contract_id);
@@ -1093,7 +1131,8 @@ mod test {
                 | OutboundDelegateMsg::GetContractRequest(_)
                 | OutboundDelegateMsg::PutContractRequest(_)
                 | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+                | OutboundDelegateMsg::SubscribeContractRequest(_)
+                | OutboundDelegateMsg::SendDelegateMessage(_) => None,
             })
             .expect("Expected an ApplicationMessage (Echo)");
         assert!(echo_msg.processed);
@@ -1135,7 +1174,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -1242,7 +1282,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1255,7 +1296,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1310,7 +1352,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1332,7 +1375,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1372,7 +1416,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1406,7 +1451,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1445,7 +1491,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1488,7 +1535,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1511,7 +1559,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1575,7 +1624,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1618,7 +1668,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1683,7 +1734,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1705,7 +1757,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1764,7 +1817,8 @@ mod test {
                 | OutboundDelegateMsg::GetContractRequest(_)
                 | OutboundDelegateMsg::PutContractRequest(_)
                 | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                | OutboundDelegateMsg::SubscribeContractRequest(_)
+                | OutboundDelegateMsg::SendDelegateMessage(_) => {
                     panic!("Expected ApplicationMessage")
                 }
             };
@@ -1834,7 +1888,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1855,7 +1910,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1876,7 +1932,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1914,7 +1971,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -1953,7 +2011,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -2014,7 +2073,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -2084,7 +2144,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -2124,7 +2185,8 @@ mod test {
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
         };
@@ -2230,7 +2292,8 @@ mod test {
                 | OutboundDelegateMsg::GetContractRequest(_)
                 | OutboundDelegateMsg::PutContractRequest(_)
                 | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                | OutboundDelegateMsg::SubscribeContractRequest(_)
+                | OutboundDelegateMsg::SendDelegateMessage(_) => {
                     panic!("Expected ApplicationMessage")
                 }
             };
@@ -2309,7 +2372,8 @@ mod test {
                 | OutboundDelegateMsg::GetContractRequest(_)
                 | OutboundDelegateMsg::PutContractRequest(_)
                 | OutboundDelegateMsg::UpdateContractRequest(_)
-                | OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                | OutboundDelegateMsg::SubscribeContractRequest(_)
+                | OutboundDelegateMsg::SendDelegateMessage(_) => {
                     panic!("Expected ApplicationMessage")
                 }
             };
@@ -2555,7 +2619,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -2642,7 +2707,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -2754,7 +2820,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -2961,7 +3028,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected PutContractRequest, got {:?}", other)
             }
         };
@@ -2989,7 +3057,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -3047,7 +3116,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected UpdateContractRequest, got {:?}", other)
             }
         };
@@ -3075,7 +3145,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -3135,7 +3206,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
-            | other @ OutboundDelegateMsg::UpdateContractRequest(_) => {
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected SubscribeContractRequest, got {:?}", other)
             }
         };
@@ -3163,7 +3235,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -3225,7 +3298,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };
@@ -3336,7 +3410,8 @@ mod test {
             | other @ OutboundDelegateMsg::ContextUpdated(_)
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
-            | other @ OutboundDelegateMsg::UpdateContractRequest(_) => {
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected SubscribeContractRequest, got {:?}", other)
             }
         };
@@ -3400,7 +3475,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         }
@@ -3443,7 +3519,8 @@ mod test {
             | other @ OutboundDelegateMsg::GetContractRequest(_)
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-            | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {:?}", other)
             }
         };

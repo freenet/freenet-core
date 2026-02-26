@@ -2278,7 +2278,8 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                 | other @ OutboundDelegateMsg::GetContractRequest(_)
                 | other @ OutboundDelegateMsg::PutContractRequest(_)
                 | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-                | other @ OutboundDelegateMsg::SubscribeContractRequest(_) => {
+                | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+                | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                     bail!("Expected ApplicationMessage, got {:?}", other)
                 }
             };
