@@ -3624,4 +3624,290 @@ mod test {
         std::mem::drop(temp_dir);
         Ok(())
     }
+
+    // --- Delegate-to-delegate messaging tests ---
+
+    const TEST_DELEGATE_MESSAGING: &str = "test_delegate_messaging";
+
+    mod messaging_messages {
+        use super::*;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum InboundAppMessage {
+            SendToDelegate {
+                target_key_bytes: Vec<u8>,
+                target_code_hash: Vec<u8>,
+                payload: Vec<u8>,
+            },
+            Ping {
+                data: Vec<u8>,
+            },
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub enum OutboundAppMessage {
+            MessageSent,
+            DelegateMessageReceived {
+                sender_key_bytes: Vec<u8>,
+                payload: Vec<u8>,
+            },
+            PingResponse {
+                data: Vec<u8>,
+            },
+        }
+    }
+
+    async fn setup_runtime_with_params(
+        name: &str,
+        params: Vec<u8>,
+    ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::contract::storages::Storage;
+        let temp_dir = get_temp_dir();
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let mut runtime =
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+
+        let delegate = {
+            let bytes = super::super::tests::get_test_module(name)?;
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &params.into(),
+            ))))
+        };
+        let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _registered =
+            runtime
+                .secret_store
+                .register_delegate(delegate.key().clone(), cipher, nonce);
+
+        Ok((delegate, runtime, temp_dir))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delegate_emits_send_delegate_message() -> Result<(), Box<dyn std::error::Error>> {
+        use messaging_messages::*;
+
+        let (delegate_a, mut runtime, _temp_dir) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![1]).await?;
+        let key_a = delegate_a.key().clone();
+
+        // Create a fake target delegate key B
+        let target_key_bytes = vec![42u8; 32];
+        let target_code_hash = vec![99u8; 32];
+
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
+            target_key_bytes: target_key_bytes.clone(),
+            target_code_hash: target_code_hash.clone(),
+            payload: b"hello".to_vec(),
+        })?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound = runtime.inbound_app_message(
+            &key_a,
+            &vec![1u8].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Should have SendDelegateMessage and ApplicationMessage(MessageSent)
+        assert!(
+            !outbound.is_empty(),
+            "Expected at least 1 outbound message, got {}",
+            outbound.len()
+        );
+
+        let send_msg = outbound
+            .iter()
+            .find_map(|m| match m {
+                OutboundDelegateMsg::SendDelegateMessage(msg) => Some(msg),
+                OutboundDelegateMsg::ApplicationMessage(_)
+                | OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            })
+            .expect("Expected SendDelegateMessage in outbound");
+
+        // Verify target matches what we sent
+        let mut expected_key = [0u8; 32];
+        expected_key.copy_from_slice(&target_key_bytes);
+        let mut expected_hash = [0u8; 32];
+        expected_hash.copy_from_slice(&target_code_hash);
+        assert_eq!(*send_msg.target, expected_key);
+        assert_eq!(send_msg.target.code_hash(), &CodeHash::new(expected_hash));
+
+        // Verify sender attestation: runtime overwrites sender with actual delegate key
+        assert_eq!(
+            send_msg.sender, key_a,
+            "Sender should be attested as delegate A"
+        );
+
+        // Verify payload
+        assert_eq!(send_msg.payload, b"hello");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delegate_receives_delegate_message() -> Result<(), Box<dyn std::error::Error>> {
+        use messaging_messages::*;
+
+        let (delegate_b, mut runtime, _temp_dir) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![2]).await?;
+        let key_b = delegate_b.key().clone();
+
+        // Create a fake sender key A
+        let sender_key = DelegateKey::new([11u8; 32], CodeHash::new([22u8; 32]));
+
+        // Deliver a DelegateMessage to B
+        let delegate_msg =
+            DelegateMessage::new(key_b.clone(), sender_key.clone(), b"hello".to_vec());
+
+        let outbound = runtime.inbound_app_message(
+            &key_b,
+            &vec![2u8].into(),
+            None,
+            vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected 1 outbound message");
+
+        let app_msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
+                panic!("Expected ApplicationMessage, got {:?}", &outbound[0])
+            }
+        };
+
+        let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+        match response {
+            OutboundAppMessage::DelegateMessageReceived {
+                sender_key_bytes,
+                payload,
+            } => {
+                assert_eq!(sender_key_bytes, sender_key.bytes());
+                assert_eq!(payload, b"hello");
+            }
+            OutboundAppMessage::MessageSent | OutboundAppMessage::PingResponse { .. } => {
+                panic!("Expected DelegateMessageReceived, got {:?}", response)
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delegate_to_delegate_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use messaging_messages::*;
+
+        // Load same code with different params → different keys
+        let (delegate_a, mut runtime_a, _temp_dir_a) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![1]).await?;
+        let key_a = delegate_a.key().clone();
+
+        let (delegate_b, mut runtime_b, _temp_dir_b) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![2]).await?;
+        let key_b = delegate_b.key().clone();
+
+        // Step 1: Send command to A: "send a message to B"
+        let app_id = ContractInstanceId::new([1u8; 32]);
+        let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
+            target_key_bytes: key_b.bytes().to_vec(),
+            target_code_hash: key_b.code_hash().as_ref().to_vec(),
+            payload: b"inter-delegate".to_vec(),
+        })?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        let outbound_a = runtime_a.inbound_app_message(
+            &key_a,
+            &vec![1u8].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+        )?;
+
+        // Step 2: Extract the SendDelegateMessage from A's output
+        let send_msg = outbound_a
+            .iter()
+            .find_map(|m| match m {
+                OutboundDelegateMsg::SendDelegateMessage(msg) => Some(msg.clone()),
+                OutboundDelegateMsg::ApplicationMessage(_)
+                | OutboundDelegateMsg::RequestUserInput(_)
+                | OutboundDelegateMsg::ContextUpdated(_)
+                | OutboundDelegateMsg::GetContractRequest(_)
+                | OutboundDelegateMsg::PutContractRequest(_)
+                | OutboundDelegateMsg::UpdateContractRequest(_)
+                | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            })
+            .expect("Expected SendDelegateMessage from delegate A");
+
+        assert_eq!(send_msg.sender, key_a, "Sender should be attested as A");
+        assert_eq!(send_msg.payload, b"inter-delegate");
+
+        // Step 3: Deliver to B as InboundDelegateMsg::DelegateMessage
+        let outbound_b = runtime_b.inbound_app_message(
+            &key_b,
+            &vec![2u8].into(),
+            None,
+            vec![InboundDelegateMsg::DelegateMessage(send_msg)],
+        )?;
+
+        assert_eq!(outbound_b.len(), 1);
+
+        let app_msg_b = match &outbound_b[0] {
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+            OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_) => {
+                panic!(
+                    "Expected ApplicationMessage from B, got {:?}",
+                    &outbound_b[0]
+                )
+            }
+        };
+
+        let response: OutboundAppMessage = bincode::deserialize(&app_msg_b.payload)?;
+        match response {
+            OutboundAppMessage::DelegateMessageReceived {
+                sender_key_bytes,
+                payload,
+            } => {
+                assert_eq!(
+                    sender_key_bytes,
+                    key_a.bytes(),
+                    "B should see A as the sender"
+                );
+                assert_eq!(payload, b"inter-delegate");
+            }
+            OutboundAppMessage::MessageSent | OutboundAppMessage::PingResponse { .. } => {
+                panic!("Expected DelegateMessageReceived, got {:?}", response)
+            }
+        }
+
+        Ok(())
+    }
 }
