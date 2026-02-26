@@ -235,10 +235,14 @@ fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<Tran
                     let keypair = TransportKeypair::new();
                     keypair.save(path)?;
 
-                    // Also update the public key file if it exists in the same directory
-                    // (freenet-test-network generates keypair.pem and public_key.pem together)
+                    // Also update the companion public key file if it exists.
+                    // Derive the public key path from the private key filename:
+                    //   "gw1_private_key.pem" → "gw1_public_key.pem"
+                    //   "private_key.pem" → "public_key.pem"
                     if let Some(parent) = path.parent() {
-                        let public_key_path = parent.join("public_key.pem");
+                        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                        let public_filename = filename.replace("private", "public");
+                        let public_key_path = parent.join(&public_filename);
                         if public_key_path.exists() {
                             if let Err(e) = keypair.public().save(&public_key_path) {
                                 tracing::warn!(
