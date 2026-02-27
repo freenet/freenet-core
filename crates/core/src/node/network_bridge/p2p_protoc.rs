@@ -440,6 +440,11 @@ impl P2pConnManager {
         let gateways_arc = Arc::new(gateways.clone());
         let key_pair = config.key_pair.clone();
 
+        // Bridge channel capacity: must exceed the max number of connected peers
+        // to avoid self-deadlock when the event loop broadcasts inline. The primary
+        // mitigation is spawning fan-out via broadcast_to_peers(), but this provides
+        // defense-in-depth. Do NOT fan-out more than this many sends inline on the
+        // event loop — use broadcast_to_peers() instead.
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(512);
         let bridge = P2pBridge::new(
             tx_bridge_cmd,
