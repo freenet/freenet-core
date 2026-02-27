@@ -1378,7 +1378,13 @@ impl ConnectionManager {
         self.recently_failed_addrs.write().remove(&addr);
     }
 
-    /// Return addresses of all currently established ring connections.
+    /// Return addresses of all peers tracked in `location_for_peer` (established and pending).
+    ///
+    /// `location_for_peer` contains both fully-established ring connections and entries added
+    /// during `should_accept()` for in-progress handshakes. Returning both is intentional:
+    /// excluding pending peers from the bloom filter is conservative but correct — we don't
+    /// want the connect state machine to route a new request to a peer whose handshake is
+    /// still in flight, since that would create a duplicate connection attempt.
     pub fn connected_peer_addrs(&self) -> Vec<SocketAddr> {
         self.location_for_peer.read().keys().copied().collect()
     }

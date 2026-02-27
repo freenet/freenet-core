@@ -1036,11 +1036,20 @@ impl ConnectOp {
 
         // Exclude already-connected peers and recently-failed NAT addresses so routing
         // nodes don't forward back to peers we already have a ring connection with.
+        //
+        // Bloom filter saturation note: VisitedPeers uses a 512-bit filter with k=4 hash
+        // functions. Pre-loading N entries raises the false-positive rate; at typical
+        // network sizes (≤ 20 connections in current deployments) the FP rate is negligible
+        // (~0.01%). At DEFAULT_MAX_CONNECTIONS (200), the rate reaches ~39%, which would
+        // cause routing to occasionally skip reachable peers. This is an accepted trade-off
+        // for current network sizes. If production nodes routinely reach high connection
+        // counts, consider capping pre-populated entries to the N closest connected peers
+        // (since greedy routing preferentially selects nearby peers anyway).
         for addr in exclude_addrs {
             visited.mark_visited(*addr);
         }
         if !exclude_addrs.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 excluded_addrs = exclude_addrs.len(),
                 "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
             );
@@ -2147,8 +2156,15 @@ pub(crate) async fn join_ring_request(
         .min(u8::MAX as usize) as u8;
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
-    let mut exclude_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
-    exclude_addrs.extend(op_manager.ring.connection_manager.connected_peer_addrs());
+    let failed_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
+    let connected_addrs = op_manager.ring.connection_manager.connected_peer_addrs();
+    tracing::debug!(
+        failed = failed_addrs.len(),
+        connected = connected_addrs.len(),
+        "connect: pre-populating bloom filter with excluded peer addresses"
+    );
+    let mut exclude_addrs = failed_addrs;
+    exclude_addrs.extend(connected_addrs);
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
