@@ -1102,8 +1102,7 @@ fn test_not_found_result_intermediate_node_sends_notfound() {
     let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
 
     // Intermediate node (has requester_addr) should return SendAndComplete with NotFound
-    let result =
-        SubscribeOp::not_found_result(tx, instance_id, Some(requester), "HTL exhausted");
+    let result = SubscribeOp::not_found_result(tx, instance_id, Some(requester), "HTL exhausted");
 
     match result {
         Ok(OperationResult::SendAndComplete {
@@ -1111,7 +1110,11 @@ fn test_not_found_result_intermediate_node_sends_notfound() {
             next_hop,
             stream_data,
         }) => {
-            assert_eq!(next_hop, Some(requester), "NotFound should be sent to requester");
+            assert_eq!(
+                next_hop,
+                Some(requester),
+                "NotFound should be sent to requester"
+            );
             assert!(stream_data.is_none());
 
             // Verify the message is a NotFound response
@@ -1151,7 +1154,10 @@ fn test_not_found_result_originator_returns_error() {
     // Originator (no requester_addr) should return Err
     let result = SubscribeOp::not_found_result(tx, instance_id, None, "no closer peers");
 
-    assert!(result.is_err(), "Originator should get an error, not a message");
+    assert!(
+        result.is_err(),
+        "Originator should get an error, not a message"
+    );
 }
 
 /// it validates that the temporary operation created for routing carries the
