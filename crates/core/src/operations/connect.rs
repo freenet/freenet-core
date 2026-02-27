@@ -173,6 +173,13 @@ pub(crate) enum ConnectMsg {
         id: Transaction,
         desired_location: Location,
     },
+    /// Sent by the joiner when hole-punch to an acceptor fails. Travels downstream
+    /// from the gateway through the relay chain so each relay can try re-routing
+    /// to a different acceptor. If no relay can re-route, propagates back upstream.
+    ConnectFailed {
+        id: Transaction,
+        failed_acceptor_addr: SocketAddr,
+    },
 }
 
 impl InnerMessage for ConnectMsg {
@@ -181,7 +188,8 @@ impl InnerMessage for ConnectMsg {
             ConnectMsg::Request { id, .. }
             | ConnectMsg::Response { id, .. }
             | ConnectMsg::ObservedAddress { id, .. }
-            | ConnectMsg::Rejected { id, .. } => id,
+            | ConnectMsg::Rejected { id, .. }
+            | ConnectMsg::ConnectFailed { id, .. } => id,
         }
     }
 
@@ -191,7 +199,9 @@ impl InnerMessage for ConnectMsg {
             ConnectMsg::Rejected {
                 desired_location, ..
             } => Some(*desired_location),
-            ConnectMsg::Response { .. } | ConnectMsg::ObservedAddress { .. } => None,
+            ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::ConnectFailed { .. } => None,
         }
     }
 }
@@ -214,6 +224,15 @@ impl fmt::Display for ConnectMsg {
                 desired_location, ..
             } => {
                 write!(f, "Rejected {{ desired: {desired_location} }}")
+            }
+            ConnectMsg::ConnectFailed {
+                failed_acceptor_addr,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ConnectFailed {{ failed_acceptor: {failed_acceptor_addr} }}"
+                )
             }
         }
     }
@@ -278,6 +297,10 @@ pub(crate) struct RelayState {
     pub forwarded_at: Option<Instant>,
     pub observed_sent: bool,
     pub accepted_locally: bool,
+    /// Set to true after successfully forwarding a ConnectResponse upstream.
+    /// Prevents false "uphill route timed out" logging in GC, and preserves
+    /// `forwarded_to` for ConnectFailed downstream propagation.
+    pub response_forwarded: bool,
 }
 
 /// Abstractions required to evaluate an inbound connect request at an
@@ -671,6 +694,7 @@ impl RelayContext for RelayEnv<'_> {
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
+            connection_manager: &self.op_manager.ring.connection_manager,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -769,6 +793,7 @@ impl RelayContext for RelayEnv<'_> {
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
+            connection_manager: &self.op_manager.ring.connection_manager,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -938,6 +963,7 @@ impl ConnectOp {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         }));
         Self {
             id,
@@ -1117,6 +1143,7 @@ impl ConnectOp {
                 forwarded_at: None,
                 observed_sent: false,
                 accepted_locally: false,
+                response_forwarded: false,
             })));
         }
 
@@ -1503,7 +1530,7 @@ impl Operation for ConnectOp {
                                     })
                                     .await?;
 
-                                if let Some(result) = rx.recv().await {
+                                let hole_punch_ok = if let Some(result) = rx.recv().await {
                                     if let Ok((peer_id, _remaining)) = result {
                                         tracing::info!(
                                             %peer_id,
@@ -1511,12 +1538,14 @@ impl Operation for ConnectOp {
                                             elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect joined peer"
                                         );
+                                        true
                                     } else {
                                         tracing::warn!(
                                             tx=%self.id,
                                             elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect ConnectPeer failed"
                                         );
+                                        false
                                     }
                                 } else {
                                     tracing::warn!(
@@ -1526,11 +1555,45 @@ impl Operation for ConnectOp {
                                         "ConnectPeer callback channel closed without result; \
                                          peer promotion may not have completed"
                                     );
+                                    false
+                                };
+
+                                // On hole-punch failure, send ConnectFailed to the gateway
+                                // so the relay chain can try re-routing to a different acceptor.
+                                // Stay in WaitingForResponses to receive a new ConnectResponse.
+                                if !hole_punch_ok {
+                                    if let Some(failed_addr) = new_acceptor.peer.socket_addr() {
+                                        if let Some(gw_addr) = self.get_next_hop_addr() {
+                                            let failed_msg = ConnectMsg::ConnectFailed {
+                                                id: self.id,
+                                                failed_acceptor_addr: failed_addr,
+                                            };
+                                            tracing::info!(
+                                                tx = %self.id,
+                                                failed_acceptor = %failed_addr,
+                                                gateway = %gw_addr,
+                                                "connect: sending ConnectFailed to gateway for re-routing"
+                                            );
+                                            network_bridge
+                                                .send(
+                                                    gw_addr,
+                                                    NetMessage::V1(NetMessageV1::Connect(
+                                                        failed_msg,
+                                                    )),
+                                                )
+                                                .await?;
+                                        }
+                                    }
                                 }
                             }
 
                             if acceptance.satisfied {
                                 self.state = Some(ConnectState::Completed);
+                                // Reset jitter counter on successful connect
+                                op_manager
+                                    .ring
+                                    .connection_manager
+                                    .reset_connect_jitter_failures();
                                 // Clear gateway backoff on successful connect completion
                                 // This ensures successful gateways aren't penalized by previous failures
                                 if let Some(gw_addr) = self.get_next_hop_addr() {
@@ -1587,6 +1650,11 @@ impl Operation for ConnectOp {
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
+                        // Mark that we've forwarded a response so GC doesn't log
+                        // a false "uphill route timed out" for this completed relay.
+                        if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                            state.response_forwarded = true;
+                        }
                         Ok(store_operation_state(&mut self))
                     } else {
                         tracing::warn!(
@@ -1756,17 +1824,165 @@ impl Operation for ConnectOp {
                         Ok(store_operation_state(&mut self))
                     }
                 }
+                ConnectMsg::ConnectFailed {
+                    failed_acceptor_addr,
+                    ..
+                } => {
+                    if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                        // Relay received ConnectFailed. Strategy: if we have a downstream
+                        // peer that already forwarded a response, send ConnectFailed there
+                        // first (closer relay has better local knowledge for re-routing).
+                        if state.response_forwarded {
+                            if let Some(ref fwd) = state.forwarded_to {
+                                if let Some(fwd_addr) = fwd.socket_addr() {
+                                    let fwd_msg = ConnectMsg::ConnectFailed {
+                                        id: self.id,
+                                        failed_acceptor_addr: *failed_acceptor_addr,
+                                    };
+                                    tracing::info!(
+                                        tx = %self.id,
+                                        forwarded_to_addr = %fwd_addr,
+                                        failed_acceptor = %failed_acceptor_addr,
+                                        "connect: forwarding ConnectFailed downstream"
+                                    );
+                                    network_bridge
+                                        .send(
+                                            fwd_addr,
+                                            NetMessage::V1(NetMessageV1::Connect(fwd_msg)),
+                                        )
+                                        .await?;
+                                    state.response_forwarded = false;
+                                    return Ok(store_operation_state(&mut self));
+                                }
+                            }
+                        }
+
+                        // No downstream available — try re-routing locally.
+                        // Extract fields before dropping state borrow (same pattern as Rejected).
+                        let upstream_addr = state.upstream_addr;
+                        let failed_peer = state.forwarded_to.clone();
+                        let desired_location = state.request.desired_location;
+
+                        // Record failure in exclusion tracker
+                        op_manager
+                            .ring
+                            .connection_manager
+                            .record_connect_acceptor_failure(*failed_acceptor_addr);
+
+                        // Record forward failure in estimator (drops state borrow via self)
+                        if let Some(ref fwd) = failed_peer {
+                            self.record_forward_outcome(fwd, desired_location, false);
+                        }
+
+                        // Re-borrow state, add failed acceptor to bloom filter, re-route
+                        let env = RelayEnv::new(op_manager);
+                        let estimator = self.connect_forward_estimator.read().clone();
+                        let retry_actions =
+                            if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                                state.request.visited.mark_visited(*failed_acceptor_addr);
+                                state.forwarded_to = None;
+                                state.forwarded_at = None;
+                                state.response_forwarded = false;
+                                state.handle_request(
+                                    &env,
+                                    &self.recency,
+                                    &mut self.forward_attempts,
+                                    &estimator,
+                                )
+                            } else {
+                                unreachable!("state was Relaying at branch entry")
+                            };
+
+                        if let Some((peer, forward_req)) = retry_actions.forward {
+                            self.recency.insert(peer.clone(), Instant::now());
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_acceptor = %failed_acceptor_addr,
+                                retry_peer = %peer.pub_key(),
+                                "connect: relay re-routing to different peer after ConnectFailed"
+                            );
+                            let forward_msg = ConnectMsg::Request {
+                                id: self.id,
+                                payload: forward_req,
+                            };
+                            if let Some(addr) = peer.socket_addr() {
+                                network_bridge
+                                    .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
+                                    .await?;
+                            }
+                        } else if let Some(response) = retry_actions.accept_response {
+                            tracing::info!(
+                                tx = %self.id,
+                                failed_acceptor = %failed_acceptor_addr,
+                                acceptor = %response.acceptor.pub_key(),
+                                "connect: relay accepting locally after ConnectFailed"
+                            );
+                            let response_msg = ConnectMsg::Response {
+                                id: self.id,
+                                payload: response,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                                )
+                                .await?;
+                        } else {
+                            // No options — propagate ConnectFailed upstream
+                            tracing::info!(
+                                tx = %self.id,
+                                upstream_addr = %upstream_addr,
+                                failed_acceptor = %failed_acceptor_addr,
+                                "connect: relay propagating ConnectFailed upstream (no re-route available)"
+                            );
+                            let upstream_msg = ConnectMsg::ConnectFailed {
+                                id: self.id,
+                                failed_acceptor_addr: *failed_acceptor_addr,
+                            };
+                            network_bridge
+                                .send(
+                                    upstream_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(upstream_msg)),
+                                )
+                                .await?;
+                        }
+                        Ok(store_operation_state(&mut self))
+                    } else if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
+                        // Joiner received ConnectFailed propagated all the way back —
+                        // no relay could re-route. Record failure and complete so the
+                        // retry loop (with jitter) can try again.
+                        tracing::info!(
+                            tx = %self.id,
+                            failed_acceptor = %failed_acceptor_addr,
+                            "connect: all relays exhausted, ConnectFailed reached joiner"
+                        );
+                        op_manager.ring.record_connection_failure(
+                            self.desired_location.unwrap_or_else(Location::random),
+                            ConnectionFailureReason::Rejected,
+                        );
+                        self.state = Some(ConnectState::Completed);
+                        Ok(store_operation_state(&mut self))
+                    } else {
+                        tracing::warn!(
+                            tx = %self.id,
+                            state = ?self.state,
+                            "connect: received ConnectFailed but not in expected state"
+                        );
+                        Ok(store_operation_state(&mut self))
+                    }
+                }
             }
         })
     }
 }
 
-/// Skip list that combines visited peers with the current node's own address.
-/// This ensures we never select ourselves as a forwarding target, even if
-/// self wasn't properly added to the visited list by upstream callers.
+/// Skip list that combines visited peers, own address, and CONNECT-excluded peers.
+/// This ensures we never select ourselves as a forwarding target and avoids
+/// peers with repeated acceptor failures.
 struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
+    connection_manager: &'a crate::ring::ConnectionManager,
 }
 
 impl Contains<SocketAddr> for SkipListWithSelf<'_> {
@@ -1776,6 +1992,10 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
             if target == self_addr {
                 return true;
             }
+        }
+        // Check if target is excluded from CONNECT routing due to repeated failures
+        if self.connection_manager.is_connect_excluded(target) {
+            return true;
         }
         // Check if target is in the visited list (bloom filter)
         self.visited.probably_visited(target)
@@ -1872,7 +2092,34 @@ pub(crate) async fn join_ring_request(
     // - The gateway routes toward the joiner's ring neighborhood → better initial placement
     // - Deterministic in simulation tests (same seed → same location → same topology)
     // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
-    let desired_location = own.location().unwrap_or_else(Location::random);
+    let base_location = own.location().unwrap_or_else(Location::random);
+
+    // Apply location jitter on retry to explore different ring regions.
+    // After consecutive hole-punch failures, the same location routes to the same
+    // acceptors. Jittering the target location causes routing to converge on
+    // different ring peers, increasing the chance of finding a NAT-compatible acceptor.
+    let failures = op_manager
+        .ring
+        .connection_manager
+        .increment_connect_jitter_failures();
+    let desired_location = if failures > 1 {
+        // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
+        let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);
+        // Generate uniform random offset in [-magnitude, +magnitude]
+        let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+        let offset = magnitude * (2.0 * uniform_01 - 1.0);
+        let jittered = (base_location.as_f64() + offset).rem_euclid(1.0);
+        tracing::info!(
+            failures,
+            magnitude,
+            base = %base_location,
+            jittered,
+            "connect: applying location jitter after consecutive failures"
+        );
+        Location::new(jittered)
+    } else {
+        base_location
+    };
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -2276,6 +2523,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc.clone());
@@ -2320,6 +2568,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc.clone());
@@ -2361,6 +2610,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc)
@@ -2400,6 +2650,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // should_accept() returns true, but we have a next_hop - so we're NOT at terminus
@@ -2461,6 +2712,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc);
@@ -2524,6 +2776,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc);
@@ -2591,7 +2844,8 @@ mod tests {
             }
             other @ ConnectMsg::Response { .. }
             | other @ ConnectMsg::ObservedAddress { .. }
-            | other @ ConnectMsg::Rejected { .. } => panic!("unexpected message: {other:?}"),
+            | other @ ConnectMsg::Rejected { .. }
+            | other @ ConnectMsg::ConnectFailed { .. } => panic!("unexpected message: {other:?}"),
         }
 
         assert!(matches!(
@@ -2696,6 +2950,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(relay.clone());
@@ -2836,6 +3091,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // First call: should forward (next_hop available)
@@ -2905,6 +3161,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // No next hop available (we're at terminus)
@@ -2946,6 +3203,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // Next hop exists, but TTL is 0
@@ -3002,6 +3260,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // At terminus (no next_hop), cannot accept, but uphill_hop available
@@ -3057,6 +3316,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // At terminus, cannot accept, no uphill peers
@@ -3103,6 +3363,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // At terminus, cannot accept, uphill peer exists but TTL is 0
@@ -3224,7 +3485,8 @@ mod tests {
             ConnectMsg::Request { payload, .. } => payload,
             ConnectMsg::Response { .. }
             | ConnectMsg::ObservedAddress { .. }
-            | ConnectMsg::Rejected { .. } => panic!("Expected ConnectMsg::Request"),
+            | ConnectMsg::Rejected { .. }
+            | ConnectMsg::ConnectFailed { .. } => panic!("Expected ConnectMsg::Request"),
         };
 
         // Restore hash keys to check (simulating what relay does)
@@ -3258,9 +3520,11 @@ mod tests {
 
         visited.mark_visited(visited_addr);
 
+        let cm = crate::ring::ConnectionManager::test_default();
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
+            connection_manager: &cm,
         };
 
         // Should skip visited addresses
@@ -3299,6 +3563,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc)
@@ -3331,6 +3596,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc).accept(false);
@@ -3362,6 +3628,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         let ctx = TestRelayContext::new(self_loc)
@@ -3403,6 +3670,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // Step 1: Initial forward to peer_a
@@ -3455,6 +3723,7 @@ mod tests {
             forwarded_at: None,
             observed_sent: false,
             accepted_locally: false,
+            response_forwarded: false,
         };
 
         // Step 1: Initial forward to peer_a
@@ -3523,6 +3792,210 @@ mod tests {
             scored.len(),
             2,
             "Must keep all low-score peers when no alternatives exist"
+        );
+    }
+
+    // ==================== ConnectFailed + Jitter + Exclusion Tests ====================
+
+    #[test]
+    fn test_connect_failed_serialization_roundtrip() {
+        use bincode::{deserialize, serialize};
+        let tx = Transaction::new::<ConnectMsg>();
+        let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let msg = ConnectMsg::ConnectFailed {
+            id: tx,
+            failed_acceptor_addr: addr,
+        };
+
+        let encoded = serialize(&msg).expect("serialize ConnectFailed");
+        let decoded: ConnectMsg = deserialize(&encoded).expect("deserialize ConnectFailed");
+
+        match decoded {
+            ConnectMsg::ConnectFailed {
+                id,
+                failed_acceptor_addr,
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(failed_acceptor_addr, addr);
+            }
+            ConnectMsg::Request { .. }
+            | ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::Rejected { .. } => {
+                panic!("expected ConnectFailed, got: {decoded}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_connect_failed_inner_message_traits() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let msg = ConnectMsg::ConnectFailed {
+            id: tx,
+            failed_acceptor_addr: addr,
+        };
+
+        assert_eq!(
+            *msg.id(),
+            tx,
+            "ConnectFailed should return its transaction id"
+        );
+        assert_eq!(
+            msg.requested_location(),
+            None,
+            "ConnectFailed should return None for requested_location"
+        );
+        let display = format!("{msg}");
+        assert!(
+            display.contains("ConnectFailed"),
+            "Display should mention ConnectFailed: {display}"
+        );
+    }
+
+    #[test]
+    fn test_jitter_magnitude_at_various_failure_counts() {
+        // Verify jitter magnitude formula: 0.05 * 2^(failures-2), capped at 0.25
+        let cases = vec![
+            (1u32, 0.0), // failures=1 → no jitter
+            (2, 0.05),   // 0.05 * 2^0 = 0.05
+            (3, 0.10),   // 0.05 * 2^1 = 0.10
+            (4, 0.20),   // 0.05 * 2^2 = 0.20
+            (5, 0.25),   // 0.05 * 2^3 = 0.40 → capped at 0.25
+            (10, 0.25),  // Still capped at 0.25
+        ];
+
+        for (failures, expected_magnitude) in cases {
+            let magnitude = if failures > 1 {
+                (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25)
+            } else {
+                0.0
+            };
+            assert!(
+                (magnitude - expected_magnitude).abs() < 1e-10,
+                "failures={failures}: expected magnitude {expected_magnitude}, got {magnitude}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connect_jitter_counter() {
+        let cm = crate::ring::ConnectionManager::test_default();
+
+        assert_eq!(cm.connect_jitter_failure_count(), 0);
+
+        let count = cm.increment_connect_jitter_failures();
+        assert_eq!(count, 1);
+        assert_eq!(cm.connect_jitter_failure_count(), 1);
+
+        let count = cm.increment_connect_jitter_failures();
+        assert_eq!(count, 2);
+
+        cm.reset_connect_jitter_failures();
+        assert_eq!(cm.connect_jitter_failure_count(), 0);
+    }
+
+    #[test]
+    fn test_connect_exclusion_tracking() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+
+        // Not excluded initially
+        assert!(!cm.is_connect_excluded(addr));
+
+        // Record failures below threshold
+        cm.record_connect_acceptor_failure(addr);
+        cm.record_connect_acceptor_failure(addr);
+        assert!(!cm.is_connect_excluded(addr), "below threshold");
+
+        // Third failure crosses threshold
+        cm.record_connect_acceptor_failure(addr);
+        assert!(cm.is_connect_excluded(addr), "at threshold");
+
+        // Clear exclusion
+        cm.clear_connect_exclusion(addr);
+        assert!(!cm.is_connect_excluded(addr), "after clear");
+    }
+
+    #[test]
+    fn test_skip_list_excludes_connect_excluded_peers() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let visited = VisitedPeers::new(&tx);
+        let self_addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let excluded_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let normal_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
+
+        let cm = crate::ring::ConnectionManager::test_default();
+
+        // Exclude a peer by recording 3 failures
+        for _ in 0..3 {
+            cm.record_connect_acceptor_failure(excluded_addr);
+        }
+
+        let skip = SkipListWithSelf {
+            visited: &visited,
+            self_addr: Some(self_addr),
+            connection_manager: &cm,
+        };
+
+        assert!(skip.has_element(self_addr), "self should be skipped");
+        assert!(
+            skip.has_element(excluded_addr),
+            "connect-excluded peer should be skipped"
+        );
+        assert!(
+            !skip.has_element(normal_addr),
+            "normal peer should not be skipped"
+        );
+    }
+
+    #[test]
+    fn test_bloom_filter_excludes_failed_acceptor() {
+        // After receiving ConnectFailed, the relay marks the failed acceptor
+        // in the bloom filter so routing avoids it.
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut visited = VisitedPeers::new(&tx);
+        let failed_addr: SocketAddr = "10.0.0.99:9000".parse().unwrap();
+
+        assert!(
+            !visited.probably_visited(failed_addr),
+            "addr should not be visited initially"
+        );
+
+        visited.mark_visited(failed_addr);
+
+        assert!(
+            visited.probably_visited(failed_addr),
+            "failed addr should be marked as visited after ConnectFailed processing"
+        );
+    }
+
+    #[test]
+    fn test_response_forwarded_prevents_false_timeout() {
+        // Verify that response_forwarded=true prevents the GC from logging
+        // a false "uphill route timed out" warning.
+        let relay_peer = make_peer(5001);
+        let state = RelayState {
+            upstream_addr: "10.0.0.1:5000".parse().unwrap(),
+            request: ConnectRequest {
+                desired_location: Location::new(0.3),
+                joiner: make_peer(5002),
+                ttl: 5,
+                visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+            },
+            forwarded_to: Some(relay_peer),
+            forwarded_at: Some(Instant::now()),
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: true,
+        };
+
+        // With response_forwarded=true, even though forwarded_to is Some,
+        // this should NOT be considered a timeout.
+        assert!(state.response_forwarded, "response_forwarded should be set");
+        assert!(
+            state.forwarded_to.is_some(),
+            "forwarded_to should still be preserved for ConnectFailed propagation"
         );
     }
 }

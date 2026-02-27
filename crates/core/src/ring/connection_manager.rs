@@ -16,7 +16,7 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -262,6 +262,13 @@ pub(crate) struct ConnectionManager {
     connected_since: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
     /// Per-peer routing health statistics for eviction decisions.
     pub(crate) peer_health: Arc<Mutex<PeerHealthTracker>>,
+    /// Consecutive CONNECT failures for location jitter.
+    /// Incremented on failed hole-punch, reset on successful connect.
+    connect_jitter_failures: Arc<AtomicU32>,
+    /// Peers excluded from CONNECT routing due to repeated acceptor failures.
+    /// Key: peer addr, Value: (failure_count, last_failure_time).
+    /// Entries expire after `CONNECT_EXCLUDE_TTL`.
+    connect_excluded_peers: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, (u32, Instant)>>>,
 }
 
 impl ConnectionManager {
@@ -378,6 +385,8 @@ impl ConnectionManager {
             min_ready_connections,
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
+            connect_jitter_failures: Arc::new(AtomicU32::new(0)),
+            connect_excluded_peers: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -1395,6 +1404,66 @@ impl ConnectionManager {
         self.recently_failed_addrs.write().clear();
     }
 
+    // ==================== CONNECT Jitter ====================
+
+    /// Increment consecutive connect failure counter and return the new count.
+    pub fn increment_connect_jitter_failures(&self) -> u32 {
+        self.connect_jitter_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Reset consecutive connect failure counter (called on successful connect).
+    pub fn reset_connect_jitter_failures(&self) {
+        self.connect_jitter_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Current consecutive connect failure count.
+    #[cfg(test)]
+    pub fn connect_jitter_failure_count(&self) -> u32 {
+        self.connect_jitter_failures.load(Ordering::Relaxed)
+    }
+
+    // ==================== CONNECT Routing Exclusion ====================
+
+    /// How long a peer stays excluded from CONNECT routing after repeated failures.
+    const CONNECT_EXCLUDE_TTL: Duration = Duration::from_secs(30 * 60);
+
+    /// Number of ConnectFailed events before a peer is excluded from CONNECT routing.
+    const CONNECT_EXCLUDE_THRESHOLD: u32 = 3;
+
+    /// Record a ConnectFailed for a peer acting as acceptor. Returns the new failure count.
+    pub fn record_connect_acceptor_failure(&self, addr: SocketAddr) -> u32 {
+        let mut map = self.connect_excluded_peers.write();
+        let entry = map.entry(addr).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        entry.0
+    }
+
+    /// Check if a peer is excluded from CONNECT routing.
+    pub fn is_connect_excluded(&self, addr: SocketAddr) -> bool {
+        let map = self.connect_excluded_peers.read();
+        if let Some((count, last_failure)) = map.get(&addr) {
+            *count >= Self::CONNECT_EXCLUDE_THRESHOLD
+                && last_failure.elapsed() < Self::CONNECT_EXCLUDE_TTL
+        } else {
+            false
+        }
+    }
+
+    /// Clear connect exclusion for a peer (on successful hole-punch).
+    #[allow(dead_code)]
+    pub fn clear_connect_exclusion(&self, addr: SocketAddr) {
+        self.connect_excluded_peers.write().remove(&addr);
+    }
+
+    /// Remove expired exclusion entries.
+    #[allow(dead_code)]
+    pub fn cleanup_expired_exclusions(&self) {
+        self.connect_excluded_peers
+            .write()
+            .retain(|_, (_, ts)| ts.elapsed() < Self::CONNECT_EXCLUDE_TTL);
+    }
+
     #[allow(dead_code)]
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = SocketAddr> {
         let read = self.location_for_peer.read();
@@ -1441,6 +1510,26 @@ impl ConnectionManager {
     /// Check if *this* node has crossed the readiness threshold.
     pub fn is_self_ready(&self) -> bool {
         self.min_ready_connections == 0 || self.connection_count() >= self.min_ready_connections
+    }
+
+    /// Create a minimal ConnectionManager for unit tests.
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        use crate::topology::rate::Rate;
+        let keypair = crate::transport::TransportKeypair::new();
+        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
+        Self::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            4,
+            10,
+            7,
+            (keypair.public().clone(), None, own_location),
+            false,
+            10,
+            Duration::from_secs(60),
+            0,
+        )
     }
 }
 

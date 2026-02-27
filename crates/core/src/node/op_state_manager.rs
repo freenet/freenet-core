@@ -1307,6 +1307,12 @@ fn remove_get_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring
 /// This directly counts lost uphill routes and identifies which peers are unresponsive.
 fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
     if let Some(ConnectState::Relaying(state)) = &op.state {
+        // Don't log timeout for relays that already forwarded a ConnectResponse —
+        // forwarded_to is preserved for ConnectFailed propagation, not because
+        // we're still waiting for a response.
+        if state.response_forwarded {
+            return;
+        }
         if let Some(ref peer) = state.forwarded_to {
             let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
                 fwd_at.elapsed().as_secs()
