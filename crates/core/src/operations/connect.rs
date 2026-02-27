@@ -2407,6 +2407,67 @@ pub(crate) async fn initial_join_procedure(
     Ok(handle)
 }
 
+/// Periodic gateway probe that runs independently of the bootstrap loop.
+///
+/// Fixes the "stuck peer island" problem: peers with enough connections
+/// (>= BOOTSTRAP_THRESHOLD) never contact gateways, so they never discover
+/// version mismatches. This probe picks a random gateway every ~30 minutes
+/// and attempts a join_ring_request. If the gateway has a different version,
+/// the handshake fails with ProtocolVersionMismatch which triggers the
+/// existing update mechanism.
+pub(crate) async fn spawn_gateway_probe(
+    op_manager: Arc<OpManager>,
+    gateways: &[PeerKeyLocation],
+) -> JoinHandle<()> {
+    let gateways = gateways.to_vec();
+    GlobalExecutor::spawn(async move {
+        if gateways.is_empty() {
+            return;
+        }
+
+        // Initial delay: let bootstrap complete first.
+        const INITIAL_DELAY_SECS: u64 = 300; // 5 minutes
+        const PROBE_INTERVAL_SECS: u64 = 1800; // 30 minutes
+
+        tokio::time::sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
+
+        loop {
+            // ±20% jitter on the probe interval
+            let jitter_factor = 0.8 + (GlobalRng::random_u64() % 400) as f64 / 1000.0;
+            let interval = Duration::from_secs_f64(PROBE_INTERVAL_SECS as f64 * jitter_factor);
+
+            // Sleep is interruptible via gateway_backoff_cleared (matching existing patterns).
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {},
+                _ = op_manager.gateway_backoff_cleared.notified() => {
+                    tracing::debug!("Gateway probe: backoff cleared, probing now");
+                },
+            }
+
+            // Pick a random gateway
+            let idx = GlobalRng::random_u64() as usize % gateways.len();
+            let gateway = &gateways[idx];
+
+            tracing::info!(
+                %gateway,
+                "Periodic gateway probe: checking for version compatibility"
+            );
+
+            if let Err(error) = join_ring_request(gateway, &op_manager).await {
+                // ProtocolVersionMismatch → signaling is handled inside the handshake.
+                // Other errors are harmless (connection refused, already connected, etc.)
+                tracing::debug!(
+                    %gateway,
+                    %error,
+                    "Gateway probe: connection attempt result"
+                );
+            } else {
+                tracing::debug!(%gateway, "Gateway probe: connection succeeded");
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

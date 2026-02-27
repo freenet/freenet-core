@@ -186,11 +186,17 @@ Alice                                                Bob
 - Mismatch causes connection rejection
 - Prevents downgrade attacks
 
-**Version Format:**
-- 8 bytes: `[major:1][minor:1][patch:1][flags:4][reserved:1]`
-- Flags encode pre-release tags (alpha/beta/rc)
+**Version Format (new, v0.1.153+):**
+- 8 bytes: `[0xFF:1][major:1][minor:1][patch_hi:1][patch_lo:1][min_patch_hi:1][min_patch_lo:1][format:1]`
+- `0xFF` marker in byte 0 distinguishes from old format (old peers see major mismatch → clean reject)
+- `min_patch` encodes the minimum compatible patch version (bidirectional range check)
+- `format` byte (currently 1) in byte 7 provides additional old-format discrimination
 
-**Upgrade Strategy:** Major version mismatch → incompatible, minor version mismatch → backward compatible
+**Version Format (old, ≤0.1.152):**
+- 8 bytes: `[major:1][minor:1][patch:1][flags:4][reserved=0:1]`
+- New peers detect old format via byte[7]==0 and apply one-way compatibility check
+
+**Upgrade Strategy:** Bidirectional range-based compatibility. Each peer advertises its minimum compatible version; both sides must satisfy each other's minimum.
 
 **Code Reference:** `crates/core/src/transport/connection_handler.rs:1940-2058`
 

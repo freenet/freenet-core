@@ -167,6 +167,12 @@ impl NodeP2P {
             .await?;
             self.initial_join_task = Some(join_handle);
 
+            // Periodic gateway probe: detect version mismatches even when
+            // the peer has enough connections (fixes "stuck island" problem).
+            let _probe_handle =
+                connect::spawn_gateway_probe(self.op_manager.clone(), &self.conn_manager.gateways)
+                    .await;
+
             // Note: We don't run aggressive_initial_connections here because
             // the event listener hasn't started yet. The connect requests from
             // initial_join_procedure are queued but won't be processed until

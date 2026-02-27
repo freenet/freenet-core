@@ -7,6 +7,7 @@
 //! See `architecture.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -52,6 +53,55 @@ pub fn has_version_mismatch() -> bool {
 /// Clear the version mismatch flag (called after checking for updates).
 pub fn clear_version_mismatch() {
     VERSION_MISMATCH_DETECTED.store(false, Ordering::SeqCst);
+}
+
+// =============================================================================
+// Decentralized version discovery
+// =============================================================================
+//
+// Peers learn about newer versions from successful handshakes with neighbors.
+// HIGHEST_SEEN_VERSION tracks the highest version seen in the network.
+// URGENT_UPDATE_NEEDED is set when a remote's min_compatible > our version
+// (meaning we MUST update to remain connected).
+
+/// Highest version observed from any peer during handshake.
+static HIGHEST_SEEN_VERSION: Mutex<Option<(u8, u8, u16)>> = Mutex::new(None);
+
+/// Set when a remote peer's min_compatible version exceeds our version,
+/// meaning we cannot connect to that peer without updating.
+static URGENT_UPDATE_NEEDED: AtomicBool = AtomicBool::new(false);
+
+/// Called on every successful handshake to track the highest version seen.
+pub fn report_peer_version(version: (u8, u8, u16)) {
+    if let Ok(mut guard) = HIGHEST_SEEN_VERSION.lock() {
+        if guard.map_or(true, |cur| version > cur) {
+            *guard = Some(version);
+        }
+    }
+}
+
+/// Get the highest version seen from any peer, if any.
+pub fn get_highest_seen_version() -> Option<(u8, u8, u16)> {
+    HIGHEST_SEEN_VERSION.lock().ok().and_then(|g| *g)
+}
+
+/// Called when a version mismatch indicates we are too old
+/// (remote's min_compatible > our version). This is a breaking change
+/// that requires immediate update.
+pub fn signal_urgent_update() {
+    URGENT_UPDATE_NEEDED.store(true, Ordering::SeqCst);
+    // Also trigger the legacy mismatch path
+    signal_version_mismatch();
+}
+
+/// Check if an urgent (breaking) update is needed.
+pub fn is_urgent_update() -> bool {
+    URGENT_UPDATE_NEEDED.load(Ordering::SeqCst)
+}
+
+/// Clear the urgent update flag.
+pub fn clear_urgent_update() {
+    URGENT_UPDATE_NEEDED.store(false, Ordering::SeqCst);
 }
 
 /// Global counter of open ring connections, updated by `connection_maintenance`.

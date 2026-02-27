@@ -1184,15 +1184,23 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
                                             let decrypted_data = decrypted.data();
                                             let proto_len = PROTOC_VERSION.len();
-                                            if decrypted_data.len() >= proto_len + 16
-                                                && decrypted_data[..proto_len] == PROTOC_VERSION
-                                            {
-                                                tracing::info!(
-                                                    peer_addr = %remote_addr,
-                                                    "Outdated peer upgraded. Allowing reconnection."
-                                                );
-                                                outdated_peer.remove(&remote_addr);
-                                                self.connections.clear_rate_limit(&remote_addr);
+                                            if decrypted_data.len() >= proto_len + 16 {
+                                                let protoc_bytes: Result<[u8; 8], _> =
+                                                    decrypted_data[..proto_len].try_into();
+                                                if let Ok(ref remote_ver) = protoc_bytes {
+                                                    if version_cmp::is_compatible(&PROTOC_VERSION, remote_ver).is_ok() {
+                                                        tracing::info!(
+                                                            peer_addr = %remote_addr,
+                                                            "Outdated peer upgraded. Allowing reconnection."
+                                                        );
+                                                        outdated_peer.remove(&remote_addr);
+                                                        self.connections.clear_rate_limit(&remote_addr);
+                                                    } else {
+                                                        continue;
+                                                    }
+                                                } else {
+                                                    continue;
+                                                }
                                             } else {
                                                 continue;
                                             }
@@ -1231,8 +1239,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     Ok(decrypted) => {
                                                         let decrypted_data = decrypted.data();
                                                         let proto_len = PROTOC_VERSION.len();
-                                                        decrypted_data.len() >= proto_len + 16
-                                                            && decrypted_data[..proto_len] == PROTOC_VERSION
+                                                        if decrypted_data.len() >= proto_len + 16 {
+                                                            decrypted_data[..proto_len].try_into().ok()
+                                                                .map(|remote_ver: [u8; 8]| {
+                                                                    version_cmp::is_compatible(&PROTOC_VERSION, &remote_ver).is_ok()
+                                                                })
+                                                                .unwrap_or(false)
+                                                        } else {
+                                                            false
+                                                        }
                                                     }
                                                     Err(_) => false,
                                                 }
@@ -1468,7 +1483,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             tracing::info!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
-                                crate::transport::signal_version_mismatch();
                             }
                             self.connections.fail_gateway_handshake(&remote_addr);
                         }
@@ -1524,7 +1538,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
-                                    crate::transport::signal_version_mismatch();
                                 }
                                 TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
@@ -1645,16 +1658,33 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     cause: "invalid symmetric key".into(),
                 }
             })?;
-            if protoc != PROTOC_VERSION {
-                let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                socket
-                    .send_to(&packet.prepared_send(), remote_addr)
-                    .await
-                    .map_err(|_| TransportError::ChannelClosed)?;
-                return Err(TransportError::ProtocolVersionMismatch {
-                    expected: PCK_VERSION.to_string(),
-                    actual: format!("{:?}", protoc),
-                });
+            let protoc_bytes: [u8; 8] =
+                protoc
+                    .try_into()
+                    .map_err(|_| TransportError::ConnectionEstablishmentFailure {
+                        cause: "Protocol version field wrong size".into(),
+                    })?;
+            match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
+                Ok(remote_info) => {
+                    crate::transport::report_peer_version(remote_info.version);
+                }
+                Err(reason) => {
+                    // Track version even on incompatible peers — aids version discovery.
+                    let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
+                    crate::transport::report_peer_version(remote_info.version);
+                    if version_cmp::remote_requires_newer_than_us(&PROTOC_VERSION, &protoc_bytes) {
+                        crate::transport::signal_urgent_update();
+                    }
+                    let packet = SymmetricMessage::ack_error(&outbound_key)?;
+                    socket
+                        .send_to(&packet.prepared_send(), remote_addr)
+                        .await
+                        .map_err(|_| TransportError::ChannelClosed)?;
+                    return Err(TransportError::ProtocolVersionMismatch {
+                        expected: PCK_VERSION.to_string(),
+                        actual: reason.to_string(),
+                    });
+                }
             }
 
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
@@ -1823,13 +1853,35 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     "Received intro packet"
                 );
                 let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
-                if protoc != PROTOC_VERSION {
+                if let Ok(protoc_bytes) = <[u8; 8]>::try_from(protoc) {
+                    match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
+                        Ok(remote_info) => {
+                            crate::transport::report_peer_version(remote_info.version);
+                        }
+                        Err(reason) => {
+                            // Track version even on incompatible peers — aids version discovery.
+                            let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
+                            crate::transport::report_peer_version(remote_info.version);
+                            if version_cmp::remote_requires_newer_than_us(
+                                &PROTOC_VERSION,
+                                &protoc_bytes,
+                            ) {
+                                crate::transport::signal_urgent_update();
+                            }
+                            tracing::debug!(
+                                peer_addr = %remote_addr,
+                                %reason,
+                                direction = "outbound",
+                                "Remote is using an incompatible protocol version"
+                            );
+                            return Err(());
+                        }
+                    }
+                } else {
                     tracing::debug!(
                         peer_addr = %remote_addr,
-                        remote_protoc = ?protoc,
-                        this_protoc = ?PROTOC_VERSION,
                         direction = "outbound",
-                        "Remote is using a different protocol version"
+                        "Protocol version field wrong size"
                     );
                     return Err(());
                 }
@@ -2208,8 +2260,27 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
 fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     if let Some(expected) = err.split("expected version").nth(1) {
+        let remote_version_str = expected.trim();
+        // Check if this old peer's rejection actually means we need to update.
+        // Old peers do strict exact-match. If they're compatible with our range
+        // but just don't support range-checking, we should NOT self-update.
+        if !version_cmp::old_peer_rejection_means_we_must_update(
+            remote_version_str,
+            &PROTOC_VERSION,
+        ) {
+            tracing::info!(
+                remote_version = remote_version_str,
+                "Old peer rejected us (strict match) but is within our compatible range — not triggering self-update"
+            );
+            return TransportError::ProtocolVersionMismatch {
+                expected: remote_version_str.to_string(),
+                actual: PCK_VERSION.to_string(),
+            };
+        }
+        // Remote is genuinely newer — signal version mismatch
+        crate::transport::signal_version_mismatch();
         TransportError::ProtocolVersionMismatch {
-            expected: expected.trim().to_string(),
+            expected: remote_version_str.to_string(),
             actual: PCK_VERSION.to_string(),
         }
     } else {
@@ -2258,122 +2329,448 @@ struct InboundRemoteConnection {
 }
 
 mod version_cmp {
-    use crate::config::PCK_VERSION;
+    use crate::config::{MIN_COMPATIBLE_VERSION, PCK_VERSION};
 
-    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(PCK_VERSION);
+    /// New-format marker byte. Old peers see major=0xFF (!=their major) → clean reject.
+    const NEW_FORMAT_MARKER: u8 = 0xFF;
+    /// Format version byte in position 7. Old peers see reserved!=0 → clean reject.
+    const FORMAT_VERSION: u8 = 1;
 
-    const fn parse_version_with_flags(version: &str) -> [u8; 8] {
+    /// Our version in the new 8-byte wire format.
+    ///
+    /// Layout: `[0xFF, major, minor, patch_hi, patch_lo, min_patch_hi, min_patch_lo, format=1]`
+    ///
+    /// Old peers (0.1.152 and earlier) used: `[major, minor, patch_u8, flags(4), reserved=0]`
+    /// They see byte[0]=0xFF as major mismatch → clean ack_error. No crypto confusion.
+    pub(super) const PROTOC_VERSION: [u8; 8] =
+        encode_new_format(PCK_VERSION, MIN_COMPATIBLE_VERSION);
+
+    /// Parsed version info from an 8-byte wire version field.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct VersionInfo {
+        pub version: (u8, u8, u16),
+        /// None for old-format peers (they don't advertise min_compatible).
+        pub min_compatible: Option<(u8, u8, u16)>,
+    }
+
+    impl std::fmt::Display for VersionInfo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let (maj, min, pat) = self.version;
+            write!(f, "{maj}.{min}.{pat}")
+        }
+    }
+
+    /// Encode version + min_compatible into the new 8-byte format.
+    const fn encode_new_format(version: &str, min_compatible: &str) -> [u8; 8] {
+        let (major, minor, patch) = parse_semver(version);
+        let (_min_maj, _min_min, min_patch) = parse_semver(min_compatible);
+        [
+            NEW_FORMAT_MARKER,
+            major,
+            minor,
+            (patch >> 8) as u8,
+            patch as u8,
+            (min_patch >> 8) as u8,
+            min_patch as u8,
+            FORMAT_VERSION,
+        ]
+    }
+
+    /// Parse "X.Y.Z" or "X.Y.Z-prerelease" into (major, minor, patch as u16).
+    const fn parse_semver(version: &str) -> (u8, u8, u16) {
         let mut major = 0u8;
         let mut minor = 0u8;
-        let mut patch = 0u8;
-        let mut flags = 0u32;
-        let mut state = 0; // 0: major, 1: minor, 2: patch
+        let mut patch = 0u16;
+        let mut state = 0u8; // 0: major, 1: minor, 2: patch
 
         let bytes = version.as_bytes();
         let mut i = 0;
-
-        // Parse major.minor.patch
         while i < bytes.len() {
             let c = bytes[i];
             if c == b'.' {
                 state += 1;
             } else if c >= b'0' && c <= b'9' {
-                let digit = c - b'0';
+                let digit = (c - b'0') as u16;
                 match state {
-                    0 => major = major * 10 + digit,
-                    1 => minor = minor * 10 + digit,
+                    0 => major = (major as u16 * 10 + digit) as u8,
+                    1 => minor = (minor as u16 * 10 + digit) as u8,
                     2 => patch = patch * 10 + digit,
                     _ => {}
                 }
             } else {
-                break; // Move to flags processing.
+                break; // Pre-release suffix — ignored for wire format.
             }
             i += 1;
         }
-
-        // Parse flags (pre-release only)
-        if i < bytes.len() && bytes[i] == b'-' {
-            i += 1; // Skip the '-'
-
-            flags = get_flag_hash(bytes, i);
-        }
-
-        // Encode into [u8; 8]
-        [
-            major,
-            minor,
-            patch,
-            (flags >> 24) as u8,
-            (flags >> 16) as u8,
-            (flags >> 8) as u8,
-            flags as u8,
-            0, // Reserved for future use
-        ]
+        (major, minor, patch)
     }
 
-    const fn get_flag_hash(bytes: &[u8], start_index: usize) -> u32 {
-        let mut hash = 0u32;
-        let mut i = start_index;
-
-        while i < bytes.len() {
-            let byte = bytes[i];
-            hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
-            i += 1;
+    /// Parse 8 version bytes. Detects old (byte[7]==0) vs new (byte[0]==0xFF, byte[7]!=0).
+    pub(super) fn parse_version_bytes(bytes: &[u8; 8]) -> VersionInfo {
+        if bytes[0] == NEW_FORMAT_MARKER && bytes[7] != 0 {
+            // New format
+            let major = bytes[1];
+            let minor = bytes[2];
+            let patch = u16::from_be_bytes([bytes[3], bytes[4]]);
+            let min_patch = u16::from_be_bytes([bytes[5], bytes[6]]);
+            VersionInfo {
+                version: (major, minor, patch),
+                min_compatible: Some((major, minor, min_patch)),
+            }
+        } else {
+            // Old format: [major, minor, patch_u8, flags(4), reserved=0]
+            let major = bytes[0];
+            let minor = bytes[1];
+            let patch = bytes[2] as u16;
+            VersionInfo {
+                version: (major, minor, patch),
+                min_compatible: None,
+            }
         }
-        hash
+    }
+
+    /// Version tuple comparison: returns true if a >= b.
+    /// Uses lexicographic tuple ordering, which matches semver precedence.
+    pub(super) fn ver_ge(a: (u8, u8, u16), b: (u8, u8, u16)) -> bool {
+        a >= b
+    }
+
+    /// Returns true if the remote's min_compatible exceeds our local version,
+    /// meaning we MUST update to connect to this peer.
+    pub(super) fn remote_requires_newer_than_us(local: &[u8; 8], remote_bytes: &[u8; 8]) -> bool {
+        let remote_info = parse_version_bytes(remote_bytes);
+        let local_info = parse_version_bytes(local);
+        remote_info
+            .min_compatible
+            .is_some_and(|min| !ver_ge(local_info.version, min))
+    }
+
+    /// Bidirectional compatibility check.
+    ///
+    /// - Old remote (no min_compatible): check `remote_ver >= local_min_compatible`
+    /// - New remote: check both directions
+    pub(super) fn is_compatible(local: &[u8; 8], remote: &[u8; 8]) -> Result<VersionInfo, String> {
+        let local_info = parse_version_bytes(local);
+        let remote_info = parse_version_bytes(remote);
+
+        // Check: remote version >= our min_compatible
+        if let Some(local_min) = local_info.min_compatible {
+            if !ver_ge(remote_info.version, local_min) {
+                return Err(format!(
+                    "remote {} too old for our min_compatible {}.{}.{}",
+                    remote_info, local_min.0, local_min.1, local_min.2,
+                ));
+            }
+        }
+
+        // Check: our version >= remote's min_compatible (if remote is new-format)
+        if let Some(remote_min) = remote_info.min_compatible {
+            if !ver_ge(local_info.version, remote_min) {
+                return Err(format!(
+                    "our {} too old for remote's min_compatible {}.{}.{}",
+                    local_info, remote_min.0, remote_min.1, remote_min.2,
+                ));
+            }
+        }
+
+        Ok(remote_info)
+    }
+
+    /// Check if a version mismatch from an old peer means WE need to update.
+    ///
+    /// When an old peer rejects us (they do strict exact-match), parse their
+    /// version from the error. If their version >= our min_compatible, they're
+    /// compatible with us — they just don't know it. We don't need to update.
+    pub(super) fn old_peer_rejection_means_we_must_update(
+        remote_version_str: &str,
+        local: &[u8; 8],
+    ) -> bool {
+        let local_info = parse_version_bytes(local);
+        let (rmaj, rmin, rpatch) = parse_semver(remote_version_str);
+
+        if let Some(local_min) = local_info.min_compatible {
+            // If remote < our min, we don't care about their rejection
+            // (they're too old for us anyway)
+            if !ver_ge((rmaj, rmin, rpatch), local_min) {
+                return false;
+            }
+        }
+
+        // Remote is compatible with us. Check if WE are compatible with them.
+        // Old peers have strict matching, so their "min_compatible" is effectively
+        // their exact version. If our version < their version, we may need to update.
+        // But actually, an old peer rejects anyone != their exact version.
+        // Since we're new-format and they're old-format, they'll always reject us.
+        // The question is: should we update? Only if they're NEWER than us.
+        !ver_ge(local_info.version, (rmaj, rmin, rpatch))
     }
 
     #[cfg(test)]
-    #[test]
-    fn test_parse_version_with_flags() {
-        fn decode_version_from_bytes(bytes: [u8; 8]) -> String {
-            let major = bytes[0];
-            let minor = bytes[1];
-            let patch = bytes[2];
+    mod tests {
+        use super::*;
 
-            let flags = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-
-            let flags_str = match flags {
-                _ if flags == get_flag_hash(b"alpha", 0) => "alpha",
-                _ if flags == get_flag_hash(b"beta2", 0) => "beta2",
-                _ if flags == get_flag_hash(b"rc1", 0) => "rc1",
-                _ if flags == get_flag_hash(b"rc2", 0) => "rc2",
-                _ => "",
-            };
-
-            if !flags_str.is_empty() {
-                format!("{major}.{minor}.{patch}-{flags_str}")
-            } else {
-                format!("{major}.{minor}.{patch}")
-            }
+        #[test]
+        fn test_parse_semver() {
+            assert_eq!(parse_semver("0.1.152"), (0, 1, 152));
+            assert_eq!(parse_semver("0.1.256"), (0, 1, 256));
+            assert_eq!(parse_semver("0.1.65535"), (0, 1, 65535));
+            assert_eq!(parse_semver("1.2.3-alpha"), (1, 2, 3));
+            assert_eq!(parse_semver("10.20.300"), (10, 20, 300));
         }
 
-        let test_cases = vec![
-            "1.2.3",
-            "1.2.3-alpha",
-            "255.255.255",
-            "10.20.30-beta2",
-            "1.2.3-rc1",
-            "1.2.3-rc2",
-        ];
+        #[test]
+        fn test_new_format_roundtrip() {
+            let encoded = encode_new_format("0.1.153", "0.1.152");
+            let info = parse_version_bytes(&encoded);
+            assert_eq!(info.version, (0, 1, 153));
+            assert_eq!(info.min_compatible, Some((0, 1, 152)));
+        }
 
-        for version_str in test_cases {
-            // Step 1: Encode the version string into bytes
-            let encoded = parse_version_with_flags(version_str);
+        #[test]
+        fn test_old_format_parsing() {
+            // Old format: [major=0, minor=1, patch=152, flags(4), reserved=0]
+            let old = [0u8, 1, 152, 0, 0, 0, 0, 0];
+            let info = parse_version_bytes(&old);
+            assert_eq!(info.version, (0, 1, 152));
+            assert_eq!(info.min_compatible, None);
+        }
 
-            // Step 2: Decode the bytes back into a version string
-            let decoded = decode_version_from_bytes(encoded);
+        #[test]
+        fn test_old_format_with_flags() {
+            // Old format with pre-release flags: still old format because byte[7]=0
+            let old = [0u8, 1, 152, 0x12, 0x34, 0x56, 0x78, 0];
+            let info = parse_version_bytes(&old);
+            assert_eq!(info.version, (0, 1, 152));
+            assert_eq!(info.min_compatible, None);
+        }
 
-            // Step 3: Compare the decoded string with the original version string
-            assert_eq!(
-                decoded, version_str,
-                "Failed for version string '{version_str}', decoded as '{decoded}'"
+        #[test]
+        fn test_new_accepts_old_compatible() {
+            // New peer (0.1.153, min=0.1.152) accepts old peer (0.1.152)
+            let new = encode_new_format("0.1.153", "0.1.152");
+            let old = [0u8, 1, 152, 0, 0, 0, 0, 0];
+            let result = is_compatible(&new, &old);
+            assert!(result.is_ok(), "new should accept compatible old peer");
+            assert_eq!(result.unwrap().version, (0, 1, 152));
+        }
+
+        #[test]
+        fn test_new_rejects_old_incompatible() {
+            // New peer (0.1.155, min=0.1.153) rejects old peer (0.1.152)
+            let new = encode_new_format("0.1.155", "0.1.153");
+            let old = [0u8, 1, 152, 0, 0, 0, 0, 0];
+            let result = is_compatible(&new, &old);
+            assert!(result.is_err(), "new should reject incompatible old peer");
+        }
+
+        #[test]
+        fn test_new_to_new_bidirectional() {
+            // Both new format, compatible
+            let a = encode_new_format("0.1.155", "0.1.153");
+            let b = encode_new_format("0.1.153", "0.1.152");
+            assert!(is_compatible(&a, &b).is_ok());
+            assert!(is_compatible(&b, &a).is_ok());
+        }
+
+        #[test]
+        fn test_new_to_new_asymmetric_reject() {
+            // A requires min 0.1.154, B is 0.1.153 → bidirectional check fails both ways
+            // because B (0.1.153) < A's min (0.1.154)
+            let a = encode_new_format("0.1.155", "0.1.154");
+            let b = encode_new_format("0.1.153", "0.1.150");
+            assert!(
+                is_compatible(&a, &b).is_err(),
+                "A should reject B (too old)"
+            );
+            assert!(
+                is_compatible(&b, &a).is_err(),
+                "B should also reject A (B knows it's too old for A's min)"
+            );
+
+            // One-way compatible: A requires min 0.1.152, B is 0.1.153 → both accept
+            // B requires min 0.1.150, A is 0.1.155 → both accept
+            let a2 = encode_new_format("0.1.155", "0.1.152");
+            let b2 = encode_new_format("0.1.153", "0.1.150");
+            assert!(is_compatible(&a2, &b2).is_ok(), "A2 should accept B2");
+            assert!(is_compatible(&b2, &a2).is_ok(), "B2 should accept A2");
+        }
+
+        #[test]
+        fn test_patch_256_and_above() {
+            let v = encode_new_format("0.1.256", "0.1.200");
+            let info = parse_version_bytes(&v);
+            assert_eq!(info.version, (0, 1, 256));
+            assert_eq!(info.min_compatible, Some((0, 1, 200)));
+
+            let v2 = encode_new_format("0.1.65535", "0.1.1000");
+            let info2 = parse_version_bytes(&v2);
+            assert_eq!(info2.version, (0, 1, 65535));
+            assert_eq!(info2.min_compatible, Some((0, 1, 1000)));
+        }
+
+        #[test]
+        fn test_old_peer_rejection_analysis() {
+            let local = encode_new_format("0.1.153", "0.1.152");
+
+            // Old peer 0.1.152 rejects us — but 0.1.152 >= our min 0.1.152,
+            // and 0.1.152 < 0.1.153 (our version), so we are newer. No update needed.
+            assert!(
+                !old_peer_rejection_means_we_must_update("0.1.152", &local),
+                "should not trigger update when we are newer"
+            );
+
+            // Old peer 0.1.154 rejects us — they're newer. We should update.
+            assert!(
+                old_peer_rejection_means_we_must_update("0.1.154", &local),
+                "should trigger update when remote is newer"
+            );
+
+            // Old peer 0.1.153 rejects us — same version. No update needed.
+            assert!(
+                !old_peer_rejection_means_we_must_update("0.1.153", &local),
+                "should not trigger update for same version"
             );
         }
 
-        let rc1 = parse_version_with_flags("0.1.0-rc1");
-        let rc2 = parse_version_with_flags("0.1.0-rc2");
-        assert_ne!(rc1, rc2, "rc1 and rc2 should have different flags");
+        #[test]
+        fn test_protoc_version_is_new_format() {
+            // Verify our compiled PROTOC_VERSION uses the new format
+            assert_eq!(
+                PROTOC_VERSION[0], NEW_FORMAT_MARKER,
+                "byte 0 must be 0xFF marker"
+            );
+            assert_eq!(
+                PROTOC_VERSION[7], FORMAT_VERSION,
+                "byte 7 must be format version"
+            );
+        }
+
+        #[test]
+        fn test_remote_requires_newer_than_us() {
+            // Remote requires min 0.1.154, we are 0.1.153 → we are too old
+            let local = encode_new_format("0.1.153", "0.1.152");
+            let remote = encode_new_format("0.1.155", "0.1.154");
+            assert!(remote_requires_newer_than_us(&local, &remote));
+
+            // Remote requires min 0.1.152, we are 0.1.153 → we are fine
+            let remote2 = encode_new_format("0.1.155", "0.1.152");
+            assert!(!remote_requires_newer_than_us(&local, &remote2));
+
+            // Old-format remote (no min_compatible) → never triggers urgent
+            let old_remote = [0u8, 1, 155, 0, 0, 0, 0, 0];
+            assert!(!remote_requires_newer_than_us(&local, &old_remote));
+        }
+
+        #[test]
+        fn test_ver_ge() {
+            assert!(ver_ge((0, 1, 153), (0, 1, 152)));
+            assert!(ver_ge((0, 1, 152), (0, 1, 152)));
+            assert!(!ver_ge((0, 1, 151), (0, 1, 152)));
+            assert!(ver_ge((0, 2, 0), (0, 1, 999)));
+            assert!(ver_ge((1, 0, 0), (0, 255, 65535)));
+        }
+
+        /// Wire format only encodes min_patch, inheriting major.minor from the version.
+        /// This is a deliberate constraint: during the 0.x era, all releases share
+        /// major=0, minor=1. When major/minor changes, bump the format byte.
+        #[test]
+        fn test_min_compatible_shares_major_minor_with_version() {
+            // min_compatible always gets the same major.minor as the version
+            let v = encode_new_format("0.1.200", "0.1.150");
+            let info = parse_version_bytes(&v);
+            assert_eq!(info.version, (0, 1, 200));
+            assert_eq!(info.min_compatible, Some((0, 1, 150)));
+
+            // Even if min_compatible had a different major.minor in the source string,
+            // only the patch is preserved (major.minor inherited from version).
+            let v2 = encode_new_format("1.0.5", "0.1.3");
+            let info2 = parse_version_bytes(&v2);
+            assert_eq!(info2.version, (1, 0, 5));
+            // min_compatible inherits (1, 0, _) from version, patch=3 from min_compat
+            assert_eq!(info2.min_compatible, Some((1, 0, 3)));
+        }
+
+        /// Old peer well below our min_compatible should not trigger our self-update.
+        #[test]
+        fn test_old_peer_rejection_below_min_compatible() {
+            let local = encode_new_format("0.1.153", "0.1.152");
+
+            // Old peer 0.1.100 is WAY below our min_compatible (0.1.152).
+            // Their rejection doesn't matter — they're too old for us anyway.
+            assert!(
+                !old_peer_rejection_means_we_must_update("0.1.100", &local),
+                "should not trigger update for peer below our min_compatible"
+            );
+        }
+
+        /// parse_semver with adversarial/malformed input.
+        #[test]
+        fn test_parse_semver_malformed() {
+            // Empty string
+            assert_eq!(parse_semver(""), (0, 0, 0));
+            // Missing patch
+            assert_eq!(parse_semver("0.1"), (0, 1, 0));
+            // Non-numeric
+            assert_eq!(parse_semver("abc"), (0, 0, 0));
+            // Extra dots
+            assert_eq!(parse_semver("0.1.2.3"), (0, 1, 2));
+            // Leading zeros (parsed as decimal digits)
+            assert_eq!(parse_semver("0.1.007"), (0, 1, 7));
+        }
+
+        /// Old-format always has byte[7]==0. New format always has byte[7]!=0.
+        #[test]
+        fn test_format_detection_byte7() {
+            // Old format: byte[7] = 0
+            let old = [0u8, 1, 152, 0, 0, 0, 0, 0];
+            assert!(parse_version_bytes(&old).min_compatible.is_none());
+
+            // New format: byte[7] = FORMAT_VERSION (1)
+            let new = encode_new_format("0.1.153", "0.1.152");
+            assert_eq!(new[7], FORMAT_VERSION);
+            assert!(parse_version_bytes(&new).min_compatible.is_some());
+
+            // Hypothetical old peer with major=255: byte[0]=0xFF, byte[7]=0
+            // Should be parsed as OLD format (byte[7]==0)
+            let old_255 = [0xFF, 1, 152, 0, 0, 0, 0, 0];
+            let info = parse_version_bytes(&old_255);
+            assert!(
+                info.min_compatible.is_none(),
+                "byte[0]=0xFF but byte[7]=0 → old format"
+            );
+            assert_eq!(info.version, (0xFF, 1, 152));
+        }
+
+        /// Both old-format peers: is_compatible always succeeds (no min_compatible check).
+        #[test]
+        fn test_both_old_format_always_compatible() {
+            let a = [0u8, 1, 152, 0, 0, 0, 0, 0];
+            let b = [0u8, 1, 151, 0, 0, 0, 0, 0];
+            // Both old format — no range checking possible, both accept
+            assert!(is_compatible(&a, &b).is_ok());
+            assert!(is_compatible(&b, &a).is_ok());
+        }
+
+        /// Cross-major version peers are always incompatible because min_compatible
+        /// inherits major.minor from the version (wire format only encodes min_patch).
+        /// A 1.0.x peer's min_compatible is always (1, 0, _), which no 0.x peer satisfies.
+        #[test]
+        fn test_cross_major_version_always_incompatible() {
+            let v1 = encode_new_format("1.0.5", "1.0.3");
+            let v0 = encode_new_format("0.1.200", "0.1.150");
+            // v0 (0.1.200) < v1's min (1.0.3) → v1 rejects v0
+            assert!(
+                is_compatible(&v1, &v0).is_err(),
+                "v1 should reject v0 (cross-major incompatible)"
+            );
+            // v1 (1.0.5) >= v0's min (0.1.150) → v0 accepts v1, but v1 (1.0.5) satisfies
+            // v0's min anyway. However, the bidirectional check means v0 also checks
+            // v1's min: v0 (0.1.200) < (1.0.3) → reject.
+            assert!(
+                is_compatible(&v0, &v1).is_err(),
+                "v0 should also reject v1 (v0's version < v1's min)"
+            );
+        }
     }
 
     /// Verifies that handshake completion is atomic - state transitions directly

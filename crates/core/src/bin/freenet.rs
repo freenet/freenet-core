@@ -127,6 +127,7 @@ async fn run_network_node_with_signals(
         has_reached_max_backoff, has_version_mismatch, reset_backoff, version_mismatch_generation,
         UpdateCheckResult, UpdateNeededError,
     };
+    use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
 
     // Set up SIGTERM handler for Unix systems
@@ -188,12 +189,18 @@ async fn run_network_node_with_signals(
     };
 
     // Monitor for version mismatches and check for updates (#3204).
-    // Mitigations against peers getting stuck on old versions:
-    //   1. Reset backoff on fresh mismatch (prevents stale disk state)
-    //   2. Exit code 42 at max backoff + 0 connections (trusts gateway signal)
-    //   3. Hard timeout: 6h isolated with mismatch forces exit regardless
-    //   4. Disabled for dirty builds — `freenet update` replaces the binary with a
-    //      prebuilt release, which would discard local modifications (#3245)
+    //
+    // Three update triggers (checked each 60s tick):
+    //   1. Urgent update: remote's min_compatible > our version → verify with GitHub, exit immediately
+    //   2. Decentralized discovery: highest_seen_version > our version → start stagger timer,
+    //      verify with GitHub when timer expires
+    //   3. Legacy mismatch: existing backoff-based mechanism (fallback)
+    //
+    // GitHub verification before exit-42 is always required — decentralized discovery
+    // tells us *when* to check, GitHub confirms *what* to install.
+    //
+    // Disabled for dirty builds — `freenet update` replaces the binary with a
+    // prebuilt release, which would discard local modifications (#3245)
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
     let auto_update_disabled = !build_info::GIT_DIRTY.is_empty();
     let update_check_task = GlobalExecutor::spawn(async move {
@@ -205,20 +212,103 @@ async fn run_network_node_with_signals(
                 "Auto-update disabled: this is a dirty (locally modified) build. \
                  Run `freenet update` manually if needed."
             );
-            // Don't exit — just sit idle forever so the oneshot channel stays open
             std::future::pending::<()>().await;
             return;
         }
 
+        /// Parse our version string into a (major, minor, patch) tuple for comparison.
+        fn parse_our_version() -> Option<(u8, u8, u16)> {
+            let parts: Vec<&str> = build_info::VERSION.split('.').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let major: u8 = parts[0].parse().ok()?;
+            let minor: u8 = parts[1].parse().ok()?;
+            // Patch may have pre-release suffix
+            let patch_str = parts[2].split('-').next()?;
+            let patch: u16 = patch_str.parse().ok()?;
+            Some((major, minor, patch))
+        }
+
         const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+        // Stagger timer: random delay 0-4 hours before updating on decentralized discovery.
+        const MAX_STAGGER_SECS: u64 = 4 * 3600;
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut last_mismatch_generation = version_mismatch_generation();
         let mut isolated_mismatch_since: Option<Instant> = None;
+        let mut stagger_deadline: Option<Instant> = None;
+        let our_version = parse_our_version();
 
         loop {
             interval.tick().await;
 
+            // --- Priority 1: Urgent update (breaking change) ---
+            if is_urgent_update() {
+                tracing::warn!("Urgent update needed (remote's min_compatible > our version)");
+                match check_if_update_available(build_info::VERSION).await {
+                    UpdateCheckResult::UpdateAvailable(new_version) => {
+                        clear_version_mismatch();
+                        clear_urgent_update();
+                        tracing::info!(
+                            new_version = %new_version,
+                            "Urgent update confirmed on GitHub, triggering immediate auto-update"
+                        );
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = update_tx.send(new_version);
+                        return;
+                    }
+                    UpdateCheckResult::Skipped => {
+                        // GitHub not reachable or no update yet; will retry next tick
+                    }
+                }
+            }
+
+            // --- Priority 2: Decentralized version discovery (staggered) ---
+            if let (Some(our_ver), Some(highest)) = (our_version, get_highest_seen_version()) {
+                if highest > our_ver {
+                    if stagger_deadline.is_none() {
+                        let stagger_secs =
+                            freenet::config::GlobalRng::random_u64() % MAX_STAGGER_SECS;
+                        let deadline =
+                            Instant::now() + std::time::Duration::from_secs(stagger_secs);
+                        tracing::info!(
+                            highest_seen = %format!("{}.{}.{}", highest.0, highest.1, highest.2),
+                            our_version = build_info::VERSION,
+                            stagger_secs,
+                            "Newer version discovered via peer handshake, stagger timer started"
+                        );
+                        stagger_deadline = Some(deadline);
+                    }
+
+                    if let Some(deadline) = stagger_deadline {
+                        if Instant::now() >= deadline {
+                            tracing::info!("Stagger timer expired, checking GitHub for updates");
+                            match check_if_update_available(build_info::VERSION).await {
+                                UpdateCheckResult::UpdateAvailable(new_version) => {
+                                    clear_version_mismatch();
+                                    clear_urgent_update();
+                                    tracing::info!(
+                                        new_version = %new_version,
+                                        "Update confirmed on GitHub after stagger, triggering auto-update"
+                                    );
+                                    #[allow(clippy::let_underscore_must_use)]
+                                    let _ = update_tx.send(new_version);
+                                    return;
+                                }
+                                UpdateCheckResult::Skipped => {
+                                    // GitHub unreachable or no update — reset stagger so
+                                    // we don't poll GitHub every 60s. A new higher version
+                                    // from a future handshake will re-arm it.
+                                    stagger_deadline = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Priority 3: Legacy mismatch-based update (fallback) ---
             // Reset backoff when a fresh mismatch signal arrives.
             let current_generation = version_mismatch_generation();
             if current_generation != last_mismatch_generation {
@@ -233,7 +323,6 @@ async fn run_network_node_with_signals(
             if has_version_mismatch() {
                 let open_connections = get_open_connection_count();
 
-                // Track how long we've been isolated with a version mismatch.
                 if open_connections == 0 {
                     isolated_mismatch_since.get_or_insert_with(Instant::now);
                 } else {
@@ -268,8 +357,6 @@ async fn run_network_node_with_signals(
                         return;
                     }
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
-                        // Re-read connection count after the await — it may
-                        // have changed during the GitHub HTTP request.
                         let open_connections = get_open_connection_count();
                         if open_connections == 0 {
                             tracing::warn!(

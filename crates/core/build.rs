@@ -4,6 +4,9 @@ fn main() {
     // Emit build metadata for startup logging
     emit_build_metadata();
 
+    // Emit min-compatible version for range-based version checking
+    emit_min_compatible_version();
+
     // Flatbuffers codegen is intentionally NOT run automatically.
     // The generated file (src/generated/topology_generated.rs) is checked in
     // and only needs regeneration when schemas/flatbuffers/topology.fbs changes.
@@ -11,6 +14,32 @@ fn main() {
     // To regenerate:
     //   flatc --rust -o crates/core/src/generated ../../schemas/flatbuffers/topology.fbs
     //   cargo fmt -p freenet
+}
+
+fn emit_min_compatible_version() {
+    // Allow overriding min-compatible version at build time.
+    // Default: current package version (strict match, same as old behavior).
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let min_compat =
+        std::env::var("FREENET_MIN_COMPATIBLE_VERSION").unwrap_or_else(|_| pkg_version.clone());
+
+    // Validate: min_compatible must share major.minor with the package version.
+    // The wire format only encodes min_patch (major.minor inherited from version).
+    let pkg_parts: Vec<&str> = pkg_version.split('.').collect();
+    let min_parts: Vec<&str> = min_compat.split('.').collect();
+    if pkg_parts.len() >= 2
+        && min_parts.len() >= 2
+        && (pkg_parts[0] != min_parts[0] || pkg_parts[1] != min_parts[1])
+    {
+        panic!(
+            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must share major.minor \
+             with package version ({pkg_version}). The wire format only encodes \
+             min_patch; major.minor is inherited from the version field."
+        );
+    }
+
+    println!("cargo:rustc-env=FREENET_MIN_COMPATIBLE_VERSION={min_compat}");
+    println!("cargo:rerun-if-env-changed=FREENET_MIN_COMPATIBLE_VERSION");
 }
 
 fn emit_build_metadata() {

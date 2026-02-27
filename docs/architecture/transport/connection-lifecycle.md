@@ -70,7 +70,7 @@ sequenceDiagram
 3. Transition to ACTIVE state
 4. Begin keep-alive ping/pong cycle
 
-**Security Check:** Protocol version must match exactly, otherwise connection rejected with version mismatch error.
+**Security Check:** Protocol version compatibility is checked bidirectionally — each peer's version must satisfy the other's minimum compatible version. Incompatible peers receive an ack_error and the connection is rejected.
 
 ## Inbound Connection Flow
 
