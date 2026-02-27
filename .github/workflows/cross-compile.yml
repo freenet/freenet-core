@@ -7,10 +7,11 @@ on:
     branches: [main]
     tags: ['v*']
 
-# Cancel in-progress runs when a new commit is pushed to main
+# Cancel in-progress runs when a new commit is pushed to the same ref.
+# On main, never cancel — each merge must complete its build (#3311).
 concurrency:
   group: cross-compile-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build-x86_64-linux:

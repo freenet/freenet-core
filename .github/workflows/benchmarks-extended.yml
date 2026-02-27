@@ -22,10 +22,11 @@ on:
   # Allow manual trigger
   workflow_dispatch:
 
-# Cancel in-progress runs when a new commit is pushed
+# Cancel in-progress runs when a new commit is pushed.
+# On main, never cancel — each merge must complete its run (#3311).
 concurrency:
   group: benchmarks-extended-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   extended-benchmark:
