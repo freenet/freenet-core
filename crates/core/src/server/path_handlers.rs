@@ -325,7 +325,7 @@ fn shell_page(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Freenet</title>
-<link rel="icon" href="https://freenet.org/favicon.ico">
+<link rel="icon" href="https://freenet.org/freenet_logo.svg">
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
@@ -847,7 +847,7 @@ mod tests {
             "shell page title mismatch"
         );
         assert!(
-            html.contains(r#"<link rel="icon" href="https://freenet.org/favicon.ico">"#),
+            html.contains(r#"<link rel="icon" href="https://freenet.org/freenet_logo.svg">"#),
             "favicon link missing"
         );
         // Shell message handler must be present in bridge JS
