@@ -564,6 +564,13 @@ impl SubscribeOp {
     }
 
     /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
+    ///
+    /// # Information disclosure note
+    /// Before this fix, subscribe failures caused a 60s timeout which provided implicit
+    /// rate limiting on network probing. Instant NotFound responses allow faster contract
+    /// hosting enumeration. The risk is low (contract locations are already somewhat
+    /// predictable from the DHT topology), but future hardening could add jitter or
+    /// rate-limit NotFound responses if probing becomes a practical concern.
     fn not_found_result(
         id: Transaction,
         instance_id: ContractInstanceId,
@@ -601,6 +608,18 @@ impl SubscribeOp {
         }
     }
 
+    /// Check whether this operation should forward a NotFound upstream on abort.
+    fn should_forward_not_found_on_abort(
+        &self,
+    ) -> Option<(ContractInstanceId, std::net::SocketAddr)> {
+        let requester_addr = self.requester_addr?;
+        if let SubscribeState::AwaitingResponse(data) = &self.state {
+            Some((data.instance_id, requester_addr))
+        } else {
+            None
+        }
+    }
+
     /// Handle aborted connections by failing the operation immediately.
     ///
     /// Unlike Get operations, Subscribe doesn't have alternative routes to try.
@@ -613,41 +632,38 @@ impl SubscribeOp {
             "Subscribe operation aborted due to connection failure"
         );
 
-        // If we're an intermediate node, forward NotFound upstream so the
-        // originator gets a fast failure instead of waiting for the 60s timeout.
-        // Mirrors the pattern in GetOp::handle_abort.
-        if let Some(requester_addr) = self.requester_addr {
-            if let SubscribeState::AwaitingResponse(data) = &self.state {
-                let instance_id = data.instance_id;
-                tracing::warn!(
-                    tx = %self.id,
-                    %instance_id,
-                    requester = %requester_addr,
-                    phase = "not_found",
-                    "Subscribe aborted at intermediate node - sending NotFound to upstream"
-                );
+        // Forward NotFound upstream so the originator gets a fast failure instead of
+        // a 60s timeout. Uses notify_op_change because handle_abort lacks NetworkBridge
+        // access; the round-trip through process_message is functionally equivalent.
+        if let Some((instance_id, requester_addr)) = self.should_forward_not_found_on_abort() {
+            tracing::warn!(
+                tx = %self.id,
+                %instance_id,
+                requester = %requester_addr,
+                phase = "not_found",
+                "Subscribe aborted at intermediate node - sending NotFound to upstream"
+            );
 
-                let response_op = SubscribeOp {
-                    id: self.id,
-                    state: SubscribeState::Failed,
-                    requester_addr: self.requester_addr,
-                    requester_pub_key: self.requester_pub_key,
-                    is_renewal: self.is_renewal,
-                    stats: self.stats,
-                };
+            let response_op = SubscribeOp {
+                id: self.id,
+                state: SubscribeState::Failed,
+                requester_addr: self.requester_addr,
+                requester_pub_key: self.requester_pub_key,
+                is_renewal: self.is_renewal,
+                stats: self.stats,
+            };
 
-                op_manager
-                    .notify_op_change(
-                        NetMessage::from(SubscribeMsg::Response {
-                            id: self.id,
-                            instance_id,
-                            result: SubscribeMsgResult::NotFound,
-                        }),
-                        OpEnum::Subscribe(response_op),
-                    )
-                    .await?;
-                return Err(OpError::StatePushed);
-            }
+            op_manager
+                .notify_op_change(
+                    NetMessage::from(SubscribeMsg::Response {
+                        id: self.id,
+                        instance_id,
+                        result: SubscribeMsgResult::NotFound,
+                    }),
+                    OpEnum::Subscribe(response_op),
+                )
+                .await?;
+            return Err(OpError::StatePushed);
         }
 
         if op_manager.is_sub_operation(self.id) {

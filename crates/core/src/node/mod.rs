@@ -1120,6 +1120,9 @@ where
                     tx_type = ?tx.transaction_type(),
                     "Received Aborted message, delegating to handle_aborted_op"
                 );
+                // Empty gateways: Aborted messages arrive over p2p connections, not
+                // from the gateway join path. The gateways list is only used by
+                // Connect retries; other operation types ignore it entirely.
                 if let Err(err) = handle_aborted_op(tx, &op_manager, &[]).await {
                     if !matches!(err, OpError::StatePushed) {
                         tracing::error!(
