@@ -233,11 +233,16 @@ async fn run_network_node_with_signals(
         const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
         // Stagger timer: random delay 0-4 hours before updating on decentralized discovery.
         const MAX_STAGGER_SECS: u64 = 4 * 3600;
+        // After a stagger check returns Skipped (GitHub unreachable or no update),
+        // wait at least this long before re-arming. Prevents polling GitHub every
+        // few hours indefinitely when peers report a version that isn't on GitHub yet.
+        const STAGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut last_mismatch_generation = version_mismatch_generation();
         let mut isolated_mismatch_since: Option<Instant> = None;
         let mut stagger_deadline: Option<Instant> = None;
+        let mut stagger_cooldown_until: Option<Instant> = None;
         let our_version = parse_our_version();
 
         loop {
@@ -267,7 +272,11 @@ async fn run_network_node_with_signals(
             // --- Priority 2: Decentralized version discovery (staggered) ---
             if let (Some(our_ver), Some(highest)) = (our_version, get_highest_seen_version()) {
                 if highest > our_ver {
-                    if stagger_deadline.is_none() {
+                    // Don't re-arm stagger if we're in cooldown after a failed check.
+                    let in_cooldown =
+                        stagger_cooldown_until.is_some_and(|until| Instant::now() < until);
+
+                    if stagger_deadline.is_none() && !in_cooldown {
                         let stagger_secs =
                             freenet::config::GlobalRng::random_u64() % MAX_STAGGER_SECS;
                         let deadline =
@@ -297,10 +306,12 @@ async fn run_network_node_with_signals(
                                     return;
                                 }
                                 UpdateCheckResult::Skipped => {
-                                    // GitHub unreachable or no update — reset stagger so
-                                    // we don't poll GitHub every 60s. A new higher version
-                                    // from a future handshake will re-arm it.
+                                    // GitHub unreachable or no update yet. Enter cooldown
+                                    // to avoid re-arming every tick (highest > our_ver is
+                                    // permanently true once set).
                                     stagger_deadline = None;
+                                    stagger_cooldown_until =
+                                        Some(Instant::now() + STAGGER_COOLDOWN);
                                 }
                             }
                         }

@@ -65,16 +65,18 @@ pub fn clear_version_mismatch() {
 // (meaning we MUST update to remain connected).
 
 /// Highest version observed from any peer during handshake, with the number
-/// of distinct peers that reported it.
+/// of handshakes that reported it.
 static HIGHEST_SEEN_VERSION: Mutex<Option<HighestSeenVersion>> = Mutex::new(None);
 
 /// Set when a remote peer's min_compatible version exceeds our version,
 /// meaning we cannot connect to that peer without updating.
 static URGENT_UPDATE_NEEDED: AtomicBool = AtomicBool::new(false);
 
-/// Minimum number of distinct peers that must report a version before we
-/// trust it for the stagger timer. A single malicious peer cannot trigger
-/// an update check.
+/// Minimum number of handshakes that must report a version before we
+/// trust it for the stagger timer. This is a lightweight defense against
+/// a single transient bad report — it does not track peer identity, so a
+/// persistent attacker reconnecting can bypass it. The real protection is
+/// that GitHub verification is always required before exit-42.
 const MIN_VERSION_REPORTERS: usize = 2;
 
 #[derive(Clone, Copy)]
@@ -85,13 +87,11 @@ struct HighestSeenVersion {
 
 /// Called on every successful handshake to track the highest version seen.
 ///
-/// Mitigation against malicious peers reporting fake versions:
-/// At least `MIN_VERSION_REPORTERS` distinct peers must report the same
-/// version before `get_highest_seen_version()` returns it. A single
-/// malicious peer cannot trigger update checks.
-///
-/// No version-distance filtering is applied — the `min_compatible` field
-/// in the wire format already defines the compatibility boundary.
+/// Lightweight defense: at least `MIN_VERSION_REPORTERS` handshakes must
+/// report the same version before `get_highest_seen_version()` returns it.
+/// This catches single transient bad reports. A persistent attacker can
+/// bypass this by reconnecting, but the real protection is that the update
+/// check task always verifies against GitHub before triggering exit-42.
 pub fn report_peer_version(version: (u8, u8, u16)) {
     // Recover from mutex poisoning — version tracking is best-effort and
     // must not permanently break if another thread panicked while holding it.

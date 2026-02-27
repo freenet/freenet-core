@@ -49,7 +49,14 @@ fn emit_min_compatible_version() {
     }
 
     // Must not exceed the package version (would reject all peers including ourselves).
-    if min_compat > pkg_version {
+    // Compare numerically, not lexicographically ("0.1.9" > "0.1.152" in string order).
+    let min_patch: u64 = min_parts[2].parse().unwrap_or_else(|_| {
+        panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) has non-numeric patch")
+    });
+    let pkg_patch: u64 = pkg_parts[2]
+        .parse()
+        .unwrap_or_else(|_| panic!("CARGO_PKG_VERSION ({pkg_version}) has non-numeric patch"));
+    if min_patch > pkg_patch {
         panic!(
             "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be <= package version \
              ({pkg_version}). A min_compatible higher than our own version would \
