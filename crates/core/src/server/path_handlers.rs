@@ -433,7 +433,20 @@ function freenetBridge(authToken) {
   window.addEventListener('message', function(event) {
     if (event.source !== iframe.contentWindow) return;
     var msg = event.data;
-    if (!msg || !msg.__freenet_ws__) return;
+    if (!msg) return;
+
+    // Handle shell-level messages (title, favicon) from iframe
+    if (msg.__freenet_shell__) {
+      if (msg.type === 'title' && typeof msg.title === 'string') {
+        document.title = msg.title;
+      } else if (msg.type === 'favicon' && typeof msg.href === 'string') {
+        var link = document.querySelector('link[rel="icon"]');
+        if (link) link.href = msg.href;
+      }
+      return;
+    }
+
+    if (!msg.__freenet_ws__) return;
 
     switch (msg.type) {
       case 'open': {
@@ -502,24 +515,6 @@ function freenetBridge(authToken) {
         }
         break;
       }
-    }
-  });
-
-  // Handle shell-level messages (title, favicon) from iframe
-  window.addEventListener('message', function(event) {
-    if (event.source !== iframe.contentWindow) return;
-    var msg = event.data;
-    if (!msg || !msg.__freenet_shell__) return;
-    switch (msg.type) {
-      case 'title':
-        if (typeof msg.title === 'string') document.title = msg.title;
-        break;
-      case 'favicon':
-        if (typeof msg.href === 'string') {
-          var link = document.querySelector('link[rel="icon"]');
-          if (link) link.href = msg.href;
-        }
-        break;
     }
   });
 }
