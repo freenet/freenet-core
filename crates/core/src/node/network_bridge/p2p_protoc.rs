@@ -440,7 +440,7 @@ impl P2pConnManager {
         let gateways_arc = Arc::new(gateways.clone());
         let key_pair = config.key_pair.clone();
 
-        let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
+        let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(512);
         let bridge = P2pBridge::new(
             tx_bridge_cmd,
             op_manager,
@@ -3664,6 +3664,28 @@ impl P2pConnManager {
         EventResult::Continue
     }
 
+    /// Send a message to a list of peers, off the event loop.
+    ///
+    /// Extracted as a static method so it can be spawned via `tokio::spawn`
+    /// to prevent self-deadlock: the bridge channel (capacity 512) is
+    /// drained by the event loop, so inline fan-out of >capacity sends
+    /// blocks forever. See: vega gateway outage 2026-02-27T07:50Z.
+    async fn send_to_peers(
+        bridge: P2pBridge,
+        peers: Vec<SocketAddr>,
+        msg: crate::message::NetMessage,
+    ) {
+        for peer_addr in peers {
+            if let Err(e) = bridge.send(peer_addr, msg.clone()).await {
+                tracing::warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    "Failed to send broadcast message to peer"
+                );
+            }
+        }
+    }
+
     /// Broadcast a ProximityCache message to all connected peers.
     async fn handle_broadcast_proximity_cache(
         &mut self,
@@ -3679,22 +3701,15 @@ impl P2pConnManager {
         let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::ProximityCache {
             message: message.clone(),
         });
+        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
 
-        for peer_addr in self.connections.keys() {
-            tracing::trace!(
-                peer_addr = %peer_addr,
-                phase = "broadcast",
-                "Sending proximity cache to peer"
-            );
-            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
-                tracing::warn!(
-                    peer_addr = %peer_addr,
-                    error = %e,
-                    phase = "error",
-                    "Failed to send proximity cache to peer"
-                );
-            }
-        }
+        let bridge = self.bridge.clone();
+        #[cfg(not(feature = "simulation_tests"))]
+        tokio::spawn(async move {
+            Self::send_to_peers(bridge, peers, msg).await;
+        });
+        #[cfg(feature = "simulation_tests")]
+        Self::send_to_peers(bridge, peers, msg).await;
     }
 
     /// Broadcast ChangeInterests message to all connected peers.
@@ -3709,16 +3724,15 @@ impl P2pConnManager {
         let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync {
             message: crate::message::InterestMessage::ChangeInterests { added, removed },
         });
+        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
 
-        for peer_addr in self.connections.keys() {
-            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
-                tracing::warn!(
-                    peer_addr = %peer_addr,
-                    error = %e,
-                    "Failed to send ChangeInterests to peer"
-                );
-            }
-        }
+        let bridge = self.bridge.clone();
+        #[cfg(not(feature = "simulation_tests"))]
+        tokio::spawn(async move {
+            Self::send_to_peers(bridge, peers, msg).await;
+        });
+        #[cfg(feature = "simulation_tests")]
+        Self::send_to_peers(bridge, peers, msg).await;
     }
 
     /// Send an interest message to a specific peer.
@@ -3755,15 +3769,15 @@ impl P2pConnManager {
             "Broadcasting ReadyState to connected peers"
         );
 
-        for peer_addr in self.connections.keys() {
-            if let Err(e) = self.bridge.send(*peer_addr, msg.clone()).await {
-                tracing::warn!(
-                    peer_addr = %peer_addr,
-                    error = %e,
-                    "Failed to send ReadyState to peer"
-                );
-            }
-        }
+        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
+
+        let bridge = self.bridge.clone();
+        #[cfg(not(feature = "simulation_tests"))]
+        tokio::spawn(async move {
+            Self::send_to_peers(bridge, peers, msg).await;
+        });
+        #[cfg(feature = "simulation_tests")]
+        Self::send_to_peers(bridge, peers, msg).await;
     }
 
     /// Maximum retry attempts when a broadcast finds no targets.
