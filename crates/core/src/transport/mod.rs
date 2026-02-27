@@ -77,10 +77,6 @@ static URGENT_UPDATE_NEEDED: AtomicBool = AtomicBool::new(false);
 /// an update check.
 const MIN_VERSION_REPORTERS: usize = 2;
 
-/// Maximum patch delta above our own version that we accept. Versions
-/// claiming to be further ahead are silently ignored (likely malicious).
-const MAX_PLAUSIBLE_PATCH_DELTA: u16 = 50;
-
 #[derive(Clone, Copy)]
 struct HighestSeenVersion {
     version: (u8, u8, u16),
@@ -89,30 +85,14 @@ struct HighestSeenVersion {
 
 /// Called on every successful handshake to track the highest version seen.
 ///
-/// `our_version` is the local node's parsed version tuple, used for
-/// plausibility filtering.
+/// Mitigation against malicious peers reporting fake versions:
+/// At least `MIN_VERSION_REPORTERS` distinct peers must report the same
+/// version before `get_highest_seen_version()` returns it. A single
+/// malicious peer cannot trigger update checks.
 ///
-/// Mitigations against malicious peers reporting fake versions:
-/// - Versions must share major.minor with ours (different major.minor is
-///   a different protocol era and would fail the handshake anyway).
-/// - Patch must be within `MAX_PLAUSIBLE_PATCH_DELTA` of our own.
-/// - At least `MIN_VERSION_REPORTERS` distinct peers must report the same
-///   version before `get_highest_seen_version()` returns it.
-pub fn report_peer_version(our_version: (u8, u8, u16), version: (u8, u8, u16)) {
-    // Plausibility filter: reject versions with different major.minor or
-    // implausibly high patch numbers. A single malicious peer could otherwise
-    // set HIGHEST_SEEN_VERSION to (0, 1, 65535) and trigger GitHub API calls.
-    if version.0 != our_version.0 || version.1 != our_version.1 {
-        return; // Different protocol era — ignore
-    }
-    if version.2 > our_version.2 + MAX_PLAUSIBLE_PATCH_DELTA {
-        tracing::debug!(
-            reported = format!("{}.{}.{}", version.0, version.1, version.2),
-            "Ignoring implausibly high version from peer (>{MAX_PLAUSIBLE_PATCH_DELTA} patches ahead)"
-        );
-        return;
-    }
-
+/// No version-distance filtering is applied — the `min_compatible` field
+/// in the wire format already defines the compatibility boundary.
+pub fn report_peer_version(version: (u8, u8, u16)) {
     // Recover from mutex poisoning — version tracking is best-effort and
     // must not permanently break if another thread panicked while holding it.
     let mut guard = HIGHEST_SEEN_VERSION
@@ -555,8 +535,7 @@ mod version_discovery_tests {
     #[test]
     fn single_reporter_not_trusted() {
         reset_version_discovery();
-        let us = (0, 1, 152);
-        report_peer_version(us, (0, 1, 153));
+        report_peer_version((0, 1, 153));
         // Only 1 reporter — should not be trusted yet
         assert_eq!(get_highest_seen_version(), None);
     }
@@ -564,45 +543,32 @@ mod version_discovery_tests {
     #[test]
     fn two_reporters_trusted() {
         reset_version_discovery();
-        let us = (0, 1, 152);
-        report_peer_version(us, (0, 1, 153));
-        report_peer_version(us, (0, 1, 153));
+        report_peer_version((0, 1, 153));
+        report_peer_version((0, 1, 153));
         assert_eq!(get_highest_seen_version(), Some((0, 1, 153)));
-    }
-
-    #[test]
-    fn implausibly_high_patch_rejected() {
-        reset_version_discovery();
-        let us = (0, 1, 152);
-        // 50 patches ahead is plausible, 51 is not
-        report_peer_version(us, (0, 1, 203)); // 152 + 51 = 203 > threshold
-        report_peer_version(us, (0, 1, 203));
-        assert_eq!(get_highest_seen_version(), None);
-    }
-
-    #[test]
-    fn different_major_minor_rejected() {
-        reset_version_discovery();
-        let us = (0, 1, 152);
-        report_peer_version(us, (0, 2, 0));
-        report_peer_version(us, (0, 2, 0));
-        assert_eq!(get_highest_seen_version(), None);
     }
 
     #[test]
     fn higher_version_resets_count() {
         reset_version_discovery();
-        let us = (0, 1, 152);
-        report_peer_version(us, (0, 1, 153));
-        report_peer_version(us, (0, 1, 153)); // count=2, now trusted
+        report_peer_version((0, 1, 153));
+        report_peer_version((0, 1, 153)); // count=2, now trusted
         assert_eq!(get_highest_seen_version(), Some((0, 1, 153)));
 
         // New higher version resets count
-        report_peer_version(us, (0, 1, 154));
+        report_peer_version((0, 1, 154));
         // Only 1 reporter for 154 — not trusted yet
         assert_eq!(get_highest_seen_version(), None);
 
-        report_peer_version(us, (0, 1, 154));
+        report_peer_version((0, 1, 154));
         assert_eq!(get_highest_seen_version(), Some((0, 1, 154)));
+    }
+
+    #[test]
+    fn major_minor_bumps_accepted() {
+        reset_version_discovery();
+        report_peer_version((1, 0, 0));
+        report_peer_version((1, 0, 0));
+        assert_eq!(get_highest_seen_version(), Some((1, 0, 0)));
     }
 }

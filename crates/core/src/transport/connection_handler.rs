@@ -26,7 +26,7 @@ use tokio::{
     task_local,
 };
 use tracing::{span, Instrument};
-use version_cmp::{OUR_VERSION, PROTOC_VERSION};
+use version_cmp::PROTOC_VERSION;
 
 use super::{
     congestion_control::CongestionControlConfig,
@@ -1666,12 +1666,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     })?;
             match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
                 Ok(remote_info) => {
-                    crate::transport::report_peer_version(OUR_VERSION, remote_info.version);
+                    crate::transport::report_peer_version(remote_info.version);
                 }
                 Err(reason) => {
                     // Track version even on incompatible peers — aids version discovery.
                     let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
-                    crate::transport::report_peer_version(OUR_VERSION, remote_info.version);
+                    crate::transport::report_peer_version(remote_info.version);
                     if version_cmp::remote_requires_newer_than_us(&PROTOC_VERSION, &protoc_bytes) {
                         crate::transport::signal_urgent_update();
                     }
@@ -1856,12 +1856,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 if let Ok(protoc_bytes) = <[u8; 8]>::try_from(protoc) {
                     match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
                         Ok(remote_info) => {
-                            crate::transport::report_peer_version(OUR_VERSION, remote_info.version);
+                            crate::transport::report_peer_version(remote_info.version);
                         }
                         Err(reason) => {
                             // Track version even on incompatible peers — aids version discovery.
                             let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
-                            crate::transport::report_peer_version(OUR_VERSION, remote_info.version);
+                            crate::transport::report_peer_version(remote_info.version);
                             if version_cmp::remote_requires_newer_than_us(
                                 &PROTOC_VERSION,
                                 &protoc_bytes,
@@ -2344,12 +2344,6 @@ mod version_cmp {
     /// They see byte[0]=0xFF as major mismatch → clean ack_error. No crypto confusion.
     pub(super) const PROTOC_VERSION: [u8; 8] =
         encode_new_format(PCK_VERSION, MIN_COMPATIBLE_VERSION);
-
-    /// Our version as a (major, minor, patch) tuple, for passing to `report_peer_version`.
-    pub(super) const OUR_VERSION: (u8, u8, u16) = {
-        let (maj, min, pat) = parse_semver(PCK_VERSION);
-        (maj, min, pat)
-    };
 
     /// Parsed version info from an 8-byte wire version field.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
