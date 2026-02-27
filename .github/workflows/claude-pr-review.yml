@@ -3,14 +3,21 @@ name: Claude PR Rule Review
 # Advisory review: checks every PR against .claude/rules/ and posts findings
 # as a sticky comment. Non-blocking — does not gate merge.
 #
+# Triggers:
+# - pull_request_target: runs for all PRs (including forks) with base-repo
+#   secrets available. Safe because we only read the diff — we never execute
+#   fork code (no cargo build/test on the PR head).
+# - labeled: re-run when a maintainer adds the 'claude-review' label, useful
+#   for fork PRs where the initial run may have been skipped.
+#
 # Complements (does not replace):
 # - ci.yml: cargo fmt, clippy, tests, conventional commits
 # - claude.yml: interactive @claude mentions
 # - claude-ci-analysis (in ci.yml): failure debugging
 
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
     paths-ignore:
       - 'docs/**'
       - '*.md'
@@ -27,22 +34,27 @@ jobs:
     name: Claude Rule Review
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Skip draft PRs, release branches, and dependabot
+    # Skip draft PRs, release branches, and dependabot.
+    # For label events, only run when the 'claude-review' label was added.
     if: |
       !github.event.pull_request.draft &&
-      !startsWith(github.head_ref, 'release/v') &&
-      !startsWith(github.head_ref, 'dependabot/')
+      !startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
 
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
+          # Explicitly checkout the PR head so git diff sees the fork's changes.
+          # Safe: we only run git diff and call the Claude API — we never
+          # execute the fork's code (no cargo build/test).
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Determine applicable rules
