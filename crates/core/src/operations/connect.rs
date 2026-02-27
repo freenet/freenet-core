@@ -173,9 +173,10 @@ pub(crate) enum ConnectMsg {
         id: Transaction,
         desired_location: Location,
     },
-    /// Sent by the joiner when hole-punch to an acceptor fails. Travels downstream
-    /// from the gateway through the relay chain so each relay can try re-routing
-    /// to a different acceptor. If no relay can re-route, propagates back upstream.
+    /// Sent by the joiner upstream to its first hop (gateway) when hole-punch to an
+    /// acceptor fails. Each relay that receives it may forward it downstream (toward
+    /// the acceptor-facing relay for re-routing) or try re-routing locally. If no
+    /// relay can re-route, propagates back upstream to the joiner.
     ConnectFailed {
         id: Transaction,
         failed_acceptor_addr: SocketAddr,
@@ -1503,7 +1504,8 @@ impl Operation for ConnectOp {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
 
-                        if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
+                        if let Some(mut acceptance) = self.handle_response(&payload, Instant::now())
+                        {
                             // Note: Location assignment happens in ObservedAddress handler,
                             // not here. The joiner's ring location is derived from their
                             // external IP address (observed by the gateway), not from
@@ -1538,6 +1540,13 @@ impl Operation for ConnectOp {
                                             elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect joined peer"
                                         );
+                                        // Clear exclusion for this acceptor on successful hole-punch
+                                        if let Some(addr) = new_acceptor.peer.socket_addr() {
+                                            op_manager
+                                                .ring
+                                                .connection_manager
+                                                .clear_connect_exclusion(addr);
+                                        }
                                         true
                                     } else {
                                         tracing::warn!(
@@ -1562,6 +1571,16 @@ impl Operation for ConnectOp {
                                 // so the relay chain can try re-routing to a different acceptor.
                                 // Stay in WaitingForResponses to receive a new ConnectResponse.
                                 if !hole_punch_ok {
+                                    // Remove the failed acceptor from accepted set so we don't
+                                    // declare satisfied prematurely (the hole-punch didn't work).
+                                    if let Some(ConnectState::WaitingForResponses(joiner_state)) =
+                                        self.state.as_mut()
+                                    {
+                                        joiner_state.accepted.remove(&new_acceptor.peer);
+                                        acceptance.satisfied = joiner_state.accepted.len()
+                                            >= joiner_state.target_connections;
+                                    }
+
                                     if let Some(failed_addr) = new_acceptor.peer.socket_addr() {
                                         if let Some(gw_addr) = self.get_next_hop_addr() {
                                             let failed_msg = ConnectMsg::ConnectFailed {

@@ -1451,12 +1451,12 @@ impl ConnectionManager {
     }
 
     /// Clear connect exclusion for a peer (on successful hole-punch).
-    #[allow(dead_code)]
     pub fn clear_connect_exclusion(&self, addr: SocketAddr) {
         self.connect_excluded_peers.write().remove(&addr);
     }
 
     /// Remove expired exclusion entries.
+    /// Wire into connection_maintenance for periodic cleanup (see #3296).
     #[allow(dead_code)]
     pub fn cleanup_expired_exclusions(&self) {
         self.connect_excluded_peers
