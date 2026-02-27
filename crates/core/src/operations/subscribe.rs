@@ -563,6 +563,44 @@ impl SubscribeOp {
         }
     }
 
+    /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
+    fn not_found_result(
+        id: Transaction,
+        instance_id: ContractInstanceId,
+        requester_addr: Option<std::net::SocketAddr>,
+        reason: &str,
+    ) -> Result<OperationResult, OpError> {
+        if let Some(requester_addr) = requester_addr {
+            // We're an intermediate node — send NotFound back to the upstream requester
+            tracing::debug!(
+                tx = %id,
+                %instance_id,
+                requester = %requester_addr,
+                %reason,
+                "Sending NotFound response to requester"
+            );
+            Ok(OperationResult::SendAndComplete {
+                msg: NetMessage::from(SubscribeMsg::Response {
+                    id,
+                    instance_id,
+                    result: SubscribeMsgResult::NotFound,
+                }),
+                next_hop: Some(requester_addr),
+                stream_data: None,
+            })
+        } else {
+            // We're the originator — fail the operation directly
+            tracing::warn!(
+                tx = %id,
+                %instance_id,
+                %reason,
+                phase = "not_found",
+                "Subscribe failed at originator"
+            );
+            Err(RingError::NoCachingPeers(instance_id).into())
+        }
+    }
+
     /// Handle aborted connections by failing the operation immediately.
     ///
     /// Unlike Get operations, Subscribe doesn't have alternative routes to try.
@@ -571,8 +609,46 @@ impl SubscribeOp {
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
         tracing::debug!(
             tx = %self.id,
+            requester_addr = ?self.requester_addr,
             "Subscribe operation aborted due to connection failure"
         );
+
+        // If we're an intermediate node, forward NotFound upstream so the
+        // originator gets a fast failure instead of waiting for the 60s timeout.
+        // Mirrors the pattern in GetOp::handle_abort.
+        if let Some(requester_addr) = self.requester_addr {
+            if let SubscribeState::AwaitingResponse(data) = &self.state {
+                let instance_id = data.instance_id;
+                tracing::warn!(
+                    tx = %self.id,
+                    %instance_id,
+                    requester = %requester_addr,
+                    phase = "not_found",
+                    "Subscribe aborted at intermediate node - sending NotFound to upstream"
+                );
+
+                let response_op = SubscribeOp {
+                    id: self.id,
+                    state: SubscribeState::Failed,
+                    requester_addr: self.requester_addr,
+                    requester_pub_key: self.requester_pub_key,
+                    is_renewal: self.is_renewal,
+                    stats: self.stats,
+                };
+
+                op_manager
+                    .notify_op_change(
+                        NetMessage::from(SubscribeMsg::Response {
+                            id: self.id,
+                            instance_id,
+                            result: SubscribeMsgResult::NotFound,
+                        }),
+                        OpEnum::Subscribe(response_op),
+                    )
+                    .await?;
+                return Err(OpError::StatePushed);
+            }
+        }
 
         if op_manager.is_sub_operation(self.id) {
             // Async sub-operation: no client is waiting on this transaction.
@@ -898,9 +974,13 @@ impl Operation for SubscribeOp {
 
                     // Contract still not found - try to forward
                     if *htl == 0 {
-                        tracing::warn!(tx = %id, contract = %instance_id, htl = 0, phase = "error", "Subscribe request exhausted HTL");
-                        // Can't send a response without the full key - just return error
-                        return Err(RingError::NoCachingPeers(*instance_id).into());
+                        tracing::warn!(tx = %id, contract = %instance_id, htl = 0, phase = "not_found", "Subscribe request exhausted HTL");
+                        return Self::not_found_result(
+                            *id,
+                            *instance_id,
+                            self.requester_addr,
+                            "HTL exhausted",
+                        );
                     }
 
                     // Find next hop
@@ -918,20 +998,32 @@ impl Operation for SubscribeOp {
                             .k_closest_potentially_caching(instance_id, &new_visited, 3);
 
                     let Some(next_hop) = candidates.first() else {
-                        // No forward target
-                        return Err(RingError::NoCachingPeers(*instance_id).into());
+                        tracing::warn!(tx = %id, contract = %instance_id, phase = "not_found", "No closer peers to forward subscribe request");
+                        return Self::not_found_result(
+                            *id,
+                            *instance_id,
+                            self.requester_addr,
+                            "no closer peers available",
+                        );
                     };
 
                     // Convert to KnownPeerKeyLocation for compile-time address guarantee
-                    let next_hop_known = KnownPeerKeyLocation::try_from(next_hop)
-                        .map_err(|e| {
+                    let next_hop_known = match KnownPeerKeyLocation::try_from(next_hop) {
+                        Ok(known) => known,
+                        Err(e) => {
                             tracing::error!(
                                 tx = %id,
                                 pub_key = %e.pub_key,
                                 "INTERNAL ERROR: next_hop has unknown address - routing selected peer without address"
                             );
-                            RingError::NoCachingPeers(*instance_id)
-                        })?;
+                            return Self::not_found_result(
+                                *id,
+                                *instance_id,
+                                self.requester_addr,
+                                "next hop has unknown address",
+                            );
+                        }
+                    };
                     let next_addr = next_hop_known.socket_addr();
                     new_visited.mark_visited(next_addr);
 

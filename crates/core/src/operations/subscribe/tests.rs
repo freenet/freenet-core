@@ -1087,6 +1087,73 @@ fn test_subscribe_renewal_reports_outcome() {
 /// Verify that create_unsubscribe_op produces the correct routing state.
 ///
 /// This is the only non-trivial unit test for the unsubscribe message path:
+/// Regression test for #3241: forwarding peers must send SubscribeMsgResult::NotFound
+/// instead of returning Err(NoCachingPeers) when they can't route a subscribe request.
+///
+/// Before the fix, the three failure paths (HTL exhausted, no closer peers, unknown
+/// peer address) returned Err which became a generic Aborted message that was silently
+/// dropped, causing the originator to hang for 60s.
+#[test]
+fn test_not_found_result_intermediate_node_sends_notfound() {
+    use crate::operations::OperationResult;
+
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+    let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    // Intermediate node (has requester_addr) should return SendAndComplete with NotFound
+    let result =
+        SubscribeOp::not_found_result(tx, instance_id, Some(requester), "HTL exhausted");
+
+    match result {
+        Ok(OperationResult::SendAndComplete {
+            msg,
+            next_hop,
+            stream_data,
+        }) => {
+            assert_eq!(next_hop, Some(requester), "NotFound should be sent to requester");
+            assert!(stream_data.is_none());
+
+            // Verify the message is a NotFound response
+            let crate::message::NetMessage::V1(net_msg) = msg;
+            match net_msg {
+                crate::message::NetMessageV1::Subscribe(SubscribeMsg::Response {
+                    id,
+                    instance_id: resp_instance_id,
+                    result,
+                }) => {
+                    assert_eq!(id, tx);
+                    assert_eq!(resp_instance_id, instance_id);
+                    assert!(
+                        matches!(result, SubscribeMsgResult::NotFound),
+                        "Expected NotFound, got {:?}",
+                        result
+                    );
+                }
+                other => panic!("Expected Subscribe Response, got {:?}", other),
+            }
+        }
+        other => panic!(
+            "Expected Ok(SendAndComplete), got {:?}",
+            other.as_ref().map(|_| "Ok(other)").unwrap_or("Err")
+        ),
+    }
+}
+
+/// Regression test for #3241: when we're the originator (no requester_addr),
+/// not_found_result should return Err(NoCachingPeers) so the client gets
+/// a fast failure notification.
+#[test]
+fn test_not_found_result_originator_returns_error() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+
+    // Originator (no requester_addr) should return Err
+    let result = SubscribeOp::not_found_result(tx, instance_id, None, "no closer peers");
+
+    assert!(result.is_err(), "Originator should get an error, not a message");
+}
+
 /// it validates that the temporary operation created for routing carries the
 /// correct target address so `peek_next_hop_addr` can resolve it.
 #[test]

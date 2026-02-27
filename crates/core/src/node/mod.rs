@@ -1114,7 +1114,23 @@ where
                 );
                 return Ok(None);
             }
-            NetMessageV1::Aborted(_) => return Ok(None),
+            NetMessageV1::Aborted(tx) => {
+                tracing::debug!(
+                    %tx,
+                    tx_type = ?tx.transaction_type(),
+                    "Received Aborted message, delegating to handle_aborted_op"
+                );
+                if let Err(err) = handle_aborted_op(tx, &op_manager, &[]).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        tracing::error!(
+                            %tx,
+                            error = %err,
+                            "Error handling aborted operation"
+                        );
+                    }
+                }
+                return Ok(None);
+            }
         }
     }
 
