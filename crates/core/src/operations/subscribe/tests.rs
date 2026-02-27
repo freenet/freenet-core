@@ -1114,3 +1114,185 @@ fn test_create_unsubscribe_op() {
 
     assert_eq!(op.get_next_hop_addr(), Some(target_addr));
 }
+
+// =============================================================================
+// NotFound Response Tests (#3241)
+// =============================================================================
+
+/// Regression test for #3241: forwarding peers must send SubscribeMsgResult::NotFound
+/// instead of returning Err(NoCachingPeers) when they can't route a subscribe request.
+///
+/// Before the fix, the three failure paths (HTL exhausted, no closer peers, unknown
+/// peer address) returned Err which became a generic Aborted message that was silently
+/// dropped, causing the originator to hang for 60s.
+#[test]
+fn test_not_found_result_intermediate_node_sends_notfound() {
+    use crate::operations::OperationResult;
+
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+    let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    // Intermediate node (has requester_addr) should return SendAndComplete with NotFound
+    let result = SubscribeOp::not_found_result(tx, instance_id, Some(requester), "HTL exhausted");
+
+    match result {
+        Ok(OperationResult::SendAndComplete {
+            msg,
+            next_hop,
+            stream_data,
+        }) => {
+            assert_eq!(
+                next_hop,
+                Some(requester),
+                "NotFound should be sent to requester"
+            );
+            assert!(stream_data.is_none());
+
+            // Verify the message is a NotFound response
+            let crate::message::NetMessage::V1(net_msg) = msg;
+            match net_msg {
+                crate::message::NetMessageV1::Subscribe(SubscribeMsg::Response {
+                    id,
+                    instance_id: resp_instance_id,
+                    result,
+                }) => {
+                    assert_eq!(id, tx);
+                    assert_eq!(resp_instance_id, instance_id);
+                    assert!(
+                        matches!(result, SubscribeMsgResult::NotFound),
+                        "Expected NotFound, got {:?}",
+                        result
+                    );
+                }
+                other => panic!("Expected Subscribe Response, got {:?}", other),
+            }
+        }
+        other => panic!(
+            "Expected Ok(SendAndComplete), got {:?}",
+            other.as_ref().map(|_| "Ok(other)").unwrap_or("Err")
+        ),
+    }
+}
+
+/// Regression test for #3241: when we're the originator (no requester_addr),
+/// not_found_result should return Err(NoCachingPeers) so the client gets
+/// a fast failure notification.
+#[test]
+fn test_not_found_result_originator_returns_error() {
+    use crate::operations::OpError;
+    use crate::ring::RingError;
+
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+
+    // Originator (no requester_addr) should return Err(RingError::NoCachingPeers)
+    let result = SubscribeOp::not_found_result(tx, instance_id, None, "no closer peers");
+
+    match result {
+        Err(OpError::RingError(RingError::NoCachingPeers(id))) => {
+            assert_eq!(
+                id, instance_id,
+                "Error should reference the correct contract"
+            );
+        }
+        Err(other) => panic!("Expected NoCachingPeers error, got: {other}"),
+        Ok(_) => panic!("Originator should get an error, not a message"),
+    }
+}
+
+/// Verify should_forward_not_found_on_abort state guard: only AwaitingResponse
+/// with a requester_addr triggers the forwarding path. Other states (PrepareRequest,
+/// Failed) and originator ops (no requester_addr) must return None.
+#[test]
+fn test_should_forward_not_found_on_abort_state_guard() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+    let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    // Case 1: PrepareRequest state with requester → should NOT forward
+    let op_prepare = SubscribeOp {
+        id: tx,
+        state: SubscribeState::PrepareRequest(super::PrepareRequestData {
+            id: tx,
+            instance_id,
+            is_renewal: false,
+        }),
+        requester_addr: Some(requester),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        op_prepare.should_forward_not_found_on_abort().is_none(),
+        "PrepareRequest state must not trigger forwarding"
+    );
+
+    // Case 2: Failed state with requester → should NOT forward
+    let op_failed = SubscribeOp {
+        id: tx,
+        state: SubscribeState::Failed,
+        requester_addr: Some(requester),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        op_failed.should_forward_not_found_on_abort().is_none(),
+        "Failed state must not trigger forwarding"
+    );
+
+    // Case 3: Completed state with requester → should NOT forward
+    let op_completed = SubscribeOp {
+        id: tx,
+        state: SubscribeState::Completed(super::CompletedData {
+            key: ContractKey::from_id_and_code(instance_id, CodeHash::new([99u8; 32])),
+        }),
+        requester_addr: Some(requester),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        op_completed.should_forward_not_found_on_abort().is_none(),
+        "Completed state must not trigger forwarding"
+    );
+
+    // Case 4: AwaitingResponse with NO requester (originator) → should NOT forward
+    let op_originator = SubscribeOp {
+        id: tx,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            instance_id,
+            next_hop: None,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        op_originator.should_forward_not_found_on_abort().is_none(),
+        "Originator (no requester_addr) must not trigger forwarding"
+    );
+
+    // Case 5: AwaitingResponse WITH requester → SHOULD forward
+    let op_intermediate = SubscribeOp {
+        id: tx,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            instance_id,
+            next_hop: None,
+        }),
+        requester_addr: Some(requester),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    let result = op_intermediate.should_forward_not_found_on_abort();
+    assert!(
+        result.is_some(),
+        "Intermediate node in AwaitingResponse must trigger forwarding"
+    );
+    let (fwd_instance_id, fwd_addr) = result.unwrap();
+    assert_eq!(fwd_instance_id, instance_id);
+    assert_eq!(fwd_addr, requester);
+}
