@@ -750,35 +750,65 @@ pub fn generate_wrapper_script(binary_path: &Path) -> String {
 # Freenet service wrapper for auto-update support.
 # This wrapper monitors exit code 42 (update needed) and runs update before restart.
 # Includes exponential backoff to prevent rapid restart loops on repeated failures.
+# On startup, kills any stale 'freenet network' processes to avoid port conflicts.
 
 BACKOFF=10       # Initial backoff in seconds
 MAX_BACKOFF=300  # Maximum backoff (5 minutes)
 CONSECUTIVE_FAILURES=0
+PORT_CONFLICT_KILLS=0
+MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
+
+LOG="$HOME/Library/Logs/freenet/freenet.log"
+
+# Kill any stale freenet network processes before starting.
+# This handles the case where a previous launch daemon restart left a child
+# process still holding the port (e.g. port 7509).
+# Scoped to the current user to avoid killing processes owned by other users.
+if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
+    echo "$(date): Killed stale freenet network process(es) on startup" >> "$LOG"
+    sleep 2
+fi
 
 while true; do
-    "{binary}" network
+    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last"
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 42 ]; then
-        echo "$(date): Update needed, running freenet update..." >> "$HOME/Library/Logs/freenet/freenet.log"
+        echo "$(date): Update needed, running freenet update..." >> "$LOG"
         if "{binary}" update --quiet; then
-            echo "$(date): Update successful, restarting..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            echo "$(date): Update successful, restarting..." >> "$LOG"
             CONSECUTIVE_FAILURES=0
+            PORT_CONFLICT_KILLS=0
             BACKOFF=10
             sleep 2
         else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$LOG"
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
             [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
         fi
         continue
     elif [ $EXIT_CODE -eq 0 ]; then
-        echo "$(date): Normal shutdown" >> "$HOME/Library/Logs/freenet/freenet.log"
+        echo "$(date): Normal shutdown" >> "$LOG"
         exit 0
     else
-        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$HOME/Library/Logs/freenet/freenet.log"
+        # Check if this looks like a port-already-in-use failure.
+        if grep -q "already in use" "$HOME/Library/Logs/freenet/freenet.error.log.last" 2>/dev/null; then
+            PORT_CONFLICT_KILLS=$((PORT_CONFLICT_KILLS + 1))
+            if [ $PORT_CONFLICT_KILLS -le $MAX_PORT_CONFLICT_KILLS ]; then
+                echo "$(date): Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..." >> "$LOG"
+                pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
+                sleep 2
+                BACKOFF=10
+                continue
+            else
+                echo "$(date): Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..." >> "$LOG"
+            fi
+        fi
+        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        PORT_CONFLICT_KILLS=0
+        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$LOG"
         sleep $BACKOFF
         BACKOFF=$((BACKOFF * 2))
         [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
@@ -1292,6 +1322,61 @@ mod tests {
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_script_generation() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        // Regression for #3301: startup stale-process cleanup, scoped to current user
+        assert!(
+            script.contains("pkill -f -u \"$(id -u)\" \"freenet network\""),
+            "wrapper must kill stale processes on startup, scoped to current user"
+        );
+        assert!(
+            script.contains("sleep 2"),
+            "wrapper must wait after startup kill to let the OS release the port"
+        );
+
+        // Port-conflict detection: stderr captured for grep inspection
+        assert!(
+            script.contains("freenet.error.log.last"),
+            "wrapper must capture stderr to a scratch file for port-conflict detection"
+        );
+        assert!(
+            script.contains("already in use"),
+            "wrapper must detect port-already-in-use errors from stderr"
+        );
+
+        // Port-conflict recovery: capped kill-and-retry loop
+        assert!(
+            script.contains("PORT_CONFLICT_KILLS"),
+            "wrapper must track port-conflict kill attempts"
+        );
+        assert!(
+            script.contains("MAX_PORT_CONFLICT_KILLS"),
+            "wrapper must cap port-conflict kill attempts to prevent infinite loops"
+        );
+
+        // Correct binary path embedded (binary path is quoted in the generated script)
+        assert!(
+            script.contains("\"/usr/local/bin/freenet\" network"),
+            "wrapper must invoke the correct binary"
+        );
+
+        // Normal shutdown path
+        assert!(
+            script.contains("exit 0"),
+            "wrapper must exit cleanly on normal shutdown"
+        );
+
+        // Update path (exit code 42)
+        assert!(
+            script.contains("EXIT_CODE -eq 42"),
+            "wrapper must handle exit code 42 for auto-update"
+        );
     }
 
     #[test]
