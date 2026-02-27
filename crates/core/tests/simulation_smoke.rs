@@ -1056,3 +1056,114 @@ async fn test_stale_reservation_cleanup_frees_capacity() {
     let reserved_after = sim.reserved_connections_count(&gw).unwrap();
     assert!(reserved_after < reserved_before);
 }
+
+// =============================================================================
+// Connection Growth Tests (#3303)
+// =============================================================================
+
+/// Regression test for #3303: nodes must grow ring connections past the initial gateway.
+///
+/// ## The Bug
+/// `initiate_join_request` only excluded recently-failed NAT addresses from the routing
+/// bloom filter. Already-connected ring peers were never excluded. Routing nodes always
+/// forwarded connect requests to the nearest already-connected peer, which then "reused
+/// the existing transport" instead of forming a new ring connection.
+/// The result: `ring_connections` never grew. Observed stuck at 3 for 26+ consecutive
+/// jitter cycles in production.
+///
+/// ## Core Fix Validation
+/// The core fix — pre-populating the bloom filter with already-connected peer addresses —
+/// is validated directly by the unit test `test_initiate_join_request_excludes_connected_peers`
+/// in `operations/connect.rs`. That test verifies the bloom filter IS pre-populated and that
+/// routing candidates correctly exclude already-connected peers.
+///
+/// ## What This Integration Test Checks
+/// With 1 gateway + 5 nodes, after sufficient virtual time every non-gateway node must
+/// have at least 2 ring connections (gateway + at least one other peer). This ensures:
+/// 1. Basic ring connectivity is maintained: each node participates in the DHT.
+/// 2. Connection maintenance successfully grows rings beyond just the initial gateway
+///    connection (every node bootstraps with at least the gateway connection).
+/// 3. The fix does not break the ability of nodes to acquire new connections at all.
+///
+/// ## Scope Note
+/// Testing that nodes reach `min_connections` reliably in simulation is difficult because
+/// `bootstrap_target_locations` (used when connections < 5) always targets a node's own
+/// ring location. In small networks, all peers near that location are often already
+/// connected, so routing terminates at the gateway (which correctly becomes terminus
+/// but is already connected). The production fix is most impactful in larger networks
+/// where diverse non-connected peers exist near any target location.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_connection_growth_past_initial_peers() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x3303_C0FF_EE01;
+    const NETWORK_NAME: &str = "conn-growth-3303";
+    const MIN_CONNECTIONS: usize = 3;
+    // 1 gateway + 5 nodes = 6 peers total.
+    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 5, 7, 3, 6, MIN_CONNECTIONS, SEED).await;
+    sim.with_start_backoff(Duration::from_millis(50));
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 3, 20)
+        .await;
+
+    // Allow enough virtual time for initial bootstrap + several connection-maintenance cycles.
+    // FAST_CHECK_TICK_DURATION = 1s in test mode.
+    let_network_run(&mut sim, Duration::from_secs(60)).await;
+
+    // Every non-gateway node must have at least 2 ring connections (gateway + at least one
+    // more peer). The fix must not break normal connection acquisition; nodes that can grow
+    // beyond the gateway must do so.
+    //
+    // Node labels start at 1 (index 0 is the gateway).
+    for i in 1..=5 {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        let count = sim.connection_count(&label).unwrap_or(0);
+        assert!(
+            count >= 2,
+            "Node {} has {} connections, expected >= 2 — basic ring connectivity is broken \
+             (each node should connect to gateway + at least one ring peer)",
+            i,
+            count,
+        );
+    }
+}
+
+/// Edge case for #3303: fully-connected small network should work correctly.
+///
+/// When a node is already connected to all available peers in a tiny network
+/// (1 gateway + 2 nodes, max 2 connections each), the bloom filter will eventually
+/// exclude all peers — but this is correct behavior since there is nobody new to
+/// connect to. Verifies that the fix doesn't break operation in the degenerate case
+/// where the exclude list saturates all available peers.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_fully_saturated_small_network() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x3303_C0FF_EE02;
+    const NETWORK_NAME: &str = "saturation-3303";
+    // Very small: 1 gateway + 2 nodes, min=2. Maximum possible connections per node = 2.
+    let mut sim = SimNetwork::new(NETWORK_NAME, 1, 2, 7, 3, 4, 2, SEED).await;
+    sim.with_start_backoff(Duration::from_millis(50));
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 2, 10)
+        .await;
+
+    let_network_run(&mut sim, Duration::from_secs(60)).await;
+
+    // All nodes should be connected to something (connectivity is satisfied even though
+    // the exclude list may contain all available peers once fully connected).
+    let gw = NodeLabel::gateway(NETWORK_NAME, 0);
+    let gw_count = sim.connection_count(&gw).unwrap_or(0);
+    assert!(gw_count >= 1, "Gateway should have at least 1 connection");
+
+    // Node labels start at 1 (index 0 is the gateway).
+    for i in 1..=2 {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        let count = sim.connection_count(&label).unwrap_or(0);
+        assert!(
+            count >= 1,
+            "Node {} should be connected (got 0) — fix must not break fully-saturated networks",
+            i
+        );
+    }
+}

@@ -2212,6 +2212,14 @@ impl Ring {
         let target_connections = self.connection_manager.min_connections;
 
         let failed_addrs = self.connection_manager.recently_failed_addrs();
+        let connected_addrs = self.connection_manager.connected_peer_addrs();
+        tracing::debug!(
+            failed = failed_addrs.len(),
+            connected = connected_addrs.len(),
+            "acquire_new: pre-populating bloom filter with excluded peer addresses"
+        );
+        let mut exclude_addrs = failed_addrs;
+        exclude_addrs.extend(connected_addrs);
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner.clone(),
             query_target.clone(),
@@ -2219,7 +2227,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
-            &failed_addrs,
+            &exclude_addrs,
         );
 
         // Emit telemetry for initial connect request sent

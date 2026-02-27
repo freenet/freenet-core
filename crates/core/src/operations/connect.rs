@@ -1020,7 +1020,7 @@ impl ConnectOp {
         ttl: u8,
         target_connections: usize,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
-        recently_failed_addrs: &[SocketAddr],
+        exclude_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
 
@@ -1034,14 +1034,24 @@ impl ConnectOp {
             visited.mark_visited(target_addr);
         }
 
-        // Mark peers that recently failed NAT traversal so routing nodes skip them.
-        for addr in recently_failed_addrs {
+        // Exclude already-connected peers and recently-failed NAT addresses so routing
+        // nodes don't forward back to peers we already have a ring connection with.
+        //
+        // Bloom filter saturation note: VisitedPeers uses a 512-bit filter with k=4 hash
+        // functions. Pre-loading N entries raises the false-positive rate; at typical
+        // network sizes (≤ 20 connections in current deployments) the FP rate is negligible
+        // (~0.01%). At DEFAULT_MAX_CONNECTIONS (200), the rate reaches ~39%, which would
+        // cause routing to occasionally skip reachable peers. This is an accepted trade-off
+        // for current network sizes. If production nodes routinely reach high connection
+        // counts, consider capping pre-populated entries to the N closest connected peers
+        // (since greedy routing preferentially selects nearby peers anyway).
+        for addr in exclude_addrs {
             visited.mark_visited(*addr);
         }
-        if !recently_failed_addrs.is_empty() {
-            tracing::info!(
-                failed_addrs = recently_failed_addrs.len(),
-                "connect: pre-populated visited filter with recently failed peer addresses"
+        if !exclude_addrs.is_empty() {
+            tracing::debug!(
+                excluded_addrs = exclude_addrs.len(),
+                "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
             );
         }
 
@@ -2147,6 +2157,14 @@ pub(crate) async fn join_ring_request(
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
     let failed_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
+    let connected_addrs = op_manager.ring.connection_manager.connected_peer_addrs();
+    tracing::debug!(
+        failed = failed_addrs.len(),
+        connected = connected_addrs.len(),
+        "connect: pre-populating bloom filter with excluded peer addresses"
+    );
+    let mut exclude_addrs = failed_addrs;
+    exclude_addrs.extend(connected_addrs);
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -2154,7 +2172,7 @@ pub(crate) async fn join_ring_request(
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
-        &failed_addrs,
+        &exclude_addrs,
     );
 
     // Emit telemetry for initial connect request sent
@@ -4015,6 +4033,61 @@ mod tests {
         assert!(
             state.forwarded_to.is_some(),
             "forwarded_to should still be preserved for ConnectFailed propagation"
+        );
+    }
+
+    /// Regression test for #3303: already-connected peers must be excluded from the visited
+    /// filter so routing doesn't forward connect requests back to them as acceptors.
+    ///
+    /// Before the fix, only recently-failed NAT addresses were excluded. This caused nodes to
+    /// get permanently stuck: every ConnectResponse resolved to the same already-connected peer,
+    /// `connect_peer` logged "reusing existing transport", and ring_connections never grew.
+    #[test]
+    fn test_initiate_join_request_excludes_connected_peers() {
+        let own = make_peer(8001);
+        let target = make_peer(8002);
+        let desired_location = Location::try_from(0.5).unwrap();
+        let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+
+        let connected_peer1: SocketAddr = "10.0.0.10:9000".parse().unwrap();
+        let connected_peer2: SocketAddr = "10.0.0.11:9001".parse().unwrap();
+        let unconnected_peer: SocketAddr = "10.0.0.99:9999".parse().unwrap();
+
+        let exclude_addrs = vec![connected_peer1, connected_peer2];
+
+        let (tx, _op, msg) = ConnectOp::initiate_join_request(
+            own.clone(),
+            target.clone(),
+            desired_location,
+            10,
+            3,
+            estimator,
+            &exclude_addrs,
+        );
+
+        let request = match msg {
+            ConnectMsg::Request { payload, .. } => payload,
+            ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::Rejected { .. }
+            | ConnectMsg::ConnectFailed { .. } => panic!("Expected ConnectMsg::Request"),
+        };
+
+        let visited = request.visited.with_transaction(&tx);
+
+        // Already-connected peers must be in the visited filter so routing skips them.
+        assert!(
+            visited.probably_visited(connected_peer1),
+            "connected peer 1 should be marked visited to prevent routing back to it"
+        );
+        assert!(
+            visited.probably_visited(connected_peer2),
+            "connected peer 2 should be marked visited to prevent routing back to it"
+        );
+        // An unrelated peer should not be in the filter.
+        assert!(
+            !visited.probably_visited(unconnected_peer),
+            "unconnected peer should not be in the visited filter"
         );
     }
 }
