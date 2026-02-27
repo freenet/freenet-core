@@ -28,10 +28,12 @@ on:
       - '.github/FUNDING.yml'
   merge_group:
 
-# Cancel in-progress runs when a new commit is pushed to the same branch
+# Cancel in-progress runs when a new commit is pushed to the same branch.
+# On main, never cancel — each merge must complete its CI run. Otherwise a
+# fast succession of merges silently cancels earlier builds (#3311).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Fast checks first - fail fast on simple issues
