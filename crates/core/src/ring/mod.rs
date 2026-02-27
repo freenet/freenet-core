@@ -2211,7 +2211,8 @@ impl Ring {
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
-        let failed_addrs = self.connection_manager.recently_failed_addrs();
+        let mut exclude_addrs = self.connection_manager.recently_failed_addrs();
+        exclude_addrs.extend(self.connection_manager.connected_peer_addrs());
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner.clone(),
             query_target.clone(),
@@ -2219,7 +2220,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
-            &failed_addrs,
+            &exclude_addrs,
         );
 
         // Emit telemetry for initial connect request sent

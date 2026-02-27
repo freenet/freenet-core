@@ -1378,6 +1378,11 @@ impl ConnectionManager {
         self.recently_failed_addrs.write().remove(&addr);
     }
 
+    /// Return addresses of all currently established ring connections.
+    pub fn connected_peer_addrs(&self) -> Vec<SocketAddr> {
+        self.location_for_peer.read().keys().copied().collect()
+    }
+
     /// Return addresses that failed NAT traversal within `FAILED_ADDR_TTL`.
     pub fn recently_failed_addrs(&self) -> Vec<SocketAddr> {
         let now = Instant::now();
