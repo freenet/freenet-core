@@ -324,11 +324,12 @@ fn shell_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Freenet Contract</title>
+<title>Freenet</title>
+<link rel="icon" href="https://freenet.org/favicon.ico">
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -432,7 +433,26 @@ function freenetBridge(authToken) {
   window.addEventListener('message', function(event) {
     if (event.source !== iframe.contentWindow) return;
     var msg = event.data;
-    if (!msg || !msg.__freenet_ws__) return;
+    if (!msg) return;
+
+    // Handle shell-level messages (title, favicon) from iframe
+    if (msg.__freenet_shell__) {
+      if (msg.type === 'title' && typeof msg.title === 'string') {
+        // Truncate to prevent UI spoofing with excessively long titles
+        document.title = msg.title.slice(0, 128);
+      } else if (msg.type === 'favicon' && typeof msg.href === 'string') {
+        // Only allow https: and data: schemes to prevent exfiltration
+        try {
+          var scheme = msg.href.split(':')[0].toLowerCase();
+          if (scheme !== 'https' && scheme !== 'data') return;
+        } catch(e) { return; }
+        var link = document.querySelector('link[rel="icon"]');
+        if (link) link.href = msg.href;
+      }
+      return;
+    }
+
+    if (!msg.__freenet_ws__) return;
 
     switch (msg.type) {
       case 'open': {
@@ -798,7 +818,7 @@ mod tests {
 
         // Shell page must contain sandboxed iframe
         assert!(
-            html.contains(r#"sandbox="allow-scripts allow-forms"#),
+            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups"#),
             "iframe sandbox attribute missing"
         );
         // Iframe src must include __sandbox=1
@@ -820,6 +840,25 @@ mod tests {
         assert!(
             html.contains(&format!("freenetBridge(\"{}\")", token.as_str())),
             "auth token not passed to bridge"
+        );
+        // Default title and favicon must be present
+        assert!(
+            html.contains("<title>Freenet</title>"),
+            "shell page title mismatch"
+        );
+        assert!(
+            html.contains(r#"<link rel="icon" href="https://freenet.org/favicon.ico">"#),
+            "favicon link missing"
+        );
+        // Shell message handler must be present in bridge JS
+        assert!(
+            html.contains("__freenet_shell__"),
+            "bridge JS must handle shell-level messages (title/favicon)"
+        );
+        // Security: allow-popups-to-escape-sandbox must NOT be present
+        assert!(
+            !html.contains("allow-popups-to-escape-sandbox"),
+            "allow-popups-to-escape-sandbox must not be set (security)"
         );
     }
 
@@ -988,6 +1027,19 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("connections.delete(msg.id)"),
             "bridge JS must clean up connections"
+        );
+        // Shell message handler must validate types and restrict favicon schemes
+        assert!(
+            SHELL_BRIDGE_JS.contains("typeof msg.title === 'string'"),
+            "bridge JS must type-check title before setting"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("typeof msg.href === 'string'"),
+            "bridge JS must type-check favicon href before setting"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("scheme !== 'https' && scheme !== 'data'"),
+            "bridge JS must restrict favicon href to https/data schemes"
         );
     }
 
