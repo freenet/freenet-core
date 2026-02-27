@@ -572,6 +572,12 @@ update_versions() {
     sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
+    # Update min-compatible-version in Cargo.toml metadata so cross-compile CI
+    # builds (which don't have the env var) get the correct min-compatible version.
+    echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
+    sed_inplace "s/^min-compatible-version = \".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
+    echo "✓"
+
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
     sed_inplace "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"

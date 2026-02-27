@@ -9,6 +9,12 @@ license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
+[package.metadata.freenet]
+# Minimum compatible protocol version. Peers older than this are rejected.
+# Updated by scripts/release.sh during releases. The env var
+# FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
+min-compatible-version = "0.1.152"
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
 pkg-fmt = "tgz"

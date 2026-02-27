@@ -17,20 +17,30 @@ fn main() {
 }
 
 fn emit_min_compatible_version() {
-    // Allow overriding min-compatible version at build time.
-    // Default: current package version (strict match, same as old behavior).
+    // Priority for min-compatible version:
+    // 1. FREENET_MIN_COMPATIBLE_VERSION env var (set by release.sh)
+    // 2. package.metadata.freenet.min-compatible-version in Cargo.toml
+    // 3. CARGO_PKG_VERSION (strict match — same as old behavior)
+    //
+    // Source (2) ensures cross-compile CI builds (which don't set the env var)
+    // still get the correct min-compatible version from the committed Cargo.toml.
     let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap();
-    let min_compat =
-        std::env::var("FREENET_MIN_COMPATIBLE_VERSION").unwrap_or_else(|_| pkg_version.clone());
+    let min_compat = std::env::var("FREENET_MIN_COMPATIBLE_VERSION")
+        .ok()
+        .or_else(read_min_compatible_from_cargo_toml)
+        .unwrap_or_else(|| pkg_version.clone());
 
-    // Validate: min_compatible must share major.minor with the package version.
-    // The wire format only encodes min_patch (major.minor inherited from version).
+    // Validate min_compatible format and constraints.
     let pkg_parts: Vec<&str> = pkg_version.split('.').collect();
     let min_parts: Vec<&str> = min_compat.split('.').collect();
-    if pkg_parts.len() >= 2
-        && min_parts.len() >= 2
-        && (pkg_parts[0] != min_parts[0] || pkg_parts[1] != min_parts[1])
-    {
+
+    // Must be a valid X.Y.Z version.
+    if min_parts.len() < 3 {
+        panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be in X.Y.Z format");
+    }
+
+    // Must share major.minor (wire format only encodes min_patch).
+    if pkg_parts.len() >= 2 && (pkg_parts[0] != min_parts[0] || pkg_parts[1] != min_parts[1]) {
         panic!(
             "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must share major.minor \
              with package version ({pkg_version}). The wire format only encodes \
@@ -38,8 +48,39 @@ fn emit_min_compatible_version() {
         );
     }
 
+    // Must not exceed the package version (would reject all peers including ourselves).
+    if min_compat > pkg_version {
+        panic!(
+            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be <= package version \
+             ({pkg_version}). A min_compatible higher than our own version would \
+             reject all peers."
+        );
+    }
+
     println!("cargo:rustc-env=FREENET_MIN_COMPATIBLE_VERSION={min_compat}");
     println!("cargo:rerun-if-env-changed=FREENET_MIN_COMPATIBLE_VERSION");
+}
+
+/// Read min-compatible-version from [package.metadata.freenet] in Cargo.toml.
+/// Returns None if the field is missing or unreadable.
+fn read_min_compatible_from_cargo_toml() -> Option<String> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let cargo_toml = std::path::Path::new(&manifest_dir).join("Cargo.toml");
+    let contents = std::fs::read_to_string(cargo_toml).ok()?;
+    // Simple line-based parsing — avoids adding a toml dependency to build.rs.
+    // Looks for: min-compatible-version = "X.Y.Z"
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("min-compatible-version") {
+            if let Some(value) = trimmed.split('=').nth(1) {
+                let version = value.trim().trim_matches('"').trim().to_string();
+                if !version.is_empty() {
+                    return Some(version);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn emit_build_metadata() {
