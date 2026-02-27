@@ -6053,3 +6053,152 @@ fn test_readiness_gating_with_message_loss() {
         event_count
     );
 }
+
+// =============================================================================
+// CONNECT Acceptor Diversity: Joiner succeeds despite NAT-blocked acceptor
+// =============================================================================
+
+/// Tests that a joiner can connect to the network even when partitioned from
+/// some peers (simulating NAT hole-punch failure).
+///
+/// ## Scenario
+/// 1. Create a 1-gateway + 5-node network
+/// 2. Let the network bootstrap normally (all nodes connected)
+/// 3. Inject a partition between 2 specific non-gateway nodes
+///    (simulates NAT incompatibility between those peers)
+/// 4. Continue operating — peers in the partitioned pair can't reach each other
+///    but should still connect via other paths using ConnectFailed re-routing
+/// 5. Verify the simulation completes without hanging (nodes don't get stuck
+///    retrying the same unreachable acceptor forever)
+///
+/// Without ConnectFailed + jitter, a joiner partitioned from its nearest
+/// acceptor would retry the same peer indefinitely. With the fix, ConnectFailed
+/// propagates through the relay chain, causing re-routing to different acceptors,
+/// and location jitter explores different ring regions on retry.
+#[test_log::test]
+fn test_connect_despite_nat_partition() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::Partition;
+
+    const SEED: u64 = 0xC0DE_FA11_0001;
+    const NETWORK_NAME: &str = "nat-partition";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle, node_addrs) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            5,  // 5 regular nodes (6 total)
+            7,  // max HTL
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        let node_addrs: HashMap<NodeLabel, std::net::SocketAddr> = sim.all_node_addresses().clone();
+        (sim, logs_handle, node_addrs)
+    });
+
+    // Pick two non-gateway nodes to partition from each other.
+    // This simulates NAT incompatibility: hole-punch between these two peers
+    // always fails, but both can reach the rest of the network.
+    let mut non_gw_nodes: Vec<_> = node_addrs
+        .iter()
+        .filter(|(label, _)| label.is_node())
+        .collect();
+    non_gw_nodes.sort_by_key(|(label, _)| label.number());
+
+    assert!(
+        non_gw_nodes.len() >= 2,
+        "Need at least 2 non-gateway nodes for partition"
+    );
+
+    let node_a_addr = *non_gw_nodes[0].1;
+    let node_b_addr = *non_gw_nodes[1].1;
+
+    let side_a: HashSet<std::net::SocketAddr> = [node_a_addr].into_iter().collect();
+    let side_b: HashSet<std::net::SocketAddr> = [node_b_addr].into_iter().collect();
+
+    let network_name = NETWORK_NAME.to_string();
+
+    tracing::info!(
+        node_a = %node_a_addr,
+        node_b = %node_b_addr,
+        "Will inject NAT partition between two nodes"
+    );
+
+    // Inject the partition from the test closure (like test_partition_heal_convergence)
+    // to preserve the properly-configured fault injector with VirtualTime.
+    // The partition is injected immediately and kept permanent — simulating
+    // persistent NAT incompatibility between two specific peers.
+    let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+        SEED,
+        3,                          // contracts
+        100,                        // iterations (generous budget)
+        Duration::from_secs(120),   // simulation_duration
+        Duration::from_millis(500), // event_wait
+        move || async move {
+            // Inject the permanent partition immediately
+            if let Some(injector) = freenet::dev_tool::get_fault_injector(&network_name) {
+                let mut state = injector.lock().unwrap();
+                let partition = Partition::new(side_a, side_b).permanent(0);
+                state.config.add_partition(partition);
+                tracing::info!("NAT partition injected between two nodes");
+            }
+
+            // Let the network operate with the partition active
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            tracing::info!("NAT partition test: observation period complete");
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "NAT partition simulation failed (nodes may have gotten stuck retrying \
+         unreachable acceptor): {:?}",
+        result.err()
+    );
+
+    // Check convergence — with the partition, some divergence is expected
+    // between the two partitioned nodes, but the network should still function.
+    let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+    tracing::info!(
+        "NAT partition: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    // Run anomaly detection
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+
+    tracing::info!(
+        "=== NAT PARTITION ANOMALY REPORT: {} events, {} state, {} contracts, {} anomalies ===",
+        report.total_events,
+        report.state_events,
+        report.contracts_analyzed,
+        report.anomalies.len()
+    );
+
+    // Log anomaly details for debugging
+    let divergences = report.divergences();
+    let stale = report.stale_peers();
+    tracing::warn!("  divergences={}, stale={}", divergences.len(), stale.len(),);
+
+    for (i, anomaly) in report.anomalies.iter().enumerate() {
+        tracing::debug!("  anomaly[{}] = {:?}", i, anomaly);
+    }
+
+    // The simulation completing without timeout is the primary assertion:
+    // without ConnectFailed + jitter, partitioned joiners would retry the same
+    // unreachable acceptor forever, eventually causing the simulation to hang
+    // or timeout.
+}
