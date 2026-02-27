@@ -7,6 +7,7 @@
 //! See `architecture.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -52,6 +53,118 @@ pub fn has_version_mismatch() -> bool {
 /// Clear the version mismatch flag (called after checking for updates).
 pub fn clear_version_mismatch() {
     VERSION_MISMATCH_DETECTED.store(false, Ordering::SeqCst);
+}
+
+// =============================================================================
+// Decentralized version discovery
+// =============================================================================
+//
+// Peers learn about newer versions from successful handshakes with neighbors.
+// HIGHEST_SEEN_VERSION tracks the highest version seen in the network.
+// URGENT_UPDATE_NEEDED is set when a remote's min_compatible > our version
+// (meaning we MUST update to remain connected).
+
+/// Highest version observed from any peer during handshake, with the number
+/// of handshakes that reported it.
+static HIGHEST_SEEN_VERSION: Mutex<Option<HighestSeenVersion>> = Mutex::new(None);
+
+/// Set when a remote peer's min_compatible version exceeds our version,
+/// meaning we cannot connect to that peer without updating.
+static URGENT_UPDATE_NEEDED: AtomicBool = AtomicBool::new(false);
+
+/// Minimum number of handshakes that must report a version before we
+/// trust it for the stagger timer. This is a lightweight defense against
+/// a single transient bad report — it does not track peer identity, so a
+/// persistent attacker reconnecting can bypass it. The real protection is
+/// that GitHub verification is always required before exit-42.
+const MIN_VERSION_REPORTERS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct HighestSeenVersion {
+    version: (u8, u8, u16),
+    reporter_count: usize,
+}
+
+/// Called on every successful handshake to track the highest version seen.
+///
+/// Lightweight defense: at least `MIN_VERSION_REPORTERS` handshakes must
+/// report the same version before `get_highest_seen_version()` returns it.
+/// This catches single transient bad reports. A persistent attacker can
+/// bypass this by reconnecting, but the real protection is that the update
+/// check task always verifies against GitHub before triggering exit-42.
+pub fn report_peer_version(version: (u8, u8, u16)) {
+    // Recover from mutex poisoning — version tracking is best-effort and
+    // must not permanently break if another thread panicked while holding it.
+    let mut guard = HIGHEST_SEEN_VERSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    match *guard {
+        None => {
+            *guard = Some(HighestSeenVersion {
+                version,
+                reporter_count: 1,
+            });
+        }
+        Some(ref mut current) => {
+            if version > current.version {
+                // New highest — reset count since this is a different version.
+                *current = HighestSeenVersion {
+                    version,
+                    reporter_count: 1,
+                };
+            } else if version == current.version {
+                current.reporter_count = current.reporter_count.saturating_add(1);
+            }
+            // version < current: ignore
+        }
+    }
+}
+
+/// Get the highest version seen from peers, if enough peers have reported it.
+///
+/// Returns `None` until at least `MIN_VERSION_REPORTERS` peers have reported
+/// the same highest version. This prevents a single malicious peer from
+/// triggering update checks by advertising a fake high version.
+pub fn get_highest_seen_version() -> Option<(u8, u8, u16)> {
+    let guard = HIGHEST_SEEN_VERSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.and_then(|hsv| {
+        if hsv.reporter_count >= MIN_VERSION_REPORTERS {
+            Some(hsv.version)
+        } else {
+            None
+        }
+    })
+}
+
+/// Reset version discovery state (test only).
+#[cfg(test)]
+fn reset_version_discovery() {
+    let mut guard = HIGHEST_SEEN_VERSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// Called when a version mismatch indicates we are too old
+/// (remote's min_compatible > our version). This is a breaking change
+/// that requires immediate update.
+pub fn signal_urgent_update() {
+    URGENT_UPDATE_NEEDED.store(true, Ordering::SeqCst);
+    // Also trigger the legacy mismatch path
+    signal_version_mismatch();
+}
+
+/// Check if an urgent (breaking) update is needed.
+pub fn is_urgent_update() -> bool {
+    URGENT_UPDATE_NEEDED.load(Ordering::SeqCst)
+}
+
+/// Clear the urgent update flag.
+pub fn clear_urgent_update() {
+    URGENT_UPDATE_NEEDED.store(false, Ordering::SeqCst);
 }
 
 /// Global counter of open ring connections, updated by `connection_maintenance`.
@@ -409,5 +522,53 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod version_discovery_tests {
+    use super::*;
+
+    // These tests mutate global statics and must run sequentially.
+    // Use `cargo test -- --test-threads=1 version_discovery` if running standalone.
+
+    #[test]
+    fn single_reporter_not_trusted() {
+        reset_version_discovery();
+        report_peer_version((0, 1, 153));
+        // Only 1 reporter — should not be trusted yet
+        assert_eq!(get_highest_seen_version(), None);
+    }
+
+    #[test]
+    fn two_reporters_trusted() {
+        reset_version_discovery();
+        report_peer_version((0, 1, 153));
+        report_peer_version((0, 1, 153));
+        assert_eq!(get_highest_seen_version(), Some((0, 1, 153)));
+    }
+
+    #[test]
+    fn higher_version_resets_count() {
+        reset_version_discovery();
+        report_peer_version((0, 1, 153));
+        report_peer_version((0, 1, 153)); // count=2, now trusted
+        assert_eq!(get_highest_seen_version(), Some((0, 1, 153)));
+
+        // New higher version resets count
+        report_peer_version((0, 1, 154));
+        // Only 1 reporter for 154 — not trusted yet
+        assert_eq!(get_highest_seen_version(), None);
+
+        report_peer_version((0, 1, 154));
+        assert_eq!(get_highest_seen_version(), Some((0, 1, 154)));
+    }
+
+    #[test]
+    fn major_minor_bumps_accepted() {
+        reset_version_discovery();
+        report_peer_version((1, 0, 0));
+        report_peer_version((1, 0, 0));
+        assert_eq!(get_highest_seen_version(), Some((1, 0, 0)));
     }
 }

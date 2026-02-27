@@ -14,6 +14,7 @@ fi
 
 # Parse arguments
 VERSION=""
+MIN_COMPATIBLE=""
 DRY_RUN=false
 SKIP_TESTS=false
 DEPLOY_LOCAL=false
@@ -44,10 +45,12 @@ show_help() {
     echo "• Publishing to crates.io → GitHub release → Automatic cross-compilation"
     echo
     echo "Options:"
-    echo "  --version X.Y.Z     Target version (required)"
-    echo "  --skip-tests        Skip pre-release tests"
-    echo "  --dry-run           Show what would be done without executing"
-    echo "  --help              Show this help"
+    echo "  --version X.Y.Z           Target version (required)"
+    echo "  --min-compatible X.Y.Z    Minimum compatible version for range-based"
+    echo "                            version checking (default: previous release)"
+    echo "  --skip-tests              Skip pre-release tests"
+    echo "  --dry-run                 Show what would be done without executing"
+    echo "  --help                    Show this help"
     echo
     echo "Resumption:"
     echo "  The script automatically detects completed steps and skips them."
@@ -73,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             echo "Note: --deploy-local and --deploy-remote are deprecated."
             echo "      Gateways are now updated automatically after binaries are available."
             shift
+            ;;
+        --min-compatible)
+            MIN_COMPATIBLE="$2"
+            shift 2
             ;;
         --skip-tests)
             SKIP_TESTS=true
@@ -105,6 +112,16 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "Error: Version must be in format X.Y.Z (e.g., 0.1.17)"
     exit 1
 fi
+
+# Default min-compatible to the current version in Cargo.toml (the version before the bump).
+# This means gateways running the new version will still accept peers on the previous version.
+if [[ -z "$MIN_COMPATIBLE" ]]; then
+    MIN_COMPATIBLE=$(grep "^version" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null | head -1 | cut -d'"' -f2)
+    echo "Min-compatible version: $MIN_COMPATIBLE (defaulting to current version before bump)"
+else
+    echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set)"
+fi
+export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
 
 # Get the most recently published version from crates.io (most authoritative source)
 echo -n "Checking latest published version on crates.io... "
@@ -553,6 +570,12 @@ update_versions() {
     # Update freenet version
     echo -n "  Updating freenet to $VERSION... "
     sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
+    echo "✓"
+
+    # Update min-compatible-version in Cargo.toml metadata so cross-compile CI
+    # builds (which don't have the env var) get the correct min-compatible version.
+    echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
+    sed_inplace "s/^min-compatible-version = \".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
     # Update fdev version and its freenet dependency

@@ -45,6 +45,11 @@ pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 /// Current version of the crate.
 pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Minimum compatible version for range-based version checking.
+/// Set at build time via FREENET_MIN_COMPATIBLE_VERSION env var.
+/// Defaults to PCK_VERSION (strict match) when not overridden.
+pub(crate) const MIN_COMPATIBLE_VERSION: &str = env!("FREENET_MIN_COMPATIBLE_VERSION");
+
 // Initialize the executor once.
 static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initialize_async_rt);
 
