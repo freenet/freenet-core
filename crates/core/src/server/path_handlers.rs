@@ -324,11 +324,12 @@ fn shell_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Freenet Contract</title>
+<title>Freenet</title>
+<link rel="icon" href="https://freenet.org/favicon.ico">
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -501,6 +502,24 @@ function freenetBridge(authToken) {
         }
         break;
       }
+    }
+  });
+
+  // Handle shell-level messages (title, favicon) from iframe
+  window.addEventListener('message', function(event) {
+    if (event.source !== iframe.contentWindow) return;
+    var msg = event.data;
+    if (!msg || !msg.__freenet_shell__) return;
+    switch (msg.type) {
+      case 'title':
+        if (typeof msg.title === 'string') document.title = msg.title;
+        break;
+      case 'favicon':
+        if (typeof msg.href === 'string') {
+          var link = document.querySelector('link[rel="icon"]');
+          if (link) link.href = msg.href;
+        }
+        break;
     }
   });
 }
@@ -798,7 +817,7 @@ mod tests {
 
         // Shell page must contain sandboxed iframe
         assert!(
-            html.contains(r#"sandbox="allow-scripts allow-forms"#),
+            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups"#),
             "iframe sandbox attribute missing"
         );
         // Iframe src must include __sandbox=1
