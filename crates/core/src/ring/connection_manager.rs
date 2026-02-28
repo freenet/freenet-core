@@ -16,7 +16,7 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -262,9 +262,12 @@ pub(crate) struct ConnectionManager {
     connected_since: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
     /// Per-peer routing health statistics for eviction decisions.
     pub(crate) peer_health: Arc<Mutex<PeerHealthTracker>>,
-    /// Consecutive CONNECT failures for location jitter.
+    /// Consecutive CONNECT failures for location jitter and the time of the last failure.
     /// Incremented on failed hole-punch, reset on successful connect.
-    connect_jitter_failures: Arc<AtomicU32>,
+    /// The stored `Option<Instant>` enables time-based decay: consecutive failures
+    /// accumulated during an idle period are partially wound down before the next
+    /// attempt, preventing artificially inflated jitter after idle periods.
+    connect_jitter_failures: Arc<parking_lot::Mutex<(u32, Option<Instant>)>>,
     /// Peers excluded from CONNECT routing due to repeated acceptor failures.
     /// Key: peer addr, Value: (failure_count, last_failure_time).
     /// Entries expire after `CONNECT_EXCLUDE_TTL`.
@@ -385,7 +388,7 @@ impl ConnectionManager {
             min_ready_connections,
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
-            connect_jitter_failures: Arc::new(AtomicU32::new(0)),
+            connect_jitter_failures: Arc::new(parking_lot::Mutex::new((0, None))),
             connect_excluded_peers: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         }
     }
@@ -1454,20 +1457,48 @@ impl ConnectionManager {
 
     // ==================== CONNECT Jitter ====================
 
+    /// How long between automatic decay steps for the jitter failure counter.
+    ///
+    /// If this much time has elapsed since the last failure, the counter is reduced
+    /// by one step per elapsed interval before the new failure is recorded.  This
+    /// prevents failure counts accumulated during one burst of connection attempts
+    /// from artificially inflating jitter on a reconnection attempt that happens
+    /// much later.
+    const JITTER_DECAY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
     /// Increment consecutive connect failure counter and return the new count.
-    pub fn increment_connect_jitter_failures(&self) -> u32 {
-        self.connect_jitter_failures.fetch_add(1, Ordering::Relaxed) + 1
+    ///
+    /// Before incrementing, applies time-based decay: for every full
+    /// `JITTER_DECAY_INTERVAL` that has elapsed since the last failure, the
+    /// counter is decremented by one (down to 0).
+    ///
+    /// `now` must come from a `TimeSource` so that deterministic simulation tests
+    /// can control time.
+    pub fn increment_connect_jitter_failures(&self, now: Instant) -> u32 {
+        let mut guard = self.connect_jitter_failures.lock();
+        let (count, last_failure) = &mut *guard;
+        // Apply decay proportional to elapsed idle time before recording the new failure.
+        if let Some(ts) = *last_failure {
+            let elapsed = now.duration_since(ts);
+            let decay_steps =
+                (elapsed.as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs().max(1)) as u32;
+            *count = count.saturating_sub(decay_steps);
+        }
+        *count += 1;
+        *last_failure = Some(now);
+        *count
     }
 
     /// Reset consecutive connect failure counter (called on successful connect).
     pub fn reset_connect_jitter_failures(&self) {
-        self.connect_jitter_failures.store(0, Ordering::Relaxed);
+        let mut guard = self.connect_jitter_failures.lock();
+        *guard = (0, None);
     }
 
-    /// Current consecutive connect failure count.
+    /// Current consecutive connect failure count (without applying decay).
     #[cfg(test)]
     pub fn connect_jitter_failure_count(&self) -> u32 {
-        self.connect_jitter_failures.load(Ordering::Relaxed)
+        self.connect_jitter_failures.lock().0
     }
 
     // ==================== CONNECT Routing Exclusion ====================
@@ -1479,20 +1510,26 @@ impl ConnectionManager {
     const CONNECT_EXCLUDE_THRESHOLD: u32 = 3;
 
     /// Record a ConnectFailed for a peer acting as acceptor. Returns the new failure count.
-    pub fn record_connect_acceptor_failure(&self, addr: SocketAddr) -> u32 {
+    ///
+    /// `now` must come from a `TimeSource` (not `Instant::now()` directly) so that
+    /// deterministic simulation tests can control time.
+    pub fn record_connect_acceptor_failure(&self, addr: SocketAddr, now: Instant) -> u32 {
         let mut map = self.connect_excluded_peers.write();
-        let entry = map.entry(addr).or_insert((0, Instant::now()));
+        let entry = map.entry(addr).or_insert((0, now));
         entry.0 += 1;
-        entry.1 = Instant::now();
+        entry.1 = now;
         entry.0
     }
 
     /// Check if a peer is excluded from CONNECT routing.
-    pub fn is_connect_excluded(&self, addr: SocketAddr) -> bool {
+    ///
+    /// `now` must come from a `TimeSource` so that deterministic simulation tests can
+    /// control time.
+    pub fn is_connect_excluded(&self, addr: SocketAddr, now: Instant) -> bool {
         let map = self.connect_excluded_peers.read();
         if let Some((count, last_failure)) = map.get(&addr) {
             *count >= Self::CONNECT_EXCLUDE_THRESHOLD
-                && last_failure.elapsed() < Self::CONNECT_EXCLUDE_TTL
+                && now.duration_since(*last_failure) < Self::CONNECT_EXCLUDE_TTL
         } else {
             false
         }
@@ -1503,13 +1540,14 @@ impl ConnectionManager {
         self.connect_excluded_peers.write().remove(&addr);
     }
 
-    /// Remove expired exclusion entries.
-    /// Wire into connection_maintenance for periodic cleanup (see #3296).
-    #[allow(dead_code)]
-    pub fn cleanup_expired_exclusions(&self) {
+    /// Remove expired exclusion entries. Called from `connection_maintenance` on each tick.
+    ///
+    /// `now` must come from a `TimeSource` so that deterministic simulation tests can
+    /// control time.
+    pub fn cleanup_expired_exclusions(&self, now: Instant) {
         self.connect_excluded_peers
             .write()
-            .retain(|_, (_, ts)| ts.elapsed() < Self::CONNECT_EXCLUDE_TTL);
+            .retain(|_, (_, ts)| now.duration_since(*ts) < Self::CONNECT_EXCLUDE_TTL);
     }
 
     #[allow(dead_code)]

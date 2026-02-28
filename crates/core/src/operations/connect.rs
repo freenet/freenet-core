@@ -689,6 +689,10 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
+        // Capture now once so both skip-list TTL checks and recency checks use the
+        // same timestamp, avoiding multiple `Instant::now()` calls in one logical step.
+        let now = Instant::now();
+
         // Use SkipListWithSelf to explicitly exclude ourselves from candidates,
         // ensuring we never select ourselves as a forwarding target even if
         // self wasn't added to visited by upstream callers.
@@ -696,6 +700,7 @@ impl RelayContext for RelayEnv<'_> {
             visited,
             self_addr: self.self_location.socket_addr(),
             connection_manager: &self.op_manager.ring.connection_manager,
+            now,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -711,8 +716,6 @@ impl RelayContext for RelayEnv<'_> {
             .self_location
             .location()
             .map(|loc| loc.distance(desired_location));
-
-        let now = Instant::now();
         let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
         let mut eligible: Vec<PeerKeyLocation> = Vec::new();
 
@@ -791,10 +794,15 @@ impl RelayContext for RelayEnv<'_> {
         // That means no peer passed the "closer to target than us" filter.
         // Therefore, ALL remaining candidates are by definition "uphill" (farther from target).
         // We don't need to re-check distances - just find any available peer.
+        //
+        // Capture now once so both skip-list TTL checks and recency checks use the
+        // same timestamp, avoiding multiple `Instant::now()` calls in one logical step.
+        let now = Instant::now();
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
             connection_manager: &self.op_manager.ring.connection_manager,
+            now,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -804,8 +812,6 @@ impl RelayContext for RelayEnv<'_> {
             skip,
             false, // CONNECT bypasses readiness filter to allow routing to not-yet-ready peers
         );
-
-        let now = Instant::now();
         let eligible: Vec<PeerKeyLocation> = candidates
             .into_iter()
             .filter(|cand| {
@@ -1772,6 +1778,8 @@ impl Operation for ConnectOp {
 
                         // Re-borrow state to reset forwarded_to and retry with a new peer.
                         // The previously-tried peer is in recency, so select_uphill_hop skips it.
+                        // Capture now once to avoid multiple Instant::now() calls in this handler.
+                        let now = Instant::now();
                         let env = RelayEnv::new(op_manager);
                         let estimator = self.connect_forward_estimator.read().clone();
                         let retry_actions =
@@ -1790,7 +1798,7 @@ impl Operation for ConnectOp {
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             // Found a different uphill peer — forward to it
-                            self.recency.insert(peer.clone(), Instant::now());
+                            self.recency.insert(peer.clone(), now);
                             tracing::info!(
                                 tx = %self.id,
                                 failed_peer = ?failed_peer,
@@ -1891,12 +1899,14 @@ impl Operation for ConnectOp {
                         let upstream_addr = state.upstream_addr;
                         let failed_peer = state.forwarded_to.clone();
                         let desired_location = state.request.desired_location;
+                        // Capture now once to avoid multiple Instant::now() calls in this handler.
+                        let now = Instant::now();
 
                         // Record failure in exclusion tracker
                         op_manager
                             .ring
                             .connection_manager
-                            .record_connect_acceptor_failure(*failed_acceptor_addr);
+                            .record_connect_acceptor_failure(*failed_acceptor_addr, now);
 
                         // Record forward failure in estimator (drops state borrow via self)
                         if let Some(ref fwd) = failed_peer {
@@ -1923,7 +1933,7 @@ impl Operation for ConnectOp {
                             };
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
-                            self.recency.insert(peer.clone(), Instant::now());
+                            self.recency.insert(peer.clone(), now);
                             tracing::info!(
                                 tx = %self.id,
                                 failed_acceptor = %failed_acceptor_addr,
@@ -2012,6 +2022,8 @@ struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
     connection_manager: &'a crate::ring::ConnectionManager,
+    /// Current time from a `TimeSource`, used for TTL checks without direct `Instant::now()`.
+    now: Instant,
 }
 
 impl Contains<SocketAddr> for SkipListWithSelf<'_> {
@@ -2023,7 +2035,10 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
             }
         }
         // Check if target is excluded from CONNECT routing due to repeated failures
-        if self.connection_manager.is_connect_excluded(target) {
+        if self
+            .connection_manager
+            .is_connect_excluded(target, self.now)
+        {
             return true;
         }
         // Check if target is in the visited list (bloom filter)
@@ -2130,7 +2145,7 @@ pub(crate) async fn join_ring_request(
     let failures = op_manager
         .ring
         .connection_manager
-        .increment_connect_jitter_failures();
+        .increment_connect_jitter_failures(Instant::now());
     let desired_location = if failures > 1 {
         // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
         let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);
@@ -3608,6 +3623,7 @@ mod tests {
             visited: &visited,
             self_addr: Some(self_addr),
             connection_manager: &cm,
+            now: Instant::now(),
         };
 
         // Should skip visited addresses
@@ -3964,14 +3980,15 @@ mod tests {
     #[test]
     fn test_connect_jitter_counter() {
         let cm = crate::ring::ConnectionManager::test_default();
+        let now = Instant::now();
 
         assert_eq!(cm.connect_jitter_failure_count(), 0);
 
-        let count = cm.increment_connect_jitter_failures();
+        let count = cm.increment_connect_jitter_failures(now);
         assert_eq!(count, 1);
         assert_eq!(cm.connect_jitter_failure_count(), 1);
 
-        let count = cm.increment_connect_jitter_failures();
+        let count = cm.increment_connect_jitter_failures(now);
         assert_eq!(count, 2);
 
         cm.reset_connect_jitter_failures();
@@ -3979,25 +3996,53 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_jitter_decay() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let now = Instant::now();
+
+        // Accumulate 6 failures
+        for _ in 0..6 {
+            cm.increment_connect_jitter_failures(now);
+        }
+        assert_eq!(cm.connect_jitter_failure_count(), 6);
+
+        // Simulate 15 minutes of idle time (3 decay intervals of 5 minutes each)
+        let later = now + Duration::from_secs(15 * 60);
+        let count = cm.increment_connect_jitter_failures(later);
+        // 6 - 3 decay steps = 3, then +1 = 4
+        assert_eq!(count, 4, "jitter should decay proportionally to idle time");
+
+        // Simulate enough idle time to decay to zero
+        let much_later = later + Duration::from_secs(60 * 60);
+        let count = cm.increment_connect_jitter_failures(much_later);
+        // 4 - 12 decay steps = 0 (saturating), then +1 = 1
+        assert_eq!(
+            count, 1,
+            "jitter should decay to zero after long idle period"
+        );
+    }
+
+    #[test]
     fn test_connect_exclusion_tracking() {
         let cm = crate::ring::ConnectionManager::test_default();
         let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let now = Instant::now();
 
         // Not excluded initially
-        assert!(!cm.is_connect_excluded(addr));
+        assert!(!cm.is_connect_excluded(addr, now));
 
         // Record failures below threshold
-        cm.record_connect_acceptor_failure(addr);
-        cm.record_connect_acceptor_failure(addr);
-        assert!(!cm.is_connect_excluded(addr), "below threshold");
+        cm.record_connect_acceptor_failure(addr, now);
+        cm.record_connect_acceptor_failure(addr, now);
+        assert!(!cm.is_connect_excluded(addr, now), "below threshold");
 
         // Third failure crosses threshold
-        cm.record_connect_acceptor_failure(addr);
-        assert!(cm.is_connect_excluded(addr), "at threshold");
+        cm.record_connect_acceptor_failure(addr, now);
+        assert!(cm.is_connect_excluded(addr, now), "at threshold");
 
         // Clear exclusion
         cm.clear_connect_exclusion(addr);
-        assert!(!cm.is_connect_excluded(addr), "after clear");
+        assert!(!cm.is_connect_excluded(addr, now), "after clear");
     }
 
     #[test]
@@ -4009,16 +4054,18 @@ mod tests {
         let normal_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
 
         let cm = crate::ring::ConnectionManager::test_default();
+        let now = Instant::now();
 
         // Exclude a peer by recording 3 failures
         for _ in 0..3 {
-            cm.record_connect_acceptor_failure(excluded_addr);
+            cm.record_connect_acceptor_failure(excluded_addr, now);
         }
 
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
             connection_manager: &cm,
+            now,
         };
 
         assert!(skip.has_element(self_addr), "self should be skipped");
