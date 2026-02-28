@@ -1502,9 +1502,13 @@ impl Ring {
         self.hosting_manager.should_host(contract)
     }
 
-    /// Alias for backwards compatibility - use should_host instead.
-    pub fn should_seed(&self, contract: &ContractKey) -> bool {
-        self.should_host(contract)
+    /// Check if this node is actively receiving updates for a contract.
+    ///
+    /// Returns true only when we have an active network subscription or local
+    /// client subscriptions. The hosting LRU cache alone is not sufficient,
+    /// since cached state may be stale after subscription expiry.
+    pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.is_receiving_updates(contract)
     }
 
     /// Get contracts that need subscription renewal.

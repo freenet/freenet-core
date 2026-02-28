@@ -1210,12 +1210,15 @@ async fn process_open_request(
                         let local_satisfies_request =
                             has_local_state && (!return_contract_code || contract.is_some());
 
-                        // Check if we should seed this contract (have an active subscription,
-                        // client subscriptions, or it's in our seeding cache).
-                        // If so, our cache is kept fresh via proximity cache updates.
+                        // Check if we're actively receiving updates for this contract
+                        // (active network subscription or local client subscriptions).
+                        // Only then is our cache guaranteed fresh. The hosting LRU cache
+                        // alone is not sufficient — a contract can outlive its subscription
+                        // in the LRU, leaving stale state that would never be refreshed
+                        // because the network GET path (and AUTO_SUBSCRIBE_ON_GET) is skipped.
                         let is_subscribed = full_key
                             .as_ref()
-                            .map(|k| op_manager.ring.should_seed(k))
+                            .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND EITHER:

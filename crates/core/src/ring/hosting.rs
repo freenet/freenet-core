@@ -632,6 +632,18 @@ impl HostingManager {
             || self.is_hosting_contract(contract)
     }
 
+    /// Check if this node is actively receiving updates for a contract.
+    ///
+    /// Returns true only if we have an active network subscription or local
+    /// client subscriptions — conditions that guarantee our cached state is
+    /// kept fresh via update propagation. Unlike `should_host()`, this does
+    /// NOT consider the hosting LRU cache alone as sufficient, since a contract
+    /// can remain in the LRU cache long after its subscription expires, meaning
+    /// the cached state may be stale.
+    pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
+        self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
+    }
+
     /// Touch a contract in the hosting cache (refresh TTL without adding).
     ///
     /// Called when GET or SUBSCRIBE refreshes a hosted contract's TTL.
