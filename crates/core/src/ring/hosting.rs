@@ -626,6 +626,7 @@ impl HostingManager {
     /// - We have an active subscription, OR
     /// - We have client subscriptions, OR
     /// - The contract is in our hosting cache
+    #[cfg(test)]
     pub fn should_host(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract)
             || self.has_client_subscriptions(contract.id())

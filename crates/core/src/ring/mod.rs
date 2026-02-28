@@ -1494,14 +1494,6 @@ impl Ring {
         self.hosting_manager.should_unsubscribe_upstream(contract)
     }
 
-    /// Check if we should continue hosting a contract.
-    ///
-    /// Returns true if we have an active subscription, client subscriptions,
-    /// or the contract is in our hosting cache.
-    pub fn should_host(&self, contract: &ContractKey) -> bool {
-        self.hosting_manager.should_host(contract)
-    }
-
     /// Check if this node is actively receiving updates for a contract.
     ///
     /// Returns true only when we have an active network subscription or local
