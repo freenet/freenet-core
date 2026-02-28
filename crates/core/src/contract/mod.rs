@@ -1465,7 +1465,7 @@ mod tests {
                 key: *key.id(),
                 client_id: crate::client_events::ClientId::next(),
                 summary: None,
-                subscriber_listener: tokio::sync::mpsc::unbounded_channel().0,
+                subscriber_listener: tokio::sync::mpsc::channel(64).0,
             },
         )
         .await;

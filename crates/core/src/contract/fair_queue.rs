@@ -741,7 +741,7 @@ mod tests {
                     key: contract_id,
                     client_id: crate::client_events::ClientId::next(),
                     summary: None,
-                    subscriber_listener: mpsc::unbounded_channel().0,
+                    subscriber_listener: mpsc::channel(64).0,
                 },
             ),
             (
