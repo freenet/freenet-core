@@ -1165,7 +1165,17 @@ fn test_not_found_result_intermediate_node_sends_notfound() {
                         result
                     );
                 }
-                other => panic!("Expected Subscribe Response, got {:?}", other),
+                other @ crate::message::NetMessageV1::Connect(_)
+                | other @ crate::message::NetMessageV1::Put(_)
+                | other @ crate::message::NetMessageV1::Get(_)
+                | other @ crate::message::NetMessageV1::Subscribe(_)
+                | other @ crate::message::NetMessageV1::Update(_)
+                | other @ crate::message::NetMessageV1::Aborted(_)
+                | other @ crate::message::NetMessageV1::ProximityCache { .. }
+                | other @ crate::message::NetMessageV1::InterestSync { .. }
+                | other @ crate::message::NetMessageV1::ReadyState { .. } => {
+                    panic!("Expected Subscribe Response, got {:?}", other)
+                }
             }
         }
         other => panic!(

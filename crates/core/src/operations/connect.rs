@@ -2313,13 +2313,25 @@ pub(crate) async fn initial_join_procedure(
                     // but also wake up if connection_maintenance clears the backoff
                     // (e.g. during isolation recovery or suspend detection).
                     if let Some(min_wait) = min_backoff {
+                        // When we already have some ring connections, cap the wait at
+                        // 30s so we re-check open_conns frequently: the concurrent
+                        // connection_maintenance task may have added connections via
+                        // ring-based acquisition, bringing us to BOOTSTRAP_THRESHOLD
+                        // before the gateway backoff fully expires.  See issue #3304.
+                        let effective_wait = if open_conns > 0 {
+                            min_wait.min(Duration::from_secs(30))
+                        } else {
+                            min_wait
+                        };
                         tracing::info!(
-                            wait_secs = min_wait.as_secs(),
+                            wait_secs = effective_wait.as_secs(),
+                            gateway_backoff_secs = min_wait.as_secs(),
                             total_gateways = unconnected_count,
-                            "All gateways in backoff, waiting for shortest backoff to expire"
+                            open_connections = open_conns,
+                            "All gateways in backoff, waiting before retry"
                         );
                         tokio::select! {
-                            _ = tokio::time::sleep(min_wait) => {},
+                            _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
                                 tracing::info!("Gateway backoff cleared externally, retrying immediately");
                             },
