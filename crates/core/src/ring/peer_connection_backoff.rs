@@ -279,13 +279,13 @@ mod tests {
         // No backoff initially
         assert!(backoff.remaining_backoff(addr).is_none());
 
-        // After failure, should have remaining backoff
+        // After failure, should have remaining backoff (with ±20% jitter)
         backoff.record_failure(addr);
         let remaining = backoff.remaining_backoff(addr);
         assert!(remaining.is_some());
-        // Should be close to 10 seconds (allow for small timing variance)
-        assert!(remaining.unwrap() <= Duration::from_secs(10));
-        assert!(remaining.unwrap() >= Duration::from_secs(9));
+        // With ±20% jitter, backoff should be in [8s, 12s]
+        assert!(remaining.unwrap() <= Duration::from_secs(12));
+        assert!(remaining.unwrap() >= Duration::from_secs(7));
     }
 
     #[test]

@@ -29,6 +29,7 @@
 //! assert!(tracker.is_in_backoff(&"peer1".to_string()));
 //! ```
 
+use rand::Rng;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
@@ -205,6 +206,8 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
     /// Record a failure for a key.
     ///
     /// Increments the failure count and calculates the next retry time.
+    /// Applies ±20% random jitter to the delay to prevent synchronized retries
+    /// (thundering herd).
     pub fn record_failure(&mut self, key: K) {
         let now = Instant::now();
 
@@ -220,14 +223,17 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         };
 
         let backoff = self.config.delay_for_failures(consecutive_failures);
+        // Apply ±20% jitter to prevent thundering herd (per code-style rules)
+        let jitter_factor: f64 = rand::rng().random_range(0.8..=1.2);
+        let jittered_backoff = backoff.mul_f64(jitter_factor);
 
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.retry_after = now + backoff;
+            entry.retry_after = now + jittered_backoff;
         }
 
         tracing::debug!(
             failures = consecutive_failures,
-            backoff_secs = backoff.as_secs(),
+            backoff_ms = jittered_backoff.as_millis() as u64,
             "Backoff recorded for key"
         );
 
@@ -435,12 +441,12 @@ mod tests {
         // No backoff initially
         assert!(tracker.remaining_backoff(&key).is_none());
 
-        // After failure, should have remaining backoff
+        // After failure, should have remaining backoff (with ±20% jitter)
         tracker.record_failure(key.clone());
         let remaining = tracker.remaining_backoff(&key);
         assert!(remaining.is_some());
-        // Should be close to 10 seconds
-        assert!(remaining.unwrap() <= Duration::from_secs(10));
-        assert!(remaining.unwrap() >= Duration::from_secs(9));
+        // With ±20% jitter, backoff should be in [8s, 12s]
+        assert!(remaining.unwrap() <= Duration::from_secs(12));
+        assert!(remaining.unwrap() >= Duration::from_secs(7));
     }
 }
