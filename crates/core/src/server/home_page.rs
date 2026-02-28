@@ -1,7 +1,7 @@
 //! Homepage served at `/` when a user navigates to their local Freenet node.
 //!
 //! Renders a card-based dashboard showing connection status, peers, subscriptions,
-//! operation stats, and helpful troubleshooting advice.
+//! and operation stats. Styled to match the global telemetry dashboard.
 
 use std::fmt::Write;
 
@@ -17,16 +17,11 @@ pub(super) async fn homepage() -> impl IntoResponse {
 fn homepage_html() -> String {
     let snap = network_status::get_snapshot();
 
-    let (version, uptime, port) = match &snap {
-        Some(s) => (
-            s.version.as_str(),
-            format_duration(s.elapsed_secs),
-            s.listening_port,
-        ),
-        None => ("?", "0s".to_string(), 0),
+    let (version, uptime) = match &snap {
+        Some(s) => (s.version.as_str(), format_duration(s.elapsed_secs)),
+        None => ("?", "0s".to_string()),
     };
 
-    let is_connected = snap.as_ref().is_some_and(|s| s.open_connections > 0);
     let favicon = build_favicon_data_uri(&snap);
 
     let status_card = build_status_card(&snap);
@@ -41,7 +36,7 @@ fn homepage_html() -> String {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="5">
-    <title>Freenet</title>
+    <title>Freenet — Local Peer</title>
     <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
     <script>{JS}</script>
@@ -50,13 +45,14 @@ fn homepage_html() -> String {
     <header>
         <div class="header-left">
             <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
-            <span class="header-title">Freenet</span>
+            <span class="header-title">FREENET</span>
+            <span class="header-scope">Local Peer</span>
             <span class="badge">v{version}</span>
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
-            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark mode">
-                <span id="theme-icon">🌙</span>
+            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
+                <span id="theme-icon">☀️</span>
             </button>
         </div>
     </header>
@@ -85,12 +81,6 @@ fn homepage_html() -> String {
                 <li><a href="https://github.com/freenet/freenet-core" target="_blank" rel="noopener noreferrer">GitHub</a></li>
             </ul>
         </div>
-
-        <div class="card card-muted">
-            <h2>Troubleshooting</h2>
-            <p>If you're having problems, run <code>freenet service report</code> in your terminal and share the code on our <a href="https://matrix.to/#/#freenet-locutus:matrix.org" target="_blank" rel="noopener noreferrer">Matrix channel</a>.</p>
-            {port_note}
-        </div>
     </main>
 </body>
 </html>"##,
@@ -103,11 +93,6 @@ fn homepage_html() -> String {
         peers_card = peers_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
-        port_note = if is_connected {
-            format!(r#"<p class="note">Listening on UDP port <code>{port}</code>.</p>"#)
-        } else {
-            String::new()
-        },
     )
 }
 
@@ -189,10 +174,10 @@ fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // Color is pre-encoded for data URI (# → %23) to avoid scanning the entire SVG.
     let color = match snap {
         None => "%239e9e9e",                              // grey — starting up
-        Some(s) if s.open_connections > 0 => "%232196F3", // blue — connected
+        Some(s) if s.open_connections > 0 => "%23007FFF", // blue — connected
         Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "%238b0000", // dark red — NAT problems
         Some(s) if !s.failures.is_empty() => "%23f44336", // red — connection issues
-        Some(_) => "%23ff9800",                           // amber — connecting
+        Some(_) => "%23fbbf24",                           // amber — connecting
     };
 
     format!(
@@ -414,7 +399,7 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         for p in peers {
             if let Some(ploc) = p.location {
                 let (px, py) = loc_to_xy(ploc);
-                let stroke = if p.is_gateway { "#ffa726" } else { "#90caf9" };
+                let stroke = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
                 write!(
                     svg,
                     "<line x1=\"{ox:.1}\" y1=\"{oy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" stroke=\"{stroke}\" stroke-width=\"1\" opacity=\"0.4\"/>"
@@ -428,7 +413,7 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
     for p in peers {
         if let Some(loc) = p.location {
             let (px, py) = loc_to_xy(loc);
-            let fill = if p.is_gateway { "#ff9800" } else { "#2196F3" };
+            let fill = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
             write!(
                 svg,
                 "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/>"
@@ -442,7 +427,7 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         let (ox, oy) = loc_to_xy(own_loc);
         write!(
             svg,
-            "<circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#4caf50\" stroke=\"#fff\" stroke-width=\"2\"/>"
+            "<circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#34d399\" stroke=\"#fff\" stroke-width=\"2\"/>"
         )
         .ok();
     }
@@ -541,20 +526,68 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
 }
 
 const CSS: &str = r##"
+/* ── CSS Variables (dark mode default, matching global telemetry dashboard) ── */
+:root {
+    --bg-primary: #06080c;
+    --bg-secondary: #0d1117;
+    --bg-tertiary: #161b22;
+    --bg-panel: rgba(13, 17, 23, 0.8);
+    --border-color: rgba(48, 54, 61, 0.6);
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #484f58;
+    --accent-primary: #007FFF;
+    --accent-light: #7ecfef;
+    --accent-dark: #0052cc;
+    --font-mono: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+/* Light mode overrides */
+[data-theme="light"] {
+    --bg-primary: #f0f4f8;
+    --bg-secondary: #e2e8f0;
+    --bg-tertiary: #cbd5e1;
+    --bg-panel: rgba(255, 255, 255, 0.85);
+    --border-color: rgba(148, 163, 184, 0.5);
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --text-muted: #94a3b8;
+}
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #f5f5f5;
-    color: #333;
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
     line-height: 1.5;
+}
+/* Atmospheric background (matching telemetry dashboard) */
+body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background:
+        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.05) 0%, transparent 40%),
+        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.05) 0%, transparent 40%);
+    pointer-events: none;
+    z-index: 0;
+}
+[data-theme="light"] body::before {
+    background:
+        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.04) 0%, transparent 40%),
+        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.04) 0%, transparent 40%);
 }
 header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     padding: 0.75rem 1.5rem;
-    background: #fff;
-    border-bottom: 1px solid #e0e0e0;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-color);
+    backdrop-filter: blur(10px);
+    position: relative;
+    z-index: 1;
 }
 .header-left {
     display: flex;
@@ -562,19 +595,45 @@ header {
     gap: 0.5rem;
 }
 .header-right {
-    color: #888;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: var(--text-secondary);
     font-size: 0.9rem;
 }
 .logo { width: 28px; height: 28px; }
-.header-title { font-weight: 600; font-size: 1.1rem; }
+.header-title {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 1.1rem;
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, var(--accent-light) 0%, var(--accent-primary) 50%, var(--accent-dark) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+.header-scope {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--accent-light);
+    background: rgba(126, 207, 239, 0.1);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid rgba(126, 207, 239, 0.2);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
 .badge {
-    background: #e3f2fd;
-    color: #1565c0;
+    background: rgba(0, 127, 255, 0.15);
+    color: var(--accent-light);
     padding: 0.15rem 0.5rem;
     border-radius: 12px;
     font-size: 0.75rem;
     font-weight: 500;
+    font-family: var(--font-mono);
 }
+.uptime { font-family: var(--font-mono); font-size: 0.85rem; }
 main {
     max-width: 800px;
     margin: 1.5rem auto;
@@ -582,20 +641,25 @@ main {
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    position: relative;
+    z-index: 1;
 }
 .card {
-    background: #fff;
-    border: 1px solid #e0e0e0;
-    border-radius: 8px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
     padding: 1rem 1.25rem;
+    backdrop-filter: blur(10px);
 }
-.card-muted { background: #fafafa; }
+.card-muted { background: var(--bg-secondary); }
 .card h2 {
-    font-size: 0.95rem;
-    color: #555;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
     text-transform: uppercase;
-    letter-spacing: 0.03em;
+    letter-spacing: 0.05em;
     margin-bottom: 0.75rem;
+    font-family: var(--font-mono);
+    font-weight: 500;
 }
 .card-header {
     display: flex;
@@ -606,8 +670,8 @@ main {
 .card-header h2 { margin-bottom: 0; }
 .own-loc {
     font-size: 0.8rem;
-    color: #888;
-    font-family: monospace;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
 }
 .status-row {
     display: flex;
@@ -624,27 +688,28 @@ main {
     display: inline-block;
     flex-shrink: 0;
 }
-.dot-green { background: #4caf50; }
-.dot-yellow { background: #ff9800; }
+.dot-green { background: #34d399; box-shadow: 0 0 8px rgba(52, 211, 153, 0.5); }
+.dot-yellow { background: #fbbf24; box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
 .spinner {
     width: 20px;
     height: 20px;
-    border: 2px solid #e0e0e0;
-    border-top-color: #2196F3;
+    border: 2px solid var(--border-color);
+    border-top-color: var(--accent-primary);
     border-radius: 50%;
     animation: spin 1s linear infinite;
     margin: 0.5rem 0;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .warning {
-    background: #fff3cd;
-    border: 1px solid #ffc107;
+    background: rgba(251, 191, 36, 0.1);
+    border: 1px solid rgba(251, 191, 36, 0.3);
     border-radius: 6px;
     padding: 0.75rem 1rem;
     margin: 0.75rem 0;
     font-size: 0.9rem;
-    color: #664d03;
+    color: #fbbf24;
 }
+[data-theme="light"] .warning { color: #92400e; background: rgba(251, 191, 36, 0.12); border-color: rgba(251, 191, 36, 0.4); }
 .warning ul {
     margin: 0.5rem 0 0 1.25rem;
     font-size: 0.85rem;
@@ -652,43 +717,47 @@ main {
 .warning li { margin-bottom: 0.25rem; }
 .nat-stat {
     font-size: 0.85rem;
-    color: #666;
+    color: var(--text-secondary);
     margin-top: 0.5rem;
 }
-.nat-fail { color: #c62828; font-weight: 500; }
+.nat-fail { color: #f87171; font-weight: 500; }
+[data-theme="light"] .nat-fail { color: #dc2626; }
 .nat-advice {
-    background: #ffebee;
-    border: 1px solid #ef9a9a;
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.3);
     border-radius: 6px;
     padding: 0.5rem 0.75rem;
     margin-top: 0.5rem;
     font-size: 0.85rem;
-    color: #b71c1c;
+    color: #f87171;
 }
+[data-theme="light"] .nat-advice { color: #b91c1c; background: rgba(248, 113, 113, 0.08); }
 .diagnostics {
-    background: #fff3cd;
-    border: 1px solid #ffc107;
+    background: rgba(251, 191, 36, 0.1);
+    border: 1px solid rgba(251, 191, 36, 0.3);
     border-radius: 6px;
     padding: 0.75rem 1rem;
     margin-top: 0.75rem;
 }
 .diagnostics h3 {
-    color: #856404;
+    color: #fbbf24;
     font-size: 0.9rem;
     margin-bottom: 0.4rem;
 }
+[data-theme="light"] .diagnostics h3 { color: #92400e; }
+[data-theme="light"] .diagnostics { color: #78350f; background: rgba(251, 191, 36, 0.12); }
 .diagnostics ul {
     padding-left: 1.2rem;
     margin: 0.4rem 0;
     list-style: disc;
 }
 .diagnostics li {
-    color: #555;
+    color: var(--text-secondary);
     margin-bottom: 0.35rem;
     font-size: 0.85rem;
 }
 .attempts {
-    color: #888;
+    color: var(--text-muted);
     font-size: 0.8rem;
     margin-top: 0.4rem;
 }
@@ -697,12 +766,13 @@ table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
+    font-family: var(--font-mono);
 }
 thead th {
     text-align: left;
     padding: 0.4rem 0.6rem;
-    border-bottom: 2px solid #e0e0e0;
-    color: #888;
+    border-bottom: 2px solid var(--border-color);
+    color: var(--text-secondary);
     font-weight: 500;
     font-size: 0.8rem;
     text-transform: uppercase;
@@ -710,16 +780,18 @@ thead th {
 }
 tbody td {
     padding: 0.4rem 0.6rem;
-    border-bottom: 1px solid #f0f0f0;
+    border-bottom: 1px solid var(--border-color);
 }
 code {
-    background: #f5f5f5;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
     font-size: 0.85em;
+    font-family: var(--font-mono);
 }
 .empty {
-    color: #aaa;
+    color: var(--text-muted);
     font-size: 0.9rem;
     font-style: italic;
 }
@@ -731,37 +803,42 @@ code {
 .op-cell {
     text-align: center;
     padding: 0.5rem;
-    background: #fafafa;
+    background: var(--bg-secondary);
     border-radius: 6px;
-    border: 1px solid #f0f0f0;
+    border: 1px solid var(--border-color);
 }
 .op-name {
     font-size: 0.75rem;
-    color: #888;
+    color: var(--text-secondary);
     font-weight: 500;
     text-transform: uppercase;
     margin-bottom: 0.25rem;
+    font-family: var(--font-mono);
 }
-.op-ok { color: #2e7d32; font-weight: 600; }
+.op-ok { color: #34d399; font-weight: 600; }
 .op-ok::before { content: "\2713 "; }
-.op-fail { color: #c62828; font-weight: 600; margin-left: 0.5rem; }
+.op-fail { color: #f87171; font-weight: 600; margin-left: 0.5rem; }
 .op-fail::before { content: "\2717 "; }
+[data-theme="light"] .op-ok { color: #059669; }
+[data-theme="light"] .op-fail { color: #dc2626; }
 .app-list, .link-list {
     list-style: none;
     padding: 0;
 }
 .app-list li, .link-list li { margin-bottom: 0.4rem; }
 .app-list a, .link-list a {
-    color: #1976D2;
+    color: var(--accent-light);
     text-decoration: none;
 }
 .app-list a:hover, .link-list a:hover { text-decoration: underline; }
+[data-theme="light"] .app-list a, [data-theme="light"] .link-list a { color: var(--accent-primary); }
 .note {
-    color: #888;
+    color: var(--text-secondary);
     font-size: 0.8rem;
     margin-top: 0.15rem;
 }
-.note a { color: #1976D2; }
+.note a { color: var(--accent-light); }
+[data-theme="light"] .note a { color: var(--accent-primary); }
 p { margin-bottom: 0.5rem; }
 p:last-child { margin-bottom: 0; }
 .ring-wrap {
@@ -771,12 +848,13 @@ p:last-child { margin-bottom: 0; }
     margin-bottom: 0.75rem;
 }
 .ring-svg { display: block; }
+.ring-svg circle:first-child { stroke: var(--text-muted) !important; }
 .ring-legend {
     display: flex;
     gap: 1rem;
     margin-top: 0.4rem;
     font-size: 0.75rem;
-    color: #888;
+    color: var(--text-secondary);
 }
 .ring-key {
     display: flex;
@@ -789,19 +867,12 @@ p:last-child { margin-bottom: 0; }
     border-radius: 50%;
     display: inline-block;
 }
-.ring-dot-self { background: #4caf50; }
-.ring-dot-peer { background: #2196F3; }
-.ring-dot-gw { background: #ff9800; }
-.header-right {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    color: #888;
-    font-size: 0.9rem;
-}
+.ring-dot-self { background: #34d399; }
+.ring-dot-peer { background: var(--accent-primary); }
+.ring-dot-gw { background: #fbbf24; }
 .theme-btn {
     background: none;
-    border: 1px solid #e0e0e0;
+    border: 1px solid var(--border-color);
     border-radius: 6px;
     padding: 0.2rem 0.5rem;
     cursor: pointer;
@@ -810,86 +881,48 @@ p:last-child { margin-bottom: 0; }
     color: inherit;
     transition: border-color 0.15s;
 }
-.theme-btn:hover { border-color: #bbb; }
+.theme-btn:hover { border-color: var(--text-secondary); }
 @media (max-width: 600px) {
     .op-grid { grid-template-columns: repeat(2, 1fr); }
     header { padding: 0.5rem 1rem; }
     main { margin: 1rem auto; }
     .ring-svg { width: 180px; height: 180px; }
 }
-/* Dark mode */
-[data-theme="dark"] body { background: #121212; color: #e0e0e0; }
-[data-theme="dark"] header { background: #1e1e1e; border-bottom-color: #333; }
-[data-theme="dark"] .header-right { color: #aaa; }
-[data-theme="dark"] .theme-btn { border-color: #444; }
-[data-theme="dark"] .theme-btn:hover { border-color: #888; }
-[data-theme="dark"] .badge { background: #1a2a40; color: #90caf9; }
-[data-theme="dark"] .card { background: #1e1e1e; border-color: #333; }
-[data-theme="dark"] .card-muted { background: #181818; }
-[data-theme="dark"] .card h2 { color: #aaa; }
-[data-theme="dark"] .own-loc { color: #aaa; }
-[data-theme="dark"] thead th { border-bottom-color: #333; color: #aaa; }
-[data-theme="dark"] tbody td { border-bottom-color: #2a2a2a; }
-[data-theme="dark"] code { background: #2a2a2a; color: #e0e0e0; }
-[data-theme="dark"] .op-cell { background: #181818; border-color: #2a2a2a; }
-[data-theme="dark"] .op-name { color: #aaa; }
-[data-theme="dark"] .spinner { border-color: #333; border-top-color: #90caf9; }
-[data-theme="dark"] .warning { background: #2a1a00; border-color: #5a3a00; color: #ffcc80; }
-[data-theme="dark"] .warning ul { color: #ffcc80; }
-[data-theme="dark"] .diagnostics { background: #2a1a00; border-color: #5a3a00; }
-[data-theme="dark"] .diagnostics h3 { color: #ffcc80; }
-[data-theme="dark"] .diagnostics li { color: #ccc; }
-[data-theme="dark"] .nat-stat { color: #aaa; }
-[data-theme="dark"] .nat-fail { color: #ff6b6b; }
-[data-theme="dark"] .nat-advice { background: #2a0000; border-color: #5a0000; color: #ff8a80; }
-[data-theme="dark"] .attempts { color: #888; }
-[data-theme="dark"] .empty { color: #666; }
-[data-theme="dark"] .note { color: #888; }
-[data-theme="dark"] .note a { color: #90caf9; }
-[data-theme="dark"] .app-list a, [data-theme="dark"] .link-list a { color: #90caf9; }
-[data-theme="dark"] .ring-legend { color: #aaa; }
-[data-theme="dark"] .ring-svg circle:first-child { stroke: #444 !important; }
 "##;
 
-/// Inline JavaScript for the dark mode toggle.
+/// Inline JavaScript for the dark/light mode toggle.
+/// Dark mode is the default (matching the global telemetry dashboard).
 /// A plain (non-module) script so it runs synchronously before first paint
 /// and so toggleTheme() is reachable from the button's onclick attribute.
 /// The page auto-refreshes every 5 s, so restoring the saved theme before
 /// render is essential to avoid a flash of the wrong theme on each refresh.
-/// Theme priority: localStorage override > OS prefers-color-scheme > light.
 const JS: &str = r##"
 (function() {
-    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     try {
-        var saved = localStorage.getItem('theme');
-        if (saved === 'dark' || (saved === null && prefersDark)) {
-            document.documentElement.setAttribute('data-theme', 'dark');
+        if (localStorage.getItem('theme') === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
         }
-    } catch (e) {
-        if (prefersDark) {
-            document.documentElement.setAttribute('data-theme', 'dark');
-        }
-    }
+    } catch (e) { /* localStorage unavailable — default to dark */ }
 })();
 
 function toggleTheme() {
-    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    var isLight = document.documentElement.getAttribute('data-theme') === 'light';
     var icon = document.getElementById('theme-icon');
-    if (isDark) {
+    if (isLight) {
         document.documentElement.removeAttribute('data-theme');
-        if (icon) icon.textContent = '\uD83C\uDF19'; /* moon */
-        try { localStorage.setItem('theme', 'light'); } catch (e) {}
+        if (icon) icon.textContent = '\u2600\uFE0F'; /* sun = click to switch to light */
+        try { localStorage.removeItem('theme'); } catch (e) {}
     } else {
-        document.documentElement.setAttribute('data-theme', 'dark');
-        if (icon) icon.textContent = '\u2600\uFE0F'; /* sun */
-        try { localStorage.setItem('theme', 'dark'); } catch (e) {}
+        document.documentElement.setAttribute('data-theme', 'light');
+        if (icon) icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
+        try { localStorage.setItem('theme', 'light'); } catch (e) {}
     }
 }
 
 document.addEventListener('DOMContentLoaded', function() {
     var icon = document.getElementById('theme-icon');
-    if (icon && document.documentElement.getAttribute('data-theme') === 'dark') {
-        icon.textContent = '\u2600\uFE0F'; /* sun = switch to light */
+    if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
+        icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
 });
 "##;
@@ -931,7 +964,7 @@ mod tests {
         let mut snap = base_snapshot();
         snap.open_connections = 3;
         let uri = build_favicon_data_uri(&Some(snap));
-        assert!(uri.contains("%232196F3"), "expected blue color");
+        assert!(uri.contains("%23007FFF"), "expected blue color");
     }
 
     #[test]
@@ -958,7 +991,7 @@ mod tests {
     fn favicon_amber_when_connecting() {
         let snap = base_snapshot();
         let uri = build_favicon_data_uri(&Some(snap));
-        assert!(uri.contains("%23ff9800"), "expected amber color");
+        assert!(uri.contains("%23fbbf24"), "expected amber color");
     }
 
     #[test]
@@ -973,7 +1006,7 @@ mod tests {
         });
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(
-            uri.contains("%232196F3"),
+            uri.contains("%23007FFF"),
             "connected should override failure colors"
         );
     }
@@ -985,7 +1018,7 @@ mod tests {
         snap.nat_stats.successes = 3;
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(
-            uri.contains("%23ff9800"),
+            uri.contains("%23fbbf24"),
             "partial NAT success should show amber, not dark red"
         );
     }
