@@ -79,6 +79,11 @@ pub(crate) const SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE: usize = 64;
 /// Beyond this limit, remaining subscribers receive full state instead of a computed delta.
 pub(crate) const MAX_DELTA_COMPUTATIONS_PER_FANOUT: usize = 32;
 
+/// Subscriber count above which a warning is logged during notification fan-out.
+/// This is below `MAX_SUBSCRIBERS_PER_CONTRACT` to provide early visibility into
+/// contracts with high fan-out before they hit the hard cap.
+pub(crate) const FANOUT_WARNING_THRESHOLD: usize = 50;
+
 pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 
@@ -783,6 +788,9 @@ type SharedSummaries = Arc<
     >,
 >;
 
+// Per-client subscription counts for O(1) limit enforcement (used by RuntimePool)
+type SharedClientCounts = Arc<std::sync::RwLock<HashMap<ClientId, usize>>>;
+
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 ///
@@ -796,6 +804,8 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Notification channels for any clients subscribed to updates for a given contract.
     /// Used when executor is standalone (not in a pool).
     update_notifications: HashMap<ContractInstanceId, Vec<(ClientId, mpsc::Sender<HostResult>)>>,
+    /// Per-client subscription counts for O(1) limit enforcement (standalone executor).
+    client_subscription_counts: HashMap<ClientId, usize>,
     /// Summaries of the state of all clients subscribed to a given contract.
     /// Used when executor is standalone (not in a pool).
     subscriber_summaries:
@@ -817,6 +827,8 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     shared_notifications: Option<SharedNotifications>,
     /// Shared subscriber summaries at pool level (when running in a pool).
     shared_summaries: Option<SharedSummaries>,
+    /// Per-client subscription counts at pool level for O(1) limit enforcement.
+    shared_client_counts: Option<SharedClientCounts>,
     /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
     /// See [`CorruptedStateRecoveryGuard`] for details.
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
@@ -858,6 +870,7 @@ where
             runtime,
             state_store,
             update_notifications: HashMap::default(),
+            client_subscription_counts: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
             init_tracker: ContractInitTracker::new(),
@@ -865,6 +878,7 @@ where
             op_manager,
             shared_notifications: None,
             shared_summaries: None,
+            shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
             summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
@@ -889,9 +903,11 @@ where
         &mut self,
         notifications: SharedNotifications,
         summaries: SharedSummaries,
+        client_counts: SharedClientCounts,
     ) {
         self.shared_notifications = Some(notifications);
         self.shared_summaries = Some(summaries);
+        self.shared_client_counts = Some(client_counts);
     }
 
     /// Set a shared recovery guard for pool-based operation.

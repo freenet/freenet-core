@@ -27,25 +27,28 @@ type SharedNotifications = Arc<
 type SharedSummaries =
     Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
 
-/// Send a subscription error to all clients registered for a contract.
-/// Takes a snapshot of the channels to avoid holding any lock during sends.
+// Tracks per-client subscription counts for O(1) limit enforcement.
+// Kept in sync with SharedNotifications under the same write lock acquisition.
+type SharedClientCounts = Arc<RwLock<HashMap<ClientId, usize>>>;
+
 /// Construct a subscriber limit error for a registration that was rejected.
 ///
-/// Uses `MissingContract` variant because `Subscribe` requires a `ContractKey`
-/// (which needs a `CodeHash` we don't have in the registration path).
-/// The real cause is conveyed via tracing logs at the call site.
+/// Uses `Subscribe` variant with a synthetic `ContractKey` (zeroed `CodeHash`)
+/// because the registration path only has a `ContractInstanceId`, not the full
+/// `ContractKey`. The cause string carries the real rejection reason.
 fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<RequestError> {
-    // Log the cause since MissingContract doesn't carry a cause string
-    tracing::debug!(
-        contract = %instance_id,
-        cause = cause,
-        "Subscriber registration rejected"
+    let synthetic_key = ContractKey::from_id_and_code(
+        instance_id,
+        freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
     );
-    Box::new(RequestError::ContractError(
-        StdContractError::MissingContract { key: instance_id },
-    ))
+    Box::new(RequestError::ContractError(StdContractError::Subscribe {
+        key: synthetic_key,
+        cause: cause.to_string().into(),
+    }))
 }
 
+/// Send a subscription error to all clients registered for a contract.
+/// Takes a snapshot of the channels to avoid holding any lock during sends.
 fn send_subscription_error_to_clients(
     channels: &[(ClientId, tokio::sync::mpsc::Sender<HostResult>)],
     key: ContractInstanceId,
@@ -145,6 +148,8 @@ pub struct RuntimePool {
     shared_notifications: SharedNotifications,
     /// Shared subscriber summaries for computing deltas.
     shared_summaries: SharedSummaries,
+    /// Per-client subscription count for O(1) limit enforcement.
+    shared_client_counts: SharedClientCounts,
     /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
     shared_contract_modules: SharedModuleCache<ContractKey>,
     /// Shared compiled delegate module cache.
@@ -187,6 +192,7 @@ impl RuntimePool {
         // so we can pass references to each executor
         let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
         let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
+        let shared_client_counts: SharedClientCounts = Arc::new(RwLock::new(HashMap::new()));
 
         // Create delegate notification channel for subscription delivery
         let (delegate_notification_tx, delegate_notification_rx) =
@@ -223,8 +229,11 @@ impl RuntimePool {
         )
         .await?;
         let shared_backend_engine = first_executor.runtime.clone_backend_engine();
-        first_executor
-            .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+        first_executor.set_shared_notifications(
+            shared_notifications.clone(),
+            shared_summaries.clone(),
+            shared_client_counts.clone(),
+        );
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
         first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
         runtimes.push(Some(first_executor));
@@ -242,8 +251,11 @@ impl RuntimePool {
             .await?;
 
             // Set shared notification storage so this executor uses pool-level storage
-            executor
-                .set_shared_notifications(shared_notifications.clone(), shared_summaries.clone());
+            executor.set_shared_notifications(
+                shared_notifications.clone(),
+                shared_summaries.clone(),
+                shared_client_counts.clone(),
+            );
             executor.set_recovery_guard(shared_recovery_guard.clone());
             executor.set_delegate_notification_tx(delegate_notification_tx.clone());
 
@@ -269,6 +281,7 @@ impl RuntimePool {
             shared_state_store,
             shared_notifications,
             shared_summaries,
+            shared_client_counts,
             shared_contract_modules,
             shared_delegate_modules,
             shared_backend_engine,
@@ -403,6 +416,7 @@ impl RuntimePool {
         executor.set_shared_notifications(
             self.shared_notifications.clone(),
             self.shared_summaries.clone(),
+            self.shared_client_counts.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
         executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());
@@ -523,8 +537,12 @@ impl ContractExecutor for RuntimePool {
 
         if let Some((idx, same_channel)) = already_registered {
             if !same_channel {
-                // Client reconnected with new channel, update it
-                notifications.get_mut(&instance_id).unwrap()[idx] = (cli_id, notification_ch);
+                // Client reconnected with new channel, update it.
+                // Safety: `already_registered` was derived from `notifications.get(&instance_id)`
+                // succeeding, so the entry is guaranteed to exist.
+                if let Some(channels) = notifications.get_mut(&instance_id) {
+                    channels[idx] = (cli_id, notification_ch);
+                }
                 tracing::debug!(
                     client = %cli_id,
                     contract = %instance_id,
@@ -551,12 +569,11 @@ impl ContractExecutor for RuntimePool {
                 ));
             }
 
-            // Enforce per-client subscription limit across all contracts
-            let client_sub_count = notifications
-                .values()
-                .filter(|ch| ch.binary_search_by_key(&&cli_id, |(id, _)| id).is_ok())
-                .count();
+            // Enforce per-client subscription limit using O(1) counter
+            let mut client_counts = self.shared_client_counts.write().unwrap();
+            let client_sub_count = client_counts.get(&cli_id).copied().unwrap_or(0);
             if client_sub_count >= super::MAX_SUBSCRIPTIONS_PER_CLIENT {
+                drop(client_counts);
                 drop(notifications);
                 tracing::warn!(
                     client = %cli_id,
@@ -578,6 +595,7 @@ impl ContractExecutor for RuntimePool {
             let channels = notifications.entry(instance_id).or_default();
             let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
             channels.insert(insert_pos, (cli_id, notification_ch));
+            *client_counts.entry(cli_id).or_insert(0) += 1;
             tracing::debug!(
                 client = %cli_id,
                 contract = %instance_id,
@@ -657,6 +675,12 @@ impl ContractExecutor for RuntimePool {
             }
             // Remove contracts with no remaining subscribers
             notifications.retain(|_, channels| !channels.is_empty());
+        }
+
+        // Update per-client subscription counter
+        if removed_notifications > 0 {
+            let mut client_counts = self.shared_client_counts.write().unwrap();
+            client_counts.remove(&client_id);
         }
 
         // Clean shared_summaries
@@ -1343,8 +1367,11 @@ where
                     client = %cli_id,
                     "Client already subscribed, updating notification channel"
                 );
-                self.update_notifications.get_mut(&instance_id).unwrap()[idx] =
-                    (cli_id, notification_ch);
+                // Safety: `already_registered` was derived from `self.update_notifications.get(&instance_id)`
+                // succeeding, so the entry is guaranteed to exist.
+                if let Some(channels) = self.update_notifications.get_mut(&instance_id) {
+                    channels[idx] = (cli_id, notification_ch);
+                }
             }
         } else {
             // New subscriber: enforce per-contract limit
@@ -1368,12 +1395,12 @@ where
                 ));
             }
 
-            // Enforce per-client subscription limit across all contracts
+            // Enforce per-client subscription limit using O(1) counter
             let client_sub_count = self
-                .update_notifications
-                .values()
-                .filter(|ch| ch.binary_search_by_key(&&cli_id, |(id, _)| id).is_ok())
-                .count();
+                .client_subscription_counts
+                .get(&cli_id)
+                .copied()
+                .unwrap_or(0);
             if client_sub_count >= super::MAX_SUBSCRIPTIONS_PER_CLIENT {
                 tracing::warn!(
                     client = %cli_id,
@@ -1395,6 +1422,7 @@ where
             let channels = self.update_notifications.entry(instance_id).or_default();
             let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
             channels.insert(insert_pos, (cli_id, notification_ch));
+            *self.client_subscription_counts.entry(cli_id).or_insert(0) += 1;
         }
 
         if self
@@ -1833,7 +1861,7 @@ where
                 summaries.get(&instance_id).cloned().unwrap_or_default()
             };
 
-            if notifiers_snapshot.len() > 50 {
+            if notifiers_snapshot.len() > super::FANOUT_WARNING_THRESHOLD {
                 tracing::warn!(
                     contract = %key,
                     subscriber_count = notifiers_snapshot.len(),
@@ -1843,6 +1871,8 @@ where
 
             let mut failures = Vec::with_capacity(32);
             let mut delta_computations = 0usize;
+            // Pre-allocate full state once for subscribers that don't get deltas
+            let full_state = State::from(new_state.as_ref()).into_owned();
 
             for (peer_key, notifier) in &notifiers_snapshot {
                 let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
@@ -1869,9 +1899,9 @@ where
                             contract = %key,
                             "Delta computation cap reached, sending full state"
                         );
-                        UpdateData::State(State::from(new_state.as_ref()).into_owned())
+                        UpdateData::State(full_state.clone())
                     }
-                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                    None => UpdateData::State(full_state.clone()),
                 };
 
                 match notifier.try_send(Ok(
@@ -1917,11 +1947,25 @@ where
                         contract_summaries.remove(failed_client);
                     }
                 }
+                drop(summaries);
+
+                // Decrement per-client subscription counters for failed clients
+                if let Some(shared_client_counts) = &self.shared_client_counts {
+                    let mut client_counts = shared_client_counts.write().unwrap();
+                    for failed_client in &failures {
+                        if let Some(count) = client_counts.get_mut(failed_client) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                client_counts.remove(failed_client);
+                            }
+                        }
+                    }
+                }
             }
         } else if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
             let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
 
-            if notifiers.len() > 50 {
+            if notifiers.len() > super::FANOUT_WARNING_THRESHOLD {
                 tracing::warn!(
                     contract = %key,
                     subscriber_count = notifiers.len(),
@@ -1931,6 +1975,8 @@ where
 
             let mut failures = Vec::with_capacity(32);
             let mut delta_computations = 0usize;
+            // Pre-allocate full state once for subscribers that don't get deltas
+            let full_state = State::from(new_state.as_ref()).into_owned();
 
             for (peer_key, notifier) in notifiers.iter() {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
@@ -1954,9 +2000,9 @@ where
                             contract = %key,
                             "Delta computation cap reached, sending full state"
                         );
-                        UpdateData::State(State::from(new_state.as_ref()).into_owned())
+                        UpdateData::State(full_state.clone())
                     }
-                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                    None => UpdateData::State(full_state.clone()),
                 };
 
                 match notifier.try_send(Ok(
@@ -1991,6 +2037,15 @@ where
 
             if !failures.is_empty() {
                 notifiers.retain(|(c, _)| !failures.contains(c));
+                // Decrement per-client subscription counters for failed clients
+                for failed_client in &failures {
+                    if let Some(count) = self.client_subscription_counts.get_mut(failed_client) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.client_subscription_counts.remove(failed_client);
+                        }
+                    }
+                }
             }
         }
         Ok(())

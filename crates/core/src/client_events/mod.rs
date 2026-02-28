@@ -1711,13 +1711,24 @@ async fn process_open_request(
                 });
 
                 if let Some(ch) = &subscription_listener {
-                    if ch.try_send(host_response).is_err() {
-                        tracing::error!(
-                            client_id = %client_id,
-                            request_id = %request_id,
-                            delegate = %delegate_key,
-                            "Failed to send delegate response through subscription channel"
-                        );
+                    match ch.try_send(host_response) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                delegate = %delegate_key,
+                                "Subscription channel full — delegate response dropped"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::error!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                delegate = %delegate_key,
+                                "Failed to send delegate response — subscription channel closed"
+                            );
+                        }
                     }
                     return Ok(None);
                 }

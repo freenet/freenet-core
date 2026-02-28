@@ -59,6 +59,38 @@ Is cancellation possible?
   → Document cancellation safety in function docs
 ```
 
+### WHEN adding per-key collections, per-client tracking, or fan-out patterns
+
+```
+NEVER use unbounded per-key collections for data that external
+actors (clients, network peers) can influence.
+
+1. Per-key collections (subscribers per contract, peers per resource)
+   MUST have a maximum size enforced at insertion time.
+   → Reject new entries when the limit is reached
+   → Return an error or false so callers know registration was rejected
+
+2. Per-client/per-peer resource counts MUST be bounded.
+   → A single client must not hold unbounded subscriptions across all keys
+   → A single peer must not register unbounded interest across all contracts
+
+3. Fan-out patterns (one event → N recipients) MUST cap the cost.
+   → Cap expensive per-recipient work (e.g., WASM calls) to a fixed limit
+   → Fall back to cheaper alternatives (e.g., full state vs computed delta)
+   → Log warnings when fan-out exceeds a threshold
+
+WHY: Unbounded collections are amplification vectors.
+An attacker who can register N subscribers or open N channels can
+multiply the cost of every state update by N, exhausting memory,
+CPU (WASM execution), and executor time. Per-key caps prevent
+amplification; per-client caps prevent resource spreading attacks.
+
+See: executor.rs constants (MAX_SUBSCRIBERS_PER_CONTRACT,
+SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, MAX_DELTA_COMPUTATIONS_PER_FANOUT,
+FANOUT_WARNING_THRESHOLD, MAX_SUBSCRIPTIONS_PER_CLIENT)
+and hosting.rs (MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT)
+```
+
 ### WHEN using `biased` in `tokio::select!`
 
 **Unguarded `biased;` select is banned.**

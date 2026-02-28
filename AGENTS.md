@@ -56,43 +56,6 @@ Exemptions in GC deserve the same scrutiny as the original bug.
 See: docs/weekly-fix-review-2025-02.md (befb0bd → 0b88945 cycle)
 ```
 
-### WHEN adding channels, queues, or collection storage
-
-```
-NEVER use unbounded channels or unbounded per-key collections
-for data that external actors (clients, network peers) can influence.
-
-1. Channels carrying notifications, responses, or events MUST be bounded.
-   → Use tokio::sync::mpsc::channel(N), NOT unbounded_channel()
-   → Use try_send() in non-async contexts to avoid blocking executors
-   → Drop messages when full (lossy) rather than blocking or growing
-
-2. Per-key collections (subscribers per contract, peers per resource)
-   MUST have a maximum size enforced at insertion time.
-   → Reject new entries when the limit is reached
-   → Return an error or false so callers know registration was rejected
-
-3. Per-client/per-peer resource counts MUST be bounded.
-   → A single client must not hold unbounded subscriptions across all keys
-   → A single peer must not register unbounded interest across all contracts
-
-4. Fan-out patterns (one event → N recipients) MUST cap the cost.
-   → Cap expensive per-recipient work (e.g., WASM calls) to a fixed limit
-   → Fall back to cheaper alternatives (e.g., full state vs computed delta)
-   → Log warnings when fan-out exceeds a threshold
-
-WHY: Unbounded queues and collections are amplification vectors.
-An attacker who can register N subscribers or open N channels can
-multiply the cost of every state update by N, exhausting memory,
-CPU (WASM execution), and executor time. Bounded channels provide
-backpressure; per-key caps prevent amplification; per-client caps
-prevent resource spreading attacks.
-
-See: executor.rs constants (MAX_SUBSCRIBERS_PER_CONTRACT,
-SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, MAX_DELTA_COMPUTATIONS_PER_FANOUT,
-MAX_SUBSCRIPTIONS_PER_CLIENT) and hosting.rs (MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT)
-```
-
 ### WHEN you discover outdated or missing documentation
 
 ```
