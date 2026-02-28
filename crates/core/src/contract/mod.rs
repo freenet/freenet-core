@@ -8,6 +8,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 mod executor;
+mod fair_queue;
 mod handler;
 pub mod storages;
 
@@ -40,6 +41,11 @@ use self::executor::DelegateNotificationReceiver;
 
 /// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
+
+/// Maximum delegate notifications to drain per iteration.
+/// Matches the same bounded-drain pattern as MAX_DRAIN_BATCH for contract events,
+/// preventing delegate notification channel growth under sustained contract load.
+const MAX_DELEGATE_DRAIN_BATCH: usize = 16;
 
 /// Handle a delegate request, including any contract request messages in the response.
 ///
@@ -503,22 +509,148 @@ async fn recv_delegate_notification(
     }
 }
 
+/// Try to receive a delegate notification without blocking.
+/// Returns `None` if the channel is `None`, closed, or has no pending notifications.
+fn try_recv_delegate_notification(
+    rx: &mut Option<DelegateNotificationReceiver>,
+) -> Option<executor::DelegateNotification> {
+    match rx {
+        Some(rx) => rx.try_recv().ok(),
+        None => None,
+    }
+}
+
 pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
 {
     let mut delegate_rx = contract_handler.executor().take_delegate_notification_rx();
+    let mut fair_queue = fair_queue::FairEventQueue::new();
 
     loop {
+        // Drain pending events from the channel into the fair queue (bounded batch).
+        // Capped at MAX_DRAIN_BATCH (256) to bound the synchronous work per iteration
+        // before yielding back to the Tokio scheduler. Each iteration of this loop is
+        // a non-blocking try_recv + HashMap insert, so 256 iterations complete in
+        // single-digit microseconds even at peak load.
+        for _ in 0..fair_queue::MAX_DRAIN_BATCH {
+            match contract_handler.channel().try_recv_from_sender()? {
+                Some((id, event)) => {
+                    // Process ClientDisconnect inline — it's a lightweight cleanup
+                    // operation that should never be delayed or compete with
+                    // DelegateRequest events for the default queue's limited capacity.
+                    if let ContractHandlerEvent::ClientDisconnect { client_id } = &event {
+                        let client_id = *client_id;
+                        contract_handler.executor().remove_client(client_id);
+                        contract_handler.channel().drop_waiting_response(id);
+                        continue;
+                    }
+                    if let Err(rejected) = fair_queue.try_push(id, event) {
+                        send_queue_full_response(contract_handler.channel(), rejected).await;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // Drain delegate notifications (non-blocking, bounded) even when the fair queue
+        // has work. This prevents delegate starvation under sustained contract load.
+        // We drain up to MAX_DELEGATE_DRAIN_BATCH to handle bursts (e.g., a contract
+        // update triggering many delegate notifications simultaneously).
+        for _ in 0..MAX_DELEGATE_DRAIN_BATCH {
+            match try_recv_delegate_notification(&mut delegate_rx) {
+                Some(notification) => {
+                    handle_delegate_notification(&mut contract_handler, notification).await;
+                }
+                None => break,
+            }
+        }
+
+        // Process one event from the fair queue (round-robin across contracts)
+        if let Some((id, event)) = fair_queue.pop() {
+            handle_contract_event(&mut contract_handler, id, event).await?;
+            continue;
+        }
+
+        // Fair queue is empty — block-wait for a new event or delegate notification
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event) = result?;
-                handle_contract_event(&mut contract_handler, id, event).await?;
+                if let Err(rejected) = fair_queue.try_push(id, event) {
+                    send_queue_full_response(contract_handler.channel(), rejected).await;
+                }
             }
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification).await;
             }
         }
+    }
+}
+
+/// Send an error response to the event sender when the per-contract queue is full.
+///
+/// Logs a warning and sends the appropriate error response variant for the rejected event.
+/// For fire-and-forget events (delegates, disconnects), no response is sent.
+async fn send_queue_full_response(
+    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+    rejected: Box<fair_queue::RejectedEvent>,
+) {
+    tracing::warn!(
+        event = %rejected.event,
+        "Rejected event due to per-contract queue capacity limit"
+    );
+    let make_err = || ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
+    let response = match &rejected.event {
+        ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
+            new_value: Err(make_err()),
+            state_changed: false,
+        },
+        ContractHandlerEvent::UpdateQuery { .. } => ContractHandlerEvent::UpdateResponse {
+            new_value: Err(make_err()),
+            state_changed: false,
+        },
+        ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Err(make_err()),
+        },
+        ContractHandlerEvent::GetSummaryQuery { key, .. } => {
+            ContractHandlerEvent::GetSummaryResponse {
+                key: *key,
+                summary: Err(make_err()),
+            }
+        }
+        ContractHandlerEvent::GetDeltaQuery { key, .. } => ContractHandlerEvent::GetDeltaResponse {
+            key: *key,
+            delta: Err(make_err()),
+        },
+        // Events without error response variants: drop the oneshot sender to
+        // unblock the caller. The caller's receiver will get a RecvError, which
+        // maps to ContractError::NoEvHandlerResponse. This prevents leaking
+        // entries in the waiting_response map.
+        ContractHandlerEvent::DelegateRequest { .. }
+        | ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::PutResponse { .. }
+        | ContractHandlerEvent::GetResponse { .. }
+        | ContractHandlerEvent::UpdateResponse { .. }
+        | ContractHandlerEvent::UpdateNoChange { .. }
+        | ContractHandlerEvent::RegisterSubscriberListener { .. }
+        | ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | ContractHandlerEvent::QuerySubscriptions { .. }
+        | ContractHandlerEvent::QuerySubscriptionsResponse
+        | ContractHandlerEvent::GetSummaryResponse { .. }
+        | ContractHandlerEvent::GetDeltaResponse { .. }
+        | ContractHandlerEvent::NotifySubscriptionError { .. }
+        | ContractHandlerEvent::NotifySubscriptionErrorResponse
+        | ContractHandlerEvent::ClientDisconnect { .. } => {
+            channel.drop_waiting_response(rejected.id);
+            return;
+        }
+    };
+    if let Err(error) = channel.send_to_sender(rejected.id, response).await {
+        tracing::warn!(
+            error = %error,
+            "Failed to send queue-full response (client may have disconnected)"
+        );
     }
 }
 
@@ -1099,4 +1231,268 @@ pub(crate) enum ContractError {
         key: ContractKey,
         error: ExecutorError,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+mod tests {
+    use super::*;
+    use crate::config::GlobalExecutor;
+    use std::time::Duration;
+
+    fn make_contract_key() -> ContractKey {
+        let code = ContractCode::from(vec![42u8; 32]);
+        let params = Parameters::from(vec![7u8; 8]);
+        ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// Helper: send an event through the sender halve and receive it on the handler side,
+    /// then wrap it as a RejectedEvent. This simulates the normal drain path where
+    /// try_recv_from_sender inserts into waiting_response, followed by queue rejection.
+    async fn setup_rejected_event(
+        send_halve: handler::ContractHandlerChannel<handler::SenderHalve>,
+        rcv_halve: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+        event: ContractHandlerEvent,
+    ) -> (
+        Box<fair_queue::RejectedEvent>,
+        tokio::task::JoinHandle<Result<ContractHandlerEvent, anyhow::Error>>,
+    ) {
+        // Spawn the sender — it blocks until the response arrives
+        let handle = GlobalExecutor::spawn(async move {
+            send_halve
+                .send_to_handler(event)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+
+        // Receive on the handler side (populates waiting_response)
+        let (id, received_event) =
+            tokio::time::timeout(Duration::from_millis(200), rcv_halve.recv_from_sender())
+                .await
+                .expect("timeout waiting for event")
+                .expect("channel should be open");
+
+        let rejected = Box::new(fair_queue::RejectedEvent {
+            id,
+            event: received_event,
+        });
+
+        (rejected, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_put_query() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::PutQuery {
+                key,
+                state: WrappedState::new(vec![1, 2, 3]),
+                related_contracts: RelatedContracts::default(),
+                contract: None,
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::PutResponse {
+                new_value,
+                state_changed,
+            } => {
+                assert!(new_value.is_err(), "should be an error response");
+                assert!(!state_changed);
+            }
+            other => panic!("expected PutResponse, got {other}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_get_query() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::GetQuery {
+                instance_id: *key.id(),
+                return_contract_code: false,
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::GetResponse { response, .. } => {
+                assert!(response.is_err(), "should be an error response");
+            }
+            other => panic!("expected GetResponse, got {other}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_update_query() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::UpdateQuery {
+                key,
+                data: UpdateData::Delta(StateDelta::from(vec![1])),
+                related_contracts: RelatedContracts::default(),
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::UpdateResponse {
+                new_value,
+                state_changed,
+            } => {
+                assert!(new_value.is_err(), "should be an error response");
+                assert!(!state_changed);
+            }
+            other => panic!("expected UpdateResponse, got {other}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_get_summary_query() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::GetSummaryQuery { key },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::GetSummaryResponse {
+                key: resp_key,
+                summary,
+            } => {
+                assert_eq!(resp_key, key);
+                assert!(summary.is_err(), "should be an error response");
+            }
+            other => panic!("expected GetSummaryResponse, got {other}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_get_delta_query() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::GetDeltaQuery {
+                key,
+                their_summary: StateSummary::from(vec![1, 2]),
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::GetDeltaResponse {
+                key: resp_key,
+                delta,
+            } => {
+                assert_eq!(resp_key, key);
+                assert!(delta.is_err(), "should be an error response");
+            }
+            other => panic!("expected GetDeltaResponse, got {other}"),
+        }
+    }
+
+    /// Verify that fire-and-forget events (RegisterSubscriberListener, delegates, etc.)
+    /// have their waiting_response entry cleaned up via drop_waiting_response when rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_fire_and_forget_cleans_waiting_response() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::RegisterSubscriberListener {
+                key: *key.id(),
+                client_id: crate::client_events::ClientId::next(),
+                summary: None,
+                subscriber_listener: tokio::sync::mpsc::unbounded_channel().0,
+            },
+        )
+        .await;
+
+        // Verify waiting_response was populated
+        assert!(
+            rcv_halve.has_waiting_response(&rejected.id),
+            "waiting_response should contain the event"
+        );
+
+        let rejected_id = handler::EventId { id: rejected.id.id };
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        // Verify waiting_response was cleaned up
+        assert!(
+            !rcv_halve.has_waiting_response(&rejected_id),
+            "waiting_response should be cleaned up after rejection"
+        );
+
+        // The sender should get a RecvError (NoEvHandlerResponse) since we dropped the oneshot
+        let result = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete");
+        assert!(
+            result.is_err(),
+            "fire-and-forget rejection should produce an error"
+        );
+    }
 }

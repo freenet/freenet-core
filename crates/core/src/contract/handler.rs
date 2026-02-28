@@ -173,9 +173,9 @@ impl ContractHandler for NetworkContractHandler {
     }
 }
 
-#[derive(Eq)]
+#[derive(Debug, Eq)]
 pub(crate) struct EventId {
-    id: u64,
+    pub(crate) id: u64,
 }
 
 impl PartialEq for EventId {
@@ -549,6 +549,12 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
         self.end.waiting_response.remove(&id.id);
     }
 
+    /// Check if a waiting_response entry exists for the given event ID.
+    #[cfg(test)]
+    pub fn has_waiting_response(&self, id: &EventId) -> bool {
+        self.end.waiting_response.contains_key(&id.id)
+    }
+
     pub async fn recv_from_sender(
         &mut self,
     ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
@@ -557,6 +563,25 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             return Ok((EventId { id }, ev));
         }
         Err(ContractError::NoEvHandlerResponse)
+    }
+
+    /// Try to receive an event without blocking.
+    ///
+    /// Returns `Ok(None)` if the channel is empty, `Err` if the channel is closed.
+    /// Used by the fair-queue drain loop to batch-fill the fair queue before processing.
+    pub fn try_recv_from_sender(
+        &mut self,
+    ) -> Result<Option<(EventId, ContractHandlerEvent)>, ContractError> {
+        match self.end.event_receiver.try_recv() {
+            Ok(InternalCHEvent { ev, id, result }) => {
+                self.end.waiting_response.insert(id, result);
+                Ok(Some((EventId { id }, ev)))
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(ContractError::NoEvHandlerResponse)
+            }
+        }
     }
 }
 
@@ -1028,6 +1053,70 @@ pub mod test {
                 std::mem::discriminant(other)
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn try_recv_from_sender_empty_channel() {
+        let (_send_halve, mut rcv_halve, _) = contract_handler_channel();
+
+        // Empty channel should return Ok(None)
+        let result = rcv_halve.try_recv_from_sender();
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_recv_from_sender_receives_event() {
+        let (send_halve, mut rcv_halve, _) = contract_handler_channel();
+
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![10, 11, 12])),
+            Parameters::from(vec![13]),
+        )));
+        let key = contract.key();
+
+        // Send an event from another task
+        let _h = GlobalExecutor::spawn(async move {
+            send_halve
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key,
+                    state: vec![20, 21].into(),
+                    related_contracts: RelatedContracts::default(),
+                    contract: None,
+                })
+                .await
+        });
+
+        // Wait briefly for the event to arrive
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // try_recv should succeed
+        let result = rcv_halve.try_recv_from_sender();
+        assert!(result.is_ok());
+        let (id, event) = result.unwrap().expect("should have received an event");
+        // Verify we got a valid EventId (any u64 is valid)
+
+        let ContractHandlerEvent::PutQuery { state, .. } = event else {
+            panic!("expected PutQuery event");
+        };
+        assert_eq!(state.as_ref(), &[20, 21]);
+
+        // The waiting_response entry should be populated
+        assert!(rcv_halve.end.waiting_response.contains_key(&id.id));
+    }
+
+    #[tokio::test]
+    async fn try_recv_from_sender_disconnected() {
+        let (send_halve, mut rcv_halve, _) = contract_handler_channel();
+
+        // Drop the sender to disconnect the channel
+        drop(send_halve);
+
+        let result = rcv_halve.try_recv_from_sender();
+        assert!(
+            matches!(result, Err(super::ContractError::NoEvHandlerResponse)),
+            "Expected NoEvHandlerResponse, got {:?}",
+            result
+        );
     }
 }
 
