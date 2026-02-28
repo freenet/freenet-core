@@ -1077,6 +1077,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     error = %e,
                                     "Resend send failed, will retry on next RTO"
                                 );
+                                // Re-insert packet so RTO will retry it. Without this,
+                                // the packet would be permanently lost from tracking since
+                                // resend_check() already removed it.
+                                self.remote_conn
+                                    .sent_tracker
+                                    .lock()
+                                    .report_sent_packet(idx, packet);
                                 break;
                             }
                         }
