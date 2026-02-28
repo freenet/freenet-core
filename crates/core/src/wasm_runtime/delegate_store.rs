@@ -54,9 +54,7 @@ impl DelegateStore {
             }
         }
 
-        // Phase 2: Reconcile with .reg files (supplementary backup).
-        // Any .reg entries missing from ReDb get restored, ensuring resilience
-        // against ReDb corruption or lost entries.
+        // Phase 2: Restore any .reg entries missing from ReDb (crash recovery).
         let mut reg_count = 0u32;
         let mut restored_count = 0u32;
 
@@ -84,16 +82,14 @@ impl DelegateStore {
                     continue;
                 };
 
-                let dk_bytes = match bs58::decode(dk_encoded)
+                let dk_bytes: [u8; 32] = match bs58::decode(dk_encoded)
                     .with_alphabet(bs58::Alphabet::BITCOIN)
                     .into_vec()
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
                 {
-                    Ok(bytes) if bytes.len() == 32 => {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        arr
-                    }
-                    _ => {
+                    Some(arr) => arr,
+                    None => {
                         tracing::warn!("Invalid delegate key encoding in filename: {dk_encoded}");
                         continue;
                     }
@@ -165,8 +161,7 @@ impl DelegateStore {
         })
     }
 
-    /// Ensures the index mapping exists for a key, repairing it if missing.
-    /// Updates ReDb, DashMap, and .reg file.
+    /// Ensures the index mapping and .reg backup exist for a key, repairing if missing.
     fn ensure_index_entry(
         &mut self,
         key: &DelegateKey,
@@ -185,7 +180,6 @@ impl DelegateStore {
         Ok(())
     }
 
-    /// Extract params from a DelegateContainer by destructuring.
     fn extract_params(delegate: &DelegateContainer) -> Parameters<'static> {
         match delegate {
             DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
@@ -217,10 +211,9 @@ impl DelegateStore {
             return Ok(());
         }
 
-        // CRITICAL ORDER: Write WASM first, then .reg, then ReDb index, then cache.
+        // Write order: WASM -> .reg -> ReDb -> in-memory -> cache.
         // .reg files ensure the index can be rebuilt if ReDb entries are ever lost.
 
-        // Step 1: Save WASM to disk (ensures data is persisted)
         let version = APIVersion::from(delegate.clone());
         let output: Vec<u8> = delegate
             .code()
@@ -230,20 +223,15 @@ impl DelegateStore {
         file.write_all(output.as_slice())?;
         file.sync_all()?;
 
-        // Step 2: Write .reg registration record (supplementary backup)
         write_reg_file_if_missing(&self.delegates_dir, key, code_hash, &params)?;
 
-        // Step 3: Update index in ReDb (primary persistent store)
         self.db
             .store_delegate_index(key, code_hash)
             .map_err(|e| anyhow::anyhow!("Failed to store delegate index: {e}"))?;
 
-        // Step 4: Update in-memory index
         self.key_to_code_part.insert(key.clone(), *code_hash);
 
-        // Step 5: Insert into memory cache (best-effort, may be rejected by TinyLFU)
-        let data = delegate.code().as_ref();
-        let code_size = data.len() as i64;
+        let code_size = delegate.code().as_ref().len() as i64;
         self.delegate_cache
             .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
         let _cache_result = self.delegate_cache.wait();
@@ -262,21 +250,16 @@ impl DelegateStore {
         // Remove from in-memory index
         self.key_to_code_part.remove(key);
 
-        // Remove .reg file
-        let reg_path = self.delegates_dir.join(key.encode()).with_extension("reg");
-        match std::fs::remove_file(&reg_path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-            Ok(_) => {}
+        // Remove .reg and .wasm files (ignore NotFound)
+        for ext in ["reg", "wasm"] {
+            let path = self.delegates_dir.join(key.encode()).with_extension(ext);
+            if let Err(err) = std::fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+            }
         }
-
-        // Remove WASM file (keyed by delegate key encoding — legacy behavior)
-        let cmp_path: PathBuf = self.delegates_dir.join(key.encode()).with_extension("wasm");
-        match std::fs::remove_file(cmp_path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
-            Ok(_) => Ok(()),
-        }
+        Ok(())
     }
 
     pub fn get_delegate_path(&mut self, key: &DelegateKey) -> RuntimeResult<PathBuf> {
@@ -319,10 +302,8 @@ fn write_reg_file_if_missing(
 /// Parse a .reg registration record file.
 /// Returns (code_hash, params) if valid, None if corrupt/unsupported.
 fn parse_reg_file(data: &[u8]) -> Option<(CodeHash, Parameters<'static>)> {
-    if data.len() < 37 {
-        return None;
-    }
-    if data[0] != REG_FILE_VERSION {
+    // Minimum: 1 (version) + 32 (hash) + 4 (params len) = 37 bytes
+    if data.len() < 37 || data[0] != REG_FILE_VERSION {
         return None;
     }
     let mut code_hash_bytes = [0u8; 32];
@@ -561,8 +542,8 @@ mod test {
     }
 
     /// parse_reg_file handles valid and invalid data correctly
-    #[tokio::test]
-    async fn parse_reg_file_validation() -> Result<(), Box<dyn std::error::Error>> {
+    #[test]
+    fn parse_reg_file_validation() -> Result<(), Box<dyn std::error::Error>> {
         // Valid: version 1, 32-byte hash, 0-length params
         let mut valid = vec![1u8];
         valid.extend_from_slice(&[0u8; 32]);
