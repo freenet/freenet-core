@@ -2314,12 +2314,17 @@ pub(crate) async fn initial_join_procedure(
                     // (e.g. during isolation recovery or suspend detection).
                     if let Some(min_wait) = min_backoff {
                         // When we already have some ring connections, cap the wait at
-                        // 30s so we re-check open_conns frequently: the concurrent
+                        // ~30s so we re-check open_conns frequently: the concurrent
                         // connection_maintenance task may have added connections via
                         // ring-based acquisition, bringing us to BOOTSTRAP_THRESHOLD
                         // before the gateway backoff fully expires.  See issue #3304.
+                        //
+                        // Apply ±20% jitter (24–36s range) to prevent thundering herd
+                        // when many nodes simultaneously hit the gateway-backoff path.
                         let effective_wait = if open_conns > 0 {
-                            min_wait.min(Duration::from_secs(30))
+                            let jitter_ms = GlobalRng::random_range(0u64..12_000u64);
+                            let cap = Duration::from_secs(24) + Duration::from_millis(jitter_ms);
+                            min_wait.min(cap)
                         } else {
                             min_wait
                         };
