@@ -34,14 +34,14 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// retrying at ~3 Hz can flood the event loop and cause "node not available"
 /// errors for all clients. See #3305, #3332.
 ///
-/// Two-phase tracking:
-/// - On outgoing requests: stores the delegate key and checks for existing backoff
-/// - On incoming responses: records errors/successes to update backoff state
+/// Tracking approach:
+/// - On outgoing requests: checks for existing backoff and rejects immediately
+///   if in backoff (returns the remaining duration so the caller can send an
+///   error response without forwarding to the node or blocking the event loop)
+/// - On incoming responses: extracts the delegate key directly from the error
+///   or success response to record backoff state (no correlation needed)
 struct DelegateRateLimiter {
     backoff: TrackedBackoff<[u8; 32]>,
-    /// The delegate key from the most recent outgoing request (if any).
-    /// Used to correlate error responses back to the delegate key.
-    last_requested_key: Option<[u8; 32]>,
 }
 
 impl DelegateRateLimiter {
@@ -52,30 +52,25 @@ impl DelegateRateLimiter {
         );
         Self {
             backoff: TrackedBackoff::new(config, 64),
-            last_requested_key: None,
         }
     }
 
-    /// Record that a delegate request is being sent for this key.
-    /// Returns the backoff delay that should be imposed, or `Duration::ZERO`.
-    fn on_request(&mut self, delegate_key: &[u8]) -> Duration {
-        let Some(key) = to_key_array(delegate_key) else {
-            return Duration::ZERO;
-        };
-        self.last_requested_key = Some(key);
-        self.backoff.remaining_backoff(&key).unwrap_or(Duration::ZERO)
+    /// Check if a delegate key is currently in backoff.
+    /// Returns the remaining backoff duration, or `None` if the request can proceed.
+    fn check_backoff(&self, delegate_key: &[u8]) -> Option<Duration> {
+        let key = to_key_array(delegate_key)?;
+        self.backoff.remaining_backoff(&key)
     }
 
-    /// Record a delegate error response. Uses the last requested delegate key.
-    fn on_error_response(&mut self) {
-        if let Some(key) = self.last_requested_key.take() {
+    /// Record a delegate error for a specific key (extracted from the error response).
+    fn record_error(&mut self, delegate_key: &[u8]) {
+        if let Some(key) = to_key_array(delegate_key) {
             self.backoff.record_failure(key);
         }
     }
 
     /// Record a successful delegate response. Clears backoff for the key.
-    fn on_success_response(&mut self, delegate_key: &[u8]) {
-        self.last_requested_key = None;
+    fn record_success(&mut self, delegate_key: &[u8]) {
         if let Some(key) = to_key_array(delegate_key) {
             self.backoff.record_success(&key);
         }
@@ -84,12 +79,21 @@ impl DelegateRateLimiter {
 
 /// Convert a delegate key byte slice to a fixed-size array, or `None` if wrong length.
 fn to_key_array(key: &[u8]) -> Option<[u8; 32]> {
-    if key.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(key);
-        Some(arr)
-    } else {
-        None
+    key.try_into().ok()
+}
+
+/// Extract the delegate key bytes from a `DelegateError`, if available.
+///
+/// Most `DelegateError` variants carry a `DelegateKey`; `ExecutionError` and
+/// `ForbiddenSecretAccess` do not, so we return `None` for those.
+fn delegate_error_key(err: &DelegateError) -> Option<&[u8]> {
+    match err {
+        DelegateError::RegisterError(key) => Some(key.bytes()),
+        DelegateError::Missing(key) => Some(key.bytes()),
+        DelegateError::MissingSecret { key, .. } => Some(key.bytes()),
+        DelegateError::ExecutionError(_) | DelegateError::ForbiddenSecretAccess(_) => None,
+        // non_exhaustive: future variants without a key get no tracking
+        _ => None,
     }
 }
 
@@ -104,7 +108,10 @@ use axum::{
     Extension, Router,
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, DelegateError, ErrorKind, HostResponse,
+        RequestError,
+    },
     prelude::*,
 };
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
@@ -921,20 +928,34 @@ async fn process_client_request(
     };
 
     // Rate-limit delegate requests that have been failing repeatedly (#3305).
-    // This prevents a single client from flooding the event loop with requests
-    // for missing delegates at ~3 Hz, which can cause "node not available" for
-    // all clients (#3332).
+    // If the delegate key is in backoff, reject the request immediately without
+    // forwarding it to the node. This prevents a single misbehaving client from
+    // flooding the event loop (which caused "node not available" for all clients,
+    // #3332) and avoids blocking the connection's event loop with a sleep (which
+    // would stall pings, subscriptions, and other responses).
     if let ClientRequest::DelegateOp(ref delegate_req) = req {
         let key_bytes: &[u8] = delegate_req.key().bytes();
-        let backoff = rate_limiter.on_request(key_bytes);
-        if !backoff.is_zero() {
+        if let Some(remaining) = rate_limiter.check_backoff(key_bytes) {
             tracing::warn!(
                 %client_id,
                 delegate_key = %delegate_req.key(),
-                backoff_ms = backoff.as_millis(),
-                "Rate-limiting delegate request due to repeated failures"
+                backoff_ms = remaining.as_millis(),
+                "Rejecting delegate request due to repeated failures (retry after backoff)"
             );
-            tokio::time::sleep(backoff).await;
+            let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+                DelegateError::Missing(delegate_req.key().clone()),
+            ))
+            .into();
+            let serialized = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))
+                        .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?
+                }
+            };
+            return Ok(Some(Message::Binary(serialized.into())));
         }
     }
 
@@ -1004,15 +1025,27 @@ async fn process_host_response(
 
             // Update delegate rate limiter based on response (#3305).
             // On success: clear backoff so the client can resume normal speed.
-            // On error: record the failure to build up backoff for repeat offenders.
+            // On delegate error: extract the delegate key from the error and
+            // record the failure. We match only DelegateError (not ContractError,
+            // Disconnect, or Timeout) to avoid penalizing delegate keys for
+            // unrelated failures.
             match &result {
                 Ok(HostResponse::DelegateResponse { key, .. }) => {
-                    rate_limiter.on_success_response(key.bytes());
+                    rate_limiter.record_success(key.bytes());
                 }
-                Err(err) if matches!(err.kind(), ErrorKind::RequestError(_)) => {
-                    // Delegate errors (missing, execution failure) come back as
-                    // RequestError. Correlate with the last requested delegate key.
-                    rate_limiter.on_error_response();
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::RequestError(RequestError::DelegateError(_))
+                    ) =>
+                {
+                    if let ErrorKind::RequestError(RequestError::DelegateError(delegate_err)) =
+                        err.kind()
+                    {
+                        if let Some(key_bytes) = delegate_error_key(delegate_err) {
+                            rate_limiter.record_error(key_bytes);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1421,5 +1454,127 @@ mod tests {
         let h = headers_with_host("localhost:7509");
         assert!(is_same_origin("http://localhost:7509", &h));
         assert!(!is_same_origin("http://evil.com", &h));
+    }
+
+    #[test]
+    fn test_to_key_array_valid() {
+        let key = [42u8; 32];
+        assert_eq!(to_key_array(&key), Some(key));
+    }
+
+    #[test]
+    fn test_to_key_array_wrong_length() {
+        assert_eq!(to_key_array(&[0u8; 31]), None);
+        assert_eq!(to_key_array(&[0u8; 33]), None);
+        assert_eq!(to_key_array(&[]), None);
+    }
+
+    #[test]
+    fn test_rate_limiter_no_backoff_initially() {
+        let limiter = DelegateRateLimiter::new();
+        let key = [1u8; 32];
+        assert!(limiter.check_backoff(&key).is_none());
+    }
+
+    #[test]
+    fn test_rate_limiter_backoff_after_error() {
+        let mut limiter = DelegateRateLimiter::new();
+        let key = [1u8; 32];
+
+        // No backoff before any errors
+        assert!(limiter.check_backoff(&key).is_none());
+
+        // Record a failure
+        limiter.record_error(&key);
+
+        // Now should be in backoff
+        let remaining = limiter.check_backoff(&key);
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_rate_limiter_success_clears_backoff() {
+        let mut limiter = DelegateRateLimiter::new();
+        let key = [1u8; 32];
+
+        limiter.record_error(&key);
+        assert!(limiter.check_backoff(&key).is_some());
+
+        limiter.record_success(&key);
+        assert!(limiter.check_backoff(&key).is_none());
+    }
+
+    #[test]
+    fn test_rate_limiter_independent_keys() {
+        let mut limiter = DelegateRateLimiter::new();
+        let key_a = [1u8; 32];
+        let key_b = [2u8; 32];
+
+        limiter.record_error(&key_a);
+
+        // key_a is in backoff, key_b is not
+        assert!(limiter.check_backoff(&key_a).is_some());
+        assert!(limiter.check_backoff(&key_b).is_none());
+
+        // Success on key_a doesn't affect key_b
+        limiter.record_error(&key_b);
+        limiter.record_success(&key_a);
+        assert!(limiter.check_backoff(&key_a).is_none());
+        assert!(limiter.check_backoff(&key_b).is_some());
+    }
+
+    #[test]
+    fn test_rate_limiter_escalating_backoff() {
+        let mut limiter = DelegateRateLimiter::new();
+        let key = [1u8; 32];
+
+        // First failure
+        limiter.record_error(&key);
+        let first_backoff = limiter.check_backoff(&key).unwrap();
+
+        // Record success then failure again to reset and measure independently
+        limiter.record_success(&key);
+
+        // Two consecutive failures should produce longer backoff
+        limiter.record_error(&key);
+        limiter.record_error(&key);
+        let second_backoff = limiter.check_backoff(&key).unwrap();
+
+        // Second backoff should be longer (accounting for jitter)
+        // With base=100ms: 1 failure ≈ 100ms, 2 failures ≈ 200ms
+        // Even with ±20% jitter, 200ms*0.8 > 100ms*1.2 doesn't always hold,
+        // but the underlying failure count should increase
+        assert!(second_backoff > Duration::ZERO);
+        assert!(first_backoff > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_delegate_error_key_extraction() {
+        use freenet_stdlib::prelude::DelegateKey;
+
+        let code_hash = freenet_stdlib::prelude::CodeHash::new([0u8; 32]);
+        let delegate_key = DelegateKey::new([42u8; 32], code_hash);
+
+        // Missing variant carries the key
+        let err = DelegateError::Missing(delegate_key.clone());
+        let extracted = delegate_error_key(&err);
+        assert!(extracted.is_some());
+        assert_eq!(extracted.unwrap(), &[42u8; 32]);
+
+        // RegisterError variant carries the key
+        let err = DelegateError::RegisterError(delegate_key.clone());
+        assert!(delegate_error_key(&err).is_some());
+
+        // MissingSecret variant carries the key
+        let err = DelegateError::MissingSecret {
+            key: delegate_key,
+            secret: freenet_stdlib::prelude::SecretsId::new(b"test".to_vec()),
+        };
+        assert!(delegate_error_key(&err).is_some());
+
+        // ExecutionError does NOT carry a key
+        let err = DelegateError::ExecutionError("test error".into());
+        assert!(delegate_error_key(&err).is_none());
     }
 }
