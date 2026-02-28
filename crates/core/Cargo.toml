@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.157"
+version = "0.1.158"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -13,7 +13,7 @@ readme = "README.md"
 # Minimum compatible protocol version. Peers older than this are rejected.
 # Updated by scripts/release.sh during releases. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
-min-compatible-version = "0.1.156"
+min-compatible-version = "0.1.157"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
