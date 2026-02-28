@@ -7,12 +7,12 @@ use tokio::time::Instant;
 
 const UPDATE_CACHED_TIME_EVERY: Duration = Duration::from_millis(10);
 
-pub trait TimeSource {
+pub trait TimeSource: std::fmt::Debug {
     fn now(&self) -> Instant;
 }
 
 /// A simple time source that returns the current time using `Instant::now()`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct InstantTimeSrc(());
 
 impl InstantTimeSrc {
@@ -80,7 +80,7 @@ impl crate::simulation::TimeSource for InstantTimeSrc {
 /// **Warning**: This time source will only be accurate to within about 20ms,
 /// any usage should be tested carefully to verify that this inaccuracy is acceptable.
 /// In the absence of such testing use [`InstantTimeSrc`] instead.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CachingSystemTimeSrc(());
 
 // Global atomic pointer to the cached time. Initialized as a null pointer.
@@ -149,7 +149,7 @@ impl TimeSource for CachingSystemTimeSrc {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MockTimeSource {
     current_instant: Instant,
 }
@@ -192,7 +192,7 @@ impl TimeSource for MockTimeSource {
 /// component.do_something_time_dependent();
 /// ```
 #[cfg(test)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SharedMockTimeSource {
     /// The epoch when time started (used as baseline for elapsed calculations)
     epoch: Instant,
