@@ -67,7 +67,8 @@ pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 
 pub(crate) use init_tracker::{
-    now_nanos, ContractInitTracker, InitCheckResult, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
+    now_nanos, ContractInitTracker, InitCheckResult, MAX_CONCURRENT_INITIALIZATIONS,
+    MAX_QUEUED_OPS_PER_CONTRACT, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
 pub(crate) use runtime::RuntimePool;
 

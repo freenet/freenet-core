@@ -761,6 +761,17 @@ where
                     cause: "contract is already being initialized".into(),
                 }));
             }
+            InitCheckResult::QueueFull => {
+                tracing::warn!(
+                    contract = %key,
+                    limit = MAX_QUEUED_OPS_PER_CONTRACT,
+                    "Contract initialization queue full, rejecting operation"
+                );
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "contract initialization queue is full, try again later".into(),
+                }));
+            }
             InitCheckResult::Queued { queue_size } => {
                 tracing::info!(
                     contract = %key,
@@ -863,7 +874,25 @@ where
                 contract = %key,
                 "Starting contract initialization - queueing subsequent operations"
             );
-            self.init_tracker.start_initialization(key, now_nanos());
+            if let Err(e) = self.init_tracker.start_initialization(key, now_nanos()) {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    limit = MAX_CONCURRENT_INITIALIZATIONS,
+                    "Too many concurrent initializations, rejecting PUT"
+                );
+                if let Err(re) = self.runtime.remove_contract(&key) {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %re,
+                        "Failed to remove contract after init tracker rejection"
+                    );
+                }
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "node is too busy: too many contracts initializing simultaneously, try again later".into(),
+                }));
+            }
         }
 
         let mut updates = match update {
