@@ -1199,23 +1199,19 @@ async fn process_open_request(
 
                         // Determine whether to route through network or return local cache.
                         //
-                        // The key insight: if we're actively subscribed to a contract (is_seeding_contract),
-                        // our local cache is kept fresh via subscription updates. So we can return it.
-                        // If we're NOT subscribed, our cache may be stale and we should fetch from network.
-                        //
-                        // This fixes the stale cache bug (PR #2388) while avoiding the performance
-                        // regression of routing ALL GETs through network.
+                        // If we're actively receiving updates (is_receiving_updates), our
+                        // local cache is fresh and we can return it directly. Otherwise,
+                        // fetch from network to avoid serving stale state.
+                        // See PR #2388 (original fix) and #3340 (LRU staleness fix).
                         let connection_count = op_manager.ring.open_connections();
                         let has_local_state = full_key.is_some() && state.is_some();
                         let local_satisfies_request =
                             has_local_state && (!return_contract_code || contract.is_some());
 
-                        // Check if we're actively receiving updates for this contract
-                        // (active network subscription or local client subscriptions).
-                        // Only then is our cache guaranteed fresh. The hosting LRU cache
-                        // alone is not sufficient — a contract can outlive its subscription
-                        // in the LRU, leaving stale state that would never be refreshed
-                        // because the network GET path (and AUTO_SUBSCRIBE_ON_GET) is skipped.
+                        // Only return local cache if we're actively receiving updates
+                        // (network subscription or client subscriptions). The hosting
+                        // LRU cache alone is insufficient — contracts can outlive their
+                        // subscriptions, leaving stale state (see #3340).
                         let is_subscribed = full_key
                             .as_ref()
                             .map(|k| op_manager.ring.is_receiving_updates(k))

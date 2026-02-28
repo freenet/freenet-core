@@ -636,10 +636,9 @@ impl HostingManager {
     ///
     /// Returns true only if we have an active network subscription or local
     /// client subscriptions — conditions that guarantee our cached state is
-    /// kept fresh via update propagation. Unlike `should_host()`, this does
-    /// NOT consider the hosting LRU cache alone as sufficient, since a contract
-    /// can remain in the LRU cache long after its subscription expires, meaning
-    /// the cached state may be stale.
+    /// kept fresh. Unlike [`should_host()`](Self::should_host), this excludes
+    /// the hosting LRU cache, which can retain contracts after their
+    /// subscriptions expire (leaving stale state).
     pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
