@@ -4,12 +4,30 @@ use stretto::AsyncCache;
 
 use crate::config::GlobalExecutor;
 
+/// Maximum size of a single contract state blob (50 MiB).
+///
+/// This is a network-level protocol constant — identical across all nodes — so that any node
+/// can make routing and caching decisions without prior knowledge of which peer will handle a
+/// request. Making it per-node-configurable would create routing non-determinism and allow
+/// an attacker to selectively target lenient nodes.
+///
+/// 50 MiB is conservative enough to prevent disk exhaustion by malicious contracts while
+/// remaining large enough for legitimate use cases (web apps, documents, datasets). A contract
+/// whose `validate_state` returns `Valid` for arbitrarily large state cannot bypass this limit.
+pub(crate) const MAX_STATE_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
+
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
     #[error(transparent)]
     Any(#[from] anyhow::Error),
     #[error("missing contract: {0}")]
     MissingContract(ContractKey),
+    #[error("contract state too large for {key}: {size} bytes exceeds limit of {limit} bytes")]
+    StateTooLarge {
+        key: ContractKey,
+        size: usize,
+        limit: usize,
+    },
 }
 
 impl From<StateStoreError> for crate::wasm_runtime::ContractError {
@@ -19,6 +37,9 @@ impl From<StateStoreError> for crate::wasm_runtime::ContractError {
                 crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
             }
             err @ StateStoreError::MissingContract(_) => {
+                crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
+            }
+            err @ StateStoreError::StateTooLarge { .. } => {
                 crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
             }
         }
@@ -103,6 +124,20 @@ where
         key: &ContractKey,
         state: WrappedState,
     ) -> Result<(), StateStoreError> {
+        if state.size() > MAX_STATE_SIZE {
+            tracing::warn!(
+                contract = %key,
+                size_bytes = state.size(),
+                limit_bytes = MAX_STATE_SIZE,
+                "Rejecting oversized state at storage layer (update)"
+            );
+            return Err(StateStoreError::StateTooLarge {
+                key: *key,
+                size: state.size(),
+                limit: MAX_STATE_SIZE,
+            });
+        }
+
         // only allow updates for existing contracts
         let cache_miss = if let Some(cache) = &self.state_mem_cache {
             cache.get(key).await.is_none()
@@ -135,6 +170,20 @@ where
         state: WrappedState,
         params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
+        if state.size() > MAX_STATE_SIZE {
+            tracing::warn!(
+                contract = %key,
+                size_bytes = state.size(),
+                limit_bytes = MAX_STATE_SIZE,
+                "Rejecting oversized state at storage layer (store)"
+            );
+            return Err(StateStoreError::StateTooLarge {
+                key,
+                size: state.size(),
+                limit: MAX_STATE_SIZE,
+            });
+        }
+
         // Update memory cache first (if enabled) to prevent race condition
         if let Some(cache) = &self.state_mem_cache {
             let cost = state.size() as i64;
@@ -513,6 +562,65 @@ mod tests {
         let retrieved = store.get(&key).await.unwrap();
         assert_eq!(retrieved, empty_state);
         assert_eq!(retrieved.size(), 0);
+    }
+
+    // ============ State Size Limit Tests ============
+
+    /// Verify that store() rejects state exceeding MAX_STATE_SIZE.
+    ///
+    /// Uses new_uncached() for determinism — stretto's TinyLFU admission policy
+    /// is non-deterministic and irrelevant to the size-limit check.
+    #[tokio::test]
+    async fn test_store_rejects_oversized_state() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+        let oversized = make_test_state(&vec![0u8; MAX_STATE_SIZE + 1]);
+        let params = Parameters::from(vec![1, 2, 3]);
+
+        let result = store.store(key, oversized, params).await;
+
+        assert!(
+            matches!(result, Err(StateStoreError::StateTooLarge { .. })),
+            "Expected StateTooLarge, got: {result:?}"
+        );
+    }
+
+    /// Verify that update() rejects state exceeding MAX_STATE_SIZE.
+    #[tokio::test]
+    async fn test_update_rejects_oversized_state() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+        let small = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![1, 2, 3]);
+
+        // Store a valid initial state first (update requires an existing contract)
+        store.store(key, small, params).await.unwrap();
+
+        let oversized = make_test_state(&vec![0u8; MAX_STATE_SIZE + 1]);
+        let result = store.update(&key, oversized).await;
+
+        assert!(
+            matches!(result, Err(StateStoreError::StateTooLarge { .. })),
+            "Expected StateTooLarge, got: {result:?}"
+        );
+    }
+
+    /// Verify that state at exactly MAX_STATE_SIZE is accepted (limit is inclusive).
+    #[tokio::test]
+    async fn test_store_accepts_state_at_limit() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+        let at_limit = make_test_state(&vec![0u8; MAX_STATE_SIZE]);
+        let params = Parameters::from(vec![1, 2, 3]);
+
+        // State of exactly MAX_STATE_SIZE bytes should be accepted
+        store
+            .store(key, at_limit, params)
+            .await
+            .expect("State at exactly MAX_STATE_SIZE should be accepted");
     }
 
     // ============ Edge Case: Large State ============
