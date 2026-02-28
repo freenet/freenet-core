@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex as StdMutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
@@ -26,6 +26,120 @@ pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 /// interval that prevents most idle timeouts while not creating excessive
 /// overhead.
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum delegate error responses before rate limiting kicks in per key.
+const DELEGATE_ERROR_THRESHOLD: u32 = 3;
+
+/// Time window for counting delegate errors. Errors older than this are forgotten.
+const DELEGATE_ERROR_WINDOW: Duration = Duration::from_secs(10);
+
+/// Maximum backoff delay for rate-limited delegate requests.
+const DELEGATE_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Maximum number of tracked delegate keys per client to bound memory usage.
+const DELEGATE_RATE_LIMIT_MAX_KEYS: usize = 64;
+
+/// Per-client rate limiter for delegate operations.
+///
+/// Tracks recent delegate error responses and throttles clients that repeatedly
+/// send requests for missing/failing delegates. Without this, a single misbehaving
+/// client retrying at ~3 Hz can flood the event loop and cause "node not available"
+/// errors for all clients. See #3305, #3332.
+///
+/// The rate limiter uses two-phase tracking:
+/// - On outgoing requests: checks if the delegate key is rate-limited and delays if so
+/// - On incoming responses: records errors/successes to update rate limit state
+struct DelegateRateLimiter {
+    /// Map of delegate key bytes → (error count in window, time of first error)
+    error_counts: HashMap<[u8; 32], (u32, Instant)>,
+    /// The delegate key from the most recent outgoing request (if any).
+    /// Used to correlate error responses back to the delegate key.
+    last_requested_key: Option<[u8; 32]>,
+}
+
+impl DelegateRateLimiter {
+    fn new() -> Self {
+        Self {
+            error_counts: HashMap::new(),
+            last_requested_key: None,
+        }
+    }
+
+    /// Record that a delegate request is being sent for this key.
+    /// Returns the backoff delay that should be imposed, or `Duration::ZERO`.
+    fn on_request(&mut self, delegate_key: &[u8]) -> Duration {
+        // Store the key for correlating with the response later
+        if delegate_key.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(delegate_key);
+            self.last_requested_key = Some(key);
+        }
+
+        self.check_rate_limit(delegate_key)
+    }
+
+    /// Record a delegate error response. Uses the last requested delegate key.
+    fn on_error_response(&mut self) {
+        if let Some(key) = self.last_requested_key.take() {
+            self.record_error(&key);
+        }
+    }
+
+    /// Record a successful delegate response. Clears backoff for the key.
+    fn on_success_response(&mut self, delegate_key: &[u8]) {
+        self.last_requested_key = None;
+        if delegate_key.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(delegate_key);
+            self.error_counts.remove(&key);
+        }
+    }
+
+    fn record_error(&mut self, delegate_key: &[u8; 32]) {
+        let now = Instant::now();
+
+        // Evict stale entries and bound memory
+        if self.error_counts.len() >= DELEGATE_RATE_LIMIT_MAX_KEYS {
+            self.error_counts.retain(|_, (_, first_error)| {
+                now.duration_since(*first_error) < DELEGATE_ERROR_WINDOW
+            });
+        }
+
+        let entry = self.error_counts.entry(*delegate_key).or_insert((0, now));
+
+        // Reset window if too old
+        if now.duration_since(entry.1) > DELEGATE_ERROR_WINDOW {
+            *entry = (0, now);
+        }
+
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    fn check_rate_limit(&self, delegate_key: &[u8]) -> Duration {
+        if delegate_key.len() != 32 {
+            return Duration::ZERO;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(delegate_key);
+
+        let Some((count, first_error)) = self.error_counts.get(&key) else {
+            return Duration::ZERO;
+        };
+
+        let now = Instant::now();
+        if now.duration_since(*first_error) > DELEGATE_ERROR_WINDOW {
+            return Duration::ZERO;
+        }
+
+        if *count >= DELEGATE_ERROR_THRESHOLD {
+            // Exponential backoff: 100ms, 200ms, 400ms, ... capped at max
+            let backoff_ms = 100u64 * (1u64 << (*count - DELEGATE_ERROR_THRESHOLD).min(10));
+            Duration::from_millis(backoff_ms).min(DELEGATE_MAX_BACKOFF)
+        } else {
+            Duration::ZERO
+        }
+    }
+}
 
 use axum::{
     extract::{
@@ -152,7 +266,17 @@ pub struct WebSocketProxy {
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
 
-const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
+/// Channel capacity for WebSocket client connections to the node event loop.
+///
+/// This must be large enough to handle bursts of concurrent client connections
+/// and requests without filling up. When this channel is full, new client
+/// connections fail with `NodeUnavailable`, which cascades to ALL connecting
+/// clients — not just the ones causing the load. See #3332.
+///
+/// Previous value of 10 was far too small: a single misbehaving client retrying
+/// at 3 Hz could saturate it within seconds, causing all other clients to get
+/// "node not available" errors.
+const PARALLELISM: usize = 256;
 
 impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
@@ -604,6 +728,9 @@ async fn websocket_interface(
         // Don't close connection immediately - let client handle the error gracefully
     }
 
+    // Per-connection rate limiter for delegate operations (#3305, #3332)
+    let mut delegate_rate_limiter = DelegateRateLimiter::new();
+
     // Create ping interval to keep connection alive and prevent idle timeout
     let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
     // Don't send ping immediately on connection, wait for first interval
@@ -668,6 +795,7 @@ async fn websocket_interface(
                     auth_token.as_mut().map(|t| t.1),
                     encoding_protoc,
                     api_version,
+                    &mut delegate_rate_limiter,
                 )
                 .await
                 {
@@ -697,7 +825,7 @@ async fn websocket_interface(
             msg = response_rx.recv() => {
                 // process_host_response runs in the branch handler (not the select future)
                 // so it cannot be cancelled by other branches resolving first.
-                let msg = match process_host_response(msg, client_id, encoding_protoc, &mut server_sink).await {
+                let msg = match process_host_response(msg, client_id, encoding_protoc, &mut server_sink, &mut delegate_rate_limiter).await {
                     Ok(msg) => msg,
                     Err(err) => {
                         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
@@ -791,6 +919,7 @@ struct NewSubscription {
     callback: mpsc::UnboundedReceiver<HostResult>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_client_request(
     client_id: ClientId,
     msg: Result<Message, axum::Error>,
@@ -799,6 +928,7 @@ async fn process_client_request(
     attested_contract: Option<ContractInstanceId>,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
+    rate_limiter: &mut DelegateRateLimiter,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data.to_vec(),
@@ -834,6 +964,24 @@ async fn process_client_request(
             },
         }
     };
+
+    // Rate-limit delegate requests that have been failing repeatedly (#3305).
+    // This prevents a single client from flooding the event loop with requests
+    // for missing delegates at ~3 Hz, which can cause "node not available" for
+    // all clients (#3332).
+    if let ClientRequest::DelegateOp(ref delegate_req) = req {
+        let key_bytes: &[u8] = delegate_req.key().bytes();
+        let backoff = rate_limiter.on_request(key_bytes);
+        if !backoff.is_zero() {
+            tracing::warn!(
+                %client_id,
+                delegate_key = %delegate_req.key(),
+                backoff_ms = backoff.as_millis(),
+                "Rate-limiting delegate request due to repeated failures"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+    }
 
     // Scope check: contract web apps (identified by attested_contract) cannot use NodeQueries.
     // This prevents malicious contracts from exfiltrating peer topology data.
@@ -893,10 +1041,27 @@ async fn process_host_response(
     client_id: ClientId,
     encoding_protoc: EncodingProtocol,
     tx: &mut SplitSink<WebSocket, Message>,
+    rate_limiter: &mut DelegateRateLimiter,
 ) -> anyhow::Result<Option<NewSubscription>> {
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
+
+            // Update delegate rate limiter based on response (#3305).
+            // On success: clear backoff so the client can resume normal speed.
+            // On error: record the failure to build up backoff for repeat offenders.
+            match &result {
+                Ok(HostResponse::DelegateResponse { key, .. }) => {
+                    rate_limiter.on_success_response(key.bytes());
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::RequestError(_)) => {
+                    // Delegate errors (missing, execution failure) come back as
+                    // RequestError. Correlate with the last requested delegate key.
+                    rate_limiter.on_error_response();
+                }
+                _ => {}
+            }
+
             let result = match result {
                 Ok(res) => {
                     let response_type = match res {
