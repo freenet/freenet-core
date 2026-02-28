@@ -987,6 +987,18 @@ impl P2pConnManager {
                                 "Sending outbound message to peer"
                             );
 
+                            // Trace outbound events (UnsubscribeSent, etc.) for telemetry.
+                            // Without this, messages routed via handle_notification_msg are
+                            // invisible to the event aggregator.
+                            ctx.bridge
+                                .log_register
+                                .register_events(NetEventLog::from_outbound_msg(
+                                    &msg,
+                                    &ctx.bridge.op_manager.ring,
+                                    Some(target_addr),
+                                ))
+                                .await;
+
                             // Look up the connection using the explicit target address
                             let peer_connection = ctx.connections.get(&target_addr);
 

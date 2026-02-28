@@ -197,9 +197,9 @@ impl<T: TimeSource> HostingCache<T> {
 
     /// Touch/refresh a contract's timestamp without adding it if missing.
     ///
-    /// Called when UPDATE is received for a hosted contract.
-    /// This refreshes the TTL and LRU position, indicating the contract
+    /// Refreshes the TTL and LRU position, indicating the contract
     /// is actively receiving updates.
+    #[cfg(test)]
     pub fn touch(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.last_accessed = self.time_source.now();
