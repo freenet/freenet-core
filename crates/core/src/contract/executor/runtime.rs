@@ -8,28 +8,27 @@ use crate::node::OpManager;
 use crate::wasm_runtime::{
     BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE,
 };
+use dashmap::DashMap;
 use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-// Type alias for shared notification storage
-// Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
-// never during WASM execution (get_state_delta)
-type SharedNotifications = Arc<
-    RwLock<HashMap<ContractInstanceId, Vec<(ClientId, tokio::sync::mpsc::Sender<HostResult>)>>>,
->;
+// Type alias for shared notification storage.
+// Uses DashMap for fine-grained per-key locking: concurrent reads to different
+// contracts proceed in parallel, and writes only block the affected shard.
+type SharedNotifications =
+    Arc<DashMap<ContractInstanceId, Vec<(ClientId, tokio::sync::mpsc::Sender<HostResult>)>>>;
 
-// Type alias for shared subscriber summaries
+// Type alias for shared subscriber summaries.
 type SharedSummaries =
-    Arc<RwLock<HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>>;
+    Arc<DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
 
 // Tracks per-client subscription counts for O(1) limit enforcement.
-// Kept in sync with SharedNotifications under the same write lock acquisition.
-type SharedClientCounts = Arc<RwLock<HashMap<ClientId, usize>>>;
+type SharedClientCounts = Arc<DashMap<ClientId, usize>>;
 
 /// Construct a subscriber limit error for a registration that was rejected.
 ///
@@ -190,9 +189,9 @@ impl RuntimePool {
 
         // Create shared notification storage BEFORE creating executors
         // so we can pass references to each executor
-        let shared_notifications: SharedNotifications = Arc::new(RwLock::new(HashMap::new()));
-        let shared_summaries: SharedSummaries = Arc::new(RwLock::new(HashMap::new()));
-        let shared_client_counts: SharedClientCounts = Arc::new(RwLock::new(HashMap::new()));
+        let shared_notifications: SharedNotifications = Arc::new(DashMap::new());
+        let shared_summaries: SharedSummaries = Arc::new(DashMap::new());
+        let shared_client_counts: SharedClientCounts = Arc::new(DashMap::new());
 
         // Create delegate notification channel for subscription delivery
         let (delegate_notification_tx, delegate_notification_rx) =
@@ -525,22 +524,21 @@ impl ContractExecutor for RuntimePool {
         // when the subscription is registered or when updates arrive.
         let owned_summary = summary.map(StateSummary::into_owned);
 
-        // Brief lock acquisition for registration (fast operation)
-        let mut notifications = self.shared_notifications.write().unwrap();
-
         // Check if this client is already registered for this contract
-        let already_registered = notifications.get(&instance_id).and_then(|ch| {
-            ch.binary_search_by_key(&&cli_id, |(p, _)| p)
-                .ok()
-                .map(|i| (i, ch[i].1.same_channel(&notification_ch)))
-        });
+        let already_registered = self
+            .shared_notifications
+            .get(&instance_id)
+            .and_then(|channels| {
+                channels
+                    .binary_search_by_key(&&cli_id, |(p, _)| p)
+                    .ok()
+                    .map(|i| (i, channels[i].1.same_channel(&notification_ch)))
+            });
 
         if let Some((idx, same_channel)) = already_registered {
             if !same_channel {
                 // Client reconnected with new channel, update it.
-                // Safety: `already_registered` was derived from `notifications.get(&instance_id)`
-                // succeeding, so the entry is guaranteed to exist.
-                if let Some(channels) = notifications.get_mut(&instance_id) {
+                if let Some(mut channels) = self.shared_notifications.get_mut(&instance_id) {
                     channels[idx] = (cli_id, notification_ch);
                 }
                 tracing::debug!(
@@ -551,9 +549,11 @@ impl ContractExecutor for RuntimePool {
             }
         } else {
             // New subscriber: enforce per-contract limit
-            let contract_sub_count = notifications.get(&instance_id).map_or(0, |ch| ch.len());
+            let contract_sub_count = self
+                .shared_notifications
+                .get(&instance_id)
+                .map_or(0, |ch| ch.len());
             if contract_sub_count >= super::MAX_SUBSCRIBERS_PER_CONTRACT {
-                drop(notifications);
                 tracing::warn!(
                     client = %cli_id,
                     contract = %instance_id,
@@ -570,11 +570,8 @@ impl ContractExecutor for RuntimePool {
             }
 
             // Enforce per-client subscription limit using O(1) counter
-            let mut client_counts = self.shared_client_counts.write().unwrap();
-            let client_sub_count = client_counts.get(&cli_id).copied().unwrap_or(0);
+            let client_sub_count = self.shared_client_counts.get(&cli_id).map_or(0, |c| *c);
             if client_sub_count >= super::MAX_SUBSCRIPTIONS_PER_CLIENT {
-                drop(client_counts);
-                drop(notifications);
                 tracing::warn!(
                     client = %cli_id,
                     contract = %instance_id,
@@ -592,22 +589,23 @@ impl ContractExecutor for RuntimePool {
             }
 
             // Insert in sorted order for efficient lookup
-            let channels = notifications.entry(instance_id).or_default();
+            let mut channels = self.shared_notifications.entry(instance_id).or_default();
             let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
             channels.insert(insert_pos, (cli_id, notification_ch));
-            *client_counts.entry(cli_id).or_insert(0) += 1;
+            let total = channels.len();
+            drop(channels); // Release DashMap ref before accessing another entry
+
+            *self.shared_client_counts.entry(cli_id).or_insert(0) += 1;
             tracing::debug!(
                 client = %cli_id,
                 contract = %instance_id,
-                total_subscribers = channels.len(),
+                total_subscribers = total,
                 "Registered new subscription in shared pool storage"
             );
         }
-        drop(notifications); // Explicitly release lock before acquiring the next
 
         // Also register the summary
-        let mut summaries = self.shared_summaries.write().unwrap();
-        summaries
+        self.shared_summaries
             .entry(instance_id)
             .or_default()
             .insert(cli_id, owned_summary);
@@ -629,27 +627,28 @@ impl ContractExecutor for RuntimePool {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         // Read subscription info from shared storage at pool level
-        // Brief read lock - just iterating over data
-        let notifications = self.shared_notifications.read().unwrap();
-        notifications
+        self.shared_notifications
             .iter()
-            .flat_map(|(instance_id, clients)| {
-                clients
+            .flat_map(|entry| {
+                let instance_id = *entry.key();
+                entry
+                    .value()
                     .iter()
                     .map(move |(client_id, _)| crate::message::SubscriptionInfo {
-                        instance_id: *instance_id,
+                        instance_id,
                         client_id: *client_id,
                         last_update: None, // Pool doesn't track last update time
                     })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
 
     fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        let channels = {
-            let notifications = self.shared_notifications.read().unwrap();
-            notifications.get(&key).cloned()
-        };
+        let channels = self
+            .shared_notifications
+            .get(&key)
+            .map(|e| e.value().clone());
         if let Some(channels) = channels {
             send_subscription_error_to_clients(&channels, key, reason);
         }
@@ -664,36 +663,27 @@ impl ContractExecutor for RuntimePool {
         let mut removed_notifications = 0usize;
         let mut removed_summaries = 0usize;
 
-        // Clean shared_notifications
-        {
-            let mut notifications = self.shared_notifications.write().unwrap();
-            for (_contract, channels) in notifications.iter_mut() {
-                if let Ok(i) = channels.binary_search_by_key(&&client_id, |(id, _)| id) {
-                    channels.remove(i);
-                    removed_notifications += 1;
-                }
+        // Clean shared_notifications (DashMap::retain gives &mut V per entry)
+        self.shared_notifications.retain(|_contract, channels| {
+            if let Ok(i) = channels.binary_search_by_key(&&client_id, |(id, _)| id) {
+                channels.remove(i);
+                removed_notifications += 1;
             }
-            // Remove contracts with no remaining subscribers
-            notifications.retain(|_, channels| !channels.is_empty());
-        }
+            !channels.is_empty()
+        });
 
         // Update per-client subscription counter
         if removed_notifications > 0 {
-            let mut client_counts = self.shared_client_counts.write().unwrap();
-            client_counts.remove(&client_id);
+            self.shared_client_counts.remove(&client_id);
         }
 
         // Clean shared_summaries
-        {
-            let mut summaries = self.shared_summaries.write().unwrap();
-            for (_contract, client_summaries) in summaries.iter_mut() {
-                if client_summaries.remove(&client_id).is_some() {
-                    removed_summaries += 1;
-                }
+        self.shared_summaries.retain(|_contract, client_summaries| {
+            if client_summaries.remove(&client_id).is_some() {
+                removed_summaries += 1;
             }
-            // Remove contracts with no remaining summaries
-            summaries.retain(|_, client_summaries| !client_summaries.is_empty());
-        }
+            !client_summaries.is_empty()
+        });
 
         if removed_notifications > 0 || removed_summaries > 0 {
             tracing::info!(
@@ -1848,18 +1838,17 @@ where
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
         ) {
-            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> = {
-                let notifications = shared_notifications.read().unwrap();
-                match notifications.get(&instance_id) {
-                    Some(notifiers) => notifiers.clone(),
+            // Snapshot subscribers and release the DashMap read-lock before sending
+            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> =
+                match shared_notifications.get(&instance_id) {
+                    Some(notifiers) => notifiers.value().clone(),
                     None => return Ok(()),
-                }
-            };
+                };
 
-            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> = {
-                let summaries = shared_summaries.read().unwrap();
-                summaries.get(&instance_id).cloned().unwrap_or_default()
-            };
+            let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
+                shared_summaries
+                    .get(&instance_id)
+                    .map_or_else(HashMap::new, |s| s.value().clone());
 
             if notifiers_snapshot.len() > super::FANOUT_WARNING_THRESHOLD {
                 tracing::warn!(
@@ -1935,29 +1924,28 @@ where
             }
 
             if !failures.is_empty() {
-                let mut notifications = shared_notifications.write().unwrap();
-                if let Some(notifiers) = notifications.get_mut(&instance_id) {
+                if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
-                drop(notifications);
 
-                let mut summaries = shared_summaries.write().unwrap();
-                if let Some(contract_summaries) = summaries.get_mut(&instance_id) {
+                if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
                     for failed_client in &failures {
                         contract_summaries.remove(failed_client);
                     }
                 }
-                drop(summaries);
 
                 // Decrement per-client subscription counters for failed clients
                 if let Some(shared_client_counts) = &self.shared_client_counts {
-                    let mut client_counts = shared_client_counts.write().unwrap();
                     for failed_client in &failures {
-                        if let Some(count) = client_counts.get_mut(failed_client) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                client_counts.remove(failed_client);
-                            }
+                        let remove = shared_client_counts
+                            .get_mut(failed_client)
+                            .map(|mut count| {
+                                *count = count.saturating_sub(1);
+                                *count == 0
+                            })
+                            .unwrap_or(false);
+                        if remove {
+                            shared_client_counts.remove(failed_client);
                         }
                     }
                 }

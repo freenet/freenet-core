@@ -57,6 +57,14 @@ Need a channel for notifications, events, or responses?
 
 Is cancellation possible?
   → Document cancellation safety in function docs
+
+Need a shared HashMap across threads/tasks?
+  → Use DashMap, NOT Arc<RwLock<HashMap<_, _>>> or Arc<Mutex<HashMap<_, _>>>
+  → DashMap provides fine-grained per-shard locking: concurrent reads/writes
+    to different keys proceed in parallel instead of serializing on a global lock
+  → Only exception: when you need to atomically read-modify-write across
+    MULTIPLE keys in a single transaction. In that case document why DashMap
+    is insufficient and a global lock is required.
 ```
 
 ### WHEN adding per-key collections, per-client tracking, or fan-out patterns

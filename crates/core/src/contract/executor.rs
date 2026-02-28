@@ -775,21 +775,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// if corruption happens again later.
 pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<ContractKey>>>;
 
-// Type alias for shared notification storage (used by RuntimePool)
-// Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
-// never during WASM execution (get_state_delta)
+// Type alias for shared notification storage (used by RuntimePool).
+// Uses DashMap for fine-grained per-key locking instead of a global RwLock.
 type SharedNotifications =
-    Arc<std::sync::RwLock<HashMap<ContractInstanceId, Vec<(ClientId, mpsc::Sender<HostResult>)>>>>;
+    Arc<dashmap::DashMap<ContractInstanceId, Vec<(ClientId, mpsc::Sender<HostResult>)>>>;
 
-// Type alias for shared subscriber summaries (used by RuntimePool)
-type SharedSummaries = Arc<
-    std::sync::RwLock<
-        HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
-    >,
->;
+// Type alias for shared subscriber summaries (used by RuntimePool).
+type SharedSummaries =
+    Arc<dashmap::DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
 
-// Per-client subscription counts for O(1) limit enforcement (used by RuntimePool)
-type SharedClientCounts = Arc<std::sync::RwLock<HashMap<ClientId, usize>>>;
+// Per-client subscription counts for O(1) limit enforcement (used by RuntimePool).
+type SharedClientCounts = Arc<dashmap::DashMap<ClientId, usize>>;
 
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
