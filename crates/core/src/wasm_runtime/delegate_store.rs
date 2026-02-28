@@ -3,7 +3,7 @@ use freenet_stdlib::prelude::{
     APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
-use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
+use std::{fs::File, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc};
 use stretto::Cache;
 
 use crate::contract::storages::Storage;
@@ -150,7 +150,8 @@ impl DelegateStore {
             ))
             .ok()?
             else {
-                unimplemented!()
+                tracing::warn!("unsupported delegate container version for key `{key}`");
+                return None;
             };
             tracing::debug!("loaded `{key}` from path");
             let size = delegate_code.as_ref().len() as i64;
@@ -180,19 +181,25 @@ impl DelegateStore {
         Ok(())
     }
 
-    fn extract_params(delegate: &DelegateContainer) -> Parameters<'static> {
+    #[allow(clippy::wildcard_enum_match_arm)] // DelegateContainer is #[non_exhaustive]
+    fn extract_params(delegate: &DelegateContainer) -> Option<Parameters<'static>> {
         match delegate {
             DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
-                d.params().clone().into_owned()
+                Some(d.params().clone().into_owned())
             }
-            _ => unimplemented!("unsupported delegate container version"),
+            _ => {
+                tracing::warn!("unsupported delegate container version");
+                None
+            }
         }
     }
 
     pub fn store_delegate(&mut self, delegate: DelegateContainer) -> RuntimeResult<()> {
         let code_hash = delegate.code_hash();
         let key = delegate.key();
-        let params = Self::extract_params(&delegate);
+        let Some(params) = Self::extract_params(&delegate) else {
+            return Err(anyhow::anyhow!("unsupported delegate container version").into());
+        };
 
         // Early return if already in cache - but ensure index and .reg are updated
         if self.delegate_cache.get(code_hash).is_some() {
@@ -240,7 +247,8 @@ impl DelegateStore {
     }
 
     pub fn remove_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_cache.remove(key.code_hash());
+        let code_hash = *key.code_hash();
+        self.delegate_cache.remove(&code_hash);
 
         // Remove from ReDb index
         self.db
@@ -250,21 +258,40 @@ impl DelegateStore {
         // Remove from in-memory index
         self.key_to_code_part.remove(key);
 
-        // Remove .reg and .wasm files (ignore NotFound)
-        for ext in ["reg", "wasm"] {
-            let path = self.delegates_dir.join(key.encode()).with_extension(ext);
-            if let Err(err) = std::fs::remove_file(&path) {
+        // Remove .reg file (keyed by delegate_key)
+        let reg_path = self.delegates_dir.join(key.encode()).with_extension("reg");
+        if let Err(err) = std::fs::remove_file(&reg_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+
+        // Remove .wasm file (keyed by code_hash) only if no other delegate uses it
+        let other_delegates_use_code = self
+            .key_to_code_part
+            .iter()
+            .any(|entry| *entry.value() == code_hash);
+        if !other_delegates_use_code {
+            let wasm_path = self
+                .delegates_dir
+                .join(code_hash.encode())
+                .with_extension("wasm");
+            if let Err(err) = std::fs::remove_file(&wasm_path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     return Err(err.into());
                 }
             }
         }
+
         Ok(())
     }
 
     pub fn get_delegate_path(&mut self, key: &DelegateKey) -> RuntimeResult<PathBuf> {
-        let key_path = key.encode().to_lowercase();
-        Ok(self.delegates_dir.join(key_path).with_extension("wasm"))
+        let code_hash = key.code_hash();
+        Ok(self
+            .delegates_dir
+            .join(code_hash.encode())
+            .with_extension("wasm"))
     }
 
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
@@ -280,9 +307,6 @@ fn write_reg_file_if_missing(
     params: &Parameters<'_>,
 ) -> RuntimeResult<()> {
     let reg_path = delegates_dir.join(key.encode()).with_extension("reg");
-    if reg_path.exists() {
-        return Ok(());
-    }
 
     let params_bytes = params.as_ref();
     let mut reg = Vec::with_capacity(1 + 32 + 4 + params_bytes.len());
@@ -291,7 +315,17 @@ fn write_reg_file_if_missing(
     reg.extend_from_slice(&(params_bytes.len() as u32).to_le_bytes());
     reg.extend_from_slice(params_bytes);
 
-    let mut file = File::create(&reg_path)?;
+    // Atomic create: create_new(true) fails with AlreadyExists if file exists,
+    // avoiding TOCTOU race between exists() check and File::create().
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&reg_path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     file.write_all(&reg)?;
     file.sync_all()?;
 
@@ -537,6 +571,130 @@ mod test {
         let mtime2 = std::fs::metadata(&reg_path)?.modified()?;
 
         assert_eq!(mtime1, mtime2, ".reg file should not be rewritten");
+
+        Ok(())
+    }
+
+    /// remove_delegate actually deletes the .wasm file (keyed by code_hash, not delegate_key)
+    #[tokio::test]
+    async fn remove_delegate_cleans_wasm_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates-remove-wasm-test");
+        std::fs::create_dir_all(&delegate_dir)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let delegate = {
+            let delegate = Delegate::from((&vec![70, 71, 72].into(), &vec![].into()));
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
+        };
+        let key = delegate.key().clone();
+        let code_hash = *delegate.code_hash();
+        store.store_delegate(delegate)?;
+
+        let wasm_path = delegate_dir.join(code_hash.encode()).with_extension("wasm");
+        assert!(wasm_path.exists(), ".wasm file should exist after store");
+
+        store.remove_delegate(&key)?;
+        assert!(!wasm_path.exists(), ".wasm file should be removed");
+
+        Ok(())
+    }
+
+    /// Removing one delegate with shared WASM does not break the other
+    #[tokio::test]
+    async fn remove_shared_wasm_preserves_other_delegate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates-shared-wasm-test");
+        std::fs::create_dir_all(&delegate_dir)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let wasm_code: Vec<u8> = vec![80, 81, 82];
+
+        let delegate1 = {
+            let delegate = Delegate::from((&wasm_code.clone().into(), &vec![].into()));
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
+        };
+        let key1 = delegate1.key().clone();
+
+        let delegate2 = {
+            let delegate = Delegate::from((&wasm_code.clone().into(), &vec![9, 10].into()));
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
+        };
+        let key2 = delegate2.key().clone();
+        let code_hash = *delegate2.code_hash();
+
+        store.store_delegate(delegate1)?;
+        store.store_delegate(delegate2)?;
+
+        let wasm_path = delegate_dir.join(code_hash.encode()).with_extension("wasm");
+        assert!(wasm_path.exists());
+
+        // Remove delegate1 — shared .wasm should NOT be deleted
+        store.remove_delegate(&key1)?;
+
+        assert!(
+            wasm_path.exists(),
+            "shared .wasm should survive when another delegate uses it"
+        );
+        assert!(
+            store.fetch_delegate(&key2, &vec![9, 10].into()).is_some(),
+            "other delegate should still be fetchable"
+        );
+
+        // Now remove delegate2 — .wasm should be deleted (no more users)
+        store.remove_delegate(&key2)?;
+        assert!(
+            !wasm_path.exists(),
+            ".wasm should be removed when last delegate is removed"
+        );
+
+        Ok(())
+    }
+
+    /// Corrupt .reg files are skipped during startup without affecting valid ones
+    #[tokio::test]
+    async fn startup_skips_corrupt_reg_files() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates-corrupt-reg-test");
+        std::fs::create_dir_all(&delegate_dir)?;
+
+        // Store a valid delegate first
+        let db_path = temp_dir.path().join("db1");
+        std::fs::create_dir_all(&db_path)?;
+        let db = create_test_db(&db_path).await;
+        let mut store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let delegate = {
+            let delegate = Delegate::from((&vec![90, 91].into(), &vec![].into()));
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
+        };
+        let key = delegate.key().clone();
+        store.store_delegate(delegate)?;
+        drop(store);
+
+        // Write a corrupt .reg file alongside the valid one
+        let corrupt_path = delegate_dir.join("CorruptFileNoRealKey.reg");
+        std::fs::write(&corrupt_path, b"garbage data")?;
+
+        // Create a new store with fresh ReDb — should recover valid entry and skip corrupt
+        let db_path2 = temp_dir.path().join("db2");
+        std::fs::create_dir_all(&db_path2)?;
+        let db2 = create_test_db(&db_path2).await;
+        let store2 = DelegateStore::new(delegate_dir.clone(), 10_000, db2)?;
+
+        assert!(
+            store2.key_to_code_part.contains_key(&key),
+            "valid delegate should be restored"
+        );
+        assert!(
+            store2.fetch_delegate(&key, &vec![].into()).is_some(),
+            "valid delegate should be fetchable"
+        );
 
         Ok(())
     }
