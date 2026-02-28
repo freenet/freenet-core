@@ -419,11 +419,16 @@ impl ConnectForwardEstimator {
 impl RelayState {
     /// Helper to prepare and execute forwarding to a peer.
     /// Returns the forward action to add to RelayActions.
+    ///
+    /// `now` is passed in (not derived from `Instant::now()`) so callers can
+    /// provide a consistent timestamp shared with other time-sensitive operations
+    /// in the same routing decision.
     fn forward_to_peer<C: RelayContext>(
         &mut self,
         _ctx: &C,
         peer: PeerKeyLocation,
         forward_attempts: &mut HashMap<PeerKeyLocation, ForwardAttempt>,
+        now: Instant,
     ) -> (PeerKeyLocation, ConnectRequest) {
         let mut forward_req = self.request.clone();
         forward_req.ttl = forward_req.ttl.saturating_sub(1);
@@ -431,14 +436,14 @@ impl RelayState {
         // forward_to_peer is called, so no need to mark it again here.
         let forward_snapshot = forward_req.clone();
         self.forwarded_to = Some(peer.clone());
-        self.forwarded_at = Some(Instant::now());
+        self.forwarded_at = Some(now);
         self.request = forward_req;
         forward_attempts.insert(
             peer.clone(),
             ForwardAttempt {
                 peer: peer.clone(),
                 desired: self.request.desired_location,
-                sent_at: Instant::now(),
+                sent_at: now,
             },
         );
         (peer, forward_snapshot)
@@ -450,6 +455,7 @@ impl RelayState {
         recency: &HashMap<PeerKeyLocation, Instant>,
         forward_attempts: &mut HashMap<PeerKeyLocation, ForwardAttempt>,
         estimator: &ConnectForwardEstimator,
+        now: Instant,
     ) -> RelayActions {
         let mut actions = RelayActions::default();
         tracing::debug!(
@@ -535,7 +541,7 @@ impl RelayState {
                 ring_distance_to_target = ?dist,
                 "connect: forwarding join request to next hop (not accepting - not at terminus)"
             );
-            actions.forward = Some(self.forward_to_peer(ctx, next, forward_attempts));
+            actions.forward = Some(self.forward_to_peer(ctx, next, forward_attempts, now));
         }
 
         // Only accept at terminus (can't forward to a closer peer)
@@ -609,7 +615,7 @@ impl RelayState {
                         "connect: at terminus but cannot accept, routing uphill"
                     );
                     actions.forward =
-                        Some(self.forward_to_peer(ctx, uphill_peer, forward_attempts));
+                        Some(self.forward_to_peer(ctx, uphill_peer, forward_attempts, now));
                 } else {
                     tracing::info!(
                         target = %self.request.desired_location,
@@ -689,8 +695,8 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
-        // Capture now once so both skip-list TTL checks and recency checks use the
-        // same timestamp, avoiding multiple `Instant::now()` calls in one logical step.
+        // Capture now once so that the skip-list TTL check (is_connect_excluded) and
+        // the recency cooldown check both see the same timestamp for this routing decision.
         let now = Instant::now();
 
         // Use SkipListWithSelf to explicitly exclude ourselves from candidates,
@@ -795,8 +801,8 @@ impl RelayContext for RelayEnv<'_> {
         // Therefore, ALL remaining candidates are by definition "uphill" (farther from target).
         // We don't need to re-check distances - just find any available peer.
         //
-        // Capture now once so both skip-list TTL checks and recency checks use the
-        // same timestamp, avoiding multiple `Instant::now()` calls in one logical step.
+        // Capture now once so that the skip-list TTL check (is_connect_excluded) and
+        // the recency cooldown check both see the same timestamp for this routing decision.
         let now = Instant::now();
         let skip = SkipListWithSelf {
             visited,
@@ -1150,8 +1156,9 @@ impl ConnectOp {
         upstream_addr: SocketAddr,
         request: ConnectRequest,
         estimator: &ConnectForwardEstimator,
+        now: Instant,
     ) -> RelayActions {
-        self.expire_forward_attempts(Instant::now());
+        self.expire_forward_attempts(now);
         if !matches!(self.state, Some(ConnectState::Relaying(_))) {
             self.state = Some(ConnectState::Relaying(Box::new(RelayState {
                 upstream_addr,
@@ -1168,7 +1175,13 @@ impl ConnectOp {
             Some(ConnectState::Relaying(state)) => {
                 state.upstream_addr = upstream_addr;
                 state.request = request;
-                state.handle_request(ctx, &self.recency, &mut self.forward_attempts, estimator)
+                state.handle_request(
+                    ctx,
+                    &self.recency,
+                    &mut self.forward_attempts,
+                    estimator,
+                    now,
+                )
             }
             _ => RelayActions::default(),
         }
@@ -1280,6 +1293,10 @@ impl Operation for ConnectOp {
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            // Capture a single timestamp for the entire message handler so that all
+            // time-sensitive operations within one message exchange see a consistent
+            // "now" rather than accumulating drift across multiple Instant::now() calls.
+            let now = Instant::now();
             match msg {
                 ConnectMsg::Request { payload, .. } => {
                     let env = RelayEnv::new(op_manager);
@@ -1322,7 +1339,7 @@ impl Operation for ConnectOp {
                     };
 
                     let actions =
-                        self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
+                        self.handle_request(&env, upstream_addr, payload.clone(), &estimator, now);
 
                     // Emit telemetry for request received
                     if let Some(event) = NetEventLog::connect_request_received(
@@ -1415,7 +1432,7 @@ impl Operation for ConnectOp {
 
                     if let Some((next, request)) = actions.forward {
                         // Record recency for this forward to avoid hammering the same neighbor.
-                        self.recency.insert(next.clone(), Instant::now());
+                        self.recency.insert(next.clone(), now);
                         let forward_msg = ConnectMsg::Request {
                             id: self.id,
                             payload: request,
@@ -1520,8 +1537,7 @@ impl Operation for ConnectOp {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
 
-                        if let Some(mut acceptance) = self.handle_response(&payload, Instant::now())
-                        {
+                        if let Some(mut acceptance) = self.handle_response(&payload, now) {
                             // Note: Location assignment happens in ObservedAddress handler,
                             // not here. The joiner's ring location is derived from their
                             // external IP address (observed by the gateway), not from
@@ -1719,7 +1735,7 @@ impl Operation for ConnectOp {
                         "ObservedAddress received"
                     );
 
-                    self.handle_observed_address(*address, Instant::now());
+                    self.handle_observed_address(*address, now);
                     // Update this node's external address and ring location based on the observed
                     // address. The joiner doesn't know their external IP (behind NAT), so the
                     // gateway observes it from the UDP packet source and sends it back.
@@ -1791,6 +1807,7 @@ impl Operation for ConnectOp {
                                     &self.recency,
                                     &mut self.forward_attempts,
                                     &estimator,
+                                    now,
                                 )
                             } else {
                                 unreachable!("state was Relaying at branch entry")
@@ -1927,6 +1944,7 @@ impl Operation for ConnectOp {
                                     &self.recency,
                                     &mut self.forward_attempts,
                                     &estimator,
+                                    now,
                                 )
                             } else {
                                 unreachable!("state was Relaying at branch entry")
@@ -2022,7 +2040,9 @@ struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
     connection_manager: &'a crate::ring::ConnectionManager,
-    /// Current time from a `TimeSource`, used for TTL checks without direct `Instant::now()`.
+    /// Current time used for TTL checks (`is_connect_excluded`). Captured once by the caller
+    /// so that the skip-list check and any recency checks in the same routing decision share
+    /// a consistent timestamp.
     now: Instant,
 }
 
@@ -2138,6 +2158,10 @@ pub(crate) async fn join_ring_request(
     // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
     let base_location = own.location().unwrap_or_else(Location::random);
 
+    // Capture now once so the jitter failure counter and any other time-sensitive
+    // calls in this function share a consistent timestamp.
+    let now = Instant::now();
+
     // Apply location jitter on retry to explore different ring regions.
     // After consecutive hole-punch failures, the same location routes to the same
     // acceptors. Jittering the target location causes routing to converge on
@@ -2145,7 +2169,7 @@ pub(crate) async fn join_ring_request(
     let failures = op_manager
         .ring
         .connection_manager
-        .increment_connect_jitter_failures(Instant::now());
+        .increment_connect_jitter_failures(now);
     let desired_location = if failures > 1 {
         // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
         let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);
@@ -2628,7 +2652,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         let response = actions.accept_response.expect("expected acceptance");
         // Verify acceptor has correct identity
@@ -2673,7 +2703,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         let response = actions.accept_response.expect("expected acceptance");
 
@@ -2717,7 +2753,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         assert!(actions.accept_response.is_none());
         let (forward_to, request) = actions.forward.expect("expected forward");
@@ -2758,7 +2800,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT accept (not at terminus)
         assert!(
@@ -2817,7 +2865,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Gateway should emit ObservedAddress since it discovered the joiner's external address
         let (target, addr) = actions.observed_address.expect(
@@ -2881,7 +2935,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT emit ObservedAddress since the address was already known
         assert!(
@@ -2982,7 +3042,13 @@ mod tests {
             .accept(false)
             .next_hop(Some(relay_b.clone()));
         let estimator = ConnectForwardEstimator::new();
-        let actions = relay_op.handle_request(&ctx, joiner_addr, request.clone(), &estimator);
+        let actions = relay_op.handle_request(
+            &ctx,
+            joiner_addr,
+            request.clone(),
+            &estimator,
+            Instant::now(),
+        );
 
         let (forward_target, forward_request) = actions
             .forward
@@ -3004,8 +3070,13 @@ mod tests {
         );
         let ctx_accept = TestRelayContext::new(relay_b.clone());
         let estimator = ConnectForwardEstimator::new();
-        let accept_actions =
-            accepting_relay.handle_request(&ctx_accept, relay_a_addr, forward_request, &estimator);
+        let accept_actions = accepting_relay.handle_request(
+            &ctx_accept,
+            relay_a_addr,
+            forward_request,
+            &estimator,
+            Instant::now(),
+        );
 
         let response = accept_actions
             .accept_response
@@ -3055,7 +3126,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Verify acceptance was issued
         assert!(
@@ -3137,7 +3214,13 @@ mod tests {
         // Acceptor context - this peer will accept the joiner
         let ctx = TestRelayContext::new(acceptor_peer.clone());
         let estimator = ConnectForwardEstimator::new();
-        let actions = relay_op.handle_request(&ctx, joiner_addr, request.clone(), &estimator);
+        let actions = relay_op.handle_request(
+            &ctx,
+            joiner_addr,
+            request.clone(),
+            &estimator,
+            Instant::now(),
+        );
 
         // Verify acceptance was issued
         let response = actions
@@ -3200,7 +3283,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions1 = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions1 = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Verify we forwarded, not accepted
         assert!(
@@ -3223,8 +3312,13 @@ mod tests {
             .accept(true) // would accept if allowed
             .next_hop(None); // no next hop available anymore
 
-        let actions2 =
-            state.handle_request(&ctx_retry, &recency, &mut forward_attempts, &estimator);
+        let actions2 = state.handle_request(
+            &ctx_retry,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // CRITICAL: Should NOT accept (we already forwarded)
         assert!(
@@ -3269,7 +3363,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should accept because we're at terminus
         assert!(
@@ -3313,7 +3413,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT forward (TTL = 0)
         assert!(
@@ -3371,7 +3477,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT accept (should_accept returned false)
         assert!(
@@ -3427,7 +3539,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT accept
         assert!(
@@ -3474,7 +3592,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
 
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         // Should NOT accept
         assert!(
@@ -3671,7 +3795,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         assert!(actions.rejected, "should reject when no uphill peers");
         assert!(actions.accept_response.is_none());
@@ -3702,7 +3832,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         assert!(actions.rejected, "should reject when TTL exhausted");
         assert!(actions.accept_response.is_none());
@@ -3736,7 +3872,13 @@ mod tests {
         let recency = HashMap::new();
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
-        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
 
         assert!(!actions.rejected, "should not reject when uphill available");
         assert!(actions.forward.is_some(), "should forward uphill");
@@ -3779,7 +3921,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
         let recency = HashMap::new();
-        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx_a,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
         assert!(actions.forward.is_some(), "should forward to peer_a");
         assert_eq!(
             state.forwarded_to.as_ref().unwrap().pub_key(),
@@ -3794,8 +3942,13 @@ mod tests {
         let ctx_b = TestRelayContext::new(self_loc)
             .accept(false)
             .uphill_hop(Some(peer_b.clone()));
-        let retry_actions =
-            state.handle_request(&ctx_b, &recency, &mut forward_attempts, &estimator);
+        let retry_actions = state.handle_request(
+            &ctx_b,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
         assert!(
             retry_actions.forward.is_some(),
             "should forward to peer_b on retry"
@@ -3832,7 +3985,13 @@ mod tests {
         let mut forward_attempts = HashMap::new();
         let estimator = ConnectForwardEstimator::new();
         let recency = HashMap::new();
-        let actions = state.handle_request(&ctx_a, &recency, &mut forward_attempts, &estimator);
+        let actions = state.handle_request(
+            &ctx_a,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
         assert!(actions.forward.is_some());
 
         // Step 2: Reset forwarded_to (simulating rejection receipt)
@@ -3841,8 +4000,13 @@ mod tests {
 
         // Step 3: No uphill peers available on retry → should reject
         let ctx_none = TestRelayContext::new(self_loc).accept(false);
-        let retry_actions =
-            state.handle_request(&ctx_none, &recency, &mut forward_attempts, &estimator);
+        let retry_actions = state.handle_request(
+            &ctx_none,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
         assert!(
             retry_actions.rejected,
             "should reject when no uphill peers on retry"

@@ -1821,12 +1821,15 @@ impl Ring {
                 );
             }
 
+            // Capture a single `now` for all TTL/cleanup checks in this tick so that
+            // they all see the same moment rather than drifting across calls.
+            let tick_now = Instant::now();
+
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
             // Expire connect-exclusion entries for peers whose TTL has elapsed
-            self.connection_manager
-                .cleanup_expired_exclusions(Instant::now());
+            self.connection_manager.cleanup_expired_exclusions(tick_now);
 
             // Clean up expired transient connections
             let expired_transients = self.connection_manager.cleanup_expired_transients();

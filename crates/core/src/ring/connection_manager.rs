@@ -11,6 +11,12 @@
 //! after a deadlock introduced in PR #3091 (fixed in PR #3095), where
 //! `cleanup_stale_reservations` acquired `pending_reservations` before `connections_by_location`,
 //! while `prune_connection` acquired them in the opposite order.
+//!
+//! The following locks are **always acquired independently** (never nested with each other or
+//! with the locks above) so they do not participate in the ordering:
+//!
+//! - `connect_jitter_failures` (`parking_lot::Mutex<(u32, Option<Instant>)>`)
+//! - `connect_excluded_peers` (`parking_lot::RwLock<BTreeMap<SocketAddr, (u32, Instant)>>`)
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -1472,16 +1478,19 @@ impl ConnectionManager {
     /// `JITTER_DECAY_INTERVAL` that has elapsed since the last failure, the
     /// counter is decremented by one (down to 0).
     ///
-    /// `now` must come from a `TimeSource` so that deterministic simulation tests
-    /// can control time.
+    /// `now` should be captured once by the caller and shared with other time-sensitive
+    /// calls in the same context for a consistent timestamp.
     pub fn increment_connect_jitter_failures(&self, now: Instant) -> u32 {
         let mut guard = self.connect_jitter_failures.lock();
         let (count, last_failure) = &mut *guard;
         // Apply decay proportional to elapsed idle time before recording the new failure.
+        // Integer division is intentional: decay only triggers after a complete 5-minute
+        // interval (floor rounding). Sub-interval gaps accumulate no decay steps.
         if let Some(ts) = *last_failure {
             let elapsed = now.duration_since(ts);
-            let decay_steps =
-                (elapsed.as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs().max(1)) as u32;
+            // JITTER_DECAY_INTERVAL is a non-zero Duration::from_secs constant, so
+            // as_secs() is always > 0 and division is safe without a .max(1) guard.
+            let decay_steps = (elapsed.as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs()) as u32;
             *count = count.saturating_sub(decay_steps);
         }
         *count += 1;
@@ -1511,8 +1520,8 @@ impl ConnectionManager {
 
     /// Record a ConnectFailed for a peer acting as acceptor. Returns the new failure count.
     ///
-    /// `now` must come from a `TimeSource` (not `Instant::now()` directly) so that
-    /// deterministic simulation tests can control time.
+    /// `now` should be captured once by the caller and shared with related time-sensitive
+    /// calls in the same handler so they all see a consistent timestamp.
     pub fn record_connect_acceptor_failure(&self, addr: SocketAddr, now: Instant) -> u32 {
         let mut map = self.connect_excluded_peers.write();
         let entry = map.entry(addr).or_insert((0, now));
@@ -1523,8 +1532,8 @@ impl ConnectionManager {
 
     /// Check if a peer is excluded from CONNECT routing.
     ///
-    /// `now` must come from a `TimeSource` so that deterministic simulation tests can
-    /// control time.
+    /// `now` should be the same value passed to `record_connect_acceptor_failure` in the
+    /// same handler, ensuring the check and the record use a consistent timestamp.
     pub fn is_connect_excluded(&self, addr: SocketAddr, now: Instant) -> bool {
         let map = self.connect_excluded_peers.read();
         if let Some((count, last_failure)) = map.get(&addr) {
@@ -1542,8 +1551,8 @@ impl ConnectionManager {
 
     /// Remove expired exclusion entries. Called from `connection_maintenance` on each tick.
     ///
-    /// `now` must come from a `TimeSource` so that deterministic simulation tests can
-    /// control time.
+    /// `now` should be the tick's captured timestamp so that all cleanup operations in
+    /// the same maintenance cycle share a consistent view of current time.
     pub fn cleanup_expired_exclusions(&self, now: Instant) {
         self.connect_excluded_peers
             .write()
