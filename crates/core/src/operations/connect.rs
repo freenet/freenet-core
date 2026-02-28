@@ -2217,6 +2217,17 @@ pub(crate) async fn join_ring_request(
     Ok(())
 }
 
+/// When a gateway is in backoff but the node already has ring connections,
+/// we cap the per-iteration gateway-backoff sleep to this value so the loop
+/// re-checks `open_conns` frequently.  The concurrent `connection_maintenance`
+/// task adds connections via ring-based acquisition every 5s; polling at ~30s
+/// intervals lets `initial_join_procedure` notice when `BOOTSTRAP_THRESHOLD`
+/// is reached without waiting for the full gateway backoff to expire.
+///
+/// Also applied in `handle_aborted_op` for the same reason.  ±20% jitter is
+/// applied at each call site to prevent thundering herd.  See issue #3304.
+pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
+
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
@@ -2333,13 +2344,28 @@ pub(crate) async fn initial_join_procedure(
                     // but also wake up if connection_maintenance clears the backoff
                     // (e.g. during isolation recovery or suspend detection).
                     if let Some(min_wait) = min_backoff {
+                        // When we already have some ring connections, cap the wait at
+                        // GATEWAY_BACKOFF_POLL_CAP so we re-check open_conns frequently.
+                        // Apply ±20% jitter (24–36s) to prevent thundering herd.
+                        let effective_wait = if open_conns > 0 {
+                            let jitter_ms = GlobalRng::random_range(
+                                0u64..(GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5) as u64,
+                            );
+                            let cap = GATEWAY_BACKOFF_POLL_CAP.mul_f64(0.8)
+                                + Duration::from_millis(jitter_ms);
+                            min_wait.min(cap)
+                        } else {
+                            min_wait
+                        };
                         tracing::info!(
-                            wait_secs = min_wait.as_secs(),
+                            wait_secs = effective_wait.as_secs(),
+                            gateway_backoff_secs = min_wait.as_secs(),
                             total_gateways = unconnected_count,
-                            "All gateways in backoff, waiting for shortest backoff to expire"
+                            open_connections = open_conns,
+                            "All gateways in backoff, waiting before retry"
                         );
                         tokio::select! {
-                            _ = tokio::time::sleep(min_wait) => {},
+                            _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
                                 tracing::info!("Gateway backoff cleared externally, retrying immediately");
                             },
