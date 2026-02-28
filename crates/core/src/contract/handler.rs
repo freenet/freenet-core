@@ -169,7 +169,7 @@ impl ContractHandler for NetworkContractHandler {
 
 #[derive(Eq)]
 pub(crate) struct EventId {
-    id: u64,
+    pub(crate) id: u64,
 }
 
 impl PartialEq for EventId {
@@ -551,6 +551,25 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             return Ok((EventId { id }, ev));
         }
         Err(ContractError::NoEvHandlerResponse)
+    }
+
+    /// Try to receive an event without blocking.
+    ///
+    /// Returns `Ok(None)` if the channel is empty, `Err` if the channel is closed.
+    /// Used by the fair-queue drain loop to batch-fill the fair queue before processing.
+    pub fn try_recv_from_sender(
+        &mut self,
+    ) -> Result<Option<(EventId, ContractHandlerEvent)>, ContractError> {
+        match self.end.event_receiver.try_recv() {
+            Ok(InternalCHEvent { ev, id, result }) => {
+                self.end.waiting_response.insert(id, result);
+                Ok(Some((EventId { id }, ev)))
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(ContractError::NoEvHandlerResponse)
+            }
+        }
     }
 }
 

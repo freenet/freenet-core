@@ -72,6 +72,9 @@ pub struct PoolHealthStatus {
     pub total: usize,
     /// Number of executors that were replaced due to failures
     pub replacements: usize,
+    /// Number of distinct contracts currently being processed.
+    /// Observability-only: the sequential event loop means this is always 0 or 1.
+    pub contracts_in_flight: usize,
 }
 
 /// A pool of executors that enables concurrent contract execution.
@@ -141,6 +144,9 @@ pub struct RuntimePool {
     delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
     delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
+    /// Per-contract executor usage tracking (for observability).
+    /// Not used for enforcement since the event loop is sequential.
+    in_flight_contracts: HashMap<ContractKey, usize>,
 }
 
 impl RuntimePool {
@@ -254,6 +260,7 @@ impl RuntimePool {
             shared_recovery_guard,
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
+            in_flight_contracts: HashMap::new(),
         })
     }
 
@@ -286,6 +293,7 @@ impl RuntimePool {
             checked_out,
             total: self.pool_size,
             replacements,
+            contracts_in_flight: self.in_flight_contracts.len(),
         }
     }
 
@@ -302,6 +310,25 @@ impl RuntimePool {
                 "RuntimePool health status (degraded - {} replacements)",
                 status.replacements
             );
+        }
+    }
+
+    /// Record that an executor has been checked out for the given contract.
+    /// Observability-only — the sequential event loop means at most one contract
+    /// is ever in flight at a time.
+    fn track_contract_checkout(&mut self, key: &ContractKey) {
+        *self.in_flight_contracts.entry(*key).or_insert(0) += 1;
+    }
+
+    /// Record that an executor has been returned after processing the given contract.
+    fn track_contract_return(&mut self, key: &ContractKey) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            self.in_flight_contracts.entry(*key)
+        {
+            *e.get_mut() = e.get().saturating_sub(1);
+            if *e.get() == 0 {
+                e.remove();
+            }
         }
     }
 
@@ -457,9 +484,11 @@ impl ContractExecutor for RuntimePool {
         key: ContractKey,
         return_contract_code: bool,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        self.track_contract_checkout(&key);
         let mut executor = self.pop_executor().await;
         let result = executor.fetch_contract(key, return_contract_code).await;
         self.return_checked(executor, "fetch_contract").await;
+        self.track_contract_return(&key);
         result
     }
 
@@ -470,11 +499,13 @@ impl ContractExecutor for RuntimePool {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        self.track_contract_checkout(&key);
         let mut executor = self.pop_executor().await;
         let result = executor
             .upsert_contract_state(key, update, related_contracts, code)
             .await;
         self.return_checked(executor, "upsert_contract_state").await;
+        self.track_contract_return(&key);
         result
     }
 
@@ -617,10 +648,12 @@ impl ContractExecutor for RuntimePool {
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
+        self.track_contract_checkout(&key);
         let mut executor = self.pop_executor().await;
         let result = executor.summarize_contract_state(key).await;
         self.return_checked(executor, "summarize_contract_state")
             .await;
+        self.track_contract_return(&key);
         result
     }
 
@@ -629,10 +662,12 @@ impl ContractExecutor for RuntimePool {
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
+        self.track_contract_checkout(&key);
         let mut executor = self.pop_executor().await;
         let result = executor.get_contract_state_delta(key, their_summary).await;
         self.return_checked(executor, "get_contract_state_delta")
             .await;
+        self.track_contract_return(&key);
         result
     }
 

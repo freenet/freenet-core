@@ -8,6 +8,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 mod executor;
+mod fair_queue;
 mod handler;
 pub mod storages;
 
@@ -503,22 +504,130 @@ async fn recv_delegate_notification(
     }
 }
 
+/// Try to receive a delegate notification without blocking.
+/// Returns `None` if the channel is `None`, closed, or has no pending notifications.
+fn try_recv_delegate_notification(
+    rx: &mut Option<DelegateNotificationReceiver>,
+) -> Option<executor::DelegateNotification> {
+    match rx {
+        Some(rx) => rx.try_recv().ok(),
+        None => None,
+    }
+}
+
 pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
 {
     let mut delegate_rx = contract_handler.executor().take_delegate_notification_rx();
+    let mut fair_queue = fair_queue::FairEventQueue::new();
 
     loop {
+        // Drain pending events from the channel into the fair queue (bounded batch).
+        // This runs every iteration regardless of queue state, ensuring new events
+        // are picked up promptly.
+        for _ in 0..fair_queue::MAX_DRAIN_BATCH {
+            match contract_handler.channel().try_recv_from_sender()? {
+                Some((id, event)) => {
+                    if let Err(rejected) = fair_queue.try_push(id, event) {
+                        send_queue_full_response(contract_handler.channel(), rejected).await;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // Check for delegate notifications (non-blocking) even when the fair queue
+        // has work. This prevents delegate starvation under sustained contract load.
+        if let Some(notification) = try_recv_delegate_notification(&mut delegate_rx) {
+            handle_delegate_notification(&mut contract_handler, notification).await;
+        }
+
+        // Process one event from the fair queue (round-robin across contracts)
+        if let Some((id, event)) = fair_queue.pop() {
+            handle_contract_event(&mut contract_handler, id, event).await?;
+            continue;
+        }
+
+        // Fair queue is empty — block-wait for a new event or delegate notification
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event) = result?;
-                handle_contract_event(&mut contract_handler, id, event).await?;
+                if let Err(rejected) = fair_queue.try_push(id, event) {
+                    send_queue_full_response(contract_handler.channel(), rejected).await;
+                }
             }
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification).await;
             }
         }
+    }
+}
+
+/// Send an error response to the event sender when the per-contract queue is full.
+///
+/// Logs a warning and sends the appropriate error response variant for the rejected event.
+/// For fire-and-forget events (delegates, disconnects), no response is sent.
+async fn send_queue_full_response(
+    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+    rejected: Box<fair_queue::RejectedEvent>,
+) {
+    tracing::warn!(
+        event = %rejected.event,
+        "Rejected event due to per-contract queue capacity limit"
+    );
+    let make_err = || ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
+    let response = match &rejected.event {
+        ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
+            new_value: Err(make_err()),
+            state_changed: false,
+        },
+        ContractHandlerEvent::UpdateQuery { .. } => ContractHandlerEvent::UpdateResponse {
+            new_value: Err(make_err()),
+            state_changed: false,
+        },
+        ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Err(make_err()),
+        },
+        ContractHandlerEvent::GetSummaryQuery { key, .. } => {
+            ContractHandlerEvent::GetSummaryResponse {
+                key: *key,
+                summary: Err(make_err()),
+            }
+        }
+        ContractHandlerEvent::GetDeltaQuery { key, .. } => ContractHandlerEvent::GetDeltaResponse {
+            key: *key,
+            delta: Err(make_err()),
+        },
+        // Events without error response variants: drop the oneshot sender to
+        // unblock the caller. The caller's receiver will get a RecvError, which
+        // maps to ContractError::NoEvHandlerResponse. This prevents leaking
+        // entries in the waiting_response map.
+        ContractHandlerEvent::DelegateRequest { .. }
+        | ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::PutResponse { .. }
+        | ContractHandlerEvent::GetResponse { .. }
+        | ContractHandlerEvent::UpdateResponse { .. }
+        | ContractHandlerEvent::UpdateNoChange { .. }
+        | ContractHandlerEvent::RegisterSubscriberListener { .. }
+        | ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | ContractHandlerEvent::QuerySubscriptions { .. }
+        | ContractHandlerEvent::QuerySubscriptionsResponse
+        | ContractHandlerEvent::GetSummaryResponse { .. }
+        | ContractHandlerEvent::GetDeltaResponse { .. }
+        | ContractHandlerEvent::NotifySubscriptionError { .. }
+        | ContractHandlerEvent::NotifySubscriptionErrorResponse
+        | ContractHandlerEvent::ClientDisconnect { .. } => {
+            channel.drop_waiting_response(rejected.id);
+            return;
+        }
+    };
+    if let Err(error) = channel.send_to_sender(rejected.id, response).await {
+        tracing::debug!(
+            error = %error,
+            "Failed to send queue-full response (client may have disconnected)"
+        );
     }
 }
 
