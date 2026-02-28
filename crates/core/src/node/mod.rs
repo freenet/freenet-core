@@ -1776,16 +1776,34 @@ async fn handle_aborted_op(
                             };
 
                             if let Some(duration) = backoff_duration {
+                                // Cap the wait at GATEWAY_BACKOFF_POLL_CAP when the
+                                // node already has ring connections, matching the
+                                // policy in initial_join_procedure (issue #3304).
+                                // ±20% jitter to prevent thundering herd.
+                                let open_conns = op_manager.ring.open_connections();
+                                let effective = if open_conns > 0 {
+                                    let jitter_ms = crate::config::GlobalRng::random_range(
+                                        0u64..(connect::GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5)
+                                            as u64,
+                                    );
+                                    let cap = connect::GATEWAY_BACKOFF_POLL_CAP.mul_f64(0.8)
+                                        + Duration::from_millis(jitter_ms);
+                                    duration.min(cap)
+                                } else {
+                                    duration
+                                };
                                 tracing::info!(
                                     gateway = %gateway,
                                     backoff_secs = duration.as_secs(),
+                                    effective_wait_secs = effective.as_secs(),
+                                    open_connections = open_conns,
                                     "Gateway connection failed, waiting before retry"
                                 );
                                 // Use select! so suspend/isolation recovery can
                                 // wake us immediately via gateway_backoff_cleared,
                                 // matching the pattern in initial_join_procedure.
                                 tokio::select! {
-                                    _ = tokio::time::sleep(duration) => {},
+                                    _ = tokio::time::sleep(effective) => {},
                                     _ = op_manager.gateway_backoff_cleared.notified() => {
                                         tracing::info!(
                                             gateway = %gateway,

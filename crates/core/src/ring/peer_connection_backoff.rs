@@ -44,6 +44,10 @@ impl PeerConnectionBackoff {
     /// 10-minute backoff means the node cannot bootstrap at all.  NAT traversal
     /// failures are transient (network change, temporary congestion) so a 90s cap
     /// gives the network time to stabilize without long-term isolation.
+    ///
+    /// `PeerConnectionBackoff` is currently used only for the `gateway_backoff`
+    /// tracker.  If it is ever reused for ring peers, per-peer-class caps should
+    /// be introduced via `with_config()` rather than raising this default.
     /// See issues #2595 and #3304.
     const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(90);
 
@@ -145,23 +149,21 @@ mod tests {
     ///
     /// Before #3304, `DEFAULT_MAX_BACKOFF` was 600s.  With a single configured
     /// gateway this meant the node could be isolated for up to 10 minutes after
-    /// repeated NAT traversal failures.  Verify that the default cap is 90s.
+    /// repeated NAT traversal failures.  Verify that the production constructor
+    /// (`new()`) enforces the 90s cap.
     #[test]
     fn test_default_max_backoff_is_90s_for_gateway_recovery() {
-        let mut backoff = PeerConnectionBackoff::with_config(
-            Duration::from_secs(30),
-            PeerConnectionBackoff::DEFAULT_MAX_BACKOFF,
-            1024,
-        );
+        // Use new() — the production constructor — to also validate that path.
+        let mut backoff = PeerConnectionBackoff::new();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-        // Drive through many failures until the cap is hit
+        // Drive through many failures until the cap is hit.
         for _ in 0..10 {
             backoff.record_failure(addr);
         }
 
         let remaining = backoff.remaining_backoff(addr).unwrap();
-        // Must not exceed the 90s cap (allow a small margin for test execution time)
+        // Must not exceed the 90s cap (allow a small margin for test execution time).
         assert!(
             remaining <= Duration::from_secs(90),
             "Gateway backoff exceeded 90s cap: {remaining:?} — issue #3304"
