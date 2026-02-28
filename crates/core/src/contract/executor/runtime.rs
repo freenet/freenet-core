@@ -767,7 +767,7 @@ where
                     limit = MAX_QUEUED_OPS_PER_CONTRACT,
                     "Contract initialization queue full, rejecting operation"
                 );
-                return Err(ExecutorError::request(StdContractError::Put {
+                return Err(ExecutorError::request(StdContractError::Update {
                     key,
                     cause: "contract initialization queue is full, try again later".into(),
                 }));
