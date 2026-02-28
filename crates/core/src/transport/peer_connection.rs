@@ -1546,18 +1546,23 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        self.outbound_stream_with_id(stream_id, data.into(), None)
+        self.outbound_stream_with_id(stream_id, data.into(), None, None)
             .await;
     }
 
     /// Send stream data with a caller-provided StreamId.
     /// Used by operations-level streaming where the StreamId is communicated
     /// in the metadata message and must match the data stream.
+    ///
+    /// If `completion_tx` is provided, it will be signaled when the stream
+    /// transfer completes (success or failure). Used by the broadcast queue
+    /// to hold a semaphore permit until the actual transfer finishes.
     async fn outbound_stream_with_id(
         &mut self,
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
@@ -1572,6 +1577,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
                 metadata,
+                completion_tx,
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -1897,11 +1903,12 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.outbound_stream_with_id(stream_id, data, metadata)
+            self.outbound_stream_with_id(stream_id, data, metadata, completion_tx)
                 .await;
             Ok(())
         })
@@ -2163,6 +2170,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
         ))
         .map_err(|e| e.into());
