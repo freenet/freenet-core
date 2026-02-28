@@ -626,10 +626,22 @@ impl HostingManager {
     /// - We have an active subscription, OR
     /// - We have client subscriptions, OR
     /// - The contract is in our hosting cache
+    #[cfg(test)]
     pub fn should_host(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract)
             || self.has_client_subscriptions(contract.id())
             || self.is_hosting_contract(contract)
+    }
+
+    /// Check if this node is actively receiving updates for a contract.
+    ///
+    /// Returns true only if we have an active network subscription or local
+    /// client subscriptions — conditions that guarantee our cached state is
+    /// kept fresh. Unlike [`should_host()`](Self::should_host), this excludes
+    /// the hosting LRU cache, which can retain contracts after their
+    /// subscriptions expire (leaving stale state).
+    pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
+        self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
 
     /// Touch a contract in the hosting cache (refresh TTL without adding).
@@ -1394,6 +1406,42 @@ mod tests {
         // Add to hosting cache
         manager.record_contract_access(contract, 1000, AccessType::Put);
         assert!(manager.should_host(&contract));
+    }
+
+    /// Regression test for #3340: is_receiving_updates must return false when
+    /// a contract is only in the hosting LRU cache (no active subscription).
+    #[test]
+    fn test_is_receiving_updates_excludes_hosting_cache_only() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        // Not receiving updates initially
+        assert!(!manager.is_receiving_updates(&contract));
+
+        // Add to hosting cache only — should_host true, is_receiving_updates false
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+        assert!(manager.should_host(&contract));
+        assert!(
+            !manager.is_receiving_updates(&contract),
+            "Hosting cache alone should NOT count as receiving updates"
+        );
+
+        // Add active subscription — now is_receiving_updates should be true
+        manager.subscribe(contract);
+        assert!(manager.is_receiving_updates(&contract));
+    }
+
+    /// Regression test for #3340: is_receiving_updates with client subscriptions.
+    #[test]
+    fn test_is_receiving_updates_with_client_subscription() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
+
+        assert!(!manager.is_receiving_updates(&contract));
+
+        manager.add_client_subscription(contract.id(), client_id);
+        assert!(manager.is_receiving_updates(&contract));
     }
 
     #[test]
