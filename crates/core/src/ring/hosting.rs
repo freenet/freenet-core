@@ -1407,6 +1407,42 @@ mod tests {
         assert!(manager.should_host(&contract));
     }
 
+    /// Regression test for #3340: is_receiving_updates must return false when
+    /// a contract is only in the hosting LRU cache (no active subscription).
+    #[test]
+    fn test_is_receiving_updates_excludes_hosting_cache_only() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        // Not receiving updates initially
+        assert!(!manager.is_receiving_updates(&contract));
+
+        // Add to hosting cache only — should_host true, is_receiving_updates false
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+        assert!(manager.should_host(&contract));
+        assert!(
+            !manager.is_receiving_updates(&contract),
+            "Hosting cache alone should NOT count as receiving updates"
+        );
+
+        // Add active subscription — now is_receiving_updates should be true
+        manager.subscribe(contract);
+        assert!(manager.is_receiving_updates(&contract));
+    }
+
+    /// Regression test for #3340: is_receiving_updates with client subscriptions.
+    #[test]
+    fn test_is_receiving_updates_with_client_subscription() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
+
+        assert!(!manager.is_receiving_updates(&contract));
+
+        manager.add_client_subscription(contract.id(), client_id);
+        assert!(manager.is_receiving_updates(&contract));
+    }
+
     #[test]
     fn test_contracts_needing_renewal_includes_hosted() {
         // This is the key test for the bug fix
