@@ -838,7 +838,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
                             if !receipts.is_empty() {
-                                self.noop(receipts).await?;
+                                if let Err(e) = self.noop(receipts).await {
+                                    if e.is_transient_send_failure() {
+                                        tracing::warn!(
+                                            peer_addr = %self.remote_conn.remote_addr,
+                                            "ACK noop send failed, will retry"
+                                        );
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
                             }
                         },
                         (ReportResult::Ok, _) => {}
@@ -918,6 +927,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             );
                             // Report to global metrics for periodic telemetry snapshots
                             super::TRANSPORT_METRICS.record_transfer_completed(&stats);
+                        }
+                        Err(e) if e.is_transient_send_failure() => {
+                            tracing::warn!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                error = %e,
+                                "Outbound stream send failed, operation layer will timeout and retry"
+                            );
                         }
                         Err(e) => return Err(e),
                     }
@@ -1044,14 +1060,26 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                         // Common path for both Resend and TlpProbe: send the packet,
                         // re-register for ACK tracking, and enforce per-iteration limit.
-                        self.remote_conn
+                        match self.remote_conn
                             .socket
                             .send_to(&packet, self.remote_conn.remote_addr)
                             .await
-                            .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-                        // Re-register packet for ACK/RTO tracking. on_send() is NOT called
-                        // because bytes were already counted in flightsize during the initial send.
-                        self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                        {
+                            Ok(_) => {
+                                // Re-register packet for ACK/RTO tracking. on_send() is NOT called
+                                // because bytes were already counted in flightsize during the initial send.
+                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    packet_id = idx,
+                                    error = %e,
+                                    "Resend send failed, will retry on next RTO"
+                                );
+                                break;
+                            }
+                        }
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
                             resend_check_sleep = Some(self.time_source.sleep(resend_yield));
@@ -1069,7 +1097,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             receipt_count = receipts.len(),
                             "Background ACK timer: sending pending receipts"
                         );
-                        self.noop(receipts).await?;
+                        if let Err(e) = self.noop(receipts).await {
+                            if e.is_transient_send_failure() {
+                                tracing::warn!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    "Background ACK send failed, will retry next tick"
+                                );
+                            } else {
+                                return Err(e);
+                            }
+                        }
                     }
                 },
                 // Rate update timer - update TokenBucket rate based on BBR cwnd
@@ -1215,11 +1252,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.remote_conn.inbound_symmetric_key_bytes,
                     self.remote_conn.remote_addr,
                 )?;
-                self.remote_conn
+                if let Err(e) = self
+                    .remote_conn
                     .socket
                     .send_to(packet.data(), self.remote_conn.remote_addr)
                     .await
-                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                {
+                    tracing::warn!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        error = %e,
+                        "AckOk send failed, peer will retransmit if needed"
+                    );
+                }
                 Ok(None)
             }
             StreamFragment {
@@ -1438,18 +1482,29 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         )?
         .prepared_send();
 
-        self.remote_conn
+        match self
+            .remote_conn
             .socket
             .send_to(&pong_packet, self.remote_conn.remote_addr)
             .await
-            .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-
-        tracing::trace!(
-            peer_addr = %self.remote_conn.remote_addr,
-            packet_id,
-            pong_sequence = sequence,
-            "Pong packet sent"
-        );
+        {
+            Ok(_) => {
+                tracing::trace!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    packet_id,
+                    pong_sequence = sequence,
+                    "Pong packet sent"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    error = %e,
+                    pong_sequence = sequence,
+                    "Pong send failed, keepalive will handle liveness"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1713,13 +1768,13 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                     Ok(())
                 }
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         peer_addr = %remote_addr,
                         packet_id,
                         error = %e,
-                        "Failed to send packet"
+                        "Failed to send packet (transient)"
                     );
-                    Err(TransportError::ConnectionClosed(remote_addr))
+                    Err(TransportError::SendFailed(remote_addr, e.kind()))
                 }
             }
         }
@@ -1736,7 +1791,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         socket
                             .send_to(&packet_data, remote_addr)
                             .await
-                            .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
+                            .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
                         sent_tracker.lock().report_sent_packet_with_token(
                             packet_id,
                             packet_data,
@@ -1910,6 +1965,105 @@ mod tests {
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
+    }
+
+    /// Test socket with configurable send failures for testing transient error resilience.
+    struct FailableTestSocket {
+        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+        fail_sends: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FailableTestSocket {
+        fn new(
+            sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+            fail_sends: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self { sender, fail_sends }
+        }
+    }
+
+    impl crate::transport::Socket for FailableTestSocket {
+        async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            unimplemented!()
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.fail_sends.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "simulated ENETUNREACH",
+                ));
+            }
+            self.sender
+                .send_async((target, buf.into()))
+                .await
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.fail_sends.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "simulated ENETUNREACH",
+                ));
+            }
+            self.sender
+                .send((target, buf.into()))
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+    }
+
+    /// Verify that packet_sending returns SendFailed (not ConnectionClosed) on send errors,
+    /// and that SendFailed is classified as a transient failure.
+    #[test]
+    fn send_failure_returns_transient_error() {
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, _rx) = fast_channel::bounded(16);
+        let socket = Arc::new(FailableTestSocket::new(tx, fail_flag));
+        let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let outbound_key = {
+                use aes_gcm::KeyInit;
+                Aes128Gcm::new(&[0u8; 16].into())
+            };
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::transport::sent_packet_tracker::tests::mock_sent_packet_tracker(),
+            ));
+
+            let result = packet_sending(
+                remote_addr,
+                &socket,
+                1,
+                &outbound_key,
+                vec![],
+                (),
+                &sent_tracker,
+                None,
+            )
+            .await;
+
+            let err = result.expect_err("should fail");
+            assert!(
+                err.is_transient_send_failure(),
+                "expected SendFailed, got: {err:?}"
+            );
+            assert!(
+                !matches!(err, TransportError::ConnectionClosed(_)),
+                "should NOT be ConnectionClosed"
+            );
+        });
     }
 
     /// Verify that ACK_CHECK_INTERVAL is properly configured relative to MAX_CONFIRMATION_DELAY.

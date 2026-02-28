@@ -332,6 +332,8 @@ pub enum TransportError {
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
     #[error("Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core")]
     ProtocolVersionMismatch { expected: String, actual: String },
+    #[error("send to {0} failed: {1}")]
+    SendFailed(SocketAddr, std::io::ErrorKind),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -340,6 +342,15 @@ pub enum TransportError {
     PubKeyDecryptionError(#[from] crypto::DecryptionError),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
+}
+
+impl TransportError {
+    /// Returns true if this error is a transient UDP send failure that should
+    /// not kill the connection. The idle timeout is the sole authority on
+    /// connection liveness.
+    pub fn is_transient_send_failure(&self) -> bool {
+        matches!(self, TransportError::SendFailed(..))
+    }
 }
 
 /// Socket trait for abstracting UDP communication.

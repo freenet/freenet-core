@@ -4510,17 +4510,30 @@ async fn peer_connection_listener(
                 Ok(msg) => {
                     drained += 1;
                     if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
-                        tracing::debug!(
-                            to = %remote_addr,
-                            ?error,
-                            "[CONN_LIFECYCLE] Connection closed after channel command"
-                        );
-                        // Drain any messages that arrived after our try_recv() but before
-                        // handle_peer_channel_message returned an error
-                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
-                        notify_transport_closed(&conn_events, remote_addr, error, connection_id)
+                        if error.is_transient_send_failure() {
+                            tracing::warn!(
+                                to = %remote_addr,
+                                ?error,
+                                "[CONN_LIFECYCLE] Transient send failure, continuing"
+                            );
+                        } else {
+                            tracing::debug!(
+                                to = %remote_addr,
+                                ?error,
+                                "[CONN_LIFECYCLE] Connection closed after channel command"
+                            );
+                            // Drain any messages that arrived after our try_recv() but before
+                            // handle_peer_channel_message returned an error
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                            notify_transport_closed(
+                                &conn_events,
+                                remote_addr,
+                                error,
+                                connection_id,
+                            )
                             .await;
-                        return;
+                            return;
+                        }
                     }
                     if drained >= MAX_OUTBOUND_DRAIN {
                         break;
@@ -4552,15 +4565,23 @@ async fn peer_connection_listener(
                 match msg {
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
-                            tracing::debug!(
-                                to = %remote_addr,
-                                ?error,
-                                "[CONN_LIFECYCLE] Connection closed after channel command"
-                            );
-                            // Drain any messages that arrived while we were processing this one
-                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
-                            notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
-                            return;
+                            if error.is_transient_send_failure() {
+                                tracing::warn!(
+                                    to = %remote_addr,
+                                    ?error,
+                                    "[CONN_LIFECYCLE] Transient send failure, continuing"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    to = %remote_addr,
+                                    ?error,
+                                    "[CONN_LIFECYCLE] Connection closed after channel command"
+                                );
+                                // Drain any messages that arrived while we were processing this one
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                                notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
+                                return;
+                            }
                         }
                     }
                     None => {
@@ -4625,6 +4646,16 @@ async fn peer_connection_listener(
                             return;
                         }
                     },
+                    Err(error) if error.is_transient_send_failure() => {
+                        // Transient send failure from internal sends (ACKs, etc.) that
+                        // bubbled up through recv(). Don't kill the connection — the idle
+                        // timeout is the sole authority on liveness.
+                        tracing::warn!(
+                            from = %remote_addr,
+                            ?error,
+                            "[CONN_LIFECYCLE] Transient send failure during recv, continuing"
+                        );
+                    }
                     Err(error) => {
                         tracing::debug!(
                             from = %remote_addr,
