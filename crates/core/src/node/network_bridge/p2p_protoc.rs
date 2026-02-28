@@ -1217,7 +1217,10 @@ impl P2pConnManager {
                             metadata,
                             completion_tx,
                         } => {
-                            // Route stream data to the per-connection channel
+                            // Route stream data to the per-connection channel.
+                            // If dispatch fails, signal completion_tx so the
+                            // broadcast queue releases its semaphore permit
+                            // immediately instead of waiting for the 120s timeout.
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
                                 if let Err(e) = peer_connection
                                     .sender
@@ -1237,6 +1240,15 @@ impl P2pConnManager {
                                         phase = "error",
                                         "Failed to send stream data to peer connection"
                                     );
+                                    // The completion_tx is inside the failed send;
+                                    // extract and signal it so the permit is released.
+                                    if let Right(ConnEvent::StreamSend {
+                                        completion_tx: Some(tx),
+                                        ..
+                                    }) = e.0
+                                    {
+                                        let _ignored = tx.send(());
+                                    }
                                 }
                             } else {
                                 tracing::warn!(
@@ -1245,6 +1257,11 @@ impl P2pConnManager {
                                     phase = "error",
                                     "No connection found for stream send target"
                                 );
+                                // Signal completion so the broadcast queue permit
+                                // is released immediately.
+                                if let Some(tx) = completion_tx {
+                                    let _ignored = tx.send(());
+                                }
                             }
                         }
                         ConnEvent::PipeStream {
