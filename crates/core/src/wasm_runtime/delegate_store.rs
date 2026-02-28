@@ -250,6 +250,16 @@ impl DelegateStore {
         let code_hash = *key.code_hash();
         self.delegate_cache.remove(&code_hash);
 
+        // Remove .reg file FIRST to prevent resurrection on crash.
+        // If we crash after ReDb removal but before .reg removal, startup
+        // reconciliation would restore the deleted delegate from the stale .reg.
+        let reg_path = self.delegates_dir.join(key.encode()).with_extension("reg");
+        if let Err(err) = std::fs::remove_file(&reg_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+
         // Remove from ReDb index
         self.db
             .remove_delegate_index(key)
@@ -257,14 +267,6 @@ impl DelegateStore {
 
         // Remove from in-memory index
         self.key_to_code_part.remove(key);
-
-        // Remove .reg file (keyed by delegate_key)
-        let reg_path = self.delegates_dir.join(key.encode()).with_extension("reg");
-        if let Err(err) = std::fs::remove_file(&reg_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
 
         // Remove .wasm file (keyed by code_hash) only if no other delegate uses it
         let other_delegates_use_code = self
