@@ -618,7 +618,7 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractInstanceId,
         client_id: ClientId,
         summary: Option<StateSummary<'static>>,
-        subscriber_listener: UnboundedSender<HostResult>,
+        subscriber_listener: mpsc::Sender<HostResult>,
     },
     RegisterSubscriberListenerResponse,
     #[allow(dead_code)]

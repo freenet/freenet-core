@@ -754,9 +754,16 @@ fn register_downstream_subscriber(
         });
 
     if let Some(peer_key) = peer_key {
-        op_manager
+        if !op_manager
             .ring
-            .add_downstream_subscriber(key, peer_key.clone());
+            .add_downstream_subscriber(key, peer_key.clone())
+        {
+            tracing::warn!(
+                tx = %tx,
+                contract = %key,
+                "Downstream subscriber limit reached for contract"
+            );
+        }
         op_manager
             .interest_manager
             .register_peer_interest(key, peer_key, None, false);

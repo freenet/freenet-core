@@ -4,7 +4,6 @@ use crate::node::OpManager;
 use crate::wasm_runtime::{InMemoryContractStore, MockStateStorage, StateStorage};
 use dashmap::DashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 
 // =============================================================================
 // CRDT Emulation Mode
@@ -243,7 +242,7 @@ where
         &mut self,
         _id: ClientId,
         _req: ClientRequest<'_>,
-        _updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
+        _updates: Option<mpsc::Sender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         unreachable!("MockRuntime does not handle client requests directly")
     }
@@ -693,7 +692,7 @@ where
         &mut self,
         _key: ContractInstanceId,
         _cli_id: ClientId,
-        _notification_ch: UnboundedSender<HostResult>,
+        _notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         _summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         Ok(())

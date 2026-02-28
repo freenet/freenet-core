@@ -17,7 +17,7 @@ use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
@@ -176,7 +176,7 @@ pub struct OpenRequest<'a> {
     pub client_id: ClientId,
     pub request_id: RequestId,
     pub request: Box<ClientRequest<'a>>,
-    pub notification_channel: Option<UnboundedSender<HostResult>>,
+    pub notification_channel: Option<mpsc::Sender<HostResult>>,
     pub token: Option<AuthToken>,
     pub attested_contract: Option<ContractInstanceId>,
 }
@@ -210,7 +210,7 @@ impl<'a> OpenRequest<'a> {
         }
     }
 
-    pub fn with_notification(mut self, ch: UnboundedSender<HostResult>) -> Self {
+    pub fn with_notification(mut self, ch: mpsc::Sender<HostResult>) -> Self {
         self.notification_channel = Some(ch);
         self
     }
@@ -244,7 +244,7 @@ async fn register_subscription_listener(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
     client_id: ClientId,
-    subscription_listener: UnboundedSender<HostResult>,
+    subscription_listener: mpsc::Sender<HostResult>,
     operation_type: &str,
 ) -> Result<(), Error> {
     tracing::debug!(
@@ -635,7 +635,7 @@ async fn process_open_request(
         let client_id = request.client_id;
         let request_id = request.request_id;
 
-        let subscription_listener: Option<UnboundedSender<HostResult>> =
+        let subscription_listener: Option<mpsc::Sender<HostResult>> =
             request.notification_channel.take();
 
         match *request.request {
@@ -1711,7 +1711,7 @@ async fn process_open_request(
                 });
 
                 if let Some(ch) = &subscription_listener {
-                    if ch.send(host_response).is_err() {
+                    if ch.try_send(host_response).is_err() {
                         tracing::error!(
                             client_id = %client_id,
                             request_id = %request_id,
@@ -1888,7 +1888,7 @@ pub(crate) mod test {
         /// Keeps subscription notification receivers alive so the sender half
         /// (passed as `notification_channel`) isn't immediately broken.
         #[allow(dead_code)]
-        subscription_receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<HostResult>>,
+        subscription_receivers: Vec<tokio::sync::mpsc::Receiver<HostResult>>,
     }
 
     impl<R> MemoryEventsGen<R>
@@ -1989,7 +1989,9 @@ pub(crate) mod test {
                 | ClientRequest::ContractOp(ContractRequest::Get {
                     subscribe: true, ..
                 }) => {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (tx, rx) = tokio::sync::mpsc::channel(
+                        crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
+                    );
                     self.subscription_receivers.push(rx);
                     Some(tx)
                 }

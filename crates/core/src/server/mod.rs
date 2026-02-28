@@ -97,7 +97,7 @@ pub(crate) enum HostCallbackResult {
         id: ClientId,
         /// The contract being subscribed to (identified by instance_id since full key may not be known yet)
         key: ContractInstanceId,
-        callback: tokio::sync::mpsc::UnboundedReceiver<HostResult>,
+        callback: tokio::sync::mpsc::Receiver<HostResult>,
     },
 }
 

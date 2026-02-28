@@ -20,12 +20,7 @@ use tokio::sync::Semaphore;
 // Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
 // never during WASM execution (get_state_delta)
 type SharedNotifications = Arc<
-    RwLock<
-        HashMap<
-            ContractInstanceId,
-            Vec<(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)>,
-        >,
-    >,
+    RwLock<HashMap<ContractInstanceId, Vec<(ClientId, tokio::sync::mpsc::Sender<HostResult>)>>>,
 >;
 
 // Type alias for shared subscriber summaries
@@ -34,8 +29,25 @@ type SharedSummaries =
 
 /// Send a subscription error to all clients registered for a contract.
 /// Takes a snapshot of the channels to avoid holding any lock during sends.
+/// Construct a subscriber limit error for a registration that was rejected.
+///
+/// Uses `MissingContract` variant because `Subscribe` requires a `ContractKey`
+/// (which needs a `CodeHash` we don't have in the registration path).
+/// The real cause is conveyed via tracing logs at the call site.
+fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<RequestError> {
+    // Log the cause since MissingContract doesn't carry a cause string
+    tracing::debug!(
+        contract = %instance_id,
+        cause = cause,
+        "Subscriber registration rejected"
+    );
+    Box::new(RequestError::ContractError(
+        StdContractError::MissingContract { key: instance_id },
+    ))
+}
+
 fn send_subscription_error_to_clients(
-    channels: &[(ClientId, tokio::sync::mpsc::UnboundedSender<HostResult>)],
+    channels: &[(ClientId, tokio::sync::mpsc::Sender<HostResult>)],
     key: ContractInstanceId,
     reason: String,
 ) {
@@ -45,13 +57,22 @@ fn send_subscription_error_to_clients(
         }
         .into();
     for (client_id, sender) in channels {
-        if let Err(e) = sender.send(Err(error.clone())) {
-            tracing::debug!(
-                client = %client_id,
-                contract = %key,
-                error = %e,
-                "Failed to send subscription error notification (channel closed)"
-            );
+        match sender.try_send(Err(error.clone())) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    client = %client_id,
+                    contract = %key,
+                    "Subscriber notification channel full — subscription error dropped"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    client = %client_id,
+                    contract = %key,
+                    "Failed to send subscription error notification (channel closed)"
+                );
+            }
         }
     }
 }
@@ -482,7 +503,7 @@ impl ContractExecutor for RuntimePool {
         &mut self,
         instance_id: ContractInstanceId,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         // Register in shared storage at pool level.
@@ -492,14 +513,18 @@ impl ContractExecutor for RuntimePool {
 
         // Brief lock acquisition for registration (fast operation)
         let mut notifications = self.shared_notifications.write().unwrap();
-        let channels = notifications.entry(instance_id).or_default();
 
-        // Check if this client is already registered
-        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
-            let (_, existing_ch) = &channels[i];
-            if !existing_ch.same_channel(&notification_ch) {
+        // Check if this client is already registered for this contract
+        let already_registered = notifications.get(&instance_id).and_then(|ch| {
+            ch.binary_search_by_key(&&cli_id, |(p, _)| p)
+                .ok()
+                .map(|i| (i, ch[i].1.same_channel(&notification_ch)))
+        });
+
+        if let Some((idx, same_channel)) = already_registered {
+            if !same_channel {
                 // Client reconnected with new channel, update it
-                channels[i] = (cli_id, notification_ch);
+                notifications.get_mut(&instance_id).unwrap()[idx] = (cli_id, notification_ch);
                 tracing::debug!(
                     client = %cli_id,
                     contract = %instance_id,
@@ -507,7 +532,50 @@ impl ContractExecutor for RuntimePool {
                 );
             }
         } else {
+            // New subscriber: enforce per-contract limit
+            let contract_sub_count = notifications.get(&instance_id).map_or(0, |ch| ch.len());
+            if contract_sub_count >= super::MAX_SUBSCRIBERS_PER_CONTRACT {
+                drop(notifications);
+                tracing::warn!(
+                    client = %cli_id,
+                    contract = %instance_id,
+                    limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
+                    "Subscriber limit reached for contract, rejecting registration"
+                );
+                return Err(subscriber_limit_error(
+                    instance_id,
+                    &format!(
+                        "subscriber limit ({}) reached for contract",
+                        super::MAX_SUBSCRIBERS_PER_CONTRACT
+                    ),
+                ));
+            }
+
+            // Enforce per-client subscription limit across all contracts
+            let client_sub_count = notifications
+                .values()
+                .filter(|ch| ch.binary_search_by_key(&&cli_id, |(id, _)| id).is_ok())
+                .count();
+            if client_sub_count >= super::MAX_SUBSCRIPTIONS_PER_CLIENT {
+                drop(notifications);
+                tracing::warn!(
+                    client = %cli_id,
+                    contract = %instance_id,
+                    limit = super::MAX_SUBSCRIPTIONS_PER_CLIENT,
+                    current = client_sub_count,
+                    "Per-client subscription limit reached, rejecting registration"
+                );
+                return Err(subscriber_limit_error(
+                    instance_id,
+                    &format!(
+                        "per-client subscription limit ({}) reached",
+                        super::MAX_SUBSCRIPTIONS_PER_CLIENT
+                    ),
+                ));
+            }
+
             // Insert in sorted order for efficient lookup
+            let channels = notifications.entry(instance_id).or_default();
             let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
             channels.insert(insert_pos, (cli_id, notification_ch));
             tracing::debug!(
@@ -1254,22 +1322,79 @@ where
         &mut self,
         instance_id: ContractInstanceId,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        let channels = self.update_notifications.entry(instance_id).or_default();
-        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
-            let (_, existing_ch) = &channels[i];
-            if !existing_ch.same_channel(&notification_ch) {
+        // Check if already registered (immutable borrow)
+        let already_registered = self
+            .update_notifications
+            .get(&instance_id)
+            .and_then(|channels| {
+                channels
+                    .binary_search_by_key(&&cli_id, |(p, _)| p)
+                    .ok()
+                    .map(|i| (i, channels[i].1.same_channel(&notification_ch)))
+            });
+
+        if let Some((idx, same_channel)) = already_registered {
+            if !same_channel {
                 tracing::info!(
                     contract = %instance_id,
                     client = %cli_id,
                     "Client already subscribed, updating notification channel"
                 );
-                channels[i] = (cli_id, notification_ch);
+                self.update_notifications.get_mut(&instance_id).unwrap()[idx] =
+                    (cli_id, notification_ch);
             }
         } else {
-            channels.push((cli_id, notification_ch));
+            // New subscriber: enforce per-contract limit
+            let contract_sub_count = self
+                .update_notifications
+                .get(&instance_id)
+                .map_or(0, |ch| ch.len());
+            if contract_sub_count >= super::MAX_SUBSCRIBERS_PER_CONTRACT {
+                tracing::warn!(
+                    client = %cli_id,
+                    contract = %instance_id,
+                    limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
+                    "Subscriber limit reached for contract, rejecting registration"
+                );
+                return Err(subscriber_limit_error(
+                    instance_id,
+                    &format!(
+                        "subscriber limit ({}) reached for contract",
+                        super::MAX_SUBSCRIBERS_PER_CONTRACT
+                    ),
+                ));
+            }
+
+            // Enforce per-client subscription limit across all contracts
+            let client_sub_count = self
+                .update_notifications
+                .values()
+                .filter(|ch| ch.binary_search_by_key(&&cli_id, |(id, _)| id).is_ok())
+                .count();
+            if client_sub_count >= super::MAX_SUBSCRIPTIONS_PER_CLIENT {
+                tracing::warn!(
+                    client = %cli_id,
+                    contract = %instance_id,
+                    limit = super::MAX_SUBSCRIPTIONS_PER_CLIENT,
+                    current = client_sub_count,
+                    "Per-client subscription limit reached, rejecting registration"
+                );
+                return Err(subscriber_limit_error(
+                    instance_id,
+                    &format!(
+                        "per-client subscription limit ({}) reached",
+                        super::MAX_SUBSCRIPTIONS_PER_CLIENT
+                    ),
+                ));
+            }
+
+            // Insert in sorted order for efficient lookup (matches pool path)
+            let channels = self.update_notifications.entry(instance_id).or_default();
+            let insert_pos = channels.partition_point(|(id, _)| id < &cli_id);
+            channels.insert(insert_pos, (cli_id, notification_ch));
         }
 
         if self
@@ -1695,7 +1820,7 @@ where
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
         ) {
-            let notifiers_snapshot: Vec<(ClientId, mpsc::UnboundedSender<HostResult>)> = {
+            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> = {
                 let notifications = shared_notifications.read().unwrap();
                 match notifications.get(&instance_id) {
                     Some(notifiers) => notifiers.clone(),
@@ -1708,44 +1833,74 @@ where
                 summaries.get(&instance_id).cloned().unwrap_or_default()
             };
 
+            if notifiers_snapshot.len() > 50 {
+                tracing::warn!(
+                    contract = %key,
+                    subscriber_count = notifiers_snapshot.len(),
+                    "High subscriber count for notification fan-out"
+                );
+            }
+
             let mut failures = Vec::with_capacity(32);
+            let mut delta_computations = 0usize;
 
             for (peer_key, notifier) in &notifiers_snapshot {
                 let peer_summary = summaries_snapshot.get(peer_key).and_then(|s| s.as_ref());
 
                 let update = match peer_summary {
-                    Some(summary) => self
-                        .runtime
-                        .get_state_delta(&key, params, new_state, summary)
-                        .map_err(|err| {
-                            tracing::error!("{err}");
-                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                        })?
-                        .to_owned()
-                        .into(),
+                    Some(summary)
+                        if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
+                    {
+                        delta_computations += 1;
+                        self.runtime
+                            .get_state_delta(&key, params, new_state, summary)
+                            .map_err(|err| {
+                                tracing::error!("{err}");
+                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                            })?
+                            .to_owned()
+                            .into()
+                    }
+                    Some(_) => {
+                        // Delta computation cap reached: send full state instead of
+                        // running another WASM get_state_delta() call
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            "Delta computation cap reached, sending full state"
+                        );
+                        UpdateData::State(State::from(new_state.as_ref()).into_owned())
+                    }
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
 
-                if let Err(err) =
-                    notifier.send(Ok(
-                        ContractResponse::UpdateNotification { key, update }.into()
-                    ))
-                {
-                    failures.push(*peer_key);
-                    tracing::error!(
-                        client = %peer_key,
-                        contract = %key,
-                        error = %err,
-                        phase = "notification_send_failed_shared",
-                        "Failed to send update notification to client (shared storage)"
-                    );
-                } else {
-                    tracing::debug!(
-                        client = %peer_key,
-                        contract = %key,
-                        phase = "notification_sent_shared",
-                        "Sent update notification to client (shared storage)"
-                    );
+                match notifier.try_send(Ok(
+                    ContractResponse::UpdateNotification { key, update }.into()
+                )) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_sent_shared",
+                            "Sent update notification to client (shared storage)"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            client = %peer_key,
+                            contract = %key,
+                            "Subscriber notification channel full — notification dropped"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        failures.push(*peer_key);
+                        tracing::error!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_send_failed_shared",
+                            "Failed to send update notification to client (channel closed)"
+                        );
+                    }
                 }
             }
 
@@ -1765,43 +1920,72 @@ where
             }
         } else if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
             let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
+
+            if notifiers.len() > 50 {
+                tracing::warn!(
+                    contract = %key,
+                    subscriber_count = notifiers.len(),
+                    "High subscriber count for notification fan-out"
+                );
+            }
+
             let mut failures = Vec::with_capacity(32);
+            let mut delta_computations = 0usize;
 
             for (peer_key, notifier) in notifiers.iter() {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = match peer_summary {
-                    Some(summary) => self
-                        .runtime
-                        .get_state_delta(&key, params, new_state, &*summary)
-                        .map_err(|err| {
-                            tracing::error!("{err}");
-                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                        })?
-                        .to_owned()
-                        .into(),
+                    Some(summary)
+                        if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
+                    {
+                        delta_computations += 1;
+                        self.runtime
+                            .get_state_delta(&key, params, new_state, &*summary)
+                            .map_err(|err| {
+                                tracing::error!("{err}");
+                                ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
+                            })?
+                            .to_owned()
+                            .into()
+                    }
+                    Some(_) => {
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            "Delta computation cap reached, sending full state"
+                        );
+                        UpdateData::State(State::from(new_state.as_ref()).into_owned())
+                    }
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
 
-                if let Err(err) =
-                    notifier.send(Ok(
-                        ContractResponse::UpdateNotification { key, update }.into()
-                    ))
-                {
-                    failures.push(*peer_key);
-                    tracing::error!(
-                        client = %peer_key,
-                        contract = %key,
-                        error = %err,
-                        phase = "notification_send_failed",
-                        "Failed to send update notification to client"
-                    );
-                } else {
-                    tracing::debug!(
-                        client = %peer_key,
-                        contract = %key,
-                        phase = "notification_sent",
-                        "Sent update notification to client"
-                    );
+                match notifier.try_send(Ok(
+                    ContractResponse::UpdateNotification { key, update }.into()
+                )) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_sent",
+                            "Sent update notification to client"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            client = %peer_key,
+                            contract = %key,
+                            "Subscriber notification channel full — notification dropped"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        failures.push(*peer_key);
+                        tracing::error!(
+                            client = %peer_key,
+                            contract = %key,
+                            phase = "notification_send_failed",
+                            "Failed to send update notification to client (channel closed)"
+                        );
+                    }
                 }
             }
 
@@ -1845,7 +2029,7 @@ impl ContractExecutor for Executor<Runtime> {
         &mut self,
         instance_id: ContractInstanceId,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         self.bridged_register_contract_notifier(instance_id, cli_id, notification_ch, summary)
@@ -1998,7 +2182,7 @@ impl Executor<Runtime> {
         &mut self,
         id: ClientId,
         req: ClientRequest<'_>,
-        updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
+        updates: Option<mpsc::Sender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
@@ -2028,7 +2212,7 @@ impl Executor<Runtime> {
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
-        updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
+        updates: Option<mpsc::Sender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         tracing::debug!(
             client = %cli_id,

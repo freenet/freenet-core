@@ -48,6 +48,13 @@ Need to wait on multiple futures?
 Need shared state across tasks?
   → Prefer channels (mpsc, oneshot) over Arc<Mutex<>>
 
+Need a channel for notifications, events, or responses?
+  → ALWAYS use bounded channels: mpsc::channel(N), NOT unbounded_channel()
+  → In non-async contexts (inside executor checkout), use try_send() not send().await
+  → Drop messages when full (lossy) rather than blocking or growing unboundedly
+  → unbounded_channel() is only acceptable for internal control flow where the
+    sender count is statically known and bounded (e.g., handler event loops)
+
 Is cancellation possible?
   → Document cancellation safety in function docs
 ```

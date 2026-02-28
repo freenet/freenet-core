@@ -138,7 +138,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         &mut self,
         instance_id: ContractInstanceId,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         self.bridged_register_contract_notifier(instance_id, cli_id, notification_ch, summary)

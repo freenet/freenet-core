@@ -75,6 +75,10 @@ const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(120); // 2 minute
 /// Maximum number of tracked subscription backoff entries.
 const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
 
+/// Maximum number of downstream peer subscribers per contract.
+/// Prevents network-level subscription amplification attacks.
+const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -418,11 +422,20 @@ impl HostingManager {
     // =========================================================================
 
     /// Record that a downstream peer is subscribed to a contract we host.
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) {
-        self.downstream_subscribers
-            .entry(*contract)
-            .or_default()
-            .insert(peer, self.time_source.now());
+    /// Returns false if the downstream subscriber limit for this contract has been reached
+    /// and the peer is not already tracked (existing peers can always renew).
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
+        let mut entry = self.downstream_subscribers.entry(*contract).or_default();
+        if !entry.contains_key(&peer) && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
+            tracing::warn!(
+                contract = %contract,
+                limit = MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT,
+                "Downstream subscriber limit reached, rejecting peer"
+            );
+            return false;
+        }
+        entry.insert(peer, self.time_source.now());
+        true
     }
 
     /// Renew a downstream peer's subscription lease.
