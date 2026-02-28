@@ -75,6 +75,10 @@ const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(120); // 2 minute
 /// Maximum number of tracked subscription backoff entries.
 const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
 
+/// Maximum number of downstream peer subscribers per contract.
+/// Prevents network-level subscription amplification attacks.
+const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -418,11 +422,20 @@ impl HostingManager {
     // =========================================================================
 
     /// Record that a downstream peer is subscribed to a contract we host.
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) {
-        self.downstream_subscribers
-            .entry(*contract)
-            .or_default()
-            .insert(peer, self.time_source.now());
+    /// Returns false if the downstream subscriber limit for this contract has been reached
+    /// and the peer is not already tracked (existing peers can always renew).
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
+        let mut entry = self.downstream_subscribers.entry(*contract).or_default();
+        if !entry.contains_key(&peer) && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
+            tracing::warn!(
+                contract = %contract,
+                limit = MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT,
+                "Downstream subscriber limit reached, rejecting peer"
+            );
+            return false;
+        }
+        entry.insert(peer, self.time_source.now());
+        true
     }
 
     /// Renew a downstream peer's subscription lease.
@@ -1790,5 +1803,91 @@ mod tests {
         assert!(manager.should_unsubscribe_upstream(&contract));
         // InterestManager still tracks the peer — independent of unsubscribe decision
         assert!(interest.remove_peer_interest(&contract, &peer));
+    }
+
+    // =========================================================================
+    // Downstream Subscriber Limit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_downstream_subscriber_limit_enforced() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(50);
+
+        // Use a small limit for testing to avoid issues with peer key generation.
+        // We test the limit logic by adding peers up to the constant and verifying rejection.
+        let limit = MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT;
+
+        // Add `limit` peers — all should succeed
+        let mut peers = Vec::with_capacity(limit);
+        for i in 0..limit {
+            let peer = PeerKey(crate::transport::TransportPublicKey::from_bytes({
+                let mut bytes = [0u8; 32];
+                // Encode index across 3 bytes for safety
+                bytes[0] = (i & 0xFF) as u8;
+                bytes[1] = ((i >> 8) & 0xFF) as u8;
+                bytes[2] = ((i >> 16) & 0xFF) as u8;
+                bytes
+            }));
+            peers.push(peer.clone());
+            let result = manager.add_downstream_subscriber(&contract, peer);
+            assert!(
+                result,
+                "Downstream subscriber {i} should succeed within limit (count before: {i})"
+            );
+        }
+
+        // Verify the actual count
+        let actual_count = manager
+            .downstream_subscribers
+            .get(&contract)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        assert_eq!(
+            actual_count, limit,
+            "Should have exactly {limit} entries, got {actual_count}"
+        );
+
+        // The next new peer (with completely different bytes) should be rejected
+        let extra_peer = PeerKey(crate::transport::TransportPublicKey::from_bytes([0xAA; 32]));
+        // Verify it's not in the set
+        let is_new = !manager
+            .downstream_subscribers
+            .get(&contract)
+            .map(|e| e.contains_key(&extra_peer))
+            .unwrap_or(false);
+        assert!(is_new, "Extra peer should not already be in the set");
+
+        let rejected = !manager.add_downstream_subscriber(&contract, extra_peer);
+        assert!(
+            rejected,
+            "Downstream subscriber beyond limit should be rejected (count was {actual_count})"
+        );
+    }
+
+    #[test]
+    fn test_downstream_subscriber_existing_peer_can_renew_at_limit() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(51);
+
+        // Fill up to the limit
+        let first_peer = make_peer_key(1);
+        manager.add_downstream_subscriber(&contract, first_peer.clone());
+
+        for i in 1..MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
+            let peer = PeerKey(crate::transport::TransportPublicKey::from_bytes({
+                let mut bytes = [0u8; 32];
+                bytes[0] = (i & 0xFF) as u8;
+                bytes[1] = ((i >> 8) & 0xFF) as u8;
+                bytes
+            }));
+            manager.add_downstream_subscriber(&contract, peer);
+        }
+
+        // Existing peer can still renew (re-insert updates the timestamp)
+        assert!(
+            manager.add_downstream_subscriber(&contract, first_peer),
+            "Existing peer should be able to renew at limit"
+        );
     }
 }

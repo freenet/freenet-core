@@ -407,8 +407,10 @@ async fn drift_detector_register_notifier_divergence() {
     // valid. This test verifies registration tracking, not notification delivery.
     // Notification delivery is covered by the wasm_conformance_tests which test
     // the ContractRuntimeInterface directly.
-    let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (tx1, _rx1) =
+        tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    let (tx2, _rx2) =
+        tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
     let client_id = crate::client_events::ClientId::next();
 
     mock.register_contract_notifier(instance_id, client_id, tx1, None)

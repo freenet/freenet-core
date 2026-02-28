@@ -219,7 +219,9 @@ impl WebSocketProxy {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
                         tracing::debug!(%client_id, contract = %key, "subscribing to contract");
                         // intercept subscription messages because they require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tx, rx) = tokio::sync::mpsc::channel(
+                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
+                        );
                         if let Some(ch) = self.response_channels.get(&client_id) {
                             ch.send(HostCallbackResult::SubscriptionChannel {
                                 key: *key,
@@ -246,7 +248,9 @@ impl WebSocketProxy {
                     }) => {
                         tracing::debug!(%client_id, contract = %key, "get with auto-subscribe");
                         // intercept GET with subscribe=true because they also require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tx, rx) = tokio::sync::mpsc::channel(
+                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
+                        );
                         if let Some(ch) = self.response_channels.get(&client_id) {
                             ch.send(HostCallbackResult::SubscriptionChannel {
                                 key: *key,
@@ -273,7 +277,9 @@ impl WebSocketProxy {
                     }) => {
                         tracing::debug!(%client_id, contract = %contract.key(), "put with auto-subscribe");
                         // intercept PUT with subscribe=true because they also require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tx, rx) = tokio::sync::mpsc::channel(
+                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
+                        );
                         if let Some(ch) = self.response_channels.get(&client_id) {
                             ch.send(HostCallbackResult::SubscriptionChannel {
                                 key: *contract.key().id(),
@@ -571,7 +577,7 @@ async fn websocket_interface(
     let (mut response_rx, client_id) =
         new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
-    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
+    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
     // If a token was provided but is invalid (stale/expired), immediately send an error
@@ -788,7 +794,7 @@ async fn new_client_connection(
 
 struct NewSubscription {
     key: ContractInstanceId,
-    callback: mpsc::UnboundedReceiver<HostResult>,
+    callback: mpsc::Receiver<HostResult>,
 }
 
 async fn process_client_request(

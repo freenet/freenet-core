@@ -63,6 +63,27 @@ pub(crate) struct DelegateNotification {
 /// change instead. This prevents unbounded memory growth under load.
 pub(crate) const DELEGATE_NOTIFICATION_CHANNEL_SIZE: usize = 1000;
 
+/// Maximum number of subscriber clients per contract.
+/// Prevents unbounded WASM amplification and memory growth from notification fan-out.
+pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
+
+/// Maximum total subscriptions a single client may hold across all contracts.
+/// Prevents a single client from spreading thin across many contracts to exhaust resources.
+pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 50;
+
+/// Buffer size for per-subscriber notification channels.
+/// When full, notifications are dropped (lossy) rather than blocking the executor.
+pub(crate) const SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE: usize = 64;
+
+/// Maximum WASM `get_state_delta()` calls per notification fan-out.
+/// Beyond this limit, remaining subscribers receive full state instead of a computed delta.
+pub(crate) const MAX_DELTA_COMPUTATIONS_PER_FANOUT: usize = 32;
+
+/// Subscriber count above which a warning is logged during notification fan-out.
+/// This is below `MAX_SUBSCRIBERS_PER_CONTRACT` to provide early visibility into
+/// contracts with high fan-out before they hit the hard cap.
+pub(crate) const FANOUT_WARNING_THRESHOLD: usize = 50;
+
 pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 
@@ -697,7 +718,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
         &mut self,
         key: ContractInstanceId,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        notification_ch: tokio::sync::mpsc::Sender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>>;
 
@@ -754,21 +775,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// if corruption happens again later.
 pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<ContractKey>>>;
 
-// Type alias for shared notification storage (used by RuntimePool)
-// Uses RwLock<HashMap> with snapshot pattern - locks are only held briefly during clone,
-// never during WASM execution (get_state_delta)
-type SharedNotifications = Arc<
-    std::sync::RwLock<
-        HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
-    >,
->;
+// Type alias for shared notification storage (used by RuntimePool).
+// Uses DashMap for fine-grained per-key locking instead of a global RwLock.
+type SharedNotifications =
+    Arc<dashmap::DashMap<ContractInstanceId, Vec<(ClientId, mpsc::Sender<HostResult>)>>>;
 
-// Type alias for shared subscriber summaries (used by RuntimePool)
-type SharedSummaries = Arc<
-    std::sync::RwLock<
-        HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
-    >,
->;
+// Type alias for shared subscriber summaries (used by RuntimePool).
+type SharedSummaries =
+    Arc<dashmap::DashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>>;
+
+// Per-client subscription counts for O(1) limit enforcement (used by RuntimePool).
+type SharedClientCounts = Arc<dashmap::DashMap<ClientId, usize>>;
 
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
@@ -782,8 +799,9 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     pub state_store: StateStore<S>,
     /// Notification channels for any clients subscribed to updates for a given contract.
     /// Used when executor is standalone (not in a pool).
-    update_notifications:
-        HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
+    update_notifications: HashMap<ContractInstanceId, Vec<(ClientId, mpsc::Sender<HostResult>)>>,
+    /// Per-client subscription counts for O(1) limit enforcement (standalone executor).
+    client_subscription_counts: HashMap<ClientId, usize>,
     /// Summaries of the state of all clients subscribed to a given contract.
     /// Used when executor is standalone (not in a pool).
     subscriber_summaries:
@@ -805,6 +823,8 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     shared_notifications: Option<SharedNotifications>,
     /// Shared subscriber summaries at pool level (when running in a pool).
     shared_summaries: Option<SharedSummaries>,
+    /// Per-client subscription counts at pool level for O(1) limit enforcement.
+    shared_client_counts: Option<SharedClientCounts>,
     /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
     /// See [`CorruptedStateRecoveryGuard`] for details.
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
@@ -846,6 +866,7 @@ where
             runtime,
             state_store,
             update_notifications: HashMap::default(),
+            client_subscription_counts: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
             init_tracker: ContractInitTracker::new(),
@@ -853,6 +874,7 @@ where
             op_manager,
             shared_notifications: None,
             shared_summaries: None,
+            shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
             summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
@@ -877,9 +899,11 @@ where
         &mut self,
         notifications: SharedNotifications,
         summaries: SharedSummaries,
+        client_counts: SharedClientCounts,
     ) {
         self.shared_notifications = Some(notifications);
         self.shared_summaries = Some(summaries);
+        self.shared_client_counts = Some(client_counts);
     }
 
     /// Set a shared recovery guard for pool-based operation.

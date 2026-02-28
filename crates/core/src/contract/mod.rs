@@ -15,7 +15,7 @@ pub mod storages;
 pub(crate) use executor::{
     mediator_channels, mock_runtime::MockRuntime, op_request_channel, run_op_request_mediator,
     Callback, ContractExecutor, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-    UpsertResult,
+    UpsertResult, SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
 };
 
 // Re-export CRDT emulation functions for testing
@@ -1465,7 +1465,7 @@ mod tests {
                 key: *key.id(),
                 client_id: crate::client_events::ClientId::next(),
                 summary: None,
-                subscriber_listener: tokio::sync::mpsc::unbounded_channel().0,
+                subscriber_listener: tokio::sync::mpsc::channel(64).0,
             },
         )
         .await;

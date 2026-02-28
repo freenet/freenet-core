@@ -1465,7 +1465,7 @@ impl Ring {
 
     // ==================== Downstream Subscriber Tracking ====================
 
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) {
+    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
         self.hosting_manager
             .add_downstream_subscriber(contract, peer)
     }
