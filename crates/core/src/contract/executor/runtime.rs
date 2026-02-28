@@ -6,7 +6,7 @@ use super::{
 };
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY,
+    BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE,
 };
 use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
@@ -868,6 +868,35 @@ where
 
         let mut updates = match update {
             Either::Left(incoming_state) => {
+                // Fast-reject oversized state before expensive WASM validation.
+                // A malicious contract could return `Valid` for any state, so this check must
+                // happen at the node level before any WASM execution.
+                let incoming_size = incoming_state.as_ref().len();
+                if incoming_size > MAX_STATE_SIZE {
+                    tracing::warn!(
+                        contract = %key,
+                        size_bytes = incoming_size,
+                        limit_bytes = MAX_STATE_SIZE,
+                        "Rejecting oversized state before WASM validation"
+                    );
+                    if remove_if_fail {
+                        if let Err(e) = self.runtime.remove_contract(&key) {
+                            tracing::warn!(
+                                contract = %key,
+                                error = %e,
+                                "failed to remove contract after size rejection"
+                            );
+                        }
+                    }
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: format!(
+                            "state size {incoming_size} bytes exceeds maximum allowed {MAX_STATE_SIZE} bytes"
+                        )
+                        .into(),
+                    }));
+                }
+
                 let result = self
                     .runtime
                     .validate_state(&key, &params, &incoming_state, &related_contracts)
@@ -1061,6 +1090,9 @@ where
                 }));
             }
             Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
+            Err(err @ StateStoreError::StateTooLarge { .. }) => {
+                return Err(ExecutorError::other(err))
+            }
         };
 
         for (id, state) in related_contracts
@@ -1453,6 +1485,23 @@ where
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
+        let state_size = new_state.as_ref().len();
+        if state_size > MAX_STATE_SIZE {
+            tracing::warn!(
+                contract = %key,
+                size_bytes = state_size,
+                limit_bytes = MAX_STATE_SIZE,
+                "Rejecting oversized contract state at executor layer"
+            );
+            return Err(ExecutorError::request(StdContractError::Update {
+                key: *key,
+                cause: format!(
+                    "state size {state_size} bytes exceeds maximum allowed {MAX_STATE_SIZE} bytes"
+                )
+                .into(),
+            }));
+        }
+
         self.state_store
             .update(key, new_state.clone())
             .await
