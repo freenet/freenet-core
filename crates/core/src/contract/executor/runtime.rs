@@ -146,6 +146,12 @@ pub struct RuntimePool {
     delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
     /// Per-contract executor usage tracking (for observability).
     /// Not used for enforcement since the event loop is sequential.
+    /// Tracked via RAII `InFlightGuard` in: `fetch_contract`, `upsert_contract_state`,
+    /// `summarize_contract_state`, `get_contract_state_delta`.
+    /// Intentionally NOT tracked in: `execute_delegate_request` (no contract key),
+    /// `register_contract_notifier` (synchronous, no executor checkout),
+    /// `lookup_key`, `get_subscription_info`, `notify_subscription_error`,
+    /// `remove_client` (read-only / no executor checkout).
     in_flight_contracts: HashMap<ContractKey, usize>,
 }
 
@@ -316,6 +322,11 @@ impl RuntimePool {
     /// Record that an executor has been checked out for the given contract.
     /// Observability-only — the sequential event loop means at most one contract
     /// is ever in flight at a time.
+    ///
+    /// Panic safety: WASM panics are caught at the wasmer FFI boundary and
+    /// converted to errors (not Rust panics), so `track_contract_return` is
+    /// guaranteed to run after `track_contract_checkout` in the methods below.
+    /// There are no `?` operators between the checkout/return calls.
     fn track_contract_checkout(&mut self, key: &ContractKey) {
         *self.in_flight_contracts.entry(*key).or_insert(0) += 1;
     }

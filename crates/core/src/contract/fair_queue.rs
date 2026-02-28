@@ -201,7 +201,7 @@ impl FairEventQueue {
     }
 
     /// Returns the total number of queued events across all contracts.
-    #[allow(dead_code)] // Used for metrics/logging
+    #[cfg(test)]
     pub(super) fn total_queued(&self) -> usize {
         self.total_queued
     }
@@ -582,5 +582,277 @@ mod tests {
 
         assert_eq!(queue.total_queued(), 1);
         assert!(queue.contract_queues.contains_key(&contract_id));
+    }
+
+    #[test]
+    fn test_default_queue_per_slot_limit() {
+        let mut queue = FairEventQueue::new();
+
+        // Fill default queue to per-slot limit with ClientDisconnect events
+        for i in 0..MAX_QUEUED_PER_CONTRACT as u64 {
+            queue
+                .try_push(make_event_id(i), make_delegate_event())
+                .expect("should succeed within limit");
+        }
+
+        // One more should be rejected
+        let result = queue.try_push(
+            make_event_id(MAX_QUEUED_PER_CONTRACT as u64),
+            make_delegate_event(),
+        );
+        assert!(
+            result.is_err(),
+            "should reject when default queue per-slot limit exceeded"
+        );
+    }
+
+    #[test]
+    fn test_interleaved_push_pop() {
+        let mut queue = FairEventQueue::new();
+        let a = make_contract_id(1);
+        let b = make_contract_id(2);
+
+        // Push event for A, pop (gets A)
+        queue.try_push(make_event_id(0), make_get_event(a)).unwrap();
+        let (id0, _) = queue.pop().expect("should pop A");
+        assert_eq!(id0.id, 0);
+
+        // Push events for B and A
+        queue.try_push(make_event_id(1), make_get_event(b)).unwrap();
+        queue.try_push(make_event_id(2), make_get_event(a)).unwrap();
+
+        // Round-robin should give B first (B was added after A was drained,
+        // so B is at front of round_robin)
+        let (id1, ev1) = queue.pop().expect("should pop B");
+        let ContractHandlerEvent::GetQuery { instance_id, .. } = ev1 else {
+            panic!("unexpected event type");
+        };
+        assert_eq!(instance_id, b, "expected B (id={})", id1.id);
+
+        // Then A
+        let (id2, ev2) = queue.pop().expect("should pop A");
+        let ContractHandlerEvent::GetQuery { instance_id, .. } = ev2 else {
+            panic!("unexpected event type");
+        };
+        assert_eq!(instance_id, a, "expected A (id={})", id2.id);
+
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn test_interleaved_three_contracts() {
+        let mut queue = FairEventQueue::new();
+        let a = make_contract_id(1);
+        let b = make_contract_id(2);
+        let c = make_contract_id(3);
+
+        // Fill: A(3), B(2), C(1)
+        for i in 0..3u64 {
+            queue.try_push(make_event_id(i), make_get_event(a)).unwrap();
+        }
+        for i in 3..5u64 {
+            queue.try_push(make_event_id(i), make_get_event(b)).unwrap();
+        }
+        queue.try_push(make_event_id(5), make_get_event(c)).unwrap();
+
+        // Pop 3 — should be one from each (A, B, C in round-robin)
+        let mut first_round = Vec::new();
+        for _ in 0..3 {
+            let (_, ev) = queue.pop().unwrap();
+            let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
+                panic!("unexpected");
+            };
+            first_round.push(instance_id);
+        }
+        assert_eq!(first_round, vec![a, b, c]);
+
+        // C is now drained, so second round is A, B
+        let mut second_round = Vec::new();
+        for _ in 0..2 {
+            let (_, ev) = queue.pop().unwrap();
+            let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
+                panic!("unexpected");
+            };
+            second_round.push(instance_id);
+        }
+        assert_eq!(second_round, vec![a, b]);
+
+        // Third round: only A remains
+        let (_, ev) = queue.pop().unwrap();
+        let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
+            panic!("unexpected");
+        };
+        assert_eq!(instance_id, a);
+
+        assert!(queue.pop().is_none());
+    }
+
+    /// Test that extract_contract_id correctly routes all event variants.
+    #[test]
+    fn test_extract_contract_id_all_variants() {
+        use freenet_stdlib::prelude::UpdateData;
+        use tokio::sync::mpsc;
+
+        let code = ContractCode::from(vec![99u8; 32]);
+        let params = Parameters::from(vec![88u8; 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let contract_id = *key.id();
+
+        // Events that SHOULD map to a contract queue (Some)
+        let contract_events: Vec<(&str, ContractHandlerEvent)> = vec![
+            (
+                "PutQuery",
+                ContractHandlerEvent::PutQuery {
+                    key,
+                    state: WrappedState::new(vec![1]),
+                    related_contracts: RelatedContracts::default(),
+                    contract: None,
+                },
+            ),
+            (
+                "UpdateQuery",
+                ContractHandlerEvent::UpdateQuery {
+                    key,
+                    data: UpdateData::Delta(freenet_stdlib::prelude::StateDelta::from(vec![2])),
+                    related_contracts: RelatedContracts::default(),
+                },
+            ),
+            (
+                "GetQuery",
+                ContractHandlerEvent::GetQuery {
+                    instance_id: contract_id,
+                    return_contract_code: false,
+                },
+            ),
+            (
+                "GetSummaryQuery",
+                ContractHandlerEvent::GetSummaryQuery { key },
+            ),
+            (
+                "GetDeltaQuery",
+                ContractHandlerEvent::GetDeltaQuery {
+                    key,
+                    their_summary: freenet_stdlib::prelude::StateSummary::from(vec![3]),
+                },
+            ),
+            (
+                "RegisterSubscriberListener",
+                ContractHandlerEvent::RegisterSubscriberListener {
+                    key: contract_id,
+                    client_id: crate::client_events::ClientId::next(),
+                    summary: None,
+                    subscriber_listener: mpsc::unbounded_channel().0,
+                },
+            ),
+            (
+                "NotifySubscriptionError",
+                ContractHandlerEvent::NotifySubscriptionError {
+                    key: contract_id,
+                    reason: "test".to_string(),
+                },
+            ),
+        ];
+
+        for (name, event) in &contract_events {
+            let result = extract_contract_id(event);
+            assert_eq!(
+                result,
+                Some(contract_id),
+                "{name} should route to contract queue"
+            );
+        }
+
+        // Events that SHOULD map to the default queue (None)
+        let default_events: Vec<(&str, ContractHandlerEvent)> = vec![
+            (
+                "DelegateRequest",
+                ContractHandlerEvent::DelegateRequest {
+                    req: freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                        key: freenet_stdlib::prelude::DelegateKey::new(
+                            [1u8; 32],
+                            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                        ),
+                        params: Parameters::from(vec![]),
+                        inbound: vec![],
+                    },
+                    attested_contract: None,
+                },
+            ),
+            (
+                "DelegateResponse",
+                ContractHandlerEvent::DelegateResponse(vec![]),
+            ),
+            (
+                "ClientDisconnect",
+                ContractHandlerEvent::ClientDisconnect {
+                    client_id: crate::client_events::ClientId::next(),
+                },
+            ),
+            (
+                "PutResponse",
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(WrappedState::new(vec![])),
+                    state_changed: false,
+                },
+            ),
+            (
+                "GetResponse",
+                ContractHandlerEvent::GetResponse {
+                    key: None,
+                    response: Ok(crate::contract::handler::StoreResponse {
+                        state: None,
+                        contract: None,
+                    }),
+                },
+            ),
+            (
+                "UpdateResponse",
+                ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(WrappedState::new(vec![])),
+                    state_changed: false,
+                },
+            ),
+            (
+                "UpdateNoChange",
+                ContractHandlerEvent::UpdateNoChange { key },
+            ),
+            (
+                "RegisterSubscriberListenerResponse",
+                ContractHandlerEvent::RegisterSubscriberListenerResponse,
+            ),
+            (
+                "QuerySubscriptionsResponse",
+                ContractHandlerEvent::QuerySubscriptionsResponse,
+            ),
+            (
+                "GetSummaryResponse",
+                ContractHandlerEvent::GetSummaryResponse {
+                    key,
+                    summary: Ok(freenet_stdlib::prelude::StateSummary::from(vec![])),
+                },
+            ),
+            (
+                "GetDeltaResponse",
+                ContractHandlerEvent::GetDeltaResponse {
+                    key,
+                    delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![])),
+                },
+            ),
+            (
+                "NotifySubscriptionErrorResponse",
+                ContractHandlerEvent::NotifySubscriptionErrorResponse,
+            ),
+            (
+                "QuerySubscriptions",
+                ContractHandlerEvent::QuerySubscriptions {
+                    callback: mpsc::channel::<crate::message::QueryResult>(1).0,
+                },
+            ),
+        ];
+
+        for (name, event) in &default_events {
+            let result = extract_contract_id(event);
+            assert_eq!(result, None, "{name} should route to default queue");
+        }
     }
 }
