@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex as StdMutex, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -27,31 +27,18 @@ pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 /// overhead.
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maximum delegate error responses before rate limiting kicks in per key.
-const DELEGATE_ERROR_THRESHOLD: u32 = 3;
-
-/// Time window for counting delegate errors. Errors older than this are forgotten.
-const DELEGATE_ERROR_WINDOW: Duration = Duration::from_secs(10);
-
-/// Maximum backoff delay for rate-limited delegate requests.
-const DELEGATE_MAX_BACKOFF: Duration = Duration::from_secs(5);
-
-/// Maximum number of tracked delegate keys per client to bound memory usage.
-const DELEGATE_RATE_LIMIT_MAX_KEYS: usize = 64;
-
 /// Per-client rate limiter for delegate operations.
 ///
-/// Tracks recent delegate error responses and throttles clients that repeatedly
-/// send requests for missing/failing delegates. Without this, a single misbehaving
-/// client retrying at ~3 Hz can flood the event loop and cause "node not available"
+/// Wraps `TrackedBackoff` to throttle clients that repeatedly send requests
+/// for missing/failing delegates. Without this, a single misbehaving client
+/// retrying at ~3 Hz can flood the event loop and cause "node not available"
 /// errors for all clients. See #3305, #3332.
 ///
-/// The rate limiter uses two-phase tracking:
-/// - On outgoing requests: checks if the delegate key is rate-limited and delays if so
-/// - On incoming responses: records errors/successes to update rate limit state
+/// Two-phase tracking:
+/// - On outgoing requests: stores the delegate key and checks for existing backoff
+/// - On incoming responses: records errors/successes to update backoff state
 struct DelegateRateLimiter {
-    /// Map of delegate key bytes → (error count in window, time of first error)
-    error_counts: HashMap<[u8; 32], (u32, Instant)>,
+    backoff: TrackedBackoff<[u8; 32]>,
     /// The delegate key from the most recent outgoing request (if any).
     /// Used to correlate error responses back to the delegate key.
     last_requested_key: Option<[u8; 32]>,
@@ -59,8 +46,12 @@ struct DelegateRateLimiter {
 
 impl DelegateRateLimiter {
     fn new() -> Self {
+        let config = ExponentialBackoff::new(
+            Duration::from_millis(100), // base: 100ms after first failure
+            Duration::from_secs(5),     // max: 5s cap
+        );
         Self {
-            error_counts: HashMap::new(),
+            backoff: TrackedBackoff::new(config, 64),
             last_requested_key: None,
         }
     }
@@ -68,76 +59,37 @@ impl DelegateRateLimiter {
     /// Record that a delegate request is being sent for this key.
     /// Returns the backoff delay that should be imposed, or `Duration::ZERO`.
     fn on_request(&mut self, delegate_key: &[u8]) -> Duration {
-        // Store the key for correlating with the response later
-        if delegate_key.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(delegate_key);
-            self.last_requested_key = Some(key);
-        }
-
-        self.check_rate_limit(delegate_key)
+        let Some(key) = to_key_array(delegate_key) else {
+            return Duration::ZERO;
+        };
+        self.last_requested_key = Some(key);
+        self.backoff.remaining_backoff(&key).unwrap_or(Duration::ZERO)
     }
 
     /// Record a delegate error response. Uses the last requested delegate key.
     fn on_error_response(&mut self) {
         if let Some(key) = self.last_requested_key.take() {
-            self.record_error(&key);
+            self.backoff.record_failure(key);
         }
     }
 
     /// Record a successful delegate response. Clears backoff for the key.
     fn on_success_response(&mut self, delegate_key: &[u8]) {
         self.last_requested_key = None;
-        if delegate_key.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(delegate_key);
-            self.error_counts.remove(&key);
+        if let Some(key) = to_key_array(delegate_key) {
+            self.backoff.record_success(&key);
         }
     }
+}
 
-    fn record_error(&mut self, delegate_key: &[u8; 32]) {
-        let now = Instant::now();
-
-        // Evict stale entries and bound memory
-        if self.error_counts.len() >= DELEGATE_RATE_LIMIT_MAX_KEYS {
-            self.error_counts.retain(|_, (_, first_error)| {
-                now.duration_since(*first_error) < DELEGATE_ERROR_WINDOW
-            });
-        }
-
-        let entry = self.error_counts.entry(*delegate_key).or_insert((0, now));
-
-        // Reset window if too old
-        if now.duration_since(entry.1) > DELEGATE_ERROR_WINDOW {
-            *entry = (0, now);
-        }
-
-        entry.0 = entry.0.saturating_add(1);
-    }
-
-    fn check_rate_limit(&self, delegate_key: &[u8]) -> Duration {
-        if delegate_key.len() != 32 {
-            return Duration::ZERO;
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(delegate_key);
-
-        let Some((count, first_error)) = self.error_counts.get(&key) else {
-            return Duration::ZERO;
-        };
-
-        let now = Instant::now();
-        if now.duration_since(*first_error) > DELEGATE_ERROR_WINDOW {
-            return Duration::ZERO;
-        }
-
-        if *count >= DELEGATE_ERROR_THRESHOLD {
-            // Exponential backoff: 100ms, 200ms, 400ms, ... capped at max
-            let backoff_ms = 100u64 * (1u64 << (*count - DELEGATE_ERROR_THRESHOLD).min(10));
-            Duration::from_millis(backoff_ms).min(DELEGATE_MAX_BACKOFF)
-        } else {
-            Duration::ZERO
-        }
+/// Convert a delegate key byte slice to a fixed-size array, or `None` if wrong length.
+fn to_key_array(key: &[u8]) -> Option<[u8; 32]> {
+    if key.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(key);
+        Some(arr)
+    } else {
+        None
     }
 }
 
@@ -163,7 +115,10 @@ use tokio::sync::{mpsc, Mutex};
 use crate::{
     client_events::AuthToken,
     server::{ApiVersion, ClientConnection, HostCallbackResult},
-    util::EncodingProtocol,
+    util::{
+        backoff::{ExponentialBackoff, TrackedBackoff},
+        EncodingProtocol,
+    },
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};

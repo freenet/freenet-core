@@ -128,6 +128,39 @@ CORRECT:
 ### WHEN writing retry/backoff loops
 
 ```
+DO NOT hand-roll exponential backoff logic.
+  → USE: TrackedBackoff<K> from crate::util::backoff for per-key tracking
+  → USE: ExponentialBackoff from crate::util::backoff for stateless delay calc
+  → See also: ConnectionBackoff (ring/), PeerConnectionBackoff (ring/)
+
+TrackedBackoff<K> provides:
+  - Per-key failure counting with record_failure(key) / record_success(key)
+  - Automatic exponential delay: base * 2^failures, capped at max
+  - LRU eviction when max_entries exceeded
+  - remaining_backoff(key) → Option<Duration>
+  - is_in_backoff(key) → bool
+  - cleanup_expired() for periodic GC
+
+Example:
+  use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
+
+  let config = ExponentialBackoff::new(
+      Duration::from_millis(100),  // base delay
+      Duration::from_secs(5),      // max delay
+  );
+  let mut tracker: TrackedBackoff<PeerId> = TrackedBackoff::new(config, 64);
+
+  // On failure:
+  tracker.record_failure(peer_id);
+
+  // Before retry:
+  if let Some(delay) = tracker.remaining_backoff(&peer_id) {
+      tokio::time::sleep(delay).await;
+  }
+
+  // On success:
+  tracker.record_success(&peer_id);
+
 All retry/backoff loops MUST apply random jitter:
   → At least ±20% of the interval to prevent thundering herd
 
