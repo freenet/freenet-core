@@ -2320,9 +2320,11 @@ pub(crate) mod test {
         }
 
         fn random_byte_vec(&mut self) -> Vec<u8> {
-            (0..self.gen_u8())
-                .map(|_| self.gen_u8())
-                .collect::<Vec<_>>()
+            // Generate 1..=256 bytes. Using gen_u8() + 1 ensures at least 1 byte,
+            // preventing empty states/deltas that would trip debug_assert invariants
+            // in put_contract (stored state must be non-empty after successful PUT).
+            let len = self.gen_u8() as usize + 1;
+            (0..len).map(|_| self.gen_u8()).collect::<Vec<_>>()
         }
     }
 

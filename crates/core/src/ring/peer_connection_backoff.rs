@@ -36,12 +36,20 @@ impl PeerConnectionBackoff {
     /// See issue #2595 for context.
     const DEFAULT_BASE_INTERVAL: Duration = Duration::from_secs(30);
 
-    /// Default maximum backoff interval (10 minutes).
+    /// Default maximum backoff interval (90 seconds).
     ///
-    /// With 30s base and exponential growth (30s → 60s → 120s → 240s → 480s → 600s),
-    /// persistent failures quickly escalate to meaningful delays that prevent resource
-    /// waste on known-unreachable peers. See issue #2595.
-    const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(600);
+    /// With 30s base and exponential growth (30s → 60s → 90s), persistent failures
+    /// cap quickly at 90s.  The previous 600s cap was appropriate for random ring
+    /// peers but far too aggressive for configured gateways: a single gateway in a
+    /// 10-minute backoff means the node cannot bootstrap at all.  NAT traversal
+    /// failures are transient (network change, temporary congestion) so a 90s cap
+    /// gives the network time to stabilize without long-term isolation.
+    ///
+    /// `PeerConnectionBackoff` is currently used only for the `gateway_backoff`
+    /// tracker.  If it is ever reused for ring peers, per-peer-class caps should
+    /// be introduced via `with_config()` rather than raising this default.
+    /// See issues #2595 and #3304.
+    const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(90);
 
     /// Default maximum number of tracked entries
     const DEFAULT_MAX_ENTRIES: usize = 1024;
@@ -136,6 +144,31 @@ impl PeerConnectionBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for issue #3304: gateway backoff must not exceed 90s.
+    ///
+    /// Before #3304, `DEFAULT_MAX_BACKOFF` was 600s.  With a single configured
+    /// gateway this meant the node could be isolated for up to 10 minutes after
+    /// repeated NAT traversal failures.  Verify that the production constructor
+    /// (`new()`) enforces the 90s cap.
+    #[test]
+    fn test_default_max_backoff_is_90s_for_gateway_recovery() {
+        // Use new() — the production constructor — to also validate that path.
+        let mut backoff = PeerConnectionBackoff::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Drive through many failures until the cap is hit.
+        for _ in 0..10 {
+            backoff.record_failure(addr);
+        }
+
+        let remaining = backoff.remaining_backoff(addr).unwrap();
+        // Must not exceed the 90s cap (allow a small margin for test execution time).
+        assert!(
+            remaining <= Duration::from_secs(90),
+            "Gateway backoff exceeded 90s cap: {remaining:?} — issue #3304"
+        );
+    }
 
     #[test]
     fn test_not_in_backoff_initially() {
