@@ -2260,8 +2260,32 @@ pub(crate) async fn initial_join_procedure(
 
             let unconnected_count = unconnected_gateways.len();
 
-            // Diagnose stalls: below threshold but no gateways available to retry (#3219).
-            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
+            // When fully isolated (0 connections) but all gateways appear "connected/pending",
+            // force-clear stale pending reservations so gateways become retryable immediately.
+            // Without this, the peer is stuck for up to PENDING_RESERVATION_TTL (60s) per
+            // failed attempt, compounding with gateway backoff to cause 20+ minute recovery
+            // delays (#3319). The reservations were created by previous failed join_ring_request()
+            // calls and no longer represent real in-progress connections.
+            if open_conns == 0 && unconnected_count == 0 {
+                let gateway_addrs: Vec<_> =
+                    gateways.iter().filter_map(|gw| gw.socket_addr()).collect();
+                op_manager
+                    .ring
+                    .connection_manager
+                    .clear_pending_reservations_for(&gateway_addrs);
+                tracing::warn!(
+                    total_gateways = gateways.len(),
+                    "Fully isolated: cleared stale gateway reservations to unblock recovery"
+                );
+                // Also clear gateway backoff — when at 0 connections, we need to retry
+                // aggressively instead of waiting up to 10 minutes.
+                {
+                    let mut backoff = op_manager.gateway_backoff.lock();
+                    backoff.clear();
+                }
+                op_manager.gateway_backoff_cleared.notify_waiters();
+                continue;
+            } else if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
                 tracing::info!(
                     open_conns,
                     total_gateways = gateways.len(),

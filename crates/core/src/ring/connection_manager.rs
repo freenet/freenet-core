@@ -843,6 +843,28 @@ impl ConnectionManager {
         self.prune_connection(addr, false)
     }
 
+    /// Clear pending reservations for specific addresses.
+    ///
+    /// Used during isolation recovery (#3319): when a peer has zero ring connections
+    /// but all gateways appear "connected/pending" due to stale reservations from
+    /// previous failed CONNECT attempts, this forces them to become retryable
+    /// immediately instead of waiting for the 60-second TTL to expire.
+    pub fn clear_pending_reservations_for(&self, addrs: &[SocketAddr]) {
+        let mut pending = self.pending_reservations.write();
+        let mut location_for_peer = self.location_for_peer.write();
+        for addr in addrs {
+            if pending.remove(addr).is_some() {
+                // Also remove orphaned location_for_peer entries so
+                // has_connection_or_pending() returns false.
+                location_for_peer.remove(addr);
+                tracing::debug!(
+                    addr = %addr,
+                    "Cleared stale pending reservation for isolated peer recovery"
+                );
+            }
+        }
+    }
+
     /// Get the duration of an existing connection by address in milliseconds.
     /// Returns None if the connection doesn't exist.
     pub fn get_connection_duration_ms(&self, addr: SocketAddr) -> Option<u64> {
@@ -2503,6 +2525,51 @@ mod tests {
             cm.has_connection_or_pending(addr),
             "has_connection_or_pending should see fresh reservations"
         );
+    }
+
+    /// Regression test for #3319: when a peer has 0 connections and all gateways
+    /// appear "connected/pending" due to stale reservations, clear_pending_reservations_for
+    /// must make them retryable immediately.
+    #[test]
+    fn test_clear_pending_reservations_for_unblocks_gateways() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        let gw1_addr = make_addr(31337);
+        let gw2_addr = make_addr(31338);
+        let other_addr = make_addr(9001);
+        let gw1_loc = Location::new(0.5);
+        let gw2_loc = Location::new(0.7);
+        let other_loc = Location::new(0.3);
+
+        // Simulate failed join_ring_request creating pending reservations
+        assert!(cm.should_accept(gw1_loc, gw1_addr));
+        assert!(cm.should_accept(gw2_loc, gw2_addr));
+        assert!(cm.should_accept(other_loc, other_addr));
+        assert_eq!(cm.get_reserved_connections(), 3);
+
+        // All three appear as "connected/pending"
+        assert!(cm.has_connection_or_pending(gw1_addr));
+        assert!(cm.has_connection_or_pending(gw2_addr));
+        assert!(cm.has_connection_or_pending(other_addr));
+
+        // Clear only the gateway addresses
+        cm.clear_pending_reservations_for(&[gw1_addr, gw2_addr]);
+
+        // Gateways are now retryable
+        assert!(
+            !cm.has_connection_or_pending(gw1_addr),
+            "gateway 1 should be retryable after clearing"
+        );
+        assert!(
+            !cm.has_connection_or_pending(gw2_addr),
+            "gateway 2 should be retryable after clearing"
+        );
+        // Non-gateway reservation should be untouched
+        assert!(
+            cm.has_connection_or_pending(other_addr),
+            "non-gateway reservation should not be affected"
+        );
+        assert_eq!(cm.get_reserved_connections(), 1);
     }
 
     #[test]
