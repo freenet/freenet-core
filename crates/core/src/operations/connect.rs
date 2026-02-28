@@ -2279,10 +2279,7 @@ pub(crate) async fn initial_join_procedure(
                 );
                 // Also clear gateway backoff — when at 0 connections, we need to retry
                 // aggressively instead of waiting up to 10 minutes.
-                {
-                    let mut backoff = op_manager.gateway_backoff.lock();
-                    backoff.clear();
-                }
+                op_manager.gateway_backoff.lock().clear();
                 op_manager.gateway_backoff_cleared.notify_waiters();
                 continue;
             } else if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {

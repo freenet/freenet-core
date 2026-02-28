@@ -854,7 +854,7 @@ impl ConnectionManager {
         let mut location_for_peer = self.location_for_peer.write();
         for addr in addrs {
             if pending.remove(addr).is_some() {
-                // Also remove orphaned location_for_peer entries so
+                // Also remove the corresponding location_for_peer entry so
                 // has_connection_or_pending() returns false.
                 location_for_peer.remove(addr);
                 tracing::debug!(
