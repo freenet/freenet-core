@@ -6,11 +6,6 @@
 //!
 //! The chunk header is 5 bytes (`CHUNK_HEADER_SIZE`): the 1-byte type prefix
 //! followed by a single little-endian `u32` total_chunks field.
-//!
-//! TCP guarantees ordered delivery on a single WebSocket connection, and the
-//! server select loop sends all chunks of a message before starting another.
-//! This means chunks always arrive sequentially — no stream IDs, no
-//! out-of-order handling needed.
 
 use bytes::Bytes;
 
@@ -138,10 +133,6 @@ pub(crate) fn parse_message(data: &[u8]) -> Result<StreamMessage<'_>, StreamErro
 }
 
 /// Sequential reassembly buffer for chunked streams.
-///
-/// TCP guarantees ordered delivery and the select loop serializes message sends,
-/// so chunks always arrive in order within a single stream. This buffer simply
-/// appends incoming chunks and returns the complete payload when all arrive.
 pub(crate) struct ChunkReassemblyBuffer {
     data: Vec<u8>,
     total_chunks: u32,
