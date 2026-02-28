@@ -113,7 +113,7 @@ use crate::ring::{ConnectionFailureReason, KnownPeerKeyLocation, PeerAddr, PeerK
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
-use crate::util::{Contains, IterExt};
+use crate::util::{time_source::InstantTimeSrc, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
 use super::VisitedPeers;
@@ -898,6 +898,10 @@ pub(crate) struct ConnectOp {
     recency: HashMap<PeerKeyLocation, Instant>,
     forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt>,
     connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
+    /// Injectable time source. Using `util::TimeSource` (which returns `tokio::time::Instant`)
+    /// lets tests supply `SharedMockTimeSource` for fine-grained time control without needing
+    /// to pause the entire tokio runtime.
+    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
 }
 
 impl ConnectOp {
@@ -956,6 +960,7 @@ impl ConnectOp {
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
+            time_source: Arc::new(InstantTimeSrc::new()),
         }
     }
 
@@ -986,6 +991,7 @@ impl ConnectOp {
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
+            time_source: Arc::new(InstantTimeSrc::new()),
         }
     }
 
@@ -1295,8 +1301,10 @@ impl Operation for ConnectOp {
         Box::pin(async move {
             // Capture a single timestamp for the entire message handler so that all
             // time-sensitive operations within one message exchange see a consistent
-            // "now" rather than accumulating drift across multiple Instant::now() calls.
-            let now = Instant::now();
+            // "now". Using `self.time_source` (rather than `Instant::now()` directly)
+            // allows tests to supply a `SharedMockTimeSource` for fine-grained time
+            // control without needing to pause the entire tokio runtime.
+            let now = self.time_source.now();
             match msg {
                 ConnectMsg::Request { payload, .. } => {
                     let env = RelayEnv::new(op_manager);
@@ -2090,6 +2098,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
             recency: op.recency.clone(),
             forward_attempts: op.forward_attempts.clone(),
             connect_forward_estimator: op.connect_forward_estimator.clone(),
+            time_source: op.time_source.clone(),
         }))
     });
     match (return_msg, state) {

@@ -23,7 +23,7 @@ use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
 use crate::transport::TransportPublicKey;
-use crate::util::Contains;
+use crate::util::{time_source::InstantTimeSrc, Contains};
 use crate::{
     config::{GlobalExecutor, GlobalRng},
     message::{NetMessage, NetMessageV1, Transaction},
@@ -87,6 +87,10 @@ pub(crate) struct Ring {
     connection_backoff: Arc<parking_lot::Mutex<ConnectionBackoff>>,
     /// Per-contract backoff for contract-directed CONNECT attempts.
     contract_connect_backoff: Mutex<HashMap<ContractKey, ContractConnectState>>,
+    /// Injectable time source used by `connection_maintenance`. Using `util::TimeSource`
+    /// (which returns `tokio::time::Instant`) lets tests supply `SharedMockTimeSource` for
+    /// fine-grained control without pausing the entire tokio runtime.
+    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -213,6 +217,7 @@ impl Ring {
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
+            time_source: Arc::new(InstantTimeSrc::new()),
         };
 
         if let Some(loc) = config.location {
@@ -1822,8 +1827,10 @@ impl Ring {
             }
 
             // Capture a single `now` for all TTL/cleanup checks in this tick so that
-            // they all see the same moment rather than drifting across calls.
-            let tick_now = Instant::now();
+            // they all see the same moment rather than drifting across calls. Using
+            // `self.time_source` (rather than `Instant::now()` directly) allows tests
+            // to supply a `SharedMockTimeSource` without pausing the whole tokio runtime.
+            let tick_now = self.time_source.now();
 
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
