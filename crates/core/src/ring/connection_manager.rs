@@ -849,13 +849,28 @@ impl ConnectionManager {
     /// but all gateways appear "connected/pending" due to stale reservations from
     /// previous failed CONNECT attempts, this forces them to become retryable
     /// immediately instead of waiting for the 60-second TTL to expire.
+    ///
+    /// Uses two-phase locking to respect the documented lock ordering
+    /// (`location_for_peer` before `pending_reservations`). See module-level
+    /// comment for the ordering rationale.
     pub fn clear_pending_reservations_for(&self, addrs: &[SocketAddr]) {
-        let mut pending = self.pending_reservations.write();
-        let mut location_for_peer = self.location_for_peer.write();
-        for addr in addrs {
-            if pending.remove(addr).is_some() {
-                // Also remove the corresponding location_for_peer entry so
-                // has_connection_or_pending() returns false.
+        // Phase 1: Remove from pending_reservations, collect which were actually removed.
+        // Release this lock before acquiring location_for_peer to avoid ABBA deadlock
+        // with prune_connection (which acquires location_for_peer → pending_reservations).
+        let removed: Vec<SocketAddr> = {
+            let mut pending = self.pending_reservations.write();
+            addrs
+                .iter()
+                .filter(|addr| pending.remove(addr).is_some())
+                .copied()
+                .collect()
+        }; // pending_reservations lock released
+
+        // Phase 2: Remove corresponding location_for_peer entries so
+        // has_connection_or_pending() returns false for these addresses.
+        if !removed.is_empty() {
+            let mut location_for_peer = self.location_for_peer.write();
+            for addr in &removed {
                 location_for_peer.remove(addr);
                 tracing::debug!(
                     addr = %addr,
@@ -2573,6 +2588,37 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_pending_reservations_for_empty_list() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(31337);
+        let loc = Location::new(0.5);
+
+        assert!(cm.should_accept(loc, addr));
+        assert_eq!(cm.get_reserved_connections(), 1);
+
+        // Clearing with an empty list should be a no-op
+        cm.clear_pending_reservations_for(&[]);
+        assert_eq!(cm.get_reserved_connections(), 1);
+        assert!(cm.has_connection_or_pending(addr));
+    }
+
+    #[test]
+    fn test_clear_pending_reservations_for_unknown_addrs() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+        let addr = make_addr(31337);
+        let loc = Location::new(0.5);
+
+        assert!(cm.should_accept(loc, addr));
+        assert_eq!(cm.get_reserved_connections(), 1);
+
+        // Clearing unknown addresses should be a no-op
+        let unknown = make_addr(9999);
+        cm.clear_pending_reservations_for(&[unknown]);
+        assert_eq!(cm.get_reserved_connections(), 1);
+        assert!(cm.has_connection_or_pending(addr));
+    }
+
+    #[test]
     fn test_has_connection_or_pending_always_sees_established() {
         let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
         let keypair = TransportKeypair::new();
@@ -3304,7 +3350,7 @@ mod tests {
                     let addr = make_addr(port);
                     let loc = Location::new(rng.random_range(0.01..0.99));
 
-                    match rng.random_range(0u8..5) {
+                    match rng.random_range(0u8..6) {
                         // Inject a reservation that will look stale to cleanup
                         0 => {
                             cm.inject_reservation(
@@ -3333,6 +3379,13 @@ mod tests {
                         4 => {
                             let keypair = TransportKeypair::new();
                             cm.add_connection(loc, addr, keypair.public().clone(), rng.random());
+                        }
+                        // clear_pending_reservations_for (#3319 isolation recovery)
+                        5 => {
+                            let addrs: Vec<_> = (0..3)
+                                .map(|_| make_addr(rng.random_range(9000..9030)))
+                                .collect();
+                            cm.clear_pending_reservations_for(&addrs);
                         }
                         _ => unreachable!(),
                     }

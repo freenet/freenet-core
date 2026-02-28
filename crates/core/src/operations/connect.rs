@@ -2277,11 +2277,10 @@ pub(crate) async fn initial_join_procedure(
                     total_gateways = gateways.len(),
                     "Fully isolated: cleared stale gateway reservations to unblock recovery"
                 );
-                // Also clear gateway backoff — when at 0 connections, we need to retry
-                // aggressively instead of waiting up to 10 minutes.
-                op_manager.gateway_backoff.lock().clear();
-                op_manager.gateway_backoff_cleared.notify_waiters();
-                continue;
+                // Don't clear gateway backoff here — let the normal exponential backoff
+                // control retry timing to avoid thundering herd when multiple peers lose
+                // connectivity simultaneously. The 120-second isolation recovery in
+                // connection_maintenance resets both backoff and reservations periodically.
             } else if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
                 tracing::info!(
                     open_conns,
