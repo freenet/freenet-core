@@ -833,8 +833,10 @@ impl HostingManager {
                 continue;
             }
             // Skip contracts with no remaining interest (not hosted, no clients,
-            // no downstream). Hosted contracts pass this check because
-            // should_unsubscribe_upstream() returns false for them.
+            // no downstream). For contracts from the hosting cache iterator above,
+            // should_unsubscribe_upstream() always returns false (due to the
+            // is_hosting_contract check). This guard exists for defensive correctness
+            // in case iteration or eviction logic changes in the future.
             if self.should_unsubscribe_upstream(&contract) {
                 continue;
             }
@@ -1895,10 +1897,33 @@ mod tests {
         );
     }
 
-    /// After a contract is evicted from the hosting cache (e.g., TTL expiry),
-    /// it should be eligible for upstream unsubscribe again.
+    /// Interior peer scenario: contract hosted via GET, downstream peer leaves.
+    /// Should NOT propagate unsubscribe upstream because the contract is still hosted.
     #[test]
-    fn test_evicted_contract_allows_unsubscribe() {
+    fn test_chain_propagation_blocked_by_hosting() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(45);
+        let downstream = make_peer_key(30);
+
+        // Peer hosts contract via GET and has one downstream subscriber
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.subscribe(contract);
+        manager.add_downstream_subscriber(&contract, downstream.clone());
+
+        // Downstream peer unsubscribes
+        assert!(manager.remove_downstream_subscriber(&contract, &downstream));
+
+        // Should NOT propagate upstream — contract is still hosted
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract),
+            "Hosted contract should block upstream unsubscribe even after last downstream leaves"
+        );
+    }
+
+    /// A contract not in the hosting cache should still be eligible for
+    /// upstream unsubscribe when it has no clients or downstream.
+    #[test]
+    fn test_non_hosted_contract_allows_unsubscribe() {
         let manager = HostingManager::new();
         let contract = make_contract_key(43);
 
